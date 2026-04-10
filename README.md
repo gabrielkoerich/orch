@@ -232,6 +232,8 @@ orch chat                           # Interactive REPL
 orch chat "what's running?"         # Single message mode
 orch chat --session ops             # Use a named session profile
 orch chat history                   # Show recent messages
+orch chat history --with-cost       # Include per-message token/cost info
+orch chat stats                     # Show session token/cost summary
 orch chat history --search "bean"   # Search past conversations
 ```
 

@@ -666,6 +666,8 @@ pub async fn send_message(
             None,
             None,
             None,
+            None,
+            None,
         )
         .await?;
 
@@ -756,6 +758,8 @@ pub async fn send_message(
         (Some(t), None) | (None, Some(t)) => Some(t as i64),
         _ => None,
     };
+    let input_tokens = result.input_tokens.map(|t| t as i64);
+    let output_tokens = result.output_tokens.map(|t| t as i64);
     let cost_usd = match (result.input_tokens, result.output_tokens) {
         (Some(input), Some(output)) => {
             let pricing = crate::store::pricing_for_model(&model);
@@ -777,6 +781,8 @@ pub async fn send_message(
             parsed.summary.as_deref(),
             Some(&model),
             Some(&agent),
+            input_tokens,
+            output_tokens,
             total_tokens,
             cost_usd,
         )
@@ -861,6 +867,8 @@ mod tests {
                 Some("checked status"),
                 Some("sonnet"),
                 Some("claude"),
+                None,
+                None,
                 None,
                 None,
             )
@@ -1147,6 +1155,8 @@ mod tests {
                 Some("greeted"),
                 Some("sonnet"),
                 Some("claude"),
+                Some(input_tokens as i64),
+                Some(output_tokens as i64),
                 Some((input_tokens + output_tokens) as i64),
                 cost_usd,
             )

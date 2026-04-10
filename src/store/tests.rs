@@ -4970,6 +4970,8 @@ async fn control_insert_and_list() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -4983,6 +4985,8 @@ async fn control_insert_and_list() {
             Some("listed tasks"),
             Some("sonnet"),
             Some("claude"),
+            Some(300),
+            Some(200),
             Some(500),
             Some(0.01),
         )
@@ -5014,6 +5018,8 @@ async fn control_search_messages() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -5024,6 +5030,8 @@ async fn control_search_messages() {
             "cli",
             None,
             "unblock trading tasks",
+            None,
+            None,
             None,
             None,
             None,
@@ -5056,6 +5064,8 @@ async fn control_recent_summaries() {
             Some("claude"),
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -5069,6 +5079,8 @@ async fn control_recent_summaries() {
             Some("did Y"),
             Some("sonnet"),
             Some("claude"),
+            None,
+            None,
             None,
             None,
         )
@@ -5096,6 +5108,8 @@ async fn control_sessions_are_isolated() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -5106,6 +5120,8 @@ async fn control_sessions_are_isolated() {
             "cli",
             None,
             "message in B",
+            None,
+            None,
             None,
             None,
             None,
@@ -5127,6 +5143,68 @@ async fn control_sessions_are_isolated() {
     assert_eq!(b_msgs.len(), 1);
     assert!(a_msgs[0].content.contains("in A"));
     assert!(b_msgs[0].content.contains("in B"));
+}
+
+#[tokio::test]
+async fn control_session_cost_summary_aggregates_tokens_cost_and_model_breakdown() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    store
+        .insert_control_message(
+            "default", "user", "cli", None, "hello", None, None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+
+    store
+        .insert_control_message(
+            "default",
+            "assistant",
+            "cli",
+            None,
+            "hi",
+            Some("responded"),
+            Some("sonnet"),
+            Some("claude"),
+            Some(100),
+            Some(40),
+            Some(140),
+            Some(0.010),
+        )
+        .await
+        .unwrap();
+
+    store
+        .insert_control_message(
+            "default",
+            "assistant",
+            "cli",
+            None,
+            "done",
+            Some("completed"),
+            Some("sonnet"),
+            Some("claude"),
+            Some(50),
+            Some(25),
+            Some(75),
+            Some(0.005),
+        )
+        .await
+        .unwrap();
+
+    let summary = store.get_session_cost_summary("default").await.unwrap();
+    assert_eq!(summary.total_messages, 3);
+    assert_eq!(summary.assistant_messages, 2);
+    assert_eq!(summary.total_input_tokens, 150);
+    assert_eq!(summary.total_output_tokens, 65);
+    assert_eq!(summary.total_tokens, 215);
+    assert!((summary.total_cost_usd - 0.015).abs() < 1e-9);
+    assert_eq!(summary.primary_model.as_deref(), Some("sonnet"));
+    assert_eq!(summary.primary_agent.as_deref(), Some("claude"));
+    assert_eq!(summary.by_model.len(), 1);
+    assert_eq!(summary.by_model[0].0, "sonnet");
+    assert_eq!(summary.by_model[0].1, 2);
+    assert_eq!(summary.by_model[0].2, 215);
 }
 
 /// Regression test: resolve_task_id fallback must not cross repo boundaries.
@@ -5239,6 +5317,8 @@ async fn control_list_messages_since_filters_old() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -5295,6 +5375,8 @@ async fn control_search_messages_since_filters_old() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -5307,6 +5389,8 @@ async fn control_search_messages_since_filters_old() {
             "cli",
             None,
             "unrelated recent",
+            None,
+            None,
             None,
             None,
             None,
