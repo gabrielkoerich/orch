@@ -21,7 +21,7 @@
 //! - 1 GraphQL batch call
 //! - K `is_collaborator` REST calls (K = unique automated-review users ≪ N)
 
-use crate::backends::{ExternalBackend, Status};
+use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::config;
 use crate::engine::auto_merge::{dedup_reviews, handle_review_changes, MAX_MERGE_CONFLICT_RETRIES};
 use crate::engine::tasks::TaskManager;
@@ -37,6 +37,77 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::sync::ReviewTaskSnapshot;
+
+/// Action to take when a PR has merge conflicts after approval.
+#[derive(Debug, Clone, Copy)]
+enum ConflictAction {
+    /// Retry review by re-triggering the review agent to rebase.
+    RetryReview,
+    /// Block the task for human review (retry limit exceeded).
+    BlockForHuman,
+}
+
+/// Handle a merge conflict detected in a fully-approved PR.
+///
+/// Returns the action to take: either retry review (increment counter + set
+/// NeedsReview) or block for human (write block_reason + set Blocked).
+async fn handle_merge_conflict(
+    id: &ExternalId,
+    pr_number: u64,
+    retries: u64,
+    task_manager: &Arc<TaskManager>,
+    store: &Arc<TaskStore>,
+    store_id: i64,
+) -> ConflictAction {
+    let task_id = &id.0;
+    if retries >= MAX_MERGE_CONFLICT_RETRIES {
+        tracing::error!(
+            task_id,
+            pr_number,
+            retries,
+            "PR approved but merge conflict retry limit reached — blocking for human review"
+        );
+        let fields = [
+            (
+                "block_reason",
+                serde_json::json!(format!(
+                    "merge conflict retry limit ({}) reached",
+                    MAX_MERGE_CONFLICT_RETRIES
+                )),
+            ),
+            (
+                "last_error",
+                serde_json::json!(format!(
+                    "PR approved but has unresolved merge conflicts after {} retries",
+                    retries
+                )),
+            ),
+        ];
+        if let Err(e) = task_manager
+            .update_task_status_and_result(id, Status::Blocked, &fields)
+            .await
+        {
+            tracing::error!(task_id, err = %e, "failed to write block_reason and set Blocked");
+        }
+        return ConflictAction::BlockForHuman;
+    }
+    tracing::info!(
+        task_id,
+        pr_number,
+        retries,
+        "PR approved but has merge conflicts — re-triggering review agent to rebase"
+    );
+    if let Err(e) =
+        store_increment_by_id(&Some(Arc::clone(store)), store_id, "merge_conflict_retries").await
+    {
+        tracing::warn!(task_id, err = %e, "failed to increment merge_conflict_retries — skipping dispatch to avoid bypassing retry limit");
+        return ConflictAction::BlockForHuman;
+    }
+    if let Err(e) = task_manager.update_task_status(id, Status::NeedsReview).await {
+        tracing::warn!(task_id, err = %e, "failed to set NeedsReview for conflict retry");
+    }
+    ConflictAction::RetryReview
+}
 
 /// Review open PRs - re-dispatch agent to address review feedback.
 ///
@@ -440,64 +511,19 @@ pub(crate) async fn review_open_prs(
 
                 if is_conflicting {
                     let retries = stored_task.merge_conflict_retries as u64;
-                    if retries >= MAX_MERGE_CONFLICT_RETRIES {
-                        tracing::error!(
-                            task_id,
-                            pr_number,
-                            retries,
-                            "PR approved but merge conflict retry limit reached — blocking for human review"
-                        );
-                        let fields = [
-                            (
-                                "block_reason",
-                                serde_json::json!(format!(
-                                    "merge conflict retry limit ({}) reached",
-                                    MAX_MERGE_CONFLICT_RETRIES
-                                )),
-                            ),
-                            (
-                                "last_error",
-                                serde_json::json!(format!(
-                                    "PR approved but has unresolved merge conflicts after {} retries",
-                                    retries
-                                )),
-                            ),
-                        ];
-                        if let Err(e) = task_manager
-                            .update_task_status_and_result(&task.id, Status::Blocked, &fields)
-                            .await
-                        {
-                            tracing::error!(task_id, err = %e, "failed to write block_reason and set Blocked");
-                        }
-                        continue;
-                    }
-                    tracing::info!(
-                        task_id,
+                    match handle_merge_conflict(
+                        &task.id,
                         pr_number,
                         retries,
-                        "PR approved but has merge conflicts — re-triggering review agent to rebase"
-                    );
-                    if let Err(e) = store_increment_by_id(
-                        &Some(Arc::clone(store)),
+                        task_manager,
+                        store,
                         task_info.store_id,
-                        "merge_conflict_retries",
                     )
                     .await
                     {
-                        tracing::warn!(task_id, err = %e, "failed to increment merge_conflict_retries — skipping dispatch to avoid bypassing retry limit");
-                        continue;
+                        ConflictAction::BlockForHuman => continue,
+                        ConflictAction::RetryReview => {}
                     }
-                    if let Err(e) = task_manager
-                        .update_task_status(&task.id, Status::NeedsReview)
-                        .await
-                    {
-                        tracing::warn!(
-                            task_id,
-                            err = %e,
-                            "failed to set NeedsReview for conflict retry"
-                        );
-                    }
-                    continue;
                 }
 
                 tracing::info!(
@@ -587,57 +613,19 @@ pub(crate) async fn review_open_prs(
 
                 if is_conflicting {
                     let retries = stored_task.merge_conflict_retries as u64;
-                    if retries >= MAX_MERGE_CONFLICT_RETRIES {
-                        tracing::error!(task_id, pr_number, retries, "PR approved but merge conflict retry limit reached — blocking for human review (auto_close disabled)");
-                        // Persist block_reason BEFORE transitioning to Blocked to avoid
-                        // a race where auto_unblock sees a blocked task without a reason
-                        // and immediately unblocks it.
-                        let fields = [
-                            (
-                                "block_reason",
-                                serde_json::json!(format!(
-                                    "merge conflict retry limit ({}) reached",
-                                    MAX_MERGE_CONFLICT_RETRIES
-                                )),
-                            ),
-                            (
-                                "last_error",
-                                serde_json::json!(format!(
-                                    "PR approved but has unresolved merge conflicts after {} retries",
-                                    retries
-                                )),
-                            ),
-                        ];
-                        if let Err(e) = task_manager
-                            .update_task_status_and_result(&task.id, Status::Blocked, &fields)
-                            .await
-                        {
-                            tracing::error!(task_id, err = %e, "failed to write block_reason and set Blocked");
-                        }
-                        continue;
-                    }
-                    tracing::info!(task_id, pr_number, retries, "PR approved but has merge conflicts — re-triggering review agent to rebase (auto_close disabled)");
-                    if let Err(e) = store_increment_by_id(
-                        &Some(Arc::clone(store)),
+                    match handle_merge_conflict(
+                        &task.id,
+                        pr_number,
+                        retries,
+                        task_manager,
+                        store,
                         task_info.store_id,
-                        "merge_conflict_retries",
                     )
                     .await
                     {
-                        tracing::warn!(task_id, err = %e, "failed to increment merge_conflict_retries — skipping dispatch to avoid bypassing retry limit");
-                        continue;
+                        ConflictAction::BlockForHuman => continue,
+                        ConflictAction::RetryReview => {}
                     }
-                    if let Err(e) = task_manager
-                        .update_task_status(&task.id, Status::NeedsReview)
-                        .await
-                    {
-                        tracing::warn!(
-                            task_id,
-                            err = %e,
-                            "failed to set NeedsReview for conflict retry"
-                        );
-                    }
-                    continue;
                 }
 
                 tracing::info!(task_id, pr_number, comment_approved, "PR approved (auto_close disabled) — marking task done and leaving PR open for human merge");
