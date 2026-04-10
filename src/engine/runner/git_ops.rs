@@ -184,6 +184,163 @@ pub async fn auto_commit(
 /// add/add conflicts that block the agent and leave the worktree unusable.
 const MAX_REBASE_COMMITS: usize = 50;
 
+/// Rebase the current branch on top of `origin/{branch}`.
+///
+/// Used for push-failure recovery: when another agent has pushed to the same
+/// branch, we fetch the latest remote state and rebase local commits on top.
+/// Returns `Ok(true)` if rebase succeeded, `Ok(false)` if there was nothing to
+/// rebase, and `Err` if rebase failed (conflicts).
+///
+/// Similar to `rebase_on_default` but targets the feature branch instead of
+/// the default branch, and is used after push failures rather than at startup.
+pub async fn rebase_on_branch(dir: &Path, branch: &str) -> anyhow::Result<bool> {
+    let origin_branch = format!("origin/{branch}");
+
+    // Fetch the remote branch to get latest state.
+    let fetch = Command::new("git")
+        .args(["fetch", "origin", branch])
+        .current_dir(dir)
+        .output_with_context()
+        .await;
+
+    match fetch {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            anyhow::bail!("failed to fetch origin/{branch}: {stderr}");
+        }
+        Err(e) => anyhow::bail!("failed to fetch origin/{branch}: {e}"),
+    }
+
+    // Check if there are local commits to rebase.
+    let count_output = Command::new("git")
+        .args(["rev-list", "--count", &format!("{origin_branch}..HEAD")])
+        .current_dir(dir)
+        .output_with_context()
+        .await;
+
+    let commit_count: usize = match count_output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0),
+        _ => 0,
+    };
+
+    if commit_count == 0 {
+        // No local commits to rebase — nothing to do.
+        return Ok(false);
+    }
+
+    if commit_count > MAX_REBASE_COMMITS {
+        anyhow::bail!(
+            "refusing to rebase {commit_count} commits on origin/{branch} (max {})",
+            MAX_REBASE_COMMITS
+        );
+    }
+
+    tracing::info!(
+        branch = branch,
+        commit_count,
+        "rebasing local commits on origin/{branch}"
+    );
+
+    // Stash any uncommitted changes so the rebase can proceed cleanly.
+    let stash_ref: Option<String> = if has_changes(dir).await {
+        let stash_out = Command::new("git")
+            .args(["stash", "--include-untracked"])
+            .current_dir(dir)
+            .output_with_context()
+            .await;
+        match stash_out {
+            Ok(o) if o.status.success() => {
+                // Capture the OID of the stash object just created.
+                let ref_out = Command::new("git")
+                    .args(["rev-parse", "refs/stash@{0}"])
+                    .current_dir(dir)
+                    .output_with_context()
+                    .await;
+                ref_out
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .filter(|s| !s.is_empty())
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // Perform the rebase.
+    let output = Command::new("git")
+        .args(["rebase", &origin_branch])
+        .current_dir(dir)
+        .output_with_context()
+        .await;
+
+    match output {
+        Ok(o) if o.status.success() => {
+            tracing::info!(branch = branch, "successfully rebased on origin/{branch}");
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            tracing::warn!(
+                branch = branch,
+                err = %stderr,
+                "rebase failed, aborting and returning error"
+            );
+            // Abort failed rebase so the worktree is in a clean state.
+            let _ = Command::new("git")
+                .args(["rebase", "--abort"])
+                .current_dir(dir)
+                .output_with_context()
+                .await;
+            anyhow::bail!("rebase failed: {stderr}");
+        }
+        Err(e) => {
+            tracing::warn!(branch = branch, err = %e, "failed to run rebase");
+            anyhow::bail!("failed to run rebase: {e}");
+        }
+    }
+
+    // Restore stashed changes using the captured ref.
+    if let Some(ref stash_hash) = stash_ref {
+        let apply = Command::new("git")
+            .args(["stash", "apply", stash_hash])
+            .current_dir(dir)
+            .output_with_context()
+            .await;
+        if apply.map(|o| o.status.success()).unwrap_or(false) {
+            let list = Command::new("git")
+                .args(["stash", "list", "--format=%H %gd"])
+                .current_dir(dir)
+                .output_with_context()
+                .await;
+            if let Ok(output) = list {
+                if output.status.success() {
+                    let list_str = String::from_utf8_lossy(&output.stdout);
+                    if let Some(stash_ref) = find_stash_ref_by_hash(&list_str, stash_hash) {
+                        let _ = Command::new("git")
+                            .args(["stash", "drop", &stash_ref])
+                            .current_dir(dir)
+                            .output_with_context()
+                            .await;
+                    }
+                }
+            }
+        } else {
+            tracing::warn!(
+                stash = %stash_hash,
+                branch = branch,
+                "stash apply failed after rebase — stash preserved for manual recovery"
+            );
+        }
+    }
+
+    Ok(true)
+}
+
 /// Rebase the current branch on the default branch.
 ///
 /// Run before the agent starts to ensure the worktree has the latest code.
