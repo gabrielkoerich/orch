@@ -526,63 +526,6 @@ async fn handle_slash_command(
     }
 }
 
-/// What to do with a comment in the unified scan loop.
-#[derive(Debug, PartialEq)]
-pub(crate) enum CommentAction {
-    /// Already processed or not relevant — skip.
-    Skip,
-    /// Slash command without @mention — execute the command.
-    ExecuteCommand {
-        command: crate::engine::commands::OwnerCommand,
-        issue_num: String,
-    },
-    /// @mention with a slash command — execute and record sentinel task.
-    ExecuteCommandForMention {
-        command: crate::engine::commands::OwnerCommand,
-        issue_num: String,
-    },
-    /// @mention without command — create internal task for agent to respond.
-    CreateMentionTask { issue_num: Option<String> },
-}
-
-/// Classify a comment into the appropriate action.
-///
-/// Pure function — no I/O, no async. Determines what the scan loop should do
-/// with each comment based on its content and whether it was already processed.
-pub(crate) fn classify_comment(
-    body: &str,
-    issue_url: Option<&str>,
-    current_user: &str,
-    already_processed: bool,
-) -> CommentAction {
-    if already_processed {
-        return CommentAction::Skip;
-    }
-
-    let is_mention =
-        body.contains(current_user) || body.contains("@orch") || body.contains("@orchestrator");
-    let command = parse_command(body);
-    let issue_num = issue_url.and_then(extract_issue_number_from_url);
-
-    match (command, is_mention, issue_num) {
-        (Some(cmd), true, Some(num)) => CommentAction::ExecuteCommandForMention {
-            command: cmd,
-            issue_num: num,
-        },
-        (Some(cmd), false, Some(num)) => CommentAction::ExecuteCommand {
-            command: cmd,
-            issue_num: num,
-        },
-        // Command but no issue URL — if it's a mention, create task; otherwise skip
-        (Some(_), true, None) => CommentAction::CreateMentionTask { issue_num: None },
-        (Some(_), false, None) => CommentAction::Skip,
-        // Mention without command — create task for agent
-        (None, true, issue_num) => CommentAction::CreateMentionTask { issue_num },
-        // Neither mention nor command — skip
-        (None, false, _) => CommentAction::Skip,
-    }
-}
-
 fn auto_unblock_cooldown_elapsed(count: i32, last_at: &str) -> bool {
     if count == 0 {
         return true;
