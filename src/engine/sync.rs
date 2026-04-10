@@ -1198,9 +1198,33 @@ async fn scan_comments(
     };
 
     let gh = crate::github::http::GhHttp::new()?;
+
+    // Pre-fetch is_pull_request for every comment that has an issue URL,
+    // running all checks in parallel instead of N serial API calls.
+    let is_pr_results: Vec<bool> = {
+        let futs: Vec<_> = comments
+            .iter()
+            .map(|c| {
+                let num_opt = c
+                    .issue_url
+                    .as_deref()
+                    .and_then(extract_issue_number_from_url);
+                let gh = &gh;
+                async move {
+                    if let Some(ref num) = num_opt {
+                        gh.is_pull_request(repo, num).await
+                    } else {
+                        false
+                    }
+                }
+            })
+            .collect();
+        futures::future::join_all(futs).await
+    };
+
     let mut last_success_ts: Option<String> = None;
 
-    for comment in comments {
+    for (comment_idx, comment) in comments.iter().enumerate() {
         let action = classify_comment(
             &comment.body,
             comment.issue_url.as_deref(),
@@ -1244,7 +1268,7 @@ async fn scan_comments(
                     repo,
                     task_manager,
                     &gh,
-                    &comment,
+                    comment,
                     &command,
                     &mut last_success_ts,
                 )
@@ -1256,11 +1280,7 @@ async fn scan_comments(
                     tracing::debug!(err = %e, mention_id = %comment.id, "failed to acknowledge mention");
                 }
 
-                let is_pr = if let Some(ref num) = issue_num {
-                    gh.is_pull_request(repo, num).await
-                } else {
-                    false
-                };
+                let is_pr = is_pr_results[comment_idx];
 
                 let (title, task_body) = match (&issue_num, is_pr) {
                     (Some(num), false) => (
@@ -1292,7 +1312,7 @@ async fn scan_comments(
                     record_mention_task(
                         s,
                         repo,
-                        &comment,
+                        comment,
                         &title,
                         &task_body,
                         parent_id,
