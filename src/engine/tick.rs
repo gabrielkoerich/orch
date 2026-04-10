@@ -1248,12 +1248,16 @@ pub(crate) async fn tick_dispatch_tasks(
                                 .resolve_task_id(&repo_owned, &task_id)
                                 .await
                             {
-                                Ok(Some(store_id)) => store_for_spawn
+                                Ok(Some(store_id)) => match store_for_spawn
                                     .get(store_id)
                                     .await
-                                    .ok()
-                                    .and_then(|t| t.pr_number)
-                                    .is_some(),
+                                {
+                                    Ok(t) => t.pr_number.is_some(),
+                                    Err(e) => {
+                                        tracing::warn!(task_id, err = %e, "store.get() failed — defaulting to needs_review");
+                                        true
+                                    }
+                                },
                                 Ok(None) => false,
                                 Err(e) => {
                                     tracing::warn!(task_id, err = %e, "failed to check PR status — defaulting to needs_review");
