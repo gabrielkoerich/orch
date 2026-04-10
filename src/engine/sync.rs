@@ -29,22 +29,55 @@ use tokio::process::Command;
 use tokio::sync::RwLock;
 
 /// Read a KV value from the store.
+///
+/// Returns `None` if the store is unavailable, the key doesn't exist, OR if
+/// the store query fails. Use [`try_kv_get_prefer_store`] if you need to
+/// distinguish between "key not found" and actual errors.
 async fn kv_get_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str) -> Option<String> {
+    try_kv_get_prefer_store(store, key).await.ok().flatten()
+}
+
+/// Try to read a KV value from the store, returning errors instead of
+/// silently discarding them.
+///
+/// Returns `Ok(None)` if the store is unavailable or the key doesn't exist.
+/// Returns `Err` if the store query fails.
+async fn try_kv_get_prefer_store(
+    store: &Option<&Arc<TaskStore>>,
+    key: &str,
+) -> anyhow::Result<Option<String>> {
     if let Some(s) = store {
-        if let Ok(v) = s.kv_get(key).await {
-            return v;
-        }
+        Ok(s.kv_get(key).await?)
+    } else {
+        Ok(None)
     }
-    None
 }
 
 /// Write a KV value to the store.
+///
+/// Logs warnings on failure but provides no way for callers to know if the
+/// write succeeded. Use [`try_kv_set_prefer_store`] if you need to handle
+/// errors or guarantee persistence (e.g., for circuit breaker state).
 async fn kv_set_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str, value: &str) {
-    if let Some(s) = store {
-        if let Err(e) = s.kv_set(key, value).await {
-            tracing::warn!(key, err = %e, "kv_set failed");
-        }
+    if let Err(e) = try_kv_set_prefer_store(store, key, value).await {
+        tracing::warn!(key, err = %e, "kv_set failed");
     }
+}
+
+/// Try to write a KV value to the store, returning errors instead of
+/// silently logging them.
+///
+/// Returns `Ok(())` if the store is unavailable (best-effort) or if the
+/// write succeeds. Returns `Err` if the store query fails.
+async fn try_kv_set_prefer_store(
+    store: &Option<&Arc<TaskStore>>,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<()> {
+    if let Some(s) = store {
+        s.kv_set(key, value).await?;
+    }
+    Ok(())
 }
 
 use super::cleanup::{check_merged_prs, cleanup_done_worktrees};
@@ -677,9 +710,16 @@ pub(crate) async fn sync_tick(
             "GitHub 5xx circuit breaker open — skipping non-critical sync work"
         );
         // Persist circuit breaker state as a metric for operators.
-        kv_set_prefer_store(&Some(store), "metrics:orch.github_5xx_circuit.open", "1").await;
-    } else {
-        kv_set_prefer_store(&Some(store), "metrics:orch.github_5xx_circuit.open", "0").await;
+        // This is critical for avoiding thundering herd after restart during outages.
+        if let Err(e) =
+            try_kv_set_prefer_store(&Some(store), "metrics:orch.github_5xx_circuit.open", "1").await
+        {
+            tracing::warn!(err = %e, "failed to persist circuit breaker state — may cause thundering herd after restart");
+        }
+    } else if let Err(e) =
+        try_kv_set_prefer_store(&Some(store), "metrics:orch.github_5xx_circuit.open", "0").await
+    {
+        tracing::warn!(err = %e, "failed to clear circuit breaker state");
     }
 
     // 0. Ingest all active external tasks into the unified store.
@@ -1485,12 +1525,15 @@ pub(crate) async fn emit_degraded_agents_if_needed(
 
     // Always persist the count metric so operators can scrape it every tick,
     // including when the count is 0.
-    kv_set_prefer_store(
+    if let Err(e) = try_kv_set_prefer_store(
         &store,
         "metrics:orch.agents_degraded.count",
         &count.to_string(),
     )
-    .await;
+    .await
+    {
+        tracing::warn!(err = %e, "failed to persist degraded agents count metric");
+    }
 
     if count >= 3 {
         // Build structured dimension strings for the log.
@@ -1514,10 +1557,16 @@ pub(crate) async fn emit_degraded_agents_if_needed(
         );
 
         // Dedicated alert metric: "1" while the threshold is exceeded.
-        kv_set_prefer_store(&store, "metrics:orch.agents_degraded.alert", "1").await;
-    } else {
+        if let Err(e) =
+            try_kv_set_prefer_store(&store, "metrics:orch.agents_degraded.alert", "1").await
+        {
+            tracing::warn!(err = %e, "failed to persist degraded agents alert metric");
+        }
+    } else if let Err(e) =
+        try_kv_set_prefer_store(&store, "metrics:orch.agents_degraded.alert", "0").await
+    {
         // Clear the alert metric when healthy.
-        kv_set_prefer_store(&store, "metrics:orch.agents_degraded.alert", "0").await;
+        tracing::warn!(err = %e, "failed to clear degraded agents alert metric");
     }
 }
 
@@ -2247,6 +2296,55 @@ mod tests {
         let opt: Option<&Arc<TaskStore>> = None;
         // Should not panic
         kv_set_prefer_store(&opt, "k4", "val4").await;
+    }
+
+    // ── try_kv_get_prefer_store / try_kv_set_prefer_store ────────────────
+
+    #[tokio::test]
+    async fn try_kv_get_prefer_store_returns_value_from_store() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        store.kv_set("try_k1", "try_val1").await.unwrap();
+
+        let opt = Some(&store);
+        let result = try_kv_get_prefer_store(&opt, "try_k1").await;
+        assert_eq!(result.unwrap().as_deref(), Some("try_val1"));
+    }
+
+    #[tokio::test]
+    async fn try_kv_get_prefer_store_returns_none_for_missing_key() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let opt = Some(&store);
+
+        let result = try_kv_get_prefer_store(&opt, "nonexistent_key").await;
+        assert_eq!(result.unwrap(), None); // Key doesn't exist, but query succeeded
+    }
+
+    #[tokio::test]
+    async fn try_kv_get_prefer_store_returns_none_without_store() {
+        let opt: Option<&Arc<TaskStore>> = None;
+        let result = try_kv_get_prefer_store(&opt, "try_k2").await;
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn try_kv_set_prefer_store_writes_to_store() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let opt = Some(&store);
+
+        let result = try_kv_set_prefer_store(&opt, "try_k3", "try_val3").await;
+        assert!(result.is_ok());
+        assert_eq!(
+            store.kv_get("try_k3").await.unwrap().as_deref(),
+            Some("try_val3")
+        );
+    }
+
+    #[tokio::test]
+    async fn try_kv_set_prefer_store_ok_without_store() {
+        let opt: Option<&Arc<TaskStore>> = None;
+        // Should not error - best effort when store unavailable
+        let result = try_kv_set_prefer_store(&opt, "try_k4", "try_val4").await;
+        assert!(result.is_ok());
     }
 
     // ── dispatching lock tests ──────────────────────────────────────────
