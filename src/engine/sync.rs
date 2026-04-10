@@ -1333,70 +1333,76 @@ async fn scan_comments(
             CommentAction::ExecuteCommandForMention { command, .. } => {
                 if let Err(e) = backend.acknowledge_mention(&comment.id).await {
                     tracing::debug!(err = %e, mention_id = %comment.id, "failed to acknowledge mention");
+                    // Do NOT advance the cursor or call handle_slash_command — the GitHub
+                    // reaction was never posted. Retry on next tick once the network
+                    // glitch has resolved.
+                } else {
+                    handle_slash_command(
+                        backend,
+                        store,
+                        repo,
+                        task_manager,
+                        &gh,
+                        comment,
+                        &command,
+                        &mut last_success_ts,
+                    )
+                    .await;
                 }
-                handle_slash_command(
-                    backend,
-                    store,
-                    repo,
-                    task_manager,
-                    &gh,
-                    comment,
-                    &command,
-                    &mut last_success_ts,
-                )
-                .await;
             }
 
             CommentAction::CreateMentionTask { issue_num } => {
                 if let Err(e) = backend.acknowledge_mention(&comment.id).await {
                     tracing::debug!(err = %e, mention_id = %comment.id, "failed to acknowledge mention");
-                }
+                    // Do NOT record the mention task or advance the cursor — the GitHub
+                    // reaction was never posted. Retry on next tick once the network
+                    // glitch has resolved.
+                } else {
+                    // Use the pre-fetched value — no serial API call here.
+                    // invariant: CreateMentionTask with Some(issue_num) must have been
+                    // collected into pr_check_inputs, so the entry must exist.
+                    let is_pr = is_pr_map.get(&comment_idx).copied().expect(
+                        "is_pr_map missing entry for CreateMentionTask: invariant violated",
+                    );
 
-                // Use the pre-fetched value — no serial API call here.
-                // invariant: CreateMentionTask with Some(issue_num) must have been
-                // collected into pr_check_inputs, so the entry must exist.
-                let is_pr = is_pr_map
-                    .get(&comment_idx)
-                    .copied()
-                    .expect("is_pr_map missing entry for CreateMentionTask: invariant violated");
-
-                let (title, task_body) = match (&issue_num, is_pr) {
-                    (Some(num), false) => (
-                        format!("Respond to mention by @{} on task #{num}", comment.author),
-                        format!(
-                            "Mention by @{} on GitHub issue #{num}:\n\n{}\n\n---\nThis mention was posted on issue #{num}. Review the full issue to understand the context before responding.",
-                            comment.author, comment.body
+                    let (title, task_body) = match (&issue_num, is_pr) {
+                        (Some(num), false) => (
+                            format!("Respond to mention by @{} on task #{num}", comment.author),
+                            format!(
+                                "Mention by @{} on GitHub issue #{num}:\n\n{}\n\n---\nThis mention was posted on issue #{num}. Review the full issue to understand the context before responding.",
+                                comment.author, comment.body
+                            ),
                         ),
-                    ),
-                    (Some(num), true) => (
-                        format!("Respond to mention by @{} on PR #{num}", comment.author),
-                        format!(
-                            "Mention by @{} on GitHub PR #{num}:\n\n{}\n\n---\nThis mention was posted on PR #{num}. Review the full PR (diff, description, and comments) to understand the context before responding.",
-                            comment.author, comment.body
+                        (Some(num), true) => (
+                            format!("Respond to mention by @{} on PR #{num}", comment.author),
+                            format!(
+                                "Mention by @{} on GitHub PR #{num}:\n\n{}\n\n---\nThis mention was posted on PR #{num}. Review the full PR (diff, description, and comments) to understand the context before responding.",
+                                comment.author, comment.body
+                            ),
                         ),
-                    ),
-                    (None, _) => (
-                        format!("Respond to mention by @{}", comment.author),
-                        format!("Mention by @{}:\n\n{}", comment.author, comment.body),
-                    ),
-                };
-
-                if let Some(s) = store {
-                    let parent_id = if let Some(ref num) = issue_num {
-                        resolve_mention_parent_id(s, repo, num, is_pr).await
-                    } else {
-                        None
+                        (None, _) => (
+                            format!("Respond to mention by @{}", comment.author),
+                            format!("Mention by @{}:\n\n{}", comment.author, comment.body),
+                        ),
                     };
-                    record_mention_task(
-                        s,
-                        repo,
-                        comment,
-                        &title,
-                        &task_body,
-                        parent_id,
-                        &mut last_success_ts,
-                    )
-                    .await;
+
+                    if let Some(s) = store {
+                        let parent_id = if let Some(ref num) = issue_num {
+                            resolve_mention_parent_id(s, repo, num, is_pr).await
+                        } else {
+                            None
+                        };
+                        record_mention_task(
+                            s,
+                            repo,
+                            comment,
+                            &title,
+                            &task_body,
+                            parent_id,
+                            &mut last_success_ts,
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -3654,5 +3660,218 @@ mod tests {
         // @mention + command but no issue URL → can't run command, create mention task
         let action = classify_comment("@orch /retry", None, "@bot", false);
         assert_eq!(action, CommentAction::CreateMentionTask { issue_num: None });
+    }
+
+    // ── scan_comments: acknowledge_mention failure does not advance cursor ────
+
+    /// Backend that tracks acknowledge_mention calls and can be configured to fail them.
+    struct AckTrackingBackend {
+        ack_calls: tokio::sync::Mutex<Vec<String>>,
+        ack_failure: bool,
+        inner: crate::backends::test_helpers::NoopBackend,
+    }
+
+    impl AckTrackingBackend {
+        fn new(ack_failure: bool) -> Arc<Self> {
+            Arc::new(Self {
+                ack_calls: tokio::sync::Mutex::new(Vec::new()),
+                ack_failure,
+                inner: crate::backends::test_helpers::NoopBackend,
+            })
+        }
+
+        fn fail_on_ack(&self) -> bool {
+            self.ack_failure
+        }
+    }
+
+    #[async_trait]
+    impl ExternalBackend for AckTrackingBackend {
+        fn name(&self) -> &str {
+            "ack-tracking"
+        }
+
+        async fn acknowledge_mention(&self, comment_id: &str) -> anyhow::Result<()> {
+            self.ack_calls.lock().await.push(comment_id.to_string());
+            if self.fail_on_ack() {
+                // Return a transient error to simulate network glitch.
+                anyhow::bail!("network error: temporary failure posting reaction");
+            }
+            Ok(())
+        }
+
+        // Override get_authenticated_user to ensure scan proceeds.
+        async fn get_authenticated_user(&self) -> anyhow::Result<Option<String>> {
+            Ok(Some("bot".into()))
+        }
+
+        // Override get_mentions to return empty (we use prefetched comments).
+        async fn get_mentions(&self, _since: &str) -> anyhow::Result<Vec<Mention>> {
+            Ok(vec![])
+        }
+
+        // Delegate everything else to NoopBackend.
+        async fn create_task(&self, t: &str, b: &str, l: &[String]) -> anyhow::Result<ExternalId> {
+            self.inner.create_task(t, b, l).await
+        }
+        async fn get_task(&self, id: &ExternalId) -> anyhow::Result<ExternalTask> {
+            self.inner.get_task(id).await
+        }
+        async fn list_by_status(&self, s: Status) -> anyhow::Result<Vec<ExternalTask>> {
+            self.inner.list_by_status(s).await
+        }
+        async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
+            self.inner.list_routable().await
+        }
+        async fn post_comment(&self, id: &ExternalId, b: &str) -> anyhow::Result<()> {
+            self.inner.post_comment(id, b).await
+        }
+        async fn set_labels(&self, id: &ExternalId, l: &[String]) -> anyhow::Result<()> {
+            self.inner.set_labels(id, l).await
+        }
+        async fn remove_label(&self, id: &ExternalId, l: &str) -> anyhow::Result<()> {
+            self.inner.remove_label(id, l).await
+        }
+        async fn get_sub_issues(&self, id: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
+            self.inner.get_sub_issues(id).await
+        }
+        async fn create_sub_task(
+            &self,
+            p: &ExternalId,
+            t: &str,
+            b: &str,
+            l: &[String],
+        ) -> anyhow::Result<ExternalId> {
+            self.inner.create_sub_task(p, t, b, l).await
+        }
+        async fn ensure_status_label(&self, l: &str) -> anyhow::Result<()> {
+            self.inner.ensure_status_label(l).await
+        }
+        async fn has_open_issue_with_title(&self, t: &str, l: &str) -> anyhow::Result<bool> {
+            self.inner.has_open_issue_with_title(t, l).await
+        }
+        async fn health_check(&self) -> anyhow::Result<()> {
+            self.inner.health_check().await
+        }
+        async fn is_pr_merged(&self, b: &str) -> anyhow::Result<bool> {
+            self.inner.is_pr_merged(b).await
+        }
+        async fn update_status(&self, id: &ExternalId, s: Status) -> anyhow::Result<()> {
+            self.inner.update_status(id, s).await
+        }
+    }
+
+    /// When acknowledge_mention fails for CreateMentionTask, the cursor must NOT
+    /// advance and no mention task should be created. The next tick will retry.
+    #[tokio::test]
+    async fn create_mention_task_skips_on_ack_failure() {
+        let backend: Arc<AckTrackingBackend> = AckTrackingBackend::new(true);
+        let store: Arc<TaskStore> = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        // Set an initial cursor so we can verify it wasn't advanced.
+        let initial_ts = "2026-01-01T00:00:00Z";
+        store
+            .kv_set("mentions_last_checked", initial_ts)
+            .await
+            .unwrap();
+
+        let mention = Mention {
+            id: "mention-abc".into(),
+            body: "@bot can you help?".into(),
+            author: "alice".into(),
+            created_at: "2026-01-02T00:00:00Z".into(),
+            issue_url: Some("https://api.github.com/repos/owner/repo/issues/42".into()),
+        };
+
+        let backend_trait: Arc<dyn ExternalBackend> = backend.clone();
+        let task_manager = Arc::new(TaskManager::new(backend_trait.clone()));
+
+        scan_comments(
+            &backend_trait,
+            Some(&store),
+            "owner/repo",
+            &task_manager,
+            Some(&[mention]),
+        )
+        .await
+        .unwrap();
+
+        // acknowledge_mention was called with the mention ID.
+        let calls = backend.ack_calls.lock().await;
+        assert_eq!(
+            &**calls,
+            &["mention-abc"],
+            "acknowledge_mention must be called"
+        );
+
+        // No mention task was created.
+        let all = store.list_all("owner/repo").await.unwrap();
+        assert!(
+            all.is_empty(),
+            "no task should be created when acknowledge_mention fails"
+        );
+
+        // Cursor was NOT advanced.
+        let cursor = store.kv_get("mentions_last_checked").await.unwrap();
+        assert_eq!(
+            cursor.as_deref(),
+            Some(initial_ts),
+            "cursor must not advance when acknowledge_mention fails"
+        );
+    }
+
+    /// When acknowledge_mention fails for ExecuteCommandForMention, handle_slash_command
+    /// must NOT be called and no mention task should be created.
+    #[tokio::test]
+    async fn execute_command_for_mention_skips_on_ack_failure() {
+        let backend: Arc<AckTrackingBackend> = AckTrackingBackend::new(true);
+        let store: Arc<TaskStore> = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        let initial_ts = "2026-01-01T00:00:00Z";
+        store
+            .kv_set("mentions_last_checked", initial_ts)
+            .await
+            .unwrap();
+
+        // Mention with a slash command and issue URL → ExecuteCommandForMention.
+        let mention = Mention {
+            id: "mention-def".into(),
+            body: "@bot /close".into(),
+            author: "alice".into(),
+            created_at: "2026-01-02T00:00:00Z".into(),
+            issue_url: Some("https://api.github.com/repos/owner/repo/issues/42".into()),
+        };
+
+        let backend_trait: Arc<dyn ExternalBackend> = backend.clone();
+        let task_manager = Arc::new(TaskManager::new(backend_trait.clone()));
+
+        scan_comments(
+            &backend_trait,
+            Some(&store),
+            "owner/repo",
+            &task_manager,
+            Some(&[mention]),
+        )
+        .await
+        .unwrap();
+
+        // acknowledge_mention was called.
+        let calls = backend.ack_calls.lock().await;
+        assert_eq!(&**calls, &["mention-def"]);
+
+        // No mention task was created (handle_slash_command was not called).
+        let all = store.list_all("owner/repo").await.unwrap();
+        assert!(
+            all.is_empty(),
+            "no task should be created when acknowledge_mention fails for ExecuteCommandForMention"
+        );
+
+        // Cursor was NOT advanced.
+        let cursor = store.kv_get("mentions_last_checked").await.unwrap();
+        assert_eq!(
+            cursor.as_deref(),
+            Some(initial_ts),
+            "cursor must not advance when acknowledge_mention fails for ExecuteCommandForMention"
+        );
     }
 }
