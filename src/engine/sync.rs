@@ -1260,20 +1260,30 @@ async fn scan_mentions(
             tracing::debug!(err = %e, mention_id = %mention.id, "failed to acknowledge mention");
         }
 
-        // Try slash command first
+        // Try slash command first — only if the mention has a valid issue URL.
+        // If issue_url is missing or unparsable, fall through to the generic
+        // mention-task creation path below so the mention is not silently dropped.
         if let Some(command) = parse_command(&mention.body) {
-            handle_slash_command(
-                backend,
-                store,
-                repo,
-                task_manager,
-                &gh,
-                mention,
-                &command,
-                &mut last_success_ts,
-            )
-            .await;
-            continue;
+            if mention
+                .issue_url
+                .as_deref()
+                .and_then(extract_issue_number_from_url)
+                .is_some()
+            {
+                handle_slash_command(
+                    backend,
+                    store,
+                    repo,
+                    task_manager,
+                    &gh,
+                    mention,
+                    &command,
+                    &mut last_success_ts,
+                )
+                .await;
+                continue;
+            }
+            // issue_url missing or unparsable — fall through to generic mention-task creation
         }
 
         // No command — create a mention task
