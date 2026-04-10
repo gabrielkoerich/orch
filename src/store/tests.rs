@@ -2895,11 +2895,11 @@ async fn store_tokens_accumulates_across_calls() {
     let cost1 = task.total_cost_usd;
     assert!(cost1 > 0.0);
 
-    // Second call replaces (not accumulates)
+    // Second call accumulates (not replaces)
     store.store_tokens(id, 2000, 1000, "sonnet").await.unwrap();
     let task = store.get(id).await.unwrap();
-    assert_eq!(task.input_tokens, 2000);
-    assert_eq!(task.output_tokens, 1000);
+    assert_eq!(task.input_tokens, 3000);
+    assert_eq!(task.output_tokens, 1500);
     assert!(task.total_cost_usd > cost1);
 }
 
@@ -3357,11 +3357,11 @@ async fn store_tokens_overwrites_previous_values() {
     assert_eq!(task.input_tokens, 1000);
     assert_eq!(task.output_tokens, 500);
 
-    // Second store overwrites (not accumulates)
+    // Second store accumulates (not overwrites)
     store.store_tokens(id, 2000, 1000, "sonnet").await.unwrap();
     let task = store.get(id).await.unwrap();
-    assert_eq!(task.input_tokens, 2000);
-    assert_eq!(task.output_tokens, 1000);
+    assert_eq!(task.input_tokens, 3000);
+    assert_eq!(task.output_tokens, 1500);
     assert_eq!(task.model, Some("sonnet".to_string()));
 }
 
