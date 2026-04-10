@@ -15,7 +15,11 @@ pub enum ErrorHandleResult {
     /// Task was rerouted — `run()` should record metrics then return early.
     EarlyReturn { status: String },
     /// Normal failover applied (or task marked needs_review) — proceed to cleanup + metrics.
-    Continue { status: String },
+    ///
+    /// `error` is the current run's attributed error message (e.g. "kimi timed out after 1801s").
+    /// Callers should pass this as `error_override` to `build_run_audit` so that stale
+    /// `last_error` values from a previous agent's run are not mis-attributed.
+    Continue { status: String, error: String },
 }
 
 /// Try to reroute the task to an untried free model.
@@ -328,6 +332,7 @@ pub async fn handle_error(
                 );
                 return Ok(ErrorHandleResult::Continue {
                     status: "needs_review".to_string(),
+                    error: msg,
                 });
             }
             // Apply backoff to pace retries
@@ -481,7 +486,10 @@ pub async fn handle_error(
     )
     .await;
 
-    Ok(ErrorHandleResult::Continue { status })
+    Ok(ErrorHandleResult::Continue {
+        status,
+        error: error_msg,
+    })
 }
 
 #[cfg(test)]

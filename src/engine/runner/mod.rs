@@ -634,7 +634,12 @@ impl TaskRunner {
         .await;
 
         // Handle outcome: success or error recovery
-        let (final_status, _budget_exceeded, push_failed) = match parse_result {
+        // `fallback_error` carries the attributed error message from `handle_error()` when
+        // the Continue path is taken.  It is passed as `error_override` to `build_run_audit`
+        // so that stale `last_error` values from a previous agent's run are never written
+        // into the current run's audit record (fixes misattribution bug: task_run shows
+        // agent=kimi but error="minimax timed out...").
+        let (final_status, _budget_exceeded, push_failed, fallback_error) = match parse_result {
             Ok(ref parsed) => {
                 let (status, budget_exceeded, push_failed) = response_handler::handle_success(
                     task_id,
@@ -671,7 +676,7 @@ impl TaskRunner {
                         audit,
                     }));
                 }
-                (status, budget_exceeded, push_failed)
+                (status, budget_exceeded, push_failed, None)
             }
             Err(ref agent_err) => {
                 match fallback::handle_error(
@@ -710,7 +715,9 @@ impl TaskRunner {
                             audit,
                         }));
                     }
-                    fallback::ErrorHandleResult::Continue { status } => (status, false, false),
+                    fallback::ErrorHandleResult::Continue { status, error } => {
+                        (status, false, false, Some(error))
+                    }
                 }
             }
         };
@@ -732,6 +739,9 @@ impl TaskRunner {
         }
 
         // Return final status and the session exit code so callers can record it.
+        // Use `fallback_error` as error_override when available: it carries the error message
+        // attributed to the current agent (set by handle_error), preventing stale last_error
+        // values from a prior run from contaminating this run's audit record.
         let audit = self
             .build_run_audit(RunAuditInput {
                 task_id,
@@ -740,7 +750,7 @@ impl TaskRunner {
                 raw_stdout: &session_output.raw_stdout,
                 raw_stderr: &session_output.raw_stderr,
                 started_at,
-                error_override: None,
+                error_override: fallback_error,
                 elapsed_secs: session_output.elapsed_secs,
                 push_failed,
                 budget_exceeded: _budget_exceeded,
