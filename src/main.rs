@@ -17,7 +17,7 @@ mod template;
 mod tmux;
 mod webhook_status;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 
 const MAX_SERVICE_LOG_BYTES: u64 = 2 * 1024 * 1024;
@@ -161,7 +161,8 @@ fn rotated_log_path(path: &std::path::Path, suffix: usize) -> std::path::PathBuf
 
 #[cfg(test)]
 mod tests {
-    use super::{rotate_log_if_needed, rotated_log_path, MAX_SERVICE_LOG_BYTES};
+    use super::{rotate_log_if_needed, rotated_log_path, Cli, Commands, MAX_SERVICE_LOG_BYTES};
+    use clap::Parser;
 
     #[test]
     fn rotated_log_path_appends_suffix() {
@@ -199,6 +200,42 @@ mod tests {
             std::fs::read(path.with_file_name("orch.log.3")).unwrap(),
             b"two"
         );
+    }
+
+    #[test]
+    fn stream_defaults_to_formatted_output() {
+        let cli = Cli::parse_from(["orch", "stream"]);
+        match cli.command {
+            Commands::Stream { formatted, raw, .. } => {
+                assert!(formatted);
+                assert!(!raw);
+            }
+            _ => panic!("expected stream command"),
+        }
+    }
+
+    #[test]
+    fn stream_allows_disabling_formatted_output() {
+        let cli = Cli::parse_from(["orch", "stream", "--formatted=false"]);
+        match cli.command {
+            Commands::Stream { formatted, raw, .. } => {
+                assert!(!formatted);
+                assert!(!raw);
+            }
+            _ => panic!("expected stream command"),
+        }
+    }
+
+    #[test]
+    fn stream_raw_flag_still_parses_for_backwards_compat() {
+        let cli = Cli::parse_from(["orch", "stream", "--raw"]);
+        match cli.command {
+            Commands::Stream { formatted, raw, .. } => {
+                assert!(formatted);
+                assert!(raw);
+            }
+            _ => panic!("expected stream command"),
+        }
     }
 }
 
@@ -251,8 +288,11 @@ enum Commands {
     Stream {
         /// Task ID to stream (omit to stream all running tasks)
         task_id: Option<String>,
-        /// Print raw NDJSON instead of human-readable output
-        #[arg(long)]
+        /// Format NDJSON into human-readable output (`--formatted=false` for raw)
+        #[arg(long, default_value_t = true, action = ArgAction::Set)]
+        formatted: bool,
+        /// Print raw NDJSON instead of human-readable output (deprecated: use `--formatted=false`)
+        #[arg(long, hide = true)]
         raw: bool,
     },
     /// Chat with the orch control session
@@ -758,10 +798,17 @@ async fn main() -> anyhow::Result<()> {
             let val = config::get(&key)?;
             println!("{val}");
         }
-        Commands::Stream { task_id, raw } => match task_id {
-            Some(id) => cli::stream_task(&id, raw).await?,
-            None => cli::stream_all(raw).await?,
-        },
+        Commands::Stream {
+            task_id,
+            formatted,
+            raw,
+        } => {
+            let formatted = if raw { false } else { formatted };
+            match task_id {
+                Some(id) => cli::stream_task(&id, formatted).await?,
+                None => cli::stream_all(formatted).await?,
+            }
+        }
         Commands::Chat {
             action,
             message,

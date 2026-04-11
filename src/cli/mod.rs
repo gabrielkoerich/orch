@@ -444,9 +444,9 @@ fn print_formatted(content: &str) {
 
 /// Stream live output from a running task.
 ///
-/// When `raw` is false (default), NDJSON lines are parsed and formatted into
-/// human-readable output. Pass `raw: true` to print unformatted NDJSON.
-pub async fn stream_task(task_id: &str, raw: bool) -> anyhow::Result<()> {
+/// When `formatted` is true (default), NDJSON lines are parsed and formatted
+/// into human-readable output. Pass `formatted: false` to print raw NDJSON.
+pub async fn stream_task(task_id: &str, formatted: bool) -> anyhow::Result<()> {
     let transport = Arc::new(Transport::new());
 
     let tmux = crate::tmux::TmuxManager::new();
@@ -485,10 +485,10 @@ pub async fn stream_task(task_id: &str, raw: bool) -> anyhow::Result<()> {
     loop {
         match rx.recv().await {
             Ok(chunk) => {
-                if raw {
-                    print!("{}", chunk.content);
-                } else {
+                if formatted {
                     print_formatted(&chunk.content);
+                } else {
+                    print!("{}", chunk.content);
                 }
                 std::io::Write::flush(&mut std::io::stdout())?;
 
@@ -520,9 +520,9 @@ pub async fn stream_task(task_id: &str, raw: bool) -> anyhow::Result<()> {
 /// new sessions that appear while streaming. Prefixes each line with the
 /// session name so interleaved output is distinguishable.
 ///
-/// When `raw` is false (default), NDJSON lines are formatted into human-readable
-/// output. Pass `raw: true` to print unformatted NDJSON.
-pub async fn stream_all(raw: bool) -> anyhow::Result<()> {
+/// When `formatted` is true (default), NDJSON lines are formatted into
+/// human-readable output. Pass `formatted: false` to print raw NDJSON.
+pub async fn stream_all(formatted: bool) -> anyhow::Result<()> {
     use std::collections::HashSet;
     use tokio::sync::broadcast;
 
@@ -655,17 +655,17 @@ pub async fn stream_all(raw: bool) -> anyhow::Result<()> {
         }
         // Prefix each line with the session name (strip the "orch-" prefix for brevity)
         let label = session.strip_prefix("orch-").unwrap_or(&session);
-        if raw {
-            for line in chunk.content.lines() {
-                println!("[{label}] {line}");
-            }
-        } else {
+        if formatted {
             for line in chunk.content.lines() {
                 if let Some(formatted) = ndjson::format_line(line) {
                     for fline in formatted.lines() {
                         println!("[{label}] {fline}");
                     }
                 }
+            }
+        } else {
+            for line in chunk.content.lines() {
+                println!("[{label}] {line}");
             }
         }
         // If content didn't end with newline, don't add extra one
