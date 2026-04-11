@@ -383,35 +383,45 @@ pub async fn build_full_context(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
 ) -> TaskContext {
-    let task_context = load_task_context(&task.id.0).await;
-
-    let parent_context = if let Some(b) = backend {
-        build_parent_context(task, b, store, repo).await
-    } else {
-        String::new()
-    };
-
-    let project_instructions = build_project_instructions(project_dir).await;
-    let skills_docs = build_skills_docs(selected_skills).await;
-    let repo_tree = build_repo_tree(project_dir).await;
-
-    let git_diff = if attempts > 0 {
-        build_git_diff(project_dir, default_branch).await
-    } else {
-        String::new()
-    };
-
-    let issue_comments = if let Some(b) = backend {
-        fetch_issue_comments(b, &task.id.0, 10).await
-    } else {
-        String::new()
-    };
-
-    // Load PR review context from store
-    let pr_review_context = load_pr_review_context(&task.id.0, store, repo).await;
-
-    // Always load memory from previous attempts (empty on first run, populated on retries)
-    let (_, memory) = build_memory_context(&task.id.0, store, repo).await;
+    let (
+        task_context,
+        parent_context,
+        project_instructions,
+        skills_docs,
+        repo_tree,
+        git_diff,
+        issue_comments,
+        pr_review_context,
+        (_, memory),
+    ) = tokio::join!(
+        load_task_context(&task.id.0),
+        async {
+            if let Some(b) = backend {
+                build_parent_context(task, b, store, repo).await
+            } else {
+                String::new()
+            }
+        },
+        build_project_instructions(project_dir),
+        build_skills_docs(selected_skills),
+        build_repo_tree(project_dir),
+        async {
+            if attempts > 0 {
+                build_git_diff(project_dir, default_branch).await
+            } else {
+                String::new()
+            }
+        },
+        async {
+            if let Some(b) = backend {
+                fetch_issue_comments(b, &task.id.0, 10).await
+            } else {
+                String::new()
+            }
+        },
+        load_pr_review_context(&task.id.0, store, repo),
+        build_memory_context(&task.id.0, store, repo),
+    );
 
     TaskContext {
         task_context,
