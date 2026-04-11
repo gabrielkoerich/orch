@@ -716,28 +716,24 @@ async fn parse_review_output(
 
     let raw_output =
         runner::response::read_output_file(&ctx.review_task_id, &ctx.output_file, repo).await;
-    let agent_runner = runner::agents::get_runner(&ctx.review_agent);
-    let agent_result_for_tokens = runner::agents::find_agent_result(&ctx.review_agent, &raw_output);
+    let agent_result = runner::agents::find_agent_result(&ctx.review_agent, &raw_output);
     let token_usage = RunTokenUsage {
-        input_tokens: agent_result_for_tokens
+        input_tokens: agent_result
             .as_ref()
             .and_then(|r| r.input_tokens)
             .unwrap_or(0),
-        output_tokens: agent_result_for_tokens
+        output_tokens: agent_result
             .as_ref()
             .and_then(|r| r.output_tokens)
             .unwrap_or(0),
-        total_cost_usd: agent_result_for_tokens
+        total_cost_usd: agent_result
             .as_ref()
             .and_then(|r| r.cost_usd)
             .unwrap_or(0.0),
         duration_secs: 0.0,
     };
 
-    let agent_result_is_error = agent_result_for_tokens
-        .as_ref()
-        .map(|r| r.is_error)
-        .unwrap_or(false);
+    let agent_result_is_error = agent_result.as_ref().map(|r| r.is_error).unwrap_or(false);
     let is_hard_failure = raw_output.is_empty() || agent_result_is_error;
 
     if is_hard_failure {
@@ -748,6 +744,7 @@ async fn parse_review_output(
             stderr_len = stderr.len(),
             "review agent: entering error path"
         );
+        let agent_runner = runner::agents::get_runner(&ctx.review_agent);
         let err = agent_runner.classify_error(exit_code, &raw_output, &stderr);
         record_review_agent_failure(&task.id.0, &ctx.review_agent, &err).await;
         tracing::error!(task_id = task.id.0, error = %err, "review agent failed");
@@ -766,7 +763,7 @@ async fn parse_review_output(
         return ReviewPhase::EarlyReturn(ReviewDecision::Failed(format!("agent error: {err}")));
     }
 
-    let text_for_review = agent_result_for_tokens
+    let text_for_review = agent_result
         .as_ref()
         .map(|r| r.result_text.clone())
         .filter(|text| !text.is_empty())
@@ -790,35 +787,6 @@ async fn parse_review_output(
                 );
                 response
             } else {
-                let already_errored = agent_result_for_tokens
-                    .as_ref()
-                    .map(|r| r.is_error)
-                    .unwrap_or(false);
-                if already_errored {
-                    let err = agent_runner.classify_error(exit_code, &raw_output, &stderr);
-                    record_review_agent_failure(&task.id.0, &ctx.review_agent, &err).await;
-                    tracing::error!(
-                        task_id = task.id.0,
-                        error = %err,
-                        "review agent error from per-agent extractor"
-                    );
-                    complete_review_run(
-                        store,
-                        run.run_id,
-                        Some(exit_code),
-                        &raw_output,
-                        &stderr,
-                        &text_for_review,
-                        outcome_for_agent_error(&err),
-                        &format!("per-agent error: {err}"),
-                        token_usage,
-                    )
-                    .await;
-                    return ReviewPhase::EarlyReturn(ReviewDecision::Failed(format!(
-                        "per-agent error: {err}"
-                    )));
-                }
-
                 if let Some(runner::agents::AgentError::RateLimit { message }) =
                     runner::agents::patterns::detect_rate_limit(&text_for_review)
                 {
