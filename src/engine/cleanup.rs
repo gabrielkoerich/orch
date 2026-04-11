@@ -13,7 +13,9 @@ use crate::store::TaskStatus;
 use crate::store::TaskStore;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::process::Command;
+use tokio::time::sleep;
 
 use super::sync::ReviewTaskSnapshot;
 
@@ -582,7 +584,59 @@ pub(crate) async fn remove_worktree_and_branch(
 
     match remove_result {
         Ok(output) if output.status.success() => {
-            tracing::info!(task_id, "worktree removed");
+            tracing::info!(task_id, "worktree removed (git metadata)");
+            // `git worktree remove` only removes git metadata — the physical directory
+            // with working files may remain. Clean it up with retry logic, since macOS
+            // sometimes needs a moment to release file handles from a recently-exited
+            // process. Retrying with a delay addresses "Directory not empty" errors.
+            const MAX_RETRIES: usize = 3;
+            const RETRY_DELAY_MS: u64 = 2000;
+            let mut removed = false;
+            for attempt in 0..MAX_RETRIES {
+                match tokio::fs::remove_dir_all(wt).await {
+                    Ok(()) => {
+                        removed = true;
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Directory was already removed by git or another cleanup pass.
+                        removed = true;
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                        if attempt < MAX_RETRIES - 1 {
+                            tracing::debug!(
+                                task_id,
+                                path = %wt.display(),
+                                attempt = attempt + 1,
+                                "worktree directory not empty — retrying after delay"
+                            );
+                            sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                        } else {
+                            tracing::warn!(
+                                task_id,
+                                path = %wt.display(),
+                                err = %e,
+                                "failed to remove worktree directory after {} attempts (Directory not empty)",
+                                MAX_RETRIES
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(task_id, path = %wt.display(), err = %e, "failed to remove worktree directory");
+                        break;
+                    }
+                }
+            }
+            if removed {
+                tracing::info!(task_id, path = %wt.display(), "worktree physical directory removed");
+            } else {
+                tracing::warn!(
+                    task_id,
+                    path = %wt.display(),
+                    "worktree directory still present after git worktree remove"
+                );
+            }
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1354,6 +1408,58 @@ mod tests {
             "remove_worktree_and_branch should return true when directory is gone"
         );
         assert!(!wt_dir.exists(), "worktree directory should be removed");
+    }
+
+    /// Successful worktree cleanup must still delete the local branch.
+    /// This guards against early-return regressions in `remove_worktree_and_branch`.
+    #[tokio::test]
+    async fn remove_worktree_success_still_deletes_local_branch() {
+        let Some((tmp, wt_dir)) = setup_test_repo() else {
+            eprintln!("skipping test: git not available");
+            return;
+        };
+
+        let repo_dir = tmp.path().join("repo.git");
+        let repo_dir_str = repo_dir
+            .to_str()
+            .expect("test repo path contains non-UTF-8 characters");
+        let branch = "gh-issue-42-test";
+
+        let before = std::process::Command::new("git")
+            .args([
+                "-C",
+                repo_dir_str,
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
+            .status()
+            .unwrap();
+        assert!(
+            before.success(),
+            "test setup must create local branch before cleanup"
+        );
+
+        let removed =
+            remove_worktree_and_branch("42", &wt_dir, Some(branch), &repo_dir, false).await;
+        assert!(removed, "worktree should be removed");
+
+        let after = std::process::Command::new("git")
+            .args([
+                "-C",
+                repo_dir_str,
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
+            .status()
+            .unwrap();
+        assert!(
+            !after.success(),
+            "local branch should be deleted after successful worktree cleanup"
+        );
     }
 
     /// `remove_worktree_and_branch` returns false when the worktree directory
