@@ -1038,25 +1038,25 @@ impl Router {
         // If every pool entry was pre-cooled (nothing was attempted), do not
         // immediately exhaust the pool again — fail fast and let the tick loop
         // retry on the next cycle instead of cascading failures.
+        // However, we should still try the fallback if configured.
         if !attempted_any {
             let now = chrono::Utc::now().timestamp();
             let earliest = self.earliest_pool_cooldown();
             if let Some(until) = earliest {
+                // Pool entries exist but are all cooled - we'll try fallback below
                 let remaining = until.saturating_sub(now);
                 tracing::warn!(
                     remaining_secs = remaining,
                     pool = ?pool,
-                    "all router LLM pool entries on cooldown — failing fast to let tick retry"
+                    "all router LLM pool entries on cooldown — will try fallback"
                 );
-                return Err(AllCooledError {
-                    scope: "router pool".to_string(),
-                }
-                .into());
+                // Continue to fallback logic instead of returning early
+            } else {
+                // No pool cooldowns found either — this means the pool was empty
+                // or every entry was filtered out for some other reason.
+                return Err(last_err
+                    .unwrap_or_else(|| anyhow::anyhow!("all router LLM pool entries exhausted")));
             }
-            // No pool cooldowns found either — this means the pool was empty
-            // or every entry was filtered out for some other reason.
-            return Err(last_err
-                .unwrap_or_else(|| anyhow::anyhow!("all router LLM pool entries exhausted")));
         }
 
         // All pool entries failed or were cooled — try the configured fallback
