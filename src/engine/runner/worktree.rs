@@ -44,22 +44,13 @@ pub async fn list_project_worktrees(project_dir: &Path) -> anyhow::Result<Vec<Pa
     let base = project_worktrees_dir(project_dir);
     let mut worktrees = Vec::new();
 
-    // Use async metadata to avoid blocking the reactor thread.
-    let base_is_dir = tokio::fs::metadata(&base)
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false);
-    if !base_is_dir {
+    if !tokio::fs::metadata(&base).await.is_ok() {
         return Ok(worktrees);
     }
 
     let mut entries = tokio::fs::read_dir(&base).await?;
     while let Some(entry) = entries.next_entry().await? {
-        let entry_is_dir = tokio::fs::metadata(entry.path())
-            .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
-        if entry_is_dir {
+        if entry.metadata().await.map(|m| m.is_dir()).unwrap_or(false) {
             worktrees.push(entry.path());
         }
     }
@@ -338,15 +329,16 @@ async fn resolve_branch_start_point(repo_root: &str, branch: &str, default_branc
 /// indicating the worktree metadata is broken and the directory should be cleaned up.
 pub async fn validate_worktree_gitdir(worktree_dir: &Path) -> bool {
     let git_file = worktree_dir.join(".git");
-
-    // Use async metadata to avoid blocking the reactor thread.
-    let git_file_meta = match tokio::fs::metadata(&git_file).await {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-
+    // Use tokio::fs::metadata for async-safe existence check
+    if !tokio::fs::metadata(&git_file).await.is_ok() {
+        return false;
+    }
     // In a linked worktree .git is a file; in the main repo it's a directory (always valid).
-    if git_file_meta.is_dir() {
+    if tokio::fs::metadata(&git_file)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
         return true;
     }
 
@@ -355,6 +347,7 @@ pub async fn validate_worktree_gitdir(worktree_dir: &Path) -> bool {
         Err(_) => return false,
     };
     // Expected format: "gitdir: /absolute/path/to/.git/worktrees/<name>\n"
+    // Use spawn_blocking for the final exists check on the resolved path
     if let Some(gitdir_path) = content
         .lines()
         .next()
@@ -454,20 +447,20 @@ pub async fn setup_worktree(
 
     let (branch_name_str, worktree_dir) = if let Some(ref saved) = saved_branch {
         if !saved.is_empty() {
-            // Use spawn_blocking to avoid blocking the reactor thread on a stat call.
-            let wt_exists = match &saved_worktree {
+            // Use spawn_blocking for blocking Path::exists call in async context
+            let wt = match &saved_worktree {
                 Some(wt) if !wt.is_empty() => {
                     let wt_str = wt.clone();
-                    tokio::task::spawn_blocking(move || Path::new(&wt_str).exists())
+                    let exists = tokio::task::spawn_blocking(move || Path::new(&wt_str).exists())
                         .await
-                        .unwrap_or(false)
+                        .unwrap_or(false);
+                    if exists {
+                        PathBuf::from(wt)
+                    } else {
+                        worktrees_base.join(saved)
+                    }
                 }
-                _ => false,
-            };
-            let wt = if wt_exists {
-                PathBuf::from(saved_worktree.as_ref().unwrap())
-            } else {
-                worktrees_base.join(saved)
+                _ => worktrees_base.join(saved),
             };
             (saved.clone(), wt)
         } else if let Some((parent_branch, parent_wt)) =
@@ -514,13 +507,8 @@ pub async fn setup_worktree(
     // inherit that broken state, causing all subsequent git operations to
     // fail.  Aborting here is safe: if no rebase is in progress git exits
     // with a non-zero code which we silently ignore.
-    let wt_exists_for_rebase = {
-        let wt = worktree_dir.clone();
-        tokio::task::spawn_blocking(move || wt.exists())
-            .await
-            .unwrap_or(false)
-    };
-    if wt_exists_for_rebase {
+    // Use tokio::fs for async-safe existence check
+    if tokio::fs::metadata(&worktree_dir).await.is_ok() {
         let _ = Command::new("git")
             .args(["rebase", "--abort"])
             .current_dir(&worktree_dir)
@@ -529,13 +517,7 @@ pub async fn setup_worktree(
     }
 
     // Create worktree if it doesn't exist
-    let wt_exists_for_create = {
-        let wt = worktree_dir.clone();
-        tokio::task::spawn_blocking(move || wt.exists())
-            .await
-            .unwrap_or(false)
-    };
-    if !wt_exists_for_create {
+    if tokio::fs::metadata(&worktree_dir).await.is_err() {
         tracing::info!(task_id, worktree = %worktree_dir.display(), "creating worktree");
 
         // Pull/fetch latest so the new branch starts from up-to-date main.
@@ -595,13 +577,7 @@ pub async fn setup_worktree(
             .output_with_context()
             .await?;
 
-        let worktree_created = {
-            let wt = worktree_dir.clone();
-            tokio::task::spawn_blocking(move || wt.exists())
-                .await
-                .unwrap_or(false)
-        };
-        if !output.status.success() && !worktree_created {
+        if !output.status.success() && tokio::fs::metadata(&worktree_dir).await.is_err() {
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             // Retry: prune and recreate
@@ -675,13 +651,7 @@ pub async fn setup_worktree(
                 }
             }
 
-            let worktree_created_final = {
-                let wt = worktree_dir.clone();
-                tokio::task::spawn_blocking(move || wt.exists())
-                    .await
-                    .unwrap_or(false)
-            };
-            if !worktree_created_final {
+            if tokio::fs::metadata(&worktree_dir).await.is_err() {
                 anyhow::bail!(
                     "failed to create worktree at {} for task {} (stdout: {}, stderr: {}, retry stdout: {}, retry stderr: {}, retry error: {})",
                     worktree_dir.display(),
@@ -776,12 +746,8 @@ async fn find_existing_worktree(worktrees_base: &Path, task_id: &str) -> Option<
         let name = entry.file_name().to_string_lossy().to_string();
         let matches =
             name.starts_with(&prefix_new) || legacy_prefixes.iter().any(|p| name.starts_with(p));
-        // Use async metadata to avoid blocking the reactor thread.
-        let entry_is_dir = tokio::fs::metadata(entry.path())
-            .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
-        if matches && entry_is_dir {
+        // Use async metadata for is_dir check
+        if matches && entry.metadata().await.map(|m| m.is_dir()).unwrap_or(false) {
             return Some(entry.path());
         }
     }

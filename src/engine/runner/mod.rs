@@ -1394,7 +1394,13 @@ impl TaskRunner {
                 let path = PathBuf::from(path_str);
                 // Check if this project's .orch.yml has matching repo
                 if let Ok(repo) = config::get_repo_for_project(&path) {
-                    if repo == self.repo && path.exists() {
+                    // Use thread spawn for path.exists() to avoid blocking async runtime
+                    let path_for_check = path.clone();
+                    if repo == self.repo
+                        && std::thread::spawn(move || path_for_check.exists())
+                            .join()
+                            .unwrap_or(false)
+                    {
                         return Ok(path);
                     }
                 }
@@ -1405,7 +1411,11 @@ impl TaskRunner {
         if let Ok(dir) = config::get("project_dir") {
             if !dir.is_empty() {
                 let path = PathBuf::from(&dir);
-                if path.exists() {
+                let path_for_check = path.clone();
+                if std::thread::spawn(move || path_for_check.exists())
+                    .join()
+                    .unwrap_or(false)
+                {
                     return Ok(path);
                 }
             }
@@ -1419,7 +1429,11 @@ impl TaskRunner {
                 .join("projects")
                 .join(parts[0])
                 .join(format!("{}.git", parts[1]));
-            if bare.exists() {
+            let bare_for_check = bare.clone();
+            if std::thread::spawn(move || bare_for_check.exists())
+                .join()
+                .unwrap_or(false)
+            {
                 return Ok(bare);
             }
         }
