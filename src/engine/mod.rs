@@ -486,18 +486,32 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
                             keep_remote,
                         )
                         .await;
-                        if let Ok(Some(reset_id)) =
-                            engine.store.resolve_task_id(&engine.repo, &task_id).await
-                        {
-                            let _ = engine.store.reset_to_new(reset_id).await;
+                        match engine.store.resolve_task_id(&engine.repo, &task_id).await {
+                            Ok(Some(reset_id)) => {
+                                if let Err(e) = engine.store.reset_to_new(reset_id).await {
+                                    tracing::warn!(task_id, err = %e, "failed to reset task to new after rebase failure");
+                                }
+                            }
+                            Ok(None) => {
+                                tracing::warn!(
+                                    task_id,
+                                    "task not found in store during reconciliation"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(task_id, err = %e, "failed to resolve task ID during reconciliation");
+                            }
                         }
-                        let _ = engine
+                        if let Err(e) = engine
                             .task_manager
                             .update_task_status(
                                 &ExternalId(task_id.clone()),
                                 crate::backends::Status::New,
                             )
-                            .await;
+                            .await
+                        {
+                            tracing::warn!(task_id, err = %e, "failed to update backend status during reconciliation");
+                        }
                         cleaned += 1;
                     } else {
                         valid_kept += 1;
