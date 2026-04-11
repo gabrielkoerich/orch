@@ -507,7 +507,7 @@ impl Router {
             .find(|a| !exclude.contains(&a.as_str()))
             .cloned()
             // Fallback: use the first available candidate (even if excluded)
-            .or_else(|| candidates.get(idx).cloned())?;
+            .or_else(|| candidates.first().cloned())?;
 
         self.review_rr_index = (idx + 1) % self.available_agents.len().max(1);
         Some(agent)
@@ -2334,6 +2334,45 @@ Hope that helps!"#;
         let mut seen = vec![a1, a2, a3];
         seen.sort();
         assert_eq!(seen, vec!["test_a", "test_b", "test_c"]);
+    }
+
+    #[test]
+    fn review_rr_fallback_with_cooled_agent() {
+        // Regression test for #2428: when one agent is in cooldown (candidates.len() <
+        // available_agents.len()), review_rr_index can exceed candidates.len()-1 causing
+        // candidates.get(idx) to return None even though candidates is non-empty.
+        let mut config = RouterConfig::default();
+        // Register 3 agents in model_map but only 2 will be "available" (simulate cooldown)
+        for agent in &["test_a", "test_b", "test_c"] {
+            config
+                .model_map
+                .entry("medium".to_string())
+                .or_default()
+                .insert((*agent).to_string(), vec!["test-model".to_string()]);
+        }
+        // Only 2 candidates available (test_c is in cooldown / not in available_agents)
+        let agents = vec!["test_a".to_string(), "test_b".to_string()];
+        let mut weights = AgentWeights::default();
+        weights.ensure_agents(&agents);
+        let mut router = Router {
+            config,
+            available_agents: agents,
+            weights,
+            llm_router: LlmRouter::new(),
+            rr_index: 0,
+            last_agent: None,
+            // Start index at 2, which is >= candidates.len() (2), triggering the bug
+            review_rr_index: 2,
+            router_pool: vec![],
+            pool_index: 0,
+        };
+
+        // All candidates excluded — should fall back to first candidate, not None
+        let result = router.next_round_robin_agent(&["test_a", "test_b"], "medium");
+        assert!(
+            result.is_some(),
+            "next_round_robin_agent must not return None when candidates is non-empty"
+        );
     }
 
     #[tokio::test]
