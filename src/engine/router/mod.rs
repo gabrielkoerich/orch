@@ -760,9 +760,7 @@ impl Router {
                         get_task_field_direct(store, repo, &task.id.0, "no_code_last_agent")
                             .await
                             .unwrap_or_default();
-                    let use_fallback =
-                        !no_code_agent.is_empty() && candidates.iter().any(|a| a != &no_code_agent);
-                    if use_fallback || result.agent == no_code_agent {
+                    if result.agent == no_code_agent {
                         // Pick the first agent that isn't the no-code agent.
                         let fallback_agent = candidates
                             .iter()

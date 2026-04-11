@@ -1139,6 +1139,7 @@ impl TaskStore {
             auto_unblock_last_reason = '',
             ci_recovery_count = 0,
             no_code_reroutes = 0,
+            no_code_last_agent = '',
             needs_review_refires = 0,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          WHERE id = ?",
@@ -1176,6 +1177,7 @@ impl TaskStore {
             auto_unblock_last_reason = '',
             ci_recovery_count = 0,
             no_code_reroutes = 0,
+            no_code_last_agent = '',
             needs_review_refires = 0,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          WHERE id = ?",
