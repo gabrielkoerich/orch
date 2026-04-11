@@ -341,7 +341,8 @@ pub(crate) async fn review_open_prs(
                             .ok()
                             .and_then(|s| s.parse().ok())
                     })
-                    .unwrap_or(3);
+                    .unwrap_or(3)
+                    .max(1);
 
                 // Avoid incrementing persistent reroute counters when the last
                 // store error indicates a transient GitHub 5xx/transport failure.
