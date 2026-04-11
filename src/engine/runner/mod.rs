@@ -996,18 +996,35 @@ impl TaskRunner {
         // normal dispatch, regardless of why it was rerouted.
         let is_rerouted = status == "new" || status == "routed";
         if is_rerouted {
-            if let Err(e) = store::store_set_result(
-                &self.store,
-                &self.repo,
-                task_id,
-                &[
-                    ("agent", serde_json::json!("")),
-                    ("model", serde_json::json!("")),
-                ],
-            )
-            .await
-            {
-                tracing::warn!(task_id, err = %e, "failed to clear agent/model for reroute in store");
+            // Check if silence detection (tick phase1b) already re-routed this task while
+            // the session was running. Silence detection sets status to Routed/New and
+            // stores the fallback agent — we must NOT overwrite those fields here.
+            // If the stored status is still InProgress, silence detection did not fire
+            // and we can safely clear agent/model for normal reroute.
+            let silence_already_reset = store::opt_store_get_task(&self.store, &self.repo, task_id)
+                .await
+                .map(|t| !matches!(t.status, crate::store::TaskStatus::InProgress))
+                .unwrap_or(false);
+
+            if !silence_already_reset {
+                if let Err(e) = store::store_set_result(
+                    &self.store,
+                    &self.repo,
+                    task_id,
+                    &[
+                        ("agent", serde_json::json!("")),
+                        ("model", serde_json::json!("")),
+                    ],
+                )
+                .await
+                {
+                    tracing::warn!(task_id, err = %e, "failed to clear agent/model for reroute in store");
+                }
+            } else {
+                tracing::debug!(
+                    task_id,
+                    "silence detection already set fallback agent — skipping agent/model clear"
+                );
             }
         }
         let weight_signal = if is_rerouted {
