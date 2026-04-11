@@ -98,15 +98,26 @@ In `src/engine/subscribers/review.rs`, move `set_review_session_expected(true)` 
 | 2 | Per-agent review response extraction | ❌ Blocked | Issue #2032 |
 | 3 | Fix attempt numbering for reviews | ✅ Done | `src/engine/review.rs:768` |
 | 4 | Set review_session_expected before spawn | ✅ Done | `src/engine/review.rs:172` |
-| 5 | Integration test for full review cycle | ❌ Not done | - |
+| 5 | Integration test for full review cycle | ✅ Done | `tests/integration_review.rs` + `src/engine/runner/response.rs` |
 | 6 | Startup worktree reconciliation | ✅ Done | - |
 
 ### Task 5: Integration test for full review cycle
 
-Extend `tests/integration_review.rs`:
-1. Spawn agent in tmux with review prompt
-2. Wait for completion
-3. Read output file
-4. Parse with the same code path as review.rs
-5. Verify decision is extracted
-6. Test with each agent: claude, kimi, minimax, opencode
+Implemented via fixture-based tests in `tests/integration_review.rs` and `src/engine/runner/response.rs`:
+
+**Fixture files** (`tests/fixtures/review_*.jsonl`):
+- `review_claude_approve.jsonl` — Claude approves
+- `review_claude_request_changes.jsonl` — Claude requests changes (markdown-wrapped JSON)
+- `review_claude_rate_limit.jsonl` — Claude rate limit (is_error=true envelope)
+- `review_opencode_approve.jsonl` — OpenCode approves
+- `review_opencode_request_changes.jsonl` — OpenCode requests changes
+- `review_opencode_plain_text.jsonl` — OpenCode plain text (keyword inference)
+- `review_codex_approve.jsonl` — Codex approves
+- `review_codex_request_changes.jsonl` — Codex requests changes
+- `review_codex_plain_text.jsonl` — Codex plain text (keyword inference)
+- `review_kimi_approve.jsonl` — Kimi approves
+- `review_minimax_request_changes.jsonl` — MiniMax requests changes
+
+**Tests**:
+- `tests/integration_review.rs` — 11 fixture-based tests (all run by default) + 4 `#[ignore]` end-to-end tests (manual only)
+- `src/engine/runner/response.rs` — fixture-based tests in `#[cfg(test)]` module covering full pipeline + token extraction + error propagation
