@@ -409,9 +409,12 @@ impl TaskRunner {
                 // Update GitHub status to NeedsReview so engine stops re-dispatching.
                 if let Some(b) = backend {
                     let id = crate::backends::ExternalId(task_id.to_string());
-                    let _ = b
+                    if let Err(e) = b
                         .update_status(&id, crate::backends::Status::NeedsReview)
-                        .await;
+                        .await
+                    {
+                        tracing::warn!(task_id, err = %e, "failed to update backend status to NeedsReview after max attempts");
+                    }
 
                     // If this was label-forced to a specific agent, remove the agent label
                     // so that /retry can route to a different agent instead of looping.
@@ -463,7 +466,9 @@ impl TaskRunner {
                 );
                 if let Some(b) = backend {
                     let id = crate::backends::ExternalId(task_id.to_string());
-                    let _ = b.update_status(&id, crate::backends::Status::Blocked).await;
+                    if let Err(e) = b.update_status(&id, crate::backends::Status::Blocked).await {
+                        tracing::warn!(task_id, err = %e, "failed to update backend status to Blocked after token budget exceeded");
+                    }
                 }
                 return Ok(Some(RunExecution {
                     status: "blocked".to_string(),
