@@ -272,41 +272,39 @@ pub async fn assemble_context(store: &TaskStore, session_id: &str) -> Result<Cha
             .join("\n")
     };
 
-    // 3. Service status via `brew services info orch` (best-effort, 10s timeout)
-    let service_status = {
-        let mut cmd = tokio::process::Command::new("brew");
-        cmd.args(["services", "info", "orch"]).kill_on_drop(true);
-        match timeout(SUBPROCESS_TIMEOUT, cmd.output()).await {
-            Ok(Ok(output)) if output.status.success() => {
-                String::from_utf8_lossy(&output.stdout).trim().to_string()
+    // 3-5. Run independent subprocess calls in parallel (best-effort, 10s timeout each)
+    let (service_status, task_list, job_list) = tokio::join!(
+        async {
+            let mut cmd = tokio::process::Command::new("brew");
+            cmd.args(["services", "info", "orch"]).kill_on_drop(true);
+            match timeout(SUBPROCESS_TIMEOUT, cmd.output()).await {
+                Ok(Ok(output)) if output.status.success() => {
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                }
+                _ => "(could not check service status)".to_string(),
             }
-            _ => "(could not check service status)".to_string(),
-        }
-    };
-
-    // 4. Live state via `orch task list` (best-effort, 10s timeout)
-    let task_list = {
-        let mut cmd = tokio::process::Command::new("orch");
-        cmd.args(["task", "list"]).kill_on_drop(true);
-        match timeout(SUBPROCESS_TIMEOUT, cmd.output()).await {
-            Ok(Ok(output)) if output.status.success() => {
-                String::from_utf8_lossy(&output.stdout).trim().to_string()
+        },
+        async {
+            let mut cmd = tokio::process::Command::new("orch");
+            cmd.args(["task", "list"]).kill_on_drop(true);
+            match timeout(SUBPROCESS_TIMEOUT, cmd.output()).await {
+                Ok(Ok(output)) if output.status.success() => {
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                }
+                _ => "(could not fetch live state)".to_string(),
             }
-            _ => "(could not fetch live state)".to_string(),
-        }
-    };
-
-    // 5. Scheduled jobs via `orch job list` (best-effort, 10s timeout)
-    let job_list = {
-        let mut cmd = tokio::process::Command::new("orch");
-        cmd.args(["job", "list"]).kill_on_drop(true);
-        match timeout(SUBPROCESS_TIMEOUT, cmd.output()).await {
-            Ok(Ok(output)) if output.status.success() => {
-                String::from_utf8_lossy(&output.stdout).trim().to_string()
+        },
+        async {
+            let mut cmd = tokio::process::Command::new("orch");
+            cmd.args(["job", "list"]).kill_on_drop(true);
+            match timeout(SUBPROCESS_TIMEOUT, cmd.output()).await {
+                Ok(Ok(output)) if output.status.success() => {
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                }
+                _ => "(no jobs configured)".to_string(),
             }
-            _ => "(no jobs configured)".to_string(),
-        }
-    };
+        },
+    );
 
     let version = env!("ORCH_VERSION");
     let state = format!(
