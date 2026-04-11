@@ -366,6 +366,35 @@ async fn is_bare_repo(dir: &Path) -> bool {
     matches!(output, Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
 }
 
+/// Resolve the branch and worktree directory from a parent task, if available.
+///
+/// When a child task is created from a mention on a PR, it should work on the
+/// parent task's branch so changes are committed to the existing PR rather than
+/// a new one being opened.
+async fn resolve_parent_branch(
+    store: &Option<Arc<TaskStore>>,
+    parent_id: Option<i64>,
+    worktrees_base: &Path,
+) -> Option<(String, PathBuf)> {
+    let parent_id = parent_id?;
+    let parent = store::opt_store_get_task_by_id(store, parent_id).await?;
+    if parent.branch.is_empty() {
+        return None;
+    }
+    let wt = if !parent.worktree.is_empty() && Path::new(&parent.worktree).exists() {
+        PathBuf::from(&parent.worktree)
+    } else {
+        worktrees_base.join(&parent.branch)
+    };
+    tracing::info!(
+        parent_id,
+        branch = %parent.branch,
+        worktree = %wt.display(),
+        "child task inheriting parent branch"
+    );
+    Some((parent.branch, wt))
+}
+
 /// Set up a worktree for task execution.
 ///
 /// Returns the working directory, branch name, and default branch.
@@ -384,10 +413,17 @@ pub async fn setup_worktree(
     tokio::fs::create_dir_all(&worktrees_base).await?;
 
     // Check if we have a saved branch/worktree in store
-    let (saved_branch, saved_worktree) = store::opt_store_get_task(store, repo, task_id)
-        .await
-        .map(|t| (Some(t.branch), Some(t.worktree)))
-        .unwrap_or((None, None));
+    let task_record = store::opt_store_get_task(store, repo, task_id).await;
+    let (saved_branch, saved_worktree, parent_id) = task_record
+        .as_ref()
+        .map(|t| {
+            (
+                Some(t.branch.clone()),
+                Some(t.worktree.clone()),
+                t.parent_id,
+            )
+        })
+        .unwrap_or((None, None, None));
 
     let (branch_name_str, worktree_dir) = if let Some(ref saved) = saved_branch {
         if !saved.is_empty() {
@@ -396,24 +432,36 @@ pub async fn setup_worktree(
                 _ => worktrees_base.join(saved),
             };
             (saved.clone(), wt)
+        } else if let Some((parent_branch, parent_wt)) =
+            resolve_parent_branch(store, parent_id, &worktrees_base).await
+        {
+            // Child task with no saved branch: inherit parent's branch so we
+            // commit onto the existing PR instead of opening a new one.
+            (parent_branch, parent_wt)
         } else {
             let bn = branch_name(task_id, title);
             (bn.clone(), worktrees_base.join(&bn))
         }
     } else {
-        // Check for existing worktree by prefix pattern
-        let existing = find_existing_worktree(&worktrees_base, task_id).await;
-        if let Some(existing_dir) = existing {
-            let bn = existing_dir
-                .file_name()
-                .filter(|n| !n.is_empty())
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| branch_name(task_id, title));
-            tracing::info!(task_id, worktree = %existing_dir.display(), "found existing worktree");
-            (bn, existing_dir)
+        // No store record — check parent branch, then existing worktree by prefix
+        if let Some((parent_branch, parent_wt)) =
+            resolve_parent_branch(store, parent_id, &worktrees_base).await
+        {
+            (parent_branch, parent_wt)
         } else {
-            let bn = branch_name(task_id, title);
-            (bn.clone(), worktrees_base.join(&bn))
+            let existing = find_existing_worktree(&worktrees_base, task_id).await;
+            if let Some(existing_dir) = existing {
+                let bn = existing_dir
+                    .file_name()
+                    .filter(|n| !n.is_empty())
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| branch_name(task_id, title));
+                tracing::info!(task_id, worktree = %existing_dir.display(), "found existing worktree");
+                (bn, existing_dir)
+            } else {
+                let bn = branch_name(task_id, title);
+                (bn.clone(), worktrees_base.join(&bn))
+            }
         }
     };
 
@@ -964,5 +1012,123 @@ mod tests {
             .unwrap();
 
         assert!(find_existing_worktree(dir.path(), "42").await.is_none());
+    }
+
+    // --- resolve_parent_branch tests ---
+
+    /// No store → always returns None.
+    #[tokio::test]
+    async fn resolve_parent_branch_no_store_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve_parent_branch(&None, Some(1), dir.path()).await;
+        assert!(result.is_none());
+    }
+
+    /// parent_id = None → always returns None regardless of store.
+    #[tokio::test]
+    async fn resolve_parent_branch_no_parent_id_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve_parent_branch(&None, None, dir.path()).await;
+        assert!(result.is_none());
+    }
+
+    /// Parent exists but has empty branch → returns None so child gets its own branch.
+    #[tokio::test]
+    async fn resolve_parent_branch_empty_parent_branch_returns_none() {
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("test.db");
+        let store = Arc::new(
+            crate::store::TaskStore::open_single(&db_path)
+                .await
+                .unwrap(),
+        );
+
+        // Create parent task — branch defaults to empty string
+        let parent_id = store
+            .create_internal("owner/repo", "parent task", "", "issue", "99", None)
+            .await
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store_opt = Some(store);
+        let result = resolve_parent_branch(&store_opt, Some(parent_id), dir.path()).await;
+        assert!(result.is_none());
+    }
+
+    /// Parent has a branch set → child inherits that branch and worktree path.
+    #[tokio::test]
+    async fn resolve_parent_branch_returns_parent_branch_and_worktree() {
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("test.db");
+        let store = Arc::new(
+            crate::store::TaskStore::open_single(&db_path)
+                .await
+                .unwrap(),
+        );
+
+        // Create parent task and set its branch
+        let parent_id = store
+            .create_internal("owner/repo", "parent task", "", "issue", "99", None)
+            .await
+            .unwrap();
+        store
+            .set_fields(
+                parent_id,
+                &[("branch", serde_json::json!("gh-issue-99-parent-task"))],
+            )
+            .await
+            .unwrap();
+
+        let worktrees_base = tempfile::tempdir().unwrap();
+        let store_opt = Some(store);
+        let result =
+            resolve_parent_branch(&store_opt, Some(parent_id), worktrees_base.path()).await;
+
+        let (branch, wt) = result.expect("should return parent branch");
+        assert_eq!(branch, "gh-issue-99-parent-task");
+        assert_eq!(wt, worktrees_base.path().join("gh-issue-99-parent-task"));
+    }
+
+    /// When parent has both branch and a worktree path that exists, use the worktree path.
+    #[tokio::test]
+    async fn resolve_parent_branch_prefers_existing_worktree_path() {
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("test.db");
+        let store = Arc::new(
+            crate::store::TaskStore::open_single(&db_path)
+                .await
+                .unwrap(),
+        );
+
+        let worktrees_base = tempfile::tempdir().unwrap();
+        // Create the parent worktree directory
+        let parent_wt_dir = worktrees_base.path().join("custom-worktree-path");
+        tokio::fs::create_dir_all(&parent_wt_dir).await.unwrap();
+
+        let parent_id = store
+            .create_internal("owner/repo", "parent task", "", "issue", "99", None)
+            .await
+            .unwrap();
+        store
+            .set_fields(
+                parent_id,
+                &[
+                    ("branch", serde_json::json!("gh-issue-99-parent-task")),
+                    (
+                        "worktree",
+                        serde_json::json!(parent_wt_dir.to_string_lossy().as_ref()),
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let store_opt = Some(store);
+        let result =
+            resolve_parent_branch(&store_opt, Some(parent_id), worktrees_base.path()).await;
+
+        let (branch, wt) = result.expect("should return parent branch");
+        assert_eq!(branch, "gh-issue-99-parent-task");
+        assert_eq!(wt, parent_wt_dir);
     }
 }
