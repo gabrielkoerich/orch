@@ -768,6 +768,17 @@ fn classify_opencode_message(message: &str) -> AgentError {
         };
     }
 
+    // OpenCode surfaces opaque upstream provider failures as "Provider returned error".
+    // This is a generic error from the opencode CLI when the underlying LLM API returns
+    // an error it can't classify (rate limit, auth, etc.). Classify as AgentFailed so the
+    // standard retry mechanism applies — this gives the provider/model a cooldown window
+    // before re-route, rather than immediately failing the task.
+    if lower.contains("provider returned error") {
+        return AgentError::AgentFailed {
+            message: message.to_string(),
+        };
+    }
+
     AgentError::AgentFailed {
         message: message.to_string(),
     }
@@ -1284,6 +1295,24 @@ mod tests {
     }
 
     #[test]
+    fn classify_opencode_provider_returned_error() {
+        // Issue #2478: "Provider returned error" is an opaque upstream failure from the
+        // opencode CLI. It should be classified as AgentFailed (not Unknown), triggering
+        // the standard retry cooldown rather than blocking the task.
+        let err = classify_opencode_message("Provider returned error");
+        assert!(
+            matches!(err, AgentError::AgentFailed { .. }),
+            "expected AgentFailed, got: {err:?}"
+        );
+        let err_with_detail =
+            classify_opencode_message("Provider returned error: upstream connection timed out");
+        assert!(
+            matches!(err_with_detail, AgentError::AgentFailed { .. }),
+            "expected AgentFailed, got: {err_with_detail:?}"
+        );
+    }
+
+    #[test]
     fn free_models_discovery_returns_vec() {
         // discover_free_opencode_models returns empty when cache is cold
         // and opencode isn't installed (no hardcoded fallbacks)
@@ -1344,6 +1373,18 @@ mod tests {
         if let AgentError::ModelUnavailable { model, .. } = &err {
             assert_eq!(model, "anthropic/claude-sonnet-4-6");
         }
+    }
+
+    /// Real failure: OpenCode returns "Provider returned error" as an opaque upstream
+    /// provider failure. Classified as AgentFailed so standard retry cooldown applies.
+    #[test]
+    fn fixture_opencode_provider_returned_error() {
+        let raw = include_str!("../../../../tests/fixtures/opencode_provider_returned_error.jsonl");
+        let err = runner().parse_response(raw).unwrap_err();
+        assert!(
+            matches!(err, AgentError::AgentFailed { .. }),
+            "expected AgentFailed, got: {err:?}"
+        );
     }
 
     // ── extract_text ─────────────────────────────────────────────
