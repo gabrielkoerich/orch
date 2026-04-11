@@ -794,24 +794,33 @@ pub fn discover_free_opencode_models() -> Vec<String> {
         }
     }
 
-    // Cache is cold or expired. Spawn a background thread to refresh.
+    // Cache is cold or expired. Spawn a background task on the current runtime to refresh.
     // Only one refresh runs at a time.
     if !FREE_MODELS_REFRESH_IN_PROGRESS.swap(true, Ordering::AcqRel) {
-        std::thread::spawn(|| {
+        let refresh = async {
             let _guard = scopeguard::guard((), |_| {
                 FREE_MODELS_REFRESH_IN_PROGRESS.store(false, Ordering::Release);
             });
-            // Run the async discovery in a new tokio runtime to use async sleep
-            let discovered = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt.block_on(run_opencode_models_discovery_async()),
-                Err(_) => vec![],
-            };
+            let discovered = run_opencode_models_discovery_async().await;
             let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
             let now = chrono::Utc::now().timestamp();
             if let Ok(mut guard) = cache.lock() {
                 *guard = (now, discovered);
             }
-        });
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            // Use the current tokio runtime's handle to spawn the async discovery task,
+            // avoiding the overhead of a std::thread + new tokio runtime.
+            handle.spawn(refresh);
+        } else {
+            // No tokio runtime (e.g. called from a plain unit test). Spawn a thread
+            // with a dedicated runtime — this is the fallback path.
+            std::thread::spawn(move || {
+                if let Ok(rt) = tokio::runtime::Runtime::new() {
+                    rt.block_on(refresh);
+                }
+            });
+        }
     }
 
     // Return whatever is in cache (may be empty on first call).
@@ -823,36 +832,23 @@ pub fn discover_free_opencode_models() -> Vec<String> {
 ///
 /// Called from `Router::new()` via `spawn_blocking` so the initial
 /// blocking subprocess doesn't stall the Tokio runtime.
+/// Runs `run_opencode_models_discovery_async()` in a dedicated thread with its
+/// own tokio runtime, avoiding `block_on` restrictions when called from within
+/// an existing runtime (e.g. `#[tokio::test]` or a nested runtime context).
 pub fn prime_free_model_cache() {
-    let discovered = run_opencode_models_discovery();
+    let discovered = std::thread::spawn(|| {
+        if let Ok(rt) = tokio::runtime::Runtime::new() {
+            rt.block_on(run_opencode_models_discovery_async())
+        } else {
+            vec![]
+        }
+    })
+    .join()
+    .unwrap_or_default();
     let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
     let now = chrono::Utc::now().timestamp();
     if let Ok(mut guard) = cache.lock() {
         *guard = (now, discovered);
-    }
-}
-
-/// Execute `opencode models` with a 30s timeout and return lines containing "free".
-fn run_opencode_models_discovery() -> Vec<String> {
-    // Check if we're already in a tokio runtime
-    if tokio::runtime::Handle::try_current().is_ok() {
-        // We're in a runtime, spawn a thread to run the async discovery
-        // to avoid blocking issues with single-threaded runtimes
-        std::thread::spawn(|| match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt.block_on(run_opencode_models_discovery_async()),
-            Err(_) => vec![],
-        })
-        .join()
-        .unwrap_or_default()
-    } else {
-        // Not in a runtime, create a new one in this thread
-        match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt.block_on(run_opencode_models_discovery_async()),
-            Err(e) => {
-                tracing::debug!(error = %e, "failed to create tokio runtime for opencode discovery");
-                vec![]
-            }
-        }
     }
 }
 
