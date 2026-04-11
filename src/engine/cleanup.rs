@@ -353,7 +353,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
     //   1. stored "worktree" path, if it exists on disk.
     //   2. Construct from worktrees_base + project name + branch, if it exists.
     let worktree_to_remove = if let Some(ref wt) = worktree_path {
-        if wt.exists() {
+        if tokio::fs::try_exists(wt).await.unwrap_or(false) {
             Some(wt.clone())
         } else {
             // The recorded worktree path doesn't exist — try reconstructing from branch.
@@ -364,7 +364,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
                     .unwrap_or(repo)
                     .trim_end_matches(".git");
                 let candidate = worktrees_base.join(project).join(b);
-                if candidate.exists() {
+                if tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
                     Some(candidate)
                 } else {
                     None
@@ -381,7 +381,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
             .unwrap_or(repo)
             .trim_end_matches(".git");
         let candidate = worktrees_base.join(project).join(b);
-        if candidate.exists() {
+        if tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
             Some(candidate)
         } else {
             None
@@ -599,7 +599,7 @@ pub(crate) async fn remove_worktree_and_branch(
                 );
                 if let Err(e) = tokio::fs::remove_dir_all(wt).await {
                     // Only warn if the directory actually still exists after removal attempt.
-                    if wt.exists() {
+                    if tokio::fs::try_exists(wt).await.unwrap_or(false) {
                         tracing::warn!(
                             task_id,
                             path = %wt.display(),
@@ -671,7 +671,7 @@ pub(crate) async fn remove_worktree_and_branch(
     }
 
     // Definitively check: is the worktree directory actually gone?
-    !wt.exists()
+    !tokio::fs::try_exists(wt).await.unwrap_or(false)
 }
 
 /// Delete local and remote branches for a task.
@@ -774,7 +774,7 @@ async fn worktree_age_hours(worktree: &std::path::Path) -> Option<u64> {
 pub async fn resolve_repo_root_from_worktree(wt: &std::path::Path) -> anyhow::Result<String> {
     // For worktrees, .git is a file (not a directory) containing gitdir path
     let git_file = wt.join(".git");
-    if !git_file.exists() {
+    if !tokio::fs::try_exists(&git_file).await.unwrap_or(false) {
         anyhow::bail!(".git file not found in worktree at {}", wt.display());
     }
 
@@ -818,9 +818,9 @@ pub(crate) async fn resolve_repo_root(repo: &str) -> anyhow::Result<String> {
         let path = std::path::Path::new(path_str);
         let orch_yml = path.join(".orch.yml");
         let legacy = path.join(".orchestrator.yml");
-        let config_file = if orch_yml.exists() {
+        let config_file = if tokio::fs::try_exists(&orch_yml).await.unwrap_or(false) {
             orch_yml
-        } else if legacy.exists() {
+        } else if tokio::fs::try_exists(&legacy).await.unwrap_or(false) {
             legacy
         } else {
             continue;
@@ -849,7 +849,7 @@ pub(crate) async fn resolve_repo_root(repo: &str) -> anyhow::Result<String> {
     } else {
         std::path::PathBuf::new()
     };
-    if bare.exists() {
+    if tokio::fs::try_exists(&bare).await.unwrap_or(false) {
         return Ok(bare.display().to_string());
     }
 
