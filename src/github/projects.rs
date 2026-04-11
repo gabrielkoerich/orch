@@ -299,6 +299,11 @@ impl ProjectSync {
         self.estimate_field_id.as_deref()
     }
 
+    /// Get the project ID.
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
     /// Update an item's Estimate number field on the project board.
     ///
     /// Returns the project item ID (either found or newly added).

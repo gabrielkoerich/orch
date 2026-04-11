@@ -149,10 +149,44 @@ impl ExternalBackend for GitHubBackend {
             None => return Ok(()),
         };
 
-        // Only sync if the estimate field is configured.
-        if project.estimate_field_id().is_none() {
-            return Ok(());
-        }
+        // If the estimate field ID is missing from config, try to discover it
+        // automatically and persist it for future calls. This handles the case
+        // where the service was set up before the estimate sync feature existed.
+        let project = if project.estimate_field_id().is_none() {
+            match ProjectSync::discover_fields(project.project_id()).await {
+                Ok(discovered) => {
+                    if discovered.estimate_field_id().is_some() {
+                        if let Err(e) =
+                            crate::github::projects::write_project_config(&discovered).await
+                        {
+                            tracing::warn!(
+                                err = %e,
+                                "failed to persist discovered estimate field ID to config"
+                            );
+                        } else {
+                            tracing::info!(
+                                "auto-discovered and persisted project_estimate_field_id to config"
+                            );
+                        }
+                        discovered
+                    } else {
+                        tracing::debug!(
+                            "project has no 'Estimate' number field — skipping estimate sync"
+                        );
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        err = %e,
+                        "estimate field auto-discovery failed — skipping estimate sync"
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            project
+        };
 
         // Fetch the issue to get its node_id.
         let issue = self.gh.get_issue(&self.repo, &id.0).await?;
