@@ -37,7 +37,7 @@ use crate::engine::cooldown::{
     cooldown_until, is_agent_degraded, is_agent_in_cooldown, is_model_in_cooldown,
     refresh_degraded_agents,
 };
-use crate::store::{store_log_activity, TaskStore};
+use crate::store::{get_task_field_direct, store_log_activity, TaskStore};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -529,6 +529,44 @@ impl Router {
         Some(agent)
     }
 
+    /// If the selected agent matches `no_code_last_agent` for this task, filter it
+    /// out of the candidates and return the filtered list. Used to prevent the
+    /// same agent from being selected twice in a row after a no-code failure (#2410).
+    async fn skip_no_code_agent(
+        &self,
+        store: &std::sync::Arc<TaskStore>,
+        repo: &str,
+        task_id: &str,
+        candidates: &[String],
+    ) -> Option<Vec<String>> {
+        let no_code_agent = get_task_field_direct(store, repo, task_id, "no_code_last_agent")
+            .await
+            .unwrap_or_default();
+        if no_code_agent.is_empty() || !candidates.iter().any(|a| a == &no_code_agent) {
+            return None;
+        }
+        let filtered: Vec<String> = candidates
+            .iter()
+            .filter(|a| a.as_str() != no_code_agent)
+            .cloned()
+            .collect();
+        if filtered.is_empty() {
+            tracing::warn!(
+                task_id,
+                no_code_agent = %no_code_agent,
+                "all available agents are the no-code agent — cannot skip"
+            );
+            return None;
+        }
+        tracing::info!(
+            task_id,
+            skipped = %no_code_agent,
+            remaining = ?filtered,
+            "skipping no-code agent, routing to alternative"
+        );
+        Some(filtered)
+    }
+
     /// Route a task to the best agent.
     ///
     /// Routing logic (in priority order):
@@ -632,10 +670,21 @@ impl Router {
             let complexity = strategies::extract_complexity_from_labels(&task.labels);
 
             // Check if any agents have available models for this complexity
-            let candidates = self.available_agents_for_complexity(&complexity);
+            let mut candidates = self.available_agents_for_complexity(&complexity);
             if candidates.is_empty() {
                 self.wait_for_cooldown(Some(&complexity)).await?;
                 continue;
+            }
+
+            // Skip the no-code agent if one is recorded for this task (#2410).
+            // If all available agents are filtered out, we fall through to
+            // LLM routing with no constraints (LLM will pick the same agent but
+            // the response_handler will block it immediately via same-agent check).
+            if let Some(filtered) = self
+                .skip_no_code_agent(store, repo, &task.id.0, &candidates)
+                .await
+            {
+                candidates = filtered;
             }
 
             // 2. Weighted round-robin — capacity-based selection
@@ -703,6 +752,56 @@ impl Router {
                     if candidates.is_empty() {
                         self.wait_for_cooldown(Some(&result.complexity)).await?;
                         continue;
+                    }
+
+                    // If the LLM selected the no-code agent, filter it out and
+                    // pick an alternative (#2410). Re-use the existing fallback logic.
+                    let no_code_agent =
+                        get_task_field_direct(store, repo, &task.id.0, "no_code_last_agent")
+                            .await
+                            .unwrap_or_default();
+                    if result.agent == no_code_agent {
+                        // Pick the first agent that isn't the no-code agent.
+                        let fallback_agent = candidates
+                            .iter()
+                            .find(|a| a.as_str() != no_code_agent)
+                            .cloned()
+                            .unwrap_or_else(|| candidates[0].clone());
+                        if fallback_agent != result.agent {
+                            tracing::info!(
+                                task_id = %task.id.0,
+                                llm_selected = %result.agent,
+                                skipped = %no_code_agent,
+                                fallback = %fallback_agent,
+                                "LLM selected the no-code agent — routing to alternative"
+                            );
+                        }
+                        let fallback_model = self.config.model_for_complexity(
+                            &fallback_agent,
+                            &result.complexity,
+                            &task.id.0,
+                        );
+
+                        self.set_route_attempts(&task.id.0, 0, store, repo).await;
+                        let result = RouteResult {
+                            agent: fallback_agent.clone(),
+                            model: fallback_model,
+                            complexity: result.complexity.clone(),
+                            estimate: result.estimate,
+                            reason: format!(
+                                "LLM selected no-code agent {}; routed to {}",
+                                result.agent, fallback_agent
+                            ),
+                            profile: result.profile.clone(),
+                            selected_skills: result.selected_skills.clone(),
+                            warning: Some(format!(
+                                "LLM selected no-code agent {}; used fallback {}",
+                                result.agent, fallback_agent
+                            )),
+                        };
+                        self.log_route_activity(store, repo, &task.id.0, &result, None)
+                            .await;
+                        return Ok(result);
                     }
 
                     let model_cooled = result
