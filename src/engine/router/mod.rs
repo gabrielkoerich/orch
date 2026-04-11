@@ -492,40 +492,24 @@ impl Router {
     /// Pick the next review agent, optionally excluding one (e.g. the task's original agent).
     /// Falls back to the excluded agent only if it's the only one available.
     pub fn next_round_robin_agent(&mut self, exclude: &[&str], complexity: &str) -> Option<String> {
-        if self.available_agents.is_empty() {
+        // Use available_agents_for_complexity which already filters using agent_is_routable,
+        // eliminating duplicate cooldown/degraded/model checks.
+        let candidates = self.available_agents_for_complexity(complexity);
+        if candidates.is_empty() {
             return None;
         }
         let idx = self.review_rr_index;
+        let n = candidates.len();
 
-        // Try to find an agent that isn't excluded, isn't in cooldown, isn't degraded,
-        // and has an available model for the given complexity tier.
-        let n = self.available_agents.len();
+        // Try to find an agent that isn't excluded
         let agent = (0..n)
-            .map(|offset| &self.available_agents[(idx + offset) % n])
-            .find(|a| {
-                !exclude.contains(&a.as_str())
-                    && !crate::engine::runner::response::is_agent_in_cooldown(a)
-                    && !is_agent_degraded(a)
-                    && self
-                        .config
-                        .has_available_model_for_complexity(a, complexity)
-            })
+            .map(|offset| &candidates[(idx + offset) % n])
+            .find(|a| !exclude.contains(&a.as_str()))
             .cloned()
-            // Fallback: any non-cooled, non-degraded agent with available model
-            .or_else(|| {
-                (0..n)
-                    .map(|offset| &self.available_agents[(idx + offset) % n])
-                    .find(|a| {
-                        !crate::engine::runner::response::is_agent_in_cooldown(a)
-                            && !is_agent_degraded(a)
-                            && self
-                                .config
-                                .has_available_model_for_complexity(a, complexity)
-                    })
-                    .cloned()
-            })?;
+            // Fallback: use the first available candidate (even if excluded)
+            .or_else(|| candidates.get(idx).cloned())?;
 
-        self.review_rr_index = (idx + 1) % n;
+        self.review_rr_index = (idx + 1) % self.available_agents.len().max(1);
         Some(agent)
     }
 
