@@ -57,6 +57,22 @@ pub fn retry_max_delay_ms() -> u64 {
         .unwrap_or(120_000)
 }
 
+/// Return the configured base backoff (seconds) for an agent.
+///
+/// Returns the value of `router.backoff_base.{agent}` if set, otherwise
+/// the default BACKOFF_BASE_SECS (5 minutes).
+///
+/// This lets opencode and other higher-failure-rate agents use a longer
+/// initial backoff to reduce wasted retry attempts against consistently
+/// failing models.
+pub fn get_agent_backoff_base(agent: &str) -> i64 {
+    let key = format!("router.backoff_base.{agent}");
+    crate::config::get(&key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(crate::engine::cooldown::BACKOFF_BASE_SECS)
+}
+
 /// Default agents to check in PATH.
 ///
 /// All 5 agents are listed, but availability is checked at runtime via
@@ -131,6 +147,13 @@ pub struct RouterConfig {
     /// `0.0..=1.0` where `1.0` means never skip and `0.0` skips only when
     /// weight is exactly zero (practically never). Default: `0.3`.
     pub skip_limited_threshold: f64,
+    /// Per-agent base backoff overrides (seconds). Agents not listed use the
+    /// default BACKOFF_BASE_SECS (5 minutes). Configure as `router.backoff_base.{agent}`.
+    ///
+    /// Example: set `router.backoff_base.opencode: 600` for a 10-minute base
+    /// instead of the default 5-minute base (useful for agents with higher
+    /// failure rates like opencode at 24.8%).
+    pub agent_backoff_bases: HashMap<String, i64>,
 }
 
 /// Parse an `agent:model` pool entry string, splitting on the first colon.
@@ -186,6 +209,7 @@ impl Default for RouterConfig {
             model_map: HashMap::new(),
             weighted_round_robin: false,
             skip_limited_threshold: 0.3,
+            agent_backoff_bases: HashMap::new(),
         }
     }
 }
@@ -270,6 +294,16 @@ impl RouterConfig {
             if let Ok(val) = crate::config::get(&key) {
                 if let Ok(w) = val.parse::<f64>() {
                     config.weights.insert(agent.clone(), w.max(0.0));
+                }
+            }
+        }
+
+        // Parse per-agent backoff base seconds from router.backoff_base.<agent>
+        for agent in &config.agents {
+            let key = format!("router.backoff_base.{agent}");
+            if let Ok(val) = crate::config::get(&key) {
+                if let Ok(secs) = val.parse::<i64>() {
+                    config.agent_backoff_bases.insert(agent.clone(), secs);
                 }
             }
         }

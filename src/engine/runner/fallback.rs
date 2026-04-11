@@ -280,10 +280,25 @@ pub async fn handle_error(
             response::RetryableError::Failed,
             format!("{agent_name} invalid response"),
         ),
-        agents::AgentError::AgentFailed { message } => (
-            response::RetryableError::Failed,
-            format!("{agent_name} failed: {message}"),
-        ),
+        agents::AgentError::AgentFailed { message } => {
+            // "Provider returned error" (opencode) and similar failures should cooldown
+            // the agent+model and retry without switching agents. Returning EarlyReturn
+            // with status "routed" ensures WeightSignal::RateLimited is sent (so weighted
+            // round-robin routing decays the agent's weight) and the task re-dispatches
+            // to the same agent with a different model (model selection skips cooled ones).
+            //
+            // The caller (runner/mod.rs) applies wait_for_fallback_backoff() before
+            // returning when status == "routed", so the cooldown is respected.
+            let msg = format!("{agent_name} failed: {message}");
+            if let Some(model) = model_name {
+                response::record_model_failure(agent_name, model).await;
+            }
+            crate::engine::cooldown::record_agent_failure_with_message(agent_name, &msg).await;
+            tracing::info!(task_id, agent = agent_name, model = ?model_name, "{}", msg);
+            return Ok(ErrorHandleResult::EarlyReturn {
+                status: "routed".to_string(),
+            });
+        }
         agents::AgentError::NetworkError { message } => {
             // Transient connectivity failure — retry same agent without rerouting,
             // but grow a dedicated streak counter so backoff keeps increasing.
