@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 use super::{agents, response};
 
+const PROVIDER_RETURNED_ERROR_MODEL_COOLDOWN_SECS: u64 = 4 * 60 * 60;
+
 /// How `run()` should proceed after error handling.
 pub enum ErrorHandleResult {
     /// Task was rerouted — `run()` should record metrics then return early.
@@ -114,6 +116,9 @@ pub async fn handle_error(
     // Map AgentError to RetryableError for the existing handle_failover()
     let (retryable, error_msg) = match agent_err {
         agents::AgentError::RateLimit { message, .. } => {
+            let is_provider_returned_error = message
+                .to_ascii_lowercase()
+                .contains("provider returned error");
             // Check for credit exhaustion - these require longer agent-wide cooldowns.
             // For all other rate limits, record both the agent-level and model-level
             // cooldowns immediately so the router can observe them before any concurrent
@@ -136,7 +141,17 @@ pub async fn handle_error(
                     .await;
                 // Also record the model-specific cooldown so model_for_complexity skips it.
                 if let Some(model) = model_name {
-                    response::record_model_failure(agent_name, model).await;
+                    if is_provider_returned_error {
+                        // Opaque provider failures can remain unstable for hours.
+                        // Keep this model out longer to avoid repeated wasted runs.
+                        crate::engine::cooldown::set_model_cooldown(
+                            agent_name,
+                            model,
+                            PROVIDER_RETURNED_ERROR_MODEL_COOLDOWN_SECS,
+                        );
+                    } else {
+                        response::record_model_failure(agent_name, model).await;
+                    }
                 }
             }
             (
@@ -696,6 +711,42 @@ mod tests {
         assert!(
             !crate::engine::cooldown::is_model_in_cooldown(agent, other_model),
             "other models should not be cooled by a single model's rate limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_returned_error_sets_extended_model_cooldown() {
+        let runner = MockRunner { free: vec![] };
+        let agent = "opencode";
+        let model = "opencode/nemotron-3-super-free";
+        let key = format!("{agent}:{model}");
+
+        let err = AgentError::RateLimit {
+            message: "Provider returned error".to_string(),
+        };
+
+        let _result = handle_error(
+            "test-2478-provider-cooldown",
+            &err,
+            agent,
+            &runner,
+            Some(model),
+            Some("simple"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let until = crate::engine::cooldown::cooldown_until(&key)
+            .expect("provider error should set model cooldown");
+        let remaining = until.saturating_sub(now);
+
+        assert!(
+            remaining >= PROVIDER_RETURNED_ERROR_MODEL_COOLDOWN_SECS as i64 - 5,
+            "expected ~4h model cooldown, got {remaining}s"
         );
     }
 
