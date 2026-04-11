@@ -981,7 +981,7 @@ fn push_needs_rebase(stderr: &str) -> bool {
 /// - `Err(PrCreateError)` - API error or other failure
 #[allow(clippy::too_many_arguments)]
 pub async fn create_pr_if_needed(
-    _dir: &Path,
+    dir: &Path,
     branch: &str,
     title: &str,
     summary: &str,
@@ -1041,9 +1041,36 @@ pub async fn create_pr_if_needed(
         }
     }
 
-    if !files.is_empty() {
+    // When the agent didn't self-report files, derive them from git.
+    let git_files: Vec<String>;
+    let effective_files: &[String] = if files.is_empty() {
+        match tokio::process::Command::new("git")
+            .args([
+                "diff",
+                &format!("origin/{base_branch}...HEAD"),
+                "--name-only",
+            ])
+            .current_dir(dir)
+            .output()
+            .await
+        {
+            Ok(output) if output.status.success() => {
+                git_files = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| l.to_string())
+                    .collect();
+                &git_files
+            }
+            _ => files,
+        }
+    } else {
+        files
+    };
+
+    if !effective_files.is_empty() {
         body.push_str("\n\n### Files changed\n\n");
-        for file in files {
+        for file in effective_files {
             body.push_str(&format!("- `{file}`\n"));
         }
     }
