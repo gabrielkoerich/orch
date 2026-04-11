@@ -552,6 +552,62 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
     Ok(())
 }
 
+/// Sync Fibonacci estimates stored in SQLite to the GitHub Projects board for
+/// all tasks that have a positive estimate.
+///
+/// Runs once on startup to catch tasks that were routed before the estimate
+/// sync feature was available or before `project_estimate_field_id` was
+/// configured. The underlying mutations are idempotent, so re-syncing an
+/// already-correct estimate is harmless.
+async fn reconcile_startup_estimates(project_engines: &[ProjectEngine]) {
+    use crate::backends::ExternalId;
+
+    for engine in project_engines {
+        let tasks = match engine.store.list_external_tasks_with_estimates().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(repo = %engine.repo, err = %e, "startup estimate reconciliation: store query failed");
+                continue;
+            }
+        };
+
+        if tasks.is_empty() {
+            continue;
+        }
+
+        let mut synced: u32 = 0;
+        let mut failed: u32 = 0;
+        for (external_id, estimate) in &tasks {
+            match engine
+                .backend
+                .sync_estimate_to_project(&ExternalId(external_id.clone()), *estimate)
+                .await
+            {
+                Ok(()) => synced += 1,
+                Err(e) => {
+                    tracing::debug!(
+                        repo = %engine.repo,
+                        task_id = %external_id,
+                        estimate,
+                        err = %e,
+                        "startup estimate reconciliation: sync failed"
+                    );
+                    failed += 1;
+                }
+            }
+        }
+
+        if synced > 0 || failed > 0 {
+            tracing::info!(
+                repo = %engine.repo,
+                synced,
+                failed,
+                "startup estimate reconciliation complete"
+            );
+        }
+    }
+}
+
 /// Read per-project channel configuration from `.orch.yml`.
 fn read_project_channel_config(project_dir: &std::path::Path) -> ProjectChannelConfig {
     let config_path = project_dir.join(".orch.yml");
@@ -669,6 +725,7 @@ pub async fn serve() -> anyhow::Result<()> {
     if let Err(e) = reconcile_startup_worktrees(&project_engines).await {
         tracing::warn!(err = %e, "startup worktree reconciliation failed");
     }
+    reconcile_startup_estimates(&project_engines).await;
 
     // Build ChannelRouter from global config + per-project configs
     let global_channel_config = GlobalChannelConfig {

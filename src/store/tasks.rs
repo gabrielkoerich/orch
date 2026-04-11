@@ -1230,6 +1230,32 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Return `(external_id, estimate)` for all non-internal tasks that have a
+    /// positive Fibonacci estimate stored in the database.
+    ///
+    /// Used by startup estimate reconciliation to push orch-stored estimates to
+    /// the GitHub Projects board for tasks that were routed before the estimate
+    /// sync feature was available or before `project_estimate_field_id` was
+    /// configured.
+    pub async fn list_external_tasks_with_estimates(&self) -> anyhow::Result<Vec<(String, u8)>> {
+        let rows = sqlx::query(
+            "SELECT external_id, estimate FROM tasks \
+             WHERE estimate > 0 AND external_id NOT LIKE 'internal:%'",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut result = Vec::new();
+        for row in &rows {
+            let external_id: String = row.try_get("external_id")?;
+            let estimate_raw: i64 = row.try_get("estimate")?;
+            if (1..=255).contains(&estimate_raw) {
+                result.push((external_id, estimate_raw as u8));
+            }
+        }
+        Ok(result)
+    }
+
     /// Set the Fibonacci estimate for a task (only if currently 0).
     ///
     /// Used during ingestion to populate `tasks.estimate` from GitHub Projects
