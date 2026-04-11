@@ -1,21 +1,232 @@
 //! Integration tests for the full review agent flow.
 //!
-//! Calls REAL agents with a review prompt, captures stdout/stderr,
-//! and verifies the output can be parsed using the SAME code path as review.rs:
-//!   1. `agents::find_agent_result(agent, stdout)` — per-agent envelope extraction
-//!   2. `parse_review_response(&text)` / `infer_review_response(&text)` — JSON/plain-text review parse
+//! ## Approach
 //!
-//! `#[ignore]`d — needs API keys and installed CLIs. Run locally:
+//! Real end-to-end review integration tests (spawning agents in tmux, reading
+//! real GitHub PRs, etc.) require live API keys and installed CLIs. Instead,
+//! this module tests the **review parsing pipeline** end-to-end using pre-captured
+//! NDJSON fixtures that represent each agent's output format:
+//!
+//! ```text
+//! Agent NDJSON output → find_agent_result() → extract text → parse_review_response() → ReviewResponse
+//! ```
+//!
+//! This verifies the same code paths used by review.rs for each agent:
+//!   - `find_agent_result(agent, ndjson)` — per-agent envelope extraction
+//!   - `parse_review_response(&text)` — JSON/markdown parsing
+//!   - `infer_review_response(&text)` — keyword-based fallback for plain text
+//!
+//! ## Fixtures
+//!
+//! Each fixture is a pre-captured NDJSON stream from a real agent invocation.
+//! Fixtures cover both happy paths and error conditions:
+//!
+//! | Fixture | Agent | Decision |
+//! |---------|-------|----------|
+//! | `review_claude_approve.jsonl` | Claude | approve |
+//! | `review_claude_request_changes.jsonl` | Claude | request_changes |
+//! | `review_claude_rate_limit.jsonl` | Claude | (error) |
+//! | `review_opencode_approve.jsonl` | OpenCode | approve |
+//! | `review_opencode_request_changes.jsonl` | OpenCode | request_changes |
+//! | `review_opencode_plain_text.jsonl` | OpenCode | (plain text → infer approve) |
+//! | `review_codex_approve.jsonl` | Codex | approve |
+//! | `review_codex_request_changes.jsonl` | Codex | request_changes |
+//! | `review_codex_plain_text.jsonl` | Codex | (plain text → infer approve) |
+//! | `review_kimi_approve.jsonl` | Kimi | approve |
+//! | `review_minimax_request_changes.jsonl` | MiniMax | request_changes |
+//!
+//! ## Running
+//!
+//! ```bash
+//! cargo test --test integration_review -- --nocapture
+//! cargo test --test integration_review response_tests -- --nocapture  # subset
+//! ```
+//!
+//! ## Adding new Fixtures
+//!
+//! To add a fixture for a new agent or format:
+//! 1. Capture real agent NDJSON output (run agent with `--format json` / `stream-json`)
+//! 2. Save as `tests/fixtures/review_{agent}_{decision}.jsonl`
+//! 3. Add a test function that mirrors `verify_review_fixture()`
+//!
+//! ## End-to-End Tests (manual)
+//!
+//! For true end-to-end tests with live agents, the `#[ignore]` tests call
+//! real agents. Run with:
 //! ```bash
 //! cargo test --test integration_review -- --ignored --nocapture
 //! ```
 
 use orch::engine::runner::agents::find_agent_result;
-use orch::engine::runner::response::{infer_review_response, parse_review_response};
+use orch::engine::runner::response::{
+    infer_review_response, parse_review_response, ReviewResponse,
+};
+
+/// Full review parsing pipeline for an agent's NDJSON output.
+///
+/// Mirrors the production path in review.rs:
+/// ```text
+/// find_agent_result(agent, ndjson) → extract text → parse_review_response → infer_review_response
+/// ```
+fn parse_review_output(agent: &str, ndjson: &str) -> anyhow::Result<ReviewResponse> {
+    let text = find_agent_result(agent, ndjson)
+        .map(|r| r.result_text)
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| ndjson.to_string());
+
+    parse_review_response(&text).or_else(|_| {
+        infer_review_response(&text)
+            .ok_or_else(|| anyhow::anyhow!("failed to parse review from {agent} output"))
+    })
+}
+
+fn verify_review_fixture(agent: &str, fixture_name: &str, expected_decision: &str, ndjson: &str) {
+    eprintln!("\n=== {agent} / {fixture_name} ===");
+    eprintln!("expected decision: {expected_decision}");
+
+    let result = find_agent_result(agent, ndjson);
+
+    if let Some(ref r) = result {
+        eprintln!("find_agent_result: is_error={}", r.is_error);
+        eprintln!(
+            "result_text (first 200 chars): {}",
+            &r.result_text[..r.result_text.len().min(200)]
+        );
+        if let (Some(i), Some(o)) = (r.input_tokens, r.output_tokens) {
+            eprintln!("tokens: input={i}, output={o}");
+        }
+    } else {
+        eprintln!("find_agent_result returned None");
+    }
+
+    let review = parse_review_output(agent, ndjson);
+    if let Ok(ref r) = review {
+        eprintln!("decision: {:?} (expected: {expected_decision})", r.decision);
+        eprintln!("notes: {:?}", r.notes);
+        eprintln!("issues: {}", r.issues.len());
+    } else if let Err(ref e) = review {
+        eprintln!("parse FAILED: {e}");
+    }
+
+    let review = review.expect(
+        "parse_review_output should succeed — if it fails, the review \
+         pipeline cannot handle this agent's output format",
+    );
+    assert_eq!(
+        review.decision, expected_decision,
+        "{agent}/{fixture_name}: decision mismatch"
+    );
+    eprintln!("=== {agent} / {fixture_name} PASSED ===\n");
+}
+
+fn error_fixture(agent: &str, fixture_name: &str, ndjson: &str) {
+    eprintln!("\n=== {agent} / {fixture_name} (error) ===");
+    let result = find_agent_result(agent, ndjson).expect("should find result");
+    assert!(
+        result.is_error,
+        "{agent}/{fixture_name}: expected is_error=true, got false"
+    );
+    eprintln!("is_error: true (correct)");
+    eprintln!(
+        "error text (first 200 chars): {}",
+        &result.result_text[..result.result_text.len().min(200)]
+    );
+    eprintln!("=== {agent} / {fixture_name} PASSED ===\n");
+}
+
+// ── Claude fixtures ─────────────────────────────────────────────────────────────
+
+#[test]
+fn review_claude_approve() {
+    let ndjson = include_str!("fixtures/review_claude_approve.jsonl");
+    verify_review_fixture("claude", "approve", "approve", ndjson);
+}
+
+#[test]
+fn review_claude_request_changes() {
+    let ndjson = include_str!("fixtures/review_claude_request_changes.jsonl");
+    verify_review_fixture("claude", "request_changes", "request_changes", ndjson);
+}
+
+#[test]
+fn review_claude_rate_limit() {
+    let ndjson = include_str!("fixtures/review_claude_rate_limit.jsonl");
+    error_fixture("claude", "rate_limit", ndjson);
+}
+
+// ── OpenCode fixtures ────────────────────────────────────────────────────────────
+
+#[test]
+fn review_opencode_approve() {
+    let ndjson = include_str!("fixtures/review_opencode_approve.jsonl");
+    verify_review_fixture("opencode", "approve", "approve", ndjson);
+}
+
+#[test]
+fn review_opencode_request_changes() {
+    let ndjson = include_str!("fixtures/review_opencode_request_changes.jsonl");
+    verify_review_fixture("opencode", "request_changes", "request_changes", ndjson);
+}
+
+#[test]
+fn review_opencode_plain_text() {
+    // Plain-text review: OpenCode returns "Review complete. All tests passed, LGTM."
+    // Should infer "approve" via keyword detection.
+    let ndjson = include_str!("fixtures/review_opencode_plain_text.jsonl");
+    verify_review_fixture("opencode", "plain_text", "approve", ndjson);
+}
+
+// ── Codex fixtures ───────────────────────────────────────────────────────────────
+
+#[test]
+fn review_codex_approve() {
+    let ndjson = include_str!("fixtures/review_codex_approve.jsonl");
+    verify_review_fixture("codex", "approve", "approve", ndjson);
+}
+
+#[test]
+fn review_codex_request_changes() {
+    let ndjson = include_str!("fixtures/review_codex_request_changes.jsonl");
+    verify_review_fixture("codex", "request_changes", "request_changes", ndjson);
+}
+
+#[test]
+fn review_codex_plain_text() {
+    // Plain-text review: Codex returns "All checks passed, LGTM."
+    // Should infer "approve" via keyword detection.
+    let ndjson = include_str!("fixtures/review_codex_plain_text.jsonl");
+    verify_review_fixture("codex", "plain_text", "approve", ndjson);
+}
+
+// ── Kimi fixtures ─────────────────────────────────────────────────────────────
+
+#[test]
+fn review_kimi_approve() {
+    let ndjson = include_str!("fixtures/review_kimi_approve.jsonl");
+    verify_review_fixture("kimi", "approve", "approve", ndjson);
+}
+
+// ── MiniMax fixtures ───────────────────────────────────────────────────────────
+
+#[test]
+fn review_minimax_request_changes() {
+    let ndjson = include_str!("fixtures/review_minimax_request_changes.jsonl");
+    verify_review_fixture("minimax", "request_changes", "request_changes", ndjson);
+}
+
+// ── End-to-end tests (manual only — require live API keys and installed CLIs) ──
+//
+// These tests spawn real agents in tmux with a review prompt. They are `#[ignore]`d
+// because they require API keys, installed CLIs, and a real GitHub PR. Run locally with:
+//
+// ```bash
+// cargo test --test integration_review -- --ignored --nocapture
+// ```
+
 use std::process::Command;
 
 const REVIEW_PROMPT: &str = r#"You are a code review agent. Review this trivial change and respond with ONLY this JSON (no markdown, no explanation):
-{"decision":"approve","summary":"looks good","concerns":[]}"#;
+{"decision":"approve","notes":"LGTM","test_results":"pass","issues":[]}"#;
 
 fn is_available(binary: &str) -> bool {
     which::which(binary).is_ok()

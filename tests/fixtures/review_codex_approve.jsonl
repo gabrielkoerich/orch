@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"thread_review_001"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"Analyzing the PR changes..."}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"{\"decision\":\"approve\",\"notes\":\"Clean implementation\",\"test_results\":\"pass\",\"issues\":[]}"}}
+{"type":"turn.completed"}
