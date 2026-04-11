@@ -166,13 +166,13 @@ pub async fn run(full: bool, fix: bool, dry_run: bool) -> anyhow::Result<()> {
     // Spinner: show progress on stderr while checks run (erase with \r on done).
     let spinner_running = Arc::new(AtomicBool::new(true));
     let spinner_flag = spinner_running.clone();
-    let spinner_thread = std::thread::spawn(move || {
+    let spinner_task = tokio::spawn(async move {
         let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let mut i = 0usize;
         while spinner_flag.load(Ordering::Relaxed) {
             eprint!("\r{} Running orch doctor…", frames[i % frames.len()]);
             let _ = std::io::stderr().flush();
-            std::thread::sleep(std::time::Duration::from_millis(80));
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
             i += 1;
         }
         eprint!("\r");
@@ -182,7 +182,7 @@ pub async fn run(full: bool, fix: bool, dry_run: bool) -> anyhow::Result<()> {
     let result = run_checks(full, fix, dry_run, &repos, &store, &gh, &tmux).await;
 
     spinner_running.store(false, Ordering::Relaxed);
-    let _ = spinner_thread.join();
+    let _ = spinner_task.await;
 
     result
 }
