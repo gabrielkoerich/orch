@@ -583,7 +583,16 @@ impl Router {
                         None
                     }
                 }
-                _ => None,
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        repo,
+                        task_id = %task.id.0,
+                        err = %e,
+                        "failed to fetch stored agent, falling back to label/LLM routing"
+                    );
+                    None
+                }
             };
 
             // 2. Fall back to explicit agent label
