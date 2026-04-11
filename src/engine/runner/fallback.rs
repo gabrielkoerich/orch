@@ -374,29 +374,24 @@ pub async fn handle_error(
                 }
                 // Before falling through to handle_failover() (which tries claude/codex),
                 // check whether this agent has any free models that haven't been tried yet.
-                // Only do this for simple-complexity tasks: free models are the right tier
-                // for simple tasks.  For medium/complex tasks, fall through to
-                // handle_failover() so the next agent is chosen at the same complexity
-                // level (e.g. claude/sonnet or codex/gpt-5.2) instead of a weaker model.
-                let is_simple = matches!(complexity, None | Some("simple"));
+                // Silent exit-0 is usually model/provider-specific; retrying other free
+                // models first avoids wasting paid claude/codex failovers.
                 let current = model_name.unwrap_or("");
-                if is_simple {
-                    if let Some(result) = try_free_model_reroute(
-                        task_id,
-                        agent_name,
-                        agent_runner,
-                        &[current],
-                        true,
-                        Some("opencode"),
-                        true,
-                        "silent exit 0, retrying with free model",
-                        store,
-                        repo,
-                    )
-                    .await
-                    {
-                        return Ok(result);
-                    }
+                if let Some(result) = try_free_model_reroute(
+                    task_id,
+                    agent_name,
+                    agent_runner,
+                    &[current],
+                    true,
+                    Some("opencode"),
+                    true,
+                    "silent exit 0, retrying with free model",
+                    store,
+                    repo,
+                )
+                .await
+                {
+                    return Ok(result);
                 }
             }
             (
@@ -764,7 +759,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn silent_exit0_skips_free_model_for_medium_complexity() {
+    async fn silent_exit0_retries_free_model_for_medium_complexity() {
         let runner = MockRunner {
             free: vec!["opencode/mimo-v2-omni-free".to_string()],
         };
@@ -773,7 +768,7 @@ mod tests {
             message: String::new(),
         };
 
-        // complexity=medium → skip free model retry, fall through to agent failover
+        // complexity=medium → still retry free model before cross-agent failover
         let result = handle_error(
             "test-1195-medium",
             &err,
@@ -789,13 +784,13 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(result, ErrorHandleResult::Continue { .. }),
-            "expected Continue for medium complexity — should fall through to agent failover, not retry with free model"
+            matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "routed"),
+            "expected EarlyReturn{{status: routed}} for medium complexity — free model should be tried before failover"
         );
     }
 
     #[tokio::test]
-    async fn silent_exit0_skips_free_model_for_complex_complexity() {
+    async fn silent_exit0_retries_free_model_for_complex_complexity() {
         let runner = MockRunner {
             free: vec!["opencode/mimo-v2-omni-free".to_string()],
         };
@@ -804,7 +799,7 @@ mod tests {
             message: String::new(),
         };
 
-        // complexity=complex → skip free model retry, fall through to agent failover
+        // complexity=complex → still retry free model before cross-agent failover
         let result = handle_error(
             "test-1195-complex",
             &err,
@@ -820,8 +815,8 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(result, ErrorHandleResult::Continue { .. }),
-            "expected Continue for complex complexity — should fall through to agent failover, not retry with free model"
+            matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "routed"),
+            "expected EarlyReturn{{status: routed}} for complex complexity — free model should be tried before failover"
         );
     }
 
