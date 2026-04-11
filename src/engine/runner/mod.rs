@@ -1045,9 +1045,12 @@ impl TaskRunner {
             if has_rate_limit_error {
                 // Record in the metrics store so the router's health check detects it.
                 if let Some(ref store) = self.store {
-                    let _ = store
+                    if let Err(e) = store
                         .record_rate_limit(&agent_name, "rate_limit", Some(task_id))
-                        .await;
+                        .await
+                    {
+                        tracing::warn!(task_id, agent = %agent_name, err = %e, "failed to persist rate_limit event — router health check may miss this signal");
+                    }
                 }
                 // Also record via the cooldown system so model_for_complexity() skips
                 // this model.  Use the stored last_error text as the message since

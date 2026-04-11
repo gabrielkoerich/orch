@@ -428,9 +428,12 @@ pub async fn handle_error(
             _ => "error",
         };
         if let Some(ref s) = store {
-            let _ = s
+            if let Err(e) = s
                 .record_rate_limit(agent_name, error_type_str, Some(task_id))
-                .await;
+                .await
+            {
+                tracing::warn!(task_id, agent = %agent_name, err = %e, "failed to persist rate_limit event — router health check may miss this signal");
+            }
         }
     }
 
