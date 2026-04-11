@@ -1501,7 +1501,8 @@ pub(crate) async fn handle_review_changes(
             )
             .await
             {
-                tracing::warn!(task_id = task.id.0, err = %e, "store write failed");
+                tracing::warn!(task_id = task.id.0, err = %e, "model update failed — will retry on next tick");
+                return Ok(());
             }
 
             let fields = [
