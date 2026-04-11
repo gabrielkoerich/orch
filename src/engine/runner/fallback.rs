@@ -24,7 +24,7 @@ pub enum ErrorHandleResult {
 
 /// Try to reroute the task to an untried free model.
 ///
-/// Returns `Some(EarlyReturn { status: "routed" })` if a free model was found and the
+/// Returns `Some(EarlyReturn { status: "new" })` if a free model was found and the
 /// task was rerouted, `None` otherwise (caller should fall through to normal failover).
 ///
 /// - `exclude_models`: models to skip in addition to already-tried ones
@@ -83,7 +83,7 @@ async fn try_free_model_reroute(
         response::wait_for_fallback_backoff(task_id, store, repo).await;
     }
     Some(ErrorHandleResult::EarlyReturn {
-        status: "routed".to_string(),
+        status: "new".to_string(),
     })
 }
 
@@ -722,8 +722,8 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "routed"),
-            "expected EarlyReturn{{status: routed}} for simple complexity — free model should be tried first"
+            matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "new"),
+            "expected EarlyReturn{{status: new}} for simple complexity — free model should be tried first"
         );
     }
 
@@ -753,8 +753,8 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "routed"),
-            "expected EarlyReturn{{status: routed}} for unknown complexity — free model should be tried first"
+            matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "new"),
+            "expected EarlyReturn{{status: new}} for unknown complexity — free model should be tried first"
         );
     }
 
@@ -784,8 +784,8 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "routed"),
-            "expected EarlyReturn{{status: routed}} for medium complexity — free model should be tried before failover"
+            matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "new"),
+            "expected EarlyReturn{{status: new}} for medium complexity — free model should be tried before failover"
         );
     }
 
@@ -815,8 +815,8 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "routed"),
-            "expected EarlyReturn{{status: routed}} for complex complexity — free model should be tried before failover"
+            matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "new"),
+            "expected EarlyReturn{{status: new}} for complex complexity — free model should be tried before failover"
         );
     }
 
@@ -877,8 +877,8 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "routed"),
-            "expected EarlyReturn{{status: routed}} — store_set_result with None store should not prevent reroute"
+            matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "new"),
+            "expected EarlyReturn{{status: new}} — store_set_result with None store should not prevent reroute"
         );
     }
 
