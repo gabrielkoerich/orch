@@ -509,7 +509,7 @@ impl Router {
             // Fallback: use the first available candidate (even if excluded)
             .or_else(|| candidates.first().cloned())?;
 
-        self.review_rr_index = (idx + 1) % self.available_agents.len().max(1);
+        self.review_rr_index = (idx + 1) % candidates.len().max(1);
         Some(agent)
     }
 
@@ -2382,6 +2382,72 @@ Hope that helps!"#;
             result.is_some(),
             "next_round_robin_agent must not return None when candidates is non-empty"
         );
+    }
+
+    #[test]
+    fn review_rr_index_uses_candidates_len_not_available_len() {
+        // Regression test for #2449: review_rr_index must advance modulo candidates.len(),
+        // not available_agents.len(). When an agent has no model for the complexity,
+        // candidates.len() < available_agents.len() and the old code produced a drifting
+        // index that caused non-uniform distribution.
+        let mut config = RouterConfig::default();
+        // Only register models for test_a and test_b — test_c has no model, so it is
+        // filtered out by has_available_model_for_complexity → candidates.len() == 2.
+        for agent in &["test_a", "test_b"] {
+            config
+                .model_map
+                .entry("medium".to_string())
+                .or_default()
+                .insert((*agent).to_string(), vec!["test-model".to_string()]);
+        }
+        let agents = vec![
+            "test_a".to_string(),
+            "test_b".to_string(),
+            "test_c".to_string(), // available but no model → filtered out of candidates
+        ];
+        let mut weights = AgentWeights::default();
+        weights.ensure_agents(&agents);
+        let mut router = Router {
+            config,
+            available_agents: agents,
+            weights,
+            llm_router: LlmRouter::new(),
+            rr_index: 0,
+            last_agent: None,
+            review_rr_index: 0,
+            router_pool: vec![],
+            pool_index: 0,
+        };
+
+        // With the bug: index advances modulo 3 (available_agents.len()), so the
+        // sequence would be idx=0→1, idx=1→2, idx=2→0, meaning selection is
+        // candidates[0%2]=test_a, candidates[1%2]=test_b, candidates[2%2]=test_a —
+        // looks uniform by accident, but adding a 4th available agent breaks it.
+        //
+        // The fix: index advances modulo 2 (candidates.len()), giving a clean 0→1→0→1
+        // cycle. Verify this by checking review_rr_index after each call.
+
+        let r1 = router.next_round_robin_agent(&[], "medium").unwrap();
+        assert_eq!(
+            router.review_rr_index, 1,
+            "index should be 1 after first call"
+        );
+
+        let r2 = router.next_round_robin_agent(&[], "medium").unwrap();
+        assert_eq!(
+            router.review_rr_index, 0,
+            "index should wrap to 0 after second call"
+        );
+
+        let r3 = router.next_round_robin_agent(&[], "medium").unwrap();
+        assert_eq!(
+            router.review_rr_index, 1,
+            "index should be 1 after third call"
+        );
+
+        // Agents must alternate uniformly
+        assert_ne!(r1, r2, "consecutive calls should select different agents");
+        assert_eq!(r1, r3, "third call should match first (clean cycle)");
     }
 
     #[tokio::test]
