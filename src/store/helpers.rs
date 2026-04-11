@@ -286,6 +286,34 @@ pub async fn store_increment(
     }
 }
 
+/// Read a specific string field from a task record.
+pub async fn get_task_field(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+    field: &str,
+) -> Option<String> {
+    let task = opt_store_get_task(store, repo, task_id).await?;
+    match field {
+        "no_code_last_agent" => Some(task.no_code_last_agent),
+        _ => {
+            tracing::warn!(task_id, field, "get_task_field: unknown field");
+            None
+        }
+    }
+}
+
+/// Read a specific string field from a task record (store always available).
+pub async fn get_task_field_direct(
+    store: &Arc<TaskStore>,
+    repo: &str,
+    task_id: &str,
+    field: &str,
+) -> Option<String> {
+    let store_opt: &Option<Arc<TaskStore>> = &Some(store.clone());
+    get_task_field(store_opt, repo, task_id, field).await
+}
+
 /// Reset all task counters in the task store.
 pub async fn store_reset_counters(store: &Option<Arc<TaskStore>>, repo: &str, task_id: &str) {
     if let Some(ref store) = store {

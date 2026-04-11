@@ -20,10 +20,10 @@ pub(crate) const TASK_COLS: &str = "id, external_id, repo, origin, title, body, 
     model_reroute_chain, limit_reroute_chain, budget_warning, budget_exceeded, \
     memory, delegations, created_at, updated_at, review_session_expected, \
      review_invocations, needs_review_refires, push_failures, auto_unblock_count, auto_unblock_last_at, \
-     ci_recovery_count, auto_unblock_last_reason, no_code_reroutes, network_retries";
+     ci_recovery_count, auto_unblock_last_reason, no_code_reroutes, network_retries, no_code_last_agent";
 
 /// Number of columns in TASK_COLS (used for diagnostic verification).
-pub(crate) const TASK_COLS_COUNT: usize = 61;
+pub(crate) const TASK_COLS_COUNT: usize = 62;
 
 /// Explicit column list for `SELECT` queries on the `task_runs` table.
 const TASK_RUN_COLS: &str =
@@ -86,6 +86,7 @@ const ALLOWED_FIELDS: &[&str] = &[
     "ci_recovery_count",
     "no_code_reroutes",
     "network_retries",
+    "no_code_last_agent",
 ];
 
 /// Allowlist of fields that can be incremented via `increment` and `batch_increment`.
@@ -228,6 +229,8 @@ pub struct Task {
 
     // Done-without-PR circuit breaker
     pub no_code_reroutes: i32,
+    /// Which agent produced the last no-code failure (used to detect same-agent loops).
+    pub no_code_last_agent: String,
 
     // Timestamps
     pub created_at: String,
@@ -1964,6 +1967,9 @@ impl TaskStore {
                 .unwrap_or_default(),
             ci_recovery_count: row.try_get::<i32, _>("ci_recovery_count").unwrap_or(0),
             no_code_reroutes: row.try_get::<i32, _>("no_code_reroutes").unwrap_or(0),
+            no_code_last_agent: row
+                .try_get::<String, _>("no_code_last_agent")
+                .unwrap_or_default(),
             created_at: row.try_get::<String, _>("created_at").unwrap_or_default(),
             updated_at: row.try_get::<String, _>("updated_at").unwrap_or_default(),
         })

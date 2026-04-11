@@ -794,6 +794,7 @@ async fn apply_post_decision_effects(
     is_external: bool,
     no_code_reroutes: u64,
     max_reroutes: u32,
+    agent_name: &str,
 ) {
     if push_state.is_workflow_scope_failure {
         // Non-retryable — block immediately with actionable guidance.
@@ -866,29 +867,70 @@ async fn apply_post_decision_effects(
             "agent done, commits pushed, but PR creation failed — re-dispatching as routed"
         );
     } else if is_no_code_reroute {
-        if final_status == "blocked" {
+        // Detect same-agent loop: if the router selects the same agent that just
+        // produced a no-code result, block immediately instead of letting it
+        // run again into the same unchanged worktree state (#2410).
+        let prev_no_code_agent = ctx
+            .get_task()
+            .await
+            .map(|t| t.no_code_last_agent.clone())
+            .unwrap_or_default();
+
+        let is_same_agent = !prev_no_code_agent.is_empty() && prev_no_code_agent == agent_name;
+
+        // Block if we've hit max reroutes OR if the same agent would be selected again.
+        let should_block = final_status == "blocked" || is_same_agent;
+
+        if should_block {
             tracing::error!(
                 task_id = ctx.task_id,
                 no_code_reroutes,
                 max_reroutes,
-                "reached max reroute attempts for no-code-result on external task — blocking for human review"
+                is_same_agent,
+                agent = %agent_name,
+                "blocking no-code reroute: {}",
+                if is_same_agent {
+                    format!(
+                        "same agent {} would be selected again (prev: {prev_no_code_agent})",
+                        agent_name
+                    )
+                } else {
+                    format!(
+                        "reached max reroute attempts ({}/{}) for no-code-result",
+                        no_code_reroutes, max_reroutes
+                    )
+                }
             );
         }
-        // Clear agent/model and record an explanatory last_error.
-        let msg = if final_status == "blocked" {
-            format!(
-                "agent completed without code changes after {}/{} reroute attempts on external task requiring PR",
-                no_code_reroutes, max_reroutes
-            )
+
+        let msg = if should_block {
+            if is_same_agent {
+                format!(
+                    "agent {} completed without code changes twice — same-agent loop detected, blocking for human review",
+                    agent_name
+                )
+            } else {
+                format!(
+                    "agent completed without code changes after {}/{} reroute attempts on external task requiring PR",
+                    no_code_reroutes, max_reroutes
+                )
+            }
         } else {
             "agent completed without code changes on external task requiring PR".to_string()
         };
-        ctx.set(&[
-            ("agent", serde_json::json!(null)),
-            ("model", serde_json::json!(null)),
-            ("last_error", serde_json::json!(msg)),
-        ])
-        .await;
+
+        let mut fields: Vec<(&str, serde_json::Value)> =
+            vec![("last_error", serde_json::json!(msg))];
+
+        // Always record which agent produced this no-code result so the router can
+        // skip it on the next attempt. Also clear agent/model to force re-routing
+        // (the router will pick a fresh agent, possibly the same one, which will be
+        // caught by the same-agent check on the next round).
+        fields.push(("no_code_last_agent", serde_json::json!(agent_name)));
+        fields.push(("agent", serde_json::json!(null)));
+        fields.push(("model", serde_json::json!(null)));
+
+        ctx.set(&fields).await;
     } else if resp_status == "done" && !has_pr && is_external {
         // External task with non-code labels (e.g. documentation, research) —
         // allowed to be marked done without a PR.
@@ -1173,6 +1215,7 @@ pub async fn handle_success(
         is_external,
         no_code_reroutes,
         max_reroutes,
+        agent_name,
     )
     .await;
 
