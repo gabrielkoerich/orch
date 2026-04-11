@@ -426,14 +426,29 @@ pub(crate) async fn review_open_prs(
 
     let pr_numbers: Vec<u64> = tasks_with_pr.iter().filter_map(|t| t.pr_number).collect();
 
+    let batch_fail_key = format!("review_batch_fail:{repo}");
     let batch = match gh.batch_fetch_pr_review_data(repo, &pr_numbers).await {
-        Ok(data) => data,
+        Ok(data) => {
+            store.kv_delete(&batch_fail_key).await.ok();
+            data
+        }
         Err(e) => {
-            tracing::warn!(
-                err = %e,
-                pr_count = pr_numbers.len(),
-                "batch PR review fetch failed, skipping this tick"
-            );
+            let fails = store.kv_increment(&batch_fail_key).await.unwrap_or(1);
+            if fails >= 10 {
+                tracing::error!(
+                    err = %e,
+                    consecutive_failures = fails,
+                    pr_count = pr_numbers.len(),
+                    "review polling degraded — batch fetch failing repeatedly"
+                );
+            } else {
+                tracing::warn!(
+                    err = %e,
+                    consecutive_failures = fails,
+                    pr_count = pr_numbers.len(),
+                    "batch PR review fetch failed, skipping this tick"
+                );
+            }
             return Ok(());
         }
     };
