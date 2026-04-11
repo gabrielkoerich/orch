@@ -44,7 +44,7 @@ pub async fn list_project_worktrees(project_dir: &Path) -> anyhow::Result<Vec<Pa
     let base = project_worktrees_dir(project_dir);
     let mut worktrees = Vec::new();
 
-    if !tokio::fs::metadata(&base).await.is_ok() {
+    if tokio::fs::metadata(&base).await.is_err() {
         return Ok(worktrees);
     }
 
@@ -330,7 +330,7 @@ async fn resolve_branch_start_point(repo_root: &str, branch: &str, default_branc
 pub async fn validate_worktree_gitdir(worktree_dir: &Path) -> bool {
     let git_file = worktree_dir.join(".git");
     // Use tokio::fs::metadata for async-safe existence check
-    if !tokio::fs::metadata(&git_file).await.is_ok() {
+    if tokio::fs::metadata(&git_file).await.is_err() {
         return false;
     }
     // In a linked worktree .git is a file; in the main repo it's a directory (always valid).
@@ -1163,5 +1163,58 @@ mod tests {
         let (branch, wt) = result.expect("should return parent branch");
         assert_eq!(branch, "gh-issue-99-parent-task");
         assert_eq!(wt, parent_wt_dir);
+    }
+
+    /// Regression test: concurrent calls to list_project_worktrees and
+    /// validate_worktree_gitdir should not starve the Tokio worker thread
+    /// pool. This was broken by blocking Path::exists/is_dir calls in async
+    /// functions (issue #2467).
+    #[tokio::test]
+    async fn concurrent_worktree_checks_no_starvation() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let worktrees_base = temp_dir.path().join("worktrees");
+        tokio::fs::create_dir_all(&worktrees_base).await.unwrap();
+
+        // Create a fake worktree with valid gitdir
+        let wt_dir = worktrees_base.join("gh-issue-123-test");
+        tokio::fs::create_dir_all(&wt_dir).await.unwrap();
+        // Create .git as a file pointing to a real directory (worktree link)
+        let gitdir_target = temp_dir
+            .path()
+            .join(".git")
+            .join("worktrees")
+            .join("gh-issue-123-test");
+        tokio::fs::create_dir_all(&gitdir_target).await.unwrap();
+        let git_file = wt_dir.join(".git");
+        tokio::fs::write(&git_file, format!("gitdir: {}\n", gitdir_target.display()))
+            .await
+            .unwrap();
+
+        // Spawn many concurrent tasks - if any use blocking calls, they'll
+        // block the worker thread and cause timeout or deadlock.
+        let handles: Vec<_> = (0..20)
+            .map(|i| {
+                let wb = worktrees_base.clone();
+                let wd = wt_dir.clone();
+                tokio::spawn(async move {
+                    if i % 2 == 0 {
+                        list_project_worktrees(&wb).await.ok();
+                    } else {
+                        validate_worktree_gitdir(&wd).await;
+                    }
+                })
+            })
+            .collect();
+
+        // Wait with timeout to detect starvation
+        let results = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            futures::future::join_all(handles).await
+        })
+        .await;
+
+        assert!(
+            results.is_ok(),
+            "concurrent worktree checks timed out (starvation?)"
+        );
     }
 }
