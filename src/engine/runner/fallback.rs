@@ -280,10 +280,20 @@ pub async fn handle_error(
             response::RetryableError::Failed,
             format!("{agent_name} invalid response"),
         ),
-        agents::AgentError::AgentFailed { message } => (
-            response::RetryableError::Failed,
-            format!("{agent_name} failed: {message}"),
-        ),
+        agents::AgentError::AgentFailed { message } => {
+            // "Provider returned error" (opencode) and similar upstream failures.
+            // Record model+agent cooldowns so the router skips this model on retry,
+            // then route through handle_failover() to get proper reroute-chain
+            // tracking, exhaustion checks, and fallback pacing.
+            if let Some(model) = model_name {
+                response::record_model_failure(agent_name, model).await;
+            }
+            crate::engine::cooldown::record_agent_failure_with_message(agent_name, message).await;
+            (
+                response::RetryableError::Failed,
+                format!("{agent_name} failed: {message}"),
+            )
+        }
         agents::AgentError::NetworkError { message } => {
             // Transient connectivity failure — retry same agent without rerouting,
             // but grow a dedicated streak counter so backoff keeps increasing.

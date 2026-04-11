@@ -271,8 +271,9 @@ pub async fn record_agent_failure_with_message(agent_name: &str, error_message: 
 
     let store_opt = cooldown_store().lock().ok().and_then(|g| g.clone());
     let count = read_and_increment_failure_count(&store_opt, agent_name).await;
-    let cooldown_until = chrono::Utc::now().timestamp()
-        + compute_backoff(count, BACKOFF_BASE_SECS, BACKOFF_MAX_SECS);
+    let base = crate::engine::router::config::get_agent_backoff_base(agent_name);
+    let cooldown_until =
+        chrono::Utc::now().timestamp() + compute_backoff(count, base, BACKOFF_MAX_SECS);
     set_cooldown_async(agent_name, cooldown_until, "agent_error").await;
 }
 
@@ -399,8 +400,9 @@ pub async fn record_model_failure(agent_name: &str, model: &str) {
     let key = format!("{agent_name}:{model}");
     let store_opt = cooldown_store().lock().ok().and_then(|g| g.clone());
     let count = read_and_increment_failure_count(&store_opt, &key).await;
-    let cooldown_until = chrono::Utc::now().timestamp()
-        + compute_backoff(count, BACKOFF_BASE_SECS, BACKOFF_MAX_SECS);
+    let base = crate::engine::router::config::get_agent_backoff_base(agent_name);
+    let cooldown_until =
+        chrono::Utc::now().timestamp() + compute_backoff(count, base, BACKOFF_MAX_SECS);
     set_cooldown_async(&key, cooldown_until, "model_error").await;
 }
 
