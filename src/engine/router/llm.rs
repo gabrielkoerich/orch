@@ -11,12 +11,18 @@
 //! - Sanity-checking the routing decision
 //! - Loading and caching the skills catalog from disk
 
+use super::{AgentProfile, RouteResult, RouterConfig};
 use crate::backends::ExternalTask;
 use crate::engine::runner::agents::{self, claude, opencode, AgentError};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::{AgentProfile, RouteResult, RouterConfig};
+/// Prefix used to identify router LLM timeout errors in error messages.
+/// This lets callers (route_with_llm in mod.rs) distinguish timeouts from
+/// other failures without changing the error type hierarchy.
+/// Format: "router LLM timed out after {secs}s" — this prefix makes it easy
+/// to detect by string prefix without full pattern matching.
+pub(super) const TIMEOUT_PREFIX: &str = "router LLM timed out after ";
 use serde::Deserialize;
 
 /// Response from the LLM router.
@@ -775,7 +781,7 @@ impl LlmRouter {
                 anyhow::bail!("router LLM failed: {error_msg}");
             }
             Err(DirectCommandError::Timeout { secs }) => {
-                anyhow::bail!("router LLM timed out after {secs}s");
+                anyhow::bail!("{TIMEOUT_PREFIX}{secs}");
             }
             Err(DirectCommandError::EmptyResponse { stderr }) => {
                 tracing::warn!(stderr = %stderr, "router LLM returned empty stdout");
