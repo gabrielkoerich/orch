@@ -1990,7 +1990,9 @@ async fn ensure_pr_exists(
                 } else {
                     // Clear agent/model so router picks a different one and note the
                     // fact that this attempt produced no PR or code changes.
-                    store_set(
+                    // Use store_set_result so we only transition status when the
+                    // store write succeeds — partial failure would orphan the task.
+                    if let Err(e) = store_set_result(
                         &Some(Arc::clone(store)),
                         repo,
                         &task.id.0,
@@ -2003,8 +2005,13 @@ async fn ensure_pr_exists(
                             ),
                         ],
                     )
-                    .await;
-                    if let Err(e) = task_manager.update_task_status(&task.id, Status::New).await {
+                    .await
+                    {
+                        tracing::error!(task_id = task.id.0, err = %e, "failed to clear agent/model for reroute — skipping status transition");
+                        // Don't update status — task stays in InReview and will be retried next tick
+                    } else if let Err(e) =
+                        task_manager.update_task_status(&task.id, Status::New).await
+                    {
                         tracing::error!(task_id = task.id.0, err = %e, "update_task_status(New) failed — task may be stuck in InReview");
                     }
                 }
