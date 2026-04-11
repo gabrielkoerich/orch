@@ -386,7 +386,10 @@ pub fn parse_since_duration(s: &str) -> anyhow::Result<String> {
         'd' => n.checked_mul(86_400),
         'h' => n.checked_mul(3_600),
         'm' => n.checked_mul(60),
-        _ => unreachable!(),
+        _ => anyhow::bail!(
+            "unrecognized duration unit '{}' (expected d, h, or m)",
+            unit
+        ),
     }
     .ok_or_else(|| anyhow::anyhow!("--since value is too large"))?
     .try_into()
