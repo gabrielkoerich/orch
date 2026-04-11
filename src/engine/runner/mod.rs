@@ -1438,7 +1438,8 @@ impl TaskRunner {
             }
         }
 
-        anyhow::bail!("no project directory found for {}", self.repo)
+        // Fall back to current directory
+        Ok(std::env::current_dir()?)
     }
 }
 
