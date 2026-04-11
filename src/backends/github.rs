@@ -112,11 +112,16 @@ impl ExternalBackend for GitHubBackend {
     ///
     /// Called when a task is first ingested to ensure it appears on the
     /// project board immediately, not just when status changes later.
-    async fn sync_to_project(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
+    /// Returns `Some(node_id)` if the item was added to the project board.
+    async fn sync_to_project(
+        &self,
+        id: &ExternalId,
+        status: Status,
+    ) -> anyhow::Result<Option<String>> {
         // Only sync if project integration is configured
         let project = match ProjectSync::from_config() {
             Some(p) => p,
-            None => return Ok(()),
+            None => return Ok(None),
         };
 
         // Fetch the issue to get its node_id
@@ -126,15 +131,61 @@ impl ExternalBackend for GitHubBackend {
         let node_id = issue
             .node_id
             .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("issue missing node_id"))?;
+            .ok_or_else(|| anyhow::anyhow!("issue missing node_id"))?
+            .to_string();
 
         // Add to project board and set initial status
         project
-            .sync_item_status(node_id, &status)
+            .sync_item_status(&node_id, &status)
             .await
             .map_err(|e| anyhow::anyhow!("project board sync failed: {e}"))?;
 
+        Ok(Some(node_id))
+    }
+
+    async fn sync_estimate_to_project(&self, id: &ExternalId, estimate: u8) -> anyhow::Result<()> {
+        let project = match ProjectSync::from_config() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        // Only sync if the estimate field is configured.
+        if project.estimate_field_id().is_none() {
+            return Ok(());
+        }
+
+        // Fetch the issue to get its node_id.
+        let issue = self.gh.get_issue(&self.repo, &id.0).await?;
+        let node_id = issue
+            .node_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("issue missing node_id"))?;
+
+        project
+            .sync_item_estimate(node_id, estimate)
+            .await
+            .map_err(|e| anyhow::anyhow!("project estimate sync failed: {e}"))?;
+
         Ok(())
+    }
+
+    async fn get_project_item_estimates(
+        &self,
+        issue_node_ids: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, u8>> {
+        let project = match ProjectSync::from_config() {
+            Some(p) => p,
+            None => return Ok(std::collections::HashMap::new()),
+        };
+
+        if issue_node_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        project
+            .get_estimates_for_issues(issue_node_ids)
+            .await
+            .map_err(|e| anyhow::anyhow!("project estimate fetch failed: {e}"))
     }
 
     /// Override default update_status to add project board sync after label update.
