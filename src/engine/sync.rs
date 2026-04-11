@@ -523,9 +523,9 @@ async fn handle_slash_command(
                     mention.author, mention.body
                 ),
             ),
-            // Already handled above
             CommandOutcome::FetchFailed | CommandOutcome::CollaboratorCheckFailed => {
-                unreachable!()
+                tracing::debug!("skipping mention task record due to earlier command failure");
+                return;
             }
         };
 
