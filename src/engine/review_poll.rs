@@ -433,7 +433,18 @@ pub(crate) async fn review_open_prs(
             data
         }
         Err(e) => {
-            let fails = store.kv_increment(&batch_fail_key).await.unwrap_or(1);
+            // Track consecutive batch fetch failures in the KV store. If the
+            // KV increment itself fails (e.g. transient DB error), treat the
+            // situation as immediately degraded so operators receive an error
+            // level signal instead of silently staying at warn level.
+            let fails = match store.kv_increment(&batch_fail_key).await {
+                Ok(n) => n,
+                Err(kv_err) => {
+                    tracing::warn!(kv_err = %kv_err, err = %e, "failed to track batch_fail counter — treating as degraded");
+                    // Use a sentinel high value so the escalation path fires.
+                    u32::MAX
+                }
+            };
             if fails >= 10 {
                 tracing::error!(
                     err = %e,
