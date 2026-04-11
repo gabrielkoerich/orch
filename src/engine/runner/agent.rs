@@ -190,7 +190,7 @@ exit $CMD_STATUS
         tokio::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).await?;
     }
 
-    let command = format!("bash {}", script_path.display());
+    let command = format!("bash \"{}\"", script_path.display());
 
     // Resolve GitHub token via the process-wide shared resolver (cached after first call)
     let github_token = match crate::github::token::shared().get_token().await {
