@@ -1,0 +1,2 @@
+{"type":"text","timestamp":1706300001,"text":"Review complete. All tests passed, LGTM."}
+{"type":"step_finish","timestamp":1706300010,"part":{"type":"step-finish","reason":"stop","tokens":{"total":1500,"input":1400,"output":100}}}

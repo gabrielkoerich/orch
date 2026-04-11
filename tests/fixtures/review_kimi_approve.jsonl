@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","session_id":"s_review_kimi"}
+{"type":"assistant","message":{"id":"msg_01","type":"message","role":"assistant","content":[{"type":"text","text":"I'll review the changes."}],"usage":{"input_tokens":200,"output_tokens":30}}}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":5000,"result":"{\"decision\":\"approve\",\"notes\":\"LGTM\",\"test_results\":\"pass\",\"issues\":[]}","usage":{"input_tokens":200,"output_tokens":30}}

@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"thread_review_002"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"Reviewing code..."}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Review complete.\n\n```json\n{\"decision\":\"request_changes\",\"notes\":\"Race condition on line 15\",\"test_results\":\"fail\",\"issues\":[{\"file\":\"src/server.rs\",\"line\":15,\"severity\":\"error\",\"description\":\"race condition: mutex not held\"}]}\n```\n"}}
+{"type":"turn.completed"}

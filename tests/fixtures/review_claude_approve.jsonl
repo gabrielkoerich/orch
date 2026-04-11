@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","apiKeySource":"environment","cwd":"/tmp/work","model":"claude-haiku-4-5-20251001","permissionMode":"bypassPermissions"}
+{"type":"assistant","message":{"id":"msg_01","type":"message","role":"assistant","content":[{"type":"text","text":"I'll review the changes."}],"model":"claude-haiku-4-5-20251001","stop_reason":"end_turn","usage":{"input_tokens":200,"output_tokens":30}}}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":5000,"result":"{\"decision\":\"approve\",\"notes\":\"All checks pass\",\"test_results\":\"pass\",\"issues\":[]}","usage":{"input_tokens":200,"output_tokens":30},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":200,"outputTokens":30}},"permission_denials":[]}

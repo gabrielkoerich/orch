@@ -794,7 +794,7 @@ pub async fn store_failure_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::runner::agents::{patterns, AgentError};
+    use crate::engine::runner::agents::{find_agent_result, patterns, AgentError};
 
     #[test]
     fn calculate_backoff_delay_jitter_is_centered() {
@@ -1573,5 +1573,198 @@ That's all."#;
         assert!(!read_content.is_empty());
 
         let _ = std::fs::remove_file(&file_path);
+    }
+
+    // ── Fixture-based review integration tests ──────────────────────────────────
+
+    /// Full review pipeline: find_agent_result → parse_review_response → infer_review_response.
+    fn parse_review_via_agent(agent: &str, output: &str) -> anyhow::Result<ReviewResponse> {
+        let text = find_agent_result(agent, output)
+            .map(|r| r.result_text)
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| output.to_string());
+        if let Ok(r) = parse_review_response(&text) {
+            return Ok(r);
+        }
+        infer_review_response(&text)
+            .ok_or_else(|| anyhow::anyhow!("failed to parse review from {agent} output"))
+    }
+
+    // ── Claude review fixtures ─────────────────────────────────────────────────
+
+    #[test]
+    fn fixture_claude_review_approve() {
+        let raw = include_str!("../../../tests/fixtures/review_claude_approve.jsonl");
+        let resp = parse_review_via_agent("claude", raw).unwrap();
+        assert_eq!(resp.decision, "approve");
+        assert_eq!(resp.notes, "All checks pass");
+        assert_eq!(resp.test_results.as_deref(), Some("pass"));
+        assert!(resp.issues.is_empty());
+    }
+
+    #[test]
+    fn fixture_claude_review_request_changes() {
+        let raw = include_str!("../../../tests/fixtures/review_claude_request_changes.jsonl");
+        let resp = parse_review_via_agent("claude", raw).unwrap();
+        assert_eq!(resp.decision, "request_changes");
+        assert_eq!(resp.notes, "Fix the null deref on line 42");
+        assert_eq!(resp.test_results.as_deref(), Some("fail"));
+        assert_eq!(resp.issues.len(), 1);
+        assert_eq!(resp.issues[0].file, "src/main.rs");
+        assert_eq!(resp.issues[0].line, Some(42));
+        assert_eq!(resp.issues[0].severity, "error");
+    }
+
+    #[test]
+    fn fixture_claude_review_rate_limit_returns_error() {
+        // find_claude_result on an is_error=true result returns Some with is_error=true.
+        // The integration test verifies this is captured, not that it's a ReviewResponse.
+        let raw = include_str!("../../../tests/fixtures/review_claude_rate_limit.jsonl");
+        let result = find_agent_result("claude", raw);
+        assert!(
+            result.is_some(),
+            "should find result even for error envelope"
+        );
+        let result = result.unwrap();
+        assert!(result.is_error, "rate limit should be flagged as error");
+        assert!(result.result_text.contains("rate limit"));
+    }
+
+    // ── OpenCode review fixtures ────────────────────────────────────────────────
+
+    #[test]
+    fn fixture_opencode_review_approve() {
+        let raw = include_str!("../../../tests/fixtures/review_opencode_approve.jsonl");
+        let resp = parse_review_via_agent("opencode", raw).unwrap();
+        assert_eq!(resp.decision, "approve");
+        assert_eq!(resp.notes, "All checks pass");
+        assert!(resp.issues.is_empty());
+    }
+
+    #[test]
+    fn fixture_opencode_review_request_changes() {
+        let raw = include_str!("../../../tests/fixtures/review_opencode_request_changes.jsonl");
+        let resp = parse_review_via_agent("opencode", raw).unwrap();
+        assert_eq!(resp.decision, "request_changes");
+        assert_eq!(resp.notes, "Fix the memory leak");
+        assert_eq!(resp.test_results.as_deref(), Some("fail"));
+        assert_eq!(resp.issues.len(), 1);
+        assert_eq!(resp.issues[0].file, "src/lib.rs");
+        assert_eq!(resp.issues[0].line, Some(100));
+    }
+
+    #[test]
+    fn fixture_opencode_review_plain_text_approve() {
+        // OpenCode with plain-text review (no JSON) — should infer approval via keywords.
+        let raw = include_str!("../../../tests/fixtures/review_opencode_plain_text.jsonl");
+        let resp = parse_review_via_agent("opencode", raw).unwrap();
+        assert_eq!(resp.decision, "approve");
+    }
+
+    // ── Codex review fixtures ────────────────────────────────────────────────────
+
+    #[test]
+    fn fixture_codex_review_approve() {
+        let raw = include_str!("../../../tests/fixtures/review_codex_approve.jsonl");
+        let resp = parse_review_via_agent("codex", raw).unwrap();
+        assert_eq!(resp.decision, "approve");
+        assert_eq!(resp.notes, "Clean implementation");
+        assert!(resp.issues.is_empty());
+    }
+
+    #[test]
+    fn fixture_codex_review_request_changes() {
+        let raw = include_str!("../../../tests/fixtures/review_codex_request_changes.jsonl");
+        let resp = parse_review_via_agent("codex", raw).unwrap();
+        assert_eq!(resp.decision, "request_changes");
+        assert_eq!(resp.notes, "Race condition on line 15");
+        assert_eq!(resp.issues.len(), 1);
+        assert_eq!(resp.issues[0].file, "src/server.rs");
+        assert_eq!(resp.issues[0].line, Some(15));
+    }
+
+    #[test]
+    fn fixture_codex_review_plain_text_approve() {
+        // Codex with plain-text review — should infer approval via "LGTM" keyword.
+        let raw = include_str!("../../../tests/fixtures/review_codex_plain_text.jsonl");
+        let resp = parse_review_via_agent("codex", raw).unwrap();
+        assert_eq!(resp.decision, "approve");
+    }
+
+    // ── Kimi review fixtures ────────────────────────────────────────────────────
+
+    #[test]
+    fn fixture_kimi_review_approve() {
+        let raw = include_str!("../../../tests/fixtures/review_kimi_approve.jsonl");
+        let resp = parse_review_via_agent("kimi", raw).unwrap();
+        assert_eq!(resp.decision, "approve");
+        assert_eq!(resp.notes, "LGTM");
+        assert_eq!(resp.test_results.as_deref(), Some("pass"));
+        assert!(resp.issues.is_empty());
+    }
+
+    // ── MiniMax review fixtures ────────────────────────────────────────────────
+
+    #[test]
+    fn fixture_minimax_review_request_changes() {
+        let raw = include_str!("../../../tests/fixtures/review_minimax_request_changes.jsonl");
+        let resp = parse_review_via_agent("minimax", raw).unwrap();
+        assert_eq!(resp.decision, "request_changes");
+        assert_eq!(resp.notes, "Fix the bug");
+        assert_eq!(resp.test_results.as_deref(), Some("fail"));
+        assert_eq!(resp.issues.len(), 1);
+        assert_eq!(resp.issues[0].file, "src/foo.rs");
+        assert_eq!(resp.issues[0].line, Some(42));
+        assert_eq!(resp.issues[0].severity, "error");
+    }
+
+    // ── Cross-agent token/metadata extraction ───────────────────────────────────
+
+    /// Verify that find_agent_result extracts token counts from each agent's format.
+    #[test]
+    fn find_agent_result_extracts_tokens_claude() {
+        let raw = include_str!("../../../tests/fixtures/review_claude_approve.jsonl");
+        let result = find_agent_result("claude", raw).expect("should find result");
+        assert_eq!(result.input_tokens, Some(200));
+        assert_eq!(result.output_tokens, Some(30));
+        assert!(result.cost_usd.is_none()); // review fixtures don't include cost
+    }
+
+    #[test]
+    fn find_agent_result_extracts_tokens_opencode() {
+        let raw = include_str!("../../../tests/fixtures/review_opencode_approve.jsonl");
+        let result = find_agent_result("opencode", raw).expect("should find result");
+        assert_eq!(result.input_tokens, Some(2900));
+        assert_eq!(result.output_tokens, Some(100));
+        assert_eq!(result.cost_usd, Some(0.002));
+    }
+
+    /// Verify that find_agent_result returns None for empty/unparseable input.
+    #[test]
+    fn find_agent_result_returns_none_for_empty() {
+        assert!(find_agent_result("claude", "").is_none());
+        assert!(find_agent_result("opencode", "").is_none());
+        assert!(find_agent_result("codex", "").is_none());
+        assert!(find_agent_result("kimi", "").is_none());
+        assert!(find_agent_result("minimax", "").is_none());
+    }
+
+    #[test]
+    fn find_agent_result_returns_none_for_plain_text() {
+        assert!(find_agent_result("claude", "just some plain text").is_none());
+        assert!(find_agent_result("codex", "just some plain text").is_none());
+        // OpenCode is a special case — it can sometimes return a result for plain text.
+        // This is acceptable because opencode's extract_ndjson_text falls back gracefully.
+    }
+
+    // ── Error propagation via find_agent_result ─────────────────────────────────
+
+    /// Verify that find_agent_result surfaces rate-limit errors from Claude.
+    #[test]
+    fn find_agent_result_propagates_claude_rate_limit() {
+        let raw = include_str!("../../../tests/fixtures/review_claude_rate_limit.jsonl");
+        let result = find_agent_result("claude", raw).expect("should find result");
+        assert!(result.is_error, "should be flagged as error");
+        assert!(result.result_text.contains("rate limit"));
     }
 }
