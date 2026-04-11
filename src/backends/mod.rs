@@ -306,9 +306,41 @@ pub trait ExternalBackend: Send + Sync {
     ///
     /// Called when a task is first ingested to ensure it appears on the
     /// project board immediately, not just when status changes later.
-    /// Default is a no-op; GitHub backend implements project board sync.
-    async fn sync_to_project(&self, _id: &ExternalId, _status: Status) -> anyhow::Result<()> {
+    /// Returns `Some(node_id)` if the item was added/updated on the project board,
+    /// or `None` if project sync is not configured or failed.
+    /// Default is a no-op returning `None`; GitHub backend implements project board sync.
+    async fn sync_to_project(
+        &self,
+        _id: &ExternalId,
+        _status: Status,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Sync a task's estimate to the project board Estimate field.
+    ///
+    /// Called after the router assigns an estimate to a task (via `store_route`).
+    /// Writes the estimate value to GitHub Projects V2 so humans can see it on the board.
+    /// Default is a no-op; GitHub backend implements estimate project sync.
+    async fn sync_estimate_to_project(
+        &self,
+        _id: &ExternalId,
+        _estimate: u8,
+    ) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Batch-fetch project item estimates for a list of issue node IDs.
+    ///
+    /// Returns a map from issue node ID → estimate value (0 if not set).
+    /// Used during ingestion to populate `tasks.estimate` from GitHub Projects
+    /// when the orch estimate is still 0.
+    /// Default returns an empty map; GitHub backend implements batch estimate fetch.
+    async fn get_project_item_estimates(
+        &self,
+        _issue_node_ids: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, u8>> {
+        Ok(std::collections::HashMap::new())
     }
 
     /// Check if an open issue with the given title already exists.

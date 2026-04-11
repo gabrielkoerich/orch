@@ -1225,6 +1225,21 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Set the Fibonacci estimate for a task (only if currently 0).
+    ///
+    /// Used during ingestion to populate `tasks.estimate` from GitHub Projects
+    /// when the orch estimate is still 0. This avoids overwriting estimates
+    /// already set by the router.
+    pub async fn set_estimate_if_zero(&self, id: i64, estimate: u8) -> anyhow::Result<bool> {
+        let result = sqlx::query("UPDATE tasks SET estimate = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ? AND estimate = 0")
+            .bind(estimate as i64)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     // ---------------------------------------------------------------
     // Memory
     // ---------------------------------------------------------------

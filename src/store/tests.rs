@@ -2670,6 +2670,77 @@ async fn store_route_persists_all_routing_fields() {
     assert_eq!(task.selected_skills, r#"["git","rust"]"#);
 }
 
+#[tokio::test]
+async fn set_estimate_if_zero_populates_estimate() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let id = store
+        .create(&NewTask {
+            external_id: Some("100".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Estimate me".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // estimate starts at 0
+    let task = store.get(id).await.unwrap();
+    assert_eq!(task.estimate, 0);
+
+    // set_estimate_if_zero should return true and update when estimate is 0
+    let updated = store.set_estimate_if_zero(id, 5).await.unwrap();
+    assert!(updated, "should return true when estimate was 0");
+
+    let task = store.get(id).await.unwrap();
+    assert_eq!(task.estimate, 5, "estimate should be updated to 5");
+}
+
+#[tokio::test]
+async fn set_estimate_if_zero_does_not_overwrite() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let id = store
+        .create(&NewTask {
+            external_id: Some("101".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Already estimated".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // Set estimate via store_route (simulates router assigning an estimate).
+    store
+        .store_route(&StoreRoute {
+            id,
+            agent: "claude",
+            model: Some("sonnet"),
+            complexity: "medium",
+            estimate: 8,
+            reason: "complex refactor",
+            profile: "{}",
+            skills: "[]",
+        })
+        .await
+        .unwrap();
+
+    // set_estimate_if_zero should return false when estimate is already set
+    let updated = store.set_estimate_if_zero(id, 3).await.unwrap();
+    assert!(
+        !updated,
+        "should return false when estimate was already non-zero"
+    );
+
+    let task = store.get(id).await.unwrap();
+    assert_eq!(
+        task.estimate, 8,
+        "estimate should remain 8, not overwritten to 3"
+    );
+}
+
 // ── full run lifecycle: start → complete → query ────────────────────────
 
 #[tokio::test]

@@ -1023,6 +1023,20 @@ pub(crate) async fn tick_route_tasks(
                                 "dual-write: update_status failed"
                             );
                         }
+                        // Sync the estimate to GitHub Projects if the router assigned one.
+                        if result.estimate > 0 {
+                            if let Err(e) = backend
+                                .sync_estimate_to_project(&task.id, result.estimate)
+                                .await
+                            {
+                                tracing::debug!(
+                                    task_id = task.id.0,
+                                    estimate = result.estimate,
+                                    err = %e,
+                                    "dual-write: estimate project sync failed"
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::debug!(

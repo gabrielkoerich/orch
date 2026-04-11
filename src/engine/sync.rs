@@ -1746,6 +1746,9 @@ pub(crate) async fn ingest_external_tasks(
     // Upsert into the store, collecting store IDs for batch status check.
     // Also acknowledge newly detected issues (eyes reaction).
     let mut id_status_pairs: Vec<(i64, crate::backends::Status)> = Vec::new();
+    // Collect (store_id, node_id) for newly ingested tasks so we can batch-fetch
+    // estimate values from GitHub Projects after the loop.
+    let mut new_task_node_ids: Vec<(i64, String)> = Vec::new();
     // Pre-load existing external IDs for this repo to avoid N+1 queries
     // (each get_by_external_id call is an individual SQL query). If the
     // lookup fails, fall back to an empty set so we conservatively treat
@@ -1845,13 +1848,22 @@ pub(crate) async fn ingest_external_tasks(
                         );
                     }
                     // Sync to project board only for newly ingested tasks.
+                    // Collect the returned node_id so we can batch-fetch estimates.
                     let task_status = status.unwrap_or(Status::New);
-                    if let Err(e) = backend.sync_to_project(&task.id, task_status).await {
-                        tracing::debug!(
-                            task_id = task.id.0,
-                            err = %e,
-                            "ingest: project board sync failed"
-                        );
+                    match backend.sync_to_project(&task.id, task_status).await {
+                        Ok(Some(node_id)) => {
+                            new_task_node_ids.push((store_id, node_id));
+                        }
+                        Ok(None) => {
+                            // Project sync not configured or failed — no node_id to collect.
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                task_id = task.id.0,
+                                err = %e,
+                                "ingest: project board sync failed"
+                            );
+                        }
                     }
                 }
             }
@@ -1885,6 +1897,36 @@ pub(crate) async fn ingest_external_tasks(
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // Batch-fetch estimate values from GitHub Projects for newly ingested tasks.
+    // For each task where `tasks.estimate == 0`, populate it from the project board.
+    if !new_task_node_ids.is_empty() {
+        let node_ids: Vec<String> = new_task_node_ids.iter().map(|(_, n)| n.clone()).collect();
+        match backend.get_project_item_estimates(&node_ids).await {
+            Ok(estimates) => {
+                for (store_id, node_id) in new_task_node_ids {
+                    if let Some(&estimate) = estimates.get(&node_id) {
+                        if estimate > 0 {
+                            if let Err(e) = store.set_estimate_if_zero(store_id, estimate).await {
+                                tracing::debug!(
+                                    store_id,
+                                    estimate,
+                                    err = %e,
+                                    "ingest: failed to set estimate from project"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    err = %e,
+                    "ingest: project estimate fetch failed — skipping estimate sync this tick"
+                );
             }
         }
     }
@@ -2018,9 +2060,13 @@ mod tests {
             Ok(self.dedup_result)
         }
 
-        async fn sync_to_project(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
+        async fn sync_to_project(
+            &self,
+            id: &ExternalId,
+            status: Status,
+        ) -> anyhow::Result<Option<String>> {
             self.project_syncs.lock().await.push((id.0.clone(), status));
-            Ok(())
+            Ok(None) // Mock doesn't have real node IDs.
         }
     }
 
@@ -2319,8 +2365,12 @@ mod tests {
             async fn has_open_issue_with_title(&self, _: &str, _: &str) -> anyhow::Result<bool> {
                 Ok(false)
             }
-            async fn sync_to_project(&self, _: &ExternalId, _: Status) -> anyhow::Result<()> {
-                Ok(())
+            async fn sync_to_project(
+                &self,
+                _: &ExternalId,
+                _: Status,
+            ) -> anyhow::Result<Option<String>> {
+                Ok(None)
             }
         }
 
