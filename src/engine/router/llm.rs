@@ -672,16 +672,15 @@ impl LlmRouter {
     /// Load skills catalog from skills.yml or skills directory.
     /// Cached after first load to avoid blocking I/O in async context.
     async fn load_skills_catalog(&self) -> anyhow::Result<String> {
-        // Check cache first (quick lock, drop immediately)
-        {
-            let cache = self.skills_catalog.lock().await;
-            if let Some(ref catalog) = *cache {
-                return Ok(catalog.clone());
-            }
+        let mut cache = self.skills_catalog.lock().await;
+        if let Some(ref catalog) = *cache {
+            return Ok(catalog.clone());
         }
 
         // Offload uncached loading to blocking thread pool to avoid blocking the Tokio reactor.
         // Clone any data we need to avoid capturing &self across thread boundary.
+        // Holding the tokio::sync::Mutex across .await is safe — it doesn't block a worker thread,
+        // it just suspends the task. This ensures only one caller does the I/O work.
         let skills_dir_opt: Option<PathBuf> = match std::env::var("ORCH_HOME") {
             Ok(orch_home) => Some(PathBuf::from(orch_home).join("skills")),
             Err(_) => None,
@@ -718,7 +717,6 @@ impl LlmRouter {
         .await
         .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?;
 
-        let mut cache = self.skills_catalog.lock().await;
         *cache = Some(catalog.clone());
 
         Ok(catalog)
