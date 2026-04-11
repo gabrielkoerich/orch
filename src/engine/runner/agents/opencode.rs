@@ -801,7 +801,11 @@ pub fn discover_free_opencode_models() -> Vec<String> {
             let _guard = scopeguard::guard((), |_| {
                 FREE_MODELS_REFRESH_IN_PROGRESS.store(false, Ordering::Release);
             });
-            let discovered = run_opencode_models_discovery();
+            // Run the async discovery in a new tokio runtime to use async sleep
+            let discovered = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt.block_on(run_opencode_models_discovery_async()),
+                Err(_) => vec![],
+            };
             let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
             let now = chrono::Utc::now().timestamp();
             if let Ok(mut guard) = cache.lock() {
@@ -830,12 +834,37 @@ pub fn prime_free_model_cache() {
 
 /// Execute `opencode models` with a 30s timeout and return lines containing "free".
 fn run_opencode_models_discovery() -> Vec<String> {
+    // Check if we're already in a tokio runtime
+    if tokio::runtime::Handle::try_current().is_ok() {
+        // We're in a runtime, spawn a thread to run the async discovery
+        // to avoid blocking issues with single-threaded runtimes
+        std::thread::spawn(|| match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt.block_on(run_opencode_models_discovery_async()),
+            Err(_) => vec![],
+        })
+        .join()
+        .unwrap_or_default()
+    } else {
+        // Not in a runtime, create a new one in this thread
+        match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt.block_on(run_opencode_models_discovery_async()),
+            Err(e) => {
+                tracing::debug!(error = %e, "failed to create tokio runtime for opencode discovery");
+                vec![]
+            }
+        }
+    }
+}
+
+/// Async version of `run_opencode_models_discovery` that uses `tokio::time::sleep`
+/// instead of blocking `std::thread::sleep`.
+async fn run_opencode_models_discovery_async() -> Vec<String> {
     if !crate::cmd_cache::command_exists("opencode") {
         tracing::debug!("opencode not in PATH — skipping free model discovery");
         return vec![];
     }
 
-    let mut child = match std::process::Command::new("opencode")
+    let mut child = match tokio::process::Command::new("opencode")
         .args(["models"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -853,15 +882,16 @@ fn run_opencode_models_discovery() -> Vec<String> {
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => {
-                let stdout = child
-                    .stdout
-                    .take()
-                    .map(|mut s| {
+                // Use tokio's async read to read stdout
+                let stdout = match child.stdout.take() {
+                    Some(mut s) => {
                         let mut buf = String::new();
-                        std::io::Read::read_to_string(&mut s, &mut buf).ok();
+                        use tokio::io::AsyncReadExt;
+                        let _ = s.read_to_string(&mut buf).await.ok();
                         buf
-                    })
-                    .unwrap_or_default();
+                    }
+                    None => String::new(),
+                };
                 return stdout
                     .lines()
                     .filter(|l| l.to_lowercase().contains("free"))
@@ -876,15 +906,15 @@ fn run_opencode_models_discovery() -> Vec<String> {
             Ok(None) => {
                 if start.elapsed() > timeout {
                     tracing::warn!("opencode models timed out after 30s, killing process");
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
                     return vec![];
                 }
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
             Err(e) => {
                 tracing::debug!(error = %e, "failed to wait on opencode models");
-                let _ = child.kill();
+                let _ = child.kill().await;
                 return vec![];
             }
         }
