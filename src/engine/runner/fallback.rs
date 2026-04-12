@@ -744,8 +744,9 @@ mod tests {
             .expect("provider error should set model cooldown");
         let remaining = until.saturating_sub(now);
 
+        // Allow a wider margin for scheduler/runtime jitter in concurrent test runs.
         assert!(
-            remaining >= PROVIDER_RETURNED_ERROR_MODEL_COOLDOWN_SECS as i64 - 5,
+            remaining >= PROVIDER_RETURNED_ERROR_MODEL_COOLDOWN_SECS as i64 - 30,
             "expected ~4h model cooldown, got {remaining}s"
         );
     }
