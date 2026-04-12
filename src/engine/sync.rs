@@ -1078,9 +1078,6 @@ pub(crate) async fn sync_tick(
                     new_refires,
                     "escalating NeedsReview task to Blocked after repeated refires"
                 );
-                // Write block reason and last_error — must succeed before blocking
-                // to prevent the auto-unblock loop (block_reason.is_none() gate in
-                // auto_unblock_blocked_tasks would otherwise re-dispatch the task).
                 let fields = [
                     (
                         "block_reason",
@@ -1093,22 +1090,12 @@ pub(crate) async fn sync_tick(
                         serde_json::json!(format!("escalated after {} retries", new_refires)),
                     ),
                 ];
-                if let Err(e) = crate::store::store_set_result(
-                    &Some(Arc::clone(store)),
-                    repo,
-                    task.task_id(),
-                    &fields,
-                )
-                .await
-                {
-                    tracing::error!(task_id = task.task_id(), err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
-                    continue;
-                }
                 if let Err(e) = task_manager
-                    .update_task_status(&task.external.id, Status::Blocked)
+                    .update_task_status_and_result(&task.external.id, Status::Blocked, &fields)
                     .await
                 {
-                    tracing::warn!(task_id = task.task_id(), err = %e, "failed to set Blocked during escalation");
+                    tracing::error!(task_id = task.task_id(), err = %e, "update_task_status_and_result(Blocked) failed — skipping block to avoid silent auto-unblock loop");
+                    continue;
                 }
                 continue;
             }
