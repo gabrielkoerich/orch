@@ -221,13 +221,34 @@ pub(crate) async fn tick_detect_silent_agents(
             Ok(Some(store_id)) => match store.get(store_id).await {
                 Ok(task) => Some(task),
                 Err(e) => {
-                    tracing::warn!(task_id, error = %e, "failed to fetch task from store during silence detection");
+                    tracing::warn!(
+                        task_id,
+                        repo,
+                        store_id,
+                        operation = "store.get",
+                        error = %e,
+                        "silence detection: db error fetching task — agent/model cooldown will be skipped"
+                    );
                     None
                 }
             },
-            Ok(None) => None,
+            Ok(None) => {
+                tracing::debug!(
+                    task_id,
+                    repo,
+                    operation = "resolve_task_id",
+                    "silence detection: task not found in store (may have been cleaned up)"
+                );
+                None
+            }
             Err(e) => {
-                tracing::warn!(task_id, error = %e, "failed to resolve task id during silence detection");
+                tracing::warn!(
+                    task_id,
+                    repo,
+                    operation = "resolve_task_id",
+                    error = %e,
+                    "silence detection: db error resolving task id — agent/model cooldown will be skipped"
+                );
                 None
             }
         };
