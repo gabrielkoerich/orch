@@ -1370,11 +1370,10 @@ async fn scan_comments(
                     // glitch has resolved.
                 } else {
                     // Use the pre-fetched value — no serial API call here.
-                    // invariant: CreateMentionTask with Some(issue_num) must have been
-                    // collected into pr_check_inputs, so the entry must exist.
-                    let is_pr = is_pr_map.get(&comment_idx).copied().expect(
-                        "is_pr_map missing entry for CreateMentionTask: invariant violated",
-                    );
+                    // issue_num may be None (e.g. bot mentioned with no issue URL), in
+                    // which case is_pr_map has no entry; default to false (the None arm
+                    // of the downstream match ignores is_pr entirely).
+                    let is_pr = is_pr_map.get(&comment_idx).copied().unwrap_or(false);
 
                     let (title, task_body) = match (&issue_num, is_pr) {
                         (Some(num), false) => (
