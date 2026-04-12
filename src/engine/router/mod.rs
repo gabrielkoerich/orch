@@ -1334,12 +1334,21 @@ pub async fn get_route_result(
         valid
     });
 
-    // If a stale model was discarded, update the database to clear it.
-    // This prevents repeated warnings on subsequent dispatches (#1907).
+    // If a stale model was discarded, update the database to clear the model
+    // and record a diagnostic last_error so task_runs.error is populated if
+    // the subsequent run fails (fixes issue #2527).
     let original_model = task.model.clone().filter(|m| !m.is_empty());
     if original_model.is_some() && model.is_none() {
+        let stale_model = original_model.as_deref().unwrap_or("unknown");
+        let stale_err = format!("stale model discarded: {stale_model} not in {agent} model pools");
         if let Err(e) = store
-            .set_fields(store_id, &[("model", serde_json::json!(""))])
+            .set_fields(
+                store_id,
+                &[
+                    ("model", serde_json::json!("")),
+                    ("last_error", serde_json::json!(stale_err)),
+                ],
+            )
             .await
         {
             // Log the error so transient DB failures are visible and diagnosable.
