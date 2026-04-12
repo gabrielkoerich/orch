@@ -1416,11 +1416,34 @@ pub(crate) async fn tick_dispatch_tasks(
 pub(crate) async fn tick_unblock_parents(
     backend: &Arc<dyn ExternalBackend>,
     task_manager: &Arc<TaskManager>,
+    store: &Arc<TaskStore>,
+    repo: &str,
 ) -> anyhow::Result<()> {
     let blocked = task_manager
         .list_external_by_status(Status::Blocked)
         .await?;
+
+    // Pre-filter: skip tasks that are blocked for a known reason (e.g. CI failure,
+    // escalation). These are not waiting on children, so there is no point making
+    // a GraphQL call for them.
+    let store_blocked = store
+        .list_by_status(repo, crate::store::TaskStatus::Blocked)
+        .await
+        .unwrap_or_default();
+    let has_block_reason: std::collections::HashSet<String> = store_blocked
+        .iter()
+        .filter(|t| t.block_reason.is_some())
+        .filter_map(|t| t.external_id.clone())
+        .collect();
+
     for task in &blocked {
+        if has_block_reason.contains(&task.id.0) {
+            tracing::debug!(
+                task_id = task.id.0,
+                "skipping blocked task with known block_reason"
+            );
+            continue;
+        }
         let children = match backend.get_sub_issues(&task.id).await {
             Ok(ids) => ids,
             Err(e) => {
@@ -1518,7 +1541,7 @@ pub(crate) async fn tick(
         store,
     )
     .await?;
-    tick_unblock_parents(backend, task_manager).await?;
+    tick_unblock_parents(backend, task_manager, store, repo).await?;
     if let Err(e) = tick_job_scheduler(jobs_path, backend, Some(store), repo, transport).await {
         tracing::error!(?e, "job scheduler tick failed");
     }
@@ -1695,8 +1718,11 @@ mod tests {
         let status_updates = mock.status_updates.clone();
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = make_task_manager(backend.clone());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
-        tick_unblock_parents(&backend, &task_manager).await.unwrap();
+        tick_unblock_parents(&backend, &task_manager, &store, "test/repo")
+            .await
+            .unwrap();
 
         let updates = status_updates.lock().unwrap();
         assert_eq!(updates.len(), 1, "parent should be unblocked");
@@ -1722,8 +1748,11 @@ mod tests {
         let status_updates = mock.status_updates.clone();
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = make_task_manager(backend.clone());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
-        tick_unblock_parents(&backend, &task_manager).await.unwrap();
+        tick_unblock_parents(&backend, &task_manager, &store, "test/repo")
+            .await
+            .unwrap();
 
         let updates = status_updates.lock().unwrap();
         assert!(
@@ -1744,13 +1773,71 @@ mod tests {
         let status_updates = mock.status_updates.clone();
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = make_task_manager(backend.clone());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
-        tick_unblock_parents(&backend, &task_manager).await.unwrap();
+        tick_unblock_parents(&backend, &task_manager, &store, "test/repo")
+            .await
+            .unwrap();
 
         let updates = status_updates.lock().unwrap();
         assert!(
             updates.is_empty(),
             "should not unblock tasks with no sub-issues"
+        );
+    }
+
+    #[tokio::test]
+    async fn unblock_parents_skips_task_with_block_reason_in_store() {
+        // A blocked task that has a known block_reason in the store should never
+        // trigger a get_sub_issues GraphQL call — it is not waiting on children.
+        let mut mock = MockBackend::new();
+
+        // Blocked parent in the backend list
+        let parent = make_task("60", &["status:blocked"]);
+        mock.blocked_tasks.push(parent.clone());
+        // Give it children in the backend so that, if the skip logic is wrong,
+        // the parent would get unblocked.
+        mock.sub_issues
+            .insert("60".to_string(), vec![ExternalId("61".to_string())]);
+        mock.tasks_by_id
+            .insert("61".to_string(), make_task("61", &["status:done"]));
+
+        let status_updates = mock.status_updates.clone();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let task_manager = make_task_manager(backend.clone());
+
+        // Insert the blocked task into the store with a block_reason set.
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let task_id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "test/repo",
+                ext_id: "60",
+                title: "Task 60",
+                body: "",
+                author: "bot",
+                url: "https://github.com/test/test/issues/60",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(task_id, crate::store::TaskStatus::Blocked)
+            .await
+            .unwrap();
+        store
+            .set_block_reason(task_id, Some("CI failure limit reached"))
+            .await
+            .unwrap();
+
+        tick_unblock_parents(&backend, &task_manager, &store, "test/repo")
+            .await
+            .unwrap();
+
+        let updates = status_updates.lock().unwrap();
+        assert!(
+            updates.is_empty(),
+            "task with block_reason should be skipped — no API call, no unblock"
         );
     }
 
@@ -1986,8 +2073,11 @@ mod tests {
         let status_updates = mock.status_updates.clone();
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = make_task_manager(backend.clone());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
-        tick_unblock_parents(&backend, &task_manager).await.unwrap();
+        tick_unblock_parents(&backend, &task_manager, &store, "test/repo")
+            .await
+            .unwrap();
 
         assert!(status_updates.lock().unwrap().is_empty());
     }
@@ -2015,8 +2105,11 @@ mod tests {
         let status_updates = mock.status_updates.clone();
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = make_task_manager(backend.clone());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
-        tick_unblock_parents(&backend, &task_manager).await.unwrap();
+        tick_unblock_parents(&backend, &task_manager, &store, "test/repo")
+            .await
+            .unwrap();
 
         let updates = status_updates.lock().unwrap();
         assert_eq!(updates.len(), 1, "only one parent should be unblocked");
