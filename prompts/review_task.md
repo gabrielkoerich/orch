@@ -18,25 +18,53 @@ Keep the branch up to date — other PRs may have merged since this was created:
 
 ### Step 2: Verify CI status
 
-GitHub CI is the authoritative test environment. Check **required checks only**:
+GitHub CI is the authoritative test environment. Before running CI checks, run `git status` to verify the worktree is clean and not in a rebase state. If mid-rebase, resolve that first; if conflicts are too complex to resolve safely, set decision = `request_changes`.
+
+Check **required checks only**:
 
 ```bash
 timeout 300 gh pr checks {{PR_NUMBER}} --watch --fail-fast --required || true
 ```
 
-- **Required checks pass AND branch is up to date** (Step 1 rebase was a no-op or already applied) → proceed to Step 3 (skip local test runs)
-- **Required checks pass BUT branch was rebased** (Step 1 changed commits) → CI results are stale. Note in your review that CI needs to re-run post-rebase and proceed with code review. Orch will push the rebased branch (before posting the review decision) and CI will re-run before merging.
-- **Required checks fail** → check if the failure is related to files in this PR. If not, it's pre-existing — note it and proceed. If it is, **first check if it is trivially fixable** (e.g., `cargo fmt`, `cargo clippy --fix`, `npm run lint -- --fix`). If fixable: apply the fix in the worktree, commit, re-run the check locally to confirm it passes, then **approve** — do NOT request changes for auto-fixable issues. If not trivially fixable, set decision = `request_changes`
-- **Pre-existing CI failure that also affects this PR** → if the failure was introduced on the default branch (not by this PR), self-fix it if trivially fixable (run formatter, fix lint), commit, and approve. If not trivially fixable, note it as pre-existing and approve — do not block the PR for bugs it did not introduce.
-- **Required checks not run yet or pending** → run local checks as fallback: read `.github/workflows/` to identify what CI runs and execute those commands. Do NOT hardcode language-specific commands
+**Non-required checks** are informational — the `--required` flag filters to required checks only. The only non-required check orch installs is `review-gate`. Do NOT request changes based on non-required check failures.
 
-**Self-fix rule**: If CI fails on formatting, linting, or other auto-fixable issues, apply the fix yourself, commit, and approve. Do NOT consume a review cycle for trivially fixable issues. Example: `cargo fmt --check` fails → run `cargo fmt`, `git add -A`, `git commit -m "style: run cargo fmt"`, re-run the check, then approve.
+Follow this decision tree exactly:
 
-**Worktree state**: Before running CI checks or applying fixes, run `git status` to verify the worktree is clean and not in a rebase state. If the worktree is mid-rebase (`git rebase --continue` needed), resolve that first. If conflicts are too complex to resolve safely, set decision = `request_changes`.
+```
+IF required checks PASS:
+  IF branch was NOT rebased in Step 1 (rebase was a no-op):
+    → proceed to Step 3 (skip local tests)
+  IF branch WAS rebased in Step 1 (new commits added):
+    → CI results are stale; note this in your review and proceed to Step 3
+      (orch will push the rebased branch before posting the decision;
+       CI will re-run before merging — do NOT request changes for stale CI)
 
-**Do NOT request changes for local-only test failures when required checks are green.**
+IF required checks FAIL:
+  Are the failing checks related to files changed by this PR?
+    NO → failure is pre-existing; note it in your review and proceed to Step 3
+    YES → was this failure introduced by the default branch (not this PR)?
+      YES (pre-existing on default branch) →
+        auto-fixable? fix, commit, approve
+        not auto-fixable? note as pre-existing, approve — do not block a PR for bugs it did not introduce
+      NO (introduced by this PR) →
+        auto-fixable? fix, commit, approve
+        not auto-fixable? → decision = request_changes
 
-**Non-required checks** are informational — the `--required` flag filters to required checks only. The only non-required check orch installs is `review-gate`. Ignore pass/fail status of non-required checks. Do NOT request changes based on non-required check failures.
+IF required checks are NOT RUN or PENDING:
+  → run local checks as fallback: read .github/workflows/ to identify what CI runs
+    and execute those commands (do NOT hardcode language-specific commands)
+  → treat local results the same as "required checks PASS" or "FAIL" above
+```
+
+**Definition of auto-fixable**: ONLY the following commands qualify as auto-fixable:
+- `cargo fmt` / `cargo clippy --fix`
+- `npm run lint -- --fix` / `eslint --fix` / `prettier --write`
+- `black` / `ruff --fix` / `isort`
+- Direct equivalents of the above (formatter or linter with a `--fix`/`--write` flag)
+
+Anything requiring manual code changes — including logic fixes, API changes, test updates, or resolving clippy warnings that have no `--fix` — is **NOT auto-fixable** and must be treated as `request_changes` if it was introduced by this PR.
+
+**Self-fix procedure**: apply the fix, commit (`git add -A && git commit -m "style: run cargo fmt"`), re-run the check locally to confirm it passes, then approve.
 
 ### Step 3: Check architecture alignment
 
