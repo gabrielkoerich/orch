@@ -11,7 +11,7 @@
 
 use super::token;
 use super::types::{
-    GitHubCheckRun, GitHubComment, GitHubIssue, GitHubPullRequest, GitHubReview,
+    GitHubAnnotation, GitHubCheckRun, GitHubComment, GitHubIssue, GitHubPullRequest, GitHubReview,
     GitHubReviewComment,
 };
 use crate::engine::cooldown as engine_cooldown;
@@ -1816,6 +1816,21 @@ impl GhHttp {
             "{GITHUB_API}/repos/{repo}/commits/{sha}/check-runs?filter=latest&per_page=100"
         );
         self.get_all_pages_from_wrapper(&url, "check_runs").await
+    }
+
+    /// Get annotations for a specific check run.
+    ///
+    /// Returns the list of annotations attached to the check run, including
+    /// billing failure messages ("The job was not started because recent account
+    /// payments have failed …") that GitHub surfaces as annotations rather than
+    /// as a distinct CI conclusion value.
+    pub async fn get_check_run_annotations(
+        &self,
+        repo: &str,
+        check_run_id: u64,
+    ) -> anyhow::Result<Vec<GitHubAnnotation>> {
+        let url = format!("{GITHUB_API}/repos/{repo}/check-runs/{check_run_id}/annotations");
+        self.get_all_pages(&url, &[("per_page", "100")]).await
     }
 
     /// Get reviews for a PR.

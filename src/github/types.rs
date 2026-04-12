@@ -54,9 +54,22 @@ pub struct GitHubPullRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubCheckRun {
+    pub id: u64,
     pub name: String,
     pub status: String,
     pub conclusion: Option<String>,
+}
+
+/// A check run annotation returned by the GitHub Checks API.
+///
+/// Annotations appear on the "Annotations" tab of a check run in the GitHub UI.
+/// GitHub uses annotations for job-level messages, including billing failures
+/// ("The job was not started because recent account payments have failed …").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubAnnotation {
+    pub annotation_level: Option<String>,
+    pub message: Option<String>,
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
