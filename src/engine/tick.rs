@@ -77,7 +77,7 @@ async fn startup_cleanup(tmux: &TmuxManager) {
 
 use super::EngineConfig;
 use crate::store::{
-    review_session_expected, set_review_session_expected, store_set_by_id, store_touch_updated_at,
+    set_review_session_expected, store_set_by_id, store_touch_updated_at,
 };
 
 /// Phase 1 of tick: poll tmux for finished sessions and clean them up.
@@ -788,8 +788,23 @@ pub(crate) async fn tick_recover_stuck_tasks(
             vec![]
         }
     };
+    // Read the stored in_review rows once to avoid per-task DB lookups for
+    // `review_session_expected`. Build a set of external_ids that have the
+    // flag set so the per-task loop can check it cheaply.
+    let store_in_review = match store.list_by_status(repo, crate::store::TaskStatus::InReview).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(?e, "failed to list store in_review tasks for review_session_expected prefetch");
+            vec![]
+        }
+    };
+    let review_expected_set: std::collections::HashSet<String> = store_in_review
+        .into_iter()
+        .filter(|t| t.review_session_expected)
+        .filter_map(|t| t.external_id)
+        .collect();
     for task in &in_review {
-        if !review_session_expected(store, repo, &task.id.0).await {
+        if !review_expected_set.contains(&task.id.0) {
             tracing::debug!(
                 task_id = task.id.0,
                 "in_review task is waiting on PR review, skipping stuck-session recovery"
@@ -884,7 +899,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
     };
     for task in &internal_in_review {
         let task_id = task.id.0.clone();
-        if !review_session_expected(store, repo, &task_id).await {
+        if !review_expected_set.contains(&task_id) {
             tracing::debug!(
                 task_id,
                 "internal in_review task is waiting on PR review, skipping stuck-session recovery"
@@ -1477,13 +1492,45 @@ pub(crate) async fn tick_unblock_parents(
             continue;
         }
 
-        // Check if every child is done using the local store (falls back to GitHub API
-        // only when the child is not yet in the store).
+        // Check if every child is done using the local store (batched) and
+        // fall back to the backend only for children not present in the store.
         let mut all_done = true;
+        // Build a vec of &str external ids for the batch lookup
+        let child_exts: Vec<&str> = children.iter().map(|c| c.0.as_str()).collect();
+        // Query store for statuses of any children present locally
+        let mut store_status_map: std::collections::HashMap<String, crate::store::TaskStatus> = std::collections::HashMap::new();
+        if let Ok(map) = store.get_statuses_by_external_ids(repo, &child_exts).await {
+            // convert store::TaskStatus -> crate::store::TaskStatus (same type)
+            for (k, v) in map.into_iter() {
+                store_status_map.insert(k, v);
+            }
+        } else {
+            tracing::debug!(task_id = task.id.0, "failed to batch-query store for child statuses; falling back to per-child lookups");
+        }
+
         for child_id in &children {
-            if !task_manager.is_child_done(child_id).await {
-                all_done = false;
-                break;
+            // Check store first
+            if let Some(status) = store_status_map.get(&child_id.0) {
+                if *status != crate::store::TaskStatus::Done {
+                    all_done = false;
+                    break;
+                }
+                continue;
+            }
+
+            // Not found in store — fall back to backend check
+            match backend.get_task(child_id).await {
+                Ok(child) => {
+                    if !child.labels.iter().any(|l| l == Status::Done.as_label()) {
+                        all_done = false;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(task_id = task.id.0, child = %child_id.0, ?e, "failed to fetch child task from backend — treating as not done");
+                    all_done = false;
+                    break;
+                }
             }
         }
 
