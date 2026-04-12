@@ -1156,9 +1156,9 @@ pub(crate) async fn sync_tick(
                     tracing::warn!(
                         task_id = task.task_id(),
                         err = %e,
-                        "failed to increment needs_review_refires — proceeding with re-fire anyway"
+                        "failed to increment needs_review_refires — deferring re-fire to next tick"
                     );
-                    new_refires
+                    continue;
                 }
             };
 
