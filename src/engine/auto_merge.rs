@@ -22,6 +22,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Semaphore;
 
+/// Minimum interval between CI status checks for the same task.
+///
+/// Without this cooldown, the engine polls CI for every in_review task on every
+/// tick (~10s). With 20+ tasks in CI failure loops, this creates 120+ requests/min,
+/// quickly exhausting GitHub's 5000-point/hour GraphQL rate limit. At 60s minimum
+/// polling interval, 20 tasks generate at most 20 requests/min — a 6x reduction.
+///
+/// Configurable via workflow.ci_check_cooldown_secs.
+const DEFAULT_CI_CHECK_COOLDOWN_SECS: u64 = 60;
+
 /// Maximum number of times we will attempt to rebase and retry a conflicting PR
 /// before giving up and blocking the task for human intervention.
 /// Both `review_open_prs` and `auto_merge_pr` use this constant so the limit is
@@ -37,6 +47,51 @@ static CI_POLL_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 fn ci_poll_semaphore() -> &'static Arc<Semaphore> {
     CI_POLL_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(3)))
+}
+
+/// Check if we should skip CI status checking for this task due to per-task cooldown.
+///
+/// Uses the KV store to track the last time CI was checked for each task.
+/// Returns `true` if the cooldown has not elapsed yet.
+async fn is_ci_check_in_cooldown(store: &Arc<TaskStore>, task_id: &str) -> anyhow::Result<bool> {
+    let cooldown_secs: u64 = config::get("workflow.ci_check_cooldown_secs")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_CI_CHECK_COOLDOWN_SECS);
+
+    let key = format!("ci_check_ts:{}", task_id);
+    let last_check = store.kv_get(&key).await?;
+
+    if let Some(last_ts) = last_check {
+        if let Ok(last_time) = chrono::DateTime::parse_from_rfc3339(&last_ts) {
+            let elapsed =
+                chrono::Utc::now().signed_duration_since(last_time.with_timezone(&chrono::Utc));
+            if elapsed.num_seconds() < cooldown_secs as i64 {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+/// Check if CI checks should be skipped for this task.
+///
+/// Returns true if the task is already blocked due to a billing failure or other
+/// unrecoverable CI failure. In such cases, there's no point polling CI status.
+fn should_skip_ci_check(stored: &crate::store::Task) -> bool {
+    let block_reason = stored.block_reason.as_deref().unwrap_or("");
+    block_reason.contains("billing")
+        || block_reason.contains("payment")
+        || block_reason.contains("spending limit")
+        || block_reason.contains("CI failure limit")
+}
+
+/// Record that CI was checked for this task, updating the timestamp in KV store.
+async fn record_ci_check(store: &Arc<TaskStore>, task_id: &str) -> anyhow::Result<()> {
+    let key = format!("ci_check_ts:{}", task_id);
+    let now = chrono::Utc::now().to_rfc3339();
+    store.kv_set(&key, &now).await
 }
 
 /// Poll GitHub for PR mergeability until it is computed or `max_wait` elapses.
@@ -230,6 +285,22 @@ pub(crate) async fn auto_merge_pr(
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
+    // Early exit: skip CI checks if the task is already blocked due to
+    // unrecoverable failures (billing, CI failure limit, etc.). No point
+    // polling CI for a task that will never be unblocked.
+    if let Some(stored_task) = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0).await
+    {
+        if stored_task.status == crate::store::TaskStatus::Blocked
+            && should_skip_ci_check(&stored_task)
+        {
+            tracing::debug!(
+                task_id = task.id.0,
+                "skipping auto-merge CI checks — task is blocked with unrecoverable failure"
+            );
+            return Ok(());
+        }
+    }
+
     // 1. Get PR number from branch
     let gh = GhHttp::new()?;
     let pr_number = match gh.get_pr_number(repo, branch).await? {
@@ -454,6 +525,17 @@ pub(crate) async fn auto_merge_pr(
     };
 
     loop {
+        // Check per-task CI check cooldown before making GitHub API calls.
+        // This prevents rate limit exhaustion when many tasks are in CI loops.
+        if is_ci_check_in_cooldown(store, &task.id.0).await? {
+            tracing::debug!(
+                task_id = task.id.0,
+                pr_number,
+                "CI check skipped due to per-task cooldown"
+            );
+            return Ok(());
+        }
+
         // Acquire a global permit only for the HTTP polling batch.
         // The inner block ensures the permit drops before the match/sleep.
         let (state, total, passing, failing, pending) = {
@@ -482,6 +564,12 @@ pub(crate) async fn auto_merge_pr(
             pending,
             "CI status check"
         );
+
+        // Record that we checked CI for this task (before breaking on success or
+        // returning on failure/pending timeout). This enables per-task cooldown.
+        if let Err(e) = record_ci_check(store, &task.id.0).await {
+            tracing::warn!(task_id = task.id.0, err = %e, "failed to record CI check timestamp");
+        }
 
         match state.as_str() {
             "success" => break,
