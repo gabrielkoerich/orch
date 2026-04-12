@@ -188,11 +188,12 @@ pub async fn init_cooldown_store(store: Arc<crate::store::TaskStore>) {
 /// | 2     | 300       | 900    |
 /// | 3     | 300       | 2700   |
 /// | 4     | 300       | 8100 → capped |
-pub fn compute_backoff(count: u32, base: i64, max: i64) -> i64 {
+pub fn compute_backoff(count: u64, base: i64, max: i64) -> i64 {
     if count <= 1 {
         return base;
     }
-    let factor = 3_i64.saturating_pow(count.saturating_sub(1));
+    let exp = count.saturating_sub(1).min(u32::MAX as u64) as u32;
+    let factor = 3_i64.saturating_pow(exp);
     base.saturating_mul(factor).min(max)
 }
 
@@ -202,12 +203,12 @@ pub fn compute_backoff(count: u32, base: i64, max: i64) -> i64 {
 /// cooldown duration from growing beyond the cap, so unbounded counts are safe.
 ///
 /// Returns 1 when no store is configured (unit-test contexts without a store).
-/// Returns `u32::MAX` on store errors (e.g. lock contention) so backoff applies the cap duration
+/// Returns `u64::MAX` on store errors (e.g. lock contention) so backoff applies the cap duration
 /// instead of resetting to the base, preventing rapid re-dispatch during store outages.
 async fn read_and_increment_failure_count(
     store_opt: &Option<Arc<crate::store::TaskStore>>,
     key: &str,
-) -> u32 {
+) -> u64 {
     read_and_increment_failure_count_with_prefix(store_opt, FAILURE_COUNT_PREFIX, key).await
 }
 
@@ -219,14 +220,14 @@ async fn read_and_increment_failure_count_with_prefix(
     store_opt: &Option<Arc<crate::store::TaskStore>>,
     prefix: &str,
     key: &str,
-) -> u32 {
+) -> u64 {
     let kv_key = format!("{prefix}{key}");
     if let Some(store) = store_opt {
         match store.kv_increment(&kv_key).await {
             Ok(n) => n,
             Err(e) => {
                 tracing::warn!(key = %kv_key, err = %e, "failed to increment failure count — treating as high count for safe backoff");
-                u32::MAX
+                u64::MAX
             }
         }
     } else {
@@ -1871,7 +1872,8 @@ mod tests {
             compute_backoff(100, BACKOFF_BASE_SECS, BACKOFF_MAX_SECS),
             BACKOFF_MAX_SECS
         );
-        assert_eq!(compute_backoff(u32::MAX, 300, 14400), 14400);
+        assert_eq!(compute_backoff(u32::MAX as u64, 300, 14400), 14400);
+        assert_eq!(compute_backoff(u64::MAX, 300, 14400), 14400);
     }
 
     #[test]

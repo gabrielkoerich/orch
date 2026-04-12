@@ -27,7 +27,7 @@ impl TaskStore {
     /// Executes a single SQL statement (`INSERT … ON CONFLICT … DO UPDATE`) so concurrent
     /// callers cannot race — SQLite's serialised write lock ensures the read-modify-write is
     /// indivisible.  Returns the new value after the increment.
-    pub async fn kv_increment(&self, key: &str) -> anyhow::Result<u32> {
+    pub async fn kv_increment(&self, key: &str) -> anyhow::Result<u64> {
         let row: (i64,) = sqlx::query_as(
             "INSERT INTO kv (key, value, updated_at) VALUES (?1, '1', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
              ON CONFLICT(key) DO UPDATE
@@ -38,7 +38,7 @@ impl TaskStore {
         .bind(key)
         .fetch_one(&self.pool)
         .await?;
-        Ok(row.0.max(1) as u32)
+        Ok(row.0.max(1) as u64)
     }
 
     /// Delete a key from the KV store.
