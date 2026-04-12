@@ -1394,13 +1394,9 @@ impl TaskRunner {
                 let path = PathBuf::from(path_str);
                 // Check if this project's .orch.yml has matching repo
                 if let Ok(repo) = config::get_repo_for_project(&path) {
-                    // Use spawn_blocking for path.exists() from async context
+                    // Use tokio::fs::metadata for async-safe existence check
                     let path_for_check = path.clone();
-                    if repo == self.repo
-                        && tokio::task::spawn_blocking(move || path_for_check.exists())
-                            .await
-                            .unwrap_or(false)
-                    {
+                    if repo == self.repo && tokio::fs::metadata(&path_for_check).await.is_ok() {
                         return Ok(path);
                     }
                 }
@@ -1412,10 +1408,7 @@ impl TaskRunner {
             if !dir.is_empty() {
                 let path = PathBuf::from(&dir);
                 let path_for_check = path.clone();
-                if tokio::task::spawn_blocking(move || path_for_check.exists())
-                    .await
-                    .unwrap_or(false)
-                {
+                if tokio::fs::metadata(&path_for_check).await.is_ok() {
                     return Ok(path);
                 }
             }
