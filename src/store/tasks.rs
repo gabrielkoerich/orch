@@ -1822,6 +1822,46 @@ impl TaskStore {
         Ok(result)
     }
 
+    /// Get statuses for a batch of external IDs in a single query.
+    /// Returns a map from external_id -> TaskStatus for rows found in the DB.
+    /// Missing external_ids are simply not present in the returned map.
+    /// Uses chunking to avoid SQLite parameter limits.
+    pub async fn get_statuses_by_external_ids(
+        &self,
+        repo: &str,
+        ext_ids: &[&str],
+    ) -> anyhow::Result<std::collections::HashMap<String, TaskStatus>> {
+        let mut result = std::collections::HashMap::new();
+        if ext_ids.is_empty() {
+            return Ok(result);
+        }
+
+        const CHUNK_SIZE: usize = 500;
+        for chunk in ext_ids.chunks(CHUNK_SIZE) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT external_id, status FROM tasks WHERE repo = ? AND external_id IN ({placeholders})"
+            );
+            let mut query = sqlx::query(&sql);
+            query = query.bind(repo);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            let rows = query.fetch_all(&self.pool).await?;
+            for row in &rows {
+                let external_id: String = row.try_get("external_id").unwrap_or_default();
+                let status_str: String = row.try_get("status").unwrap_or_default();
+                if let Some(status) = TaskStatus::from_str(&status_str) {
+                    result.insert(external_id, status);
+                } else {
+                    tracing::warn!(external_id = %external_id, status = %status_str, "unknown status value in tasks table");
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Get the last run of a specific type for a task.
     /// Used by tests to assert run ordering.
     #[cfg(test)]
