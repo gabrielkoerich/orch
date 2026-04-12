@@ -25,7 +25,7 @@ async fn resolve_repo_root_for_orphaned_worktree(wt: &Path) -> anyhow::Result<St
     // not a directory)
     let git_file = wt.join(".git");
     if git_file.exists() {
-        if let Ok(content) = std::fs::read_to_string(&git_file) {
+        if let Ok(content) = tokio::fs::read_to_string(&git_file).await {
             // Parse the gitdir: line
             for line in content.lines() {
                 if let Some(gitdir) = line.strip_prefix("gitdir: ") {

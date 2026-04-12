@@ -1839,7 +1839,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let temp_home = TempDir::new().unwrap();
         let orch_home = temp_home.path().join(".orch");
-        std::fs::create_dir_all(&orch_home).unwrap();
+        tokio::fs::create_dir_all(&orch_home).await.unwrap();
         let old_orch_home = std::env::var("ORCH_HOME").ok();
         std::env::set_var("ORCH_HOME", &orch_home);
 
@@ -1919,7 +1919,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let temp_home = TempDir::new().unwrap();
         let orch_home = temp_home.path().join(".orch");
-        std::fs::create_dir_all(&orch_home).unwrap();
+        tokio::fs::create_dir_all(&orch_home).await.unwrap();
         let old_orch_home = std::env::var("ORCH_HOME").ok();
         std::env::set_var("ORCH_HOME", &orch_home);
 
@@ -2155,7 +2155,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let temp_home = TempDir::new().unwrap();
         let orch_home = temp_home.path().join(".orch");
-        std::fs::create_dir_all(&orch_home).unwrap();
+        tokio::fs::create_dir_all(&orch_home).await.unwrap();
         let old_orch_home = std::env::var("ORCH_HOME").ok();
         std::env::set_var("ORCH_HOME", &orch_home);
 
