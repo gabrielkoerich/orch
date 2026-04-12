@@ -4,7 +4,7 @@
 //! spawning the agent, waiting for completion, reading output files, and cleanup.
 
 use crate::tmux::TmuxManager;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokio::time::{timeout, Duration};
 
 use super::{agent, response};
@@ -128,7 +128,11 @@ async fn collect_output(
 
     let stderr_path_attempt = attempt_dir.join("stderr.txt");
     let stderr_path_legacy = crate::home::state_file(&format!("stderr-{task_id}.txt"))
-        .unwrap_or_else(|_| PathBuf::from(format!("/tmp/stderr-{task_id}.txt")));
+        .unwrap_or_else(|_| {
+            orch_home
+                .join("state")
+                .join(format!("stderr-{task_id}.txt"))
+        });
 
     let raw_stderr: String = match tokio::task::spawn_blocking(move || {
         std::fs::read_to_string(&stderr_path_attempt)
