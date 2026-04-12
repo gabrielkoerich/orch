@@ -877,7 +877,7 @@ pub(crate) async fn resolve_repo_root_for_orphaned_worktree(
     wt: &std::path::Path,
 ) -> anyhow::Result<String> {
     let git_file = wt.join(".git");
-    if git_file.exists() {
+    if tokio::fs::try_exists(&git_file).await.unwrap_or(false) {
         if let Ok(content) = tokio::fs::read_to_string(&git_file).await {
             for line in content.lines() {
                 if let Some(gitdir) = line.strip_prefix("gitdir: ") {
@@ -925,7 +925,7 @@ pub(crate) async fn resolve_repo_root_for_orphaned_worktree(
                     })
                     .unwrap_or_default()
             };
-            if bare.exists() {
+            if tokio::fs::try_exists(&bare).await.unwrap_or(false) {
                 return Ok(bare.display().to_string());
             }
         }
