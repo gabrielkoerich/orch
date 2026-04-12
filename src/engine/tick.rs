@@ -76,9 +76,7 @@ async fn startup_cleanup(tmux: &TmuxManager) {
 }
 
 use super::EngineConfig;
-use crate::store::{
-    set_review_session_expected, store_set_by_id, store_touch_updated_at,
-};
+use crate::store::{set_review_session_expected, store_set_by_id, store_touch_updated_at};
 
 /// Phase 1 of tick: poll tmux for finished sessions and clean them up.
 pub(crate) async fn tick_check_session_completions(
@@ -791,10 +789,16 @@ pub(crate) async fn tick_recover_stuck_tasks(
     // Read the stored in_review rows once to avoid per-task DB lookups for
     // `review_session_expected`. Build a set of external_ids that have the
     // flag set so the per-task loop can check it cheaply.
-    let store_in_review = match store.list_by_status(repo, crate::store::TaskStatus::InReview).await {
+    let store_in_review = match store
+        .list_by_status(repo, crate::store::TaskStatus::InReview)
+        .await
+    {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(?e, "failed to list store in_review tasks for review_session_expected prefetch");
+            tracing::warn!(
+                ?e,
+                "failed to list store in_review tasks for review_session_expected prefetch"
+            );
             vec![]
         }
     };
@@ -1498,14 +1502,18 @@ pub(crate) async fn tick_unblock_parents(
         // Build a vec of &str external ids for the batch lookup
         let child_exts: Vec<&str> = children.iter().map(|c| c.0.as_str()).collect();
         // Query store for statuses of any children present locally
-        let mut store_status_map: std::collections::HashMap<String, crate::store::TaskStatus> = std::collections::HashMap::new();
+        let mut store_status_map: std::collections::HashMap<String, crate::store::TaskStatus> =
+            std::collections::HashMap::new();
         if let Ok(map) = store.get_statuses_by_external_ids(repo, &child_exts).await {
             // convert store::TaskStatus -> crate::store::TaskStatus (same type)
             for (k, v) in map.into_iter() {
                 store_status_map.insert(k, v);
             }
         } else {
-            tracing::debug!(task_id = task.id.0, "failed to batch-query store for child statuses; falling back to per-child lookups");
+            tracing::debug!(
+                task_id = task.id.0,
+                "failed to batch-query store for child statuses; falling back to per-child lookups"
+            );
         }
 
         for child_id in &children {
