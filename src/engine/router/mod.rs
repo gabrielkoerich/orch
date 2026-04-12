@@ -41,7 +41,7 @@ use crate::store::{get_task_field_direct, store_log_activity, TaskStore};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use llm::LlmRouter;
+use llm::{LlmRouter, TIMEOUT_PREFIX};
 
 /// Result of routing a task to an agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1114,13 +1114,24 @@ impl Router {
                     return Ok(result);
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        agent,
-                        model = model_str,
-                        error = %e,
-                        "pool entry failed, recording cooldown and trying next"
-                    );
-                    crate::engine::runner::response::record_model_failure(agent, model_str).await;
+                    let err_msg = e.to_string();
+                    let is_timeout = err_msg.contains(TIMEOUT_PREFIX);
+                    if is_timeout {
+                        tracing::warn!(
+                            agent,
+                            model = model_str,
+                            "router LLM pool entry timed out — skipping cooldown, trying next entry"
+                        );
+                    } else {
+                        tracing::warn!(
+                            agent,
+                            model = model_str,
+                            error = %e,
+                            "pool entry failed, recording cooldown and trying next"
+                        );
+                        crate::engine::runner::response::record_model_failure(agent, model_str)
+                            .await;
+                    }
                     last_err = Some(e);
                     self.advance_pool_index_after_attempt(idx, n);
                 }
@@ -1187,14 +1198,27 @@ impl Router {
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    tracing::warn!(
-                        agent = %fb_agent,
-                        model = %fb_model_str,
-                        error = %e,
-                        "fallback router LLM also failed"
-                    );
-                    crate::engine::runner::response::record_model_failure(&fb_agent, fb_model_str)
+                    let err_msg = e.to_string();
+                    let is_timeout = err_msg.contains(TIMEOUT_PREFIX);
+                    if is_timeout {
+                        tracing::warn!(
+                            agent = %fb_agent,
+                            model = %fb_model_str,
+                            "fallback router LLM timed out — skipping cooldown"
+                        );
+                    } else {
+                        tracing::warn!(
+                            agent = %fb_agent,
+                            model = %fb_model_str,
+                            error = %e,
+                            "fallback router LLM also failed"
+                        );
+                        crate::engine::runner::response::record_model_failure(
+                            &fb_agent,
+                            fb_model_str,
+                        )
                         .await;
+                    }
                     last_err = Some(e);
                 }
             }
