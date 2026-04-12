@@ -335,7 +335,15 @@ impl TaskRunner {
     }
 
     async fn build_run_audit(&self, input: RunAuditInput<'_>) -> RunAudit {
-        let last_error = self.get_field(input.task_id, "last_error").await;
+        // Filter empty strings so that a blank last_error does not shadow the
+        // actual parse_result error.  Without this, `Option::or(Some(""))` would
+        // return `Some("")` and prevent the `unwrap_or_else` fallback from ever
+        // running, causing task_runs.error to be written as "" even when the
+        // agent returned a classifiable error (fixes issue #2527).
+        let last_error = self
+            .get_field(input.task_id, "last_error")
+            .await
+            .filter(|s| !s.is_empty());
         let error =
             input
                 .error_override
