@@ -442,7 +442,7 @@ pub(crate) async fn review_open_prs(
                 Err(kv_err) => {
                     tracing::warn!(kv_err = %kv_err, err = %e, "failed to track batch_fail counter — treating as degraded");
                     // Use a sentinel high value so the escalation path fires.
-                    u32::MAX
+                    u64::MAX
                 }
             };
             if fails >= 10 {
