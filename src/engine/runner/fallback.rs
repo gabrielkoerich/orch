@@ -318,9 +318,12 @@ pub async fn handle_error(
                     tracing::warn!(
                         task_id,
                         error = %e,
-                        "failed to increment network_retries — assuming 1 to prevent infinite loop"
+                        "failed to increment network_retries — escalating to needs_review"
                     );
-                    1
+                    return Ok(ErrorHandleResult::Continue {
+                        status: "needs_review".to_string(),
+                        error: format!("{agent_name} network error (store unavailable): {message}"),
+                    });
                 }
             };
             if let Err(e) = store::store_set_result(
