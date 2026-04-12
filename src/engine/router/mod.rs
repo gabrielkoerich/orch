@@ -1115,7 +1115,7 @@ impl Router {
                 }
                 Err(e) => {
                     let err_msg = e.to_string();
-                    let is_timeout = err_msg.starts_with(TIMEOUT_PREFIX);
+                    let is_timeout = err_msg.contains(TIMEOUT_PREFIX);
                     if is_timeout {
                         tracing::warn!(
                             agent,
@@ -1199,7 +1199,7 @@ impl Router {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     let err_msg = e.to_string();
-                    let is_timeout = err_msg.starts_with(TIMEOUT_PREFIX);
+                    let is_timeout = err_msg.contains(TIMEOUT_PREFIX);
                     if is_timeout {
                         tracing::warn!(
                             agent = %fb_agent,

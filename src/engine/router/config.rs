@@ -57,6 +57,12 @@ pub fn retry_max_delay_ms() -> u64 {
         .unwrap_or(120_000)
 }
 
+/// Upper bound for router LLM timeout (seconds).
+///
+/// Routing is a short classification step and should fail fast so a single
+/// slow model does not stall fallback to other healthy agents.
+pub const MAX_ROUTER_TIMEOUT_SECS: u64 = 45;
+
 /// Return the configured base backoff (seconds) for an agent.
 ///
 /// Returns the value of `router.backoff_base.{agent}` if set, otherwise
@@ -240,7 +246,16 @@ impl RouterConfig {
 
         if let Ok(timeout) = crate::config::get("router.timeout_seconds") {
             if let Ok(secs) = timeout.parse::<u64>() {
-                config.timeout_seconds = secs;
+                let clamped = secs.min(MAX_ROUTER_TIMEOUT_SECS);
+                if clamped != secs {
+                    tracing::warn!(
+                        configured_secs = secs,
+                        applied_secs = clamped,
+                        max_secs = MAX_ROUTER_TIMEOUT_SECS,
+                        "router.timeout_seconds is too high; clamping to keep routing responsive"
+                    );
+                }
+                config.timeout_seconds = clamped;
             }
         }
 
@@ -533,7 +548,7 @@ impl RouterConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::RouterConfig;
+    use super::{RouterConfig, MAX_ROUTER_TIMEOUT_SECS};
     use std::sync::{Mutex, OnceLock};
 
     struct CurrentDirGuard {
@@ -728,6 +743,21 @@ mod tests {
                 "claude:haiku",
             ]
         );
+    }
+
+    #[test]
+    fn from_config_clamps_router_timeout_to_max() {
+        let _lock = cwd_mutex().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".orch.yml"),
+            "router:\n  timeout_seconds: 90\n",
+        )
+        .unwrap();
+        let _guard = CurrentDirGuard::set(dir.path());
+
+        let config = RouterConfig::from_config();
+        assert_eq!(config.timeout_seconds, MAX_ROUTER_TIMEOUT_SECS);
     }
 
     #[test]
