@@ -164,6 +164,56 @@ pub(crate) fn any_changes_requested_in_reviews(reviews: &[GitHubReview]) -> bool
         .any(|r| r.state == "CHANGES_REQUESTED")
 }
 
+/// Returns `true` if any failed check run for `sha` carries a GitHub Actions
+/// billing failure annotation.
+///
+/// When an account has unpaid invoices or has hit a spending limit, GitHub
+/// refuses to start jobs and records the reason ("The job was not started
+/// because recent account payments have failed …") as a check-run annotation.
+/// The CI state still comes back as `"failure"`, which would normally trigger
+/// the agent retry loop — but no code change can fix a billing problem.
+/// This function lets the caller short-circuit that loop and block the task
+/// immediately with a human-readable billing message instead.
+async fn is_billing_failure(gh: &GhHttp, repo: &str, sha: &str) -> bool {
+    let check_runs = match gh.get_check_runs(repo, sha).await {
+        Ok(runs) => runs,
+        Err(e) => {
+            tracing::debug!(err = %e, "failed to fetch check runs for billing failure check");
+            return false;
+        }
+    };
+
+    for run in check_runs
+        .iter()
+        .filter(|r| r.conclusion.as_deref() == Some("failure"))
+    {
+        match gh.get_check_run_annotations(repo, run.id).await {
+            Ok(annotations) => {
+                for annotation in &annotations {
+                    let msg = annotation.message.as_deref().unwrap_or("");
+                    let title = annotation.title.as_deref().unwrap_or("");
+                    if msg.contains("account payments have failed")
+                        || msg.contains("spending limit")
+                        || title.contains("account payments have failed")
+                        || title.contains("spending limit")
+                    {
+                        return true;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    check_run_id = run.id,
+                    err = %e,
+                    "failed to fetch check run annotations"
+                );
+            }
+        }
+    }
+
+    false
+}
+
 /// Auto-merge a PR after review approval.
 ///
 /// Checks that the automated review comment says "approve" and that CI checks
@@ -436,6 +486,32 @@ pub(crate) async fn auto_merge_pr(
         match state.as_str() {
             "success" => break,
             "failure" => {
+                // Check for billing failures before incrementing the code-quality
+                // failure counter.  Billing failures are infrastructure problems —
+                // no agent can fix them — so we block the task immediately and skip
+                // the re-route loop entirely.
+                if is_billing_failure(&gh, repo, &head_sha).await {
+                    tracing::error!(
+                        task_id = task.id.0,
+                        pr_number,
+                        "GitHub Actions billing failure detected — blocking for human intervention"
+                    );
+                    let fields = [(
+                        "block_reason",
+                        serde_json::json!(
+                            "GitHub Actions billing failure — check Billing & plans settings \
+                             (jobs are not starting due to payment failure or spending limit)"
+                        ),
+                    )];
+                    if let Err(e) = task_manager
+                        .update_task_status_and_result(&task.id, Status::Blocked, &fields)
+                        .await
+                    {
+                        tracing::error!(task_id = task.id.0, err = %e, "failed to write billing block_reason and set Blocked");
+                    }
+                    return Ok(());
+                }
+
                 let ci_failures = match store_increment(
                     &Some(Arc::clone(store)),
                     repo,
