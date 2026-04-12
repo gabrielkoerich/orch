@@ -417,7 +417,7 @@ async fn make_unblock_harness(repo: &str) -> (broadcast::Sender<TaskEvent>, std:
     ));
 
     let (tx, rx) = broadcast::channel::<TaskEvent>(16);
-    unblock::spawn(rx, backend, task_manager, repo.to_string());
+    unblock::spawn(rx, backend, task_manager, store, repo.to_string());
 
     (tx, tmp)
 }
@@ -480,12 +480,12 @@ async fn unblock_subscriber_only_handles_its_repo() {
 
     let tm_a = Arc::new(TaskManager::with_store(
         backend_a.clone(),
-        store_a,
+        store_a.clone(),
         "repo-a/proj".to_string(),
     ));
     let tm_b = Arc::new(TaskManager::with_store(
         backend_b.clone(),
-        store_b,
+        store_b.clone(),
         "repo-b/proj".to_string(),
     ));
 
@@ -493,8 +493,8 @@ async fn unblock_subscriber_only_handles_its_repo() {
     let rx_a = tx.subscribe();
     let rx_b = tx.subscribe();
 
-    unblock::spawn(rx_a, backend_a, tm_a, "repo-a/proj".to_string());
-    unblock::spawn(rx_b, backend_b, tm_b, "repo-b/proj".to_string());
+    unblock::spawn(rx_a, backend_a, tm_a, store_a, "repo-a/proj".to_string());
+    unblock::spawn(rx_b, backend_b, tm_b, store_b, "repo-b/proj".to_string());
 
     // done event for repo-a: repo-a subscriber processes it, repo-b skips.
     tx.send(make_event("5", "repo-a/proj", "done")).unwrap();

@@ -1465,6 +1465,7 @@ pub async fn serve() -> anyhow::Result<()> {
             event_bus.subscribe(),
             engine.backend.clone(),
             engine.task_manager.clone(),
+            engine.store.clone(),
             engine.repo.clone(),
         );
     }
