@@ -489,7 +489,7 @@ impl TaskRunner {
         }
 
         // Resolve project directory
-        let project_dir = self.resolve_project_dir()?;
+        let project_dir = self.resolve_project_dir().await?;
 
         // Prepare task: worktree, context, prompts, and agent invocation
         let init = task_init::prepare_task(
@@ -1388,7 +1388,7 @@ impl TaskRunner {
     }
 
     /// Resolve the project directory for this repo.
-    fn resolve_project_dir(&self) -> anyhow::Result<PathBuf> {
+    async fn resolve_project_dir(&self) -> anyhow::Result<PathBuf> {
         // Explicit env var always wins
         if let Ok(dir) = std::env::var("PROJECT_DIR") {
             if !dir.is_empty() {
@@ -1402,7 +1402,9 @@ impl TaskRunner {
                 let path = PathBuf::from(path_str);
                 // Check if this project's .orch.yml has matching repo
                 if let Ok(repo) = config::get_repo_for_project(&path) {
-                    if repo == self.repo && path.exists() {
+                    // Use tokio::fs::metadata for async-safe existence check
+                    let path_for_check = path.clone();
+                    if repo == self.repo && tokio::fs::metadata(&path_for_check).await.is_ok() {
                         return Ok(path);
                     }
                 }
@@ -1413,7 +1415,8 @@ impl TaskRunner {
         if let Ok(dir) = config::get("project_dir") {
             if !dir.is_empty() {
                 let path = PathBuf::from(&dir);
-                if path.exists() {
+                let path_for_check = path.clone();
+                if tokio::fs::metadata(&path_for_check).await.is_ok() {
                     return Ok(path);
                 }
             }
@@ -1427,7 +1430,11 @@ impl TaskRunner {
                 .join("projects")
                 .join(parts[0])
                 .join(format!("{}.git", parts[1]));
-            if bare.exists() {
+            let bare_for_check = bare.clone();
+            if tokio::task::spawn_blocking(move || bare_for_check.exists())
+                .await
+                .unwrap_or(false)
+            {
                 return Ok(bare);
             }
         }
@@ -1675,8 +1682,8 @@ mod tests {
 
     // ── resolve_project_dir ──────────────────────────────────────────────────
 
-    #[test]
-    fn resolve_project_dir_uses_project_dir_env() {
+    #[tokio::test]
+    async fn resolve_project_dir_uses_project_dir_env() {
         // When PROJECT_DIR env var is set, it should always win.
         let runner = TaskRunner::new("owner/repo".to_string());
 
@@ -1689,7 +1696,7 @@ mod tests {
         // thread-safe in general, but the subsequent call is synchronous and
         // isolated to the temp dir created above.
         std::env::set_var("PROJECT_DIR", &dir_str);
-        let result = runner.resolve_project_dir();
+        let result = runner.resolve_project_dir().await;
         std::env::remove_var("PROJECT_DIR");
 
         assert!(
@@ -1699,12 +1706,12 @@ mod tests {
         assert_eq!(result.unwrap(), dir.path());
     }
 
-    #[test]
-    fn resolve_project_dir_empty_project_dir_env_falls_through() {
+    #[tokio::test]
+    async fn resolve_project_dir_empty_project_dir_env_falls_through() {
         // An empty PROJECT_DIR should be ignored and fall through to other logic.
         let runner = TaskRunner::new("owner/testrepo-nonexistent".to_string());
         std::env::set_var("PROJECT_DIR", "");
-        let result = runner.resolve_project_dir();
+        let result = runner.resolve_project_dir().await;
         std::env::remove_var("PROJECT_DIR");
 
         // Should succeed (falls back to current dir) without panicking.
