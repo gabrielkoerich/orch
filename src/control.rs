@@ -27,7 +27,6 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result};
 use regex::Regex;
-use sqlx::Row;
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
@@ -230,24 +229,23 @@ pub struct ChatContext {
 /// Assemble the chat context from SQLite state and live system info.
 pub async fn assemble_context(store: &TaskStore, session_id: &str) -> Result<ChatContext> {
     // 1. Gather memories from KV (keys matching control:memory:{session}:*)
-    let memory_prefix = format!("control:memory:{session_id}:%");
-    let memory_rows = sqlx::query("SELECT key, value FROM kv WHERE key LIKE ?")
-        .bind(&memory_prefix)
-        .fetch_all(store.pool())
+    // Use kv_list_prefix which correctly escapes LIKE metacharacters so that
+    // session names containing '_' or '%' don't leak memories from other sessions.
+    let memory_prefix = format!("control:memory:{session_id}:");
+    let raw_memories = store
+        .kv_list_prefix(&memory_prefix)
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(session_id, error = %e, "failed to load control memories from store");
             Vec::new()
         });
-    let memories = if memory_rows.is_empty() {
+    let memories = if raw_memories.is_empty() {
         "(none)".to_string()
     } else {
-        memory_rows
+        raw_memories
             .iter()
-            .map(|r| {
-                let key: String = r.get("key");
-                let short_key = key.strip_prefix("control:memory:").unwrap_or(&key);
-                let value: String = r.get("value");
+            .map(|(key, value)| {
+                let short_key = key.strip_prefix("control:memory:").unwrap_or(key);
                 format!("- **{short_key}**: {value}")
             })
             .collect::<Vec<_>>()
