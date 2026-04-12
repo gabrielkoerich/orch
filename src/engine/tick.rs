@@ -1428,8 +1428,7 @@ pub(crate) async fn tick_unblock_parents(
     // a GraphQL call for them.
     let store_blocked = store
         .list_by_status(repo, crate::store::TaskStatus::Blocked)
-        .await
-        .unwrap_or_default();
+        .await?;
     let has_block_reason: std::collections::HashSet<String> = store_blocked
         .iter()
         .filter(|t| t.block_reason.is_some())
