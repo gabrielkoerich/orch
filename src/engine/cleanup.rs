@@ -366,14 +366,14 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
                     .unwrap_or(repo)
                     .trim_end_matches(".git");
                 let candidate = worktrees_base.join(project).join(b);
-                match tokio::fs::try_exists(&candidate).await {
+                if match tokio::fs::try_exists(&candidate).await {
                     Ok(true) => true,
                     Ok(false) => false,
                     Err(e) => {
                         tracing::warn!(task_id, err = %e, "try_exists failed — assuming candidate does not exist");
                         false
                     }
-                }
+                } {
                     Some(candidate)
                 } else {
                     None
@@ -390,14 +390,14 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
             .unwrap_or(repo)
             .trim_end_matches(".git");
         let candidate = worktrees_base.join(project).join(b);
-            match tokio::fs::try_exists(&candidate).await {
-                Ok(true) => true,
-                Ok(false) => false,
-                Err(e) => {
-                    tracing::warn!(task_id, err = %e, "try_exists failed — assuming candidate does not exist");
-                    false
-                }
+        if match tokio::fs::try_exists(&candidate).await {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(e) => {
+                tracing::warn!(task_id, err = %e, "try_exists failed — assuming candidate does not exist");
+                false
             }
+        } {
             Some(candidate)
         } else {
             None
@@ -667,14 +667,14 @@ pub(crate) async fn remove_worktree_and_branch(
                 );
                 if let Err(e) = tokio::fs::remove_dir_all(wt).await {
                     // Only warn if the directory actually still exists after removal attempt.
-        match tokio::fs::try_exists(wt).await {
-            Ok(true) => true,
-            Ok(false) => false,
-            Err(e) => {
-                tracing::warn!(task_id, err = %e, "try_exists failed — assuming worktree does not exist");
-                false
-            }
-        }
+                    if match tokio::fs::try_exists(wt).await {
+                        Ok(true) => true,
+                        Ok(false) => false,
+                        Err(e) => {
+                            tracing::warn!(task_id, err = %e, "try_exists failed — assuming worktree does not exist");
+                            false
+                        }
+                    } {
                         tracing::warn!(
                             task_id,
                             path = %wt.display(),
