@@ -381,7 +381,7 @@ impl ExternalBackend for GitHubBackend {
 
     async fn list_reconciliation_candidates(&self) -> anyhow::Result<Vec<ExternalTask>> {
         let since = (Utc::now() - Duration::days(30)).to_rfc3339();
-        let open = self.gh.list_all_open_issues(&self.repo).await?;
+        let open = self.gh.list_all_open_issues(&self.repo, None).await?;
         let closed = self.gh.list_closed_issues_since(&self.repo, &since).await?;
         let issues = open.into_iter().chain(closed);
 
@@ -404,7 +404,7 @@ impl ExternalBackend for GitHubBackend {
 
     /// List open issues that have no `status:*` label (unprocessed) or have `status:new`.
     async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
-        let issues = self.gh.list_all_open_issues(&self.repo).await?;
+        let issues = self.gh.list_all_open_issues(&self.repo, None).await?;
         Ok(issues
             .into_iter()
             .filter(|issue| issue.pull_request.is_none()) // Exclude PRs
@@ -432,10 +432,12 @@ impl ExternalBackend for GitHubBackend {
     /// Single-call override: fetches all open issues once and partitions by status label locally,
     /// replacing the 1 (list_routable) + 5 (list_by_status per active status) fan-out with a
     /// single `list_all_open_issues` request.
+    /// When `since` is `Some(ts)`, uses GitHub's `?since` filter for efficiency.
     async fn list_active_open_issues(
         &self,
+        since: Option<&str>,
     ) -> anyhow::Result<Vec<(ExternalTask, Option<crate::backends::Status>)>> {
-        let issues = self.gh.list_all_open_issues(&self.repo).await?;
+        let issues = self.gh.list_all_open_issues(&self.repo, since).await?;
 
         let active_status_from_label = |label: &str| -> Option<crate::backends::Status> {
             match label {
@@ -549,7 +551,7 @@ impl ExternalBackend for GitHubBackend {
     async fn has_open_issue_with_title(&self, title: &str, label: &str) -> anyhow::Result<bool> {
         // Check open issues first
         let open_issues = if label.is_empty() {
-            self.gh.list_all_open_issues(&self.repo).await?
+            self.gh.list_all_open_issues(&self.repo, None).await?
         } else {
             self.gh.list_issues(&self.repo, label).await?
         };

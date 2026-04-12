@@ -1084,11 +1084,20 @@ impl GhHttp {
     }
 
     /// List all open issues (no label filter, paginated).
-    pub async fn list_all_open_issues(&self, repo: &str) -> anyhow::Result<Vec<GitHubIssue>> {
+    ///
+    /// When `since` is `Some(ts)`, only returns issues updated after that ISO 8601 timestamp.
+    /// This is more efficient for periodic syncs — GitHub filters server-side.
+    pub async fn list_all_open_issues(
+        &self,
+        repo: &str,
+        since: Option<&str>,
+    ) -> anyhow::Result<Vec<GitHubIssue>> {
         let url = format!("{GITHUB_API}/repos/{repo}/issues");
-        let all: Vec<GitHubIssue> = self
-            .get_all_pages(&url, &[("state", "open"), ("per_page", "100")])
-            .await?;
+        let params = match since {
+            Some(ts) => vec![("state", "open"), ("since", ts), ("per_page", "100")],
+            None => vec![("state", "open"), ("per_page", "100")],
+        };
+        let all: Vec<GitHubIssue> = self.get_all_pages(&url, &params).await?;
         // GitHub /issues API returns PRs too — filter them out
         Ok(all
             .into_iter()
