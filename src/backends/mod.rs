@@ -220,11 +220,17 @@ pub trait ExternalBackend: Send + Sync {
     /// Fetch all open issues for ingest in a single logical call, returning each issue paired
     /// with its detected status (`None` = unlabeled/routable, `Some(s)` = has status label `s`).
     ///
+    /// When `since` is `Some(ts)`, only returns issues updated after that ISO 8601 timestamp.
+    /// This is more efficient for periodic syncs.  Use `None` for full sync.
+    ///
     /// The default implementation calls `list_routable()` followed by `list_by_status()` for
     /// each active non-new status, deduplicating by ID.  Backends that support bulk listing
     /// (e.g. GitHub) should override this to fetch all open issues in one API call and
     /// partition locally, eliminating the 1 + N fan-out.
-    async fn list_active_open_issues(&self) -> anyhow::Result<Vec<(ExternalTask, Option<Status>)>> {
+    async fn list_active_open_issues(
+        &self,
+        _since: Option<&str>,
+    ) -> anyhow::Result<Vec<(ExternalTask, Option<Status>)>> {
         let mut seen = std::collections::HashSet::new();
         let mut result = Vec::new();
 

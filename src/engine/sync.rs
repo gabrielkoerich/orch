@@ -1735,20 +1735,37 @@ pub(crate) async fn ingest_external_tasks(
         }
     }
 
+    // Track last ingest time for incremental fetches (same pattern as mentions_last_checked).
+    // Use 24h fallback on first run or if the key is missing.
+    let kv_key = format!("issues_last_ingested:{repo}");
+    let fallback = (chrono::Utc::now() - chrono::Duration::hours(24))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    let since = store
+        .kv_get(&kv_key)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(fallback);
+    let since_for_fetch = since.clone();
+
     // Fetch all open issues in a single backend call and partition by status label locally.
     // The GitHub backend overrides list_active_open_issues() to use one list_all_open_issues()
     // request instead of a routable call + N per-status calls.
-    let all_tasks: Vec<(crate::backends::ExternalTask, Option<Status>)> =
-        match backend.list_active_open_issues().await {
-            Ok(tasks) => tasks,
-            Err(e) => {
-                tracing::debug!(
-                    ?e,
-                    "ingest: failed to list active open issues — skipping this cycle"
-                );
-                return Ok(());
-            }
-        };
+    // Pass `since` to filter issues updated since last ingest for efficiency.
+    let all_tasks: Vec<(crate::backends::ExternalTask, Option<Status>)> = match backend
+        .list_active_open_issues(Some(&since_for_fetch))
+        .await
+    {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::debug!(
+                ?e,
+                "ingest: failed to list active open issues — skipping this cycle"
+            );
+            return Ok(());
+        }
+    };
 
     // Upsert into the store, collecting store IDs for batch status check.
     // Also acknowledge newly detected issues (eyes reaction).
@@ -1938,6 +1955,12 @@ pub(crate) async fn ingest_external_tasks(
         }
     }
 
+    // Record last ingest time for next incremental fetch.
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    if let Err(e) = store.kv_set(&kv_key, &now).await {
+        tracing::warn!(key = kv_key, err = %e, "ingest: failed to record last ingest time");
+    }
+
     Ok(())
 }
 
@@ -2015,6 +2038,7 @@ mod tests {
         }
         async fn list_active_open_issues(
             &self,
+            _: Option<&str>,
         ) -> anyhow::Result<Vec<(ExternalTask, Option<Status>)>> {
             let mut result = Vec::new();
             for (label, tasks) in &self.tasks {
@@ -2339,6 +2363,7 @@ mod tests {
             /// Return a mix: one unlabeled (no status) + one labeled in_progress.
             async fn list_active_open_issues(
                 &self,
+                _: Option<&str>,
             ) -> anyhow::Result<Vec<(ExternalTask, Option<Status>)>> {
                 Ok(vec![
                     (make_ext_task("100", "Unlabeled routable"), None),
