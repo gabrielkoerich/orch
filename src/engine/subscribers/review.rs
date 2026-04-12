@@ -374,20 +374,30 @@ pub fn spawn(
                         // close, or another review cycle) may have already moved the task out
                         // of `in_review`. If so, discard the stale outcome rather than
                         // overwriting the newer state.
-                        let current_status: Option<crate::store::TaskStatus> = async {
+                        let fetched: Option<(crate::store::TaskStatus, Option<String>)> = async {
                             let id = store_c.resolve_task_id(&repo_s, &tid).await.ok().flatten()?;
                             let task = store_c.get(id).await.ok()?;
-                            Some(task.status)
+                            Some((task.status, task.block_reason))
                         }
                         .await;
+                        let current_status = fetched.as_ref().map(|(s, _)| *s);
+                        let current_block_reason =
+                            fetched.and_then(|(_, r)| r);
 
                         if !matches!(current_status, Some(crate::store::TaskStatus::InReview)) {
-                            let expected = matches!(
+                            let ci_blocked = matches!(
                                 current_status,
-                                Some(crate::store::TaskStatus::Done)
-                                    | Some(crate::store::TaskStatus::Routed)
-                                    | Some(crate::store::TaskStatus::New)
-                            );
+                                Some(crate::store::TaskStatus::Blocked)
+                            ) && current_block_reason
+                                .as_deref()
+                                .is_some_and(|r| r.contains("CI failure limit"));
+                            let expected = ci_blocked
+                                || matches!(
+                                    current_status,
+                                    Some(crate::store::TaskStatus::Done)
+                                        | Some(crate::store::TaskStatus::Routed)
+                                        | Some(crate::store::TaskStatus::New)
+                                );
                             if expected {
                                 tracing::debug!(
                                     task_id = tid,
