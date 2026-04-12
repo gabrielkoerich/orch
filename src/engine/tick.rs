@@ -502,15 +502,19 @@ pub(crate) async fn tick_recover_stuck_tasks(
         // router picks a different agent/model on the next attempt. Without this, the router
         // sees the agent as healthy and selects it again, causing the hang to repeat.
         // (Mirrors the pattern in tick_detect_silent_agents lines 219–284.)
+        let mut cached_store_id: Option<i64> = None;
         if timing.has_session {
             let store_task = match store.resolve_task_id(repo, &task.id.0).await {
-                Ok(Some(store_id)) => match store.get(store_id).await {
-                    Ok(t) => Some(t),
-                    Err(e) => {
-                        tracing::warn!(task_id = task.id.0, error = %e, "failed to fetch task from store for stuck-task cooldown");
-                        None
+                Ok(Some(store_id)) => {
+                    cached_store_id = Some(store_id);
+                    match store.get(store_id).await {
+                        Ok(t) => Some(t),
+                        Err(e) => {
+                            tracing::warn!(task_id = task.id.0, error = %e, "failed to fetch task from store for stuck-task cooldown");
+                            None
+                        }
                     }
-                },
+                }
                 Ok(None) => None,
                 Err(e) => {
                     tracing::warn!(task_id = task.id.0, error = %e, "failed to resolve task id for stuck-task cooldown");
@@ -557,7 +561,11 @@ pub(crate) async fn tick_recover_stuck_tasks(
                 }
             }
         }
-        if let Ok(Some(store_id)) = store.resolve_task_id(repo, &task.id.0).await {
+        let resolved_store_id = match cached_store_id {
+            Some(id) => Some(id),
+            None => store.resolve_task_id(repo, &task.id.0).await.ok().flatten(),
+        };
+        if let Some(store_id) = resolved_store_id {
             store_set_by_id(
                 &Some(Arc::clone(store)),
                 store_id,
@@ -673,15 +681,19 @@ pub(crate) async fn tick_recover_stuck_tasks(
         // Apply agent/model cooldown for internal stuck tasks with active sessions,
         // mirroring the external path (lines 501-546). Without this, the router picks
         // the same agent/model that caused the hang, creating an infinite loop.
+        let mut cached_store_id: Option<i64> = None;
         if timing.has_session {
             let store_task = match store.resolve_task_id(repo, &task_id).await {
-                Ok(Some(store_id)) => match store.get(store_id).await {
-                    Ok(t) => Some(t),
-                    Err(e) => {
-                        tracing::warn!(task_id, error = %e, "failed to fetch task from store for stuck internal-task cooldown");
-                        None
+                Ok(Some(store_id)) => {
+                    cached_store_id = Some(store_id);
+                    match store.get(store_id).await {
+                        Ok(t) => Some(t),
+                        Err(e) => {
+                            tracing::warn!(task_id, error = %e, "failed to fetch task from store for stuck internal-task cooldown");
+                            None
+                        }
                     }
-                },
+                }
                 Ok(None) => None,
                 Err(e) => {
                     tracing::warn!(task_id, error = %e, "failed to resolve task id for stuck internal-task cooldown");
@@ -721,7 +733,11 @@ pub(crate) async fn tick_recover_stuck_tasks(
         }
         // Reset routing state so the LLM router is used on the next attempt
         // (same reset that external tasks perform).
-        if let Ok(Some(store_id)) = store.resolve_task_id(repo, &task_id).await {
+        let resolved_store_id = match cached_store_id {
+            Some(id) => Some(id),
+            None => store.resolve_task_id(repo, &task_id).await.ok().flatten(),
+        };
+        if let Some(store_id) = resolved_store_id {
             store_set_by_id(
                 &Some(Arc::clone(store)),
                 store_id,
