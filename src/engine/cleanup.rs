@@ -847,6 +847,96 @@ async fn worktree_age_hours(worktree: &std::path::Path) -> Option<u64> {
     Some(age.as_secs() / 3600)
 }
 
+/// Resolve the repo root for an orphaned worktree and remove it.
+///
+/// Used by `orch doctor --fix` and `orch prune` to clean up worktrees that are
+/// no longer owned by any task. Returns `true` if the worktree directory is gone
+/// after the call.
+pub(crate) async fn cleanup_orphaned_worktree(task_id: &str, wt: &std::path::Path) -> bool {
+    let repo_root = match resolve_repo_root_for_orphaned_worktree(wt).await {
+        Ok(root) => root,
+        Err(e) => {
+            tracing::warn!(
+                worktree = %wt.display(),
+                error = %e,
+                "cannot resolve repo root for orphaned worktree"
+            );
+            return false;
+        }
+    };
+    remove_worktree_and_branch(task_id, wt, None, std::path::Path::new(&repo_root), false).await
+}
+
+/// Resolve the main git repository root for an orphaned worktree.
+///
+/// First tries to parse the `.git` file's `gitdir:` pointer (two levels up from
+/// the pointer gives the bare repo root, which is the orch convention). Falls back
+/// to looking up registered projects by directory name when the `.git` file is
+/// absent or unparseable.
+pub(crate) async fn resolve_repo_root_for_orphaned_worktree(
+    wt: &std::path::Path,
+) -> anyhow::Result<String> {
+    let git_file = wt.join(".git");
+    if git_file.exists() {
+        if let Ok(content) = tokio::fs::read_to_string(&git_file).await {
+            for line in content.lines() {
+                if let Some(gitdir) = line.strip_prefix("gitdir: ") {
+                    // gitdir points to: <repo>/.git/worktrees/<name> (non-bare)
+                    //                or <repo>.git/worktrees/<name>   (bare)
+                    // Two levels up reaches the .git dir / bare repo root.
+                    let gitdir_path = std::path::PathBuf::from(gitdir);
+                    if let Some(repo_root) = gitdir_path.parent().and_then(|p| p.parent()) {
+                        return Ok(repo_root.display().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: look up registered projects by the project-name component of the
+    // worktree path (format: ~/.orch/worktrees/<project>/<branch>).
+    let worktrees_dir = crate::home::worktrees_dir()?;
+    if let Ok(relative) = wt.strip_prefix(&worktrees_dir) {
+        if let Some(project_name) = relative.components().next() {
+            let project_name = project_name.as_os_str().to_string_lossy();
+
+            if let Ok(paths) = crate::config::get_project_paths() {
+                for path_str in &paths {
+                    let path = std::path::Path::new(path_str);
+                    if let Some(name) = path.file_name() {
+                        if name.to_string_lossy() == project_name {
+                            return Ok(path_str.clone());
+                        }
+                    }
+                }
+            }
+
+            // Try bare clone at ~/.orch/projects/<owner>/<project>.git
+            let parts: Vec<&str> = project_name.split('/').collect();
+            let bare = if parts.len() == 2 {
+                crate::home::projects_dir()
+                    .map(|d| d.join(parts[0]).join(format!("{}.git", parts[1])))
+                    .unwrap_or_default()
+            } else {
+                crate::home::projects_dir()
+                    .map(|d| {
+                        d.join("gabrielkoerich")
+                            .join(format!("{}.git", project_name))
+                    })
+                    .unwrap_or_default()
+            };
+            if bare.exists() {
+                return Ok(bare.display().to_string());
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "cannot resolve repo root for orphaned worktree at {} — tried .git parsing and project lookup",
+        wt.display()
+    )
+}
+
 /// Resolve the main git repository root from a worktree's .git file.
 ///
 /// For cross-project worktree cleanup, we cannot rely on `resolve_repo_root` because

@@ -418,6 +418,12 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Remove orphaned worktrees not owned by any task
+    Prune {
+        /// Show what would be removed without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Export task session output in human-readable format
     Session {
         #[command(subcommand)]
@@ -1052,6 +1058,9 @@ async fn main() -> anyhow::Result<()> {
         },
         Commands::Doctor { full, fix, dry_run } => {
             cli::doctor::run(full, fix, dry_run).await?;
+        }
+        Commands::Prune { dry_run } => {
+            cli::prune::run(dry_run).await?;
         }
         Commands::Session { action } => match action {
             SessionAction::Export {
