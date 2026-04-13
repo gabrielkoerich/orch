@@ -274,8 +274,8 @@ async fn run_gateway(
         let ws_url = state.ws_url();
         tracing::debug!(url = %ws_url, "connecting to discord gateway");
 
-        match connect_async(&ws_url).await {
-            Ok((ws, _)) => {
+        match tokio::time::timeout(Duration::from_secs(30), connect_async(&ws_url)).await {
+            Ok(Ok((ws, _))) => {
                 backoff = Duration::from_secs(1); // reset on success
 
                 let result =
@@ -297,11 +297,17 @@ async fn run_gateway(
                     }
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(
                     ?e,
                     backoff_secs = backoff.as_secs(),
                     "discord gateway: connect failed"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    backoff_secs = backoff.as_secs(),
+                    "discord gateway: connect timed out"
                 );
             }
         }
@@ -334,7 +340,9 @@ async fn handle_connection(
     let (mut write, mut read) = ws.split();
 
     // ── Step 1: Hello ────────────────────────────────────────────────────────
-    let text = next_text_message(&mut read).await?;
+    let text = tokio::time::timeout(Duration::from_secs(15), next_text_message(&mut read))
+        .await
+        .map_err(|_| anyhow::anyhow!("discord gateway: Hello timed out"))??;
     let hello: GatewayPayload = serde_json::from_str(&text)?;
     anyhow::ensure!(
         hello.op == OP_HELLO,
