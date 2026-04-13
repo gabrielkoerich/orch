@@ -1558,7 +1558,7 @@ pub(crate) async fn tick_unblock_parents(
 
 /// Phase 5 of tick: run cron job matching and fire any due jobs.
 pub(crate) async fn tick_job_scheduler(
-    jobs_path: &std::path::PathBuf,
+    jobs_path: &std::path::Path,
     backend: &Arc<dyn ExternalBackend>,
     store: Option<&Arc<TaskStore>>,
     repo: &str,
@@ -1585,7 +1585,7 @@ pub(crate) async fn tick(
     capture: &Arc<CaptureService>,
     semaphore: &Arc<Semaphore>,
     config: &EngineConfig,
-    jobs_path: &std::path::PathBuf,
+    jobs_path: &std::path::Path,
     router: &mut Router,
     task_manager: &Arc<TaskManager>,
     weight_tx: &mpsc::Sender<WeightSignal>,
