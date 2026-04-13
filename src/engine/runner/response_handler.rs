@@ -727,7 +727,7 @@ async fn detect_push_failure_state(
                 // On DB error, read current value to ensure blocking threshold is still reachable
                 ctx.get_task()
                     .await
-                    .map(|t| (t.push_failures as u64) + 1)
+                    .map(|t| (t.push_failures.max(0) as u64) + 1)
                     .unwrap_or(1) // assume at least 1 if we can't read either
             }
         }
@@ -772,7 +772,7 @@ async fn detect_no_code_reroutes(
             // On DB error, read current value to ensure blocking threshold is still reachable
             ctx.get_task()
                 .await
-                .map(|t| (t.no_code_reroutes as u64) + 1)
+                .map(|t| (t.no_code_reroutes.max(0) as u64) + 1)
                 .unwrap_or(1) // assume at least 1 if we can't read either
         }
     }
