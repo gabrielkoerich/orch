@@ -639,6 +639,12 @@ pub(crate) async fn auto_merge_pr(
                         tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason and set Blocked");
                         return Ok(());
                     }
+                    // Immediately attempt to clean up the task's worktree when blocking
+                    // due to CI failures to avoid orphaned worktrees that will never be
+                    // re-used until human intervention.
+                    if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
+                        tracing::warn!(task_id = task.id.0, err = %e, "cleanup after CI-failure block failed");
+                    }
                 } else {
                     tracing::warn!(
                         task_id = task.id.0,
@@ -693,6 +699,10 @@ pub(crate) async fn auto_merge_pr(
                         {
                             tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason and set Blocked");
                             return Ok(());
+                        }
+                        // Attempt cleanup for CI-timeout based blocks as well.
+                        if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
+                            tracing::warn!(task_id = task.id.0, err = %e, "cleanup after CI-timeout block failed");
                         }
                     } else {
                         tracing::warn!(
