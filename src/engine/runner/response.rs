@@ -179,12 +179,18 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
             let mut attempt_nums: Vec<u32> = tokio::task::spawn_blocking({
                 let a = attempts_dir.clone();
                 move || {
-                    std::fs::read_dir(&a)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|e| e.ok())
-                        .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse().ok()))
-                        .collect::<Vec<u32>>()
+                    match std::fs::read_dir(&a) {
+                        Ok(entries) => entries
+                            .filter_map(|e| e.ok())
+                            .filter_map(|e| {
+                                e.file_name().to_str().and_then(|n| n.parse().ok())
+                            })
+                            .collect::<Vec<u32>>(),
+                        Err(e) => {
+                            tracing::warn!(path = %a.display(), err = %e, "failed to read attempts dir in output fallback");
+                            Vec::new()
+                        }
+                    }
                 }
             })
             .await
