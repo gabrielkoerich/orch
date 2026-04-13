@@ -1813,20 +1813,23 @@ pub(crate) async fn ingest_external_tasks(
                                 "ingest: failed to comment on duplicate issue"
                             );
                         }
-                        if let Err(e) = backend.update_status(&task.id, Status::Done).await {
-                            tracing::warn!(
-                                task_id = task.id.0,
-                                err = %e,
-                                "ingest: failed to close duplicate issue"
-                            );
-                        } else {
-                            tracing::info!(
-                                task_id = task.id.0,
-                                duplicate_of = target.id,
-                                "ingest: closed duplicate issue"
-                            );
+                        match backend.update_status(&task.id, Status::Done).await {
+                            Ok(()) => {
+                                tracing::info!(
+                                    task_id = task.id.0,
+                                    duplicate_of = target.id,
+                                    "ingest: closed duplicate issue"
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    task_id = task.id.0,
+                                    err = %e,
+                                    "ingest: failed to close duplicate issue — falling through to ingest normally"
+                                );
+                            }
                         }
-                        continue;
                     }
                 }
             }
