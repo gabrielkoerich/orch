@@ -383,7 +383,8 @@ async fn build_review_context(
         let fetch_timeout = std::time::Duration::from_secs(60);
         let fetch_future = async {
             let mut cmd = Command::new("git");
-            cmd.args(["fetch", "origin", "--prune"]).current_dir(&worktree_path);
+            cmd.args(["fetch", "origin", "--prune"])
+                .current_dir(&worktree_path);
             // Ensure the child is killed if the timeout elapses
             cmd.kill_on_drop(true);
             cmd.output_with_context().await
@@ -1825,16 +1826,22 @@ async fn ensure_pr_exists(
                                     timeout_secs = pr_timeout.as_secs(),
                                     "gh pr create CLI fallback timed out"
                                 );
-                                let e_str = format!("gh pr create timed out after {}s", pr_timeout.as_secs());
-                                if crate::engine::runner::git_ops::is_transient_github_api_error(&e_str)
-                                {
+                                let e_str = format!(
+                                    "gh pr create timed out after {}s",
+                                    pr_timeout.as_secs()
+                                );
+                                if crate::engine::runner::git_ops::is_transient_github_api_error(
+                                    &e_str,
+                                ) {
                                     tracing::warn!(
                                         task_id = task.id.0,
                                         branch = %branch_name,
                                         "transient GitHub timeout from gh CLI fallback; will retry later without incrementing persistent failure counter"
                                     );
                                     return Ok(EnsurePrResult::EarlyReturn(
-                                        ReviewDecision::Failed(format!("transient gh error: {e_str}")),
+                                        ReviewDecision::Failed(format!(
+                                            "transient gh error: {e_str}"
+                                        )),
                                     ));
                                 }
 
