@@ -1734,41 +1734,21 @@ pub(crate) async fn ingest_external_tasks(
 
     // Track last ingest time for incremental fetches (same pattern as mentions_last_checked).
     // Use 24h fallback on first run or if the key is missing.
-    // Also reset the key if it's stale (engine was down) to avoid permanently skipping
-    // issues created during downtime. GitHub's `since` filters by updated_at, not created_at,
-    // so issues created while the engine was down would be invisible.
+    // Note: on startup, the engine clears this key for all repos (see clear_issues_last_ingested)
+    // so the first ingest after a restart always uses the 24h window. This prevents issues
+    // created during engine downtime from being permanently skipped (GitHub's `since` filters
+    // by updated_at, not created_at, so issues created while the engine was down would otherwise
+    // be invisible).
     let kv_key = format!("issues_last_ingested:{repo}");
     let fallback = (chrono::Utc::now() - chrono::Duration::hours(24))
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
-
-    let stored_since = store.kv_get(&kv_key).await.ok().flatten();
-
-    // Check if stored value is stale (engine was likely down). If the stored timestamp
-    // is more than 2x the sync interval old, delete it so we use the 24h fallback instead.
-    // This catches issues created during downtime that would otherwise be permanently skipped.
-    let since = if let Some(ref stored) = stored_since {
-        let two_sync_intervals = chrono::Duration::seconds(90); // 2x 45s sync interval
-        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(stored) {
-            let age = chrono::Utc::now().signed_duration_since(dt.with_timezone(&chrono::Utc));
-            if age > two_sync_intervals {
-                tracing::info!(
-                    stored = stored,
-                    age_hours = age.num_hours(),
-                    "issues_last_ingested is stale — clearing to catch issues created during engine downtime"
-                );
-                let _ = store.kv_delete(&kv_key).await;
-                fallback
-            } else {
-                stored.clone()
-            }
-        } else {
-            // Invalid timestamp format, fall back to 24h
-            stored.clone()
-        }
-    } else {
-        fallback
-    };
+    let since = store
+        .kv_get(&kv_key)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(fallback);
     let since_for_fetch = since.clone();
 
     // Fetch all open issues in a single backend call and partition by status label locally.
@@ -1987,6 +1967,24 @@ pub(crate) async fn ingest_external_tasks(
     }
 
     Ok(())
+}
+
+/// Clear `issues_last_ingested:{repo}` for all repos on engine startup.
+///
+/// This ensures that the first ingest after a restart uses the 24h fallback window
+/// instead of an incremental `since` timestamp that may have been set before a period
+/// of engine downtime. Without this, issues created while the engine was down would be
+/// permanently invisible: GitHub's `since` filter uses `updated_at`, so any issue whose
+/// `updated_at` predates the stored timestamp is silently skipped.
+pub(crate) async fn clear_issues_last_ingested(store: &crate::store::TaskStore, repo: &str) {
+    let kv_key = format!("issues_last_ingested:{repo}");
+    match store.kv_delete(&kv_key).await {
+        Ok(_) => tracing::info!(
+            repo,
+            "cleared issues_last_ingested for full re-scan on startup"
+        ),
+        Err(e) => tracing::warn!(repo, err = %e, "failed to clear issues_last_ingested on startup"),
+    }
 }
 
 #[cfg(test)]

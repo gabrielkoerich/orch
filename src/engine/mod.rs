@@ -741,6 +741,14 @@ pub async fn serve() -> anyhow::Result<()> {
     if let Err(e) = reconcile_startup_worktrees(&project_engines).await {
         tracing::warn!(err = %e, "startup worktree reconciliation failed");
     }
+
+    // Clear incremental ingest cursors so the first sync after startup re-scans the last 24h.
+    // This catches issues created during engine downtime that would otherwise be permanently
+    // skipped (GitHub's `since` filter uses updated_at, not created_at).
+    for engine in &project_engines {
+        crate::engine::sync::clear_issues_last_ingested(&engine.store, &engine.repo).await;
+    }
+
     {
         // Run estimate reconciliation in the background so it never blocks startup.
         // Each GraphQL mutation takes ~0.8 s; with hundreds of tasks this would
