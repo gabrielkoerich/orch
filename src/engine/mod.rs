@@ -159,6 +159,13 @@ pub struct EngineConfig {
     /// Stuck task timeout for tasks with no active tmux session (seconds).
     /// Shorter than `stuck_timeout` because no session means the agent has already exited.
     pub no_session_stuck_timeout: u64,
+    /// Stuck task timeout for in_review tasks with no active tmux session (seconds).
+    /// Longer than `no_session_stuck_timeout` because review agents exit their tmux session
+    /// on normal completion before the result is delivered to the engine. Using a short
+    /// no-session timeout for in_review tasks causes a race where a completed review result
+    /// arrives after the stuck recovery has already reset the task to needs_review, discarding
+    /// the review work.
+    pub in_review_no_session_stuck_timeout: u64,
     /// Auto-create follow-up tasks when PR reviews request changes
     pub auto_create_followup_on_changes: bool,
     /// Auto-close task (mark Done) when all PR reviews are approved.
@@ -182,6 +189,7 @@ impl Default for EngineConfig {
             max_parallel: 4,
             stuck_timeout: 1800,
             no_session_stuck_timeout: 600,
+            in_review_no_session_stuck_timeout: 1800,
             auto_create_followup_on_changes: true,
             auto_close_task_on_approval: false,
             graceful_shutdown_timeout: std::time::Duration::from_secs(600),
@@ -233,6 +241,14 @@ impl EngineConfig {
                 config.no_session_stuck_timeout = secs;
             } else {
                 tracing::warn!(key = "engine.no_session_stuck_timeout", value = %val, default_secs = config.no_session_stuck_timeout, "invalid value for engine.no_session_stuck_timeout, using default");
+            }
+        }
+
+        if let Ok(val) = crate::config::get("engine.in_review_no_session_stuck_timeout") {
+            if let Ok(secs) = val.parse::<u64>() {
+                config.in_review_no_session_stuck_timeout = secs;
+            } else {
+                tracing::warn!(key = "engine.in_review_no_session_stuck_timeout", value = %val, default_secs = config.in_review_no_session_stuck_timeout, "invalid value for engine.in_review_no_session_stuck_timeout, using default");
             }
         }
 
