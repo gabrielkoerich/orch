@@ -776,7 +776,7 @@ pub fn clear_agent_degraded(agent: &str) {
 pub async fn refresh_degraded_agents(
     store: &Arc<crate::store::TaskStore>,
     available_agents: &[String],
-    model_checker: &dyn Fn(&str) -> bool,
+    model_checker: &(dyn Fn(&str) -> bool + Send + Sync),
     window_hours: u32,
     threshold: i64,
 ) {

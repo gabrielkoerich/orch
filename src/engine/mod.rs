@@ -144,6 +144,7 @@ pub fn configured_agents() -> Vec<String> {
 }
 
 /// Engine configuration.
+#[derive(Clone)]
 pub struct EngineConfig {
     /// Main tick interval
     pub tick_interval: std::time::Duration,
@@ -1498,9 +1499,50 @@ pub async fn serve() -> anyhow::Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
 
+    // Guard to prevent concurrent sync_tick runs (sync is spawned as a background task).
+    let sync_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Tick watchdog: detects when the main loop hasn't completed a tick in > 60s.
+    // Updates an atomic timestamp at the end of each tick iteration.
+    let last_tick_epoch = Arc::new(std::sync::atomic::AtomicU64::new(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    ));
+    {
+        let last_tick_epoch = Arc::clone(&last_tick_epoch);
+        let tick_interval_secs = config.tick_interval.as_secs();
+        tokio::spawn(async move {
+            // Check every 30s whether the main loop is still ticking.
+            let mut watchdog_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                watchdog_interval.tick().await;
+                let last = last_tick_epoch.load(std::sync::atomic::Ordering::Relaxed);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let stale_secs = now.saturating_sub(last);
+                // Warn if the tick loop hasn't completed in > 6× the tick interval (at least 60s).
+                let threshold = (tick_interval_secs * 6).max(60);
+                if stale_secs > threshold {
+                    tracing::error!(
+                        stale_secs,
+                        threshold,
+                        "WATCHDOG: tick loop has not completed a tick in {}s (threshold {}s) — possible stall",
+                        stale_secs,
+                        threshold,
+                    );
+                }
+            }
+        });
+    }
+
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                let tick_start = std::time::Instant::now();
                 // Drain any pending weight signals from completed tasks
                 while let Ok(signal) = weight_rx.try_recv() {
                     let mut rw = router.write().await;
@@ -1563,22 +1605,57 @@ pub async fn serve() -> anyhow::Result<()> {
                     }
                     drop(router_guard);
 
-                    // Periodic sync (less frequent)
+                    // Periodic sync (less frequent) — spawned as a background task so it
+                    // cannot block the main tick loop. A stalled sync (hung HTTP call, slow
+                    // DB query, lock contention) previously parked all tokio workers for 12+
+                    // minutes because it ran inline. See issue #2574.
                     if last_sync.elapsed() >= config.sync_interval {
-                        for engine in &project_engines {
-                            let repo = engine.repo.clone();
-                            REPO_CONTEXT.scope(repo, async {
-                                if let Err(e) = sync::sync_tick(&engine.backend, &tmux, &engine.repo, &config, &router, &engine.task_manager, &engine.store, &dispatching, &auto_merge_in_flight).await {
-                                    tracing::error!(repo = %engine.repo, ?e, "sync tick failed for project");
+                        if sync_in_progress.compare_exchange(
+                            false,
+                            true,
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Relaxed,
+                        ).is_ok() {
+                            // Clone everything sync_tick needs — it runs in a spawned task.
+                            let sync_engines: Vec<_> = project_engines.iter().map(|e| {
+                                (e.backend.clone(), e.repo.clone(),
+                                 e.task_manager.clone(), e.store.clone())
+                            }).collect();
+                            let sync_tmux = Arc::clone(&tmux);
+                            let sync_config = config.clone();
+                            let sync_router = Arc::clone(&router);
+                            let sync_dispatching = Arc::clone(&dispatching);
+                            let sync_auto_merge = Arc::clone(&auto_merge_in_flight);
+                            let sync_guard = Arc::clone(&sync_in_progress);
+                            tokio::spawn(async move {
+                                let sync_start = std::time::Instant::now();
+                                for (backend, repo, task_manager, store) in &sync_engines {
+                                    let repo = repo.clone();
+                                    REPO_CONTEXT.scope(repo.clone(), async {
+                                        if let Err(e) = sync::sync_tick(
+                                            backend, &sync_tmux, &repo, &sync_config,
+                                            &sync_router, task_manager, store,
+                                            &sync_dispatching, &sync_auto_merge,
+                                        ).await {
+                                            tracing::error!(repo = %repo, ?e, "sync tick failed for project");
+                                        }
+                                    }).await;
                                 }
-                            }).await;
+                                // Emit degraded-agents metric/log once per sync cycle.
+                                if let Some((_, _, _, store)) = sync_engines.first() {
+                                    let r = sync_router.read().await;
+                                    sync::emit_degraded_agents_if_needed(&r, Some(store)).await;
+                                }
+                                let elapsed = sync_start.elapsed();
+                                tracing::info!(elapsed_ms = elapsed.as_millis() as u64, "sync tick complete");
+                                sync_guard.store(false, std::sync::atomic::Ordering::Release);
+                            });
+                        } else {
+                            tracing::debug!("sync tick still in progress, skipping");
                         }
-                        // Emit degraded-agents metric/log once per sync cycle (global state,
-                        // not per-project) to avoid N identical WARNs with N configured projects.
-                        if let Some(first_engine) = project_engines.first() {
-                            let r = router.read().await;
-                            sync::emit_degraded_agents_if_needed(&r, Some(&first_engine.store)).await;
-                        }
+                        // Records sync *schedule* time (not completion). This prevents
+                        // re-entering the sync branch every tick while one is in flight.
+                        // The sync_in_progress guard handles actual concurrency control.
                         last_sync = std::time::Instant::now();
                     }
                 }
@@ -1621,6 +1698,21 @@ pub async fn serve() -> anyhow::Result<()> {
                         last_webhook_health_check = std::time::Instant::now();
                     }
                 }
+
+                // Update watchdog timestamp + log tick duration.
+                let tick_elapsed = tick_start.elapsed();
+                if tick_elapsed.as_secs() > 5 {
+                    tracing::warn!(elapsed_ms = tick_elapsed.as_millis() as u64, "slow tick");
+                } else {
+                    tracing::debug!(elapsed_ms = tick_elapsed.as_millis() as u64, "tick complete");
+                }
+                last_tick_epoch.store(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
             // Webhook events trigger an immediate tick (bypass polling interval)
             _ = webhook_notify.notified() => {
