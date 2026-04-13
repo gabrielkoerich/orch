@@ -1240,7 +1240,8 @@ impl TaskStore {
     pub async fn list_external_tasks_with_estimates(&self) -> anyhow::Result<Vec<(String, u8)>> {
         let rows = sqlx::query(
             "SELECT external_id, estimate FROM tasks \
-             WHERE estimate > 0 AND external_id NOT LIKE 'internal:%'",
+             WHERE estimate > 0 AND external_id NOT LIKE 'internal:%' \
+             AND status NOT IN ('done', 'blocked')",
         )
         .fetch_all(&self.pool)
         .await?;

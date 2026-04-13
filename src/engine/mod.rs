@@ -98,6 +98,7 @@ type EngineRef = (
 ///
 /// Each project has its own backend, task runner, and task manager,
 /// but they share the global tmux manager, transport, and semaphore.
+#[derive(Clone)]
 pub struct ProjectEngine {
     pub repo: String,
     pub project_dir: std::path::PathBuf,
@@ -739,7 +740,15 @@ pub async fn serve() -> anyhow::Result<()> {
     if let Err(e) = reconcile_startup_worktrees(&project_engines).await {
         tracing::warn!(err = %e, "startup worktree reconciliation failed");
     }
-    reconcile_startup_estimates(&project_engines).await;
+    {
+        // Run estimate reconciliation in the background so it never blocks startup.
+        // Each GraphQL mutation takes ~0.8 s; with hundreds of tasks this would
+        // otherwise delay the engine reaching its main loop by several minutes.
+        let engines_snapshot: Vec<ProjectEngine> = project_engines.clone();
+        tokio::spawn(async move {
+            reconcile_startup_estimates(&engines_snapshot).await;
+        });
+    }
 
     // Build ChannelRouter from global config + per-project configs
     let global_channel_config = GlobalChannelConfig {
