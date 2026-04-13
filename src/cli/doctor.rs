@@ -788,7 +788,14 @@ async fn check_orphaned_worktrees(all_tasks: &[Task], findings: &mut Vec<Finding
         .map(|t| (t.worktree.as_str(), t))
         .collect();
 
-    for project_entry in project_dirs.flatten() {
+    for project_entry in project_dirs {
+        let project_entry = match project_entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(err = %e, "error reading worktrees directory entry");
+                continue;
+            }
+        };
         if !project_entry
             .file_type()
             .map(|t| t.is_dir())
@@ -800,7 +807,14 @@ async fn check_orphaned_worktrees(all_tasks: &[Task], findings: &mut Vec<Finding
             Ok(d) => d,
             Err(_) => continue,
         };
-        for branch_entry in branch_dirs.flatten() {
+        for branch_entry in branch_dirs {
+            let branch_entry = match branch_entry {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(err = %e, "error reading project directory entry");
+                    continue;
+                }
+            };
             if !branch_entry
                 .file_type()
                 .map(|t| t.is_dir())
