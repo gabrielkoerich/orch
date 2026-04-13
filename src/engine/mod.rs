@@ -1190,7 +1190,7 @@ pub async fn serve() -> anyhow::Result<()> {
             s.port = Some(port);
             s.healthy = false;
             s.fallback_mode = false;
-            s.save();
+            s.save().await;
         }
 
         // Spawn the HTTP server with exponential-backoff retry on transient
@@ -1232,7 +1232,7 @@ pub async fn serve() -> anyhow::Result<()> {
                             s.healthy = false;
                             s.last_failure_reason = Some(reason);
                             s.startup_attempts = attempt;
-                            s.save();
+                            s.save().await;
                             break;
                         }
                         let delay = webhook_backoff_delay(attempt);
@@ -1246,7 +1246,7 @@ pub async fn serve() -> anyhow::Result<()> {
                             let mut s = status_for_spawn.lock().await;
                             s.startup_attempts = attempt;
                             s.last_failure_reason = Some(reason);
-                            s.save();
+                            s.save().await;
                         }
                         tokio::time::sleep(delay).await;
                     }
@@ -1286,7 +1286,7 @@ pub async fn serve() -> anyhow::Result<()> {
             let mut s = webhook_status.lock().await;
             s.configured = false;
             s.fallback_mode = true;
-            s.save();
+            s.save().await;
         }
         tracing::info!(
             orch_webhook_in_fallback = true,
@@ -1700,7 +1700,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                 } else if failure_reason.is_some() {
                                     s.last_failure_reason = failure_reason;
                                 }
-                                s.save();
+                                s.save().await;
                             }
                         }
                         last_webhook_health_check = std::time::Instant::now();
