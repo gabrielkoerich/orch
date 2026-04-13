@@ -804,13 +804,21 @@ pub(crate) async fn auto_merge_pr(
                     review_agent,
                     Some(review_model),
                 );
-                let _ = gh
+                if let Err(e) = gh
                     .add_comment(
                         repo,
                         &pr_number.to_string(),
                         &format!("{}{}", comment, footer),
                     )
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        pr_number,
+                        err = %e,
+                        "auto-merge: failed to post merge conflict retry limit comment on PR"
+                    );
+                }
                 return Ok(());
             }
 
