@@ -180,12 +180,26 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
                 let a = attempts_dir.clone();
                 move || {
                     match std::fs::read_dir(&a) {
-                        Ok(entries) => entries
-                            .filter_map(|e| e.ok())
-                            .filter_map(|e| {
-                                e.file_name().to_str().and_then(|n| n.parse().ok())
-                            })
-                            .collect::<Vec<u32>>(),
+                        Ok(entries) => {
+                            let mut nums = Vec::new();
+                            for entry in entries {
+                                match entry {
+                                    Ok(e) => {
+                                        if let Some(n) =
+                                            e.file_name().to_str().and_then(|n| n.parse().ok())
+                                        {
+                                            nums.push(n);
+                                        }
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        path = %a.display(),
+                                        err = %e,
+                                        "error reading attempt dir entry in output fallback"
+                                    ),
+                                }
+                            }
+                            nums
+                        }
                         Err(e) => {
                             tracing::warn!(path = %a.display(), err = %e, "failed to read attempts dir in output fallback");
                             Vec::new()
