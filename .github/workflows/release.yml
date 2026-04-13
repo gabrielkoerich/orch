@@ -89,11 +89,9 @@ jobs:
         if: steps.find-pr.outputs.pr_number != ''
         run: |
           SUMMARY=$(lcov --summary lcov.info 2>&1 || echo "Coverage summary unavailable")
-          gh pr comment "$PR_NUMBER" --body "## Coverage Report
-
-          \`\`\`
-          ${SUMMARY}
-          \`\`\`"
+          LIST=$(lcov --list lcov.info 2>&1 || echo "Coverage list unavailable")
+          BODY=$(printf "## Coverage Report\n\nSummary:\n\n\`\`\`\n%s\n\`\`\`\n\nPer-file coverage:\n\n\`\`\`\n%s\n\`\`\`\n" "$SUMMARY" "$LIST")
+          gh pr comment "$PR_NUMBER" --body "$BODY"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.find-pr.outputs.pr_number }}
