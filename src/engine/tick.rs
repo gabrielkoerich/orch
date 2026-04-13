@@ -817,12 +817,23 @@ pub(crate) async fn tick_recover_stuck_tasks(
         }
 
         let review_task_id = format!("{}-review", task.id.0);
+        // Use in_review_no_session_stuck_timeout instead of the standard
+        // no_session_stuck_timeout. Review agents exit their tmux session on
+        // normal completion before delivering the result to the engine, so a
+        // short no-session timeout causes a race: the stuck recovery fires,
+        // resets the task to needs_review, and the completed result arriving
+        // moments later is discarded as stale. A longer threshold gives the
+        // result delivery enough time to complete.
+        let in_review_config = crate::engine::EngineConfig {
+            no_session_stuck_timeout: config.in_review_no_session_stuck_timeout,
+            ..config.clone()
+        };
         let Some(timing) = stuck_task_timing_from_map(
             tmux,
             repo,
             &review_task_id,
             &task.updated_at,
-            config,
+            &in_review_config,
             "cannot parse updated_at, skipping stuck in_review check",
             &session_map,
         ) else {
