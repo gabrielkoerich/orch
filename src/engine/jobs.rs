@@ -21,7 +21,7 @@ use crate::store::{JobState, TaskStatus};
 use anyhow::Context;
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -179,13 +179,16 @@ fn is_not_found_error(e: &anyhow::Error) -> bool {
 /// Runtime state (last_run, active_task_id, last_task_status) is stored in
 /// SQLite via the `job_state` table, not in the YAML config file.
 pub async fn tick(
-    jobs_path: &PathBuf,
+    jobs_path: &Path,
     backend: &Arc<dyn ExternalBackend>,
     store: Option<&Arc<crate::store::TaskStore>>,
     repo: &str,
     transport: Option<&Arc<Transport>>,
 ) -> anyhow::Result<()> {
-    let jobs = load_jobs(jobs_path)?;
+    let jobs_path_clone = jobs_path.to_path_buf();
+    let jobs = tokio::task::spawn_blocking(move || load_jobs(&jobs_path_clone))
+        .await
+        .map_err(|e| anyhow::anyhow!("load_jobs panicked: {e}"))??;
     let now = chrono::Utc::now();
 
     for job in &jobs {
