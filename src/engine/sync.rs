@@ -60,7 +60,7 @@ async fn try_kv_get_prefer_store(
 /// errors or guarantee persistence (e.g., for circuit breaker state).
 async fn kv_set_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str, value: &str) {
     if let Err(e) = try_kv_set_prefer_store(store, key, value).await {
-        tracing::warn!(key, err = %e, "kv_set failed");
+        tracing::error!(key, err = %e, "kv_set failed");
     }
 }
 
@@ -780,12 +780,12 @@ pub(crate) async fn sync_tick(
         if let Err(e) =
             try_kv_set_prefer_store(&Some(store), "metrics:orch.github_5xx_circuit.open", "1").await
         {
-            tracing::warn!(err = %e, "failed to persist circuit breaker state — may cause thundering herd after restart");
+            tracing::error!(err = %e, "failed to persist circuit breaker state — may cause thundering herd after restart");
         }
     } else if let Err(e) =
         try_kv_set_prefer_store(&Some(store), "metrics:orch.github_5xx_circuit.open", "0").await
     {
-        tracing::warn!(err = %e, "failed to clear circuit breaker state");
+        tracing::error!(err = %e, "failed to clear circuit breaker state");
     }
 
     // 0. Ingest all active external tasks into the unified store.
@@ -978,7 +978,7 @@ pub(crate) async fn sync_tick(
                 )
                 .await
                 {
-                    tracing::warn!(task_id = task.task_id(), err = %e, "failed to write review_agent_failures to store");
+                    tracing::error!(task_id = task.task_id(), err = %e, "failed to write review_agent_failures to store");
                 }
                 match task_manager
                     .update_task_status_if(&task.external.id, Status::NeedsReview, Status::InReview)
@@ -1948,7 +1948,7 @@ pub(crate) async fn ingest_external_tasks(
     // Record last ingest time for next incremental fetch.
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     if let Err(e) = store.kv_set(&kv_key, &now).await {
-        tracing::warn!(key = kv_key, err = %e, "ingest: failed to record last ingest time");
+        tracing::error!(key = kv_key, err = %e, "ingest: failed to record last ingest time");
     }
 
     Ok(())
