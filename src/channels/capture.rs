@@ -37,9 +37,11 @@ pub struct OutputBuffer {
     pub last_hash: Option<[u8; 32]>,
     /// When the last capture occurred
     pub last_capture: DateTime<Utc>,
-    /// Whether the session has been seen alive at least once.
-    /// Prevents firing "session ended" for sessions that were registered
-    /// before the tmux session was actually created.
+    /// Whether the session has been seen alive at least once (i.e., `capture_pane`
+    /// succeeded at least once). Prevents firing "session ended" for sessions that
+    /// were registered before the tmux session was actually created.
+    /// Also used by silence detection: a seen-alive session with no output is only
+    /// treated as silent if the tmux session is currently dead (silent exit-0).
     pub seen_alive: bool,
     /// When this session was registered for capture.
     pub registered_at: DateTime<Utc>,
@@ -166,15 +168,14 @@ impl CaptureService {
     /// A session is "silent" when:
     /// 1. It has been registered for longer than `grace_period`
     /// 2. It has NEVER produced any meaningful output (`has_output == false`)
-    /// 3. It has NEVER been confirmed alive by `capture_pane` succeeding at least once
+    /// 3. Either it was NEVER confirmed alive, OR it was seen alive but the tmux
+    ///    session is now dead (silent exit-0 case)
     ///
-    /// Condition (3) is critical: a session that's been alive for 774s+ without
-    /// terminal output is doing real work (writing files, running long tool calls),
-    /// not stuck. Only sessions that were NEVER confirmed alive should be killed —
-    /// sessions that were seen alive at least once (even with empty pane) are
-    /// actively working and will be handled by the hard timeout if they exceed
-    /// `stuck_timeout`. This prevents killing complex refactoring tasks that
-    /// produce minimal terminal output (issue #2318).
+    /// Condition (3) balances two cases:
+    /// - Session alive and working (tmux session exists, agent running, sparse output)
+    ///   → should NOT be killed; hard timeout will catch it if it runs too long (#2318)
+    /// - Session was alive but exited silently with no output (tmux session dead)
+    ///   → SHOULD trigger silence fallback within grace_period, not wait 30 min (#2573)
     ///
     /// Returns (task_id, session_name, age_secs) for silent sessions.
     pub async fn get_silent_sessions_for_repo(
@@ -184,20 +185,30 @@ impl CaptureService {
     ) -> Vec<(String, String, i64)> {
         let now = Utc::now();
         let buffers = self.buffers.read().await;
+        let mut candidates: Vec<OutputBuffer> = buffers
+            .values()
+            .filter(|buf| buf.repo == repo && !buf.has_output)
+            .cloned()
+            .collect();
+        drop(buffers);
+
         let mut silent = Vec::new();
-        for buf in buffers.values() {
-            if buf.repo != repo {
-                continue;
-            }
-            if buf.has_output {
-                continue;
-            }
-            // Only kill sessions that were never confirmed alive. If capture_pane
-            // succeeded at least once, the session is alive and actively working
-            // (just with no terminal output). The hard timeout handler will catch
-            // it if it runs too long.
+        for buf in candidates.drain(..) {
             if buf.seen_alive {
-                continue;
+                // Session was confirmed alive at least once. If the tmux session is
+                // still running, it's doing real work with sparse output — skip it
+                // (the hard stuck_timeout will catch runaway tasks). If the session
+                // is dead and produced no output, it's a silent exit — fall through
+                // to the grace period check so silence detection fires within 120s
+                // instead of waiting the full 30-minute stuck_timeout.
+                if !tmux::is_session_dead(&buf.session).await {
+                    continue;
+                }
+                tracing::debug!(
+                    task_id = buf.task_id,
+                    session = buf.session,
+                    "session seen-alive but now dead with no output, treating as silent exit"
+                );
             }
             let age = now.signed_duration_since(buf.registered_at);
             if age.num_seconds() > grace_period.as_secs() as i64 {
@@ -364,6 +375,29 @@ fn cap_content(content: &str) -> String {
     content[start..].to_string()
 }
 
+impl CaptureService {
+    /// Test helper: mutate buffer fields for a registered session by task_id.
+    /// Panics if the session is not registered.
+    #[cfg(test)]
+    pub(crate) async fn set_buffer_state_for_test(
+        &self,
+        repo: &str,
+        task_id: &str,
+        seen_alive: bool,
+        has_output: bool,
+        registered_at: chrono::DateTime<Utc>,
+    ) {
+        let skey = crate::channels::transport::session_key(repo, task_id);
+        let mut buffers = self.buffers.write().await;
+        let buf = buffers
+            .get_mut(&skey)
+            .unwrap_or_else(|| panic!("no buffer for {repo}/{task_id}"));
+        buf.seen_alive = seen_alive;
+        buf.has_output = has_output;
+        buf.registered_at = registered_at;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,27 +514,26 @@ mod tests {
         // seen_alive=false (default) + has_output=false → IS silent.
         svc.register_session(repo, "silent-task", "orch-test-silent")
             .await;
-        {
-            let skey = session_key(repo, "silent-task");
-            let mut buffers = svc.buffers.write().await;
-            let buf = buffers
-                .get_mut(&skey)
-                .expect("buffer should exist for registered silent-task session");
-            buf.registered_at = Utc::now() - chrono::Duration::seconds(200);
-        }
+        svc.set_buffer_state_for_test(
+            repo,
+            "silent-task",
+            false,
+            false,
+            Utc::now() - chrono::Duration::seconds(200),
+        )
+        .await;
 
         // Register a session that HAS produced output (should not be returned).
         svc.register_session(repo, "active-task", "orch-test-active")
             .await;
-        {
-            let skey = session_key(repo, "active-task");
-            let mut buffers = svc.buffers.write().await;
-            let buf = buffers
-                .get_mut(&skey)
-                .expect("buffer should exist for registered active-task session");
-            buf.registered_at = Utc::now() - chrono::Duration::seconds(200);
-            buf.has_output = true;
-        }
+        svc.set_buffer_state_for_test(
+            repo,
+            "active-task",
+            false,
+            true, // has_output
+            Utc::now() - chrono::Duration::seconds(200),
+        )
+        .await;
 
         // Register a fresh session within grace period (should not be returned).
         svc.register_session(repo, "new-task", "orch-test-new")
@@ -512,15 +545,24 @@ mod tests {
         assert_eq!(silent[0].0, "silent-task");
     }
 
-    /// Regression test for issue #2318: sessions that were confirmed alive (capture_pane
-    /// succeeded at least once) must NOT be killed by silence detection, even if they
-    /// have no terminal output and exceed the grace period.
+    /// Regression test for issue #2318 and fix for issue #2573.
     ///
-    /// Claude agents doing complex refactoring can run for 15+ minutes producing no
-    /// terminal output (they write files via Edit/Write tools). Such sessions are alive
-    /// and working — only the hard timeout handler should terminate them.
+    /// A session confirmed alive (capture_pane succeeded at least once) with no
+    /// terminal output falls into two cases:
+    ///
+    /// - **Tmux session dead, no output** (silent exit-0, issue #2573): IS silent.
+    ///   The agent exited immediately without printing anything. Should be detected
+    ///   within the grace period, not wait 30 minutes for stuck_timeout.
+    ///
+    /// - **Tmux session alive, no output** (issue #2318): NOT silent.
+    ///   Claude agents doing complex refactoring can run 15+ minutes with sparse
+    ///   terminal output (writing files via Edit/Write tools). Hard timeout handles them.
+    ///
+    /// In tests, tmux sessions don't exist, so `is_session_dead` returns `true` for
+    /// both sessions below — both "never-seen" and "seen-but-dead" are correctly
+    /// classified as silent exits.
     #[tokio::test]
-    async fn get_silent_sessions_excludes_seen_alive_sessions() {
+    async fn get_silent_sessions_seen_alive_dead_session_is_silent() {
         let transport = Arc::new(Transport::new());
         let svc = CaptureService::new(transport);
         let repo = "owner/repo";
@@ -528,40 +570,44 @@ mod tests {
         // Session past grace period, never seen alive → IS silent.
         svc.register_session(repo, "never-seen-task", "orch-never-seen")
             .await;
-        {
-            let skey = session_key(repo, "never-seen-task");
-            let mut buffers = svc.buffers.write().await;
-            let buf = buffers
-                .get_mut(&skey)
-                .expect("buffer should exist for registered never-seen-task session");
-            buf.registered_at = Utc::now() - chrono::Duration::seconds(500);
-            // seen_alive = false (default), has_output = false
-        }
+        svc.set_buffer_state_for_test(
+            repo,
+            "never-seen-task",
+            false, // seen_alive = false (default)
+            false, // has_output = false
+            Utc::now() - chrono::Duration::seconds(500),
+        )
+        .await;
 
-        // Session past grace period, seen alive but no output → NOT silent (issue #2318).
-        svc.register_session(repo, "seen-but-quiet-task", "orch-seen-quiet")
+        // Session past grace period, seen alive, no output, tmux session dead
+        // (simulates silent exit-0 from issue #2573) → IS silent.
+        // The session name ends with "-dead" to work with both the integration test
+        // mock (which returns `is_session_dead=true` for "-dead" names) and the unit
+        // test context (where no real tmux session by that name exists → dead).
+        svc.register_session(repo, "seen-but-dead-task", "orch-seen-dead")
             .await;
-        {
-            let skey = session_key(repo, "seen-but-quiet-task");
-            let mut buffers = svc.buffers.write().await;
-            let buf = buffers
-                .get_mut(&skey)
-                .expect("buffer should exist for registered seen-but-quiet-task session");
-            buf.registered_at = Utc::now() - chrono::Duration::seconds(500);
-            buf.seen_alive = true; // capture_pane succeeded at least once
-                                   // has_output = false (empty terminal, but session IS alive)
-        }
+        svc.set_buffer_state_for_test(
+            repo,
+            "seen-but-dead-task",
+            true,  // seen_alive: capture_pane succeeded at least once
+            false, // has_output = false, tmux session no longer exists → silent exit
+            Utc::now() - chrono::Duration::seconds(500),
+        )
+        .await;
 
         let grace = std::time::Duration::from_secs(120);
         let silent = svc.get_silent_sessions_for_repo(repo, grace).await;
-        // Only "never-seen-task" should be returned. "seen-but-quiet-task" is alive and
-        // actively working (just with no terminal output) — let the hard timeout handle it.
+        // Both sessions should be returned: "never-seen-task" was never alive, and
+        // "seen-but-dead-task" was alive but the tmux session is now dead with no output.
         assert_eq!(
             silent.len(),
-            1,
-            "seen_alive=true session must not be silenced"
+            2,
+            "both never-alive and dead-with-no-output sessions must be silenced"
         );
-        assert_eq!(silent[0].0, "never-seen-task");
+        let ids: std::collections::HashSet<&str> =
+            silent.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert!(ids.contains("never-seen-task"));
+        assert!(ids.contains("seen-but-dead-task"));
     }
 
     #[tokio::test]
@@ -573,19 +619,22 @@ mod tests {
             .await;
         svc.register_session("owner/repo-b", "task-b", "orch-b")
             .await;
-        {
-            let skey_a = session_key("owner/repo-a", "task-a");
-            let skey_b = session_key("owner/repo-b", "task-b");
-            let mut buffers = svc.buffers.write().await;
-            let buf_a = buffers
-                .get_mut(&skey_a)
-                .expect("buffer should exist for registered task-a session");
-            buf_a.registered_at = Utc::now() - chrono::Duration::seconds(200);
-            let buf_b = buffers
-                .get_mut(&skey_b)
-                .expect("buffer should exist for registered task-b session");
-            buf_b.registered_at = Utc::now() - chrono::Duration::seconds(200);
-        }
+        svc.set_buffer_state_for_test(
+            "owner/repo-a",
+            "task-a",
+            false,
+            false,
+            Utc::now() - chrono::Duration::seconds(200),
+        )
+        .await;
+        svc.set_buffer_state_for_test(
+            "owner/repo-b",
+            "task-b",
+            false,
+            false,
+            Utc::now() - chrono::Duration::seconds(200),
+        )
+        .await;
 
         let grace = std::time::Duration::from_secs(120);
         let silent_a = svc
