@@ -856,11 +856,24 @@ pub(crate) async fn auto_merge_pr(
                         "attempting rebase to resolve merge conflict"
                     );
                     let default_branch = worktree::detect_default_branch(&wt_path).await;
-                    let fetch_result = tokio::process::Command::new("git")
-                        .args(["fetch", "origin"])
-                        .current_dir(&wt_path)
-                        .output()
-                        .await;
+                    let git_timeout = std::time::Duration::from_secs(120);
+                    let fetch_result = tokio::time::timeout(
+                        git_timeout,
+                        tokio::process::Command::new("git")
+                            .args(["fetch", "origin"])
+                            .current_dir(&wt_path)
+                            .kill_on_drop(true)
+                            .output(),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        tracing::warn!(
+                            task_id = task.id.0,
+                            "git fetch timed out in rebase recovery after {}s",
+                            git_timeout.as_secs()
+                        );
+                        Err(std::io::Error::other("git fetch timed out"))
+                    });
 
                     let rebase_result = match fetch_result {
                         Ok(out) if out.status.success() => {
@@ -891,11 +904,23 @@ pub(crate) async fn auto_merge_pr(
 
                     match rebase_result {
                         Ok(git_ops::RebaseOutcome::Succeeded) => {
-                            let push_result = tokio::process::Command::new("git")
-                                .args(["push", "--force-with-lease"])
-                                .current_dir(&wt_path)
-                                .output()
-                                .await;
+                            let push_result = tokio::time::timeout(
+                                git_timeout,
+                                tokio::process::Command::new("git")
+                                    .args(["push", "--force-with-lease"])
+                                    .current_dir(&wt_path)
+                                    .kill_on_drop(true)
+                                    .output(),
+                            )
+                            .await
+                            .unwrap_or_else(|_| {
+                                tracing::warn!(
+                                    task_id = task.id.0,
+                                    "git push timed out in rebase recovery after {}s",
+                                    git_timeout.as_secs()
+                                );
+                                Err(std::io::Error::other("git push timed out"))
+                            });
 
                             match push_result {
                                 Ok(push_out) if push_out.status.success() => {
