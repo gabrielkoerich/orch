@@ -133,7 +133,15 @@ impl TaskStore {
             .await?
         };
         rows.iter()
-            .map(|r| Self::row_to_control_message(r).context("parsing control_message row"))
+            .map(|r| {
+                Self::row_to_control_message(r).with_context(|| {
+                    format!(
+                        "parsing control_message row id={:?} session_id={:?}",
+                        r.try_get::<i64, _>("id").ok(),
+                        r.try_get::<String, _>("session_id").ok()
+                    )
+                })
+            })
             .collect::<Result<Vec<_>, _>>()
     }
 
@@ -180,7 +188,15 @@ impl TaskStore {
             .await?
         };
         rows.iter()
-            .map(|r| Self::row_to_control_message(r).context("parsing control_message row"))
+            .map(|r| {
+                Self::row_to_control_message(r).with_context(|| {
+                    format!(
+                        "parsing control_message row id={:?} session_id={:?}",
+                        r.try_get::<i64, _>("id").ok(),
+                        r.try_get::<String, _>("session_id").ok()
+                    )
+                })
+            })
             .collect::<Result<Vec<_>, _>>()
     }
 
