@@ -658,6 +658,11 @@ enum TaskAction {
         /// Task ID (e.g. "1234" or "internal:8")
         id: String,
     },
+    /// Unified diagnostic view: status, agent, attempts, last error, PR, block reason
+    Inspect {
+        /// Task ID (e.g. "internal:8" or issue number)
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -917,6 +922,9 @@ async fn main() -> anyhow::Result<()> {
             }
             TaskAction::Reopen { id } => {
                 cli::task::reopen(&id).await?;
+            }
+            TaskAction::Inspect { id } => {
+                cli::task::inspect(&id).await?;
             }
         },
         Commands::Job { action } => match action {
