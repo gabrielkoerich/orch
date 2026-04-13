@@ -245,9 +245,36 @@ jobs:
           path: dist/orch-${{ matrix.arch }}
           retention-days: 1
 
+  # Build Zola docs and deploy to GitHub Pages on every push to main.
+  deploy:
+    needs: [test, secrets]
+    if: github.ref == 'refs/heads/main'
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: zola@0.22.1
+      - run: zola --root docs build
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/public
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
   # Create GitHub release with binaries
   release:
-    needs: [test, secrets, check-release, build-macos]
+    needs: [test, secrets, deploy, check-release, build-macos]
     if: github.ref == 'refs/heads/main' && needs.check-release.outputs.skip == 'false'
     runs-on: ubuntu-latest
     permissions:
@@ -470,30 +497,3 @@ jobs:
           fi
           git -C tap-repo commit -m "chore: update orch formula to ${VERSION}"
           git -C tap-repo push origin main
-
-  # Build Zola docs and deploy to GitHub Pages on every push to main.
-  deploy:
-    needs: [test, secrets]
-    if: github.ref == 'refs/heads/main'
-    concurrency:
-      group: pages
-      cancel-in-progress: false
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: zola@0.22.1
-      - run: zola --root docs build
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: docs/public
-      - id: deployment
-        uses: actions/deploy-pages@v4
