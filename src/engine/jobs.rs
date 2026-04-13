@@ -478,18 +478,30 @@ pub async fn execute_job(
                 let dir = job.dir.as_deref().unwrap_or(".");
                 tracing::info!(job_id = job.id, cmd, dir, "running bash command");
 
-                let output = tokio::process::Command::new("bash")
-                    .arg("-c")
-                    .arg(cmd)
-                    .current_dir(dir)
-                    .output_with_context()
-                    .await;
+                // Configurable timeout with 5-minute default. A bash job that hangs
+                // (network operation, blocking subprocess) would otherwise park a Tokio
+                // worker for its entire duration, blocking the inline tick loop.
+                let timeout_secs: u64 = crate::config::get("jobs.bash_timeout_seconds")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(300);
+                let timeout = std::time::Duration::from_secs(timeout_secs);
+
+                let output = tokio::time::timeout(
+                    timeout,
+                    tokio::process::Command::new("bash")
+                        .arg("-c")
+                        .arg(cmd)
+                        .current_dir(dir)
+                        .output_with_context(),
+                )
+                .await;
 
                 match output {
-                    Ok(o) if o.status.success() => {
+                    Ok(Ok(o)) if o.status.success() => {
                         state.last_task_status = Some("done".to_string());
                     }
-                    Ok(o) => {
+                    Ok(Ok(o)) => {
                         let stderr = String::from_utf8_lossy(&o.stderr);
                         tracing::warn!(
                             job_id = job.id,
@@ -499,9 +511,18 @@ pub async fn execute_job(
                         );
                         state.last_task_status = Some("failed".to_string());
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::error!(job_id = job.id, ?e, "bash command error");
                         state.last_task_status = Some("failed".to_string());
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            job_id = job.id,
+                            secs = timeout_secs,
+                            "bash job timed out after {}s — killing to unblock tick loop",
+                            timeout_secs
+                        );
+                        state.last_task_status = Some("timeout".to_string());
                     }
                 }
             }
