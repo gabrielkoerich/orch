@@ -1080,18 +1080,25 @@ pub(crate) async fn tick_route_tasks(
                             );
                         }
                         // Sync the estimate to GitHub Projects if the router assigned one.
+                        // Fire-and-forget: do NOT await inline — GraphQL mutations can take
+                        // up to 30 s and would block the entire tick loop on every routed task.
                         if result.estimate > 0 {
-                            if let Err(e) = backend
-                                .sync_estimate_to_project(&task.id, result.estimate)
-                                .await
-                            {
-                                tracing::debug!(
-                                    task_id = task.id.0,
-                                    estimate = result.estimate,
-                                    err = %e,
-                                    "dual-write: estimate project sync failed"
-                                );
-                            }
+                            let backend_clone = Arc::clone(backend);
+                            let task_id = task.id.clone();
+                            let estimate = result.estimate;
+                            tokio::spawn(async move {
+                                if let Err(e) = backend_clone
+                                    .sync_estimate_to_project(&task_id, estimate)
+                                    .await
+                                {
+                                    tracing::debug!(
+                                        task_id = task_id.0,
+                                        estimate,
+                                        err = %e,
+                                        "dual-write: estimate project sync failed"
+                                    );
+                                }
+                            });
                         }
                     }
                     Err(e) => {
