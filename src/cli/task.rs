@@ -1813,6 +1813,128 @@ pub async fn history(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Unified diagnostic view for a task: status, agent, attempts, last error, PR, block reason.
+pub async fn inspect(id: &str) -> anyhow::Result<()> {
+    let store = crate::cli::init_store().await?;
+    let repo = config::get_current_repo().unwrap_or_default();
+    let Some(task_id) = store.resolve_task_id(&repo, id).await? else {
+        anyhow::bail!("task not found: {id}");
+    };
+
+    let task = store.get(task_id).await?;
+
+    // ── Identity ─────────────────────────────────────────────────────────────
+    println!("Task: {}", task.title);
+    println!(
+        "  ID      : {} (internal:{})",
+        task.external_id.as_deref().unwrap_or("-"),
+        task.id
+    );
+    println!("  Status  : {}", task.status.as_str());
+    println!(
+        "  Created : {} ({})",
+        task.created_at,
+        format_age(&task.created_at)
+    );
+    println!(
+        "  Updated : {} ({})",
+        task.updated_at,
+        format_age(&task.updated_at)
+    );
+    if !task.url.is_empty() {
+        println!("  URL     : {}", task.url);
+    }
+
+    // ── Routing ───────────────────────────────────────────────────────────────
+    println!();
+    println!("Routing:");
+    println!("  Agent      : {}", task.agent.as_deref().unwrap_or("-"));
+    println!("  Model      : {}", task.model.as_deref().unwrap_or("-"));
+    if !task.complexity.is_empty() {
+        println!("  Complexity : {}", task.complexity);
+    }
+    if task.route_attempts > 0 {
+        println!("  Route attempts : {}", task.route_attempts);
+    }
+    if !task.route_reason.is_empty() {
+        println!("  Reason     : {}", truncate_err(&task.route_reason, 120));
+    }
+
+    // ── Execution ─────────────────────────────────────────────────────────────
+    println!();
+    println!("Execution:");
+    println!("  Attempts : {}", task.attempts);
+    if !task.branch.is_empty() {
+        println!("  Branch   : {}", task.branch);
+    }
+    if !task.worktree.is_empty() {
+        println!("  Worktree : {}", task.worktree);
+    }
+    if !task.last_error.is_empty() {
+        println!("  Last error : {}", truncate_err(&task.last_error, 200));
+    }
+    if !task.summary.is_empty() {
+        println!("  Summary  : {}", truncate_err(&task.summary, 200));
+    }
+
+    // ── PR / Review ───────────────────────────────────────────────────────────
+    if task.pr_number.is_some() || task.review_cycles > 0 || !task.pr_review_context.is_empty() {
+        println!();
+        println!("PR / Review:");
+        if let Some(pr) = task.pr_number {
+            println!("  PR number     : {}", pr);
+        }
+        if task.review_cycles > 0 {
+            println!("  Review cycles : {}", task.review_cycles);
+        }
+        if !task.pr_review_context.is_empty() {
+            println!(
+                "  Review context: {}",
+                truncate_err(&task.pr_review_context, 200)
+            );
+        }
+    }
+
+    // ── Block reason ─────────────────────────────────────────────────────────
+    if let Some(ref reason) = task.block_reason {
+        println!();
+        println!("Blocked:");
+        println!("  Reason : {}", reason);
+        if task.auto_unblock_count > 0 {
+            println!("  Auto-unblock attempts : {}", task.auto_unblock_count);
+        }
+    }
+
+    // ── Cost ─────────────────────────────────────────────────────────────────
+    let total_tokens = task.input_tokens + task.output_tokens;
+    if total_tokens > 0 || task.total_cost_usd > 0.0 {
+        println!();
+        println!("Cost:");
+        println!(
+            "  Tokens : {}in / {}out",
+            task.input_tokens, task.output_tokens
+        );
+        println!("  Total  : ${:.6}", task.total_cost_usd);
+    }
+
+    // ── Live session ─────────────────────────────────────────────────────────
+    let task_key = task
+        .external_id
+        .clone()
+        .unwrap_or_else(|| format!("internal:{}", task.id));
+    let tmux = TmuxManager::new();
+    let session = tmux.session_name(&repo, &task_key);
+    if tmux.session_exists(&session).await {
+        println!();
+        println!(
+            "Live session: {} (use `orch task attach {}` to connect)",
+            session, id
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
