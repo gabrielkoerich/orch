@@ -133,9 +133,16 @@ impl TaskStore {
             .await?
         };
         rows.iter()
-            .map(Self::row_to_control_message)
+            .map(|r| {
+                Self::row_to_control_message(r).with_context(|| {
+                    format!(
+                        "parsing control_message row id={:?} session_id={:?}",
+                        r.try_get::<i64, _>("id").ok(),
+                        r.try_get::<String, _>("session_id").ok()
+                    )
+                })
+            })
             .collect::<Result<Vec<_>, _>>()
-            .map_err(anyhow::Error::from)
     }
 
     /// Search control messages by content (LIKE match, most recent first).
@@ -181,9 +188,16 @@ impl TaskStore {
             .await?
         };
         rows.iter()
-            .map(Self::row_to_control_message)
+            .map(|r| {
+                Self::row_to_control_message(r).with_context(|| {
+                    format!(
+                        "parsing control_message row id={:?} session_id={:?}",
+                        r.try_get::<i64, _>("id").ok(),
+                        r.try_get::<String, _>("session_id").ok()
+                    )
+                })
+            })
             .collect::<Result<Vec<_>, _>>()
-            .map_err(anyhow::Error::from)
     }
 
     /// Get the N most recent assistant message summaries (chronological order).
