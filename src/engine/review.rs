@@ -376,17 +376,46 @@ async fn build_review_context(
         EnsurePrResult::EarlyReturn(decision) => return Ok(ReviewPhase::EarlyReturn(decision)),
     };
 
-    if let Err(e) = Command::new("git")
-        .args(["fetch", "origin", "--prune"])
-        .current_dir(&worktree_path)
-        .output_with_context()
-        .await
+    // Run `git fetch` with a timeout so a hung network call cannot stall the
+    // review pipeline indefinitely. Treat a timeout or non-zero exit as a
+    // non-fatal warning (stale remote refs are acceptable for the review).
     {
-        tracing::warn!(
-            task_id = task.id.0,
-            error = %e,
-            "review: git fetch failed — diff/log may use stale remote refs"
-        );
+        let fetch_timeout = std::time::Duration::from_secs(60);
+        let fetch_future = async {
+            let mut cmd = Command::new("git");
+            cmd.args(["fetch", "origin", "--prune"]).current_dir(&worktree_path);
+            // Ensure the child is killed if the timeout elapses
+            cmd.kill_on_drop(true);
+            cmd.output_with_context().await
+        };
+
+        match tokio::time::timeout(fetch_timeout, fetch_future).await {
+            Ok(Ok(o)) if o.status.success() => {
+                // ok
+            }
+            Ok(Ok(o)) => {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    exit_code = ?o.status.code(),
+                    stdout = %String::from_utf8_lossy(&o.stdout),
+                    stderr = %String::from_utf8_lossy(&o.stderr),
+                    "review: git fetch failed (non-zero exit) — diff/log may use stale remote refs"
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    error = %e,
+                    "review: git fetch failed — diff/log may use stale remote refs"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    "review: git fetch timed out after 60s — diff/log may use stale remote refs"
+                );
+            }
+        }
     }
 
     let default_branch = runner::worktree::detect_default_branch(&worktree_path).await;
@@ -1593,25 +1622,28 @@ async fn ensure_pr_exists(
                             error = %e,
                             "create_pr failed via GhHttp, falling back to CLI"
                         );
-                        // Fall back to CLI
-                        let pr_result = tokio::process::Command::new("gh")
-                            .args([
-                                "pr",
-                                "create",
-                                "--repo",
-                                repo,
-                                "--head",
-                                branch_name,
-                                "--title",
-                                &task.title,
-                                "--body",
-                                &pr_body,
-                            ])
-                            .current_dir(worktree_path)
-                            .output()
-                            .await;
+                        // Fall back to CLI. Wrap the `gh pr create` call in a timeout so
+                        // a hung CLI/network does not block the review pipeline.
+                        let pr_timeout = std::time::Duration::from_secs(120);
+                        let mut gh_cmd = tokio::process::Command::new("gh");
+                        gh_cmd.args([
+                            "pr",
+                            "create",
+                            "--repo",
+                            repo,
+                            "--head",
+                            branch_name,
+                            "--title",
+                            &task.title,
+                            "--body",
+                            &pr_body,
+                        ]);
+                        gh_cmd.current_dir(worktree_path);
+                        gh_cmd.kill_on_drop(true);
+
+                        let pr_result = tokio::time::timeout(pr_timeout, gh_cmd.output()).await;
                         match pr_result {
-                            Ok(o) if o.status.success() => {
+                            Ok(Ok(o)) if o.status.success() => {
                                 let stdout = String::from_utf8_lossy(&o.stdout);
                                 match parse_pr_number_from_url(stdout.trim()) {
                                     Ok(pr_num) => {
@@ -1643,7 +1675,7 @@ async fn ensure_pr_exists(
                                     }
                                 }
                             }
-                            Ok(o) => {
+                            Ok(Ok(o)) => {
                                 let stderr = String::from_utf8_lossy(&o.stderr);
                                 if stderr.contains("already exists") {
                                     if let Some(pr_url) =
@@ -1742,7 +1774,7 @@ async fn ensure_pr_exists(
                                     format!("no PR, create failed: {stderr}"),
                                 )))
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 tracing::error!(
                                     task_id = task.id.0,
                                     error = %e,
@@ -1784,6 +1816,50 @@ async fn ensure_pr_exists(
                                 }
                                 Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Failed(
                                     format!("no PR, gh error: {e}"),
+                                )))
+                            }
+                            Err(_elapsed) => {
+                                // Timeout from tokio::time::timeout
+                                tracing::error!(
+                                    task_id = task.id.0,
+                                    timeout_secs = pr_timeout.as_secs(),
+                                    "gh pr create CLI fallback timed out"
+                                );
+                                let e_str = format!("gh pr create timed out after {}s", pr_timeout.as_secs());
+                                if crate::engine::runner::git_ops::is_transient_github_api_error(&e_str)
+                                {
+                                    tracing::warn!(
+                                        task_id = task.id.0,
+                                        branch = %branch_name,
+                                        "transient GitHub timeout from gh CLI fallback; will retry later without incrementing persistent failure counter"
+                                    );
+                                    return Ok(EnsurePrResult::EarlyReturn(
+                                        ReviewDecision::Failed(format!("transient gh error: {e_str}")),
+                                    ));
+                                }
+
+                                match store_increment(
+                                    &Some(Arc::clone(store)),
+                                    repo,
+                                    &task.id.0,
+                                    "pr_create_failures",
+                                )
+                                .await
+                                {
+                                    Ok(failures) if failures >= MAX_PR_CREATE_FAILURES => {
+                                        return Ok(EnsurePrResult::EarlyReturn(
+                                            ReviewDecision::Blocked(format!(
+                                                "no PR, gh timeout {failures} times: {e_str}"
+                                            )),
+                                        ));
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        tracing::warn!(task_id = task.id.0, err = %e, "failed to increment pr_create_failures — skipping blocking decision this tick");
+                                    }
+                                }
+                                Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Failed(
+                                    format!("no PR, gh timeout: {e_str}"),
                                 )))
                             }
                         }
