@@ -108,6 +108,222 @@ pub(crate) fn find_stash_ref_by_hash(stash_list: &str, stash_hash: &str) -> Opti
     })
 }
 
+/// Options for [`stash_rebase_restore`].
+pub(crate) struct StashRebaseOpts {
+    /// Disable GPG commit signing during the rebase (passes `-c commit.gpgsign=false`).
+    pub disable_gpg_signing: bool,
+    /// Abort the rebase (via `git rebase --abort`) and restore the stash when the
+    /// rebase fails.  Set to `false` when the caller intentionally leaves the working
+    /// tree in the in-progress-rebase state so an agent can resolve conflicts.
+    pub abort_on_failure: bool,
+}
+
+impl Default for StashRebaseOpts {
+    fn default() -> Self {
+        Self {
+            disable_gpg_signing: false,
+            abort_on_failure: true,
+        }
+    }
+}
+
+/// Outcome returned by [`stash_rebase_restore`].
+#[derive(Debug)]
+pub(crate) enum RebaseOutcome {
+    /// Rebase completed successfully.
+    Succeeded,
+    /// Rebase failed.  When `abort_on_failure` is true the rebase was aborted and any
+    /// stash was restored; when false the working tree is left in the in-progress-rebase
+    /// state.
+    Failed(String),
+    /// A stash operation failed (push failed, or OID could not be captured); the
+    /// rebase was skipped to preserve the dirty working tree.
+    Skipped(String),
+}
+
+/// Stash uncommitted changes, rebase onto `target_ref`, then restore the stash.
+///
+/// This is the single canonical implementation of the stash → rebase → restore
+/// pattern used in multiple call sites.  Callers are responsible for any
+/// `git fetch` that should precede the rebase.
+///
+/// # Concurrency safety
+/// Git stashes are repo-global; multiple worktrees share the same stash stack.
+/// This function captures the stash OID immediately after pushing and applies by
+/// that exact ref — never via `stash pop` — to avoid restoring a stash that
+/// belongs to a different concurrently-running worktree.
+///
+/// # Stash failure handling
+/// If the stash push fails, or the OID cannot be captured after a successful push,
+/// the rebase is **skipped** and [`RebaseOutcome::Skipped`] is returned.  This
+/// preserves the dirty working tree intact rather than risking data loss.
+pub(crate) async fn stash_rebase_restore(
+    dir: &Path,
+    target_ref: &str,
+    opts: StashRebaseOpts,
+) -> anyhow::Result<RebaseOutcome> {
+    let stash_ref: Option<String> = if has_changes(dir).await {
+        let stash_out = Command::new("git")
+            .args(["stash", "push", "--include-untracked", "-m", "orch-rebase"])
+            .current_dir(dir)
+            .output_with_context()
+            .await;
+
+        match stash_out {
+            Ok(o) if o.status.success() => {
+                let stdout_preview = String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                tracing::debug!(
+                    dir = %dir.display(),
+                    stdout = %stdout_preview,
+                    "git stash push succeeded before rebase"
+                );
+
+                // Capture the OID of the stash object just created so we can
+                // apply it back by that exact ref, regardless of any stashes
+                // that other worktrees may push between now and then.
+                let ref_out = Command::new("git")
+                    .args(["rev-parse", "refs/stash@{0}"])
+                    .current_dir(dir)
+                    .output_with_context()
+                    .await;
+                let stash_hash = ref_out
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .filter(|s| !s.is_empty());
+
+                if stash_hash.is_none() {
+                    // Stash was created but we can't track its ref.
+                    // Pop immediately to avoid orphaning the changes, then skip.
+                    tracing::warn!(
+                        dir = %dir.display(),
+                        "git stash succeeded but rev-parse failed — popping stash and skipping rebase"
+                    );
+                    let _ = Command::new("git")
+                        .args(["stash", "pop"])
+                        .current_dir(dir)
+                        .output_with_context()
+                        .await;
+                    return Ok(RebaseOutcome::Skipped(
+                        "stash OID capture failed".to_string(),
+                    ));
+                }
+                stash_hash
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                tracing::warn!(
+                    dir = %dir.display(),
+                    code = ?o.status.code(),
+                    stderr = %stderr,
+                    "git stash push failed — skipping rebase to preserve dirty state"
+                );
+                return Ok(RebaseOutcome::Skipped(format!(
+                    "stash push failed: {stderr}"
+                )));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "failed to run git stash push — skipping rebase to preserve dirty state"
+                );
+                return Ok(RebaseOutcome::Skipped(format!("stash push error: {e}")));
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut rebase_args: Vec<&str> = Vec::new();
+    if opts.disable_gpg_signing {
+        rebase_args.extend(["-c", "commit.gpgsign=false"]);
+    }
+    rebase_args.extend(["rebase", target_ref]);
+
+    let output = Command::new("git")
+        .args(&rebase_args)
+        .current_dir(dir)
+        .output_with_context()
+        .await;
+
+    match output {
+        Ok(o) if o.status.success() => {
+            tracing::debug!(dir = %dir.display(), target_ref, "rebase succeeded");
+            restore_stash_by_hash(dir, stash_ref.as_deref()).await;
+            Ok(RebaseOutcome::Succeeded)
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+            tracing::warn!(dir = %dir.display(), target_ref, err = %stderr, "rebase failed");
+            if opts.abort_on_failure {
+                let _ = Command::new("git")
+                    .args(["rebase", "--abort"])
+                    .current_dir(dir)
+                    .output_with_context()
+                    .await;
+            }
+            restore_stash_by_hash(dir, stash_ref.as_deref()).await;
+            Ok(RebaseOutcome::Failed(stderr))
+        }
+        Err(e) => {
+            if opts.abort_on_failure {
+                let _ = Command::new("git")
+                    .args(["rebase", "--abort"])
+                    .current_dir(dir)
+                    .output_with_context()
+                    .await;
+            }
+            restore_stash_by_hash(dir, stash_ref.as_deref()).await;
+            Err(e)
+        }
+    }
+}
+
+/// Apply a stash entry by its OID and drop it from the stack on success.
+///
+/// On failure the entry is preserved so it can be recovered manually.
+async fn restore_stash_by_hash(dir: &Path, stash_hash: Option<&str>) {
+    let Some(stash_hash) = stash_hash else {
+        return;
+    };
+
+    let apply = Command::new("git")
+        .args(["stash", "apply", stash_hash])
+        .current_dir(dir)
+        .output_with_context()
+        .await;
+    if apply.map(|o| o.status.success()).unwrap_or(false) {
+        let list = Command::new("git")
+            .args(["stash", "list", "--format=%H %gd"])
+            .current_dir(dir)
+            .output_with_context()
+            .await;
+        if let Ok(list_out) = list {
+            if list_out.status.success() {
+                let list_str = String::from_utf8_lossy(&list_out.stdout);
+                if let Some(stash_ref) = find_stash_ref_by_hash(&list_str, stash_hash) {
+                    let _ = Command::new("git")
+                        .args(["stash", "drop", &stash_ref])
+                        .current_dir(dir)
+                        .output_with_context()
+                        .await;
+                }
+            }
+        }
+    } else {
+        tracing::warn!(
+            dir = %dir.display(),
+            stash = %stash_hash,
+            "stash apply failed after rebase — stash preserved for manual recovery"
+        );
+    }
+}
+
 /// Resolve the git author identity from config, falling back to `{agent}[bot]`.
 fn git_identity(agent: &str) -> (String, String) {
     let name = crate::config::get("git.name").unwrap_or_else(|_| format!("{agent}[bot]"));
@@ -254,112 +470,11 @@ pub async fn rebase_on_branch(dir: &Path, branch: &str) -> anyhow::Result<bool> 
         "rebasing local commits on origin/{branch}"
     );
 
-    // Stash any uncommitted changes so the rebase can proceed cleanly.
-    let stash_ref: Option<String> = if has_changes(dir).await {
-        let stash_out = Command::new("git")
-            .args(["stash", "--include-untracked"])
-            .current_dir(dir)
-            .output_with_context()
-            .await;
-        match stash_out {
-            Ok(o) if o.status.success() => {
-                // Capture the OID of the stash object just created.
-                let ref_out = Command::new("git")
-                    .args(["rev-parse", "refs/stash@{0}"])
-                    .current_dir(dir)
-                    .output_with_context()
-                    .await;
-                ref_out
-                    .ok()
-                    .filter(|o| o.status.success())
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    .filter(|s| !s.is_empty())
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
-
-    // Guard: if has_changes was true but stash failed, skip the rebase to avoid
-    // "cannot rebase: You have unstaged changes" error. The worktree remains dirty
-    // and the next tick will retry.
-    let has_uncommitted_changes = has_changes(dir).await;
-    if has_uncommitted_changes && stash_ref.is_none() {
-        tracing::warn!(
-            branch = branch,
-            "git stash failed during rebase_on_branch — skipping rebase to avoid worktree loss"
-        );
-        return Ok(false);
+    match stash_rebase_restore(dir, &origin_branch, StashRebaseOpts::default()).await? {
+        RebaseOutcome::Succeeded => Ok(true),
+        RebaseOutcome::Failed(e) => anyhow::bail!("rebase failed: {e}"),
+        RebaseOutcome::Skipped(reason) => anyhow::bail!("rebase skipped: {reason}"),
     }
-
-    // Perform the rebase.
-    let output = Command::new("git")
-        .args(["rebase", &origin_branch])
-        .current_dir(dir)
-        .output_with_context()
-        .await;
-
-    match output {
-        Ok(o) if o.status.success() => {
-            tracing::info!(branch = branch, "successfully rebased on origin/{branch}");
-        }
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            tracing::warn!(
-                branch = branch,
-                err = %stderr,
-                "rebase failed, aborting and returning error"
-            );
-            // Abort failed rebase so the worktree is in a clean state.
-            let _ = Command::new("git")
-                .args(["rebase", "--abort"])
-                .current_dir(dir)
-                .output_with_context()
-                .await;
-            anyhow::bail!("rebase failed: {stderr}");
-        }
-        Err(e) => {
-            tracing::warn!(branch = branch, err = %e, "failed to run rebase");
-            anyhow::bail!("failed to run rebase: {e}");
-        }
-    }
-
-    // Restore stashed changes using the captured ref.
-    if let Some(ref stash_hash) = stash_ref {
-        let apply = Command::new("git")
-            .args(["stash", "apply", stash_hash])
-            .current_dir(dir)
-            .output_with_context()
-            .await;
-        if apply.map(|o| o.status.success()).unwrap_or(false) {
-            let list = Command::new("git")
-                .args(["stash", "list", "--format=%H %gd"])
-                .current_dir(dir)
-                .output_with_context()
-                .await;
-            if let Ok(output) = list {
-                if output.status.success() {
-                    let list_str = String::from_utf8_lossy(&output.stdout);
-                    if let Some(stash_ref) = find_stash_ref_by_hash(&list_str, stash_hash) {
-                        let _ = Command::new("git")
-                            .args(["stash", "drop", &stash_ref])
-                            .current_dir(dir)
-                            .output_with_context()
-                            .await;
-                    }
-                }
-            }
-        } else {
-            tracing::warn!(
-                stash = %stash_hash,
-                branch = branch,
-                "stash apply failed after rebase — stash preserved for manual recovery"
-            );
-        }
-    }
-
-    Ok(true)
 }
 
 /// Rebase the current branch on the default branch.
@@ -410,113 +525,23 @@ pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
         return;
     }
 
-    // Stash any uncommitted changes so the rebase can proceed cleanly.
-    // Worktrees killed mid-run (e.g. service restart) may have leftover
-    // unstaged changes from a previous attempt that block `git rebase`.
-    //
-    // Safety: git stashes are repo-global. With multiple worktrees running
-    // concurrently we must capture the exact stash ref created here and apply
-    // it by that ref — NOT with `stash pop`, which would apply stash@{0}
-    // (the most-recent stash) and could restore a stash from a different
-    // worktree running in parallel.
-    let stash_ref: Option<String> = if has_changes(dir).await {
-        let stash_out = Command::new("git")
-            .args(["stash", "--include-untracked"])
-            .current_dir(dir)
-            .output_with_context()
-            .await;
-        match stash_out {
-            Ok(o) if o.status.success() => {
-                // Capture the OID of the stash object just created so we can
-                // apply it back by its exact ref, regardless of any stashes
-                // that other worktrees may push between now and then.
-                let ref_out = Command::new("git")
-                    .args(["rev-parse", "refs/stash@{0}"])
-                    .current_dir(dir)
-                    .output_with_context()
-                    .await;
-                ref_out
-                    .ok()
-                    .filter(|o| o.status.success())
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    .filter(|s| !s.is_empty())
-            }
-            _ => None,
+    match stash_rebase_restore(
+        dir,
+        &format!("origin/{default_branch}"),
+        StashRebaseOpts::default(),
+    )
+    .await
+    {
+        Ok(RebaseOutcome::Succeeded) => {
+            tracing::debug!(default_branch, "rebased worktree on default branch")
         }
-    } else {
-        None
-    };
-
-    // Guard: if has_changes was true but stash failed, skip the rebase to avoid
-    // "cannot rebase: You have unstaged changes" error. The worktree remains dirty
-    // and the next tick will retry.
-    let has_uncommitted_changes = has_changes(dir).await;
-    if has_uncommitted_changes && stash_ref.is_none() {
-        tracing::warn!(
-            default_branch,
-            "git stash failed during rebase_on_default — skipping rebase to avoid worktree loss"
-        );
-        return;
-    }
-
-    let output = Command::new("git")
-        .args(["rebase", &format!("origin/{default_branch}")])
-        .current_dir(dir)
-        .output_with_context()
-        .await;
-
-    match output {
-        Ok(o) if o.status.success() => {
-            tracing::debug!(default_branch, "rebased worktree on default branch");
+        Ok(RebaseOutcome::Failed(e)) => {
+            tracing::warn!(default_branch, err = %e, "rebase failed, continuing with current state")
         }
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            tracing::warn!(
-                default_branch,
-                err = %stderr,
-                "rebase failed, aborting and continuing with current state"
-            );
-            // Abort failed rebase so the worktree is in a clean state
-            let _ = Command::new("git")
-                .args(["rebase", "--abort"])
-                .current_dir(dir)
-                .output_with_context()
-                .await;
+        Ok(RebaseOutcome::Skipped(reason)) => {
+            tracing::warn!(default_branch, %reason, "stash failed before rebase, continuing with current state")
         }
-        Err(e) => {
-            tracing::warn!(err = %e, "failed to run rebase");
-        }
-    }
-
-    // Restore stashed changes using the captured ref so we never accidentally
-    // pop a stash that belongs to a different concurrently-running worktree.
-    if let Some(ref stash_hash) = stash_ref {
-        let apply = Command::new("git")
-            .args(["stash", "apply", stash_hash])
-            .current_dir(dir)
-            .output_with_context()
-            .await;
-        if apply.map(|o| o.status.success()).unwrap_or(false) {
-            let list = Command::new("git")
-                .args(["stash", "list", "--format=%H %gd"])
-                .current_dir(dir)
-                .output_with_context()
-                .await;
-            if let Ok(output) = list {
-                if output.status.success() {
-                    let list_str = String::from_utf8_lossy(&output.stdout);
-                    if let Some(stash_ref) = find_stash_ref_by_hash(&list_str, stash_hash) {
-                        let _ = Command::new("git")
-                            .args(["stash", "drop", &stash_ref])
-                            .current_dir(dir)
-                            .output_with_context()
-                            .await;
-                    }
-                }
-            }
-        } else {
-            tracing::warn!(stash = %stash_hash, "stash apply failed after rebase — stash preserved for manual recovery");
-        }
+        Err(e) => tracing::warn!(err = %e, "rebase error"),
     }
 }
 

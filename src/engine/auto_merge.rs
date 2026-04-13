@@ -10,7 +10,7 @@
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
 use crate::engine::cleanup::cleanup_task_worktree;
-use crate::engine::runner::worktree;
+use crate::engine::runner::{git_ops, worktree};
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
 use crate::github::types::{GitHubPullRequest, GitHubReview};
@@ -832,127 +832,15 @@ pub(crate) async fn auto_merge_pr(
 
                     let rebase_result = match fetch_result {
                         Ok(out) if out.status.success() => {
-                            // Stash any uncommitted changes so the rebase can proceed cleanly.
-                            // Worktrees killed mid-run (e.g. service restart) may have leftover
-                            // unstaged changes from a previous attempt that block `git rebase`.
-                            //
-                            // Safety: git stashes are repo-global. With multiple worktrees running
-                            // concurrently we must capture the exact stash ref created here and
-                            // apply it by that ref — NOT with `stash pop`, which would apply
-                            // stash@{0} (the most-recent stash) and could restore a stash from a
-                            // different worktree running in parallel.
-                            let stash_ref: Option<String> =
-                                if crate::engine::runner::git_ops::has_changes(&wt_path).await {
-                                    let stash_out = tokio::process::Command::new("git")
-                                        .args(["stash", "--include-untracked"])
-                                        .current_dir(&wt_path)
-                                        .output()
-                                        .await;
-                                    match stash_out {
-                                        Ok(o) if o.status.success() => {
-                                            let ref_out = tokio::process::Command::new("git")
-                                                .args(["rev-parse", "refs/stash@{0}"])
-                                                .current_dir(&wt_path)
-                                                .output()
-                                                .await;
-                                            let stash_hash = ref_out
-                                                .ok()
-                                                .filter(|o| o.status.success())
-                                                .map(|o| {
-                                                    String::from_utf8_lossy(&o.stdout)
-                                                        .trim()
-                                                        .to_string()
-                                                })
-                                                .filter(|s| !s.is_empty());
-                                            if stash_hash.is_none() {
-                                                // Stash was created but we can't track its ref.
-                                                // Pop immediately to avoid orphaning the changes,
-                                                // then bail — the next tick will retry.
-                                                tracing::warn!(
-                                                    task_id = task.id.0,
-                                                    "git stash succeeded but rev-parse failed — popping stash and skipping rebase"
-                                                );
-                                                let _ = tokio::process::Command::new("git")
-                                                    .args(["stash", "pop"])
-                                                    .current_dir(&wt_path)
-                                                    .output()
-                                                    .await;
-                                                return Ok(());
-                                            }
-                                            stash_hash
-                                        }
-                                        _ => None,
-                                    }
-                                } else {
-                                    None
-                                };
-
-                            // Guard: if has_changes was true but stash failed, skip the rebase
-                            // to avoid "cannot rebase: You have unstaged changes" error.
-                            let has_uncommitted_changes =
-                                crate::engine::runner::git_ops::has_changes(&wt_path).await;
-                            if has_uncommitted_changes && stash_ref.is_none() {
-                                tracing::warn!(
-                                    task_id = task.id.0,
-                                    "git stash failed during conflict-resolution rebase — skipping rebase"
-                                );
-                                return Ok(());
-                            }
-
-                            let rebase_out = tokio::process::Command::new("git")
-                                .args([
-                                    "-c",
-                                    "commit.gpgsign=false",
-                                    "rebase",
-                                    &format!("origin/{default_branch}"),
-                                ])
-                                .current_dir(&wt_path)
-                                .output()
-                                .await;
-
-                            // Restore stashed changes using the captured ref so we never
-                            // accidentally pop a stash that belongs to a different
-                            // concurrently-running worktree.
-                            if let Some(ref stash_hash) = stash_ref {
-                                let apply = tokio::process::Command::new("git")
-                                    .args(["stash", "apply", stash_hash])
-                                    .current_dir(&wt_path)
-                                    .output()
-                                    .await;
-                                if apply.map(|o| o.status.success()).unwrap_or(false) {
-                                    let list = tokio::process::Command::new("git")
-                                        .args(["stash", "list", "--format=%H %gd"])
-                                        .current_dir(&wt_path)
-                                        .output()
-                                        .await;
-                                    if let Ok(list_out) = list {
-                                        if list_out.status.success() {
-                                            let list_str =
-                                                String::from_utf8_lossy(&list_out.stdout);
-                                            if let Some(ref_entry) =
-                                                crate::engine::runner::git_ops::find_stash_ref_by_hash(
-                                                    &list_str,
-                                                    stash_hash,
-                                                )
-                                            {
-                                                let _ = tokio::process::Command::new("git")
-                                                    .args(["stash", "drop", &ref_entry])
-                                                    .current_dir(&wt_path)
-                                                    .output()
-                                                    .await;
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    tracing::warn!(
-                                        task_id = task.id.0,
-                                        stash = %stash_hash,
-                                        "stash apply failed after rebase — stash preserved for manual recovery"
-                                    );
-                                }
-                            }
-
-                            rebase_out
+                            git_ops::stash_rebase_restore(
+                                &wt_path,
+                                &format!("origin/{default_branch}"),
+                                git_ops::StashRebaseOpts {
+                                    disable_gpg_signing: true,
+                                    abort_on_failure: false,
+                                },
+                            )
+                            .await
                         }
                         Ok(out) => {
                             // fetch failed — not a content conflict; leave task in InReview for retry
@@ -964,13 +852,13 @@ pub(crate) async fn auto_merge_pr(
                             );
                             return Ok(());
                         }
-                        Err(err) => Err(err),
+                        Err(err) => Err(anyhow::anyhow!(err)),
                     };
 
                     let mut rebase_conflict = false;
 
                     match rebase_result {
-                        Ok(out) if out.status.success() => {
+                        Ok(git_ops::RebaseOutcome::Succeeded) => {
                             let push_result = tokio::process::Command::new("git")
                                 .args(["push", "--force-with-lease"])
                                 .current_dir(&wt_path)
@@ -1045,14 +933,16 @@ pub(crate) async fn auto_merge_pr(
                                 }
                             }
                         }
-                        Ok(out) => {
-                            let stderr = String::from_utf8_lossy(&out.stderr);
+                        Ok(git_ops::RebaseOutcome::Failed(stderr)) => {
                             tracing::warn!(
                                 task_id = task.id.0,
                                 stderr = %stderr,
                                 "rebase failed with content conflict — re-routing to agent"
                             );
                             rebase_conflict = true;
+                        }
+                        Ok(git_ops::RebaseOutcome::Skipped(_)) => {
+                            return Ok(());
                         }
                         Err(io_err) => {
                             tracing::error!(
