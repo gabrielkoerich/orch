@@ -413,11 +413,18 @@ pub async fn rebase_on_branch(dir: &Path, branch: &str) -> anyhow::Result<bool> 
     let origin_branch = format!("origin/{branch}");
 
     // Fetch the remote branch to get latest state.
-    let fetch = Command::new("git")
-        .args(["fetch", "origin", branch])
-        .current_dir(dir)
-        .output_with_context()
-        .await;
+    // 2-minute timeout mirrors the push timeout to prevent indefinite stalls.
+    let fetch = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        Command::new("git")
+            .args(["fetch", "origin", branch])
+            .kill_on_drop(true)
+            .current_dir(dir)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("git fetch timed out after 120s"))
+    .and_then(|r| r.map_err(Into::into));
 
     match fetch {
         Ok(o) if o.status.success() => {}
@@ -862,12 +869,19 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
     let auth_env = build_git_auth_env();
 
     // First attempt: normal push (no force).
-    let output = Command::new("git")
-        .args(["push", "-u", "origin", branch_to_push])
-        .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .current_dir(dir)
-        .output_with_context()
-        .await?;
+    // A 2-minute timeout prevents an indefinitely-stalled push from blocking
+    // post-processing and triggering a stuck-task re-dispatch race.
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        Command::new("git")
+            .args(["push", "-u", "origin", branch_to_push])
+            .kill_on_drop(true)
+            .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .current_dir(dir)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("git push timed out after 120s"))??;
 
     if output.status.success() {
         tracing::info!(branch = branch_to_push, "push succeeded");
@@ -888,12 +902,17 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
         match strip_workflow_files(dir, default_branch).await {
             Ok(true) => {
                 // Workflow files stripped, retry push
-                let retry_output = Command::new("git")
-                    .args(["push", "-u", "origin", branch_to_push])
-                    .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-                    .current_dir(dir)
-                    .output_with_context()
-                    .await?;
+                let retry_output = tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    Command::new("git")
+                        .args(["push", "-u", "origin", branch_to_push])
+                        .kill_on_drop(true)
+                        .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                        .current_dir(dir)
+                        .output(),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("git push (retry) timed out after 120s"))??;
 
                 if retry_output.status.success() {
                     tracing::info!(
