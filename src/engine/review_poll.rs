@@ -366,7 +366,7 @@ pub(crate) async fn review_open_prs(
                     }
                 };
 
-                if reroutes as u32 >= max_reroutes {
+                if reroutes >= max_reroutes as u64 {
                     tracing::error!(
                         task_id,
                         reroutes,
@@ -579,7 +579,7 @@ pub(crate) async fn review_open_prs(
                 let is_conflicting = batch_data.mergeable == Some(false);
 
                 if is_conflicting {
-                    let retries = stored_task.merge_conflict_retries as u64;
+                    let retries = stored_task.merge_conflict_retries.max(0) as u64;
                     match handle_merge_conflict(
                         &task.id,
                         pr_number,
@@ -681,7 +681,7 @@ pub(crate) async fn review_open_prs(
                 let is_conflicting = batch_data.mergeable == Some(false);
 
                 if is_conflicting {
-                    let retries = stored_task.merge_conflict_retries as u64;
+                    let retries = stored_task.merge_conflict_retries.max(0) as u64;
                     match handle_merge_conflict(
                         &task.id,
                         pr_number,

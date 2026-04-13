@@ -1053,7 +1053,7 @@ pub(crate) async fn sync_tick(
                 continue;
             }
             // Decide whether to re-fire now using exponential backoff based on a per-task counter.
-            let current_refires = task.stored.needs_review_refires as u64;
+            let current_refires = task.stored.needs_review_refires.max(0) as u64;
             let new_refires = current_refires + 1;
 
             // If we've exceeded max attempts, escalate the task to Blocked with a clear reason.
