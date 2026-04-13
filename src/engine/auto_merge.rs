@@ -887,6 +887,18 @@ pub(crate) async fn auto_merge_pr(
                                     None
                                 };
 
+                            // Guard: if has_changes was true but stash failed, skip the rebase
+                            // to avoid "cannot rebase: You have unstaged changes" error.
+                            let has_uncommitted_changes =
+                                crate::engine::runner::git_ops::has_changes(&wt_path).await;
+                            if has_uncommitted_changes && stash_ref.is_none() {
+                                tracing::warn!(
+                                    task_id = task.id.0,
+                                    "git stash failed during conflict-resolution rebase — skipping rebase"
+                                );
+                                return Ok(());
+                            }
+
                             let rebase_out = tokio::process::Command::new("git")
                                 .args([
                                     "-c",

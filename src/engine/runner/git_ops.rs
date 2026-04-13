@@ -281,6 +281,18 @@ pub async fn rebase_on_branch(dir: &Path, branch: &str) -> anyhow::Result<bool> 
         None
     };
 
+    // Guard: if has_changes was true but stash failed, skip the rebase to avoid
+    // "cannot rebase: You have unstaged changes" error. The worktree remains dirty
+    // and the next tick will retry.
+    let has_uncommitted_changes = has_changes(dir).await;
+    if has_uncommitted_changes && stash_ref.is_none() {
+        tracing::warn!(
+            branch = branch,
+            "git stash failed during rebase_on_branch — skipping rebase to avoid worktree loss"
+        );
+        return Ok(false);
+    }
+
     // Perform the rebase.
     let output = Command::new("git")
         .args(["rebase", &origin_branch])
@@ -434,6 +446,18 @@ pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
     } else {
         None
     };
+
+    // Guard: if has_changes was true but stash failed, skip the rebase to avoid
+    // "cannot rebase: You have unstaged changes" error. The worktree remains dirty
+    // and the next tick will retry.
+    let has_uncommitted_changes = has_changes(dir).await;
+    if has_uncommitted_changes && stash_ref.is_none() {
+        tracing::warn!(
+            default_branch,
+            "git stash failed during rebase_on_default — skipping rebase to avoid worktree loss"
+        );
+        return;
+    }
 
     let output = Command::new("git")
         .args(["rebase", &format!("origin/{default_branch}")])
