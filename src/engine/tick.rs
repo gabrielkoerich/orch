@@ -1010,29 +1010,46 @@ pub(crate) async fn tick_route_tasks(
                         );
                     }
                 } else {
-                    // Remove old agent/complexity/model labels to avoid duplicates on re-route
-                    for label in &task.labels {
-                        if label.starts_with("agent:")
-                            || label.starts_with("complexity:")
-                            || label.starts_with("model:")
-                        {
-                            if let Err(e) = backend.remove_label(&task.id, label).await {
-                                tracing::warn!(task_id = task.id.0, label, error = %e, "failed to remove stale routing label during re-route");
+                    // Fire-and-forget: label operations are cosmetic (routing already
+                    // persisted in DB). Spawning them prevents blocking the tick loop
+                    // on 6-9 sequential HTTP calls (~3-9s overhead per routed task).
+                    let backend_clone = Arc::clone(backend);
+                    let task_id_clone = task.id.clone();
+                    let task_labels: Vec<String> = task.labels.clone();
+                    let new_labels = {
+                        let mut labels = vec![
+                            format!("agent:{}", result.agent),
+                            format!("complexity:{}", result.complexity),
+                        ];
+                        if let Some(ref model) = result.model {
+                            labels.push(format!("model:{model}"));
+                        }
+                        labels
+                    };
+                    tokio::spawn(async move {
+                        // Remove old agent/complexity/model labels
+                        for label in &task_labels {
+                            if label.starts_with("agent:")
+                                || label.starts_with("complexity:")
+                                || label.starts_with("model:")
+                            {
+                                if let Err(e) =
+                                    backend_clone.remove_label(&task_id_clone, label).await
+                                {
+                                    tracing::warn!(task_id = task_id_clone.0, label, error = %e, "failed to remove stale routing label during re-route");
+                                }
                             }
                         }
-                    }
-
-                    // Add agent, complexity, and model labels
-                    let mut labels = vec![
-                        format!("agent:{}", result.agent),
-                        format!("complexity:{}", result.complexity),
-                    ];
-                    if let Some(ref model) = result.model {
-                        labels.push(format!("model:{model}"));
-                    }
-                    if let Err(e) = backend.set_labels(&task.id, &labels).await {
-                        tracing::warn!(task_id = task.id.0, ?e, "failed to set routing labels");
-                    }
+                        // Add new labels
+                        if let Err(e) = backend_clone.set_labels(&task_id_clone, &new_labels).await
+                        {
+                            tracing::warn!(
+                                task_id = task_id_clone.0,
+                                ?e,
+                                "failed to set routing labels"
+                            );
+                        }
+                    });
 
                     // Transition to routed
                     if let Err(e) = task_manager
