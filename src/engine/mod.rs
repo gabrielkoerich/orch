@@ -1653,6 +1653,9 @@ pub async fn serve() -> anyhow::Result<()> {
                         } else {
                             tracing::debug!("sync tick still in progress, skipping");
                         }
+                        // Records sync *schedule* time (not completion). This prevents
+                        // re-entering the sync branch every tick while one is in flight.
+                        // The sync_in_progress guard handles actual concurrency control.
                         last_sync = std::time::Instant::now();
                     }
                 }
