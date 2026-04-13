@@ -13,7 +13,7 @@ use crate::engine::cleanup::cleanup_task_worktree;
 use crate::engine::runner::{git_ops, worktree};
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
-use crate::github::types::{GitHubPullRequest, GitHubReview};
+use crate::github::types::{GitHubCheckRun, GitHubPullRequest, GitHubReview};
 use crate::store::TaskStore;
 use crate::store::{
     opt_store_get_task, store_increment, store_reset_failure_counters, store_set_result,
@@ -229,13 +229,21 @@ pub(crate) fn any_changes_requested_in_reviews(reviews: &[GitHubReview]) -> bool
 /// the agent retry loop — but no code change can fix a billing problem.
 /// This function lets the caller short-circuit that loop and block the task
 /// immediately with a human-readable billing message instead.
-async fn is_billing_failure(gh: &GhHttp, repo: &str, sha: &str) -> bool {
-    let check_runs = match gh.get_check_runs(repo, sha).await {
-        Ok(runs) => runs,
-        Err(e) => {
-            tracing::debug!(err = %e, "failed to fetch check runs for billing failure check");
-            return false;
-        }
+async fn is_billing_failure(
+    gh: &GhHttp,
+    repo: &str,
+    sha: &str,
+    prefetched: Option<Vec<GitHubCheckRun>>,
+) -> bool {
+    let check_runs = match prefetched {
+        Some(runs) => runs,
+        None => match gh.get_check_runs(repo, sha).await {
+            Ok(runs) => runs,
+            Err(e) => {
+                tracing::debug!(err = %e, "failed to fetch check runs for billing failure check");
+                return false;
+            }
+        },
     };
 
     for run in check_runs
@@ -538,6 +546,9 @@ pub(crate) async fn auto_merge_pr(
 
         // Acquire a global permit only for the HTTP polling batch.
         // The inner block ensures the permit drops before the match/sleep.
+        // When required_contexts is non-empty we also cache the raw check runs so
+        // that is_billing_failure can reuse them without a redundant API call.
+        let mut prefetched_check_runs: Option<Vec<GitHubCheckRun>> = None;
         let (state, total, passing, failing, pending) = {
             let _permit = ci_poll_semaphore().clone().acquire_owned().await;
             if required_contexts.is_empty() {
@@ -546,11 +557,14 @@ pub(crate) async fn auto_merge_pr(
             } else {
                 let check_runs = gh.get_check_runs(repo, &head_sha).await?;
                 let statuses = gh.get_commit_status_contexts(repo, &head_sha).await?;
-                let check_runs = check_runs
-                    .into_iter()
-                    .map(|run| (run.name, run.status, run.conclusion))
+                let check_run_tuples = check_runs
+                    .iter()
+                    .map(|run| (run.name.clone(), run.status.clone(), run.conclusion.clone()))
                     .collect::<Vec<_>>();
-                required_checks_state(&required_contexts, &check_runs, &statuses)
+                let result =
+                    required_checks_state(&required_contexts, &check_run_tuples, &statuses);
+                prefetched_check_runs = Some(check_runs);
+                result
             }
         }; // _permit dropped here — released before logging, match, and sleep.
 
@@ -578,7 +592,7 @@ pub(crate) async fn auto_merge_pr(
                 // failure counter.  Billing failures are infrastructure problems —
                 // no agent can fix them — so we block the task immediately and skip
                 // the re-route loop entirely.
-                if is_billing_failure(&gh, repo, &head_sha).await {
+                if is_billing_failure(&gh, repo, &head_sha, prefetched_check_runs.take()).await {
                     tracing::error!(
                         task_id = task.id.0,
                         pr_number,
