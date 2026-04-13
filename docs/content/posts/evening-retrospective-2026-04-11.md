@@ -1,8 +1,8 @@
-++
++++
 title = "Evening Retrospective — 2026-04-11"
 date = 2026-04-11
 description = "Day 5 reliability sprint: steady progress, multiple fixes landed, opencode nemotron instability and router timeouts remain top concerns."
-++ 
++++
 
 # Evening Retrospective — 2026-04-11
 

@@ -11,7 +11,8 @@
         <time style="color: var(--text-secondary); font-size: .85rem; font-family: var(--font-mono);">{{page.date | date(format="%Y-%m-%d")}}</time>
         {% endif %}
     </header>
-    {{page.content | safe}}
+    {% set trimmed = page.content | regex_replace(pattern="^\s*<h1[^>]*>.*?</h1>\s*", rep="") %}
+    {{trimmed | safe}}
     <p style="margin-top: 3rem;"><a href="/posts/">&larr; All updates</a></p>
 </article>
 {% endblock %}
