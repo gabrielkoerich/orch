@@ -750,7 +750,10 @@ pub async fn send_message(
 
     // Store assistant message with token usage
     let total_tokens = match (result.input_tokens, result.output_tokens) {
-        (Some(i), Some(o)) => Some((i + o) as i64),
+        // Use saturating_add + try_from to avoid u64 overflow and prevent
+        // casting a large u64 into a negative i64. If the sum doesn't fit
+        // into i64, cap to i64::MAX (matches store/tasks.rs pattern).
+        (Some(i), Some(o)) => Some(i64::try_from(i.saturating_add(o)).unwrap_or(i64::MAX)),
         (Some(t), None) | (None, Some(t)) => Some(t as i64),
         _ => None,
     };
