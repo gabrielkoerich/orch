@@ -763,7 +763,7 @@ pub(crate) async fn auto_merge_pr(
         if is_conflict {
             let retries = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
                 .await
-                .map(|t| t.merge_conflict_retries as u64)
+                .map(|t| t.merge_conflict_retries.max(0) as u64)
                 .unwrap_or(0);
             if retries >= MAX_MERGE_CONFLICT_RETRIES {
                 tracing::error!(
