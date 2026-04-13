@@ -1734,16 +1734,41 @@ pub(crate) async fn ingest_external_tasks(
 
     // Track last ingest time for incremental fetches (same pattern as mentions_last_checked).
     // Use 24h fallback on first run or if the key is missing.
+    // Also reset the key if it's stale (engine was down) to avoid permanently skipping
+    // issues created during downtime. GitHub's `since` filters by updated_at, not created_at,
+    // so issues created while the engine was down would be invisible.
     let kv_key = format!("issues_last_ingested:{repo}");
     let fallback = (chrono::Utc::now() - chrono::Duration::hours(24))
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
-    let since = store
-        .kv_get(&kv_key)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(fallback);
+
+    let stored_since = store.kv_get(&kv_key).await.ok().flatten();
+
+    // Check if stored value is stale (engine was likely down). If the stored timestamp
+    // is more than 2x the sync interval old, delete it so we use the 24h fallback instead.
+    // This catches issues created during downtime that would otherwise be permanently skipped.
+    let since = if let Some(ref stored) = stored_since {
+        let two_sync_intervals = chrono::Duration::seconds(90); // 2x 45s sync interval
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(stored) {
+            let age = chrono::Utc::now().signed_duration_since(dt.with_timezone(&chrono::Utc));
+            if age > two_sync_intervals {
+                tracing::info!(
+                    stored = stored,
+                    age_hours = age.num_hours(),
+                    "issues_last_ingested is stale — clearing to catch issues created during engine downtime"
+                );
+                let _ = store.kv_delete(&kv_key).await;
+                fallback
+            } else {
+                stored.clone()
+            }
+        } else {
+            // Invalid timestamp format, fall back to 24h
+            stored.clone()
+        }
+    } else {
+        fallback
+    };
     let since_for_fetch = since.clone();
 
     // Fetch all open issues in a single backend call and partition by status label locally.
