@@ -392,7 +392,14 @@ fn scan_skills_directory(skills_dir: &std::path::Path) -> Option<String> {
 
     let mut skills = Vec::new();
     if let Ok(entries) = std::fs::read_dir(skills_dir) {
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(path = %skills_dir.display(), err = %e, "error reading skills directory entry");
+                    continue;
+                }
+            };
             let path = entry.path();
             if !path.is_dir() {
                 continue;

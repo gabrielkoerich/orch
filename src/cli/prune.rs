@@ -32,7 +32,14 @@ pub async fn run(dry_run: bool) -> anyhow::Result<()> {
         }
     };
 
-    for project_entry in project_dirs.flatten() {
+    for project_entry in project_dirs {
+        let project_entry = match project_entry {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("error reading worktrees directory entry: {e}");
+                continue;
+            }
+        };
         if !project_entry
             .file_type()
             .map(|t| t.is_dir())
@@ -44,7 +51,14 @@ pub async fn run(dry_run: bool) -> anyhow::Result<()> {
             Ok(d) => d,
             Err(_) => continue,
         };
-        for branch_entry in branch_dirs.flatten() {
+        for branch_entry in branch_dirs {
+            let branch_entry = match branch_entry {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("error reading project directory entry: {e}");
+                    continue;
+                }
+            };
             if !branch_entry
                 .file_type()
                 .map(|t| t.is_dir())
