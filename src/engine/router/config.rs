@@ -248,12 +248,16 @@ impl RouterConfig {
             if let Ok(secs) = timeout.parse::<u64>() {
                 let clamped = secs.min(MAX_ROUTER_TIMEOUT_SECS);
                 if clamped != secs {
-                    tracing::warn!(
-                        configured_secs = secs,
-                        applied_secs = clamped,
-                        max_secs = MAX_ROUTER_TIMEOUT_SECS,
-                        "router.timeout_seconds is too high; clamping to keep routing responsive"
-                    );
+                    static TIMEOUT_CLAMP_WARNED: std::sync::OnceLock<()> =
+                        std::sync::OnceLock::new();
+                    TIMEOUT_CLAMP_WARNED.get_or_init(|| {
+                        tracing::warn!(
+                            configured_secs = secs,
+                            applied_secs = clamped,
+                            max_secs = MAX_ROUTER_TIMEOUT_SECS,
+                            "router.timeout_seconds is too high; clamping to keep routing responsive"
+                        );
+                    });
                 }
                 config.timeout_seconds = clamped;
             }
