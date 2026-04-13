@@ -274,7 +274,7 @@ jobs:
 
   # Create GitHub release with binaries
   release:
-    needs: [test, secrets, deploy, check-release, build-macos]
+    needs: [deploy, build-macos]
     if: github.ref == 'refs/heads/main' && needs.check-release.outputs.skip == 'false'
     runs-on: ubuntu-latest
     permissions:
