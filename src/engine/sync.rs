@@ -34,7 +34,17 @@ use tokio::sync::RwLock;
 /// the store query fails. Use [`try_kv_get_prefer_store`] if you need to
 /// distinguish between "key not found" and actual errors.
 async fn kv_get_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str) -> Option<String> {
-    try_kv_get_prefer_store(store, key).await.ok().flatten()
+    match try_kv_get_prefer_store(store, key).await {
+        Ok(opt) => opt,
+        Err(e) => {
+            // Log errors so database/query failures are visible in logs.
+            // We still return None as a best-effort fallback when the store
+            // is unavailable to preserve existing behavior, but the error
+            // should be visible to operators and alerting systems.
+            tracing::error!(key, err = %e, "kv_get failed");
+            None
+        }
+    }
 }
 
 /// Try to read a KV value from the store, returning errors instead of
