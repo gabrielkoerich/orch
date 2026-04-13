@@ -48,13 +48,17 @@ pub fn status_path() -> anyhow::Result<PathBuf> {
 
 impl WebhookStatus {
     /// Persist the status to disk. Non-fatal: logs a warning on write failure.
-    pub fn save(&self) {
+    pub async fn save(&self) {
         match status_path().and_then(|p| {
-            let json = serde_json::to_string_pretty(self)?;
-            std::fs::write(&p, json)?;
-            Ok(())
+            serde_json::to_string_pretty(self)
+                .map(|j| (p, j))
+                .map_err(anyhow::Error::from)
         }) {
-            Ok(()) => {}
+            Ok((p, json)) => {
+                if let Err(e) = tokio::fs::write(&p, json).await {
+                    tracing::warn!(error = ?e, "failed to persist webhook status");
+                }
+            }
             Err(e) => tracing::warn!(?e, "failed to persist webhook status"),
         }
     }
