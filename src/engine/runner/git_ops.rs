@@ -1333,6 +1333,11 @@ pub(crate) fn is_transient_github_error(err_str: &str) -> bool {
         return true;
     }
 
+    // Internal circuit-breaker state (orch's own GitHub 5xx protection)
+    if lower.contains("circuit-breaker") || lower.contains("circuit breaker") {
+        return true;
+    }
+
     // Rate limit errors (transient with cooldown/retry)
     if lower.contains("rate limit") || lower.contains("too many requests") {
         return true;
