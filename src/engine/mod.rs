@@ -1349,7 +1349,7 @@ pub async fn serve() -> anyhow::Result<()> {
     // still returns the task (search index propagation delay). The tmux session does not
     // exist until the runner completes worktree setup (~10s later), so session_exists
     // alone is insufficient. Keyed by "{repo}/{task_id}".
-    let dispatching: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
+    let dispatching: Arc<dashmap::DashMap<String, String>> = Arc::new(dashmap::DashMap::new());
 
     // In-memory guard to prevent double-spawn of auto-merge background tasks.
     // Since review_open_prs runs every sync_tick (~10s) but CI polling can take

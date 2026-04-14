@@ -25,7 +25,7 @@ use crate::engine::tasks::{is_internal_id, TaskManager};
 use crate::repo_context::REPO_CONTEXT;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
-use dashmap::DashSet;
+use dashmap::DashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -1173,7 +1173,7 @@ pub(crate) async fn tick_dispatch_tasks(
     task_manager: &Arc<TaskManager>,
     weight_tx: &mpsc::Sender<WeightSignal>,
     router: &Router,
-    dispatching: &Arc<DashSet<String>>,
+    dispatching: &Arc<DashMap<String, String>>,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
     // Note: Routed tasks should never have no-agent (filtered during Phase 3a routing),
@@ -1240,12 +1240,35 @@ pub(crate) async fn tick_dispatch_tasks(
         // does not exist until the runner completes worktree setup (~10s later), so the
         // session_exists check alone is insufficient.
         let dispatch_key = format!("{}/{}", repo, task.id.0);
-        if !dispatching.insert(dispatch_key.clone()) {
-            tracing::debug!(
-                task_id = task.id.0,
-                "task already dispatching, skipping duplicate"
-            );
-            continue;
+        // Atomically claim the dispatch slot.  DashMap lets us distinguish:
+        //   - same task already in-flight (expected): log debug and skip.
+        //   - different task holds the same key (should never happen): log warning and skip.
+        // A plain DashSet::insert would return false for both cases without distinction.
+        {
+            use dashmap::mapref::entry::Entry;
+            match dispatching.entry(dispatch_key.clone()) {
+                Entry::Occupied(existing) => {
+                    let existing_id = existing.get().clone();
+                    drop(existing); // release shard lock before logging
+                    if existing_id == task.id.0 {
+                        tracing::debug!(
+                            task_id = task.id.0,
+                            "task already dispatching, skipping duplicate"
+                        );
+                    } else {
+                        tracing::warn!(
+                            task_id = task.id.0,
+                            existing_task_id = existing_id,
+                            dispatch_key,
+                            "dispatch key collision: unexpected task already holds this key"
+                        );
+                    }
+                    continue;
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(task.id.0.clone());
+                }
+            }
         }
         // RAII guard — removes dispatch_key on drop even if the spawned task panics.
         let dispatch_guard = DispatchGuard::new(dispatching.clone(), dispatch_key.clone());
@@ -1626,7 +1649,7 @@ pub(crate) async fn tick(
     router: &mut Router,
     task_manager: &Arc<TaskManager>,
     weight_tx: &mpsc::Sender<WeightSignal>,
-    dispatching: &Arc<DashSet<String>>,
+    dispatching: &Arc<DashMap<String, String>>,
     store: &Arc<TaskStore>,
     transport: Option<&Arc<crate::channels::transport::Transport>>,
 ) -> anyhow::Result<()> {
@@ -2483,7 +2506,7 @@ mod tests {
         let tmux = Arc::new(TmuxManager::new());
         let semaphore = Arc::new(Semaphore::new(4));
         let (weight_tx, _weight_rx) = mpsc::channel(16);
-        let dispatching = Arc::new(DashSet::new());
+        let dispatching = Arc::new(DashMap::new());
         let transport = Arc::new(Transport::new());
         let capture = Arc::new(CaptureService::new(transport));
 

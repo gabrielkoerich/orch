@@ -11,7 +11,7 @@ use crate::github::http::GhHttp;
 use crate::repo_context::REPO_CONTEXT;
 use crate::store::{opt_store_get_task, TaskStore};
 use crate::tmux::TmuxManager;
-use dashmap::DashSet;
+use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::sync::{RwLock, Semaphore};
@@ -39,7 +39,7 @@ pub fn spawn(
     semaphore: Arc<Semaphore>,
     task_manager: Arc<TaskManager>,
     router: Arc<RwLock<Router>>,
-    dispatching: Arc<DashSet<String>>,
+    dispatching: Arc<DashMap<String, String>>,
     store: Arc<TaskStore>,
     repo: String,
 ) {
@@ -60,12 +60,33 @@ pub fn spawn(
 
                     // Atomically claim the task before any async work so concurrent
                     // review events cannot double-spawn the same review flow.
-                    if !dispatching.insert(dispatch_key.clone()) {
-                        tracing::debug!(
-                            task_id,
-                            "task locked by dispatch flow, skipping event-driven review"
-                        );
-                        continue;
+                    // Using DashMap lets us distinguish same-task duplicates (expected) from
+                    // key collisions involving a different task (should never happen).
+                    {
+                        use dashmap::mapref::entry::Entry;
+                        match dispatching.entry(dispatch_key.clone()) {
+                            Entry::Occupied(existing) => {
+                                let existing_id = existing.get().clone();
+                                drop(existing);
+                                if existing_id == *task_id {
+                                    tracing::debug!(
+                                        task_id,
+                                        "task locked by dispatch flow, skipping event-driven review"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        task_id,
+                                        existing_task_id = existing_id,
+                                        dispatch_key,
+                                        "dispatch key collision: unexpected task already holds this key"
+                                    );
+                                }
+                                continue;
+                            }
+                            Entry::Vacant(slot) => {
+                                slot.insert(task_id.clone());
+                            }
+                        }
                     }
 
                     // Create guard IMMEDIATELY after inserting the key — owns removal for all subsequent exit paths

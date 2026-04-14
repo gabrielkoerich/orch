@@ -15,7 +15,7 @@
 //! ```
 
 use async_trait::async_trait;
-use dashmap::DashSet;
+use dashmap::DashMap;
 use orch::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use orch::channels::capture::CaptureService;
 use orch::channels::transport::Transport;
@@ -308,7 +308,7 @@ async fn make_dispatch_harness(
     repo: &str,
 ) -> (
     broadcast::Sender<TaskEvent>,
-    Arc<DashSet<String>>,
+    Arc<DashMap<String, String>>,
     std::path::PathBuf,
 ) {
     let tmp = temp_db(&format!("dispatch-{}", repo.replace('/', "-")));
@@ -332,7 +332,7 @@ async fn make_dispatch_harness(
         ..RouterConfig::default()
     };
     let router = Arc::new(RwLock::new(Router::new(config)));
-    let dispatching = Arc::new(DashSet::<String>::new());
+    let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
 
     let (tx, rx) = broadcast::channel::<TaskEvent>(16);
     dispatch::spawn(
@@ -516,7 +516,7 @@ async fn make_review_harness(
     repo: &str,
 ) -> (
     broadcast::Sender<TaskEvent>,
-    Arc<DashSet<String>>,
+    Arc<DashMap<String, String>>,
     std::path::PathBuf,
 ) {
     let tmp = temp_db(&format!("review-{}", repo.replace('/', "-")));
@@ -536,7 +536,7 @@ async fn make_review_harness(
         ..RouterConfig::default()
     };
     let router = Arc::new(RwLock::new(Router::new(config)));
-    let dispatching = Arc::new(DashSet::<String>::new());
+    let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
 
     let (tx, rx) = broadcast::channel::<TaskEvent>(16);
     review::spawn(
@@ -590,7 +590,7 @@ async fn review_dispatching_guard_prevents_double_spawn() {
     // Pre-populate the key as if a review is already in flight.
     // This matches the format constructed in review::spawn:
     //   let dispatch_key = format!("{}/{}", repo, task_id);
-    dispatching.insert("owner/repo/42".to_string());
+    dispatching.insert("owner/repo/42".to_string(), "42".to_string());
 
     // The subscriber sees the key already present, logs, and continues
     // without launching a second review agent.
@@ -598,10 +598,10 @@ async fn review_dispatching_guard_prevents_double_spawn() {
         .unwrap();
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    // Dispatching set still contains the key (subscriber did not remove it
+    // Dispatching map still contains the key (subscriber did not remove it
     // since it never claimed ownership via DispatchGuard).
     assert!(
-        dispatching.contains("owner/repo/42"),
+        dispatching.contains_key("owner/repo/42"),
         "dispatching guard should have left the pre-existing key in place"
     );
     cleanup_db(&tmp);
@@ -663,8 +663,8 @@ async fn review_subscriber_only_handles_its_repo() {
     ));
     let router_a = Arc::new(RwLock::new(Router::new(config.clone())));
     let router_b = Arc::new(RwLock::new(Router::new(config)));
-    let dispatching_a = Arc::new(DashSet::<String>::new());
-    let dispatching_b = Arc::new(DashSet::<String>::new());
+    let dispatching_a: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+    let dispatching_b: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
 
     let (tx, _) = broadcast::channel::<TaskEvent>(16);
     let rx_a = tx.subscribe();

@@ -1,32 +1,62 @@
-//! RAII guard for the per-task dispatching [`DashSet`].
+//! RAII guard for the per-task dispatching [`DashMap`].
 //!
-//! [`DispatchGuard`] removes a key from the shared `dispatching` set when it is
+//! [`DispatchGuard`] removes a key from the shared `dispatching` map when it is
 //! dropped — whether the owning async task completes normally **or panics**.
 //!
 //! ## Problem it solves
 //!
-//! Without this guard, the cleanup code (`set.remove(&key)`) only runs when the
+//! Without this guard, the cleanup code (`map.remove(&key)`) only runs when the
 //! spawned async block reaches the end of its normal execution path.  If the block
 //! panics (e.g. from an `unwrap()` inside `review_and_merge`), Tokio catches the
 //! panic and terminates the task, but the manual remove never executes.  The key
-//! leaks in the set permanently: subsequent attempts to review the task are skipped
+//! leaks in the map permanently: subsequent attempts to review the task are skipped
 //! by the guard check, and stuck-task recovery keeps resetting the task to
 //! `NeedsReview` in an infinite loop until the service is restarted.
 //!
-//! ## Why DashSet instead of Mutex\<HashSet\>
+//! ## Why DashMap instead of Mutex\<HashMap\>
 //!
-//! The dispatching set is accessed from both async contexts (tick, sync, subscribers)
-//! and synchronous `Drop` implementations.  `DashSet` is a lock-free concurrent set
+//! The dispatching map is accessed from both async contexts (tick, sync, subscribers)
+//! and synchronous `Drop` implementations.  `DashMap` is a lock-free concurrent map
 //! that works in both contexts without risk of blocking Tokio worker threads — unlike
 //! `std::sync::Mutex` which blocks the OS thread, or `tokio::sync::Mutex` which
 //! cannot be used in `Drop`.
 //!
+//! ## Why DashMap instead of DashSet
+//!
+//! `DashSet::insert` returns `false` in two distinct cases:
+//! 1. The same task is already being dispatched (intended skip).
+//! 2. A different task happens to produce the same key (should never happen, but
+//!    silently skips a valid dispatch if it does).
+//!
+//! By storing the task-id as the map value, the caller can distinguish these cases:
+//! a matching task-id means an expected duplicate; a mismatched task-id is an
+//! unexpected collision that warrants a warning log.
+//!
 //! ## Usage
 //!
 //! ```rust,ignore
-//! // 1. Insert the key BEFORE the spawn.
-//! if !dispatching.insert(dispatch_key.clone()) {
-//!     continue; // already dispatching
+//! use dashmap::mapref::entry::Entry;
+//!
+//! // 1. Attempt to claim the dispatch slot atomically.
+//! match dispatching.entry(dispatch_key.clone()) {
+//!     Entry::Occupied(existing) => {
+//!         let existing_id = existing.get().clone();
+//!         drop(existing); // release shard lock before logging
+//!         if existing_id == task.id.0 {
+//!             tracing::debug!(task_id = %task.id.0, "task already dispatching, skipping duplicate");
+//!         } else {
+//!             tracing::warn!(
+//!                 task_id = %task.id.0,
+//!                 existing_task_id = %existing_id,
+//!                 dispatch_key,
+//!                 "dispatch key collision: unexpected task already holds this key"
+//!             );
+//!         }
+//!         continue;
+//!     }
+//!     Entry::Vacant(slot) => {
+//!         slot.insert(task.id.0.clone());
+//!     }
 //! }
 //!
 //! // 2. Create a guard that owns the removal obligation.
@@ -39,32 +69,32 @@
 //! });
 //! ```
 
-use dashmap::DashSet;
+use dashmap::DashMap;
 use std::sync::Arc;
 
-/// Removes a key from a shared [`DashSet<String>`] when dropped.
+/// Removes a key from a shared [`DashMap<String, String>`] when dropped.
 ///
 /// Create this guard (step 2) only after the key has already been inserted into
-/// the set (step 1) and before calling `tokio::spawn` (step 3).  Moving the guard
+/// the map (step 1) and before calling `tokio::spawn` (step 3).  Moving the guard
 /// into the spawned async block ensures the key is removed regardless of whether
 /// the block completes normally or unwinds via a panic.
 pub struct DispatchGuard {
-    set: Arc<DashSet<String>>,
+    map: Arc<DashMap<String, String>>,
     key: String,
 }
 
 impl DispatchGuard {
-    /// Creates a guard that will remove `key` from `set` on drop.
+    /// Creates a guard that will remove `key` from `map` on drop.
     ///
-    /// The caller must have already inserted `key` into `set`.
-    pub fn new(set: Arc<DashSet<String>>, key: String) -> Self {
-        Self { set, key }
+    /// The caller must have already inserted `key` into `map`.
+    pub fn new(map: Arc<DashMap<String, String>>, key: String) -> Self {
+        Self { map, key }
     }
 }
 
 impl Drop for DispatchGuard {
     fn drop(&mut self) {
-        self.set.remove(&self.key);
+        self.map.remove(&self.key);
     }
 }
 
@@ -73,37 +103,43 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    fn make_set(keys: &[&str]) -> Arc<DashSet<String>> {
-        let set = DashSet::new();
-        for key in keys {
-            set.insert(key.to_string());
+    fn make_map(entries: &[(&str, &str)]) -> Arc<DashMap<String, String>> {
+        let map = DashMap::new();
+        for (k, v) in entries {
+            map.insert(k.to_string(), v.to_string());
         }
-        Arc::new(set)
+        Arc::new(map)
     }
 
     #[test]
     fn drop_removes_key() {
-        let set = make_set(&["a", "b"]);
-        let guard = DispatchGuard::new(Arc::clone(&set), "a".to_string());
+        let map = make_map(&[("owner/repo/1", "1"), ("owner/repo/2", "2")]);
+        let guard = DispatchGuard::new(Arc::clone(&map), "owner/repo/1".to_string());
         drop(guard);
-        assert!(!set.contains("a"), "key must be removed on drop");
-        assert!(set.contains("b"), "unrelated key must be untouched");
+        assert!(
+            !map.contains_key("owner/repo/1"),
+            "key must be removed on drop"
+        );
+        assert!(
+            map.contains_key("owner/repo/2"),
+            "unrelated key must be untouched"
+        );
     }
 
     #[test]
     fn drop_is_idempotent_when_key_absent() {
-        let set = make_set(&[]);
+        let map = make_map(&[]);
         // Key not present — should not panic
-        let guard = DispatchGuard::new(Arc::clone(&set), "missing".to_string());
+        let guard = DispatchGuard::new(Arc::clone(&map), "missing".to_string());
         drop(guard);
-        assert!(set.is_empty());
+        assert!(map.is_empty());
     }
 
     #[tokio::test]
     async fn drop_runs_on_task_panic() {
-        let set = make_set(&["owner/repo/42"]);
+        let map = make_map(&[("owner/repo/42", "42")]);
         let key = "owner/repo/42".to_string();
-        let guard = DispatchGuard::new(Arc::clone(&set), key.clone());
+        let guard = DispatchGuard::new(Arc::clone(&map), key.clone());
 
         let handle = tokio::spawn(async move {
             let _guard = guard;
@@ -112,7 +148,7 @@ mod tests {
         let _ = handle.await; // absorb JoinError
 
         assert!(
-            !set.contains(&key),
+            !map.contains_key(&key),
             "key must be removed even when spawned task panics"
         );
     }

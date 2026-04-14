@@ -31,7 +31,7 @@ use crate::github::types::{GitHubComment, GitHubReviewComment, PullRequestReview
 use crate::store::TaskStore;
 use crate::store::{store_increment_by_id, store_reset_failure_counters, store_set_result_by_id};
 use async_trait::async_trait;
-use dashmap::DashSet;
+use dashmap::{DashMap, DashSet};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -158,7 +158,7 @@ pub(crate) async fn review_open_prs(
     config: &EngineConfig,
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
-    dispatching: &Arc<DashSet<String>>,
+    dispatching: &Arc<DashMap<String, String>>,
     auto_merge_in_flight: &Arc<DashSet<String>>,
     in_review_tasks: &[ReviewTaskSnapshot],
     gh: &dyn GhReviewClient,
@@ -194,7 +194,7 @@ pub(crate) async fn review_open_prs(
 
         // Skip tasks currently being processed by the main tick.
         let dispatch_key = format!("{}/{}", repo, task_id);
-        if dispatching.contains(&dispatch_key) {
+        if dispatching.contains_key(&dispatch_key) {
             tracing::debug!(
                 task_id,
                 "task locked by dispatch flow, skipping review_open_prs"
@@ -973,7 +973,7 @@ mod tests {
     use crate::github::types::{GitHubComment, GitHubReview, GitHubUser};
     use crate::store::{NewTask, TaskStatus, TaskStore};
     use async_trait::async_trait;
-    use dashmap::DashSet;
+    use dashmap::{DashMap, DashSet};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -1256,7 +1256,7 @@ mod tests {
             Arc::clone(&store),
             "owner/repo".to_string(),
         ));
-        let dispatching = Arc::new(DashSet::new());
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let in_flight = Arc::new(DashSet::new());
         let gh = MockGh::default();
 
@@ -1315,8 +1315,11 @@ mod tests {
         };
 
         // Lock the task in the dispatching set.
-        let dispatching = Arc::new(DashSet::new());
-        dispatching.insert(format!("owner/repo/{}", snapshot.external.id.0));
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+        dispatching.insert(
+            format!("owner/repo/{}", snapshot.external.id.0),
+            snapshot.external.id.0.clone(),
+        );
 
         // Mock returns pr_number = Some(42) so the task would normally proceed.
         let mut gh = MockGh::default();
@@ -1387,7 +1390,7 @@ mod tests {
         let mut gh = MockGh::default();
         gh.merged.insert("feat-branch".to_string(), true);
 
-        let dispatching = Arc::new(DashSet::new());
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let in_flight = Arc::new(DashSet::new());
         review_open_prs(
             &backend,
@@ -1447,7 +1450,7 @@ mod tests {
         // No PR, not merged.
         let gh = MockGh::default(); // merged defaults to false, pr_numbers empty
 
-        let dispatching = Arc::new(DashSet::new());
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let in_flight = Arc::new(DashSet::new());
         review_open_prs(
             &backend,
@@ -1516,7 +1519,7 @@ mod tests {
         };
 
         let gh = MockGh::default();
-        let dispatching = Arc::new(DashSet::new());
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let in_flight = Arc::new(DashSet::new());
         review_open_prs(
             &backend,
@@ -1603,7 +1606,7 @@ mod tests {
             stored,
         };
 
-        let dispatching = Arc::new(DashSet::new());
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let in_flight = Arc::new(DashSet::new());
         review_open_prs(
             &backend,
@@ -1673,7 +1676,7 @@ mod tests {
             batch_error: true,
             ..Default::default()
         };
-        let dispatching = Arc::new(DashSet::new());
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let in_flight = Arc::new(DashSet::new());
         let result = review_open_prs(
             &backend,
@@ -1753,7 +1756,7 @@ mod tests {
         let mut gh = MockGh::default();
         gh.batch_data.insert(10, batch_data);
 
-        let dispatching = Arc::new(DashSet::new());
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let in_flight = Arc::new(DashSet::new());
         review_open_prs(
             &backend,
@@ -1838,7 +1841,7 @@ mod tests {
         gh.batch_data.insert(20, batch_data);
         gh.collaborators.insert("bot".to_string(), true);
 
-        let dispatching = Arc::new(DashSet::new());
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let in_flight = Arc::new(DashSet::new());
         review_open_prs(
             &backend,
