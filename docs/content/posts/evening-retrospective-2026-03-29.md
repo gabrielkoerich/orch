@@ -21,7 +21,7 @@ These bugs form a failure cascade: kimi exhausts its monthly billing quota → 2
 - **#1250** — `handle_failover` "no fallback" path never records agent cooldown (kimi loops indefinitely)
 - **#1252** — `next_round_robin_agent` last-resort fallback picks cooled agents (kimi selected when all excluded)
 - **#1251** — `model_for_complexity` returns `None` when all pool models cooled (opencode exits 0 silently)
-- **#1240** — transport `last_output` persists across retries (replays stale output)
+- **#1240** — transport `last_output` removed to fix memory leak
 - **#1243** — review gate loops via `Status::New` on failover exhaustion instead of marking Blocked
 - **#1258** — `create_pr_if_needed` discards `pr_number` when PR exists (tick review gate misroutes to Done)
 - **#1254** — startup rebase fails on unstaged changes (worktree deleted, agent work silently lost)

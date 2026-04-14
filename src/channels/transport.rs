@@ -120,8 +120,6 @@ pub struct Transport {
     thread_to_task: Arc<RwLock<HashMap<String, String>>>,
     /// Broadcast sender for task completion notifications
     notification_tx: broadcast::Sender<TaskNotification>,
-    /// Last seen output per session (for PTY-backed sessions)
-    last_output: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl Transport {
@@ -131,7 +129,6 @@ impl Transport {
             bindings: Arc::new(RwLock::new(HashMap::new())),
             thread_to_task: Arc::new(RwLock::new(HashMap::new())),
             notification_tx,
-            last_output: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -154,9 +151,6 @@ impl Transport {
     ) {
         let key = conversation_key(channel, thread_id, topic_id);
         let skey = session_key(repo, task_id);
-        // Clear stale output before updating bindings to avoid holding
-        // write lock across await points (deadlock risk).
-        self.clear_output(&skey).await;
         // Update bindings synchronously (no await while lock held)
         {
             let mut bindings = self.bindings.write().await;
@@ -212,23 +206,10 @@ impl Transport {
             if let Some(binding) = bindings.get(&skey) {
                 let _ = binding.output_tx.send(part_chunk.clone());
             }
-            if !part_chunk.content.is_empty() {
-                let mut last = self.last_output.write().await;
-                let entry = last.entry(skey.clone()).or_insert_with(String::new);
-                entry.push_str(&part_chunk.content);
-            }
         }
     }
 
-    /// Clear any cached last_output for a task.
-    ///
-    /// When a task is rebound to a new tmux session (retry) the previous
-    /// run's output must not be replayed. Call this when registering or
-    /// rebinding sessions so stale output is discarded.
-    pub async fn clear_output(&self, session_key: &str) {
-        let mut last = self.last_output.write().await;
-        last.remove(session_key);
-    }
+
 
     /// Get the session binding for a specific task, if any.
     pub async fn get_binding(&self, repo: &str, task_id: &str) -> Option<SessionBinding> {
