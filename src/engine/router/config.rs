@@ -180,6 +180,19 @@ pub struct RouterConfig {
     ///
     /// Configurable via `router.max_tasks_per_tick` (default: 1).
     pub max_tasks_per_tick: usize,
+    /// Total time budget (seconds) for the entire LLM routing cascade (all pool
+    /// entries + fallback combined). When exceeded, routing immediately falls back
+    /// to round-robin without waiting for the remaining pool entries to time out
+    /// individually.
+    ///
+    /// `timeout_seconds` is a *per-entry* limit; `llm_budget_secs` caps the *total*
+    /// cascade. With a 3-entry pool each carrying a 45 s per-entry timeout, the
+    /// cascade could block for up to 135 s without this budget. Setting the budget
+    /// to `timeout_seconds` (45 s default) ensures at most one entry can fully
+    /// time out before round-robin takes over.
+    ///
+    /// Configurable via `router.llm_budget_secs` (default: `timeout_seconds`).
+    pub llm_budget_secs: u64,
 }
 
 /// Parse an `agent:model` pool entry string, splitting on the first colon.
@@ -237,6 +250,7 @@ impl Default for RouterConfig {
             skip_limited_threshold: 0.3,
             agent_backoff_bases: HashMap::new(),
             max_tasks_per_tick: 1,
+            llm_budget_secs: 45,
         }
     }
 }
@@ -353,6 +367,18 @@ impl RouterConfig {
             if let Ok(n) = val.parse::<usize>() {
                 if n > 0 {
                     config.max_tasks_per_tick = n;
+                }
+            }
+        }
+
+        // Parse llm_budget_secs — total time cap for the entire pool cascade.
+        // Defaults to timeout_seconds (already resolved above) so the cascade
+        // can't exceed what a single pool entry would normally take.
+        config.llm_budget_secs = config.timeout_seconds;
+        if let Ok(val) = crate::config::get("router.llm_budget_secs") {
+            if let Ok(secs) = val.parse::<u64>() {
+                if secs > 0 {
+                    config.llm_budget_secs = secs;
                 }
             }
         }
