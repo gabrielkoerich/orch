@@ -344,14 +344,18 @@ impl TaskRunner {
             .get_field(input.task_id, "last_error")
             .await
             .filter(|s| !s.is_empty());
-        let error =
-            input
-                .error_override
-                .or(last_error)
-                .unwrap_or_else(|| match input.parse_result {
-                    Ok(parsed) => parsed.response.error.clone().unwrap_or_default(),
-                    Err(err) => err.to_string(),
-                });
+        let error = match input.error_override.clone().or_else(|| last_error.clone()) {
+            Some(e) if !e.is_empty() => e,
+            _ => match input.parse_result {
+                Ok(parsed) => parsed.response.error.clone().unwrap_or_default(),
+                Err(err) => err.to_string(),
+            },
+        };
+        let error = if error.is_empty() {
+            "no error info available".to_string()
+        } else {
+            error
+        };
 
         let total_cost_usd = match &self.store {
             Some(_) => {
