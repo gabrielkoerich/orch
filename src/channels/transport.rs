@@ -209,8 +209,6 @@ impl Transport {
         }
     }
 
-
-
     /// Get the session binding for a specific task, if any.
     pub async fn get_binding(&self, repo: &str, task_id: &str) -> Option<SessionBinding> {
         let skey = session_key(repo, task_id);
