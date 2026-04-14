@@ -170,9 +170,11 @@ pub fn scan(text: &str) -> Vec<LeakMatch> {
     matches
 }
 
-/// Quick check: does this text contain any leaked secrets?
+/// Quick check: does this text contain any high-confidence leaked secrets?
 pub fn has_leaks(text: &str) -> bool {
-    !scan(text).is_empty()
+    LEAK_PATTERNS
+        .iter()
+        .any(|(_, pattern, high_conf)| *high_conf && pattern.is_match(text))
 }
 
 /// Redact all detected secrets in text, replacing them with `[REDACTED:{rule}]`.
@@ -275,5 +277,29 @@ mod tests {
 
         assert!(patterns.iter().any(|(rule, _, _)| *rule == "good"));
         assert!(!patterns.iter().any(|(rule, _, _)| *rule == "bad"));
+    }
+
+    #[test]
+    fn has_leaks_ignores_low_confidence_patterns() {
+        let text = "password = \"some_long_config_value_that_is_16_chars\"";
+        assert!(
+            !has_leaks(text),
+            "generic_secret (low confidence) should not trigger has_leaks"
+        );
+
+        let text = "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0";
+        assert!(
+            !has_leaks(text),
+            "bearer_token (low confidence) should not trigger has_leaks"
+        );
+    }
+
+    #[test]
+    fn has_leaks_triggers_on_high_confidence_patterns() {
+        let text = "password = \"sk-proj-1234567890abcdefghijklmnopqrstuv\"";
+        assert!(
+            has_leaks(text),
+            "openai_api_key (high confidence) should trigger has_leaks"
+        );
     }
 }
