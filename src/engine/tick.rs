@@ -349,15 +349,28 @@ pub(crate) async fn tick_detect_silent_agents(
 
         if use_backend {
             if let Some(ref st) = store_task {
-                for label in &st.labels {
-                    if label.starts_with("agent:")
-                        || label.starts_with("complexity:")
-                        || label.starts_with("model:")
-                    {
-                        if let Err(e) = backend.remove_label(&task_eid, label).await {
-                            tracing::warn!(task_id, label, error = %e, "failed to remove label during silence detection re-route");
+                // Fire-and-forget: label removals are cosmetic — tick should not block on them.
+                let stale_labels: Vec<String> = st
+                    .labels
+                    .iter()
+                    .filter(|l| {
+                        l.starts_with("agent:")
+                            || l.starts_with("complexity:")
+                            || l.starts_with("model:")
+                    })
+                    .cloned()
+                    .collect();
+                if !stale_labels.is_empty() {
+                    let backend_clone = Arc::clone(backend);
+                    let task_eid_clone = task_eid.clone();
+                    tokio::spawn(async move {
+                        for label in &stale_labels {
+                            if let Err(e) = backend_clone.remove_label(&task_eid_clone, label).await
+                            {
+                                tracing::warn!(task_id = task_eid_clone.0, label, error = %e, "failed to remove label during silence detection re-route");
+                            }
                         }
-                    }
+                    });
                 }
             }
         }
@@ -451,9 +464,18 @@ pub(crate) async fn tick_detect_silent_agents(
             crate::engine::orch_footer(),
         );
         if use_backend {
-            if let Err(e) = backend.post_comment(&task_eid, &comment).await {
-                tracing::warn!(task_id, ?e, "failed to post silence detection comment");
-            }
+            // Fire-and-forget: comment is informational — tick should not block on it.
+            let backend_clone = Arc::clone(backend);
+            let task_eid_clone = task_eid.clone();
+            tokio::spawn(async move {
+                if let Err(e) = backend_clone.post_comment(&task_eid_clone, &comment).await {
+                    tracing::warn!(
+                        task_id = task_eid_clone.0,
+                        ?e,
+                        "failed to post silence detection comment"
+                    );
+                }
+            });
         }
     }
 
@@ -572,12 +594,25 @@ pub(crate) async fn tick_recover_stuck_tasks(
             );
         }
 
-        // Remove stale agent/model labels so the LLM router re-routes properly
-        for label in &task.labels {
-            if label.starts_with("agent:") || label.starts_with("model:") {
-                if let Err(e) = backend.remove_label(&task.id, label).await {
-                    tracing::warn!(task_id = task.id.0, label, error = %e, "failed to remove stale routing label during stuck-task recovery");
-                }
+        // Remove stale agent/model labels so the LLM router re-routes properly.
+        // Fire-and-forget: cosmetic label operation, tick should not block on it.
+        {
+            let stale_labels: Vec<String> = task
+                .labels
+                .iter()
+                .filter(|l| l.starts_with("agent:") || l.starts_with("model:"))
+                .cloned()
+                .collect();
+            if !stale_labels.is_empty() {
+                let backend_clone = Arc::clone(backend);
+                let task_id_clone = task.id.clone();
+                tokio::spawn(async move {
+                    for label in &stale_labels {
+                        if let Err(e) = backend_clone.remove_label(&task_id_clone, label).await {
+                            tracing::warn!(task_id = task_id_clone.0, label, error = %e, "failed to remove stale routing label during stuck-task recovery");
+                        }
+                    }
+                });
             }
         }
         let resolved_store_id = match cached_store_id {
@@ -631,24 +666,25 @@ pub(crate) async fn tick_recover_stuck_tasks(
                 timing.age.num_minutes()
             )
         };
-        if let Err(e) = backend
-            .post_comment(
-                &task.id,
-                &format!(
-                    "[{}] recovered: stuck in_progress — {}{}",
-                    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-                    reason,
-                    crate::engine::orch_footer()
-                ),
-            )
-            .await
+        // Fire-and-forget: comment is informational — tick should not block on it.
         {
-            tracing::warn!(
-                task_id = task.id.0,
-                ?e,
-                "failed to post stuck-task recovery comment"
+            let backend_clone = Arc::clone(backend);
+            let task_id_clone = task.id.clone();
+            let body = format!(
+                "[{}] recovered: stuck in_progress — {}{}",
+                chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+                reason,
+                crate::engine::orch_footer()
             );
-            continue;
+            tokio::spawn(async move {
+                if let Err(e) = backend_clone.post_comment(&task_id_clone, &body).await {
+                    tracing::warn!(
+                        task_id = task_id_clone.0,
+                        ?e,
+                        "failed to post stuck-task recovery comment"
+                    );
+                }
+            });
         }
     }
 
@@ -1535,82 +1571,114 @@ pub(crate) async fn tick_unblock_parents(
         .filter_map(|t| t.external_id.clone())
         .collect();
 
-    for task in &blocked {
-        if has_block_reason.contains(&task.id.0) {
-            tracing::debug!(
-                task_id = task.id.0,
-                "skipping blocked task with known block_reason"
-            );
-            continue;
-        }
-        let children = match backend.get_sub_issues(&task.id).await {
-            Ok(ids) => ids,
-            Err(e) => {
-                tracing::debug!(task_id = task.id.0, ?e, "failed to get sub-issues");
-                continue;
+    // Spawn a concurrent task for each candidate blocked task.
+    // Previously these ran sequentially; get_sub_issues is a GraphQL call taking 1-3 s each,
+    // and with 4 blocked tasks that was 4-12 s of sequential latency every tick.
+    let handles: Vec<_> = blocked
+        .into_iter()
+        .filter(|task| {
+            if has_block_reason.contains(&task.id.0) {
+                tracing::debug!(
+                    task_id = task.id.0,
+                    "skipping blocked task with known block_reason"
+                );
+                false
+            } else {
+                true
             }
-        };
+        })
+        .map(|task| {
+            let backend_clone = Arc::clone(backend);
+            let task_manager_clone = Arc::clone(task_manager);
+            let store_clone = Arc::clone(store);
+            let repo_owned = repo.to_string();
+            tokio::spawn(async move {
+                let task_id = &task.id;
+                let children = match backend_clone.get_sub_issues(task_id).await {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        tracing::debug!(task_id = task_id.0, ?e, "failed to get sub-issues");
+                        return;
+                    }
+                };
 
-        // No children means nothing to wait on — skip (may be blocked for other reasons)
-        if children.is_empty() {
-            continue;
-        }
-
-        // Check if every child is done using the local store (batched) and
-        // fall back to the backend only for children not present in the store.
-        let mut all_done = true;
-        // Build a vec of &str external ids for the batch lookup
-        let child_exts: Vec<&str> = children.iter().map(|c| c.0.as_str()).collect();
-        // Query store for statuses of any children present locally
-        let mut store_status_map: std::collections::HashMap<String, crate::store::TaskStatus> =
-            std::collections::HashMap::new();
-        if let Ok(map) = store.get_statuses_by_external_ids(repo, &child_exts).await {
-            // convert store::TaskStatus -> crate::store::TaskStatus (same type)
-            for (k, v) in map.into_iter() {
-                store_status_map.insert(k, v);
-            }
-        } else {
-            tracing::debug!(
-                task_id = task.id.0,
-                "failed to batch-query store for child statuses; falling back to per-child lookups"
-            );
-        }
-
-        for child_id in &children {
-            // Check store first
-            if let Some(status) = store_status_map.get(&child_id.0) {
-                if *status != crate::store::TaskStatus::Done {
-                    all_done = false;
-                    break;
+                // No children means nothing to wait on — skip (may be blocked for other reasons)
+                if children.is_empty() {
+                    return;
                 }
-                continue;
-            }
 
-            // Not found in store — fall back to backend check
-            match backend.get_task(child_id).await {
-                Ok(child) => {
-                    if !child.labels.iter().any(|l| l == Status::Done.as_label()) {
-                        all_done = false;
-                        break;
+                // Check if every child is done using the local store (batched) and
+                // fall back to the backend only for children not present in the store.
+                let mut all_done = true;
+                // Build owned strings for the batch lookup (needed for &str slices below)
+                let child_ext_strs: Vec<String> =
+                    children.iter().map(|c| c.0.clone()).collect();
+                let child_exts: Vec<&str> =
+                    child_ext_strs.iter().map(|s| s.as_str()).collect();
+                // Query store for statuses of any children present locally
+                let mut store_status_map: std::collections::HashMap<
+                    String,
+                    crate::store::TaskStatus,
+                > = std::collections::HashMap::new();
+                if let Ok(map) = store_clone
+                    .get_statuses_by_external_ids(&repo_owned, &child_exts)
+                    .await
+                {
+                    for (k, v) in map.into_iter() {
+                        store_status_map.insert(k, v);
+                    }
+                } else {
+                    tracing::debug!(
+                        task_id = task_id.0,
+                        "failed to batch-query store for child statuses; falling back to per-child lookups"
+                    );
+                }
+
+                for child_id in &children {
+                    // Check store first
+                    if let Some(status) = store_status_map.get(&child_id.0) {
+                        if *status != crate::store::TaskStatus::Done {
+                            all_done = false;
+                            break;
+                        }
+                        continue;
+                    }
+
+                    // Not found in store — fall back to backend check
+                    match backend_clone.get_task(child_id).await {
+                        Ok(child) => {
+                            if !child.labels.iter().any(|l| l == Status::Done.as_label()) {
+                                all_done = false;
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(task_id = task_id.0, child = %child_id.0, ?e, "failed to fetch child task from backend — treating as not done");
+                            all_done = false;
+                            break;
+                        }
                     }
                 }
-                Err(e) => {
-                    tracing::debug!(task_id = task.id.0, child = %child_id.0, ?e, "failed to fetch child task from backend — treating as not done");
-                    all_done = false;
-                    break;
-                }
-            }
-        }
 
-        if all_done {
-            tracing::info!(
-                task_id = task.id.0,
-                children = children.len(),
-                "all children done, unblocking parent"
-            );
-            if let Err(e) = task_manager.update_task_status(&task.id, Status::New).await {
-                tracing::warn!(task_id = task.id.0, ?e, "failed to unblock parent");
-            }
+                if all_done {
+                    tracing::info!(
+                        task_id = task_id.0,
+                        children = children.len(),
+                        "all children done, unblocking parent"
+                    );
+                    if let Err(e) =
+                        task_manager_clone.update_task_status(task_id, Status::New).await
+                    {
+                        tracing::warn!(task_id = task_id.0, ?e, "failed to unblock parent");
+                    }
+                }
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        if let Err(e) = handle.await {
+            tracing::warn!(?e, "phase 4 sub-issue check panicked");
         }
     }
     Ok(())
