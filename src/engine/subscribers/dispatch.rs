@@ -42,6 +42,7 @@ pub fn spawn(
                     // The dispatching set guard inside tick_dispatch_tasks
                     // prevents double-dispatch if the tick loop also picks this up.
                     let router_guard = router_arc.read().await;
+                    let session_map = tmux.batch_session_active().await;
                     if let Err(e) = crate::engine::tick::tick_dispatch_tasks(
                         &backend,
                         &tmux,
@@ -54,6 +55,7 @@ pub fn spawn(
                         &router_guard,
                         &dispatching,
                         &store,
+                        &session_map,
                     )
                     .await
                     {
