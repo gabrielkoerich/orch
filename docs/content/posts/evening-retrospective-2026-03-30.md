@@ -17,7 +17,7 @@ All 10 root-cause issues from the kimi billing-cycle failure cascade identified 
 - **#1250** — `handle_failover` now records agent cooldown in "no fallback" path
 - **#1252** — `next_round_robin_agent` excludes cooled agents from last-resort fallback
 - **#1251** — `model_for_complexity` now handles cooled model pools gracefully
-- **#1240** — transport `last_output` no longer persists across retries
+- **#1240** — transport `last_output` removed to fix memory leak
 - **#1243** — review gate now marks tasks Blocked on failover exhaustion
 - **#1258** — `create_pr_if_needed` preserves `pr_number` when PR exists
 - **#1254** — startup rebase now handles unstaged changes safely
