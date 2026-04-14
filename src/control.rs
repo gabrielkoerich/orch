@@ -38,7 +38,11 @@ use crate::store::TaskStore;
 ///
 /// Keyed by `session_id`. A new `Arc<tokio::sync::Mutex<()>>` is inserted on first use and
 /// reused for all subsequent calls with the same session_id. Entries are evicted after each
-/// `send_message` call when no concurrent waiters remain (Arc strong count drops to 1).
+/// `send_message` call when no concurrent waiters remain. Note: because callers keep a
+/// local `Arc` clone while executing, the map entry + local clone equal 2 strong refs when
+/// there are no other waiters. We therefore test for `Arc::strong_count() == 2` when
+/// deciding to evict the map entry (map entry + local clone). If other waiters exist the
+/// count will be > 2 and we leave the entry in place.
 static SESSION_LOCKS: std::sync::LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -791,16 +795,19 @@ pub async fn send_message(
     drop(_guard);
 
     // Evict the session lock entry if no concurrent waiters are holding a reference.
-    // After drop(_guard) above, the only remaining strong reference should be the map
-    // entry itself (count == 1). If another waiter entered concurrently its clone still
-    // holds a reference (count > 1), so we leave the entry in place for it to use.
-    if Arc::strong_count(&session_lock) == 1 {
+    // After drop(_guard) above the remaining strong references are:
+    // - the map entry
+    // - the local `session_lock` clone held by this function.
+    // That sums to 2 when there are no other waiters. If another waiter entered
+    // concurrently the count will be > 2 and we should not evict. Only remove the
+    // map entry when the strong_count == 2.
+    if Arc::strong_count(&session_lock) == 2 {
         let mut map = SESSION_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
         // Re-check under the map lock: a concurrent caller may have cloned the Arc
         // between our strong_count check above and acquiring the map lock.
         if map
             .get(session_id)
-            .is_some_and(|l| Arc::strong_count(l) == 1)
+            .is_some_and(|l| Arc::strong_count(l) == 2)
         {
             map.remove(session_id);
         }
