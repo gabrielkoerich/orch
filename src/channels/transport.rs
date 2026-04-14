@@ -241,10 +241,9 @@ impl Transport {
 
     /// Unbind a task session, removing all associated entries.
     ///
-    /// Removes the entry from `bindings`, all reverse-lookup entries from
-    /// `thread_to_task` whose value matches the session key, and clears any
-    /// cached output for the session.  Call this when a task session ends so
-    /// memory does not grow indefinitely.
+    /// Removes the entry from `bindings` and all reverse-lookup entries from
+    /// `thread_to_task` whose value matches the session key.  Call this when
+    /// a task session ends so memory does not grow indefinitely.
     pub async fn unbind(&self, repo: &str, task_id: &str) {
         let skey = session_key(repo, task_id);
 
@@ -264,9 +263,6 @@ impl Transport {
                 t2t.remove(key);
             }
         }
-
-        // Clear any cached output.
-        self.clear_output(&skey).await;
     }
 
     /// List all active bindings.

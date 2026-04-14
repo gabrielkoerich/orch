@@ -44,6 +44,7 @@ This is a **regression**, not the original #2574 root cause. The original fix ad
 - Task 2623 (`feat: implement local model routing via Ollama`) — stuck task recovery triggered at 22 min, session reclaimed and re-routed to new. Currently at new status (4 tries). Being handled normally.
 - minimax/opus had 5 rate_limit outcomes in the last 24h — minor noise, cooldown applied and recovered.
 - Router LLM pool entries timing out during the 10:01-10:06 stall window — both `haiku` entries (minimax, claude) timed out, fallback `haiku` (claude-haiku-4-5-20251001) also timed out. This is what caused the cascading stall.
+- **CI failed on PR #2632** — review agent correctly caught a compile error introduced on this branch. `src/channels/transport.rs:269` called `self.clear_output(&skey).await` but the method doesn't exist (`last_output` was removed in `19f40336`). **Fixed**: removed the stale call and updated the docstring. Clippy passes. CI should go green on re-run.
 
 ---
 
@@ -77,7 +78,7 @@ Three blocked tasks:
 | Fix CLI version mismatch (CLI 0.67.7 vs service 0.68.5) | **NOT FIXED — still mismatched**. `brew upgrade orch && brew services restart orch` must be run. |
 | Investigate claude/opus 50% failure rate | **Concluded: hard task mix.** 68 runs over 48h: 33 success, 35 failed. Error pattern: "no PR or code changes produced" (28/35 = 80%). Opus is routed for complex tasks where agents often can't produce working code. Not a model degradation issue. No action needed — this is expected behavior for difficult tasks. |
 | Verify tick loop stall resolved (#2574) | **Partially resolved.** The original #2574 root cause (blocking Tokio workers) is fixed. However, a **new trigger path** was found: router LLM timeout cascade at 10:01 UTC stalled the tick for 350s. Filed as #2633. |
-| Monitor kimi recovery (~Apr 15 06:32 UTC) | **UPDATED.** kimi cooldowns expire ~1h47m from now (~10:17 UTC). The 20h30m estimate in yesterday's retro was stale — actual expiry is ~2026-04-14T10:17 UTC. Recovery imminent. |
+| Monitor kimi recovery | `kimi:haiku` cooldown ~2h remaining (recovers mid-afternoon UTC). `kimi` cooldown ~20h remaining (recovers ~Apr 15 06:30 UTC). Both active. Monitor via `orch cooldown list`. |
 | Investigate claude/(blank) model field | **Low priority.** 49 runs over 48h: 24 success, 25 failed (50%). Model field being blank likely means model was auto-resolved by the Claude CLI. Consistent ~50% rate matches opus pattern — hard tasks, not a bug. |
 
 ---
@@ -109,11 +110,12 @@ Top outcomes:
 ## Priorities
 
 1. **Fix CLI version mismatch NOW** — `brew upgrade orch && brew services restart orch && orch version`. This has been outstanding for three days.
-2. **Investigate tick loop stall regression (#2633)** — router LLM timeout cascade blocked the tick loop for 350s at 10:01 UTC. See issue for proposed fixes (per-tick routing time budget, immediate fallback).
-3. **Unblock internal:145238** — false positive blocked. Verify the 2 tasks it created exist in GitHub, then `orch task unblock internal:145238`.
-4. **Close/de-dup task 2622** — `orch task watch` already implemented in PR #2631.
-5. **Human review PR #2557** (task 2555) — implementation complete, needs owner review.
-6. **Monitor kimi recovery** later today — `kimi` and `kimi:haiku` cooldowns expire ~20h and ~2h from now.
+2. **Re-run CI on PR #2632** — compile error in transport.rs fixed (stale `clear_output` call removed). Clippy passes. Push the fix and re-trigger checks.
+3. **Investigate tick loop stall regression (#2633)** — router LLM timeout cascade blocked the tick loop for 350s at 10:01 UTC. See issue for proposed fixes (per-tick routing time budget, immediate fallback).
+4. **Unblock internal:145238** — false positive blocked. Verify the 2 tasks it created exist in GitHub, then `orch task unblock internal:145238`.
+5. **Close/de-dup task 2622** — `orch task watch` already implemented in PR #2631.
+6. **Human review PR #2557** (task 2555) — implementation complete, needs owner review.
+7. **Monitor kimi recovery** — `kimi:haiku` recovers ~2h, `kimi` recovers ~20h.
 
 ---
 
