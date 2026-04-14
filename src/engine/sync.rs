@@ -848,6 +848,7 @@ pub(crate) async fn sync_tick(
             .unwrap_or_else(|| mention_fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string());
         let shared_since = mention_since.clone();
 
+        let cached_router_config = router.read().await.config.clone();
         let (merge_result, comments_result, review_result) = tokio::join!(
             check_merged_prs(
                 backend,
@@ -876,6 +877,7 @@ pub(crate) async fn sync_tick(
                     auto_merge_in_flight,
                     &in_review_tasks,
                     &gh,
+                    &cached_router_config,
                 )
                 .await
             }

@@ -1239,6 +1239,7 @@ async fn post_review_comment(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_review_decision(
     task: &ExternalTask,
     backend: &Arc<dyn ExternalBackend>,
@@ -1247,6 +1248,7 @@ async fn apply_review_decision(
     store: &Arc<TaskStore>,
     ctx: &ReviewContext,
     parsed: &ParsedReview,
+    router_config: &crate::engine::router::RouterConfig,
 ) -> anyhow::Result<ReviewDecision> {
     restore_review_config_if_needed(&task.id.0, &ctx.worktree_path, &ctx.default_branch).await;
 
@@ -1335,6 +1337,7 @@ async fn apply_review_decision(
                 ctx.review_model_str(),
                 task_manager,
                 store,
+                router_config,
             )
             .await?;
             Ok(parsed.decision.clone())
@@ -2148,7 +2151,18 @@ pub(crate) async fn review_and_merge(
 
     finalize_review_run(task, &ctx, &parsed, store).await;
 
-    apply_review_decision(task, backend, repo, task_manager, store, &ctx, &parsed).await
+    let router_config = router.read().await.config.clone();
+    apply_review_decision(
+        task,
+        backend,
+        repo,
+        task_manager,
+        store,
+        &ctx,
+        &parsed,
+        &router_config,
+    )
+    .await
 }
 
 #[cfg(test)]
