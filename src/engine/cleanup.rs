@@ -355,7 +355,14 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
     //   1. stored "worktree" path, if it exists on disk.
     //   2. Construct from worktrees_base + project name + branch, if it exists.
     let worktree_to_remove = if let Some(ref wt) = worktree_path {
-        if tokio::fs::try_exists(wt).await.unwrap_or(false) {
+        if match tokio::fs::try_exists(wt).await {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(e) => {
+                tracing::warn!(task_id, worktree = %wt.display(), err = %e, "try_exists failed on stored worktree path — trying branch-based fallback");
+                false
+            }
+        } {
             Some(wt.clone())
         } else {
             // The recorded worktree path doesn't exist — try reconstructing from branch.
