@@ -664,6 +664,7 @@ impl TaskRunner {
                     init.new_attempts,
                     &self.repo,
                     &self.store,
+                    &session_output.raw_stdout,
                 )
                 .await?;
                 if budget_exceeded {
