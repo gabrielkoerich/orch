@@ -1666,9 +1666,19 @@ pub async fn serve() -> anyhow::Result<()> {
                                     }).await;
                                 }
                                 // Emit degraded-agents metric/log once per sync cycle.
+                                // Clone the needed data before releasing the read guard so
+                                // the lock is not held across the async store writes.
                                 if let Some((_, _, _, store)) = sync_engines.first() {
-                                    let r = sync_router.read().await;
-                                    sync::emit_degraded_agents_if_needed(&r, Some(store)).await;
+                                    let (available_agents, config) = {
+                                        let r = sync_router.read().await;
+                                        (r.available_agents.clone(), r.config.clone())
+                                    };
+                                    sync::emit_degraded_agents_if_needed(
+                                        &available_agents,
+                                        &config,
+                                        Some(store),
+                                    )
+                                    .await;
                                 }
                                 let elapsed = sync_start.elapsed();
                                 tracing::info!(elapsed_ms = elapsed.as_millis() as u64, "sync tick complete");

@@ -115,6 +115,21 @@ impl RouteResult {
     }
 }
 
+/// An opaque, cheaply-cloneable handle to the LLM routing subsystem.
+///
+/// Obtain one via [`Router::llm_router_handle`].  Holding this handle does
+/// **not** require holding the router's `RwLock`, so async operations can
+/// safely be called without starving write-lock waiters.
+pub struct LlmRouterHandle(std::sync::Arc<LlmRouter>);
+
+impl LlmRouterHandle {
+    /// Invalidate the skills catalog cache so the next routing call reloads
+    /// from disk.  Safe to await without holding any `RwLock` on `Router`.
+    pub async fn invalidate_skills_catalog(&self) {
+        self.0.invalidate_skills_catalog().await;
+    }
+}
+
 /// The agent router.
 pub struct Router {
     /// Router configuration
@@ -123,8 +138,9 @@ pub struct Router {
     pub available_agents: Vec<String>,
     /// Per-agent rate limit weights (used when weighted_round_robin is enabled)
     pub weights: AgentWeights,
-    /// LLM routing subsystem
-    llm_router: LlmRouter,
+    /// LLM routing subsystem (wrapped in Arc so callers can clone a handle
+    /// without holding the router RwLock across async operations)
+    llm_router: std::sync::Arc<LlmRouter>,
     /// Round-robin index for task routing
     pub(crate) rr_index: usize,
     /// Last agent routed to (for distribution tracking)
@@ -180,7 +196,7 @@ impl Router {
             config,
             available_agents,
             weights,
-            llm_router: LlmRouter::new(),
+            llm_router: std::sync::Arc::new(LlmRouter::new()),
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
@@ -194,11 +210,15 @@ impl Router {
         Self::new(RouterConfig::from_config())
     }
 
-    /// Invalidate the skills catalog cache so the next routing call reloads from disk.
+    /// Return a cloned handle to the LLM router subsystem.
     ///
-    /// Call this after `skills_sync()` writes new/updated skill files.
-    pub async fn invalidate_skills_catalog(&self) {
-        self.llm_router.invalidate_skills_catalog().await;
+    /// Callers that need to invoke async methods on the underlying `LlmRouter`
+    /// should clone this handle *before* releasing any `RwLock` read guard on
+    /// `Router`, then call the async method after the guard is dropped.  This
+    /// prevents holding the read lock across await points (which starves
+    /// write-lock waiters due to Tokio's write-preferring `RwLock`).
+    pub fn llm_router_handle(&self) -> LlmRouterHandle {
+        LlmRouterHandle(self.llm_router.clone())
     }
 
     fn advance_pool_index_after_attempt(&mut self, idx: usize, pool_len: usize) {
@@ -1876,7 +1896,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            llm_router: LlmRouter::new(),
+            llm_router: std::sync::Arc::new(LlmRouter::new()),
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
@@ -1911,7 +1931,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            llm_router: LlmRouter::new(),
+            llm_router: std::sync::Arc::new(LlmRouter::new()),
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
@@ -1967,7 +1987,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            llm_router: LlmRouter::new(),
+            llm_router: std::sync::Arc::new(LlmRouter::new()),
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
@@ -2257,7 +2277,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            llm_router: LlmRouter::new(),
+            llm_router: std::sync::Arc::new(LlmRouter::new()),
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
@@ -2298,7 +2318,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            llm_router: LlmRouter::new(),
+            llm_router: std::sync::Arc::new(LlmRouter::new()),
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
@@ -2364,7 +2384,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            llm_router: LlmRouter::new(),
+            llm_router: std::sync::Arc::new(LlmRouter::new()),
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
@@ -2404,7 +2424,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            llm_router: LlmRouter::new(),
+            llm_router: std::sync::Arc::new(LlmRouter::new()),
             rr_index: 0,
             last_agent: None,
             // Start index at 2, which is >= candidates.len() (2), triggering the bug
@@ -2448,7 +2468,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            llm_router: LlmRouter::new(),
+            llm_router: std::sync::Arc::new(LlmRouter::new()),
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
@@ -2510,7 +2530,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            llm_router: LlmRouter::new(),
+            llm_router: std::sync::Arc::new(LlmRouter::new()),
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
