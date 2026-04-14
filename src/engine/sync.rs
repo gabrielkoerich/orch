@@ -1081,21 +1081,6 @@ pub(crate) async fn sync_tick(
 
             // If we've exceeded max attempts, escalate the task to Blocked with a clear reason.
             if new_refires >= MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS {
-                // Increment first so the escalation value is accurate.
-                if let Err(e) = crate::store::store_increment(
-                    &Some(Arc::clone(store)),
-                    repo,
-                    task.task_id(),
-                    "needs_review_refires",
-                )
-                .await
-                {
-                    tracing::warn!(
-                        task_id = task.task_id(),
-                        err = %e,
-                        "failed to increment needs_review_refires before escalation"
-                    );
-                }
                 tracing::warn!(
                     task_id = task.task_id(),
                     new_refires,
@@ -1119,6 +1104,21 @@ pub(crate) async fn sync_tick(
                 {
                     tracing::error!(task_id = task.task_id(), err = %e, "update_task_status_and_result(Blocked) failed — skipping block to avoid silent auto-unblock loop");
                     continue;
+                }
+                // Increment only after the block transition succeeds — counter reflects actual escalations.
+                if let Err(e) = crate::store::store_increment(
+                    &Some(Arc::clone(store)),
+                    repo,
+                    task.task_id(),
+                    "needs_review_refires",
+                )
+                .await
+                {
+                    tracing::warn!(
+                        task_id = task.task_id(),
+                        err = %e,
+                        "failed to increment needs_review_refires after escalation"
+                    );
                 }
                 continue;
             }
