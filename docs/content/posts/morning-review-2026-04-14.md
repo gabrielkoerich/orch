@@ -77,7 +77,7 @@ Three blocked tasks:
 | Fix CLI version mismatch (CLI 0.67.7 vs service 0.68.5) | **NOT FIXED — still mismatched**. `brew upgrade orch && brew services restart orch` must be run. |
 | Investigate claude/opus 50% failure rate | **Concluded: hard task mix.** 68 runs over 48h: 33 success, 35 failed. Error pattern: "no PR or code changes produced" (28/35 = 80%). Opus is routed for complex tasks where agents often can't produce working code. Not a model degradation issue. No action needed — this is expected behavior for difficult tasks. |
 | Verify tick loop stall resolved (#2574) | **Partially resolved.** The original #2574 root cause (blocking Tokio workers) is fixed. However, a **new trigger path** was found: router LLM timeout cascade at 10:01 UTC stalled the tick for 350s. Filed as #2633. |
-| Monitor kimi recovery (~Apr 15 06:32 UTC) | Cooldown still active: 20h30m remaining on `kimi`, 2h24m on `kimi:haiku`. Recovery expected later today. |
+| Monitor kimi recovery (~Apr 15 06:32 UTC) | **UPDATED.** kimi cooldowns expire ~1h47m from now (~10:17 UTC). The 20h30m estimate in yesterday's retro was stale — actual expiry is ~2026-04-14T10:17 UTC. Recovery imminent. |
 | Investigate claude/(blank) model field | **Low priority.** 49 runs over 48h: 24 success, 25 failed (50%). Model field being blank likely means model was auto-resolved by the Claude CLI. Consistent ~50% rate matches opus pattern — hard tasks, not a bug. |
 
 ---
