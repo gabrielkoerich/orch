@@ -4,9 +4,9 @@
 //! When router.mode is "local", tasks are routed using a local model
 //! instead of cloud LLMs, reducing latency and cost.
 
-use super::RouteResult;
-use crate::backends::ExternalTask;
 use super::config::RouterConfig;
+use super::{AgentProfile, RouteResult};
+use crate::backends::ExternalTask;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -28,10 +28,7 @@ struct OllamaOptions {
 /// Response from Ollama /api/generate endpoint.
 #[derive(Debug, Deserialize)]
 struct OllamaResponse {
-    model: String,
     response: String,
-    #[serde(default)]
-    done: bool,
 }
 
 /// LLM router adapter for Ollama.
@@ -60,7 +57,11 @@ impl OllamaRouter {
     ///
     /// Builds a routing prompt, calls Ollama, parses the JSON response,
     /// and returns a RouteResult.
-    pub async fn route(&self, task: &ExternalTask, config: &RouterConfig) -> anyhow::Result<RouteResult> {
+    pub async fn route(
+        &self,
+        task: &ExternalTask,
+        config: &RouterConfig,
+    ) -> anyhow::Result<RouteResult> {
         // Build routing prompt
         let prompt = self.build_routing_prompt(task, config)?;
 
@@ -74,9 +75,7 @@ impl OllamaRouter {
             }),
         };
 
-        let client = reqwest::Client::builder()
-            .timeout(self.timeout)
-            .build()?;
+        let client = reqwest::Client::builder().timeout(self.timeout).build()?;
 
         let url = format!("{}/api/generate", self.url);
 
@@ -87,11 +86,7 @@ impl OllamaRouter {
             "calling Ollama for routing"
         );
 
-        let response = client
-            .post(&url)
-            .json(&request)
-            .send()
-            .await?;
+        let response = client.post(&url).json(&request).send().await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -108,37 +103,10 @@ impl OllamaRouter {
         let ollama_resp: OllamaResponse = match serde_json::from_str(&body) {
             Ok(r) => r,
             Err(e) => {
-                // Ollama might return plain text without JSON structure
+                // Ollama might return plain text without JSON wrapper — treat body as response text
                 tracing::debug!(error = %e, raw_body = %body, "Ollama response parse failed, treating as plain text");
-
-                // Try to extract JSON from plain text response
-                if let Some(json_start) = body.find('{') {
-                    if let Some(json_end) = body.rfind('}') {
-                        let json_str = &body[json_start..=json_end + 1];
-                        match serde_json::from_str::<OllamaResponse>(json_str) {
-                            Ok(r) => r,
-                            Err(_) => {
-                                // Last resort: treat plain text as response
-                                OllamaResponse {
-                                    model: self.model.clone(),
-                                    response: body.clone(),
-                                    done: true,
-                                }
-                            }
-                        }
-                    } else {
-                        OllamaResponse {
-                            model: self.model.clone(),
-                            response: body.clone(),
-                            done: true,
-                        }
-                    }
-                } else {
-                    OllamaResponse {
-                        model: self.model.clone(),
-                        response: body.clone(),
-                        done: true,
-                    }
+                OllamaResponse {
+                    response: body.clone(),
                 }
             }
         };
@@ -152,15 +120,68 @@ impl OllamaRouter {
         );
 
         // Use the same parsing logic as LlmRouter for compatibility
-        super::llm::LlmRouter::new().parse_ollama_response(
-            task,
-            llm_text,
-            &self.model,
-        )
+        let llm_router = super::llm::LlmRouter::new();
+        let llm_response = llm_router.parse_llm_response("ollama", llm_text)?;
+
+        // Validate executor against configured agents
+        let mut agent = llm_response.executor.to_lowercase();
+        if !config.agents.contains(&agent) {
+            agent = if !config.fallback_executor.is_empty() {
+                config.fallback_executor.clone()
+            } else {
+                config.agents.first().cloned().unwrap_or_default()
+            };
+        }
+
+        let complexity = if llm_response.complexity.is_empty() {
+            "medium".to_string()
+        } else {
+            llm_response.complexity.to_lowercase()
+        };
+
+        let model = config.model_for_complexity(&agent, &complexity, &task.id.0);
+
+        let mut profile = AgentProfile {
+            role: llm_response.profile.role,
+            skills: llm_response.profile.skills,
+            tools: if llm_response.profile.tools.is_empty() {
+                config.allowed_tools.clone()
+            } else {
+                llm_response.profile.tools
+            },
+            constraints: llm_response.profile.constraints,
+        };
+        for tool in &config.allowed_tools {
+            if !profile.tools.contains(tool) {
+                profile.tools.push(tool.clone());
+            }
+        }
+
+        let mut selected_skills = llm_response.selected_skills;
+        for skill in &config.default_skills {
+            if !selected_skills.contains(skill) {
+                selected_skills.push(skill.clone());
+            }
+        }
+
+        Ok(RouteResult {
+            agent,
+            model,
+            complexity,
+            estimate: llm_response.estimate,
+            reason: llm_response.reason,
+            profile,
+            selected_skills,
+            warning: None,
+        })
     }
 
     /// Build routing prompt from template.
-    fn build_routing_prompt(&self, task: &ExternalTask, config: &RouterConfig) -> anyhow::Result<String> {
+    fn build_routing_prompt(
+        &self,
+        task: &ExternalTask,
+        config: &RouterConfig,
+    ) -> anyhow::Result<String> {
         let template = include_str!("../../../prompts/route.md");
 
         // Build available agents string

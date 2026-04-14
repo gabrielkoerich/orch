@@ -275,7 +275,7 @@ impl RouterConfig {
 
         // Try to load from config
         if let Ok(mode) = crate::config::get("router.mode") {
-            if mode == "round_robin" || mode == "llm" {
+            if mode == "round_robin" || mode == "llm" || mode == "local" {
                 config.mode = mode;
             }
         }
