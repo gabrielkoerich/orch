@@ -44,6 +44,8 @@ mod channels {
             }
 
             pub async fn push_output(&self, _repo: &str, _task_id: &str, _chunk: OutputChunk) {}
+
+            pub async fn unbind(&self, _repo: &str, _task_id: &str) {}
         }
     }
 }

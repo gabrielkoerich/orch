@@ -260,6 +260,36 @@ impl Transport {
         MessageRoute::NewTask
     }
 
+    /// Unbind a task session, removing all associated entries.
+    ///
+    /// Removes the entry from `bindings`, all reverse-lookup entries from
+    /// `thread_to_task` whose value matches the session key, and clears any
+    /// cached output for the session.  Call this when a task session ends so
+    /// memory does not grow indefinitely.
+    pub async fn unbind(&self, repo: &str, task_id: &str) {
+        let skey = session_key(repo, task_id);
+
+        // Remove the binding and collect its connected threads.
+        let connected_threads = {
+            let mut bindings = self.bindings.write().await;
+            bindings
+                .remove(&skey)
+                .map(|b| b.connected_threads)
+                .unwrap_or_default()
+        };
+
+        // Remove reverse-lookup entries for all connected threads.
+        if !connected_threads.is_empty() {
+            let mut t2t = self.thread_to_task.write().await;
+            for key in &connected_threads {
+                t2t.remove(key);
+            }
+        }
+
+        // Clear any cached output.
+        self.clear_output(&skey).await;
+    }
+
     /// List all active bindings.
     pub async fn active_sessions(&self) -> Vec<SessionBinding> {
         self.bindings.read().await.values().cloned().collect()
@@ -699,6 +729,50 @@ mod tests {
             }
             other => panic!("expected TaskSession for task 20, got {other:?}"),
         }
+    }
+
+    // ── unbind ────────────────────────────────────────────────────────────────
+
+    /// After unbinding, the binding and reverse-lookup entries are removed.
+    #[tokio::test]
+    async fn unbind_removes_binding_and_reverse_lookup() {
+        let transport = Transport::new();
+        transport
+            .bind("owner/repo", "99", "orch-proj-99", "telegram", "555", None)
+            .await;
+
+        // Verify bound
+        assert!(transport.get_binding("owner/repo", "99").await.is_some());
+
+        // Unbind
+        transport.unbind("owner/repo", "99").await;
+
+        // Binding gone
+        assert!(transport.get_binding("owner/repo", "99").await.is_none());
+
+        // Reverse lookup gone — message should not route to the old session
+        let msg = IncomingMessage {
+            channel: "telegram".to_string(),
+            id: "m1".to_string(),
+            thread_id: "555".to_string(),
+            author: "user".to_string(),
+            body: "hello".to_string(),
+            timestamp: chrono::Utc::now(),
+            metadata: serde_json::json!({}),
+            topic_id: None,
+        };
+        match transport.route(&msg).await {
+            MessageRoute::NewTask => {} // correct
+            other => panic!("expected NewTask after unbind, got {other:?}"),
+        }
+    }
+
+    /// Unbinding a session that was never bound must not panic.
+    #[tokio::test]
+    async fn unbind_nonexistent_does_not_panic() {
+        let transport = Transport::new();
+        // Should complete without error
+        transport.unbind("owner/repo", "nonexistent").await;
     }
 
     /// A message arriving in a *different* topic must not be routed to a task
