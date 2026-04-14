@@ -285,7 +285,7 @@ pub(crate) async fn tick_detect_silent_agents(
 
         // 3. Cooldown the specific model (not the whole agent)
         if !agent_name.is_empty() && !model_name.is_empty() {
-            set_model_cooldown(&agent_name, &model_name, config.silence_cooldown);
+            set_model_cooldown(&agent_name, &model_name, config.silence_cooldown).await;
             if let Some(result) = record_silence_detection(&agent_name, &model_name).await {
                 if result.extended_cooldown_applied {
                     extended_note = format!(
@@ -300,7 +300,7 @@ pub(crate) async fn tick_detect_silent_agents(
         // Without this, the router picks the same agent with a different model,
         // looping through all models (~2 min each) before the long agent cooldown kicks in.
         if !agent_name.is_empty() {
-            set_agent_cooldown(&agent_name, SILENCE_AGENT_COOLDOWN_SECS);
+            set_agent_cooldown(&agent_name, SILENCE_AGENT_COOLDOWN_SECS).await;
         }
 
         // 4. Pick a fallback agent and set to Routed (not New) to preserve progress.
@@ -572,7 +572,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
                 .unwrap_or_default();
 
             if !agent_name.is_empty() && !model_name.is_empty() {
-                set_model_cooldown(&agent_name, &model_name, config.silence_cooldown);
+                set_model_cooldown(&agent_name, &model_name, config.silence_cooldown).await;
                 record_agent_failure_with_message(
                     &agent_name,
                     &format!(
@@ -583,7 +583,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
                 .await;
             }
             if !agent_name.is_empty() {
-                set_agent_cooldown(&agent_name, SILENCE_AGENT_COOLDOWN_SECS);
+                set_agent_cooldown(&agent_name, SILENCE_AGENT_COOLDOWN_SECS).await;
             }
             tracing::warn!(
                 task_id = task.id.0,
@@ -765,7 +765,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
                 .unwrap_or_default();
 
             if !agent_name.is_empty() && !model_name.is_empty() {
-                set_model_cooldown(&agent_name, &model_name, config.silence_cooldown);
+                set_model_cooldown(&agent_name, &model_name, config.silence_cooldown).await;
                 record_agent_failure_with_message(
                     &agent_name,
                     &format!(
@@ -776,7 +776,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
                 .await;
             }
             if !agent_name.is_empty() {
-                set_agent_cooldown(&agent_name, SILENCE_AGENT_COOLDOWN_SECS);
+                set_agent_cooldown(&agent_name, SILENCE_AGENT_COOLDOWN_SECS).await;
             }
             tracing::warn!(
                 task_id,

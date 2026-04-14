@@ -148,7 +148,8 @@ pub async fn handle_error(
                             agent_name,
                             model,
                             PROVIDER_RETURNED_ERROR_MODEL_COOLDOWN_SECS,
-                        );
+                        )
+                        .await;
                     } else {
                         response::record_model_failure(agent_name, model).await;
                     }
@@ -388,7 +389,7 @@ pub async fn handle_error(
                     // model cooldown.  These models (especially github-copilot/* in opencode)
                     // fail consistently across multiple hours; a 1-hour window means ~12
                     // wasted 2-minute attempts per day per model.  4 hours cuts that to ~3.
-                    crate::engine::cooldown::set_model_cooldown(agent_name, m, 4 * 3600);
+                    crate::engine::cooldown::set_model_cooldown(agent_name, m, 4 * 3600).await;
                 }
                 // Before falling through to handle_failover() (which tries claude/codex),
                 // check whether this agent has any free models that haven't been tried yet.

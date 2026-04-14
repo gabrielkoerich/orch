@@ -2809,8 +2809,8 @@ Hope that helps!"#;
             ..Default::default()
         };
         let router = Router::new(config);
-        set_model_cooldown("claude", "haiku-4-5-20251001", 300); // 5 min
-        set_model_cooldown("opencode", "haiku-4-5-20251001", 600); // 10 min
+        set_model_cooldown("claude", "haiku-4-5-20251001", 300).await; // 5 min
+        set_model_cooldown("opencode", "haiku-4-5-20251001", 600).await; // 10 min
 
         let earliest = router.earliest_pool_cooldown();
         assert!(earliest.is_some());
@@ -2820,8 +2820,8 @@ Hope that helps!"#;
         assert!((295..=300).contains(&remaining));
     }
 
-    #[test]
-    fn earliest_pool_cooldown_skips_non_pool_entries() {
+    #[tokio::test]
+    async fn earliest_pool_cooldown_skips_non_pool_entries() {
         // Use explicit pool so we can predict what entries exist.
         let config = RouterConfig {
             pool: vec![
@@ -2832,9 +2832,9 @@ Hope that helps!"#;
         };
         let router = Router::new(config);
         // Set cooldown on a non-pool model — should not affect earliest_pool_cooldown
-        set_model_cooldown("claude", "opus", 999);
+        set_model_cooldown("claude", "opus", 999).await;
         // Set cooldown on a pool entry (opencode:pool-model-b)
-        set_model_cooldown("opencode", "pool-model-b", 300);
+        set_model_cooldown("opencode", "pool-model-b", 300).await;
 
         let earliest = router.earliest_pool_cooldown();
         assert!(earliest.is_some());

@@ -3738,10 +3738,10 @@ mod tests {
             "test-agent-3d".to_string(),
         ];
 
-        // Place three agents into cooldown (in-memory only)
-        set_agent_cooldown("test-agent-3a", 3600);
-        set_agent_cooldown("test-agent-3b", 3600);
-        set_agent_cooldown("test-agent-3c", 3600);
+        // Place three agents into cooldown
+        set_agent_cooldown("test-agent-3a", 3600).await;
+        set_agent_cooldown("test-agent-3b", 3600).await;
+        set_agent_cooldown("test-agent-3c", 3600).await;
 
         // Call the helper and assert KV metrics written
         emit_degraded_agents_if_needed(&router.available_agents, &router.config, Some(&store))
@@ -3789,8 +3789,8 @@ mod tests {
         router.available_agents = vec!["test-agent-2a".to_string(), "test-agent-2b".to_string()];
 
         // Place only two agents into cooldown — below the threshold of 3
-        set_agent_cooldown("test-agent-2a", 3600);
-        set_agent_cooldown("test-agent-2b", 3600);
+        set_agent_cooldown("test-agent-2a", 3600).await;
+        set_agent_cooldown("test-agent-2b", 3600).await;
 
         emit_degraded_agents_if_needed(&router.available_agents, &router.config, Some(&store))
             .await;
