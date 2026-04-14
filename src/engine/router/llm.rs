@@ -1127,6 +1127,12 @@ impl LlmRouter {
         }
 
         None
+
+}
+
+
+/// Parse response from Ollama or other local LLMs.
+///
     }
 }
 
