@@ -1,0 +1,21 @@
+{
+  "status": "done",
+  "summary": "Fixed busy-loop issue when agents are degraded without cooldown timestamps by making wait_for_cooldown return an error instead of Ok(()).",
+  "accomplished": [
+    "Modified src/engine/router/mod.rs to return Err(AllCooledError) instead of Ok(()) when all agents are degraded but none have timed cooldown entries",
+    "This prevents the tight busy-loop by ensuring degraded agents trigger the same backoff behavior as agents with actual cooldown timestamps",
+    "Verified the fix compiles successfully with cargo check"
+  ],
+  "remaining": [],
+  "files_changed": [
+    "src/engine/router/mod.rs"
+  ],
+  "blockers": [],
+  "reason": "",
+  "learnings": [
+    "The wait_for_cooldown function was returning Ok(()) in degraded agent scenarios, causing immediate retries",
+    "Returning an error instead allows the existing tick loop backoff mechanism to prevent busy-loops",
+    "Consistency with how actual cooldowns are handled is important for predictable behavior"
+  ],
+  "delegations": []
+}
