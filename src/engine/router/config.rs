@@ -103,7 +103,11 @@ pub const DEFAULT_AGENTS: &[&str] = &["claude", "codex", "opencode", "kimi", "mi
 /// Router configuration.
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
-    /// Routing mode: "llm" or "round_robin"
+    /// Routing mode: "llm", "local", or "round_robin"
+    ///
+    /// - "llm": Use cloud LLMs for routing (default, supports pool-based routing)
+    /// - "local": Use local Ollama model for routing
+    /// - "round_robin": Distribute tasks evenly across available agents
     pub mode: String,
     /// Which agent performs routing (default: "claude")
     pub router_agent: String,
@@ -180,6 +184,12 @@ pub struct RouterConfig {
     ///
     /// Configurable via `router.max_tasks_per_tick` (default: 1).
     pub max_tasks_per_tick: usize,
+    /// Ollama base URL for local routing (default: "http://localhost:11434").
+    pub ollama_url: String,
+    /// Ollama model name for routing (default: "qwen2.5-coder:3b-instruct").
+    pub ollama_model: String,
+    /// Timeout for Ollama HTTP call in seconds (default: 30).
+    pub ollama_timeout_seconds: u64,
     /// Total time budget (seconds) for the entire LLM routing cascade (all pool
     /// entries + fallback combined). When exceeded, routing immediately falls back
     /// to round-robin without waiting for the remaining pool entries to time out
@@ -250,6 +260,9 @@ impl Default for RouterConfig {
             skip_limited_threshold: 0.3,
             agent_backoff_bases: HashMap::new(),
             max_tasks_per_tick: 1,
+            ollama_url: "http://localhost:11434".to_string(),
+            ollama_model: "qwen2.5-coder:3b-instruct".to_string(),
+            ollama_timeout_seconds: 30,
             llm_budget_secs: 45,
         }
     }
@@ -262,7 +275,7 @@ impl RouterConfig {
 
         // Try to load from config
         if let Ok(mode) = crate::config::get("router.mode") {
-            if mode == "round_robin" || mode == "llm" {
+            if mode == "round_robin" || mode == "llm" || mode == "local" {
                 config.mode = mode;
             }
         }
@@ -458,6 +471,37 @@ impl RouterConfig {
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .collect();
+                }
+            }
+        }
+
+        // Parse llm_budget_secs — total time cap for the entire pool cascade.
+        // Defaults to timeout_seconds (already resolved above) so the cascade
+        // can't exceed what a single pool entry would normally take.
+        config.llm_budget_secs = config.timeout_seconds;
+        if let Ok(val) = crate::config::get("router.llm_budget_secs") {
+            if let Ok(secs) = val.parse::<u64>() {
+                if secs > 0 {
+                    config.llm_budget_secs = secs;
+                }
+            }
+        }
+
+        // Parse Ollama-specific config for local routing mode
+        if let Ok(url) = crate::config::get("router.ollama_url") {
+            if !url.is_empty() {
+                config.ollama_url = url;
+            }
+        }
+        if let Ok(model) = crate::config::get("router.ollama_model") {
+            if !model.is_empty() {
+                config.ollama_model = model;
+            }
+        }
+        if let Ok(timeout) = crate::config::get("router.ollama_timeout_seconds") {
+            if let Ok(secs) = timeout.parse::<u64>() {
+                if secs > 0 {
+                    config.ollama_timeout_seconds = secs;
                 }
             }
         }

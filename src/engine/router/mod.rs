@@ -14,6 +14,7 @@
 
 pub mod config;
 mod llm;
+mod ollama;
 mod selection;
 mod strategies;
 pub mod weights;
@@ -733,7 +734,37 @@ impl Router {
                 return Ok(result);
             }
 
-            // 3. LLM-based routing with retry tracking
+            // 4. Local Ollama routing
+            if self.config.mode == "local" {
+                tracing::debug!(task_id = %task.id.0, ollama_url = %self.config.ollama_url, "routing via local Ollama");
+                let ollama_router = ollama::OllamaRouter::new(&self.config);
+                match ollama_router.route(task, &self.config).await {
+                    Ok(result) => {
+                        self.log_route_activity(store, repo, &task.id.0, &result, None)
+                            .await;
+                        return Ok(result);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            task_id = %task.id.0,
+                            error = %e,
+                            "Ollama routing failed, falling back to round-robin"
+                        );
+                        let result = strategies::route_via_round_robin_stateful(
+                            &candidates,
+                            &self.config,
+                            task,
+                            &mut self.rr_index,
+                            &mut self.last_agent,
+                        )?;
+                        self.log_route_activity(store, repo, &task.id.0, &result, None)
+                            .await;
+                        return Ok(result);
+                    }
+                }
+            }
+
+            // 5. LLM-based routing with retry tracking
             let route_attempts = self.get_route_attempts(&task.id.0, store, repo).await;
 
             if route_attempts >= self.config.max_route_attempts {
@@ -2029,10 +2060,12 @@ Hope that helps!"#;
         // Reload — should re-read config and remain valid
         router.reload_async().await;
 
-        // After reload, mode should be a valid value (llm or round_robin)
+        // After reload, mode should be a valid value (llm, local, or round_robin)
         assert!(
-            router.config.mode == "llm" || router.config.mode == "round_robin",
-            "mode should be 'llm' or 'round_robin', got '{}'",
+            router.config.mode == "llm"
+                || router.config.mode == "round_robin"
+                || router.config.mode == "local",
+            "mode should be 'llm', 'local', or 'round_robin', got '{}'",
             router.config.mode
         );
         // Fallback executor should always be set

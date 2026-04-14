@@ -58,14 +58,18 @@ engine:
   # silence_cooldown: 3600
 
 router:
-  mode: "llm"              # "llm" (default) or "round_robin"
-  agent: "claude"           # Which agent performs routing
-  model: "haiku"            # Model for routing (fast/cheap)
+  mode: "llm"              # "llm" (default), "local", or "round_robin"
+  agent: "claude"          # Which agent performs routing
+  model: "haiku"           # Model for routing (fast/cheap)
   timeout_seconds: 60
   fallback_executor: "codex"
-  max_route_attempts: 3     # After N LLM routing failures, fall back to round-robin
+  max_route_attempts: 3    # After N LLM routing failures, fall back to round-robin
   # Enable weighted round-robin: deprioritize agents hitting rate limits.
   # weighted_round_robin: false
+  # Local Ollama routing (when mode: "local")
+  # ollama_url: "http://localhost:11434"        # Ollama API endpoint (default)
+  # ollama_model: "qwen2.5-coder:3b-instruct"  # Model to use (default)
+  # ollama_timeout_seconds: 30                  # Timeout for Ollama calls (default)
   # Routing weights (higher = more tasks routed to this agent)
   # weights:
   #   claude: 0.25
