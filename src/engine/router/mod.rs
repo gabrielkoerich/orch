@@ -763,7 +763,38 @@ impl Router {
             // Log routing start (before await)
             tracing::debug!(task_id = %task.id.0, "starting LLM routing");
 
-            match self.route_with_llm(task, repo).await {
+            let budget = std::time::Duration::from_secs(self.config.llm_budget_secs);
+            let llm_result = tokio::time::timeout(budget, self.route_with_llm(task, repo)).await;
+
+            // Budget exceeded: the pool cascade took longer than the total
+            // allowed budget (llm_budget_secs). Fall back to round-robin
+            // immediately without incrementing route_attempts — this is not a
+            // model failure, just a latency problem.
+            if let Err(_elapsed) = llm_result {
+                tracing::warn!(
+                    task_id = %task.id.0,
+                    budget_secs = self.config.llm_budget_secs,
+                    "LLM routing budget exceeded — falling back to round-robin immediately"
+                );
+                let candidates = self.available_agents_for_complexity(&complexity);
+                if candidates.is_empty() {
+                    self.wait_for_cooldown(Some(&complexity)).await?;
+                    continue;
+                }
+                let result = strategies::route_via_round_robin_stateful(
+                    &candidates,
+                    &self.config,
+                    task,
+                    &mut self.rr_index,
+                    &mut self.last_agent,
+                )?;
+                self.log_route_activity(store, repo, &task.id.0, &result, None)
+                    .await;
+                return Ok(result);
+            }
+
+            // Budget not exceeded — unwrap the inner Result<RouteResult, _>
+            match llm_result.unwrap() {
                 Ok(result) => {
                     let candidates = self.available_agents_for_complexity(&result.complexity);
                     if candidates.is_empty() {

@@ -264,9 +264,6 @@ impl Transport {
                 t2t.remove(key);
             }
         }
-
-        // Clear any cached output.
-        self.clear_output(&skey).await;
     }
 
     /// List all active bindings.
