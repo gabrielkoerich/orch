@@ -1353,6 +1353,7 @@ pub(crate) async fn handle_review_changes(
     review_model: &str,
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
+    router_config: &crate::engine::router::config::RouterConfig,
 ) -> anyhow::Result<()> {
     // 1. Check review cycle count (max 2 review rounds)
     let task_store_record = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0).await;
@@ -1604,8 +1605,7 @@ pub(crate) async fn handle_review_changes(
         })
         .unwrap_or_else(|| "medium".to_string());
 
-    let config = crate::engine::router::config::RouterConfig::from_config();
-    let new_model = config.model_for_complexity(previous_agent, &complexity, &task.id.0);
+    let new_model = router_config.model_for_complexity(previous_agent, &complexity, &task.id.0);
 
     match new_model {
         Some(model) => {
@@ -1888,6 +1888,7 @@ mod tests {
             "sonnet",
             &task_manager,
             &store,
+            &crate::engine::router::RouterConfig::default(),
         )
         .await;
 
@@ -2016,6 +2017,7 @@ mod tests {
             "opus",
             &task_manager,
             &store,
+            &crate::engine::router::RouterConfig::default(),
         )
         .await;
 
@@ -2142,6 +2144,7 @@ mod tests {
             "sonnet",
             &task_manager,
             &store,
+            &crate::engine::router::RouterConfig::default(),
         )
         .await;
 
@@ -2271,6 +2274,7 @@ mod tests {
             "minimax-m2",
             &task_manager,
             &store,
+            &crate::engine::router::RouterConfig::default(),
         )
         .await;
 

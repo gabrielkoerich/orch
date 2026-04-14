@@ -162,6 +162,7 @@ pub(crate) async fn review_open_prs(
     auto_merge_in_flight: &Arc<DashSet<String>>,
     in_review_tasks: &[ReviewTaskSnapshot],
     gh: &dyn GhReviewClient,
+    router_config: &crate::engine::router::config::RouterConfig,
 ) -> anyhow::Result<()> {
     if in_review_tasks.is_empty() {
         tracing::debug!(count = 0, "checking in_review tasks for PR reviews");
@@ -871,6 +872,7 @@ pub(crate) async fn review_open_prs(
                 &task_model,
                 task_manager,
                 store,
+                router_config,
             )
             .await
             {
@@ -1270,6 +1272,7 @@ mod tests {
             &in_flight,
             &[],
             &gh,
+            &crate::engine::router::RouterConfig::default(),
         )
         .await;
 
@@ -1339,6 +1342,7 @@ mod tests {
             &in_flight,
             &[snapshot],
             &gh,
+            &crate::engine::router::RouterConfig::default(),
         )
         .await;
 
@@ -1402,6 +1406,7 @@ mod tests {
             &in_flight,
             &[snapshot],
             &gh,
+            &crate::engine::router::RouterConfig::default(),
         )
         .await
         .unwrap();
@@ -1462,6 +1467,7 @@ mod tests {
             &in_flight,
             &[snapshot],
             &gh,
+            &crate::engine::router::RouterConfig::default(),
         )
         .await
         .unwrap();
@@ -1531,6 +1537,7 @@ mod tests {
             &in_flight,
             &[snapshot],
             &gh,
+            &crate::engine::router::RouterConfig::default(),
         )
         .await
         .unwrap();
@@ -1618,6 +1625,7 @@ mod tests {
             &in_flight,
             &[snapshot],
             &TransientGh,
+            &crate::engine::router::RouterConfig::default(),
         )
         .await
         .unwrap();
@@ -1688,6 +1696,7 @@ mod tests {
             &in_flight,
             &[snapshot],
             &gh,
+            &crate::engine::router::RouterConfig::default(),
         )
         .await;
 
@@ -1768,6 +1777,7 @@ mod tests {
             &in_flight,
             &[snapshot],
             &gh,
+            &crate::engine::router::RouterConfig::default(),
         )
         .await
         .unwrap();
@@ -1853,6 +1863,7 @@ mod tests {
             &in_flight,
             &[snapshot],
             &gh,
+            &crate::engine::router::RouterConfig::default(),
         )
         .await
         .unwrap();
