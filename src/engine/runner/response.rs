@@ -760,7 +760,23 @@ pub async fn store_learnings_from_response(
     error: Option<&str>,
     store: &Option<Arc<TaskStore>>,
     repo: &str,
+    raw_stdout: &str,
 ) {
+    // Use agent self-reported files; fall back to NDJSON tool-call extraction when empty.
+    let files_modified = if response.files.is_empty() {
+        let extracted = crate::cli::ndjson::extract_files_changed(raw_stdout);
+        if !extracted.is_empty() {
+            tracing::debug!(
+                task_id,
+                count = extracted.len(),
+                "files_modified: fell back to NDJSON extraction (agent reported none)"
+            );
+        }
+        extracted
+    } else {
+        response.files.clone()
+    };
+
     // Build the memory entry
     let entry = crate::store::MemoryEntry {
         attempt,
@@ -768,7 +784,7 @@ pub async fn store_learnings_from_response(
         model: model.map(String::from),
         learnings: response.learnings.clone(),
         error: error.map(String::from),
-        files_modified: response.files.clone(),
+        files_modified,
         approach: response.summary.clone(),
         timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     };

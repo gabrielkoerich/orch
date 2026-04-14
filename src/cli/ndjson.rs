@@ -285,6 +285,70 @@ fn summarize_tool_input(tool: &str, input: Option<&serde_json::Value>) -> String
     }
 }
 
+/// Extract the set of files modified (written or edited) from raw NDJSON agent output.
+///
+/// Parses all three agent formats (Claude, OpenCode, Codex) and returns a sorted,
+/// deduplicated list of file paths that were written or edited.  This is used as a
+/// fallback when the agent's self-reported `files_changed` field is empty.
+pub fn extract_files_changed(content: &str) -> Vec<String> {
+    let mut files: std::collections::BTreeSet<String> = Default::default();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let event_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        match event_type {
+            // ── Claude: {"type":"tool_use","tool":{"name":"Write","input":{"file_path":"..."}}}
+            "tool_use" if v.get("tool").is_some() => {
+                if let Some(tool) = v.get("tool") {
+                    let name = tool.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    if matches!(name, "Write" | "Edit" | "MultiEdit" | "NotebookEdit") {
+                        if let Some(p) = tool
+                            .get("input")
+                            .and_then(|i| i.get("file_path"))
+                            .and_then(|p| p.as_str())
+                        {
+                            files.insert(p.to_string());
+                        }
+                    }
+                }
+            }
+
+            // ── OpenCode: {"type":"tool_use","part":{"tool":"write","state":{"input":{"file_path":"..."}}}}
+            "tool_use" if v.get("part").is_some() => {
+                if let Some(part) = v.get("part") {
+                    let name = part.get("tool").and_then(|t| t.as_str()).unwrap_or("");
+                    if matches!(
+                        name,
+                        "write" | "Write" | "edit" | "Edit" | "MultiEdit" | "NotebookEdit"
+                    ) {
+                        if let Some(p) = part
+                            .get("state")
+                            .and_then(|s| s.get("input"))
+                            .and_then(|i| i.get("file_path"))
+                            .and_then(|p| p.as_str())
+                        {
+                            files.insert(p.to_string());
+                        }
+                    }
+                }
+            }
+
+            _ => {}
+        }
+    }
+
+    files.into_iter().collect()
+}
+
 /// Get a field as a String, returning empty string if missing/not a string.
 fn field_str(v: &serde_json::Value, key: &str) -> String {
     v.get(key)
@@ -486,5 +550,65 @@ mod tests {
         let out = truncate(s, 5);
         assert!(out.ends_with('…'));
         assert!(out.len() < s.len());
+    }
+
+    // ── extract_files_changed ──────────────────────────────────────────────
+
+    #[test]
+    fn extract_files_changed_claude_write() {
+        let ndjson = r#"{"type":"tool_use","tool":{"name":"Write","input":{"file_path":"src/main.rs","content":"fn main() {}"}}}"#;
+        let files = extract_files_changed(ndjson);
+        assert_eq!(files, vec!["src/main.rs"]);
+    }
+
+    #[test]
+    fn extract_files_changed_claude_edit() {
+        let ndjson = r#"{"type":"tool_use","tool":{"name":"Edit","input":{"file_path":"src/lib.rs","old_string":"foo","new_string":"bar"}}}"#;
+        let files = extract_files_changed(ndjson);
+        assert_eq!(files, vec!["src/lib.rs"]);
+    }
+
+    #[test]
+    fn extract_files_changed_opencode_write() {
+        let ndjson = r#"{"type":"tool_use","part":{"tool":"write","state":{"input":{"file_path":"src/foo.rs"}}}}"#;
+        let files = extract_files_changed(ndjson);
+        assert_eq!(files, vec!["src/foo.rs"]);
+    }
+
+    #[test]
+    fn extract_files_changed_opencode_edit() {
+        let ndjson = r#"{"type":"tool_use","part":{"tool":"edit","state":{"input":{"file_path":"src/bar.rs"}}}}"#;
+        let files = extract_files_changed(ndjson);
+        assert_eq!(files, vec!["src/bar.rs"]);
+    }
+
+    #[test]
+    fn extract_files_changed_deduplicates_and_sorts() {
+        let ndjson = concat!(
+            r#"{"type":"tool_use","tool":{"name":"Write","input":{"file_path":"src/b.rs"}}}"#,
+            "\n",
+            r#"{"type":"tool_use","tool":{"name":"Edit","input":{"file_path":"src/a.rs"}}}"#,
+            "\n",
+            r#"{"type":"tool_use","tool":{"name":"Write","input":{"file_path":"src/b.rs"}}}"#,
+        );
+        let files = extract_files_changed(ndjson);
+        assert_eq!(files, vec!["src/a.rs", "src/b.rs"]);
+    }
+
+    #[test]
+    fn extract_files_changed_ignores_reads_and_bash() {
+        let ndjson = concat!(
+            r#"{"type":"tool_use","tool":{"name":"Read","input":{"file_path":"src/read.rs"}}}"#,
+            "\n",
+            r#"{"type":"tool_use","tool":{"name":"Bash","input":{"command":"cargo test"}}}"#,
+        );
+        let files = extract_files_changed(ndjson);
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn extract_files_changed_empty_on_no_writes() {
+        let ndjson = r#"{"type":"result","subtype":"success","result":"done"}"#;
+        assert!(extract_files_changed(ndjson).is_empty());
     }
 }

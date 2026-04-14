@@ -1090,6 +1090,7 @@ pub async fn handle_success(
     new_attempts: u32,
     repo: &str,
     store: &Option<Arc<TaskStore>>,
+    raw_stdout: &str,
 ) -> anyhow::Result<(String, bool, bool)> {
     // Extract token counts before consuming parsed.
     let input_tokens = parsed.input_tokens;
@@ -1241,6 +1242,7 @@ pub async fn handle_success(
         resp.error.as_deref(),
         store,
         repo,
+        raw_stdout,
     )
     .await;
 
