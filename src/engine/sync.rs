@@ -1025,7 +1025,113 @@ pub(crate) async fn sync_tick(
         }
     }
 
-    // 5b. Re-fire events for stale NeedsReview tasks.
+    // 5c. Detect stale InProgress tasks and recover them.
+    //
+    // Similar to stale InReview detection, we check for InProgress tasks whose
+    // agent tmux session has died (crash, OOM, etc.) and reset them to Routed
+    // so they can be re-dispatched.
+    let in_progress_tasks: Vec<_> = match store.list_by_status(repo, TaskStatus::InProgress).await {
+        Ok(tasks) => tasks
+            .into_iter()
+            .map(|stored| {
+                let external = crate::engine::tasks::store_task_to_external(&stored);
+                (stored, external)
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(err = %e, "failed to list in_progress tasks — skipping stale InProgress check");
+            vec![]
+        }
+    };
+
+    if !in_progress_tasks.is_empty() {
+        // Fetch all live tmux sessions once instead of one subprocess call per task.
+        let live_sessions: std::collections::HashSet<String> = tmux
+            .list_sessions()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+
+        for (_stored, external) in &in_progress_tasks {
+            let task_id = &external.id.0;
+
+            // Skip tasks currently being processed by the main tick (dispatch + agent flow).
+            let dispatch_key = format!("{}/{}", repo, task_id);
+            {
+                if dispatching.contains_key(&dispatch_key) {
+                    tracing::debug!(
+                        task_id = %task_id,
+                        "task locked by dispatch flow, skipping stale check"
+                    );
+                    continue;
+                }
+            }
+
+            // Skip tasks that just transitioned to InProgress — allow time for the
+            // agent to start its tmux session before treating it as stale.
+            // A task is only considered stale if it has been in InProgress for > 5 minutes.
+            const MIN_STALE_MINUTES: i64 = 5;
+            match chrono::DateTime::parse_from_rfc3339(&external.updated_at) {
+                Ok(updated_at) => {
+                    let age = chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc);
+                    if age.num_minutes() < MIN_STALE_MINUTES {
+                        tracing::debug!(
+                            task_id = %task_id,
+                            age_seconds = age.num_seconds(),
+                            "InProgress task is too young to be considered stale, skipping"
+                        );
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        ts = %external.updated_at,
+                        err = %e,
+                        "invalid updated_at timestamp — treating task as potentially stale"
+                    );
+                }
+            }
+
+            let agent_session = tmux.session_name(repo, task_id);
+            if live_sessions.contains(&agent_session) {
+                // Agent is still alive — skip.
+                continue;
+            }
+
+            // No agent session exists. The agent is dead regardless of
+            // session tracking — hard restart, crash, or flag not persisted.
+            // Reset to Routed so the dispatcher can re-spawn it.
+            {
+                tracing::warn!(
+                    task_id = %task_id,
+                    session = %agent_session,
+                    "InProgress task has no active agent session — resetting to Routed"
+                );
+                match task_manager
+                    .update_task_status_if(&external.id, Status::Routed, Status::InProgress)
+                    .await
+                {
+                    Err(e) => {
+                        tracing::error!(task_id = %task_id, err = %e, "failed to reset stale InProgress task — task may be stuck in InProgress indefinitely");
+                    }
+                    Ok(false) => {
+                        tracing::debug!(
+                            task_id = %task_id,
+                            "stale InProgress reset skipped — task already transitioned (concurrent Done/Blocked/NeedsReview)"
+                        );
+                    }
+                    Ok(true) => {
+                        // Successfully reset to Routed
+                    }
+                }
+            }
+        }
+    }
+
+    // 5d. Re-fire events for stale NeedsReview tasks.
     //
     // Two cases where the event-driven subscriber in `subscribers/review.rs` can miss
     // a NeedsReview task:
