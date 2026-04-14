@@ -1,7 +1,7 @@
 +++
 title = "Morning Review — 2026-04-14"
 date = 2026-04-14
-description = "Daily operational check-in: 6 commits merged overnight (memory leaks, HashMap fixes, stale task detection). Service healthy. CLI version STILL mismatched. Task 2622 false-positive blocked by review circuit-breaker."
+description = "Daily operational check-in: 6 commits merged overnight (memory leaks, HashMap fixes, stale task detection). NEW REGRESSION: tick loop stalled 350s at 10:01 UTC due to router LLM timeout cascade. CLI version STILL mismatched."
 +++
 
 # Morning Review — 2026-04-14
@@ -23,18 +23,27 @@ Themes: memory hygiene, error visibility, and stale-state recovery.
 
 ## Operational Health
 
-Overall status: service healthy. 175+ tasks completed in the last 24h with no service-level errors. Orch.error.log is empty (0 bytes — no errors at the service level).
+Overall status: service mostly healthy but with a significant new finding. Orch.error.log is empty (0 bytes — no panics). 175+ tasks completed in the last 24h.
 
 ### Service
 
 - Version: orch/0.68.5 (service)
 - CLI: 0.67.7 — **STILL MISMATCHED**. This was flagged in yesterday's evening retro and this morning's review. `brew upgrade orch && brew services restart orch` has not been run. Both versions need to match before the next session.
 
+### Watchdog stall — NEW REGRESSION
+
+**Tick loop stalled for 350 seconds (10:01–10:06 UTC) — a 5.8-minute stall.** This is the same watchdog mechanism that was fixed in #2574 yesterday. The stall occurred during high routing demand when two tasks (internal:145309, internal:145310) hit the router simultaneously, exhausting all LLM pool entries and timing out the fallback router. The tick never completed during this window, firing watchdog warnings every 30s up to 332s stale.
+
+This is a **regression**, not the original #2574 root cause. The original fix addressed blocking Tokio workers; this new stall is specifically router-bound under high concurrent routing demand. The system recovered once routing demand dropped.
+
+**Root cause hypothesis**: The LLM router is a bottleneck when multiple tasks require routing simultaneously. All pool entries timeout → fallback router times out → weighted round-robin fallback used, but the tick itself is blocked during this entire process. The fix for #2574 (which addressed inline blocking calls) apparently didn't cover this routing-timeout path.
+
 ### Notable events
 
-- `internal:145238` ran yesterday, completed work (reviewed codebase, created 2 tasks) but was incorrectly blocked by silence detection — see Stuck Tasks below.
-- Task 2623 (`feat: implement local model routing via Ollama`) is in review cycle 1 of 2. CI `test` job failing; review agent requested changes. Normal workflow, being handled.
+- `internal:145238` ran yesterday, completed work but was incorrectly blocked by silence detection — see Stuck Tasks below.
+- Task 2623 (`feat: implement local model routing via Ollama`) — stuck task recovery triggered at 22 min, session reclaimed and re-routed to new. Currently at new status (4 tries). Being handled normally.
 - minimax/opus had 5 rate_limit outcomes in the last 24h — minor noise, cooldown applied and recovered.
+- Router LLM pool entries timing out during the 10:01-10:06 stall window — both `haiku` entries (minimax, claude) timed out, fallback `haiku` (claude-haiku-4-5-20251001) also timed out. This is what caused the cascading stall.
 
 ---
 
@@ -67,7 +76,7 @@ Three blocked tasks:
 |------|--------|
 | Fix CLI version mismatch (CLI 0.67.7 vs service 0.68.5) | **NOT FIXED — still mismatched**. `brew upgrade orch && brew services restart orch` must be run. |
 | Investigate claude/opus 50% failure rate | **Concluded: hard task mix.** 68 runs over 48h: 33 success, 35 failed. Error pattern: "no PR or code changes produced" (28/35 = 80%). Opus is routed for complex tasks where agents often can't produce working code. Not a model degradation issue. No action needed — this is expected behavior for difficult tasks. |
-| Verify tick loop stall resolved (#2574) | **Resolved.** Recent commits (stale task detection, unbind, dead code removal) show tick loop functioning normally. Orch.error.log is empty. |
+| Verify tick loop stall resolved (#2574) | **Partially resolved.** The original #2574 root cause (blocking Tokio workers) is fixed. However, a **new trigger path** was found: router LLM timeout cascade at 10:01 UTC stalled the tick for 350s. Filed as #2633. |
 | Monitor kimi recovery (~Apr 15 06:32 UTC) | Cooldown still active: 20h30m remaining on `kimi`, 2h24m on `kimi:haiku`. Recovery expected later today. |
 | Investigate claude/(blank) model field | **Low priority.** 49 runs over 48h: 24 success, 25 failed (50%). Model field being blank likely means model was auto-resolved by the Claude CLI. Consistent ~50% rate matches opus pattern — hard tasks, not a bug. |
 
@@ -97,19 +106,22 @@ Top outcomes:
 
 ---
 
-## Prioritie
+## Priorities
 
-1. **Fix CLI version mismatch NOW** — `brew upgrade orch && brew services restart orch && orch version`. This has been outstanding for two days.
-2. **Unblock internal:145238** — false positive blocked. Verify 2 tasks were created in GitHub, then `orch task unblock internal:145238`.
-3. **Close/de-dup task 2622** — `orch task watch` is already implemented in PR #2631. Either close 2622 as duplicate or mark done.
-4. **Human review PR #2557** (task 2555) — implementation complete, needs owner review.
-5. **Monitor kimi recovery** later today — `kimi` and `kimi:haiku` cooldowns expire ~20h from now.
+1. **Fix CLI version mismatch NOW** — `brew upgrade orch && brew services restart orch && orch version`. This has been outstanding for three days.
+2. **Investigate tick loop stall regression (#2633)** — router LLM timeout cascade blocked the tick loop for 350s at 10:01 UTC. See issue for proposed fixes (per-tick routing time budget, immediate fallback).
+3. **Unblock internal:145238** — false positive blocked. Verify the 2 tasks it created exist in GitHub, then `orch task unblock internal:145238`.
+4. **Close/de-dup task 2622** — `orch task watch` already implemented in PR #2631.
+5. **Human review PR #2557** (task 2555) — implementation complete, needs owner review.
+6. **Monitor kimi recovery** later today — `kimi` and `kimi:haiku` cooldowns expire ~20h and ~2h from now.
 
 ---
 
 ## Issues
 
-No new issues created. All operational problems are either actionable immediately (CLI mismatch, false-positive blocks) or tracked in existing issues.
+- **#2633** filed for tick loop stall regression (350s watchdog stall at 10:01 UTC). Router LLM timeout cascade blocked the tick loop itself. Proposed fixes: per-tick routing time budget, immediate fallback to weighted round-robin, routing cancellation.
+
+No other operational issues.
 
 ---
 
