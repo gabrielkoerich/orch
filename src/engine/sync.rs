@@ -14,7 +14,7 @@ use crate::cmd::CommandErrorContext;
 use crate::config;
 use crate::engine::cooldown::{
     cooldown_reason, github_circuit_remaining_secs, is_agent_in_cooldown, is_github_circuit_open,
-    is_model_in_cooldown,
+    is_model_in_cooldown, refresh_degraded_agents,
 };
 use crate::engine::router::Router;
 use crate::engine::runner::agents::patterns;
@@ -1203,7 +1203,10 @@ pub(crate) async fn sync_tick(
         Ok(()) => {
             // Invalidate the LLM router's skills catalog cache so new/updated
             // skill files are picked up on the next routing call.
-            router.read().await.invalidate_skills_catalog().await;
+            // Clone the Arc handle *before* releasing the read guard so the
+            // read lock is not held across the async invalidation call.
+            let llm = router.read().await.llm_router_handle();
+            llm.invalidate_skills_catalog().await;
         }
         Err(e) => {
             tracing::warn!(err = %e, "skills sync failed");
@@ -1211,9 +1214,30 @@ pub(crate) async fn sync_tick(
     }
 
     // Pre-emptive health check: refresh degraded-agent flags from rate_limits table.
+    // Clone the required data out of the router while holding the read guard,
+    // then release the guard before the async DB query so the write lock is
+    // not starved for the duration of the I/O operation.
     {
-        let r = router.read().await;
-        r.refresh_health(store).await;
+        let (available_agents, config) = {
+            let r = router.read().await;
+            (r.available_agents.clone(), r.config.clone())
+        };
+        let model_checker = |agent: &str| -> bool {
+            for comp in &["simple", "medium", "complex", "review"] {
+                if config.has_available_model_for_complexity(agent, comp) {
+                    return true;
+                }
+            }
+            false
+        };
+        refresh_degraded_agents(
+            store,
+            &available_agents,
+            &model_checker,
+            crate::engine::router::config::health_check_window_hours(),
+            crate::engine::router::config::degraded_rate_limit_threshold(),
+        )
+        .await;
     }
 
     Ok(())
@@ -1588,7 +1612,8 @@ struct DegradedAgentDetail {
 ///   `metrics:orch.agents_degraded.alert` is set to `"1"`. The alert is
 ///   cleared to `"0"` when the count drops below the threshold.
 pub(crate) async fn emit_degraded_agents_if_needed(
-    router: &crate::engine::router::Router,
+    available_agents: &[String],
+    config: &crate::engine::router::RouterConfig,
     store: Option<&Arc<TaskStore>>,
 ) {
     // Complexity tiers to check for configured models.
@@ -1596,14 +1621,14 @@ pub(crate) async fn emit_degraded_agents_if_needed(
 
     let mut details: Vec<DegradedAgentDetail> = Vec::new();
 
-    for agent in &router.available_agents {
+    for agent in available_agents {
         let agent_in_cd = is_agent_in_cooldown(agent);
 
         // Collect individually cooled models across all complexity tiers (deduped).
         let mut cooled_models: Vec<String> = Vec::new();
         let mut seen_models = std::collections::HashSet::new();
         for comp in COMPLEXITIES {
-            if let Some(pool) = router.config.model_pool_for_complexity(agent, comp) {
+            if let Some(pool) = config.model_pool_for_complexity(agent, comp) {
                 for model in pool {
                     if seen_models.insert(model.clone()) && is_model_in_cooldown(agent, &model) {
                         cooled_models.push(model);
@@ -1614,11 +1639,9 @@ pub(crate) async fn emit_degraded_agents_if_needed(
 
         // An agent is degraded if it is in agent-level cooldown OR has no
         // available (non-cooled) model across any complexity tier.
-        let has_model = COMPLEXITIES.iter().any(|comp| {
-            router
-                .config
-                .has_available_model_for_complexity(agent, comp)
-        });
+        let has_model = COMPLEXITIES
+            .iter()
+            .any(|comp| config.has_available_model_for_complexity(agent, comp));
 
         if agent_in_cd || !has_model {
             let reason = if agent_in_cd {
@@ -3615,7 +3638,8 @@ mod tests {
         set_agent_cooldown("test-agent-3c", 3600);
 
         // Call the helper and assert KV metrics written
-        emit_degraded_agents_if_needed(&router, Some(&store)).await;
+        emit_degraded_agents_if_needed(&router.available_agents, &router.config, Some(&store))
+            .await;
 
         // Count metric always written
         let count_val = store
@@ -3662,7 +3686,8 @@ mod tests {
         set_agent_cooldown("test-agent-2a", 3600);
         set_agent_cooldown("test-agent-2b", 3600);
 
-        emit_degraded_agents_if_needed(&router, Some(&store)).await;
+        emit_degraded_agents_if_needed(&router.available_agents, &router.config, Some(&store))
+            .await;
 
         // Count metric still written (always-emit)
         let count_val = store
