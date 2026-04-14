@@ -319,12 +319,14 @@ async fn check_commits_and_clear_stale_errors(
 /// If rebase fails (conflicts), the task is blocked for human intervention.
 ///
 /// Returns `PushResult::Success` on success, `PushResult::Rebased` if rebase
-/// succeeded and the task should be re-routed, or `PushResult::Failed` if push
-/// failed and recovery was not possible.
+/// succeeded and the task should be re-routed, `PushResult::Failed` if push
+/// failed and recovery was not possible, or `PushResult::NoCommits` if the
+/// branch has no commits ahead of the default branch.
 enum PushResult {
     Success,
     Rebased,
     Failed,
+    NoCommits, // agent made no code changes
 }
 
 async fn push_branch_with_log(
@@ -622,7 +624,7 @@ async fn run_git_ops(
             })),
         )
         .await;
-        PushResult::Failed
+        PushResult::NoCommits
     } else {
         push_branch_with_log(
             ctx,
@@ -650,6 +652,11 @@ async fn run_git_ops(
         tracing::info!(
             task_id = ctx.task_id,
             "skipping PR creation after successful rebase — task will be re-routed"
+        );
+    } else if matches!(push_result, PushResult::NoCommits) {
+        tracing::info!(
+            task_id = ctx.task_id,
+            "no commits ahead of default branch, skipping push + PR"
         );
     } else if !has_pushed {
         // no commits — already logged "no commits ahead, skipping push + PR" at INFO level above
