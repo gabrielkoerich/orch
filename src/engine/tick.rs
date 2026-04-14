@@ -991,7 +991,9 @@ pub(crate) async fn tick_route_tasks(
         router.refresh_health(store).await;
     }
 
-    for task in routable {
+    // Limit routing to at most N tasks per tick to prevent blocking on LLM calls
+    let max_per_tick = crate::engine::router::config::max_tasks_per_routing_tick();
+    for task in routable.into_iter().take(max_per_tick) {
         let _task_span = tracing::info_span!("engine.route", task_id = %task.id.0).entered();
         match router.route(task, store, repo).await {
             Ok(result) => {

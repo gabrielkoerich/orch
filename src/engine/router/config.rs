@@ -79,6 +79,19 @@ pub fn get_agent_backoff_base(agent: &str) -> i64 {
         .unwrap_or(crate::engine::cooldown::BACKOFF_BASE_SECS)
 }
 
+/// Maximum number of tasks to route per tick. Prevents blocking the tick loop
+/// when multiple tasks are queued simultaneously (e.g., cron jobs). Each routing
+/// operation involves an LLM call taking 10-45 seconds, so routing N tasks
+/// sequentially would block for N×LLM-latency seconds.
+///
+/// Configurable via `router.max_tasks_per_tick` (default: 1).
+pub fn max_tasks_per_routing_tick() -> usize {
+    crate::config::get("router.max_tasks_per_tick")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}
+
 /// Default agents to check in PATH.
 ///
 /// All 5 agents are listed, but availability is checked at runtime via
@@ -160,6 +173,13 @@ pub struct RouterConfig {
     /// instead of the default 5-minute base (useful for agents with higher
     /// failure rates like opencode at 24.8%).
     pub agent_backoff_bases: HashMap<String, i64>,
+    /// Maximum number of tasks to route per tick. Prevents blocking the tick loop
+    /// when multiple tasks are queued simultaneously (e.g., cron jobs). Each routing
+    /// operation involves an LLM call taking 10-45 seconds, so routing N tasks
+    /// sequentially would block for N×LLM-latency seconds.
+    ///
+    /// Configurable via `router.max_tasks_per_tick` (default: 1).
+    pub max_tasks_per_tick: usize,
 }
 
 /// Parse an `agent:model` pool entry string, splitting on the first colon.
@@ -216,6 +236,7 @@ impl Default for RouterConfig {
             weighted_round_robin: false,
             skip_limited_threshold: 0.3,
             agent_backoff_bases: HashMap::new(),
+            max_tasks_per_tick: 1,
         }
     }
 }
@@ -323,6 +344,15 @@ impl RouterConfig {
             if let Ok(val) = crate::config::get(&key) {
                 if let Ok(secs) = val.parse::<i64>() {
                     config.agent_backoff_bases.insert(agent.clone(), secs);
+                }
+            }
+        }
+
+        // Parse max_tasks_per_tick
+        if let Ok(val) = crate::config::get("router.max_tasks_per_tick") {
+            if let Ok(n) = val.parse::<usize>() {
+                if n > 0 {
+                    config.max_tasks_per_tick = n;
                 }
             }
         }
