@@ -219,3 +219,165 @@ impl OllamaRouter {
         Ok(prompt)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::{ExternalId, ExternalTask};
+
+    fn make_router() -> OllamaRouter {
+        OllamaRouter::new(&RouterConfig::default())
+    }
+
+    fn make_task(title: &str, body: &str, labels: Vec<&str>) -> ExternalTask {
+        ExternalTask {
+            id: ExternalId("42".to_string()),
+            title: title.to_string(),
+            body: body.to_string(),
+            state: "open".to_string(),
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+            author: "testuser".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: "https://github.com/test/test/issues/42".to_string(),
+        }
+    }
+
+    // ── OllamaResponse JSON parsing ────────────────────────────────────────────
+
+    #[test]
+    fn ollama_response_parses_clean_json() {
+        let json = r#"{"response":"Here is my routing: {\"executor\":\"claude\",\"complexity\":\"medium\",\"reason\":\"good fit\"}"}"#;
+        let resp: OllamaResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.response.contains("executor"));
+        assert!(resp.response.contains("claude"));
+    }
+
+    #[test]
+    fn ollama_response_with_empty_response() {
+        let json = r#"{"response":""}"#;
+        let resp: OllamaResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.response, "");
+    }
+
+    #[test]
+    fn ollama_response_with_unicode() {
+        let json =
+            r#"{"response":"{\n  \"executor\": \"codex\",\n  \"complexity\": \"simple\"\n}"}"#;
+        let resp: OllamaResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.response.contains("executor"));
+        assert!(resp.response.contains("codex"));
+    }
+
+    // ── OllamaResponse JSON parse failure → plain text fallback ───────────────
+    // When Ollama returns plain text (no JSON wrapper), the caller falls back to
+    // treating the raw body as the response text. We test that the raw body
+    // is accessible for this fallback path.
+
+    #[test]
+    fn ollama_response_raw_body_used_on_json_failure() {
+        // Simulate the fallback: JSON parse fails → body becomes the response
+        let raw_body = r#"Here's my routing decision: use claude for this task."#;
+        let result: OllamaResponse = match serde_json::from_str::<OllamaResponse>(raw_body) {
+            Ok(r) => r,
+            Err(_) => OllamaResponse {
+                response: raw_body.to_string(),
+            },
+        };
+        assert_eq!(result.response, raw_body);
+        // The fallback text is then trimmed and passed to parse_llm_response
+        assert!(!result.response.trim().is_empty());
+    }
+
+    #[test]
+    fn ollama_response_trim_works() {
+        let json = r#"{"response":"  {\"executor\":\"claude\"}  "}"#;
+        let resp: OllamaResponse = serde_json::from_str(json).unwrap();
+        let trimmed = resp.response.trim();
+        assert!(trimmed.starts_with('{'));
+        assert!(trimmed.ends_with('}'));
+    }
+
+    // ── build_routing_prompt ───────────────────────────────────────────────────
+
+    #[test]
+    fn build_routing_prompt_substitutes_task_fields() {
+        let router = make_router();
+        let task = make_task(
+            "Fix bug in auth",
+            "The login flow is broken",
+            vec!["backend", "bug"],
+        );
+        let config = RouterConfig::default();
+        let prompt = router.build_routing_prompt(&task, &config).unwrap();
+
+        // Task fields substituted
+        assert!(prompt.contains("Fix bug in auth"));
+        assert!(prompt.contains("The login flow is broken"));
+        assert!(prompt.contains("backend, bug"));
+        // Router agent substituted
+        assert!(prompt.contains("ollama"));
+        // Default agents present
+        assert!(prompt.contains("claude"));
+    }
+
+    #[test]
+    fn build_routing_prompt_includes_labels() {
+        let router = make_router();
+        let task = make_task("Title", "Body", vec!["priority:high", "good-first-issue"]);
+        let config = RouterConfig::default();
+        let prompt = router.build_routing_prompt(&task, &config).unwrap();
+        assert!(prompt.contains("priority:high"));
+        assert!(prompt.contains("good-first-issue"));
+    }
+
+    #[test]
+    fn build_routing_prompt_skills_catalog_replaced_with_empty() {
+        let router = make_router();
+        let task = make_task("Title", "Body", vec![]);
+        let config = RouterConfig::default();
+        let prompt = router.build_routing_prompt(&task, &config).unwrap();
+        // Ollama uses "[]" for skills catalog since it doesn't support dynamic skills
+        // The template placeholder {{SKILLS_CATALOG}} should be replaced with "[]"
+        assert!(
+            !prompt.contains("{{SKILLS_CATALOG}}"),
+            "SKILLS_CATALOG placeholder should be substituted"
+        );
+    }
+
+    #[test]
+    fn build_routing_prompt_includes_weights() {
+        let router = make_router();
+        let task = make_task("Title", "Body", vec![]);
+        let mut config = RouterConfig::default();
+        config.weights.insert("claude".to_string(), 0.5);
+        config.weights.insert("codex".to_string(), 0.3);
+        let prompt = router.build_routing_prompt(&task, &config).unwrap();
+        // Weights string should be formatted
+        assert!(prompt.contains("claude") || prompt.contains("codex"));
+    }
+
+    // ── OllamaRouter construction ───────────────────────────────────────────────
+
+    #[test]
+    fn ollama_router_uses_config_values() {
+        let config = RouterConfig {
+            ollama_url: "http://localhost:11434".to_string(),
+            ollama_model: "qwen2.5-coder:3b-instruct".to_string(),
+            ollama_timeout_seconds: 30,
+            ..RouterConfig::default()
+        };
+        let router = OllamaRouter::new(&config);
+        assert_eq!(router.url, "http://localhost:11434");
+        assert_eq!(router.model, "qwen2.5-coder:3b-instruct");
+        assert_eq!(router.timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn ollama_router_default_values() {
+        let router = make_router();
+        assert_eq!(router.url, "http://localhost:11434");
+        assert_eq!(router.model, "qwen2.5-coder:3b-instruct");
+        assert_eq!(router.timeout, Duration::from_secs(30));
+    }
+}

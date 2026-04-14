@@ -475,6 +475,18 @@ impl RouterConfig {
             }
         }
 
+        // Parse llm_budget_secs — total time cap for the entire pool cascade.
+        // Defaults to timeout_seconds (already resolved above) so the cascade
+        // can't exceed what a single pool entry would normally take.
+        config.llm_budget_secs = config.timeout_seconds;
+        if let Ok(val) = crate::config::get("router.llm_budget_secs") {
+            if let Ok(secs) = val.parse::<u64>() {
+                if secs > 0 {
+                    config.llm_budget_secs = secs;
+                }
+            }
+        }
+
         // Parse Ollama-specific config for local routing mode
         if let Ok(url) = crate::config::get("router.ollama_url") {
             if !url.is_empty() {
