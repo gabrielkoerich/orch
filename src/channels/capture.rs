@@ -124,6 +124,7 @@ impl CaptureService {
                 "session unregistered"
             );
         }
+        self.transport.unbind(repo, task_id).await;
     }
 
     /// Start the capture loop.
