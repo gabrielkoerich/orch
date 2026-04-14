@@ -24,9 +24,24 @@ use crate::store::TaskStatus;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use dashmap::DashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::RwLock;
+
+static KV_GET_FAILURES: AtomicU64 = AtomicU64::new(0);
+static KV_SET_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+#[allow(dead_code)]
+pub fn kv_failure_count() -> u64 {
+    KV_GET_FAILURES.load(Ordering::Relaxed) + KV_SET_FAILURES.load(Ordering::Relaxed)
+}
+
+#[allow(dead_code)]
+pub fn reset_kv_failure_count() {
+    KV_GET_FAILURES.store(0, Ordering::Relaxed);
+    KV_SET_FAILURES.store(0, Ordering::Relaxed);
+}
 
 /// Read a KV value from the store.
 ///
@@ -37,10 +52,7 @@ async fn kv_get_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str) -> Opti
     match try_kv_get_prefer_store(store, key).await {
         Ok(opt) => opt,
         Err(e) => {
-            // Log errors so database/query failures are visible in logs.
-            // We still return None as a best-effort fallback when the store
-            // is unavailable to preserve existing behavior, but the error
-            // should be visible to operators and alerting systems.
+            KV_GET_FAILURES.fetch_add(1, Ordering::Relaxed);
             tracing::error!(key, err = %e, "kv_get failed");
             None
         }
@@ -70,6 +82,7 @@ async fn try_kv_get_prefer_store(
 /// errors or guarantee persistence (e.g., for circuit breaker state).
 async fn kv_set_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str, value: &str) {
     if let Err(e) = try_kv_set_prefer_store(store, key, value).await {
+        KV_SET_FAILURES.fetch_add(1, Ordering::Relaxed);
         tracing::error!(key, err = %e, "kv_set failed");
     }
 }
