@@ -429,6 +429,57 @@ pub async fn setup_worktree(
             .current_dir(&worktree_dir)
             .output_with_context()
             .await;
+
+        // Check for a corrupted git index (e.g. "error: could not write index").
+        // `git status` reads the index; a non-zero exit with index-related stderr
+        // indicates corruption that will cause every subsequent git operation to
+        // fail, leading to an infinite stuck-recovery loop.  When detected, nuke
+        // the worktree and recreate it from scratch below.
+        let index_ok = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&worktree_dir)
+            .output_with_context()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if !index_ok {
+            let stderr_hint = Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(&worktree_dir)
+                .output_with_context()
+                .await
+                .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+                .unwrap_or_default();
+            tracing::warn!(
+                task_id,
+                worktree = %worktree_dir.display(),
+                stderr = %stderr_hint,
+                "corrupted worktree index detected — removing and recreating worktree"
+            );
+            // Remove git worktree reference first, then delete the directory.
+            let _ = Command::new("git")
+                .args([
+                    "-C",
+                    &main_dir.to_string_lossy(),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    &worktree_dir.to_string_lossy(),
+                ])
+                .output_with_context()
+                .await;
+            // If the directory still exists (e.g. worktree remove failed), remove it
+            // manually so the worktree-creation block below re-creates it cleanly.
+            if tokio::fs::metadata(&worktree_dir).await.is_ok() {
+                let _ = tokio::fs::remove_dir_all(&worktree_dir).await;
+            }
+            // Prune stale worktree metadata so git won't complain on re-add.
+            let _ = Command::new("git")
+                .args(["-C", &main_dir.to_string_lossy(), "worktree", "prune"])
+                .output_with_context()
+                .await;
+        }
     }
 
     // Create worktree if it doesn't exist
