@@ -465,7 +465,8 @@ impl GhHttp {
                             attempts,
                             circuit_cooldown_secs
                         );
-                        engine_cooldown::set_agent_cooldown("github:5xx", circuit_cooldown_secs);
+                        engine_cooldown::set_agent_cooldown("github:5xx", circuit_cooldown_secs)
+                            .await;
                         break;
                     }
 
@@ -490,7 +491,7 @@ impl GhHttp {
                         "HTTP send failed after {} attempts — setting circuit-breaker",
                         attempts
                     );
-                    engine_cooldown::set_agent_cooldown("github:5xx", circuit_cooldown_secs);
+                    engine_cooldown::set_agent_cooldown("github:5xx", circuit_cooldown_secs).await;
                     break;
                 }
             }

@@ -431,7 +431,7 @@ pub async fn handle_failover(
         // Apply brief 120s cooldown on the failed agent so the router skips it
         // on the next routing attempt. This prevents the router from immediately
         // re-selecting the same agent after clearing both agent and model (#1492).
-        set_agent_cooldown(agent_name, 120);
+        set_agent_cooldown(agent_name, 120).await;
 
         let msg = format!("{error_message}, clearing agent/model for re-route");
         if let Err(e) = store::store_set_result(

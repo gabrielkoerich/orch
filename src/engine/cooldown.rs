@@ -411,10 +411,10 @@ pub async fn record_model_failure(agent_name: &str, model: &str) {
 ///
 /// Used by silence detection to cooldown the specific model that failed to
 /// produce any output, with a configurable duration.
-pub fn set_model_cooldown(agent_name: &str, model: &str, duration_secs: u64) {
+pub async fn set_model_cooldown(agent_name: &str, model: &str, duration_secs: u64) {
     let key = format!("{agent_name}:{model}");
     let cooldown_until = chrono::Utc::now().timestamp() + duration_secs as i64;
-    set_cooldown(&key, cooldown_until, "silence_detected");
+    set_cooldown_async(&key, cooldown_until, "silence_detected").await;
 }
 
 /// Set a short agent-level cooldown (in seconds).
@@ -423,9 +423,9 @@ pub fn set_model_cooldown(agent_name: &str, model: &str, duration_secs: u64) {
 /// router picks a different one on re-route. Unlike `record_agent_failure`
 /// (exponential backoff), this uses a short duration (typically 120s) —
 /// just enough to force one re-route cycle to a different agent.
-pub fn set_agent_cooldown(agent_name: &str, duration_secs: u64) {
+pub async fn set_agent_cooldown(agent_name: &str, duration_secs: u64) {
     let cooldown_until = chrono::Utc::now().timestamp() + duration_secs as i64;
-    set_cooldown(agent_name, cooldown_until, "silence_agent_cooldown");
+    set_cooldown_async(agent_name, cooldown_until, "silence_agent_cooldown").await;
 }
 
 /// Record a silence detection for an agent+model and apply extended cooldowns
@@ -477,7 +477,7 @@ pub async fn record_silence_detection(agent_name: &str, model: &str) -> Option<S
     let count = timestamps.len();
     let mut extended_cooldown_applied = false;
     if count >= SILENCE_COUNT_THRESHOLD {
-        set_model_cooldown(agent_name, model, SILENCE_EXTENDED_COOLDOWN_SECS);
+        set_model_cooldown(agent_name, model, SILENCE_EXTENDED_COOLDOWN_SECS).await;
         extended_cooldown_applied = true;
         timestamps.clear();
     }
@@ -683,38 +683,6 @@ async fn set_cooldown_async(key: &str, cooldown_until: i64, reason: &str) -> boo
     true
 }
 
-/// Set a cooldown with a specific expiry timestamp. Persists to KV.
-///
-/// Returns `true` if the cooldown was applied, `false` if an existing longer
-/// cooldown prevented the update (never-shorten rule).
-///
-/// For non-async callers (silence detection short cooldowns). The KV write is
-/// fire-and-forget — loss on crash is acceptable for these short-lived cooldowns.
-/// For critical cooldowns, use [`set_cooldown_async`] instead.
-fn set_cooldown(key: &str, cooldown_until: i64, reason: &str) -> bool {
-    if !set_cooldown_in_memory(key, cooldown_until, reason) {
-        return false;
-    }
-
-    // Persist to KV via a background task when we have a runtime.
-    // Unit tests call cooldown helpers without a Tokio runtime; avoid panicking.
-    let store_opt = cooldown_store().lock().ok().and_then(|g| g.clone());
-    if let Some(store) = store_opt {
-        let kv_key = format!("{KV_PREFIX}{key}");
-        let value = cooldown_until.to_string();
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::spawn(async move {
-                if let Err(e) = store.kv_set(&kv_key, &value).await {
-                    tracing::warn!(kv_key, err = %e, "failed to persist cooldown to KV store");
-                }
-            });
-        } else {
-            tracing::debug!(kv_key, "skipping KV cooldown persist (no Tokio runtime)");
-        }
-    }
-    true
-}
-
 /// Check if a key is currently in cooldown.
 fn is_in_cooldown(key: &str) -> bool {
     let map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
@@ -905,7 +873,7 @@ pub async fn record_github_5xx() {
             // Also set the generic cooldown so is_agent_in_cooldown("github:5xx")
             // returns true immediately, avoiding a race window where concurrent
             // requests bypass the circuit breaker.
-            set_agent_cooldown("github:5xx", GITHUB_5XX_COOLDOWN_SECS as u64);
+            set_agent_cooldown("github:5xx", GITHUB_5XX_COOLDOWN_SECS as u64).await;
         }
         // Clear the sliding window after tripping so we don't re-trip immediately
         let mut ts = github_5xx_timestamps()
@@ -1127,7 +1095,7 @@ mod tests {
 
         record_model_failure("testagent_persist", "testmodel_persist").await;
 
-        // set_cooldown persists via tokio::spawn — yield to let the task complete.
+        // Give the async KV write a moment to settle before querying.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let kv_key = format!("{KV_PREFIX}testagent_persist:testmodel_persist");
@@ -1189,7 +1157,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_cooldown_persists_to_kv() {
-        // Agent-level cooldowns should also go through set_cooldown which persists
+        // Agent-level cooldowns persist to KV via set_cooldown_async
         let agent = "test_agent_persist_check";
         record_agent_failure_with_message(agent, "").await;
         assert!(is_agent_in_cooldown(agent));
@@ -1198,7 +1166,7 @@ mod tests {
     #[tokio::test]
     async fn cooldown_never_shortens() {
         let agent = "test_agent_no_shorten";
-        set_agent_cooldown(agent, 24 * 60 * 60);
+        set_agent_cooldown(agent, 24 * 60 * 60).await;
         let initial = {
             let map = cooldowns().lock().unwrap();
             map.get(agent)
@@ -1220,12 +1188,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn silence_agent_cooldown_is_short_lived() {
+    #[tokio::test]
+    async fn silence_agent_cooldown_is_short_lived() {
         let agent = "test_silence_agent_cd";
         assert!(!is_agent_in_cooldown(agent));
 
-        set_agent_cooldown(agent, SILENCE_AGENT_COOLDOWN_SECS);
+        set_agent_cooldown(agent, SILENCE_AGENT_COOLDOWN_SECS).await;
         assert!(is_agent_in_cooldown(agent));
 
         // Verify it's a short cooldown (120s), not the exponential backoff one
@@ -1456,7 +1424,7 @@ mod tests {
             "first billing cycle cooldown should be ~24h, got {remaining_1}s"
         );
 
-        // Clear in-memory cooldown (but NOT failure count) to allow next set_cooldown
+        // Clear in-memory cooldown (but NOT failure count) to allow next set_cooldown_async
         {
             let mut map = cooldowns().lock().unwrap();
             map.remove(agent);
@@ -1707,7 +1675,7 @@ mod tests {
             "first failure should be ~5 min, got {remaining_1}s"
         );
 
-        // Clear the cooldown (but NOT failure count) to allow the next set_cooldown to apply
+        // Clear the cooldown (but NOT failure count) to allow the next set_cooldown_async to apply
         {
             let mut map = cooldowns().lock().unwrap();
             map.remove(agent);
@@ -1794,8 +1762,7 @@ mod tests {
             let _ = read_and_increment_failure_count(&Some(store.clone()), agent).await;
         }
         // Set a cooldown so clear_cooldown has something to clear
-        set_agent_cooldown(agent, 3600);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        set_agent_cooldown(agent, 3600).await;
 
         // Verify failure count is 5
         let kv_key = format!("{FAILURE_COUNT_PREFIX}{agent}");
@@ -1842,9 +1809,8 @@ mod tests {
         let agents = ["test_clear_all_a", "test_clear_all_b"];
         for agent in &agents {
             let _ = read_and_increment_failure_count(&Some(store.clone()), agent).await;
-            set_agent_cooldown(agent, 3600);
+            set_agent_cooldown(agent, 3600).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         clear_cooldown("*", &store).await;
 
