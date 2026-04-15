@@ -1347,7 +1347,6 @@ impl TaskStore {
             "UPDATE tasks SET
             input_tokens = COALESCE(input_tokens, 0) + ?,
             output_tokens = COALESCE(output_tokens, 0) + ?,
-            model = ?,
             input_cost_usd = COALESCE(input_cost_usd, 0.0) + ?,
             output_cost_usd = COALESCE(output_cost_usd, 0.0) + ?,
             total_cost_usd = COALESCE(total_cost_usd, 0.0) + ?,
@@ -1356,7 +1355,6 @@ impl TaskStore {
         )
         .bind(i64::try_from(input).unwrap_or(i64::MAX))
         .bind(i64::try_from(output).unwrap_or(i64::MAX))
-        .bind(model)
         .bind(cost.input_cost_usd)
         .bind(cost.output_cost_usd)
         .bind(cost.total_cost_usd)

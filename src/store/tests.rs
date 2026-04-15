@@ -855,7 +855,8 @@ async fn store_tokens() {
     assert_eq!(task.input_tokens, 50000);
     assert_eq!(task.output_tokens, 10000);
     assert!(task.total_cost_usd > 0.0);
-    assert_eq!(task.model, Some("sonnet".to_string()));
+    // model must NOT be overwritten by store_tokens — it is set exclusively by routing
+    assert_eq!(task.model, None);
 }
 
 #[tokio::test]
@@ -3515,7 +3516,8 @@ async fn store_tokens_overwrites_previous_values() {
     let task = store.get(id).await.unwrap();
     assert_eq!(task.input_tokens, 3000);
     assert_eq!(task.output_tokens, 1500);
-    assert_eq!(task.model, Some("sonnet".to_string()));
+    // model is not written by store_tokens — it is set exclusively by routing
+    assert_eq!(task.model, None);
 }
 
 #[tokio::test]
