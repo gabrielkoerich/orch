@@ -758,10 +758,26 @@ pub async fn refresh_degraded_agents(
     window_hours: u32,
     threshold: i64,
 ) {
+    // Time the DB query to surface slow health-checks that can dominate the
+    // engine tick latency. If the query fails, log and return early.
+    let start = chrono::Utc::now();
     let counts = match store.recent_rate_limit_counts(window_hours).await {
-        Ok(c) => c,
+        Ok(c) => {
+            let dur_ms = (chrono::Utc::now() - start).num_milliseconds();
+            tracing::info!(
+                duration_ms = dur_ms,
+                window_hours,
+                "recent_rate_limit_counts query completed"
+            );
+            c
+        }
         Err(e) => {
-            tracing::warn!(err = %e, "failed to query recent rate limit counts for health check");
+            let dur_ms = (chrono::Utc::now() - start).num_milliseconds();
+            tracing::warn!(
+                err = %e,
+                duration_ms = dur_ms,
+                "failed to query recent rate limit counts for health check"
+            );
             return;
         }
     };
