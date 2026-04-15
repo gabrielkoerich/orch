@@ -40,16 +40,22 @@ pub struct OllamaRouter {
     url: String,
     /// Model name to use for routing.
     model: String,
-    /// Timeout for HTTP requests.
-    timeout: Duration,
+    /// Reusable HTTP client with connection pooling.
+    client: reqwest::Client,
 }
 
 impl OllamaRouter {
     pub fn new(config: &RouterConfig) -> Self {
+        let timeout = Duration::from_secs(config.ollama_timeout_seconds);
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .build()
+            .expect("failed to build reqwest client");
         Self {
             url: config.ollama_url.clone(),
             model: config.ollama_model.clone(),
-            timeout: Duration::from_secs(config.ollama_timeout_seconds),
+            client,
         }
     }
 
@@ -75,8 +81,6 @@ impl OllamaRouter {
             }),
         };
 
-        let client = reqwest::Client::builder().timeout(self.timeout).build()?;
-
         let url = format!("{}/api/generate", self.url);
 
         tracing::debug!(
@@ -86,7 +90,7 @@ impl OllamaRouter {
             "calling Ollama for routing"
         );
 
-        let response = client.post(&url).json(&request).send().await?;
+        let response = self.client.post(&url).json(&request).send().await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -370,7 +374,6 @@ mod tests {
         let router = OllamaRouter::new(&config);
         assert_eq!(router.url, "http://localhost:11434");
         assert_eq!(router.model, "qwen2.5-coder:3b-instruct");
-        assert_eq!(router.timeout, Duration::from_secs(30));
     }
 
     #[test]
@@ -378,6 +381,5 @@ mod tests {
         let router = make_router();
         assert_eq!(router.url, "http://localhost:11434");
         assert_eq!(router.model, "qwen2.5-coder:3b-instruct");
-        assert_eq!(router.timeout, Duration::from_secs(30));
     }
 }
