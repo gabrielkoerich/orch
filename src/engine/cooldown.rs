@@ -1603,6 +1603,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn refresh_degraded_agents_ignores_expired_cooldowns() {
+        let store = test_store().await;
+        let agent = "test_refresh_expired_cooldown";
+
+        // Manually insert an already-expired cooldown entry directly into the map
+        // (simulating a stale entry that wasn't cleaned up)
+        let expired_ts = chrono::Utc::now().timestamp() - 100; // 100 seconds ago
+        {
+            let mut map = cooldowns().lock().unwrap();
+            map.insert(
+                agent.to_string(),
+                CooldownEntry {
+                    cooldown_until: expired_ts,
+                    reason: "expired_test".to_string(),
+                },
+            );
+        }
+
+        // Verify the expired entry is in the map but should not cause degraded status
+        assert!(!is_agent_in_cooldown(agent), "expired cooldown should not be active");
+
+        // Pre-mark as degraded to verify it gets cleared
+        mark_agent_degraded(agent);
+        assert!(is_agent_degraded(agent));
+
+        // Run refresh — should clear degraded because cooldown is expired
+        let agents = vec![agent.to_string()];
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+
+        assert!(
+            !is_agent_degraded(agent),
+            "agent with only expired cooldown should NOT be marked degraded"
+        );
+
+        // Cleanup
+        clear_agent_degraded(agent);
+        {
+            let mut map = cooldowns().lock().unwrap();
+            map.remove(agent);
+        }
+    }
+
     #[test]
     fn compute_backoff_grows_exponentially() {
         // count=0 or 1: base
