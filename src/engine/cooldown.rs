@@ -107,15 +107,27 @@ pub struct SilenceCountResult {
 }
 
 /// Global in-memory cooldown map, protected by a Mutex.
+///
+/// Uses `std::sync::Mutex` because this map is also read from sync helper
+/// functions (`is_in_cooldown`, `is_model_in_cooldown`, etc.).  All lock
+/// holders perform only in-memory HashMap operations — **no `.await` is ever
+/// called while a guard is held**.  This invariant must be preserved: if a
+/// future caller needs to await while holding this lock, switch to
+/// `tokio::sync::Mutex` and make the helpers async.
 fn cooldowns() -> &'static Mutex<HashMap<String, CooldownEntry>> {
     static COOLDOWNS: OnceLock<Mutex<HashMap<String, CooldownEntry>>> = OnceLock::new();
     COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Global store reference used for background KV writes.
-fn cooldown_store() -> &'static Mutex<Option<Arc<crate::store::TaskStore>>> {
-    static STORE: OnceLock<Mutex<Option<Arc<crate::store::TaskStore>>>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(None))
+///
+/// Uses `tokio::sync::Mutex` because this value is only ever accessed from
+/// async functions. A `tokio::sync::Mutex` yields the Tokio task instead of
+/// blocking the worker thread if the lock is contended.
+fn cooldown_store() -> &'static tokio::sync::Mutex<Option<Arc<crate::store::TaskStore>>> {
+    static STORE: OnceLock<tokio::sync::Mutex<Option<Arc<crate::store::TaskStore>>>> =
+        OnceLock::new();
+    STORE.get_or_init(|| tokio::sync::Mutex::new(None))
 }
 
 /// Initialise persistent cooldowns.
@@ -171,9 +183,7 @@ pub async fn init_cooldown_store(store: Arc<crate::store::TaskStore>) {
         }
     }
 
-    if let Ok(mut slot) = cooldown_store().lock() {
-        *slot = Some(store);
-    }
+    *cooldown_store().lock().await = Some(store);
 }
 
 /// Compute exponential backoff duration using base-3 growth.
@@ -241,7 +251,7 @@ async fn read_and_increment_failure_count_with_prefix(
 /// backoff from the base duration again, not from wherever it left off.
 /// Resets both generic and credit-exhaustion failure counters.
 pub async fn record_agent_success(agent_name: &str, model: &str) {
-    let store_opt = cooldown_store().lock().ok().and_then(|g| g.clone());
+    let store_opt = cooldown_store().lock().await.clone();
     if let Some(store) = store_opt {
         let agent_key = format!("{FAILURE_COUNT_PREFIX}{agent_name}");
         let model_key = format!("{FAILURE_COUNT_PREFIX}{agent_name}:{model}");
@@ -270,7 +280,7 @@ pub async fn record_agent_failure_with_message(agent_name: &str, error_message: 
         return;
     }
 
-    let store_opt = cooldown_store().lock().ok().and_then(|g| g.clone());
+    let store_opt = cooldown_store().lock().await.clone();
     let count = read_and_increment_failure_count(&store_opt, agent_name).await;
     let base = crate::engine::router::config::get_agent_backoff_base(agent_name);
     let cooldown_until =
@@ -361,7 +371,7 @@ pub async fn record_credit_exhaustion(agent_name: &str, reason: CreditExhaustion
         CreditExhaustionReason::BillingCycleExhausted => "billing_cycle_exhausted",
     };
 
-    let store_opt = cooldown_store().lock().ok().and_then(|g| g.clone());
+    let store_opt = cooldown_store().lock().await.clone();
     // Use a distinct failure counter (CREDIT_FAILURE_COUNT_PREFIX) so credit-
     // exhaustion backoff escalation is independent of generic agent failures.
     // Previously both paths shared FAILURE_COUNT_PREFIX, causing generic failures
@@ -399,7 +409,7 @@ pub async fn record_credit_exhaustion(agent_name: &str, reason: CreditExhaustion
 /// Applies exponential backoff based on the model's failure count in KV.
 pub async fn record_model_failure(agent_name: &str, model: &str) {
     let key = format!("{agent_name}:{model}");
-    let store_opt = cooldown_store().lock().ok().and_then(|g| g.clone());
+    let store_opt = cooldown_store().lock().await.clone();
     let count = read_and_increment_failure_count(&store_opt, &key).await;
     let base = crate::engine::router::config::get_agent_backoff_base(agent_name);
     let cooldown_until =
@@ -431,7 +441,7 @@ pub async fn set_agent_cooldown(agent_name: &str, duration_secs: u64) {
 /// Record a silence detection for an agent+model and apply extended cooldowns
 /// when repeated silences exceed the threshold within the rolling window.
 pub async fn record_silence_detection(agent_name: &str, model: &str) -> Option<SilenceCountResult> {
-    let store_opt = cooldown_store().lock().ok().and_then(|g| g.clone());
+    let store_opt = cooldown_store().lock().await.clone();
     let store = match store_opt {
         Some(store) => store,
         None => {
@@ -660,7 +670,7 @@ async fn set_cooldown_async(key: &str, cooldown_until: i64, reason: &str) -> boo
     if !set_cooldown_in_memory(key, cooldown_until, reason) {
         return false;
     }
-    let store_opt = cooldown_store().lock().ok().and_then(|g| g.clone());
+    let store_opt = cooldown_store().lock().await.clone();
     if let Some(store) = store_opt {
         let kv_key = format!("{KV_PREFIX}{key}");
         let value = cooldown_until.to_string();
@@ -866,7 +876,7 @@ pub async fn record_github_5xx() {
         };
         // Persist to KV (outside the mutex lock so the future is Send).
         if let Some(cd) = cooldown_until {
-            let store_opt = cooldown_store().lock().ok().and_then(|g| g.clone());
+            let store_opt = cooldown_store().lock().await.clone();
             if let Some(store) = store_opt {
                 let _ = store.kv_set("cooldown:github:5xx", &cd.to_string()).await;
             }
@@ -1088,10 +1098,7 @@ mod tests {
     async fn record_model_failure_writes_to_kv() {
         let store = test_store().await;
 
-        {
-            let mut slot = cooldown_store().lock().unwrap();
-            *slot = Some(store.clone());
-        }
+        *cooldown_store().lock().await = Some(store.clone());
 
         record_model_failure("testagent_persist", "testmodel_persist").await;
 
@@ -1211,10 +1218,7 @@ mod tests {
     #[tokio::test]
     async fn record_silence_detection_applies_extended_cooldown() {
         let store = test_store().await;
-        {
-            let mut slot = cooldown_store().lock().unwrap();
-            *slot = Some(store.clone());
-        }
+        *cooldown_store().lock().await = Some(store.clone());
 
         let agent = "test_silence_count_agent";
         let model = "test_silence_count_model";
@@ -1374,10 +1378,7 @@ mod tests {
     #[tokio::test]
     async fn record_credit_exhaustion_billing_cycle_applies_24h() {
         let store = test_store().await;
-        {
-            let mut slot = cooldown_store().lock().unwrap();
-            *slot = Some(store.clone());
-        }
+        *cooldown_store().lock().await = Some(store.clone());
 
         let agent = "test_billing_cycle_agent";
         assert!(!is_agent_in_cooldown(agent));
@@ -1404,10 +1405,7 @@ mod tests {
     #[tokio::test]
     async fn record_credit_exhaustion_billing_cycle_escalates() {
         let store = test_store().await;
-        {
-            let mut slot = cooldown_store().lock().unwrap();
-            *slot = Some(store.clone());
-        }
+        *cooldown_store().lock().await = Some(store.clone());
 
         let agent = "test_billing_cycle_escalation";
 
@@ -1656,10 +1654,7 @@ mod tests {
     #[tokio::test]
     async fn repeated_agent_failures_escalate_backoff() {
         let store = test_store().await;
-        {
-            let mut slot = cooldown_store().lock().unwrap();
-            *slot = Some(store.clone());
-        }
+        *cooldown_store().lock().await = Some(store.clone());
 
         let agent = "test_escalation_agent";
 
@@ -1697,10 +1692,7 @@ mod tests {
     #[tokio::test]
     async fn record_agent_success_resets_backoff() {
         let store = test_store().await;
-        {
-            let mut slot = cooldown_store().lock().unwrap();
-            *slot = Some(store.clone());
-        }
+        *cooldown_store().lock().await = Some(store.clone());
 
         let agent = "test_success_reset_agent";
         let model = "test_model";
@@ -1750,10 +1742,7 @@ mod tests {
     #[tokio::test]
     async fn clear_cooldown_resets_failure_counts() {
         let store = test_store().await;
-        {
-            let mut slot = cooldown_store().lock().unwrap();
-            *slot = Some(store.clone());
-        }
+        *cooldown_store().lock().await = Some(store.clone());
 
         let agent = "test_clear_fc_agent";
 
@@ -1801,10 +1790,7 @@ mod tests {
     #[tokio::test]
     async fn clear_all_cooldowns_resets_all_failure_counts() {
         let store = test_store().await;
-        {
-            let mut slot = cooldown_store().lock().unwrap();
-            *slot = Some(store.clone());
-        }
+        *cooldown_store().lock().await = Some(store.clone());
 
         let agents = ["test_clear_all_a", "test_clear_all_b"];
         for agent in &agents {
