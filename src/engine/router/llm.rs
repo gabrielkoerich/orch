@@ -788,9 +788,6 @@ impl LlmRouter {
                 anyhow::bail!("router LLM failed: {error_msg}");
             }
             Err(DirectCommandError::Timeout { secs }) => {
-                // Increment timeout telemetry counter so we can observe direct
-                // router LLM command timeouts in metrics/logs.
-                super::LLM_COMMAND_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 anyhow::bail!("{TIMEOUT_PREFIX}{secs}");
             }
             Err(DirectCommandError::EmptyResponse { stderr }) => {
