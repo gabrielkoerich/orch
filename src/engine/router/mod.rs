@@ -343,6 +343,12 @@ impl Router {
         self.weights.ensure_agents(&new_agents);
         self.router_pool = new_pool;
         self.pool_index = 0;
+        // Reinitialize Ollama router if mode changed to local
+        self.ollama_router = if self.config.mode == "local" {
+            Some(ollama::OllamaRouter::new(&self.config))
+        } else {
+            None
+        };
     }
 
     fn discover_free_opencode_models() -> Vec<String> {
