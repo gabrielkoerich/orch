@@ -105,42 +105,63 @@ fn extract_json_block(text: &str) -> Option<String> {
     let fence_end = start + "```json".len();
     let remainder = &text[fence_end..];
 
-    // Find key positions after the opening fence
+    // Find key positions after the opening fence.
     let newline_pos = remainder.find('\n');
-    let closing_fence_pos = remainder.find("```");
     let json_start_pos = remainder.find(['{', '[']);
-
-    // If there's no closing fence, we can't extract a block.
-    let closing_fence_pos = closing_fence_pos?;
-
-    // Decide fenced vs inline using a robust heuristic:
-    // - If a JSON delimiter ('{' or '[') appears before the first newline, treat as inline
-    //   (this preserves inline JSON that contains internal newlines).
-    // - Otherwise, if the closing fence appears before the first newline (or there is no newline),
-    //   treat as inline (JSON is on the same line as the fence).
-    // - Otherwise, treat as a standard fenced block where content starts after the first newline.
     let first_nl = newline_pos.unwrap_or(usize::MAX);
 
-    let is_inline = match json_start_pos {
-        Some(js) if js < first_nl => true,
-        _ => closing_fence_pos < first_nl,
-    };
+    // Decide fenced vs inline:
+    // - If a JSON delimiter ('{' or '[') appears before the first newline, treat as inline.
+    // - If there is no newline at all, treat as inline.
+    // - Otherwise, treat as a standard fenced block.
+    let is_inline = json_start_pos.is_some_and(|js| js < first_nl) || newline_pos.is_none();
 
     if is_inline {
-        // Inline: content is between the first non-whitespace after the fence and the closing fence
+        // Inline: closing fence may appear anywhere on the same logical line.
+        // Using find("```") here is safe because the JSON start already appeared
+        // before any newline, so the closing fence is on the same line too.
+        let closing_fence_pos = remainder.find("```")?;
         let content_start = remainder
             .char_indices()
             .find(|(_, ch)| !ch.is_whitespace())
             .map_or(fence_end, |(idx, _)| fence_end + idx);
         let end = fence_end + closing_fence_pos;
+        if content_start > end {
+            return None;
+        }
         Some(text[content_start..end].to_string())
     } else {
-        // Fenced block: content begins after the first newline and ends at the closing fence
+        // Fenced block: content begins after the first newline.
+        // The closing fence must be anchored to a line boundary (\n```) to avoid
+        // false positives from triple-backticks inside JSON string values.
         let nl = newline_pos?;
         let content_start = fence_end + nl + 1;
-        let end = fence_end + closing_fence_pos;
-        Some(text[content_start..end].to_string())
+        let content = &text[content_start..];
+        let closing_pos = find_closing_fence_at_line_boundary(content)?;
+        Some(text[content_start..content_start + closing_pos].to_string())
     }
+}
+
+/// Find the position (within `content`) where a ``` closing fence starts, anchored to a
+/// line boundary.  Returns the byte offset of the leading ``` so that `content[..pos]`
+/// is everything before the closing fence (including the preceding newline).
+fn find_closing_fence_at_line_boundary(content: &str) -> Option<usize> {
+    // Edge case: content itself begins with the closing fence (no preceding content).
+    if content.starts_with("```") {
+        return Some(0);
+    }
+    // Scan for \n``` pattern — the closing fence must start at the beginning of a line.
+    let mut search_from = 0;
+    while let Some(nl_idx) = content[search_from..].find('\n') {
+        let after_nl = search_from + nl_idx + 1;
+        if content[after_nl..].starts_with("```") {
+            // Return the position of the ``` (after the \n).
+            // The content slice up to this point includes the \n, matching Markdown semantics.
+            return Some(after_nl);
+        }
+        search_from = after_nl;
+    }
+    None
 }
 
 /// Fields that indicate a JSON blob is an AgentResponse (higher score = better match).
@@ -696,6 +717,50 @@ Some output here.
         assert_eq!(resp.status, "done");
         assert_eq!(resp.summary, "Fixed the bug");
         assert_eq!(resp.files, vec!["src/parser.rs"]);
+    }
+
+    // --- Edge-case tests for line-boundary fence extraction ---
+
+    #[test]
+    fn extract_json_block_backticks_inside_json_string() {
+        // Triple-backticks appear inside a JSON string value.
+        // The old code would stop at the first ``` (inside the string).
+        // The new code must find the real closing fence at a line boundary.
+        let text = "```json\n{\"code\":\"example: ```snippet``` end\"}\n```\n";
+        let block = extract_json_block(text).unwrap();
+        assert_eq!(block, "{\"code\":\"example: ```snippet``` end\"}\n");
+    }
+
+    #[test]
+    fn extract_json_block_backticks_inside_json_string_parse_roundtrip() {
+        // Full parse roundtrip: fenced block with backticks inside a JSON string value.
+        let input = "```json\n{\"status\":\"done\",\"summary\":\"use ```code``` here\"}\n```\n";
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+        assert_eq!(resp.summary, "use ```code``` here");
+    }
+
+    #[test]
+    fn extract_json_block_inline_with_embedded_backtick_pairs() {
+        // Inline JSON: embedded backticks that are NOT triple should not confuse the parser.
+        let text = "```json{\"key\":\"a`b``c\"}```\n";
+        let block = extract_json_block(text).unwrap();
+        assert_eq!(block, "{\"key\":\"a`b``c\"}");
+    }
+
+    #[test]
+    fn parse_mixed_telemetry_and_fenced_response() {
+        // Telemetry JSON with backtick sequences followed by a fenced agent response.
+        let input = r#"Processing...
+{"type":"log","msg":"calling tool: ```bash```"}
+```json
+{"status":"done","summary":"fixed it","accomplished":["patched"],"remaining":[],"files":["src/x.rs"]}
+```
+"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+        assert_eq!(resp.summary, "fixed it");
+        assert_eq!(resp.files, vec!["src/x.rs"]);
     }
 
     #[test]
