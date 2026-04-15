@@ -43,7 +43,11 @@ impl TaskStore {
         // which silently masked database corruption or unexpected negative values.
         // Use a debug assertion to loudly detect unexpected values in debug builds
         // while returning the actual stored value in release builds.
-        debug_assert!(row.0 >= 1, "kv_increment returned unexpected value {}", row.0);
+        debug_assert!(
+            row.0 >= 1,
+            "kv_increment returned unexpected value {}",
+            row.0
+        );
         Ok(row.0 as u64)
     }
 
