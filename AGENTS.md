@@ -521,6 +521,17 @@ Orch is an internal tool running on a local machine with no external network acc
 
 External consumers (CLI, local debugging tools) connect via **localhost-only websocket** (`127.0.0.1`). Do not add externally-reachable servers, do not assume inbound connections from GitHub or other services will work, and do not design features that depend on webhook delivery.
 
+### Routing concurrency is controlled by `max_tasks_per_tick` + `llm_budget_secs` — no semaphore
+
+LLM routing concurrency is governed by exactly two knobs:
+
+- **`router.max_tasks_per_tick`** (default: 1) — caps how many tasks enter the routing loop per tick. With the default of 1, only one LLM classification call can ever be in flight at a time.
+- **`router.llm_budget_secs`** (default: `timeout_seconds`, 45s) — total wall-clock budget for the entire pool cascade before falling back to round-robin. Prevents N pool entries × 45s/each from blocking the tick.
+
+**Do not add a semaphore, worker pool, or `ORCH_ROUTER_MAX_PARALLEL_LLMS` env var.** Issue #2676 / PR #2677 introduced an `llm_semaphore` field on `Router` that was redundant with `max_tasks_per_tick=1` at its default value and added no protection that the budget timeout doesn't already provide. It was removed as dead complexity.
+
+If routing is too slow: tune `router.llm_budget_secs` (lower it to fall back to round-robin faster) or reduce `router.max_tasks_per_tick`. Do not add a third concurrency mechanism.
+
 ### Security leak detection — ALL patterns block GitHub posting
 
 `has_leaks()` in `src/security.rs` checks **all** `LEAK_PATTERNS` regardless of the `high_confidence` flag. Nothing is posted to GitHub if any pattern matches — low-confidence patterns included.

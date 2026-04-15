@@ -1748,7 +1748,7 @@ pub async fn serve() -> anyhow::Result<()> {
 
                 // Update watchdog timestamp + log tick duration.
                 let tick_elapsed = tick_start.elapsed();
-                if tick_elapsed.as_secs() > 5 {
+                if tick_elapsed.as_secs() > 30 {
                     tracing::warn!(elapsed_ms = tick_elapsed.as_millis() as u64, "slow tick");
                 } else {
                     tracing::debug!(elapsed_ms = tick_elapsed.as_millis() as u64, "tick complete");

@@ -1022,12 +1022,10 @@ pub(crate) async fn tick_route_tasks(
     // not per-task (previously this ran inside route() causing N redundant
     // DB queries when routing N tasks in the same tick).
     if !routable.is_empty() {
-        // Time and log refresh_health to surface slow DB queries
         let start = std::time::Instant::now();
         router.refresh_health(store).await;
-        let dur = start.elapsed();
-        tracing::info!(
-            duration_ms = dur.as_millis(),
+        tracing::debug!(
+            duration_ms = start.elapsed().as_millis(),
             "router.refresh_health completed"
         );
     }
@@ -1036,12 +1034,10 @@ pub(crate) async fn tick_route_tasks(
     let max_per_tick = crate::engine::router::config::max_tasks_per_routing_tick();
     for task in routable.into_iter().take(max_per_tick) {
         let _task_span = tracing::info_span!("engine.route", task_id = %task.id.0).entered();
-        // Measure per-task routing latency and log budget/timeout events
         let task_start = Instant::now();
         match router.route(task, store, repo).await {
             Ok(result) => {
-                let task_dur = task_start.elapsed();
-                tracing::info!(task_id = %task.id.0, duration_ms = task_dur.as_millis(), "route completed");
+                tracing::debug!(task_id = %task.id.0, duration_ms = task_start.elapsed().as_millis(), "route completed");
                 // Store route result in store
                 if let Err(e) = router
                     .store_route_result(&task.id.0, &result, store, repo)
