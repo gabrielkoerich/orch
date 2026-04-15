@@ -95,16 +95,26 @@ impl RateLimit {
 
         // Prefer reset_at when available — avoids over-waiting with exponential backoff
         if let Some(reset_epoch) = self.reset_at {
-            let now_epoch = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if reset_epoch > now_epoch {
-                let wait_secs = reset_epoch - now_epoch + 1;
-                self.backoff_delay = Duration::from_secs(wait_secs);
-                self.backoff_until = Some(Instant::now() + self.backoff_delay);
-                tracing::warn!(wait_secs, "GitHub rate limit hit, waiting until reset time");
-                return;
+            match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                Ok(since_epoch) => {
+                    let now_epoch = since_epoch.as_secs();
+                    if reset_epoch > now_epoch {
+                        let wait_secs = reset_epoch - now_epoch + 1;
+                        self.backoff_delay = Duration::from_secs(wait_secs);
+                        self.backoff_until = Some(Instant::now() + self.backoff_delay);
+                        tracing::warn!(
+                            wait_secs,
+                            "GitHub rate limit hit, waiting until reset time"
+                        );
+                        return;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "System clock is before UNIX epoch; ignoring reset_at and falling back to exponential backoff"
+                    );
+                }
             }
         }
 
