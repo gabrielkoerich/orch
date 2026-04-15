@@ -1170,6 +1170,17 @@ pub(crate) mod patterns {
             };
         }
 
+        // Exit 0 with empty output is a silent failure (common with GitHub Copilot
+        // models in opencode). Return Unknown with a deterministic message so the
+        // caller (fallback.rs) detects it and applies model cooldown + free-model
+        // retry instead of treating it as a generic success.
+        if exit_code == 0 && text.trim().is_empty() {
+            return AgentError::Unknown {
+                exit_code,
+                message: "empty-output-exit0".to_string(),
+            };
+        }
+
         if let Some(e) = detect_missing_tool(text) {
             return e;
         }
