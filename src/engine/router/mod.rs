@@ -142,6 +142,8 @@ pub struct Router {
     /// LLM routing subsystem (wrapped in Arc so callers can clone a handle
     /// without holding the router RwLock across async operations)
     llm_router: std::sync::Arc<LlmRouter>,
+    /// Ollama router for local routing (contains reusable reqwest::Client)
+    ollama_router: Option<ollama::OllamaRouter>,
     /// Round-robin index for task routing
     pub(crate) rr_index: usize,
     /// Last agent routed to (for distribution tracking)
@@ -193,11 +195,17 @@ impl Router {
         // that async callers hitting expanded_model_pool() later return
         // instantly from cache instead of blocking a Tokio worker thread.
         crate::engine::runner::agents::opencode::prime_free_model_cache();
+        let ollama_router = if config.mode == "local" {
+            Some(ollama::OllamaRouter::new(&config))
+        } else {
+            None
+        };
         Self {
             config,
             available_agents,
             weights,
             llm_router: std::sync::Arc::new(LlmRouter::new()),
+            ollama_router,
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
