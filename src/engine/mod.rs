@@ -1200,14 +1200,15 @@ pub async fn serve() -> anyhow::Result<()> {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(64);
 
         // Initialise status: configured, not yet healthy.
-        {
+        let to_save = {
             let mut s = webhook_status.lock().await;
             s.configured = true;
             s.port = Some(port);
             s.healthy = false;
             s.fallback_mode = false;
-            s.save().await;
-        }
+            s.clone()
+        };
+        to_save.save().await;
 
         // Spawn the HTTP server with exponential-backoff retry on transient
         // bind errors (e.g. EADDRINUSE).  After MAX_ATTEMPTS the engine falls
@@ -1243,12 +1244,15 @@ pub async fn serve() -> anyhow::Result<()> {
                                 orch_webhook_in_fallback = true,
                                 "webhook server giving up, switching to polling fallback"
                             );
-                            let mut s = status_for_spawn.lock().await;
-                            s.fallback_mode = true;
-                            s.healthy = false;
-                            s.last_failure_reason = Some(reason);
-                            s.startup_attempts = attempt;
-                            s.save().await;
+                            let to_save = {
+                                let mut s = status_for_spawn.lock().await;
+                                s.fallback_mode = true;
+                                s.healthy = false;
+                                s.last_failure_reason = Some(reason);
+                                s.startup_attempts = attempt;
+                                s.clone()
+                            };
+                            to_save.save().await;
                             break;
                         }
                         let delay = webhook_backoff_delay(attempt);
@@ -1259,10 +1263,13 @@ pub async fn serve() -> anyhow::Result<()> {
                             "webhook bind failed (transient), retrying with backoff"
                         );
                         {
-                            let mut s = status_for_spawn.lock().await;
-                            s.startup_attempts = attempt;
-                            s.last_failure_reason = Some(reason);
-                            s.save().await;
+                            let to_save = {
+                                let mut s = status_for_spawn.lock().await;
+                                s.startup_attempts = attempt;
+                                s.last_failure_reason = Some(reason);
+                                s.clone()
+                            };
+                            to_save.save().await;
                         }
                         tokio::time::sleep(delay).await;
                     }
@@ -1299,10 +1306,13 @@ pub async fn serve() -> anyhow::Result<()> {
         webhook_port = None;
         webhook_healthy = false;
         {
-            let mut s = webhook_status.lock().await;
-            s.configured = false;
-            s.fallback_mode = true;
-            s.save().await;
+            let to_save = {
+                let mut s = webhook_status.lock().await;
+                s.configured = false;
+                s.fallback_mode = true;
+                s.clone()
+            };
+            to_save.save().await;
         }
         tracing::info!(
             orch_webhook_in_fallback = true,
@@ -1718,15 +1728,18 @@ pub async fn serve() -> anyhow::Result<()> {
                             }
                             // Persist updated status.
                             {
-                                let mut s = webhook_status.lock().await;
-                                s.healthy = health;
-                                s.last_check_utc = Some(chrono::Utc::now());
-                                if health {
-                                    s.last_failure_reason = None;
-                                } else if failure_reason.is_some() {
-                                    s.last_failure_reason = failure_reason;
-                                }
-                                s.save().await;
+                                let to_save = {
+                                    let mut s = webhook_status.lock().await;
+                                    s.healthy = health;
+                                    s.last_check_utc = Some(chrono::Utc::now());
+                                    if health {
+                                        s.last_failure_reason = None;
+                                    } else if failure_reason.is_some() {
+                                        s.last_failure_reason = failure_reason;
+                                    }
+                                    s.clone()
+                                };
+                                to_save.save().await;
                             }
                         }
                         last_webhook_health_check = std::time::Instant::now();
