@@ -745,7 +745,10 @@ impl Router {
             // 4. Local Ollama routing
             if self.config.mode == "local" {
                 tracing::debug!(task_id = %task.id.0, ollama_url = %self.config.ollama_url, "routing via local Ollama");
-                let ollama_router = ollama::OllamaRouter::new(&self.config);
+                let ollama_router = self
+                    .ollama_router
+                    .as_ref()
+                    .expect("ollama_router must be initialized in Router::new when mode=local");
                 match ollama_router.route(task, &self.config).await {
                     Ok(result) => {
                         self.log_route_activity(store, repo, &task.id.0, &result, None)
@@ -1967,6 +1970,7 @@ Hope that helps!"#;
             available_agents: agents,
             weights,
             llm_router: std::sync::Arc::new(LlmRouter::new()),
+            ollama_router: None,
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
@@ -2002,6 +2006,7 @@ Hope that helps!"#;
             available_agents: agents,
             weights,
             llm_router: std::sync::Arc::new(LlmRouter::new()),
+            ollama_router: None,
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
@@ -2058,6 +2063,7 @@ Hope that helps!"#;
             available_agents: agents,
             weights,
             llm_router: std::sync::Arc::new(LlmRouter::new()),
+            ollama_router: None,
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
@@ -2350,6 +2356,7 @@ Hope that helps!"#;
             available_agents: agents,
             weights,
             llm_router: std::sync::Arc::new(LlmRouter::new()),
+            ollama_router: None,
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
@@ -2391,6 +2398,7 @@ Hope that helps!"#;
             available_agents: agents,
             weights,
             llm_router: std::sync::Arc::new(LlmRouter::new()),
+            ollama_router: None,
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
@@ -2457,6 +2465,7 @@ Hope that helps!"#;
             available_agents: agents,
             weights,
             llm_router: std::sync::Arc::new(LlmRouter::new()),
+            ollama_router: None,
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
@@ -2497,6 +2506,7 @@ Hope that helps!"#;
             available_agents: agents,
             weights,
             llm_router: std::sync::Arc::new(LlmRouter::new()),
+            ollama_router: None,
             rr_index: 0,
             last_agent: None,
             // Start index at 2, which is >= candidates.len() (2), triggering the bug
@@ -2541,6 +2551,7 @@ Hope that helps!"#;
             available_agents: agents,
             weights,
             llm_router: std::sync::Arc::new(LlmRouter::new()),
+            ollama_router: None,
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
@@ -2603,6 +2614,7 @@ Hope that helps!"#;
             available_agents: agents,
             weights,
             llm_router: std::sync::Arc::new(LlmRouter::new()),
+            ollama_router: None,
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
