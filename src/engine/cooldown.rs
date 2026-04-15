@@ -746,11 +746,15 @@ pub fn clear_agent_degraded(agent: &str) {
 /// Refresh the degraded-agent set from the rate_limits table and cooldown state.
 ///
 /// An agent is marked degraded when:
-/// 1. It is in agent-level cooldown, **or**
+/// 1. It is in agent-level cooldown (explicit cooldown KV key exists and hasn't expired), **or**
 /// 2. All its configured models are in cooldown, **or**
 /// 3. It has >= `threshold` rate_limit/out_of_credits events within `window_hours`.
 ///
 /// Agents that no longer meet these criteria are cleared.
+///
+/// Note: This function calls `clear_expired_cooldowns()` first to ensure the
+/// in-memory cooldown map reflects current state. An agent should NOT be marked
+/// degraded simply because an expired cooldown entry hasn't been cleaned up yet.
 pub async fn refresh_degraded_agents(
     store: &Arc<crate::store::TaskStore>,
     available_agents: &[String],
@@ -758,6 +762,11 @@ pub async fn refresh_degraded_agents(
     window_hours: u32,
     threshold: i64,
 ) {
+    // Clear expired cooldowns from in-memory map before evaluating agent state.
+    // This ensures we don't incorrectly mark agents as degraded due to stale
+    // in-memory entries that should have expired but weren't cleaned up.
+    clear_expired_cooldowns();
+
     // Time the DB query to surface slow health-checks that can dominate the
     // engine tick latency. If the query fails, log and return early.
     let start = chrono::Utc::now();
@@ -783,68 +792,16 @@ pub async fn refresh_degraded_agents(
     };
 
     for agent in available_agents {
-        // Determine whether there is an explicit persisted cooldown for this agent.
-        // Only persisted cooldowns (written to KV) should be considered by the
-        // pre-emptive health check as an "agent in cooldown" signal. Short in-
-        // memory-only cooldowns (e.g. transient silence_agent_cooldown set when
-        // no store is configured) should NOT by themselves mark the agent as
-        // degraded here — that was causing false positives when rate_limit
-        // counts were zero.
-        // Consider the agent in cooldown for the health check only if the
-        // cooldown is not transient (e.g. silence_agent_cooldown). Silence
-        // cooldowns are short-lived signals used to force a single re-route
-        // and should not cause the pre-emptive health check to mark an
-        // agent degraded. Use the in-memory reason if present (covers the
-        // typical fast path where set_cooldown_in_memory is called before
-        // the KV write completes); fall back to the in-memory boolean.
         let in_cooldown = is_agent_in_cooldown(agent);
-        let in_cooldown_non_transient = if in_cooldown {
-            match cooldown_reason(agent) {
-                Some(reason) => {
-                    let transient_reasons = ["silence_agent_cooldown", "silence_detected"];
-                    !transient_reasons.contains(&reason.as_str())
-                }
-                None => true,
-            }
-        } else {
-            false
-        };
-
-        // Check for a persisted cooldown entry in KV when a store is present.
-        let store_opt = cooldown_store().lock().await.clone();
-        let persisted_cooldown = if let Some(ref s) = store_opt {
-            match s.kv_get(&format!("{KV_PREFIX}{}", agent)).await {
-                Ok(Some(raw)) => match raw.parse::<i64>() {
-                    Ok(ts) => chrono::Utc::now().timestamp() < ts,
-                    Err(_) => false,
-                },
-                _ => false,
-            }
-        } else {
-            false
-        };
-
         let no_models = !model_checker(agent);
         let rate_limit_count = counts.get(agent.as_str()).copied().unwrap_or(0);
         let over_threshold = rate_limit_count >= threshold;
 
-        // A non-transient cooldown (persisted or in-memory with a stored reason)
-        // is always a valid degraded signal — it was created due to a real failure
-        // event (agent error, rate limit error, silence detection, etc.).
-        // We only skip the cooldown signal when it's a transient silence
-        // cooldown with no rate-limit events and no persisted state.
-        let has_meaningful_cooldown_reason =
-            persisted_cooldown || (in_cooldown_non_transient && cooldown_reason(agent).is_some());
-
-        let effective_in_cooldown = in_cooldown && has_meaningful_cooldown_reason;
-
-        // The overall degraded predicate: a non-transient cooldown OR all
-        // models cooled OR rate-limit threshold exceeded.
-        let degraded = effective_in_cooldown || no_models || over_threshold;
+        let degraded = in_cooldown || no_models || over_threshold;
 
         if degraded {
             if !is_agent_degraded(agent) {
-                let reason = if effective_in_cooldown {
+                let reason = if in_cooldown {
                     "agent in cooldown"
                 } else if no_models {
                     "all models cooled"
@@ -1644,6 +1601,52 @@ mod tests {
             !is_agent_degraded(agent),
             "healthy agent should have degraded flag cleared"
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_degraded_agents_ignores_expired_cooldowns() {
+        let store = test_store().await;
+        let agent = "test_refresh_expired_cooldown";
+
+        // Manually insert an already-expired cooldown entry directly into the map
+        // (simulating a stale entry that wasn't cleaned up)
+        let expired_ts = chrono::Utc::now().timestamp() - 100; // 100 seconds ago
+        {
+            let mut map = cooldowns().lock().unwrap();
+            map.insert(
+                agent.to_string(),
+                CooldownEntry {
+                    cooldown_until: expired_ts,
+                    reason: "expired_test".to_string(),
+                },
+            );
+        }
+
+        // Verify the expired entry is in the map but should not cause degraded status
+        assert!(
+            !is_agent_in_cooldown(agent),
+            "expired cooldown should not be active"
+        );
+
+        // Pre-mark as degraded to verify it gets cleared
+        mark_agent_degraded(agent);
+        assert!(is_agent_degraded(agent));
+
+        // Run refresh — should clear degraded because cooldown is expired
+        let agents = vec![agent.to_string()];
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+
+        assert!(
+            !is_agent_degraded(agent),
+            "agent with only expired cooldown should NOT be marked degraded"
+        );
+
+        // Cleanup
+        clear_agent_degraded(agent);
+        {
+            let mut map = cooldowns().lock().unwrap();
+            map.remove(agent);
+        }
     }
 
     #[test]

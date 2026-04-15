@@ -33,6 +33,15 @@ pub fn health_check_window_hours() -> u32 {
 /// Minimum number of rate-limit events within the health check window to
 /// consider an agent degraded.
 ///
+/// A single transient 429 error shouldn't mark an agent degraded; we need
+/// a pattern of repeated failures to detect genuine degradation. This
+/// threshold is compared against the count of rate_limit events in the
+/// `rate_limits` table within the health check window.
+///
+/// IMPORTANT: An agent with `rate_limit_count == 0` is NOT degraded by this
+/// criterion — it must meet or exceed the threshold. The threshold should
+/// be set to a value >= 2 to avoid false positives when there are no events.
+///
 /// Configurable via `dispatch.degraded_rate_limit_threshold` (default: 3).
 pub fn degraded_rate_limit_threshold() -> i64 {
     crate::config::get("dispatch.degraded_rate_limit_threshold")
