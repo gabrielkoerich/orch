@@ -383,7 +383,13 @@ pub async fn handle_error(
             // Exit 0 with empty output is a silent failure (common with GitHub
             // Copilot models in opencode).  Record a model-specific cooldown so
             // the same model is not retried on every subsequent task.
-            if *exit_code == 0 && message.is_empty() {
+            // Also matches when message == "empty-output-exit0" (from classify_from_text
+            // or the direct empty-output branch in mod.rs).
+            if *exit_code == 0
+                && (message.is_empty()
+                    || message == "empty-output-exit0"
+                    || message.starts_with("empty-output-exit0:"))
+            {
                 if let Some(m) = model_name {
                     // Use a 4-hour cooldown for silent exits instead of the default 1-hour
                     // model cooldown.  These models (especially github-copilot/* in opencode)

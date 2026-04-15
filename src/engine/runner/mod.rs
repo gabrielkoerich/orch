@@ -628,12 +628,14 @@ impl TaskRunner {
                 session_output.elapsed_secs,
             ))
         } else {
-            // Exit 0 but empty output — check stderr for clues
-            let combined = format!("{}{}", session_output.raw_stdout, session_output.raw_stderr);
-            Err(agents::patterns::classify_from_text(
-                session_output.exit_code,
-                &combined,
-            ))
+            // Exit 0 but empty output — silent model failure. Use Unknown with a
+            // deterministic message matching what fallback.rs expects so the
+            // model gets a cooldown and free-model retry is attempted.
+            Err(agents::AgentError::Unknown {
+                exit_code: session_output.exit_code,
+                message: "empty-output-exit0: opencode returned exit 0 with empty stdout"
+                    .to_string(),
+            })
         };
 
         // Write structured result.json for deterministic testing and debugging
