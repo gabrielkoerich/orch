@@ -767,16 +767,68 @@ pub async fn refresh_degraded_agents(
     };
 
     for agent in available_agents {
+        // Determine whether there is an explicit persisted cooldown for this agent.
+        // Only persisted cooldowns (written to KV) should be considered by the
+        // pre-emptive health check as an "agent in cooldown" signal. Short in-
+        // memory-only cooldowns (e.g. transient silence_agent_cooldown set when
+        // no store is configured) should NOT by themselves mark the agent as
+        // degraded here — that was causing false positives when rate_limit
+        // counts were zero.
+        // Consider the agent in cooldown for the health check only if the
+        // cooldown is not transient (e.g. silence_agent_cooldown). Silence
+        // cooldowns are short-lived signals used to force a single re-route
+        // and should not cause the pre-emptive health check to mark an
+        // agent degraded. Use the in-memory reason if present (covers the
+        // typical fast path where set_cooldown_in_memory is called before
+        // the KV write completes); fall back to the in-memory boolean.
         let in_cooldown = is_agent_in_cooldown(agent);
+        let in_cooldown_non_transient = if in_cooldown {
+            match cooldown_reason(agent) {
+                Some(reason) => {
+                    let transient_reasons = ["silence_agent_cooldown", "silence_detected"];
+                    !transient_reasons.contains(&reason.as_str())
+                }
+                None => true,
+            }
+        } else {
+            false
+        };
+
+        // Check for a persisted cooldown entry in KV when a store is present.
+        let store_opt = cooldown_store().lock().await.clone();
+        let persisted_cooldown = if let Some(ref s) = store_opt {
+            match s.kv_get(&format!("{KV_PREFIX}{}", agent)).await {
+                Ok(Some(raw)) => match raw.parse::<i64>() {
+                    Ok(ts) => chrono::Utc::now().timestamp() < ts,
+                    Err(_) => false,
+                },
+                _ => false,
+            }
+        } else {
+            false
+        };
+
         let no_models = !model_checker(agent);
         let rate_limit_count = counts.get(agent.as_str()).copied().unwrap_or(0);
         let over_threshold = rate_limit_count >= threshold;
 
-        let degraded = in_cooldown || no_models || over_threshold;
+        // A non-transient cooldown (persisted or in-memory with a stored reason)
+        // is always a valid degraded signal — it was created due to a real failure
+        // event (agent error, rate limit error, silence detection, etc.).
+        // We only skip the cooldown signal when it's a transient silence
+        // cooldown with no rate-limit events and no persisted state.
+        let has_meaningful_cooldown_reason =
+            persisted_cooldown || (in_cooldown_non_transient && cooldown_reason(agent).is_some());
+
+        let effective_in_cooldown = in_cooldown && has_meaningful_cooldown_reason;
+
+        // The overall degraded predicate: a non-transient cooldown OR all
+        // models cooled OR rate-limit threshold exceeded.
+        let degraded = effective_in_cooldown || no_models || over_threshold;
 
         if degraded {
             if !is_agent_degraded(agent) {
-                let reason = if in_cooldown {
+                let reason = if effective_in_cooldown {
                     "agent in cooldown"
                 } else if no_models {
                     "all models cooled"
