@@ -842,7 +842,7 @@ impl Router {
             };
 
             if permit.is_none() {
-                tracing::warn!(task_id = %task.id.0, "failed to acquire llm semaphore within budget ");
+                tracing::warn!(task_id = %task.id.0, "failed to acquire llm semaphore within budget");
                 // Fall back to round-robin immediately
                 let candidates = self.available_agents_for_complexity(&complexity);
                 if candidates.is_empty() {
