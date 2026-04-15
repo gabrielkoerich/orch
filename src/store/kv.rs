@@ -38,7 +38,17 @@ impl TaskStore {
         .bind(key)
         .fetch_one(&self.pool)
         .await?;
-        Ok(row.0.max(1) as u64)
+        // The SQL always returns a value >= 1 (insert path returns 1, update adds 1 to
+        // the previous integer value). Previously this was clamped with `.max(1)`,
+        // which silently masked database corruption or unexpected negative values.
+        // Use a debug assertion to loudly detect unexpected values in debug builds
+        // while returning the actual stored value in release builds.
+        debug_assert!(
+            row.0 >= 1,
+            "kv_increment returned unexpected value {}",
+            row.0
+        );
+        Ok(row.0 as u64)
     }
 
     /// Delete a key from the KV store.
