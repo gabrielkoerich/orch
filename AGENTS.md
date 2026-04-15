@@ -521,6 +521,14 @@ Orch is an internal tool running on a local machine with no external network acc
 
 External consumers (CLI, local debugging tools) connect via **localhost-only websocket** (`127.0.0.1`). Do not add externally-reachable servers, do not assume inbound connections from GitHub or other services will work, and do not design features that depend on webhook delivery.
 
+### Security leak detection — ALL patterns block GitHub posting
+
+`has_leaks()` in `src/security.rs` checks **all** `LEAK_PATTERNS` regardless of the `high_confidence` flag. Nothing is posted to GitHub if any pattern matches — low-confidence patterns included.
+
+**Do not change `has_leaks()` to filter by `high_confidence`.** Issue #2645 / PR #2648 made this mistake: it changed `has_leaks()` to skip low-confidence patterns to reduce "false positive redactions", but the correct policy is to err on the side of caution — if anything looks like a secret, don't post it. A false positive (overly cautious) is far preferable to a false negative (leaking credentials).
+
+The `high_confidence` flag exists only to let `scan()` / `redact()` distinguish severity for display purposes — it has no effect on whether posting is blocked.
+
 ## Preferred tools
 
 - Use `rg` instead of `grep` — faster, installed as a brew dependency
