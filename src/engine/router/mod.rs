@@ -41,6 +41,8 @@ use crate::engine::cooldown::{
 use crate::store::{get_task_field_direct, store_log_activity, TaskStore};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use llm::{LlmRouter, TIMEOUT_PREFIX};
 
@@ -155,7 +157,15 @@ pub struct Router {
     pub(crate) router_pool: Vec<(String, String)>,
     /// Current round-robin index into router_pool
     pub(crate) pool_index: usize,
+    /// Semaphore to limit concurrent LLM routing invocations. Configurable
+    /// via ORCH_ROUTER_MAX_PARALLEL_LLMS env var (default: 1).
+    pub(crate) llm_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
 }
+
+/// Counter: number of times the LLM budget was exceeded and we fell back.
+pub static LLM_BUDGET_EXCEEDED: AtomicU64 = AtomicU64::new(0);
+/// Counter: number of direct router LLM command timeouts observed.
+pub static LLM_COMMAND_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 struct AllCooledError {
@@ -200,6 +210,13 @@ impl Router {
         } else {
             None
         };
+        // Configure LLM concurrency from env (default 1)
+        let max_parallel_llm = std::env::var("ORCH_ROUTER_MAX_PARALLEL_LLMS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(1);
+
         Self {
             config,
             available_agents,
@@ -211,6 +228,7 @@ impl Router {
             review_rr_index: 0,
             router_pool,
             pool_index: 0,
+            llm_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(max_parallel_llm)),
         }
     }
 
@@ -812,6 +830,43 @@ impl Router {
             tracing::debug!(task_id = %task.id.0, "starting LLM routing");
 
             let budget = std::time::Duration::from_secs(self.config.llm_budget_secs);
+            // Acquire a permit to bound concurrent LLM routing work so many
+            // parallel ticks don't spawn unbounded classifier cascades.
+            let sem = Arc::clone(&self.llm_semaphore);
+            // Wait for a permit but bounded by the overall LLM budget to avoid
+            // blocking the tick loop indefinitely.
+            let permit_fut = sem.acquire_owned();
+            let permit = match tokio::time::timeout(budget, permit_fut).await {
+                Ok(Ok(p)) => Some(p),
+                Ok(Err(_)) => None, // semaphore closed
+                Err(_) => None,      // timed out acquiring permit within budget
+            };
+
+            if permit.is_none() {
+                tracing::warn!(task_id = %task.id.0, "failed to acquire llm semaphore within budget ");
+                // Fall back to round-robin immediately
+                let candidates = self.available_agents_for_complexity(&complexity);
+                if candidates.is_empty() {
+                    self.wait_for_cooldown(Some(&complexity)).await?;
+                    continue;
+                }
+                let result = strategies::route_via_round_robin_stateful(
+                    &candidates,
+                    &self.config,
+                    task,
+                    &mut self.rr_index,
+                    &mut self.last_agent,
+                )?;
+                self.log_route_activity(store, repo, &task.id.0, &result, None)
+                    .await;
+                return Ok(result);
+            }
+
+            // We hold a permit; ensure it is dropped after the LLM call by
+            // binding it into the async block below so it's released on await
+            // completion/timeout.
+            let _permit = permit;
+
             let llm_result = tokio::time::timeout(budget, self.route_with_llm(task, repo)).await;
 
             // Budget exceeded: the pool cascade took longer than the total
@@ -819,6 +874,8 @@ impl Router {
             // immediately without incrementing route_attempts — this is not a
             // model failure, just a latency problem.
             if let Err(_elapsed) = llm_result {
+                // Increment budget-exceeded counter for telemetry/inspection
+                LLM_BUDGET_EXCEEDED.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     task_id = %task.id.0,
                     budget_secs = self.config.llm_budget_secs,
