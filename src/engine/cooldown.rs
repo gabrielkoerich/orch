@@ -1623,7 +1623,10 @@ mod tests {
         }
 
         // Verify the expired entry is in the map but should not cause degraded status
-        assert!(!is_agent_in_cooldown(agent), "expired cooldown should not be active");
+        assert!(
+            !is_agent_in_cooldown(agent),
+            "expired cooldown should not be active"
+        );
 
         // Pre-mark as degraded to verify it gets cleared
         mark_agent_degraded(agent);
