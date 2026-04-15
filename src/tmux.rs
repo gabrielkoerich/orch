@@ -319,19 +319,31 @@ impl TmuxManager {
     /// Returns a map from session name → alive (true = alive, false = dead/missing).
     /// Uses `list-panes -a` to avoid one subprocess per session.
     pub async fn batch_session_active(&self) -> HashMap<String, bool> {
-        let output = Command::new("tmux")
-            .args(["list-panes", "-a", "-F", "#{session_name} #{pane_dead}"])
-            .output()
-            .await;
         let mut map = HashMap::new();
-        if let Ok(o) = output {
-            if o.status.success() {
-                for line in String::from_utf8_lossy(&o.stdout).lines() {
-                    let mut parts = line.trim().splitn(2, ' ');
-                    if let (Some(session), Some(dead)) = (parts.next(), parts.next()) {
-                        map.insert(session.to_string(), dead.trim() == "0");
-                    }
-                }
+        let o = match Command::new("tmux")
+            .args(["list-panes", "-a", "-F", "#{session_name} #{pane_dead}"])
+            .output_with_context()
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(error = %e, "batch_session_active: failed to spawn tmux");
+                return map;
+            }
+        };
+        if !o.status.success() {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            tracing::warn!(
+                status = ?o.status,
+                stderr = %stderr.trim(),
+                "batch_session_active: tmux list-panes exited non-zero"
+            );
+            return map;
+        }
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let mut parts = line.trim().splitn(2, ' ');
+            if let (Some(session), Some(dead)) = (parts.next(), parts.next()) {
+                map.insert(session.to_string(), dead.trim() == "0");
             }
         }
         map
