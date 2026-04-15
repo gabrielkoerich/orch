@@ -40,9 +40,8 @@ use crate::engine::cooldown::{
 };
 use crate::store::{get_task_field_direct, store_log_activity, TaskStore};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::sync::Arc;
 
 use llm::{LlmRouter, TIMEOUT_PREFIX};
 
@@ -839,7 +838,7 @@ impl Router {
             let permit = match tokio::time::timeout(budget, permit_fut).await {
                 Ok(Ok(p)) => Some(p),
                 Ok(Err(_)) => None, // semaphore closed
-                Err(_) => None,      // timed out acquiring permit within budget
+                Err(_) => None,     // timed out acquiring permit within budget
             };
 
             if permit.is_none() {
@@ -2039,6 +2038,7 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            llm_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         };
 
         let task = create_test_task("1", "Test task", vec![]);
@@ -2075,6 +2075,7 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            llm_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         };
 
         let task = create_test_task("1", "Test", vec!["agent:claude".to_string()]);
@@ -2132,6 +2133,7 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            llm_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         };
 
         // Reload — should re-read config and remain valid
@@ -2425,6 +2427,7 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            llm_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         };
 
         let task = create_test_task("1", "Test task", vec![]);
@@ -2467,6 +2470,7 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            llm_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         };
 
         // Label override should take precedence over weighted routing
@@ -2534,6 +2538,7 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            llm_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         };
 
         let a1 = router.next_round_robin_agent(&[], "medium").unwrap();
@@ -2576,6 +2581,7 @@ Hope that helps!"#;
             review_rr_index: 2,
             router_pool: vec![],
             pool_index: 0,
+            llm_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         };
 
         // All candidates excluded — should fall back to first candidate, not None
@@ -2620,6 +2626,7 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            llm_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         };
 
         // With the bug: index advances modulo 3 (available_agents.len()), so the
@@ -2683,6 +2690,7 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            llm_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         };
 
         assert!(router.last_agent.is_none());

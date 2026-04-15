@@ -29,7 +29,7 @@ use dashmap::DashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::time::{SystemTime, Instant};
+use std::time::{Instant, SystemTime};
 use tokio::sync::{mpsc, Semaphore};
 
 /// Unix timestamp when the engine process started.
