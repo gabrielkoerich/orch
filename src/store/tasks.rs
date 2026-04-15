@@ -627,10 +627,6 @@ impl TaskStore {
 
         let mut block_reason_in_updates = false;
         for (col, val) in updates {
-            anyhow::ensure!(
-                ALLOWED_FIELDS.contains(col),
-                "column {col} is not in the update allowlist"
-            );
             if *col == "block_reason" {
                 block_reason_in_updates = true;
             }
