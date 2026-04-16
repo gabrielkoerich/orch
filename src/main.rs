@@ -294,6 +294,11 @@ enum Commands {
         /// Print raw NDJSON instead of human-readable output (deprecated: use `--formatted=false`)
         #[arg(long, hide = true)]
         raw: bool,
+        /// Read NDJSON from stdin and pipe through the NDJSON formatter.
+        /// Useful for piping tmux capture-pane output:
+        /// `tmux capture-pane -p -t session:pane | orch stream --pipe`
+        #[arg(long, default_value_t = false)]
+        pipe: bool,
     },
     /// Chat with the orch control session
     #[command(
@@ -813,8 +818,14 @@ async fn main() -> anyhow::Result<()> {
             task_id,
             formatted,
             raw,
+            pipe,
         } => {
             let formatted = if raw { false } else { formatted };
+            if pipe {
+                // Read NDJSON from stdin and format lines
+                cli::stream_pipe()?;
+                return Ok(());
+            }
             match task_id {
                 Some(id) => cli::stream_task(&id, formatted).await?,
                 None => cli::stream_all(formatted).await?,
