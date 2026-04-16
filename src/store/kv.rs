@@ -51,6 +51,28 @@ impl TaskStore {
         Ok(row.0 as u64)
     }
 
+    /// Insert a value only if the key is absent, then return the stored winner.
+    ///
+    /// Uses `INSERT OR IGNORE` so concurrent callers racing to create the same key
+    /// both converge on the same stored value — whoever lands first wins, and the
+    /// loser's value is silently discarded.  The unconditional `SELECT` afterwards
+    /// always reads back whichever value is actually in the store.
+    pub async fn kv_insert_if_absent(&self, key: &str, value: &str) -> anyhow::Result<String> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO kv (key, value, updated_at)
+             VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        let (stored,): (String,) = sqlx::query_as("SELECT value FROM kv WHERE key = ?")
+            .bind(key)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(stored)
+    }
+
     /// Delete a key from the KV store.
     pub async fn kv_delete(&self, key: &str) -> anyhow::Result<()> {
         sqlx::query("DELETE FROM kv WHERE key = ?")

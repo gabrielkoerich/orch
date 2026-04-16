@@ -561,16 +561,16 @@ pub async fn get_or_create_session_uuid(
     session_name: &str,
 ) -> Result<(String, bool)> {
     let key = session_uuid_key(session_name);
-    if let Some(existing) = store.kv_get(&key).await? {
-        return Ok((existing, false));
-    }
-    let uuid = Uuid::new_v4().to_string();
-    store
-        .kv_set(&key, &uuid)
+    let candidate = Uuid::new_v4().to_string();
+    let stored = store
+        .kv_insert_if_absent(&key, &candidate)
         .await
         .context("storing session UUID")?;
-    tracing::info!(session_name, uuid = %uuid, "created new chat session UUID");
-    Ok((uuid, true))
+    let is_new = stored == candidate;
+    if is_new {
+        tracing::info!(session_name, uuid = %stored, "created new chat session UUID");
+    }
+    Ok((stored, is_new))
 }
 
 /// Reset the session UUID so the next message starts a fresh conversation.

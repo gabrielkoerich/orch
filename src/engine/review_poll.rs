@@ -484,7 +484,7 @@ pub(crate) async fn review_open_prs(
         futures::future::join_all(collab_logins.iter().map(|u| gh.is_collaborator(repo, u))).await;
     let collab_cache: HashMap<String, Option<bool>> = collab_logins
         .into_iter()
-        .zip(collab_results.into_iter())
+        .zip(collab_results)
         .map(|(u, r)| match r {
             Ok(v) => (u, Some(v)),
             Err(e) => {
