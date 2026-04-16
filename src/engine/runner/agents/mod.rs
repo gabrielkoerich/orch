@@ -754,7 +754,7 @@ pub trait AgentRunner: Send + Sync {
 /// Get the appropriate AgentRunner implementation for an agent name.
 pub fn get_runner(agent_name: &str) -> Box<dyn AgentRunner> {
     // Agents that are known to be claude-compatible (same NDJSON output format)
-    const CLAUDE_COMPATIBLE_AGENTS: &[&str] = &["claude", "kimi", "minimax", "olm"];
+    const CLAUDE_COMPATIBLE_AGENTS: &[&str] = &["claude", "kimi", "minimax", "olm", "glm"];
 
     match agent_name {
         "claude" => Box::new(claude::ClaudeRunner::new(agent_name)),
@@ -1321,10 +1321,62 @@ mod tests {
         assert_eq!(get_runner("minimax").name(), "minimax");
         assert_eq!(get_runner("codex").name(), "codex");
         assert_eq!(get_runner("opencode").name(), "opencode");
-        // olm is claude-compatible and should return correct name
+        // olm and glm are claude-compatible and should return correct name
         assert_eq!(get_runner("olm").name(), "olm");
+        assert_eq!(get_runner("glm").name(), "glm");
         // Unknown falls back to claude-compatible
         assert_eq!(get_runner("unknown-agent").name(), "unknown-agent");
+    }
+
+    /// Regression test: known claude-compatible agents (including glm) must not
+    /// emit "unknown agent" warnings when get_runner() is called.
+    #[test]
+    fn get_runner_no_warning_for_claude_compatible_agents() {
+        use std::sync::{Arc, Mutex};
+        use tracing::Level;
+        use tracing_subscriber::util::SubscriberInitExt;
+        use tracing_subscriber::EnvFilter;
+
+        let output: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let output_clone = output.clone();
+
+        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for CaptureWriter {
+            type Writer = CaptureWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                CaptureWriter(self.0.clone())
+            }
+        }
+
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env().add_directive(Level::WARN.into()))
+            .with_writer(CaptureWriter(output_clone))
+            .with_ansi(false)
+            .finish()
+            .init();
+
+        for agent in &["claude", "kimi", "minimax", "olm", "glm"] {
+            get_runner(agent);
+        }
+
+        let captured = {
+            let guard = output.lock().unwrap();
+            String::from_utf8_lossy(&guard).to_string()
+        };
+        assert!(
+            !captured.contains("unknown agent"),
+            "known claude-compatible agents must not emit 'unknown agent' warnings; got: {}",
+            captured
+        );
     }
 
     #[test]
