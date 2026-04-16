@@ -135,6 +135,27 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Read NDJSON lines from stdin and format each line with `ndjson::format_line`.
+/// This is intended as a lightweight pipe mode so external tools (tmux capture)
+/// can reuse the CLI's NDJSON formatter without running the full orch service.
+pub fn stream_pipe() -> anyhow::Result<()> {
+    use std::io::{self, BufRead};
+
+    let stdin = io::stdin();
+    let handle = stdin.lock();
+    for line in handle.lines() {
+        let line = line.unwrap_or_default();
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(formatted) = ndjson::format_line(&line) {
+            println!("{}", formatted);
+        }
+    }
+
+    Ok(())
+}
+
 /// The orch review gate workflow template, loaded from the repo's own workflow file.
 /// Installed by `orch init` into `.github/workflows/orch-review.yml`.
 const ORCH_REVIEW_WORKFLOW: &str = include_str!("../../.github/workflows/orch-review.yml");
