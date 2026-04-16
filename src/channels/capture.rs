@@ -334,8 +334,20 @@ impl OutputBuffer {
             // Emitting full current_content would duplicate already-broadcast output.
             String::new()
         } else if self.last_len == current_len {
-            // Same-length overwrite (e.g. spinner/progress refresh) — resync with full content.
-            current_content.to_string()
+            // Same-length overwrite (e.g. spinner/progress refresh).
+            // Find the longest common prefix and return only the changed suffix.
+            let common_prefix = self
+                .last_content
+                .as_bytes()
+                .iter()
+                .zip(current_content.as_bytes())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let mut start = common_prefix;
+            while start < current_len && !current_content.is_char_boundary(start) {
+                start += 1;
+            }
+            current_content[start..].to_string()
         } else {
             let mut offset = self.last_len;
             while offset < current_len && !current_content.is_char_boundary(offset) {
@@ -471,6 +483,31 @@ mod tests {
         let result = buf.diff_and_update("bbbb");
 
         assert_eq!(result.as_deref(), Some("bbbb"));
+    }
+
+    #[test]
+    fn same_length_partial_change_broadcasts_only_changed_suffix() {
+        let mut buf = make_buffer();
+        // Simulate 200 lines of prior output followed by a spinner character.
+        let prior = format!("{}/", "line\n".repeat(50));
+        buf.diff_and_update(&prior);
+
+        // Spinner ticks: only last char changes, everything before is identical.
+        let updated = format!("{}-", "line\n".repeat(50));
+        assert_eq!(
+            prior.len(),
+            updated.len(),
+            "lengths must match for this test"
+        );
+
+        let result = buf.diff_and_update(&updated);
+
+        // Only the changed suffix ("-") should be returned, not the full content.
+        assert_eq!(
+            result.as_deref(),
+            Some("-"),
+            "should return only the changed suffix, not the full content"
+        );
     }
 
     #[test]
