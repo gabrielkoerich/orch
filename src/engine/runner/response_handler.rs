@@ -1380,7 +1380,6 @@ mod tests {
     fn classify_done_requires_pr_same_agent_blocks_immediately() {
         let status = classify_final_status(&DecisionInput {
             agent_status: "done",
-            is_external: true,
             requires_pr: true,
             no_code_reroutes: 1,
             max_reroutes: 3,
@@ -1418,14 +1417,12 @@ mod tests {
         assert_eq!(status, "blocked");
     }
 
-    /// Same agent on external no-pushed task → block immediately (not wait for max).
+    /// Same agent on external task requiring PR → block immediately (not wait for max).
     #[test]
     fn classify_done_external_no_pushed_same_agent_blocks_immediately() {
         let status = classify_final_status(&DecisionInput {
             agent_status: "done",
-            is_external: true,
-            has_pushed: false,
-            requires_pr: false,
+            requires_pr: true, // always true for external tasks with !has_pr + done
             no_code_reroutes: 0,
             max_reroutes: 3,
             is_same_agent: true,
