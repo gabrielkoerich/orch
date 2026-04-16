@@ -344,17 +344,33 @@ impl TaskRunner {
             .get_field(input.task_id, "last_error")
             .await
             .filter(|s| !s.is_empty());
-        let error = match input.error_override.clone().or_else(|| last_error.clone()) {
-            Some(e) if !e.is_empty() => e,
-            _ => match input.parse_result {
-                Ok(parsed) => parsed.response.error.clone().unwrap_or_default(),
-                Err(err) => err.to_string(),
-            },
-        };
-        let error = if error.is_empty() {
-            "no error info available".to_string()
+        let outcome = classify_run_outcome(
+            input.status,
+            input.parse_result,
+            input.push_failed,
+            input.budget_exceeded,
+        )
+        .to_string();
+
+        let error = if outcome == "success" {
+            String::new()
         } else {
-            error
+            let error = match input.error_override.as_deref().filter(|s| !s.is_empty()) {
+                Some(error_override) => error_override.to_string(),
+                None => match last_error {
+                    Some(last_error) => last_error,
+                    None => match input.parse_result {
+                        Ok(parsed) => parsed.response.error.clone().unwrap_or_default(),
+                        Err(err) => err.to_string(),
+                    },
+                },
+            };
+
+            if error.is_empty() {
+                "no error info available".to_string()
+            } else {
+                error
+            }
         };
 
         let total_cost_usd = match &self.store {
@@ -377,13 +393,7 @@ impl TaskRunner {
             stdout: input.raw_stdout.to_string(),
             stderr: input.raw_stderr.to_string(),
             parsed_response: serialize_parsed_response(input.parse_result, input.raw_stdout),
-            outcome: classify_run_outcome(
-                input.status,
-                input.parse_result,
-                input.push_failed,
-                input.budget_exceeded,
-            )
-            .to_string(),
+            outcome,
             error,
             input_tokens,
             output_tokens,
@@ -1464,12 +1474,35 @@ mod tests {
     use super::*;
     use crate::backends::{ExternalId, ExternalTask, Mention, Status};
     use crate::engine::runner::agents::patterns::safe_tail as safe_utf8_tail;
+    use crate::parser::AgentResponse;
+    use crate::store::{NewTask, TaskStore};
     use async_trait::async_trait;
+    use chrono::Utc;
     use once_cell::sync::Lazy;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    fn ok_parse_result(status: &str) -> Result<agents::ParsedResponse, agents::AgentError> {
+        Ok(agents::ParsedResponse {
+            response: AgentResponse {
+                status: status.to_string(),
+                summary: String::new(),
+                accomplished: vec![],
+                remaining: vec![],
+                files: vec![],
+                error: None,
+                input_tokens: None,
+                output_tokens: None,
+                learnings: vec![],
+                delegations: vec![],
+            },
+            input_tokens: None,
+            output_tokens: None,
+            duration_ms: None,
+        })
+    }
 
     // ── safe_utf8_tail ───────────────────────────────────────────────────────
 
@@ -1693,6 +1726,72 @@ mod tests {
             classify_run_error_type("billing account suspended"),
             "failed"
         );
+    }
+
+    #[tokio::test]
+    async fn build_run_audit_success_ignores_stale_last_error() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let task_id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .set_fields(
+                task_id,
+                &[("last_error", serde_json::json!("no error info available"))],
+            )
+            .await
+            .unwrap();
+
+        let runner = TaskRunner::new("owner/repo".to_string()).with_store(store);
+        let parse_result = ok_parse_result("done");
+        let started_at = Utc::now();
+        let audit = runner
+            .build_run_audit(RunAuditInput {
+                task_id: &task_id.to_string(),
+                status: "done",
+                parse_result: &parse_result,
+                raw_stdout: "",
+                raw_stderr: "",
+                started_at: &started_at,
+                error_override: None,
+                elapsed_secs: Some(1),
+                push_failed: false,
+                budget_exceeded: false,
+            })
+            .await;
+
+        assert_eq!(audit.outcome, "success");
+        assert!(audit.error.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_run_audit_non_success_uses_fallback_error_when_empty() {
+        let runner = TaskRunner::new("owner/repo".to_string());
+        let parse_result = ok_parse_result("new");
+        let started_at = Utc::now();
+        let audit = runner
+            .build_run_audit(RunAuditInput {
+                task_id: "1",
+                status: "new",
+                parse_result: &parse_result,
+                raw_stdout: "",
+                raw_stderr: "",
+                started_at: &started_at,
+                error_override: None,
+                elapsed_secs: Some(1),
+                push_failed: false,
+                budget_exceeded: false,
+            })
+            .await;
+
+        assert_eq!(audit.outcome, "failed");
+        assert_eq!(audit.error, "no error info available");
     }
 
     // ── resolve_project_dir ──────────────────────────────────────────────────

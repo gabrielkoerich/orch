@@ -759,6 +759,56 @@ async fn task_runs_lifecycle() {
 }
 
 #[tokio::test]
+async fn complete_run_stores_null_error_for_empty_string() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let task_id = store
+        .create(&NewTask {
+            repo: "owner/repo".to_string(),
+            origin: "internal".to_string(),
+            title: "Test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let run_id = store
+        .start_run(&StartRun {
+            task_id,
+            attempt: 1,
+            run_type: "agent",
+            agent: "claude",
+            model: "sonnet",
+            command: "claude -p ...",
+            prompt: "system prompt",
+        })
+        .await
+        .unwrap();
+
+    store
+        .complete_run(&CompleteRun {
+            run_id,
+            exit_code: Some(0),
+            stdout: "",
+            stderr: "",
+            parsed: "{}",
+            outcome: "success",
+            error: "",
+            tokens: RunTokenUsage::default(),
+        })
+        .await
+        .unwrap();
+
+    let stored_error: Option<String> =
+        sqlx::query_scalar("SELECT error FROM task_runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored_error, None);
+}
+
+#[tokio::test]
 async fn set_fields_updates_task() {
     let store = TaskStore::open_memory().await.unwrap();
 

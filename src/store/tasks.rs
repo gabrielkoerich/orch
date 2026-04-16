@@ -1667,7 +1667,7 @@ impl TaskStore {
         sqlx::query(
             "UPDATE task_runs SET
             exit_code = ?, stdout = ?, stderr = ?, parsed_response = ?,
-            outcome = ?, error = ?,
+            outcome = ?, error = NULLIF(?, ''),
             input_tokens = ?, output_tokens = ?, total_cost_usd = ?,
             duration_secs = ?,
             completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
