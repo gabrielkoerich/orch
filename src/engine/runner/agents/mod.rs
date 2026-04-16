@@ -557,6 +557,35 @@ pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
                 break;
             }
         }
+
+        // Past-tense action verb at sentence start indicates a completed action
+        // (e.g. "Added detect_rate_limit patterns", "Fixed the nil-pointer bug").
+        // Accept only for short sentences without hedging language to avoid matching
+        // prose like "I added a note that this might fail later".
+        let past_tense_actions = [
+            "added ",
+            "fixed ",
+            "updated ",
+            "implemented ",
+            "created ",
+            "removed ",
+            "changed ",
+            "deleted ",
+            "applied ",
+            "resolved ",
+            "patched ",
+            "refactored ",
+            "merged ",
+            "pushed ",
+            "deployed ",
+        ];
+        if !contains_hedge
+            && word_count <= 12
+            && past_tense_actions.iter().any(|v| s_lower.starts_with(v))
+        {
+            done_confident = true;
+            break;
+        }
     }
 
     let looks_done = !looks_negative && (explicit_done || done_confident);
@@ -575,8 +604,16 @@ pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
         "needs_review"
     } else if looks_done {
         "done"
-    } else {
+    } else if looks_negative {
+        // Agent explicitly stated the task is not complete — surface for human review.
         "needs_review"
+    } else {
+        // Text is ambiguous: no error signal, no completion signal, no explicit negation.
+        // This happens when agents emit exploratory or startup text (e.g. "Let's go!",
+        // "I need to find where...") and exit without producing structured JSON.
+        // Returning None causes callers to treat this as an invalid response and reroute
+        // the task rather than falsely advancing it to needs_review / in_review.
+        return None;
     };
 
     let summary_end = truncate_at_char_boundary(trimmed, 500);
@@ -1788,6 +1825,33 @@ mod tests {
         assert!(synthesize_response_from_text("   \n\t  ").is_none());
     }
 
+    // Regression: opencode/nemotron-3-super-free and similar models sometimes exit
+    // with code 0 after emitting only exploratory or startup text (e.g. "Let's go!",
+    // planning prose) without completing any work.  The synthesis must return None for
+    // such ambiguous text so the runner treats the run as an invalid response and
+    // reroutes the task instead of falsely advancing it to needs_review / in_review.
+    // (Issues #2404, #2653, #2666)
+    #[test]
+    fn synthesize_response_returns_none_for_ambiguous_startup_text() {
+        // Short greeting — not an error, not done, not an explicit negation.
+        assert!(
+            synthesize_response_from_text("Let's go!").is_none(),
+            "startup greeting must not synthesize as needs_review"
+        );
+        // Exploratory planning prose — agent is thinking out loud, not reporting completion.
+        assert!(
+            synthesize_response_from_text(
+                "I need to find where the stream command is implemented. \
+                 Looking at the CLI structure, it seems like the stream functionality \
+                 might be in the task module or another file. Let me check the CLI \
+                 command structure. First, let me look at the task module since stream \
+                 is related to tasks."
+            )
+            .is_none(),
+            "exploratory prose must not synthesize as needs_review"
+        );
+    }
+
     #[test]
     fn synthesize_response_does_not_mark_done_for_incomplete() {
         let response = synthesize_response_from_text("The task is incomplete").unwrap();
@@ -1861,16 +1925,21 @@ mod tests {
     fn synthesize_response_rejects_exploratory_prose() {
         // Regression test: ensure exploratory analysis that mentions "let me check"
         // or planning language is NOT synthesized into a "done" completion.
+        // With the ambiguous-text fix, this text correctly returns None (treated as
+        // an invalid response / reroute signal) rather than synthesizing needs_review.
+        // Crucially, it must NOT be marked "done".
         let exploratory = "I explored the codebase and found several .expect()/.unwrap() uses.\n\nLet me check each occurrence directly and run the tests to be sure. I may commit fixes afterwards.";
-        let response = synthesize_response_from_text(exploratory).unwrap();
-        assert_eq!(
-            response.status, "needs_review",
-            "Exploratory prose must not be auto-marked done"
-        );
-        assert!(
-            response.error.is_some(),
-            "Exploratory plain text should surface an error note"
-        );
+        match synthesize_response_from_text(exploratory) {
+            None => {
+                // Ambiguous exploratory prose correctly returns None — not marked done.
+            }
+            Some(resp) => {
+                assert_ne!(
+                    resp.status, "done",
+                    "Exploratory prose must not be auto-marked done"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2531,13 +2600,19 @@ mod tests {
 
     #[test]
     fn synthesize_no_false_positive_file_paths() {
-        // URLs and version strings should not appear in files list
+        // URLs and version strings should not appear in files list.
+        // The text is ambiguous (no error, no done signal, no explicit negation) so
+        // synthesize_response_from_text returns None — no file extraction happens.
         let text = "See https://example.com/foo.rs for details. Version 1.2.3 is fine.";
-        let resp = synthesize_response_from_text(text).unwrap();
-        assert!(
-            resp.files.is_empty(),
-            "expected no file paths extracted from URL text, got: {:?}",
-            resp.files
-        );
+        match synthesize_response_from_text(text) {
+            None => {} // Ambiguous text correctly returns None — no files extracted.
+            Some(resp) => {
+                assert!(
+                    resp.files.is_empty(),
+                    "expected no file paths extracted from URL text, got: {:?}",
+                    resp.files
+                );
+            }
+        }
     }
 }

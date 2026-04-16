@@ -311,26 +311,21 @@ pub fn spawn(
                                     tracing::warn!(task_id = %tid, err = %e, "failed to write needs_review_refires to store");
                                 }
 
-                                // Ensure approved PRs do not re-enter the review loop
-                                // when `auto_close_task_on_approval` is disabled.
-                                // The review gate normally marks Done when appropriate
-                                // but being defensive here prevents event-driven
-                                // re-dispatch races from leaving the task in InReview.
-                                let auto_close = crate::config::get("workflow.auto_close_task_on_approval")
-                                    .or_else(|_| crate::config::get("workflow.auto_close"))
-                                    .or_else(|_| crate::config::get("workflow.auto_merge"))
-                                    .map(|v| v.eq_ignore_ascii_case("true"))
-                                    .unwrap_or(false);
-
-                                if !auto_close {
-                                    tracing::info!(task_id = tid, "approval received (auto_close disabled) — marking task Done to avoid re-review");
-                                    if let Err(e) = task_manager_c
-                                        .update_task_status(&ExternalId(tid.clone()), Status::Done)
-                                        .await
-                                    {
-                                        tracing::warn!(task_id = %tid, err = %e, "failed to set Done after approval; task may still be InReview");
-                                    }
-                                }
+                                // When auto_close_task_on_approval is disabled the PR
+                                // merge is the actual completion signal — the review
+                                // agent approval only means the code looks good.  Marking
+                                // Done here (before the merge) causes tasks to appear
+                                // complete when no PR was ever merged (#2705).
+                                //
+                                // Leave the task in InReview.  The review_open_prs polling
+                                // loop detects `batch_data.merged == true` on the next tick
+                                // and transitions the task to Done correctly.  The review
+                                // agent will NOT be re-dispatched because the task never
+                                // returns to NeedsReview.
+                                tracing::info!(
+                                    task_id = tid,
+                                    "approval received (auto_close disabled) — leaving task in_review until PR is merged by a human"
+                                );
                                 ReviewOutcome::Ok
                             }
                             Ok(ReviewDecision::Rerouted) => {
