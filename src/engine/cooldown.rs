@@ -138,7 +138,7 @@ pub async fn init_cooldown_store(store: Arc<crate::store::TaskStore>) {
     match store.kv_list_prefix(KV_PREFIX).await {
         Ok(rows) => {
             let now = chrono::Utc::now().timestamp();
-            let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = cooldown_lock();
             let mut loaded = 0;
             for (key, value) in rows {
                 let cooldown_key = key.trim_start_matches(KV_PREFIX);
@@ -516,7 +516,7 @@ pub fn is_agent_in_cooldown(agent_name: &str) -> bool {
 
 /// Return the cooldown expiry timestamp for a key (agent or agent:model), if active.
 pub fn cooldown_until(key: &str) -> Option<i64> {
-    let map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+    let map = cooldown_lock();
     map.get(key).and_then(|entry| {
         let now = chrono::Utc::now().timestamp();
         if now < entry.cooldown_until {
@@ -529,7 +529,7 @@ pub fn cooldown_until(key: &str) -> Option<i64> {
 
 /// Return the reason string recorded when a cooldown was set, if the cooldown is still active.
 pub fn cooldown_reason(key: &str) -> Option<String> {
-    let map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+    let map = cooldown_lock();
     map.get(key).and_then(|entry| {
         let now = chrono::Utc::now().timestamp();
         if now < entry.cooldown_until {
@@ -546,7 +546,7 @@ pub fn cooldown_reason(key: &str) -> Option<String> {
 /// Expired entries are filtered out. Used by `orch cooldown list`.
 pub fn list_all_cooldowns() -> Vec<(String, i64, String)> {
     let now = chrono::Utc::now().timestamp();
-    let map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+    let map = cooldown_lock();
     let mut result: Vec<(String, i64, String)> = map
         .iter()
         .filter(|(_, entry)| now < entry.cooldown_until)
@@ -564,7 +564,7 @@ pub fn list_all_cooldowns() -> Vec<(String, i64, String)> {
 pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
     if key == "*" {
         let keys: Vec<String> = {
-            let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = cooldown_lock();
             let keys: Vec<String> = map.keys().cloned().collect();
             map.clear();
             keys
@@ -608,7 +608,7 @@ pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
         );
     } else {
         {
-            let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = cooldown_lock();
             map.remove(key);
         }
         let kv_key = format!("{KV_PREFIX}{key}");
@@ -638,7 +638,7 @@ pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
 /// for critical cooldowns that must survive a crash, or this function combined
 /// with a fire-and-forget `tokio::spawn` for non-critical short cooldowns.
 fn set_cooldown_in_memory(key: &str, cooldown_until: i64, reason: &str) -> bool {
-    let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = cooldown_lock();
     if let Some(existing) = map.get(key) {
         // Never shorten an existing cooldown. This prevents a short
         // retry window (e.g., generic rate limit) from overriding a longer
@@ -680,7 +680,7 @@ async fn set_cooldown_async(key: &str, cooldown_until: i64, reason: &str) -> boo
                 err = %e,
                 "failed to persist cooldown to KV store — rolling back in-memory entry"
             );
-            let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = cooldown_lock();
             // Only roll back if nothing has superseded our write.
             // A racing thread may have set a longer cooldown in the meantime;
             // removing unconditionally would erase that valid entry.
@@ -693,9 +693,41 @@ async fn set_cooldown_async(key: &str, cooldown_until: i64, reason: &str) -> boo
     true
 }
 
+/// Helper to acquire the cooldown map lock, logging and recovering on poison.
+fn cooldown_lock() -> std::sync::MutexGuard<'static, HashMap<String, CooldownEntry>> {
+    cooldowns().lock().unwrap_or_else(|e| {
+        tracing::error!("cooldown map lock poisoned — recovering with partial state; backoff and degraded-agent decisions may be incorrect");
+        e.into_inner()
+    })
+}
+
+/// Helper to acquire the degraded agents lock, logging and recovering on poison.
+fn degraded_agents_lock() -> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
+    degraded_agents().lock().unwrap_or_else(|e| {
+        tracing::error!("degraded agents lock poisoned — recovering with partial state; health check decisions may be incorrect");
+        e.into_inner()
+    })
+}
+
+/// Helper to acquire the GitHub 5xx timestamps lock, logging and recovering on poison.
+fn github_5xx_timestamps_lock() -> std::sync::MutexGuard<'static, Vec<i64>> {
+    github_5xx_timestamps().lock().unwrap_or_else(|e| {
+        tracing::error!("github 5xx timestamps lock poisoned — recovering with partial state; circuit breaker may operate incorrectly");
+        e.into_inner()
+    })
+}
+
+/// Helper to acquire the GitHub 5xx circuit open lock, logging and recovering on poison.
+fn github_5xx_circuit_open_lock() -> std::sync::MutexGuard<'static, Option<i64>> {
+    github_5xx_circuit_open().lock().unwrap_or_else(|e| {
+        tracing::error!("github 5xx circuit open lock poisoned — recovering with partial state; circuit breaker may operate incorrectly");
+        e.into_inner()
+    })
+}
+
 /// Check if a key is currently in cooldown.
 fn is_in_cooldown(key: &str) -> bool {
-    let map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+    let map = cooldown_lock();
     if let Some(entry) = map.get(key) {
         let now = chrono::Utc::now().timestamp();
         return now < entry.cooldown_until;
@@ -727,19 +759,19 @@ fn degraded_agents() -> &'static Mutex<std::collections::HashSet<String>> {
 /// exceeded the rate-limit/out_of_credits threshold within the configured
 /// lookback window.
 pub fn is_agent_degraded(agent: &str) -> bool {
-    let set = degraded_agents().lock().unwrap_or_else(|e| e.into_inner());
+    let set = degraded_agents_lock();
     set.contains(agent)
 }
 
 /// Mark an agent as degraded (called by [`refresh_degraded_agents`]).
 pub fn mark_agent_degraded(agent: &str) {
-    let mut set = degraded_agents().lock().unwrap_or_else(|e| e.into_inner());
+    let mut set = degraded_agents_lock();
     set.insert(agent.to_string());
 }
 
 /// Clear the degraded flag for an agent.
 pub fn clear_agent_degraded(agent: &str) {
-    let mut set = degraded_agents().lock().unwrap_or_else(|e| e.into_inner());
+    let mut set = degraded_agents_lock();
     set.remove(agent);
 }
 
@@ -833,7 +865,7 @@ pub async fn refresh_degraded_agents(
 
 /// Clear expired cooldowns from the in-memory map.
 pub fn clear_expired_cooldowns() {
-    let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = cooldown_lock();
     let now = chrono::Utc::now().timestamp();
     map.retain(|_key, entry| now < entry.cooldown_until);
 }
@@ -872,9 +904,7 @@ pub async fn record_github_5xx() {
     let window_start = now - GITHUB_5XX_WINDOW_SECS;
 
     let should_trip = {
-        let mut ts = github_5xx_timestamps()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut ts = github_5xx_timestamps_lock();
         ts.retain(|t| *t >= window_start);
         ts.push(now);
         ts.len() >= GITHUB_5XX_THRESHOLD
@@ -882,9 +912,7 @@ pub async fn record_github_5xx() {
 
     if should_trip {
         let cooldown_until = {
-            let mut open = github_5xx_circuit_open()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut open = github_5xx_circuit_open_lock();
             if open.is_none() {
                 let cd = now + GITHUB_5XX_COOLDOWN_SECS;
                 *open = Some(cd);
@@ -911,9 +939,7 @@ pub async fn record_github_5xx() {
             set_agent_cooldown("github:5xx", GITHUB_5XX_COOLDOWN_SECS as u64).await;
         }
         // Clear the sliding window after tripping so we don't re-trip immediately
-        let mut ts = github_5xx_timestamps()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut ts = github_5xx_timestamps_lock();
         ts.clear();
     }
 }
@@ -929,9 +955,7 @@ pub fn is_github_circuit_open() -> bool {
     // Check the dedicated in-memory circuit flag first. If present, honour it
     // and perform auto-recovery when it expires (logging once on close).
     {
-        let mut open = github_5xx_circuit_open()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut open = github_5xx_circuit_open_lock();
         if let Some(until) = *open {
             let now = chrono::Utc::now().timestamp();
             if now >= until {
@@ -949,9 +973,7 @@ pub fn is_github_circuit_open() -> bool {
     if let Some(until) = cooldown_until("github:5xx") {
         // Populate the dedicated in-memory flag so future checks and the
         // auto-recovery path go through the same code and logging.
-        let mut open = github_5xx_circuit_open()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut open = github_5xx_circuit_open_lock();
         if open.is_none() {
             *open = Some(until);
             let now = chrono::Utc::now().timestamp();
@@ -974,9 +996,7 @@ pub fn is_github_circuit_open() -> bool {
 pub fn github_circuit_remaining_secs() -> u64 {
     // Prefer the dedicated in-memory value when present.
     {
-        let open = github_5xx_circuit_open()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let open = github_5xx_circuit_open_lock();
         if let Some(until) = *open {
             let now = chrono::Utc::now().timestamp();
             if now < until {
@@ -1103,7 +1123,7 @@ mod tests {
             .unwrap();
 
         {
-            let mut map = cooldowns().lock().unwrap();
+            let mut map = cooldown_lock();
             map.clear();
         }
 
