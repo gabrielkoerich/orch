@@ -2770,6 +2770,9 @@ fn parse_link_next(headers: &header::HeaderMap) -> Option<String> {
             // Extract URL between < and >
             let start = part.find('<')? + 1;
             let end = part.find('>')?;
+            if start >= end {
+                return None;
+            }
             return Some(part[start..end].to_string());
         }
     }
@@ -3191,6 +3194,20 @@ mod tests {
         let mut headers = header::HeaderMap::new();
         // Malformed: no angle-bracket URL, just garbage
         headers.insert("link", "garbage; rel=\"next\"".parse().unwrap());
+        assert_eq!(parse_link_next(&headers), None);
+    }
+
+    #[test]
+    fn parse_link_next_none_when_gt_before_lt() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert("link", ">junk; rel=\"next\"; <url>".parse().unwrap());
+        assert_eq!(parse_link_next(&headers), None); // should not panic
+    }
+
+    #[test]
+    fn parse_link_next_none_when_empty_url() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert("link", "<>; rel=\"next\"".parse().unwrap());
         assert_eq!(parse_link_next(&headers), None);
     }
 
