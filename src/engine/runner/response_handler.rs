@@ -110,6 +110,11 @@ struct DecisionInput<'a> {
     /// True if the agent that just ran is the same as the one that produced
     /// the previous no-code result. Same-agent loops should be blocked immediately.
     is_same_agent: bool,
+    /// True when agent_status is "completed". Used to distinguish internal
+    /// completed tasks (mark done) from "done" tasks where the git ops pipeline
+    /// would have detected no-code reroutes. Pre-computed from agent_status
+    /// by the caller so this function stays pure.
+    is_completed_status: bool,
 }
 
 /// Determine the final task status from pre-computed state.
@@ -147,6 +152,28 @@ fn classify_final_status(input: &DecisionInput<'_>) -> String {
         // always caught by branch 6 (requires_pr = true for external tasks with
         // !has_pr and done status), so is_external can never be true here.
         // Internal tasks may legitimately produce no git-visible changes.
+        "done".to_string()
+    } else if input.is_completed_status && input.has_pr {
+        // Agent said "completed" and a PR was created — send to review.
+        "needs_review".to_string()
+    } else if input.is_completed_status && !input.has_pr && input.has_delegations {
+        // Agent said "completed" with delegations but no PR — blocked on children.
+        "blocked".to_string()
+    } else if input.is_completed_status && !input.has_pr && input.has_pushed {
+        // Agent said "completed", commits pushed but no PR — re-dispatch for PR.
+        "routed".to_string()
+    } else if input.is_completed_status && input.requires_pr {
+        // Agent said "completed" on external task requiring PR without a PR or pushes.
+        // Same-agent loop detection applies, then reroute or block.
+        if input.is_same_agent || input.no_code_reroutes >= input.max_reroutes as u64 {
+            "blocked".to_string()
+        } else {
+            "new".to_string()
+        }
+    } else if input.is_completed_status {
+        // Agent said "completed" on internal task — mark done.
+        // Git ops already ran and detected no commits, so this is a legitimate
+        // completion without code changes.
         "done".to_string()
     } else {
         input.agent_status.to_string()
@@ -1111,21 +1138,24 @@ pub async fn handle_success(
     ctx.set(&[("network_retries", serde_json::json!(0))]).await;
 
     // Auto-commit, push, create PR
-    let git =
-        if resp.status == "done" || resp.status == "in_progress" || resp.status == "needs_review" {
-            run_git_ops(
-                &ctx,
-                wt,
-                task_title,
-                &resp,
-                agent_name,
-                model_name,
-                new_attempts,
-            )
-            .await
-        } else {
-            GitOpsResult::default()
-        };
+    let git = if resp.status == "done"
+        || resp.status == "completed"
+        || resp.status == "in_progress"
+        || resp.status == "needs_review"
+    {
+        run_git_ops(
+            &ctx,
+            wt,
+            task_title,
+            &resp,
+            agent_name,
+            model_name,
+            new_attempts,
+        )
+        .await
+    } else {
+        GitOpsResult::default()
+    };
 
     // Store delegations in store if present (processed by run_with_context)
     if !resp.delegations.is_empty() {
@@ -1170,7 +1200,7 @@ pub async fn handle_success(
     // earlier chain conditions are false + done + requires_pr).
     let is_no_code_reroute = !push_state.is_workflow_scope_failure
         && !push_state.push_failed
-        && resp.status == "done"
+        && (resp.status == "done" || resp.status == "completed")
         && !has_delegations
         && !git.has_pushed
         && requires_pr;
@@ -1208,6 +1238,7 @@ pub async fn handle_success(
         no_code_reroutes,
         max_reroutes,
         is_same_agent,
+        is_completed_status: resp.status == "completed",
     });
     let final_status = final_status_owned.as_str();
 
@@ -1504,5 +1535,100 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(status, "blocked");
+    }
+
+    // ── "completed" status tests ────────────────────────────────────────────────
+
+    /// "completed" + has_pr → needs_review.
+    #[test]
+    fn classify_completed_with_pr_goes_to_needs_review() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "completed",
+            has_pr: true,
+            is_completed_status: true,
+            ..Default::default()
+        });
+        assert_eq!(status, "needs_review");
+    }
+
+    /// "completed" + delegations, no PR → blocked.
+    #[test]
+    fn classify_completed_with_delegations_no_pr_blocks() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "completed",
+            has_delegations: true,
+            is_completed_status: true,
+            ..Default::default()
+        });
+        assert_eq!(status, "blocked");
+    }
+
+    /// "completed" + pushed, no PR → routed for PR creation.
+    #[test]
+    fn classify_completed_pushed_no_pr_reroutes_for_pr_creation() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "completed",
+            has_pushed: true,
+            is_completed_status: true,
+            ..Default::default()
+        });
+        assert_eq!(status, "routed");
+    }
+
+    /// "completed" + external task requiring PR, under max reroutes → reroute.
+    #[test]
+    fn classify_completed_requires_pr_under_max_reroutes() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "completed",
+            requires_pr: true,
+            no_code_reroutes: 1,
+            max_reroutes: 3,
+            is_completed_status: true,
+            is_same_agent: false,
+            ..Default::default()
+        });
+        assert_eq!(status, "new");
+    }
+
+    /// "completed" + external task, at max reroutes → block.
+    #[test]
+    fn classify_completed_requires_pr_at_max_reroutes_blocks() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "completed",
+            requires_pr: true,
+            no_code_reroutes: 3,
+            max_reroutes: 3,
+            is_completed_status: true,
+            is_same_agent: false,
+            ..Default::default()
+        });
+        assert_eq!(status, "blocked");
+    }
+
+    /// "completed" + external task, same agent on no-code reroute → block immediately.
+    #[test]
+    fn classify_completed_same_agent_blocks_immediately() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "completed",
+            requires_pr: true,
+            no_code_reroutes: 1,
+            max_reroutes: 3,
+            is_completed_status: true,
+            is_same_agent: true,
+            ..Default::default()
+        });
+        assert_eq!(status, "blocked");
+    }
+
+    /// "completed" on internal task (no requires_pr) → mark done.
+    #[test]
+    fn classify_completed_internal_task_is_done() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "completed",
+            requires_pr: false,
+            is_completed_status: true,
+            ..Default::default()
+        });
+        assert_eq!(status, "done");
     }
 }
