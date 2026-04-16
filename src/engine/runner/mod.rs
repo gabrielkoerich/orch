@@ -2126,14 +2126,15 @@ mod tests {
 
     #[test]
     fn parse_success_output_no_tokens_when_ndjson_has_none() {
-        // Plain text without token metadata
-        let text = "This is just a plain text response, not JSON at all.";
+        // Plain text with an explicit completion signal but no token metadata.
+        // Uses "No open positions" which is in the explicit_done list.
+        let text = "No open positions, no trade executions, no conditions change.";
 
         let runner = FailingMockRunner;
         let result = parse_success_output("1551", "opencode", &runner, text);
 
-        // Should still synthesize a response, but without tokens
-        let parsed = result.expect("should synthesize response from text");
+        // Should synthesize a "done" response, but without tokens (no NDJSON envelope).
+        let parsed = result.expect("should synthesize response from explicit-done text");
         assert_eq!(parsed.input_tokens, None);
         assert_eq!(parsed.output_tokens, None);
     }

@@ -662,8 +662,11 @@ pub(crate) async fn review_open_prs(
             continue;
         }
 
-        // If the PR is fully approved but auto-close is disabled, advance the
-        // task state so it doesn't get repeatedly re-reviewed.
+        // If the PR is fully approved but auto-close is disabled, the task stays
+        // in_review waiting for a human to merge the PR.  We must NOT mark it Done
+        // here — the PR has not been merged, so the work is not complete.
+        // Once the human merges the PR, `already_merged` will be true on the next
+        // poll tick and the task will transition to Done correctly.
         if (all_approved || comment_approved)
             && !comment_changes_requested
             && !any_changes_requested
@@ -698,13 +701,15 @@ pub(crate) async fn review_open_prs(
                     }
                 }
 
-                tracing::info!(task_id, pr_number, comment_approved, "PR approved (auto_close disabled) — marking task done and leaving PR open for human merge");
-                if let Err(e) = task_manager
-                    .update_task_status(&task.id, Status::Done)
-                    .await
-                {
-                    tracing::warn!(task_id, err = %e, "failed to update task status to done");
-                }
+                // PR approved but not yet merged and auto_close is disabled —
+                // leave task in in_review so a human can merge it manually.
+                // Do NOT mark Done: the PR merge is the actual completion signal.
+                tracing::info!(
+                    task_id,
+                    pr_number,
+                    comment_approved,
+                    "PR approved (auto_close disabled) — leaving task in_review until PR is merged"
+                );
             }
             continue;
         }
