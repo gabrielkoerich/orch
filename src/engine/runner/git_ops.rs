@@ -405,11 +405,28 @@ pub async fn auto_commit(
         tracing::warn!(task_id, err = %stderr, "git commit failed");
         // Unstage files so has_changes() sees them as unstaged on the next
         // check and the workflow can retry the commit cleanly.
-        let _ = Command::new("git")
+        let restore = Command::new("git")
             .args(["restore", "--staged", "."])
             .current_dir(dir)
             .output_with_context()
             .await;
+        match restore {
+            Ok(o) if !o.status.success() => {
+                tracing::warn!(
+                    task_id,
+                    stderr = %String::from_utf8_lossy(&o.stderr),
+                    "git restore --staged failed after commit failure — files remain staged"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    task_id,
+                    error = %e,
+                    "git restore --staged command failed after commit failure — files remain staged"
+                );
+            }
+            _ => {}
+        }
         return Ok(false);
     }
 
