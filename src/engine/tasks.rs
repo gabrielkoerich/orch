@@ -328,6 +328,9 @@ impl TaskManager {
             // (empty could mean "no tasks with this status" OR "store not yet synced").
             if !external.is_empty() || store.has_external_tasks(&self.repo).await {
                 tasks.extend(external.into_iter().map(|t| store_task_to_external(&t)));
+            } else {
+                // Store not synced yet — fall back to backend for external tasks
+                tasks.extend(self.backend.list_by_status(status).await?);
             }
         } else {
             // No store - get from backend
