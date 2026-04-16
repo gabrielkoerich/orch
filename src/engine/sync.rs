@@ -619,12 +619,11 @@ async fn auto_unblock_blocked_tasks(
             continue;
         }
 
-        let id_fallback = task.id.to_string();
-        let dispatch_key = format!(
-            "{}/{}",
-            repo,
-            task.external_id.as_deref().unwrap_or(&id_fallback)
-        );
+        let task_id_str = task
+            .external_id
+            .clone()
+            .unwrap_or_else(|| format!("internal:{}", task.id));
+        let dispatch_key = format!("{}/{}", repo, task_id_str);
         if dispatching.contains_key(&dispatch_key) {
             continue;
         }
