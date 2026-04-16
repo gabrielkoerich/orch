@@ -102,7 +102,7 @@ fn classify_run_outcome(
         Ok(_)
             if matches!(
                 status,
-                "done" | "in_progress" | "in_review" | "blocked" | "needs_review"
+                "done" | "completed" | "in_progress" | "in_review" | "blocked" | "needs_review"
             ) =>
         {
             "success"
