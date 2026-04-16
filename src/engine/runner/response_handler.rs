@@ -100,13 +100,10 @@ struct DecisionInput<'a> {
     has_delegations: bool,
     /// Commits were pushed to the remote branch successfully.
     has_pushed: bool,
-    /// Whether this is an external task (has a GitHub issue).
-    is_external: bool,
     /// The task is external and requires a PR to be marked done.
     /// Always false for internal tasks.
     requires_pr: bool,
     /// Persistent no-code-reroute counter *after* this run's increment.
-    /// Only meaningful when `is_external` is `true` and `has_pushed` is `false`.
     no_code_reroutes: u64,
     /// Maximum no-code reroutes before blocking (from config).
     max_reroutes: u32,
@@ -146,26 +143,11 @@ fn classify_final_status(input: &DecisionInput<'_>) -> String {
             "new".to_string()
         }
     } else if input.agent_status == "done" && !input.has_pushed {
-        // Internal tasks and external non-code tasks may finish without a PR,
-        // but only when commits were actually pushed. If no commits were pushed
-        // (has_pushed=false), the task has no verifiable work product and must
-        // be re-routed — an agent claiming "nothing to do" without producing
-        // commits cannot close an issue.
-        if input.is_external {
-            // External task with no pushed commits: re-route up to max_reroutes,
-            // then block for human review.
-            // Same-agent loop detection: if this agent is the same as the one that
-            // produced the previous no-code result, block immediately (#2410, #2686).
-            if input.is_same_agent || input.no_code_reroutes >= input.max_reroutes as u64 {
-                "blocked".to_string()
-            } else {
-                "new".to_string()
-            }
-        } else {
-            // Internal task with no pushed commits: still mark done (internal
-            // tasks may legitimately produce no git-visible changes).
-            "done".to_string()
-        }
+        // Only internal tasks reach here — external done+!has_pr+!has_pushed is
+        // always caught by branch 6 (requires_pr = true for external tasks with
+        // !has_pr and done status), so is_external can never be true here.
+        // Internal tasks may legitimately produce no git-visible changes.
+        "done".to_string()
     } else {
         input.agent_status.to_string()
     }
@@ -1222,7 +1204,6 @@ pub async fn handle_success(
         has_pr: git.has_pr,
         has_delegations,
         has_pushed: git.has_pushed,
-        is_external,
         requires_pr,
         no_code_reroutes,
         max_reroutes,
@@ -1385,7 +1366,6 @@ mod tests {
     fn classify_done_requires_pr_under_max_reroutes() {
         let status = classify_final_status(&DecisionInput {
             agent_status: "done",
-            is_external: true,
             requires_pr: true,
             no_code_reroutes: 1,
             max_reroutes: 3,
@@ -1400,7 +1380,6 @@ mod tests {
     fn classify_done_requires_pr_same_agent_blocks_immediately() {
         let status = classify_final_status(&DecisionInput {
             agent_status: "done",
-            is_external: true,
             requires_pr: true,
             no_code_reroutes: 1,
             max_reroutes: 3,
@@ -1415,7 +1394,6 @@ mod tests {
     fn classify_done_requires_pr_at_max_reroutes_blocks() {
         let status = classify_final_status(&DecisionInput {
             agent_status: "done",
-            is_external: true,
             requires_pr: true,
             no_code_reroutes: 3,
             max_reroutes: 3,
@@ -1430,7 +1408,6 @@ mod tests {
     fn classify_done_requires_pr_exceeds_max_reroutes_blocks() {
         let status = classify_final_status(&DecisionInput {
             agent_status: "done",
-            is_external: true,
             requires_pr: true,
             no_code_reroutes: 5,
             max_reroutes: 3,
@@ -1440,14 +1417,12 @@ mod tests {
         assert_eq!(status, "blocked");
     }
 
-    /// Same agent on external no-pushed task → block immediately (not wait for max).
+    /// Same agent on external task requiring PR → block immediately (not wait for max).
     #[test]
     fn classify_done_external_no_pushed_same_agent_blocks_immediately() {
         let status = classify_final_status(&DecisionInput {
             agent_status: "done",
-            is_external: true,
-            has_pushed: false,
-            requires_pr: false,
+            requires_pr: true, // always true for external tasks with !has_pr + done
             no_code_reroutes: 0,
             max_reroutes: 3,
             is_same_agent: true,
@@ -1460,13 +1435,15 @@ mod tests {
     /// before the issue can be closed). This was the source of issue #1898 — an
     /// agent claiming "already implemented" without any code changes would
     /// previously match non-code keywords and close the issue falsely.
+    ///
+    /// External tasks with done+!has_pr+!has_pushed always have requires_pr=true
+    /// (see handle_success), so they are caught by branch 6, not branch 7.
     #[test]
     fn classify_done_external_no_pushed_commits_reroutes() {
         let status = classify_final_status(&DecisionInput {
             agent_status: "done",
-            is_external: true,
             has_pushed: false,
-            requires_pr: false, // even non-code tasks need pushed commits
+            requires_pr: true, // always true for external tasks with !has_pr + done
             no_code_reroutes: 0,
             max_reroutes: 3,
             is_same_agent: false,
@@ -1481,7 +1458,6 @@ mod tests {
     fn classify_done_internal_task_no_pr_is_done() {
         let status = classify_final_status(&DecisionInput {
             agent_status: "done",
-            is_external: false,
             has_pushed: false,
             requires_pr: false,
             ..Default::default()
