@@ -171,14 +171,13 @@ pub async fn init_cooldown_store(store: Arc<crate::store::TaskStore>) {
         if let Ok(cooldown_until) = raw.parse::<i64>() {
             let now = chrono::Utc::now().timestamp();
             if now < cooldown_until {
-                if let Ok(mut open) = github_5xx_circuit_open().lock() {
-                    *open = Some(cooldown_until);
-                    let remaining = cooldown_until - now;
-                    tracing::warn!(
-                        remaining_secs = remaining,
-                        "GitHub 5xx circuit breaker restored from KV (still open)"
-                    );
-                }
+                let mut open = github_5xx_circuit_open_lock();
+                *open = Some(cooldown_until);
+                let remaining = cooldown_until - now;
+                tracing::warn!(
+                    remaining_secs = remaining,
+                    "GitHub 5xx circuit breaker restored from KV (still open)"
+                );
             }
         }
     }
@@ -1938,7 +1937,7 @@ mod tests {
             // Also clear any generic cooldown map entry for the github 5xx
             // circuit so tests are isolated from other tests that may have
             // set the generic cooldown via set_agent_cooldown("github:5xx", ...).
-            let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = cooldown_lock();
             map.remove("github:5xx");
         }
 
@@ -1958,11 +1957,11 @@ mod tests {
     async fn github_circuit_trips_at_threshold() {
         // Reset circuit breaker state
         {
-            let mut open = github_5xx_circuit_open().lock().unwrap();
+            let mut open = github_5xx_circuit_open_lock();
             *open = None;
-            let mut ts = github_5xx_timestamps().lock().unwrap();
+            let mut ts = github_5xx_timestamps_lock();
             ts.clear();
-            let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = cooldown_lock();
             map.remove("github:5xx");
         }
 
@@ -1992,11 +1991,11 @@ mod tests {
     async fn github_circuit_cannot_double_trip() {
         // Reset circuit breaker state
         {
-            let mut open = github_5xx_circuit_open().lock().unwrap();
+            let mut open = github_5xx_circuit_open_lock();
             *open = None;
-            let mut ts = github_5xx_timestamps().lock().unwrap();
+            let mut ts = github_5xx_timestamps_lock();
             ts.clear();
-            let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = cooldown_lock();
             map.remove("github:5xx");
         }
 
@@ -2030,11 +2029,11 @@ mod tests {
     async fn github_circuit_recovers_after_cooldown() {
         // Reset circuit breaker state
         {
-            let mut open = github_5xx_circuit_open().lock().unwrap();
+            let mut open = github_5xx_circuit_open_lock();
             *open = None;
-            let mut ts = github_5xx_timestamps().lock().unwrap();
+            let mut ts = github_5xx_timestamps_lock();
             ts.clear();
-            let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = cooldown_lock();
             map.remove("github:5xx");
         }
 
@@ -2055,11 +2054,11 @@ mod tests {
     async fn github_circuit_sliding_window_ages_out() {
         // Reset circuit breaker state
         {
-            let mut open = github_5xx_circuit_open().lock().unwrap();
+            let mut open = github_5xx_circuit_open_lock();
             *open = None;
-            let mut ts = github_5xx_timestamps().lock().unwrap();
+            let mut ts = github_5xx_timestamps_lock();
             ts.clear();
-            let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = cooldown_lock();
             map.remove("github:5xx");
         }
 
