@@ -261,22 +261,42 @@ pub(crate) async fn stash_rebase_restore(
             let stderr = String::from_utf8_lossy(&o.stderr).to_string();
             tracing::warn!(dir = %dir.display(), target_ref, err = %stderr, "rebase failed");
             if opts.abort_on_failure {
-                let _ = Command::new("git")
+                let abort = Command::new("git")
                     .args(["rebase", "--abort"])
                     .current_dir(dir)
                     .output_with_context()
                     .await;
+                match abort {
+                    Err(e) => {
+                        tracing::warn!(dir = %dir.display(), error = %e, "git rebase --abort failed — worktree may be in inconsistent state")
+                    }
+                    Ok(o) if !o.status.success() => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        tracing::warn!(dir = %dir.display(), stderr = %stderr, "git rebase --abort returned non-zero — worktree may be in inconsistent state");
+                    }
+                    _ => {}
+                }
             }
             restore_stash_by_hash(dir, stash_ref.as_deref()).await;
             Ok(RebaseOutcome::Failed(stderr))
         }
         Err(e) => {
             if opts.abort_on_failure {
-                let _ = Command::new("git")
+                let abort = Command::new("git")
                     .args(["rebase", "--abort"])
                     .current_dir(dir)
                     .output_with_context()
                     .await;
+                match abort {
+                    Err(e) => {
+                        tracing::warn!(dir = %dir.display(), error = %e, "git rebase --abort failed — worktree may be in inconsistent state")
+                    }
+                    Ok(o) if !o.status.success() => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        tracing::warn!(dir = %dir.display(), stderr = %stderr, "git rebase --abort returned non-zero — worktree may be in inconsistent state");
+                    }
+                    _ => {}
+                }
             }
             restore_stash_by_hash(dir, stash_ref.as_deref()).await;
             Err(e)
