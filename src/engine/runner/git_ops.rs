@@ -307,11 +307,37 @@ async fn restore_stash_by_hash(dir: &Path, stash_hash: Option<&str>) {
             if list_out.status.success() {
                 let list_str = String::from_utf8_lossy(&list_out.stdout);
                 if let Some(stash_ref) = find_stash_ref_by_hash(&list_str, stash_hash) {
-                    let _ = Command::new("git")
+                    match Command::new("git")
                         .args(["stash", "drop", &stash_ref])
                         .current_dir(dir)
                         .output_with_context()
-                        .await;
+                        .await
+                    {
+                        Ok(drop_out) if !drop_out.status.success() => {
+                            let stderr = String::from_utf8_lossy(&drop_out.stderr);
+                            tracing::warn!(
+                                dir = %dir.display(),
+                                stash_ref = %stash_ref,
+                                err = %stderr,
+                                "stash drop failed after apply — entry may remain on stack"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                dir = %dir.display(),
+                                stash_ref = %stash_ref,
+                                error = %e,
+                                "stash drop command failed after apply — entry may remain on stack"
+                            );
+                        }
+                        _ => {}
+                    }
+                } else {
+                    tracing::warn!(
+                        dir = %dir.display(),
+                        stash = %stash_hash,
+                        "stash applied but could not find ref by hash — stash entry may be orphaned on stack"
+                    );
                 }
             }
         }
