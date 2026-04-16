@@ -110,6 +110,9 @@ struct DecisionInput<'a> {
     no_code_reroutes: u64,
     /// Maximum no-code reroutes before blocking (from config).
     max_reroutes: u32,
+    /// True if the agent that just ran is the same as the one that produced
+    /// the previous no-code result. Same-agent loops should be blocked immediately.
+    is_same_agent: bool,
 }
 
 /// Determine the final task status from pre-computed state.
@@ -134,7 +137,10 @@ fn classify_final_status(input: &DecisionInput<'_>) -> String {
     } else if input.agent_status == "done" && !input.has_pr && input.has_pushed {
         "routed".to_string()
     } else if input.agent_status == "done" && input.requires_pr {
-        if input.no_code_reroutes >= input.max_reroutes as u64 {
+        // Same-agent loop detection: if this agent is the same as the one that
+        // produced the previous no-code result, block immediately (#2410, #2686).
+        // Otherwise, block if max reroutes exhausted, else reroute.
+        if input.is_same_agent || input.no_code_reroutes >= input.max_reroutes as u64 {
             "blocked".to_string()
         } else {
             "new".to_string()
@@ -148,7 +154,9 @@ fn classify_final_status(input: &DecisionInput<'_>) -> String {
         if input.is_external {
             // External task with no pushed commits: re-route up to max_reroutes,
             // then block for human review.
-            if input.no_code_reroutes >= input.max_reroutes as u64 {
+            // Same-agent loop detection: if this agent is the same as the one that
+            // produced the previous no-code result, block immediately (#2410, #2686).
+            if input.is_same_agent || input.no_code_reroutes >= input.max_reroutes as u64 {
                 "blocked".to_string()
             } else {
                 "new".to_string()
@@ -874,70 +882,67 @@ async fn apply_post_decision_effects(
             "agent done, commits pushed, but PR creation failed — re-dispatching as routed"
         );
     } else if is_no_code_reroute {
-        // Detect same-agent loop: if the router selects the same agent that just
-        // produced a no-code result, block immediately instead of letting it
-        // run again into the same unchanged worktree state (#2410).
-        let prev_no_code_agent = ctx
-            .get_task()
-            .await
-            .map(|t| t.no_code_last_agent.clone())
-            .unwrap_or_default();
+        // Record which agent produced this no-code result so the same-agent
+        // detection on the next run can prevent loop-backs (#2410, #2686).
+        // Also clear agent/model to force re-routing.
 
-        let is_same_agent = !prev_no_code_agent.is_empty() && prev_no_code_agent == agent_name;
+        if final_status == "blocked" {
+            // final_status is "blocked" either because max_reroutes was exhausted
+            // or because is_same_agent was detected (both cases are handled by
+            // classify_final_status). Log accordingly.
+            let prev_no_code_agent = ctx
+                .get_task()
+                .await
+                .map(|t| t.no_code_last_agent.clone())
+                .unwrap_or_default();
+            let is_same_agent = !prev_no_code_agent.is_empty() && prev_no_code_agent == agent_name;
 
-        // Block if we've hit max reroutes OR if the same agent would be selected again.
-        let should_block = final_status == "blocked" || is_same_agent;
-
-        if should_block {
-            tracing::error!(
-                task_id = ctx.task_id,
-                no_code_reroutes,
-                max_reroutes,
-                is_same_agent,
-                agent = %agent_name,
-                "blocking no-code reroute: {}",
-                if is_same_agent {
-                    format!(
-                        "same agent {} would be selected again (prev: {prev_no_code_agent})",
-                        agent_name
-                    )
-                } else {
-                    format!(
-                        "reached max reroute attempts ({}/{}) for no-code-result",
-                        no_code_reroutes, max_reroutes
-                    )
-                }
-            );
-        }
-
-        let msg = if should_block {
-            if is_same_agent {
+            let msg = if is_same_agent {
+                tracing::error!(
+                    task_id = ctx.task_id,
+                    agent = %agent_name,
+                    "blocking same-agent no-code loop: agent {} would be selected again",
+                    agent_name
+                );
                 format!(
                     "agent {} completed without code changes twice — same-agent loop detected, blocking for human review",
                     agent_name
                 )
             } else {
+                tracing::error!(
+                    task_id = ctx.task_id,
+                    no_code_reroutes,
+                    max_reroutes,
+                    "blocking no-code reroute: reached max reroute attempts ({}/{}) for no-code-result",
+                    no_code_reroutes, max_reroutes
+                );
                 format!(
                     "agent completed without code changes after {}/{} reroute attempts on external task requiring PR",
                     no_code_reroutes, max_reroutes
                 )
-            }
+            };
+            ctx.set(&[("last_error", serde_json::json!(msg))]).await;
         } else {
-            "agent completed without code changes on external task requiring PR".to_string()
-        };
-
-        let mut fields: Vec<(&str, serde_json::Value)> =
-            vec![("last_error", serde_json::json!(msg))];
+            // Rerouting — no blocking error to record yet.
+            ctx.set(&[(
+                "last_error",
+                serde_json::json!(
+                    "agent completed without code changes on external task requiring PR"
+                ),
+            )])
+            .await;
+        }
 
         // Always record which agent produced this no-code result so the router can
         // skip it on the next attempt. Also clear agent/model to force re-routing
-        // (the router will pick a fresh agent, possibly the same one, which will be
-        // caught by the same-agent check on the next round).
-        fields.push(("no_code_last_agent", serde_json::json!(agent_name)));
-        fields.push(("agent", serde_json::json!(null)));
-        fields.push(("model", serde_json::json!(null)));
-
-        ctx.set(&fields).await;
+        // (the router will pick a fresh agent, which will be caught by the same-agent
+        // check on the next round if it's the same agent).
+        ctx.set(&[
+            ("no_code_last_agent", serde_json::json!(agent_name)),
+            ("agent", serde_json::json!(null)),
+            ("model", serde_json::json!(null)),
+        ])
+        .await;
     } else if resp_status == "done" && !has_pr && is_external {
         // External task with non-code labels (e.g. documentation, research) —
         // allowed to be marked done without a PR.
@@ -1191,6 +1196,21 @@ pub async fn handle_success(
     let no_code_reroutes =
         detect_no_code_reroutes(&ctx, is_no_code_reroute, new_attempts, max_reroutes).await;
 
+    // ── Detect same-agent loop ───────────────────────────────────────────────
+    //
+    // If this is a no-code reroute and the agent is the same as the one that
+    // produced the previous no-code result, flag it for blocking (#2410, #2686).
+    let is_same_agent = if is_no_code_reroute {
+        let prev_no_code_agent = ctx
+            .get_task()
+            .await
+            .map(|t| t.no_code_last_agent.clone())
+            .unwrap_or_default();
+        !prev_no_code_agent.is_empty() && prev_no_code_agent == agent_name
+    } else {
+        false
+    };
+
     // ── Pure status decision ─────────────────────────────────────────────────
 
     let final_status_owned = classify_final_status(&DecisionInput {
@@ -1206,6 +1226,7 @@ pub async fn handle_success(
         requires_pr,
         no_code_reroutes,
         max_reroutes,
+        is_same_agent,
     });
     let final_status = final_status_owned.as_str();
 
@@ -1368,9 +1389,25 @@ mod tests {
             requires_pr: true,
             no_code_reroutes: 1,
             max_reroutes: 3,
+            is_same_agent: false,
             ..Default::default()
         });
         assert_eq!(status, "new");
+    }
+
+    /// Branch 6a edge: same agent on no-code reroute → block immediately.
+    #[test]
+    fn classify_done_requires_pr_same_agent_blocks_immediately() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "done",
+            is_external: true,
+            requires_pr: true,
+            no_code_reroutes: 1,
+            max_reroutes: 3,
+            is_same_agent: true, // Same agent would be selected again
+            ..Default::default()
+        });
+        assert_eq!(status, "blocked");
     }
 
     /// Branch 6b: done + requires_pr, at max reroutes → block.
@@ -1382,6 +1419,7 @@ mod tests {
             requires_pr: true,
             no_code_reroutes: 3,
             max_reroutes: 3,
+            is_same_agent: false,
             ..Default::default()
         });
         assert_eq!(status, "blocked");
@@ -1396,6 +1434,23 @@ mod tests {
             requires_pr: true,
             no_code_reroutes: 5,
             max_reroutes: 3,
+            is_same_agent: false,
+            ..Default::default()
+        });
+        assert_eq!(status, "blocked");
+    }
+
+    /// Same agent on external no-pushed task → block immediately (not wait for max).
+    #[test]
+    fn classify_done_external_no_pushed_same_agent_blocks_immediately() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "done",
+            is_external: true,
+            has_pushed: false,
+            requires_pr: false,
+            no_code_reroutes: 0,
+            max_reroutes: 3,
+            is_same_agent: true,
             ..Default::default()
         });
         assert_eq!(status, "blocked");
@@ -1414,6 +1469,7 @@ mod tests {
             requires_pr: false, // even non-code tasks need pushed commits
             no_code_reroutes: 0,
             max_reroutes: 3,
+            is_same_agent: false,
             ..Default::default()
         });
         assert_eq!(status, "new");
