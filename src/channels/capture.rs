@@ -337,9 +337,9 @@ impl OutputBuffer {
             // Same-length overwrite (e.g. spinner/progress refresh) — resync with full content.
             current_content.to_string()
         } else {
-            let mut offset = self.last_len.min(current_len);
-            while offset > 0 && !current_content.is_char_boundary(offset) {
-                offset -= 1;
+            let mut offset = self.last_len;
+            while offset < current_len && !current_content.is_char_boundary(offset) {
+                offset += 1;
             }
             String::from_utf8_lossy(&current_bytes[offset..]).to_string()
         };
