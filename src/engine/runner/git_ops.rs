@@ -267,7 +267,9 @@ pub(crate) async fn stash_rebase_restore(
                     .output_with_context()
                     .await;
                 match abort {
-                    Err(e) => tracing::warn!(dir = %dir.display(), error = %e, "git rebase --abort failed — worktree may be in inconsistent state"),
+                    Err(e) => {
+                        tracing::warn!(dir = %dir.display(), error = %e, "git rebase --abort failed — worktree may be in inconsistent state")
+                    }
                     Ok(o) if !o.status.success() => {
                         let stderr = String::from_utf8_lossy(&o.stderr);
                         tracing::warn!(dir = %dir.display(), stderr = %stderr, "git rebase --abort returned non-zero — worktree may be in inconsistent state");
@@ -286,7 +288,9 @@ pub(crate) async fn stash_rebase_restore(
                     .output_with_context()
                     .await;
                 match abort {
-                    Err(e) => tracing::warn!(dir = %dir.display(), error = %e, "git rebase --abort failed — worktree may be in inconsistent state"),
+                    Err(e) => {
+                        tracing::warn!(dir = %dir.display(), error = %e, "git rebase --abort failed — worktree may be in inconsistent state")
+                    }
                     Ok(o) if !o.status.success() => {
                         let stderr = String::from_utf8_lossy(&o.stderr);
                         tracing::warn!(dir = %dir.display(), stderr = %stderr, "git rebase --abort returned non-zero — worktree may be in inconsistent state");
