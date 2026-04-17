@@ -615,7 +615,26 @@ pub(crate) async fn tick_recover_stuck_tasks(
         }
         let resolved_store_id = match cached_store_id {
             Some(id) => Some(id),
-            None => store.resolve_task_id(repo, &task.id.0).await.ok().flatten(),
+            None => match store.resolve_task_id(repo, &task.id.0).await {
+                Ok(Some(id)) => Some(id),
+                Ok(None) => {
+                    tracing::warn!(
+                        task_id = %task.id.0,
+                        repo,
+                        "resolve_task_id returned None during stuck-task recovery"
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::error!(
+                        task_id = %task.id.0,
+                        repo,
+                        error = %e,
+                        "resolve_task_id failed during stuck-task recovery"
+                    );
+                    None
+                }
+            },
         };
         if let Some(store_id) = resolved_store_id {
             store_set_by_id(
@@ -788,7 +807,26 @@ pub(crate) async fn tick_recover_stuck_tasks(
         // (same reset that external tasks perform).
         let resolved_store_id = match cached_store_id {
             Some(id) => Some(id),
-            None => store.resolve_task_id(repo, &task_id).await.ok().flatten(),
+            None => match store.resolve_task_id(repo, &task_id).await {
+                Ok(Some(id)) => Some(id),
+                Ok(None) => {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        repo,
+                        "resolve_task_id returned None during stuck internal-task recovery"
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::error!(
+                        task_id = %task_id,
+                        repo,
+                        error = %e,
+                        "resolve_task_id failed during stuck internal-task recovery"
+                    );
+                    None
+                }
+            },
         };
         if let Some(store_id) = resolved_store_id {
             store_set_by_id(
