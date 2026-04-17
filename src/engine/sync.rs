@@ -104,7 +104,7 @@ async fn try_kv_set_prefer_store(
 }
 
 use super::cleanup::{check_merged_prs, cleanup_done_worktrees};
-use super::commands::{parse_command, validate_and_run_command, CommandOutcome};
+use super::commands::{parse_command, validate_and_run_command, CommandOutcome, CommandStoreOps};
 use super::review_poll::review_open_prs;
 use super::EngineConfig;
 use crate::github::types::extract_issue_number_from_url;
@@ -486,7 +486,8 @@ async fn handle_slash_command(
         }
     };
 
-    let store_opt = store.cloned();
+    let store_opt: Option<Arc<dyn CommandStoreOps>> =
+        store.map(|s| Arc::clone(s) as Arc<dyn CommandStoreOps>);
     let outcome = validate_and_run_command(
         backend,
         gh,
@@ -1480,7 +1481,8 @@ async fn scan_comments(
             }
 
             CommentAction::ExecuteCommand { command, issue_num } => {
-                let store_opt = store.cloned();
+                let store_opt: Option<Arc<dyn CommandStoreOps>> =
+                    store.map(|s| Arc::clone(s) as Arc<dyn CommandStoreOps>);
                 let _outcome = validate_and_run_command(
                     backend,
                     &gh,

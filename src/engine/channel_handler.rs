@@ -14,7 +14,7 @@ use crate::channels::routing::ChannelRouter;
 use crate::channels::transport::conversation_key;
 use crate::channels::transport::{MessageRoute, Transport};
 use crate::channels::{ChannelRegistry, IncomingMessage, OutgoingMessage};
-use crate::engine::commands::{execute_command, parse_command};
+use crate::engine::commands::{execute_command, parse_command, CommandStoreOps};
 use crate::engine::tasks::{CreateTaskRequest, Task, TaskType};
 use crate::github::http::GhHttp;
 use crate::store::TaskStatus;
@@ -398,9 +398,19 @@ pub(super) async fn handle_channel_message(
                             }
                         };
                         let ext_id = ExternalId(task_id.to_string());
-                        let result =
-                            execute_command(backend, &gh, repo, &ext_id, &cmd, store, task_manager)
-                                .await;
+                        let store_ops: Option<Arc<dyn CommandStoreOps>> = store
+                            .as_ref()
+                            .map(|s| Arc::clone(s) as Arc<dyn CommandStoreOps>);
+                        let result = execute_command(
+                            backend,
+                            &gh,
+                            repo,
+                            &ext_id,
+                            &cmd,
+                            &store_ops,
+                            task_manager,
+                        )
+                        .await;
                         let reply = match result {
                             Ok(r) => r,
                             Err(e) => format!("Command `{cmd}` failed: {e}"),
