@@ -319,32 +319,32 @@ pub async fn assemble_context(store: &TaskStore, session_id: &str) -> Result<Cha
     Ok(ChatContext { system, state })
 }
 
-/// Get the current model spec from KV, defaulting to `"sonnet"` on `"claude"`.
-pub async fn get_model(store: &TaskStore) -> String {
-    store
+/// Get the current model spec from KV, defaulting to `"sonnet"` when the key is absent.
+/// Returns an error if the store read fails.
+pub async fn get_model(store: &TaskStore) -> Result<String> {
+    Ok(store
         .kv_get("control:model")
         .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "sonnet".to_string())
+        .context("reading control:model from store")?
+        .unwrap_or_else(|| "sonnet".to_string()))
 }
 
-/// Get the current agent from KV, defaulting to `"claude"`.
-pub async fn get_agent(store: &TaskStore) -> String {
-    store
+/// Get the current agent from KV, defaulting to `"claude"` when the key is absent.
+/// Returns an error if the store read fails.
+pub async fn get_agent(store: &TaskStore) -> Result<String> {
+    Ok(store
         .kv_get("control:agent")
         .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "claude".to_string())
+        .context("reading control:agent from store")?
+        .unwrap_or_else(|| "claude".to_string()))
 }
 
 /// Get the current control session spec from KV.
-pub async fn get_current_spec(store: &TaskStore) -> ModelSpec {
-    ModelSpec {
-        agent: get_agent(store).await,
-        model: get_model(store).await,
-    }
+pub async fn get_current_spec(store: &TaskStore) -> Result<ModelSpec> {
+    Ok(ModelSpec {
+        agent: get_agent(store).await?,
+        model: get_model(store).await?,
+    })
 }
 
 /// Set the current model in KV.
@@ -396,7 +396,7 @@ async fn handle_control_command(
     command: ControlCommand,
 ) -> Result<String> {
     match command {
-        ControlCommand::Model(None) => Ok(format_current_spec(&get_current_spec(store).await)),
+        ControlCommand::Model(None) => Ok(format_current_spec(&get_current_spec(store).await?)),
         ControlCommand::Model(Some(new_spec)) => {
             let spec = parse_model_spec(&new_spec);
             validate_model(&spec).await?;
@@ -405,7 +405,7 @@ async fn handle_control_command(
             reset_session_uuid(store, session_id).await?;
             Ok(format_switched_spec(&spec))
         }
-        ControlCommand::Agent(None) => Ok(format_current_spec(&get_current_spec(store).await)),
+        ControlCommand::Agent(None) => Ok(format_current_spec(&get_current_spec(store).await?)),
         ControlCommand::Agent(Some(agent)) => {
             validate_agent(&agent)?;
             let spec = set_agent_spec(store, &agent).await?;
@@ -696,8 +696,8 @@ pub async fn send_message(
     let ctx = assemble_context(store, session_id).await?;
 
     // Resolve model and agent from KV
-    let model = get_model(store).await;
-    let agent = get_agent(store).await;
+    let model = get_model(store).await?;
+    let agent = get_agent(store).await?;
 
     // Prepend live state to user message so the LLM sees it directly
     let full_message = format!("{}\n\n---\n\n{}", ctx.state, message);
@@ -982,15 +982,15 @@ mod tests {
     #[tokio::test]
     async fn send_message_model_switch() {
         let store = TaskStore::open_memory().await.unwrap();
-        let model = get_model(&store).await;
+        let model = get_model(&store).await.unwrap();
         assert_eq!(model, "sonnet");
 
         // /model with explicit agent:model — will fail validation (no binary in test)
         // so test parse_model_spec + set_model_spec directly
         let spec = parse_model_spec("minimax:sonnet");
         set_model_spec(&store, &spec).await.unwrap();
-        assert_eq!(get_model(&store).await, "sonnet");
-        assert_eq!(get_agent(&store).await, "minimax");
+        assert_eq!(get_model(&store).await.unwrap(), "sonnet");
+        assert_eq!(get_agent(&store).await.unwrap(), "minimax");
     }
 
     #[tokio::test]
@@ -1020,8 +1020,8 @@ mod tests {
         let spec = set_agent_spec(&store, "codex").await.unwrap();
         assert_eq!(spec.agent, "codex");
         assert_eq!(spec.model, "gpt-4o");
-        assert_eq!(get_agent(&store).await, "codex");
-        assert_eq!(get_model(&store).await, "gpt-4o");
+        assert_eq!(get_agent(&store).await.unwrap(), "codex");
+        assert_eq!(get_model(&store).await.unwrap(), "gpt-4o");
     }
 
     #[test]
@@ -1070,8 +1070,8 @@ mod tests {
         let spec = set_agent_spec(&store, "codex").await.unwrap();
         assert_eq!(spec.agent, "codex");
         assert_eq!(spec.model, "gpt-4o");
-        assert_eq!(get_agent(&store).await, "codex");
-        assert_eq!(get_model(&store).await, "gpt-4o");
+        assert_eq!(get_agent(&store).await.unwrap(), "codex");
+        assert_eq!(get_model(&store).await.unwrap(), "gpt-4o");
     }
 
     #[tokio::test]
@@ -1126,7 +1126,7 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("unknown agent"));
 
         // Verify the original agent is still set (not overwritten)
-        assert_eq!(get_agent(&store).await, "claude");
+        assert_eq!(get_agent(&store).await.unwrap(), "claude");
     }
 
     #[test]

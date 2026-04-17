@@ -7,8 +7,8 @@ use std::io::{self, BufRead, Write};
 /// Interactive REPL mode — reads from stdin, sends to control session.
 pub async fn interactive(session_id: &str) -> anyhow::Result<()> {
     let store = crate::cli::init_store().await?;
-    let model = control::get_model(&store).await;
-    let agent = control::get_agent(&store).await;
+    let model = control::get_model(&store).await?;
+    let agent = control::get_agent(&store).await?;
 
     let session_label = if session_id == TaskStore::DEFAULT_SESSION {
         String::new()
@@ -161,8 +161,8 @@ pub async fn stats(session_id: &str) -> anyhow::Result<()> {
     let store = crate::cli::init_store().await?;
 
     let summary = store.get_session_cost_summary(session_id).await?;
-    let fallback_model = control::get_model(&store).await;
-    let fallback_agent = control::get_agent(&store).await;
+    let fallback_model = control::get_model(&store).await?;
+    let fallback_agent = control::get_agent(&store).await?;
     let current_model = summary.primary_model.clone().unwrap_or(fallback_model);
     let current_agent = summary.primary_agent.clone().unwrap_or(fallback_agent);
 
