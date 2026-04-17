@@ -19,24 +19,25 @@ const PROVIDER_RETURNED_ERROR_MODEL_COOLDOWN_SECS: u64 = 4 * 60 * 60;
 /// Returns the original message if no api_retry JSON is found.
 fn summarize_rate_limit_error(raw_output: &str) -> String {
     // Find the last api_retry JSON object in the output
-    if let Some(last_json) = raw_output
-        .lines()
-        .rev()
-        .find(|line| line.contains("\"type\":\"system\"") && line.contains("\"subtype\":\"api_retry\""))
-    {
+    if let Some(last_json) = raw_output.lines().rev().find(|line| {
+        line.contains("\"type\":\"system\"") && line.contains("\"subtype\":\"api_retry\"")
+    }) {
         // Extract key fields from the JSON
         let error_status = extract_json_field(last_json, "\"error_status\":")
             .unwrap_or_else(|| "unknown".to_string());
-        let attempt = extract_json_field(last_json, "\"attempt\":")
-            .unwrap_or_else(|| "unknown".to_string());
-        let retry_delay_ms = extract_json_field(last_json, "\"retry_delay_ms\":")
-            .unwrap_or_else(|| "0".to_string());
+        let attempt =
+            extract_json_field(last_json, "\"attempt\":").unwrap_or_else(|| "unknown".to_string());
+        let retry_delay_ms =
+            extract_json_field(last_json, "\"retry_delay_ms\":").unwrap_or_else(|| "0".to_string());
 
         // Convert delay to seconds for readability
         let retry_delay_s = retry_delay_ms.parse::<f64>().unwrap_or(0.0) / 1000.0;
         let retry_delay_s = retry_delay_s as u64;
 
-        format!("status={} after {} attempts (last delay {}s)", error_status, attempt, retry_delay_s)
+        format!(
+            "status={} after {} attempts (last delay {}s)",
+            error_status, attempt, retry_delay_s
+        )
     } else {
         // Fall back to original behavior if no api_retry JSON found
         raw_output.to_string()
@@ -45,28 +46,30 @@ fn summarize_rate_limit_error(raw_output: &str) -> String {
 
 /// Extracts a JSON field value as a string, handling both quoted strings and raw numbers.
 fn extract_json_field(json: &str, field: &str) -> Option<String> {
-    json.find(field)
-        .and_then(|start| {
-            let value_start = start + field.len();
-            let value_str = &json[value_start..];
+    json.find(field).and_then(|start| {
+        let value_start = start + field.len();
+        let value_str = &json[value_start..];
 
-            // Handle quoted strings
-            if value_str.starts_with('"') {
-                value_str
-                    .strip_prefix('"')
-                    .and_then(|s| s.strip_suffix('"'))
-                    .and_then(|s| s.strip_suffix(','))
-                    .map(|s| s.to_string())
-            }
-            // Handle raw numbers (integers or floats)
-            else {
-                let end = value_str
-                    .find(|c: char| !c.is_ascii_digit() && c != '.')
-                    .unwrap_or(value_str.len());
-                let num_str = &value_str[..end];
-                num_str.strip_suffix(',').map(|s| s.to_string()).or_else(|| Some(num_str.to_string()))
-            }
-        })
+        // Handle quoted strings
+        if value_str.starts_with('"') {
+            value_str
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .and_then(|s| s.strip_suffix(','))
+                .map(|s| s.to_string())
+        }
+        // Handle raw numbers (integers or floats)
+        else {
+            let end = value_str
+                .find(|c: char| !c.is_ascii_digit() && c != '.')
+                .unwrap_or(value_str.len());
+            let num_str = &value_str[..end];
+            num_str
+                .strip_suffix(',')
+                .map(|s| s.to_string())
+                .or_else(|| Some(num_str.to_string()))
+        }
+    })
 }
 
 
@@ -211,7 +214,10 @@ pub async fn handle_error(
             }
             (
                 response::RetryableError::UsageLimit,
-                format!("{agent_name} rate limit: {}", summarize_rate_limit_error(&message)),
+                format!(
+                    "{agent_name} rate limit: {}",
+                    summarize_rate_limit_error(message)
+                ),
             )
         }
         agents::AgentError::Auth { message } => {
@@ -478,20 +484,20 @@ pub async fn handle_error(
                     return Ok(result);
                 }
             }
-            
+
             // Handle JSON cost telemetry in stdout for non-zero exits
             // If the message looks like Claude's cost JSON, replace with a generic message
             let error_message = if *exit_code != 0 && message.contains("\"costUSD\":") {
                 // Extract just the essential info: exit code and that cost telemetry was present
-                format!("{} exited with non-zero status (cost telemetry in stdout, no error message)", agent_name)
+                format!(
+                    "{} exited with non-zero status (cost telemetry in stdout, no error message)",
+                    agent_name
+                )
             } else {
                 format!("{agent_name} exit {exit_code}: {message}")
             };
-            
-            (
-                response::RetryableError::Failed,
-                error_message,
-            )
+
+            (response::RetryableError::Failed, error_message)
         }
     };
 

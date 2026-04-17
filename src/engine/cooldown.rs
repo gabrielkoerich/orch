@@ -29,12 +29,6 @@ pub const BACKOFF_BASE_SECS: i64 = 5 * 60;
 /// Maximum backoff for generic agent/model failures: 4 hours.
 pub const BACKOFF_MAX_SECS: i64 = 4 * 60 * 60;
 
-/// Base backoff for persistent model failures (silent exit/provider errors): 4 hours.
-pub const PERSISTENT_MODEL_BACKOFF_BASE_SECS: i64 = 4 * 60 * 60;
-
-/// Maximum backoff for persistent model failures: 7 days.
-pub const PERSISTENT_MODEL_BACKOFF_MAX_SECS: i64 = 7 * 24 * 60 * 60;
-
 /// Base backoff for credit exhaustion (out_of_credits): 1 hour.
 pub const CREDIT_BACKOFF_BASE_SECS: i64 = 60 * 60;
 
