@@ -344,28 +344,25 @@ fn classify_failure_from_run(run: &crate::store::TaskRun) -> Option<FailureCateg
 ///
 /// - If the mention is on a PR, look up the task that owns that PR via `pr_number`.
 /// - If the mention is on an issue, look up the task by external_id (issue number).
+///
+/// Returns:
+/// - `Ok(Some(id))` — parent found
+/// - `Ok(None)` — no matching parent (genuine miss, e.g. unknown issue/PR)
+/// - `Err(_)` — lookup failed (DB error); caller should defer/retry
 async fn resolve_mention_parent_id(
     store: &crate::store::TaskStore,
     repo: &str,
     issue_num: &str,
     is_pr: bool,
-) -> Option<i64> {
+) -> anyhow::Result<Option<i64>> {
     if is_pr {
         if let Ok(pr_num) = issue_num.parse::<i32>() {
-            store
-                .resolve_id_by_pr_number(repo, pr_num)
-                .await
-                .ok()
-                .flatten()
+            store.resolve_id_by_pr_number(repo, pr_num).await
         } else {
-            None
+            Ok(None)
         }
     } else {
-        store
-            .resolve_id_by_external(repo, issue_num)
-            .await
-            .ok()
-            .flatten()
+        store.resolve_id_by_external(repo, issue_num).await
     }
 }
 
@@ -461,6 +458,12 @@ pub(crate) fn classify_comment(
 /// the cursor on success; logs a warning and returns early if the mention has
 /// no valid issue URL.
 #[allow(clippy::too_many_arguments)]
+/// Execute a slash command mentioned by `@orch` on a comment.
+///
+/// Returns:
+/// - `Ok(())` — command processed (mention task recorded if applicable)
+/// - `Err(_)` — DB lookup failed for parent_id; caller must NOT advance cursor
+///   so this mention is retried on the next sync
 async fn handle_slash_command(
     backend: &Arc<dyn ExternalBackend>,
     store: Option<&Arc<TaskStore>>,
@@ -470,7 +473,7 @@ async fn handle_slash_command(
     mention: &Mention,
     command: &crate::engine::commands::OwnerCommand,
     last_success_ts: &mut Option<String>,
-) {
+) -> anyhow::Result<()> {
     let issue_num = match mention
         .issue_url
         .as_deref()
@@ -479,7 +482,7 @@ async fn handle_slash_command(
         Some(num) => num,
         None => {
             tracing::warn!(comment_id = %mention.id, "slash command without valid issue number");
-            return;
+            return Ok(());
         }
     };
 
@@ -507,13 +510,24 @@ async fn handle_slash_command(
             // not executed but the mention is marked as processed — acceptable vs
             // an infinite retry loop.
             advance_cursor(last_success_ts, &mention.created_at);
-            return;
+            return Ok(());
         }
     };
 
-    // Record a sentinel task for the mention (with correct parent_id)
+    // Record a sentinel task for the mention (with correct parent_id).
+    // On DB lookup failure, defer so the mention can be retried on next sync.
     if let Some(s) = store {
-        let parent_id = resolve_mention_parent_id(s, repo, &issue_num, is_pr).await;
+        let parent_id = match resolve_mention_parent_id(s, repo, &issue_num, is_pr).await {
+            Ok(parent_id) => parent_id,
+            Err(e) => {
+                tracing::warn!(
+                    comment_id = %mention.id,
+                    err = %e,
+                    "deferring mention task due to parent lookup failure"
+                );
+                return Err(e);
+            }
+        };
 
         let (title, body) = match &outcome {
             CommandOutcome::NotOpen { .. } => (
@@ -548,12 +562,13 @@ async fn handle_slash_command(
             ),
             CommandOutcome::FetchFailed | CommandOutcome::CollaboratorCheckFailed => {
                 tracing::debug!("skipping mention task record due to earlier command failure");
-                return;
+                return Ok(());
             }
         };
 
         record_mention_task(s, repo, mention, &title, &body, parent_id, last_success_ts).await;
     }
+    Ok(())
 }
 
 fn auto_unblock_cooldown_elapsed(count: i32, last_at: &str) -> bool {
@@ -1489,6 +1504,8 @@ async fn scan_comments(
                     // reaction was never posted. Retry on next tick once the network
                     // glitch has resolved.
                 } else {
+                    // Parent lookup failure propagates via `?` — scan_comments returns early
+                    // without advancing the cursor so the mention is retried on next sync.
                     handle_slash_command(
                         backend,
                         store,
@@ -1499,7 +1516,7 @@ async fn scan_comments(
                         &command,
                         &mut last_success_ts,
                     )
-                    .await;
+                    .await?;
                 }
             }
 
@@ -1538,10 +1555,26 @@ async fn scan_comments(
                     };
 
                     if let Some(s) = store {
-                        let parent_id = if let Some(ref num) = issue_num {
-                            resolve_mention_parent_id(s, repo, num, is_pr).await
-                        } else {
-                            None
+                        // On DB lookup failure, do NOT record the mention task or advance
+                        // the cursor — the mention will be retried on next sync.
+                        let parent_id = match issue_num {
+                            Some(ref num) => {
+                                match resolve_mention_parent_id(s, repo, num, is_pr).await {
+                                    Ok(id) => id,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            mention_id = %comment.id,
+                                            err = %e,
+                                            "deferring mention task due to parent lookup failure"
+                                        );
+                                        return Err(anyhow::anyhow!(
+                                            "deferring mention {} due to parent lookup failure",
+                                            comment.id
+                                        ));
+                                    }
+                                }
+                            }
+                            None => None,
                         };
                         record_mention_task(
                             s,
