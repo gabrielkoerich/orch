@@ -51,22 +51,30 @@ impl std::fmt::Display for OwnerCommand {
 /// closes only a backtick fence and a tilde fence closes only a tilde fence —
 /// mismatched closers are ignored.
 pub fn parse_command(body: &str) -> Option<OwnerCommand> {
-    // Track the opening fence character so mismatched closers are ignored.
-    // Per CommonMark: a backtick fence closes only a backtick fence, and a
-    // tilde fence closes only a tilde fence.
-    let mut fence_char: Option<char> = None;
+    // Track the opening fence (character, length) so mismatched or shorter
+    // closers are ignored. Per CommonMark: a backtick fence closes only a
+    // backtick fence, a tilde fence closes only a tilde fence, and the closing
+    // fence must be at least as long as the opening fence.
+    let mut fence_state: Option<(char, usize)> = None;
     for line in body.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            let ch = trimmed.chars().next().unwrap_or('\0');
-            match fence_char {
-                None => fence_char = Some(ch),
-                Some(c) if c == ch => fence_char = None,
-                Some(_) => {} // mismatched closer — ignore
+        let fence_ch = if trimmed.starts_with("```") {
+            Some('`')
+        } else if trimmed.starts_with("~~~") {
+            Some('~')
+        } else {
+            None
+        };
+        if let Some(ch) = fence_ch {
+            let run_len = trimmed.chars().take_while(|&c| c == ch).count();
+            match fence_state {
+                None => fence_state = Some((ch, run_len)),
+                Some((c, len)) if c == ch && run_len >= len => fence_state = None,
+                Some(_) => {} // mismatched closer or shorter — ignore
             }
             continue;
         }
-        if fence_char.is_some() {
+        if fence_state.is_some() {
             continue;
         }
         let command_text = trimmed
@@ -625,6 +633,41 @@ mod tests {
         // Fence opened with ``` and closed with ``` (tilde in between is ignored)
         // Command after the real closing fence should be found
         let body = "```\n/retry\n~~~\n/retry\n```\n/close";
+        assert_eq!(parse_command(body), Some(OwnerCommand::Close));
+    }
+
+    #[test]
+    fn parse_shorter_backtick_does_not_close_longer_backtick_fence() {
+        // ```` opens a 4-backtick fence; ``` (3 backticks) must NOT close it
+        let body = "````\n/retry\n```\n/retry\n````";
+        assert_eq!(parse_command(body), None);
+    }
+
+    #[test]
+    fn parse_longer_backtick_closes_shorter_backtick_fence() {
+        // ``` opens a 3-backtick fence; ```` (4 backticks) IS allowed to close it
+        let body = "```\n/retry\n````\n/close";
+        assert_eq!(parse_command(body), Some(OwnerCommand::Close));
+    }
+
+    #[test]
+    fn parse_shorter_tilde_does_not_close_longer_tilde_fence() {
+        // ~~~~ opens a 4-tilde fence; ~~~ (3 tildes) must NOT close it
+        let body = "~~~~\n/close\n~~~\n/close\n~~~~";
+        assert_eq!(parse_command(body), None);
+    }
+
+    #[test]
+    fn parse_longer_tilde_closes_shorter_tilde_fence() {
+        // ~~~ opens a 3-tilde fence; ~~~~ (4 tildes) IS allowed to close it
+        let body = "~~~\n/close\n~~~~\n/retry";
+        assert_eq!(parse_command(body), Some(OwnerCommand::Retry));
+    }
+
+    #[test]
+    fn parse_command_after_longer_backtick_fence_properly_closed() {
+        // ```` fence closed with ```` — command after should be found
+        let body = "````markdown\n/retry\n```\n/retry\n````\n/close";
         assert_eq!(parse_command(body), Some(OwnerCommand::Close));
     }
 
