@@ -29,6 +29,12 @@ pub const BACKOFF_BASE_SECS: i64 = 5 * 60;
 /// Maximum backoff for generic agent/model failures: 4 hours.
 pub const BACKOFF_MAX_SECS: i64 = 4 * 60 * 60;
 
+/// Base backoff for persistent model failures (silent exit/provider errors): 4 hours.
+pub const PERSISTENT_MODEL_BACKOFF_BASE_SECS: i64 = 4 * 60 * 60;
+
+/// Maximum backoff for persistent model failures: 7 days.
+pub const PERSISTENT_MODEL_BACKOFF_MAX_SECS: i64 = 7 * 24 * 60 * 60;
+
 /// Base backoff for credit exhaustion (out_of_credits): 1 hour.
 pub const CREDIT_BACKOFF_BASE_SECS: i64 = 60 * 60;
 
@@ -414,6 +420,24 @@ pub async fn record_model_failure(agent_name: &str, model: &str) {
     let cooldown_until =
         chrono::Utc::now().timestamp() + compute_backoff(count, base, BACKOFF_MAX_SECS);
     set_cooldown_async(&key, cooldown_until, "model_error").await;
+}
+
+/// Record a persistent model-specific failure and apply longer exponential backoff.
+///
+/// Used for failure modes that are commonly broken for long periods (for example
+/// silent exit-0 or opaque provider errors). Starts at 4h and escalates with
+/// the generic backoff formula up to 7 days.
+pub async fn record_persistent_model_failure(agent_name: &str, model: &str) {
+    let key = format!("{agent_name}:{model}");
+    let store_opt = cooldown_store().lock().await.clone();
+    let count = read_and_increment_failure_count(&store_opt, &key).await;
+    let cooldown_secs = compute_backoff(
+        count,
+        PERSISTENT_MODEL_BACKOFF_BASE_SECS,
+        PERSISTENT_MODEL_BACKOFF_MAX_SECS,
+    );
+    let cooldown_until = chrono::Utc::now().timestamp() + cooldown_secs;
+    set_cooldown_async(&key, cooldown_until, "persistent_model_error").await;
 }
 
 /// Set a model cooldown with a custom duration (in seconds).
@@ -1156,6 +1180,44 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
         // Should be in the future (cooldown_until, not failed_at)
         assert!(ts > now, "persisted timestamp should be in the future");
+    }
+
+    #[tokio::test]
+    async fn record_persistent_model_failure_escalates_and_increments_failure_count() {
+        let store = test_store().await;
+        *cooldown_store().lock().await = Some(store.clone());
+
+        let agent = "testagent_persistent";
+        let model = "testmodel_persistent";
+        let key = format!("{agent}:{model}");
+
+        // First failure -> base 4h.
+        record_persistent_model_failure(agent, model).await;
+        let now = chrono::Utc::now().timestamp();
+        let first_until = cooldown_until(&key).expect("first cooldown should exist");
+        let first_remaining = first_until.saturating_sub(now);
+        assert!(
+            first_remaining >= PERSISTENT_MODEL_BACKOFF_BASE_SECS - 5,
+            "first persistent model cooldown should be ~4h, got {first_remaining}s"
+        );
+
+        // Second failure -> 12h (3x growth).
+        record_persistent_model_failure(agent, model).await;
+        let now2 = chrono::Utc::now().timestamp();
+        let second_until = cooldown_until(&key).expect("second cooldown should exist");
+        let second_remaining = second_until.saturating_sub(now2);
+        assert!(
+            second_remaining >= (PERSISTENT_MODEL_BACKOFF_BASE_SECS * 3) - 5,
+            "second persistent model cooldown should be ~12h, got {second_remaining}s"
+        );
+
+        let count_key = format!("{FAILURE_COUNT_PREFIX}{agent}:{model}");
+        let stored_count = store
+            .kv_get(&count_key)
+            .await
+            .expect("kv read should succeed")
+            .expect("failure count should be written");
+        assert_eq!(stored_count, "2");
     }
 
     #[test]
