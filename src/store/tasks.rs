@@ -941,16 +941,15 @@ impl TaskStore {
     }
 
     /// Check whether the store has any external tasks for a repo.
-    pub async fn has_external_tasks(&self, repo: &str) -> bool {
-        sqlx::query_scalar::<_, i32>(
+    pub async fn has_external_tasks(&self, repo: &str) -> anyhow::Result<bool> {
+        let has_external = sqlx::query_scalar::<_, i32>(
             "SELECT 1 FROM tasks WHERE repo = ? AND origin != 'internal' LIMIT 1",
         )
         .bind(repo)
         .fetch_optional(&self.pool)
-        .await
-        .ok()
-        .flatten()
-        .is_some()
+        .await?
+        .is_some();
+        Ok(has_external)
     }
 
     /// Return a set of external IDs for all external tasks in a repo.

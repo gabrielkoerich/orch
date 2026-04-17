@@ -4480,7 +4480,7 @@ async fn cost_summary_returns_three_periods() {
 #[tokio::test]
 async fn has_external_tasks_returns_false_for_empty_repo() {
     let store = TaskStore::open_memory().await.unwrap();
-    assert!(!store.has_external_tasks("owner/repo").await);
+    assert!(!store.has_external_tasks("owner/repo").await.unwrap());
 }
 
 #[tokio::test]
@@ -4499,9 +4499,9 @@ async fn has_external_tasks_returns_true_after_external_insert() {
         })
         .await
         .unwrap();
-    assert!(store.has_external_tasks("owner/repo").await);
+    assert!(store.has_external_tasks("owner/repo").await.unwrap());
     // Different repo should still be false
-    assert!(!store.has_external_tasks("other/repo").await);
+    assert!(!store.has_external_tasks("other/repo").await.unwrap());
 }
 
 #[tokio::test]
@@ -4512,7 +4512,7 @@ async fn has_external_tasks_ignores_internal_rows() {
         .await
         .unwrap();
 
-    assert!(!store.has_external_tasks("owner/repo").await);
+    assert!(!store.has_external_tasks("owner/repo").await.unwrap());
 
     store
         .upsert_external(&UpsertExternal {
@@ -4528,7 +4528,7 @@ async fn has_external_tasks_ignores_internal_rows() {
         .await
         .unwrap();
 
-    assert!(store.has_external_tasks("owner/repo").await);
+    assert!(store.has_external_tasks("owner/repo").await.unwrap());
 }
 
 #[tokio::test]

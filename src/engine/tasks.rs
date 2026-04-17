@@ -255,11 +255,31 @@ impl TaskManager {
             let store_tasks = if let Some(ref store) = self.store {
                 if is_all {
                     let tasks = store.list_all(&self.repo).await?;
-                    has_external_in_store = store.has_external_tasks(&self.repo).await;
+                    has_external_in_store = match store.has_external_tasks(&self.repo).await {
+                        Ok(has_external) => has_external,
+                        Err(e) => {
+                            tracing::warn!(
+                                repo = %self.repo,
+                                error = %e,
+                                "failed to check external task sentinel; using store-only list path"
+                            );
+                            true
+                        }
+                    };
                     tasks
                 } else {
                     let tasks = store.list_active(&self.repo).await?;
-                    has_external_in_store = store.has_external_tasks(&self.repo).await;
+                    has_external_in_store = match store.has_external_tasks(&self.repo).await {
+                        Ok(has_external) => has_external,
+                        Err(e) => {
+                            tracing::warn!(
+                                repo = %self.repo,
+                                error = %e,
+                                "failed to check external task sentinel; using store-only list path"
+                            );
+                            true
+                        }
+                    };
                     tasks
                 }
             } else {
@@ -309,7 +329,23 @@ impl TaskManager {
             let external = store.list_external_by_status(&self.repo, db_status).await?;
             // Use the fetched results when non-empty; only check the sentinel when empty
             // (empty could mean "no tasks with this status" OR "store not yet synced").
-            if !external.is_empty() || store.has_external_tasks(&self.repo).await {
+            let has_external_in_store = if external.is_empty() {
+                match store.has_external_tasks(&self.repo).await {
+                    Ok(has_external) => has_external,
+                    Err(e) => {
+                        tracing::warn!(
+                            repo = %self.repo,
+                            status = ?status,
+                            error = %e,
+                            "failed to check external task sentinel; skipping backend fallback"
+                        );
+                        true
+                    }
+                }
+            } else {
+                true
+            };
+            if has_external_in_store {
                 let external: Vec<ExternalTask> =
                     external.iter().map(store_task_to_external).collect();
                 return Ok(external);
@@ -331,7 +367,23 @@ impl TaskManager {
             let external = store.list_external_by_status(&self.repo, db_status).await?;
             // Use the fetched results when non-empty; only check the sentinel when empty
             // (empty could mean "no tasks with this status" OR "store not yet synced").
-            if !external.is_empty() || store.has_external_tasks(&self.repo).await {
+            let has_external_in_store = if external.is_empty() {
+                match store.has_external_tasks(&self.repo).await {
+                    Ok(has_external) => has_external,
+                    Err(e) => {
+                        tracing::warn!(
+                            repo = %self.repo,
+                            status = ?status,
+                            error = %e,
+                            "failed to check external task sentinel; skipping backend fallback"
+                        );
+                        true
+                    }
+                }
+            } else {
+                true
+            };
+            if has_external_in_store {
                 tasks.extend(external.into_iter().map(|t| store_task_to_external(&t)));
             } else {
                 // Store not synced yet — fall back to backend for external tasks
@@ -365,7 +417,22 @@ impl TaskManager {
             // the store has external tasks and we can skip the has_external_tasks query.
             let has_external_new = all_new.iter().any(|t| t.origin != "internal");
             let tasks: Vec<ExternalTask> = all_new.iter().map(store_task_to_external).collect();
-            if has_external_new || store.has_external_tasks(&self.repo).await {
+            let has_external_in_store = if has_external_new {
+                true
+            } else {
+                match store.has_external_tasks(&self.repo).await {
+                    Ok(has_external) => has_external,
+                    Err(e) => {
+                        tracing::warn!(
+                            repo = %self.repo,
+                            error = %e,
+                            "failed to check external task sentinel; skipping backend fallback"
+                        );
+                        true
+                    }
+                }
+            };
+            if has_external_in_store {
                 return Ok(tasks);
             }
         }
