@@ -123,7 +123,7 @@ pub async fn execute_command(
             let task = backend.get_task(task_id).await?;
             for label in &task.labels {
                 if label.starts_with("agent:") {
-                    backend.remove_label(task_id, label).await.ok();
+                    backend.remove_label(task_id, label).await?;
                 }
             }
             // Reset store state (attempts + all failure counters) so the task starts fresh
@@ -139,7 +139,7 @@ pub async fn execute_command(
             let task = backend.get_task(task_id).await?;
             for label in &task.labels {
                 if label.starts_with("agent:") {
-                    backend.remove_label(task_id, label).await.ok();
+                    backend.remove_label(task_id, label).await?;
                 }
             }
             // Reset store state (attempts + all failure counters) so the task starts fresh
@@ -172,7 +172,8 @@ pub async fn execute_command(
 
         OwnerCommand::Block(reason) => {
             if let Some(ref store) = store {
-                if let Ok(Some(store_id)) = store.resolve_task_id(repo, &task_id.0).await {
+                let store_id = store.resolve_task_id(repo, &task_id.0).await?;
+                if let Some(store_id) = store_id {
                     store.set_block_reason(store_id, reason.as_deref()).await?;
                 }
             }
@@ -187,7 +188,8 @@ pub async fn execute_command(
 
         OwnerCommand::Unblock => {
             if let Some(ref store) = store {
-                if let Ok(Some(store_id)) = store.resolve_task_id(repo, &task_id.0).await {
+                let store_id = store.resolve_task_id(repo, &task_id.0).await?;
+                if let Some(store_id) = store_id {
                     store.set_block_reason(store_id, None).await?;
                 }
             }
@@ -310,6 +312,7 @@ mod tests {
 
     struct MockBackend {
         task: ExternalTask,
+        fail_remove_label: bool,
     }
 
     impl MockBackend {
@@ -326,7 +329,20 @@ mod tests {
                     updated_at: "2026-01-01T00:00:00Z".to_string(),
                     url: "".to_string(),
                 },
+                fail_remove_label: false,
             }
+        }
+
+        fn with_labels(id: &str, labels: Vec<String>) -> Self {
+            let mut b = Self::new(id);
+            b.task.labels = labels;
+            b
+        }
+
+        fn failing_remove_label(id: &str, labels: Vec<String>) -> Self {
+            let mut b = Self::with_labels(id, labels);
+            b.fail_remove_label = true;
+            b
         }
     }
 
@@ -365,7 +381,10 @@ mod tests {
             Ok(())
         }
 
-        async fn remove_label(&self, _id: &ExternalId, _label: &str) -> anyhow::Result<()> {
+        async fn remove_label(&self, _id: &ExternalId, label: &str) -> anyhow::Result<()> {
+            if self.fail_remove_label {
+                anyhow::bail!("simulated remove_label failure for {label}");
+            }
             Ok(())
         }
 
@@ -634,6 +653,75 @@ mod tests {
         // Command after the real closing fence should be found
         let body = "```\n/retry\n~~~\n/retry\n```\n/close";
         assert_eq!(parse_command(body), Some(OwnerCommand::Close));
+    }
+
+    #[tokio::test]
+    async fn retry_propagates_remove_label_error() {
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::failing_remove_label(
+            "42",
+            vec!["agent:claude".to_string()],
+        ));
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let gh = crate::github::http::GhHttp::new().unwrap();
+        let task_id = ExternalId("42".to_string());
+
+        let result = execute_command(
+            &backend,
+            &gh,
+            "owner/repo",
+            &task_id,
+            &OwnerCommand::Retry,
+            &Some(store),
+            &task_manager,
+        )
+        .await;
+
+        assert!(result.is_err(), "/retry must fail when remove_label fails");
+        assert!(
+            result.unwrap_err().to_string().contains("remove_label"),
+            "error must mention remove_label"
+        );
+    }
+
+    #[tokio::test]
+    async fn reroute_propagates_remove_label_error() {
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::failing_remove_label(
+            "42",
+            vec!["agent:codex".to_string()],
+        ));
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let gh = crate::github::http::GhHttp::new().unwrap();
+        let task_id = ExternalId("42".to_string());
+
+        let result = execute_command(
+            &backend,
+            &gh,
+            "owner/repo",
+            &task_id,
+            &OwnerCommand::Reroute(None),
+            &Some(store),
+            &task_manager,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "/reroute must fail when remove_label fails"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("remove_label"),
+            "error must mention remove_label"
+        );
     }
 
     #[test]
