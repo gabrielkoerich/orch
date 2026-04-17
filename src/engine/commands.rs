@@ -6,8 +6,38 @@
 
 use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::github::http::GhHttp;
-use crate::store;
+use async_trait::async_trait;
 use std::sync::Arc;
+
+/// Minimal store interface required by command execution.
+///
+/// Exists so tests can inject a mock that simulates DB failures without
+/// coupling the test harness to a real SQLite pool.
+#[async_trait]
+pub trait CommandStoreOps: Send + Sync {
+    async fn resolve_task_id(&self, repo: &str, task_id: &str) -> anyhow::Result<Option<i64>>;
+
+    async fn set_block_reason(&self, id: i64, reason: Option<&str>) -> anyhow::Result<()>;
+
+    /// Reset all per-attempt counters for a task. Fire-and-forget — failures are
+    /// logged but not propagated (same semantics as `store::store_reset_counters`).
+    async fn reset_counters(&self, id: i64) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+impl CommandStoreOps for crate::store::TaskStore {
+    async fn resolve_task_id(&self, repo: &str, task_id: &str) -> anyhow::Result<Option<i64>> {
+        self.resolve_task_id(repo, task_id).await
+    }
+
+    async fn set_block_reason(&self, id: i64, reason: Option<&str>) -> anyhow::Result<()> {
+        self.set_block_reason(id, reason).await
+    }
+
+    async fn reset_counters(&self, id: i64) -> anyhow::Result<()> {
+        self.reset_counters(id).await
+    }
+}
 
 /// Parsed owner command from an issue comment.
 #[derive(Debug, Clone, PartialEq)]
@@ -107,6 +137,23 @@ pub fn parse_command(body: &str) -> Option<OwnerCommand> {
     None
 }
 
+/// Reset all attempt/failure counters for a task. Fire-and-forget — errors are
+/// logged as warnings but not returned so `/retry` and `/reroute` still succeed.
+async fn cmd_reset_counters(store: &Option<Arc<dyn CommandStoreOps>>, repo: &str, task_id: &str) {
+    let Some(ref s) = store else { return };
+    match s.resolve_task_id(repo, task_id).await {
+        Ok(Some(id)) => {
+            if let Err(e) = s.reset_counters(id).await {
+                tracing::warn!(task_id, err = %e, "store reset_counters failed");
+            }
+        }
+        Ok(None) => {} // task not in store — no-op is expected
+        Err(e) => {
+            tracing::warn!(task_id, err = %e, "resolve_task_id failed in store write helper");
+        }
+    }
+}
+
 /// Execute a single owner command against a task.
 pub async fn execute_command(
     backend: &Arc<dyn ExternalBackend>,
@@ -114,7 +161,7 @@ pub async fn execute_command(
     repo: &str,
     task_id: &ExternalId,
     command: &OwnerCommand,
-    store: &Option<Arc<crate::store::TaskStore>>,
+    store: &Option<Arc<dyn CommandStoreOps>>,
     task_manager: &Arc<crate::engine::tasks::TaskManager>,
 ) -> anyhow::Result<String> {
     match command {
@@ -127,7 +174,7 @@ pub async fn execute_command(
                 }
             }
             // Reset store state (attempts + all failure counters) so the task starts fresh
-            store::store_reset_counters(store, repo, &task_id.0).await;
+            cmd_reset_counters(store, repo, &task_id.0).await;
             task_manager
                 .update_task_status(task_id, Status::New)
                 .await?;
@@ -143,7 +190,7 @@ pub async fn execute_command(
                 }
             }
             // Reset store state (attempts + all failure counters) so the task starts fresh
-            store::store_reset_counters(store, repo, &task_id.0).await;
+            cmd_reset_counters(store, repo, &task_id.0).await;
             // Optionally set new agent
             if let Some(agent_name) = agent {
                 let label = format!("agent:{agent_name}");
@@ -240,7 +287,7 @@ pub async fn validate_and_run_command(
     issue_number: &str,
     command: &OwnerCommand,
     author: &str,
-    store: &Option<Arc<crate::store::TaskStore>>,
+    store: &Option<Arc<dyn CommandStoreOps>>,
     task_manager: &Arc<crate::engine::tasks::TaskManager>,
 ) -> CommandOutcome {
     // Check issue state
@@ -435,6 +482,28 @@ mod tests {
         }
     }
 
+    /// Mock store whose `resolve_task_id` always returns an error.
+    struct FailingStore;
+
+    #[async_trait]
+    impl CommandStoreOps for FailingStore {
+        async fn resolve_task_id(
+            &self,
+            _repo: &str,
+            _task_id: &str,
+        ) -> anyhow::Result<Option<i64>> {
+            anyhow::bail!("simulated resolve_task_id DB failure")
+        }
+
+        async fn set_block_reason(&self, _id: i64, _reason: Option<&str>) -> anyhow::Result<()> {
+            anyhow::bail!("simulated set_block_reason DB failure")
+        }
+
+        async fn reset_counters(&self, _id: i64) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn block_command_persists_reason_and_unblock_clears_it() {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
@@ -470,7 +539,7 @@ mod tests {
             "owner/repo",
             &task_id,
             &OwnerCommand::Block(Some("waiting on upstream fix".to_string())),
-            &Some(store.clone()),
+            &Some(Arc::clone(&store) as Arc<dyn CommandStoreOps>),
             &task_manager,
         )
         .await
@@ -489,7 +558,7 @@ mod tests {
             "owner/repo",
             &task_id,
             &OwnerCommand::Unblock,
-            &Some(store.clone()),
+            &Some(Arc::clone(&store) as Arc<dyn CommandStoreOps>),
             &task_manager,
         )
         .await
@@ -676,7 +745,7 @@ mod tests {
             "owner/repo",
             &task_id,
             &OwnerCommand::Retry,
-            &Some(store),
+            &Some(store as Arc<dyn CommandStoreOps>),
             &task_manager,
         )
         .await;
@@ -709,7 +778,7 @@ mod tests {
             "owner/repo",
             &task_id,
             &OwnerCommand::Reroute(None),
-            &Some(store),
+            &Some(store as Arc<dyn CommandStoreOps>),
             &task_manager,
         )
         .await;
@@ -721,6 +790,74 @@ mod tests {
         assert!(
             result.unwrap_err().to_string().contains("remove_label"),
             "error must mention remove_label"
+        );
+    }
+
+    #[tokio::test]
+    async fn block_propagates_resolve_task_id_error() {
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new("42"));
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            backend.clone(),
+            store,
+            "owner/repo".to_string(),
+        ));
+        let gh = crate::github::http::GhHttp::new().unwrap();
+        let task_id = ExternalId("42".to_string());
+        let failing_store: Arc<dyn CommandStoreOps> = Arc::new(FailingStore);
+
+        let result = execute_command(
+            &backend,
+            &gh,
+            "owner/repo",
+            &task_id,
+            &OwnerCommand::Block(Some("reason".to_string())),
+            &Some(failing_store),
+            &task_manager,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "/block must fail when resolve_task_id fails"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("resolve_task_id"),
+            "error must mention resolve_task_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn unblock_propagates_resolve_task_id_error() {
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new("42"));
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            backend.clone(),
+            store,
+            "owner/repo".to_string(),
+        ));
+        let gh = crate::github::http::GhHttp::new().unwrap();
+        let task_id = ExternalId("42".to_string());
+        let failing_store: Arc<dyn CommandStoreOps> = Arc::new(FailingStore);
+
+        let result = execute_command(
+            &backend,
+            &gh,
+            "owner/repo",
+            &task_id,
+            &OwnerCommand::Unblock,
+            &Some(failing_store),
+            &task_manager,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "/unblock must fail when resolve_task_id fails"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("resolve_task_id"),
+            "error must mention resolve_task_id"
         );
     }
 
