@@ -458,6 +458,12 @@ pub(crate) fn classify_comment(
 /// the cursor on success; logs a warning and returns early if the mention has
 /// no valid issue URL.
 #[allow(clippy::too_many_arguments)]
+/// Execute a slash command mentioned by `@orch` on a comment.
+///
+/// Returns:
+/// - `Ok(())` — command processed (mention task recorded if applicable)
+/// - `Err(_)` — DB lookup failed for parent_id; caller must NOT advance cursor
+///   so this mention is retried on the next sync
 async fn handle_slash_command(
     backend: &Arc<dyn ExternalBackend>,
     store: Option<&Arc<TaskStore>>,
@@ -467,7 +473,7 @@ async fn handle_slash_command(
     mention: &Mention,
     command: &crate::engine::commands::OwnerCommand,
     last_success_ts: &mut Option<String>,
-) {
+) -> anyhow::Result<()> {
     let issue_num = match mention
         .issue_url
         .as_deref()
@@ -476,7 +482,7 @@ async fn handle_slash_command(
         Some(num) => num,
         None => {
             tracing::warn!(comment_id = %mention.id, "slash command without valid issue number");
-            return;
+            return Ok(());
         }
     };
 
@@ -504,7 +510,7 @@ async fn handle_slash_command(
             // not executed but the mention is marked as processed — acceptable vs
             // an infinite retry loop.
             advance_cursor(last_success_ts, &mention.created_at);
-            return;
+            return Ok(());
         }
     };
 
@@ -519,7 +525,7 @@ async fn handle_slash_command(
                     err = %e,
                     "deferring mention task due to parent lookup failure"
                 );
-                return;
+                return Err(e);
             }
         };
 
@@ -556,12 +562,13 @@ async fn handle_slash_command(
             ),
             CommandOutcome::FetchFailed | CommandOutcome::CollaboratorCheckFailed => {
                 tracing::debug!("skipping mention task record due to earlier command failure");
-                return;
+                return Ok(());
             }
         };
 
         record_mention_task(s, repo, mention, &title, &body, parent_id, last_success_ts).await;
     }
+    Ok(())
 }
 
 fn auto_unblock_cooldown_elapsed(count: i32, last_at: &str) -> bool {
@@ -1496,18 +1503,22 @@ async fn scan_comments(
                     // Do NOT advance the cursor or call handle_slash_command — the GitHub
                     // reaction was never posted. Retry on next tick once the network
                     // glitch has resolved.
-                } else {
-                    handle_slash_command(
-                        backend,
-                        store,
-                        repo,
-                        task_manager,
-                        &gh,
-                        comment,
-                        &command,
-                        &mut last_success_ts,
-                    )
-                    .await;
+                } else if let Err(e) = handle_slash_command(
+                    backend,
+                    store,
+                    repo,
+                    task_manager,
+                    &gh,
+                    comment,
+                    &command,
+                    &mut last_success_ts,
+                )
+                .await
+                {
+                    // Parent lookup failed — propagate error to scan_comments so it returns
+                    // early without advancing the cursor past this mention. The mention will
+                    // be retried on the next sync.
+                    return Err(e);
                 }
             }
 
