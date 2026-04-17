@@ -98,7 +98,18 @@ pub fn spawn(
                     // Look up the task from the store to get an ExternalTask.
                     let task = {
                         if crate::engine::tasks::is_internal_id(task_id)
-                            || store.has_external_tasks(&repo).await
+                            || match store.has_external_tasks(&repo).await {
+                                Ok(has_external) => has_external,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        repo = %repo,
+                                        task_id,
+                                        error = %e,
+                                        "failed to check external task sentinel; keeping store-first review lookup"
+                                    );
+                                    true
+                                }
+                            }
                         {
                             // O(1) indexed lookup — resolve task_id to its SQLite row id,
                             // then fetch directly instead of scanning the whole needs_review set.
