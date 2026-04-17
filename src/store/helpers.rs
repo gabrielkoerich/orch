@@ -8,6 +8,10 @@ use crate::store::{CostEstimate, MemoryEntry, Task, TaskStore, TokenUsage};
 use anyhow::anyhow;
 use std::sync::Arc;
 
+fn token_i64_to_u64_non_negative(tokens: i64) -> u64 {
+    u64::try_from(tokens.max(0)).unwrap_or(0)
+}
+
 /// Resolve a task's numeric store ID from its external identifier.
 ///
 /// Returns `None` if the store is unavailable, the task is not found, or the
@@ -365,8 +369,8 @@ pub async fn get_token_usage(
         if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
             if let Ok(task) = s.get(store_id).await {
                 return TokenUsage {
-                    input_tokens: task.input_tokens as u64,
-                    output_tokens: task.output_tokens as u64,
+                    input_tokens: token_i64_to_u64_non_negative(task.input_tokens),
+                    output_tokens: token_i64_to_u64_non_negative(task.output_tokens),
                 };
             }
         }
@@ -409,8 +413,8 @@ pub async fn get_token_summary(
         if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
             if let Ok(task) = s.get(store_id).await {
                 let usage = TokenUsage {
-                    input_tokens: task.input_tokens as u64,
-                    output_tokens: task.output_tokens as u64,
+                    input_tokens: token_i64_to_u64_non_negative(task.input_tokens),
+                    output_tokens: token_i64_to_u64_non_negative(task.output_tokens),
                 };
                 let total = usage.total_tokens();
                 let cost = CostEstimate {

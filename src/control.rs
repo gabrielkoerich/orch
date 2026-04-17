@@ -498,6 +498,27 @@ pub struct InvokeResult {
     pub output_tokens: Option<u64>,
 }
 
+fn token_u64_to_i64_saturating(tokens: u64) -> i64 {
+    i64::try_from(tokens).unwrap_or(i64::MAX)
+}
+
+fn opt_token_u64_to_i64_saturating(tokens: Option<u64>) -> Option<i64> {
+    tokens.map(token_u64_to_i64_saturating)
+}
+
+fn total_tokens_u64_to_i64_saturating(
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+) -> Option<i64> {
+    match (input_tokens, output_tokens) {
+        (Some(input), Some(output)) => {
+            Some(token_u64_to_i64_saturating(input.saturating_add(output)))
+        }
+        (Some(tokens), None) | (None, Some(tokens)) => Some(token_u64_to_i64_saturating(tokens)),
+        _ => None,
+    }
+}
+
 /// Prepare temp directory for agent invocation files.
 ///
 /// Uses `~/.orch/state/control/{pid}/` for isolation between concurrent processes.
@@ -753,16 +774,10 @@ pub async fn send_message(
     persist_memories(store, session_id, &parsed.memories).await?;
 
     // Store assistant message with token usage
-    let total_tokens = match (result.input_tokens, result.output_tokens) {
-        // Use saturating_add + try_from to avoid u64 overflow and prevent
-        // casting a large u64 into a negative i64. If the sum doesn't fit
-        // into i64, cap to i64::MAX (matches store/tasks.rs pattern).
-        (Some(i), Some(o)) => Some(i64::try_from(i.saturating_add(o)).unwrap_or(i64::MAX)),
-        (Some(t), None) | (None, Some(t)) => Some(t as i64),
-        _ => None,
-    };
-    let input_tokens = result.input_tokens.map(|t| t as i64);
-    let output_tokens = result.output_tokens.map(|t| t as i64);
+    let total_tokens =
+        total_tokens_u64_to_i64_saturating(result.input_tokens, result.output_tokens);
+    let input_tokens = opt_token_u64_to_i64_saturating(result.input_tokens);
+    let output_tokens = opt_token_u64_to_i64_saturating(result.output_tokens);
     let cost_usd = match (result.input_tokens, result.output_tokens) {
         (Some(input), Some(output)) => {
             let pricing = crate::store::pricing_for_model(&model);
@@ -1136,6 +1151,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn token_u64_to_i64_saturating_caps_large_values() {
+        assert_eq!(token_u64_to_i64_saturating(u64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn total_tokens_u64_to_i64_saturating_caps_single_large_value() {
+        assert_eq!(
+            total_tokens_u64_to_i64_saturating(Some(u64::MAX), None),
+            Some(i64::MAX)
+        );
+    }
+
+    #[test]
+    fn total_tokens_u64_to_i64_saturating_caps_large_sum() {
+        assert_eq!(
+            total_tokens_u64_to_i64_saturating(Some(u64::MAX), Some(1)),
+            Some(i64::MAX)
+        );
+    }
+
     #[tokio::test]
     async fn insert_control_message_stores_cost_usd() {
         use crate::store::{pricing_for_model, TokenUsage};
@@ -1161,9 +1197,9 @@ mod tests {
                 Some("greeted"),
                 Some("sonnet"),
                 Some("claude"),
-                Some(input_tokens as i64),
-                Some(output_tokens as i64),
-                Some((input_tokens + output_tokens) as i64),
+                opt_token_u64_to_i64_saturating(Some(input_tokens)),
+                opt_token_u64_to_i64_saturating(Some(output_tokens)),
+                total_tokens_u64_to_i64_saturating(Some(input_tokens), Some(output_tokens)),
                 cost_usd,
             )
             .await

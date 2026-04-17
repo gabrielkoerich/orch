@@ -288,6 +288,72 @@ async fn helper_get_token_usage_from_store() {
 }
 
 #[tokio::test]
+async fn helper_get_token_usage_negative_tokens_clamp_to_zero() {
+    let store = Arc::new(TaskStore::open_memory().await.unwrap());
+    let id = store
+        .create(&NewTask {
+            external_id: Some("701".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Negative token test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    store
+        .set_fields(
+            id,
+            &[
+                ("input_tokens", serde_json::json!(-42)),
+                ("output_tokens", serde_json::json!(8)),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let opt_store = Some(store);
+    let usage = get_token_usage(&opt_store, "owner/repo", "701").await;
+    assert_eq!(usage.input_tokens, 0);
+    assert_eq!(usage.output_tokens, 8);
+    assert_eq!(usage.total_tokens(), 8);
+}
+
+#[tokio::test]
+async fn helper_get_token_summary_negative_tokens_clamp_to_zero() {
+    let store = Arc::new(TaskStore::open_memory().await.unwrap());
+    let id = store
+        .create(&NewTask {
+            external_id: Some("702".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Negative summary token test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    store
+        .set_fields(
+            id,
+            &[
+                ("input_tokens", serde_json::json!(-5)),
+                ("output_tokens", serde_json::json!(10)),
+                ("input_cost_usd", serde_json::json!(0.05)),
+                ("output_cost_usd", serde_json::json!(0.15)),
+                ("total_cost_usd", serde_json::json!(0.20)),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let opt_store = Some(store);
+    let (total_tokens, cost) = get_token_summary(&opt_store, "owner/repo", "702").await;
+    assert_eq!(total_tokens, 10);
+    assert!((cost.total_cost_usd - 0.20).abs() < f64::EPSILON);
+}
+
+#[tokio::test]
 async fn helper_get_cost_estimate_from_store() {
     let store = Arc::new(TaskStore::open_memory().await.unwrap());
     let id = store
