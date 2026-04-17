@@ -1202,6 +1202,24 @@ pub(crate) async fn tick_route_tasks(
 }
 
 /// Phase 3b of tick: spawn agents for all status:routed tasks up to the parallel limit.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DispatchMode {
+    pub(crate) is_degraded: bool,
+    pub(crate) healthy_agents: usize,
+    pub(crate) threshold: usize,
+}
+
+pub(crate) fn dispatch_mode_from_router(router: &Router) -> DispatchMode {
+    let threshold = crate::engine::router::config::min_healthy_agents_threshold();
+    let healthy_agents = router.healthy_agent_count("simple");
+    DispatchMode {
+        is_degraded: healthy_agents < threshold,
+        healthy_agents,
+        threshold,
+    }
+}
+
+/// Phase 3b of tick: spawn agents for all status:routed tasks up to the parallel limit.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, name = "engine.tick.phase3b.dispatch")]
 pub(crate) async fn tick_dispatch_tasks(
@@ -1213,7 +1231,7 @@ pub(crate) async fn tick_dispatch_tasks(
     semaphore: &Arc<Semaphore>,
     task_manager: &Arc<TaskManager>,
     weight_tx: &mpsc::Sender<WeightSignal>,
-    router: &Router,
+    dispatch_mode: DispatchMode,
     dispatching: &Arc<DashMap<String, String>>,
     store: &Arc<TaskStore>,
     session_map: &std::collections::HashMap<String, bool>,
@@ -1235,26 +1253,21 @@ pub(crate) async fn tick_dispatch_tasks(
         .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
         .collect();
 
-    // Check if we are in degraded mode (fewer than threshold healthy agents)
-    let threshold = crate::engine::router::config::min_healthy_agents_threshold();
-    let healthy_count = router.healthy_agent_count("simple");
-    let is_degraded = healthy_count < threshold;
-
     if dispatchable.is_empty() {
         tracing::debug!(count = 0, "dispatchable tasks found");
         return Ok(());
     }
 
     tracing::info!(count = dispatchable.len(), "dispatchable tasks found");
-    if is_degraded {
+    if dispatch_mode.is_degraded {
         tracing::warn!(
-            healthy_agents = healthy_count,
-            threshold = threshold,
+            healthy_agents = dispatch_mode.healthy_agents,
+            threshold = dispatch_mode.threshold,
             "degraded mode: using sequential dispatch"
         );
     }
 
-    let sequential_delay = if is_degraded {
+    let sequential_delay = if dispatch_mode.is_degraded {
         crate::engine::router::config::sequential_dispatch_delay_ms()
     } else {
         0
@@ -1262,7 +1275,7 @@ pub(crate) async fn tick_dispatch_tasks(
 
     for (idx, task) in dispatchable.into_iter().enumerate() {
         // In degraded mode, add delay between dispatches to pace the system
-        if idx > 0 && is_degraded {
+        if idx > 0 && dispatch_mode.is_degraded {
             let delay_ms = sequential_delay;
             tracing::debug!(
                 task_id = task.id.0,
@@ -1744,6 +1757,7 @@ pub(crate) async fn tick(
     )
     .await?;
     tick_route_tasks(backend, task_manager, router, store, repo).await?;
+    let dispatch_mode = dispatch_mode_from_router(router);
     tick_dispatch_tasks(
         backend,
         tmux,
@@ -1753,7 +1767,7 @@ pub(crate) async fn tick(
         semaphore,
         task_manager,
         weight_tx,
-        router,
+        dispatch_mode,
         dispatching,
         store,
         &session_map,
@@ -2602,10 +2616,11 @@ mod tests {
         let router = Router::new(router_config);
         let router_arc = Arc::new(RwLock::new(router));
 
-        // Simulate what the main loop does: hold a write lock, then call
-        // tick_dispatch_tasks. The function now takes &Router (dereferenced
-        // from the guard), so no lock re-acquisition occurs.
+        // Simulate what the main loop does: hold a write lock, snapshot
+        // dispatch mode, then call tick_dispatch_tasks without passing any
+        // lock guard into async dispatch work.
         let write_guard = router_arc.write().await;
+        let dispatch_mode = dispatch_mode_from_router(&write_guard);
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -2620,7 +2635,7 @@ mod tests {
                 &semaphore,
                 &task_manager,
                 &weight_tx,
-                &write_guard,
+                dispatch_mode,
                 &dispatching,
                 &store,
                 &std::collections::HashMap::new(),
