@@ -390,15 +390,48 @@ pub fn spawn(
                         // close, or another review cycle) may have already moved the task out
                         // of `in_review`. If so, discard the stale outcome rather than
                         // overwriting the newer state.
-                        let fetched: Option<(crate::store::TaskStatus, Option<String>)> = async {
-                            let id = store_c.resolve_task_id(&repo_s, &tid).await.ok().flatten()?;
-                            let task = store_c.get(id).await.ok()?;
-                            Some((task.status, task.block_reason))
+                        //
+                        // IMPORTANT: Distinguish between DB errors and legitimate status changes.
+                        // A DB lookup failure should NOT be treated as "task moved out of in_review"
+                        // — we should retain the review outcome rather than discarding it on
+                        // transient errors.
+                        let fetched: Result<Option<(crate::store::TaskStatus, Option<String>)>, anyhow::Error> = async {
+                            let id = match store_c.resolve_task_id(&repo_s, &tid).await {
+                                Ok(Some(id)) => id,
+                                Ok(None) => return Ok(None), // Task doesn't exist — treat as missing
+                                Err(e) => return Err(e),      // DB error — propagate, don't discard
+                            };
+                            let task = store_c.get(id).await?;
+                            Ok(Some((task.status, task.block_reason)))
                         }
                         .await;
-                        let current_status = fetched.as_ref().map(|(s, _)| *s);
-                        let current_block_reason =
-                            fetched.and_then(|(_, r)| r);
+
+                        let current_status;
+                        let current_block_reason;
+
+                        match fetched {
+                            Ok(Some((status, block_reason))) => {
+                                current_status = Some(status);
+                                current_block_reason = block_reason;
+                            }
+                            Ok(None) => {
+                                // Task doesn't exist in store — treat as not in_review
+                                current_status = None;
+                                current_block_reason = None;
+                            }
+                            Err(e) => {
+                                // DB error — log and keep the review outcome instead of discarding
+                                tracing::error!(
+                                    task_id = tid,
+                                    error = %e,
+                                    "review outcome retained — DB lookup failed, not treating as stale"
+                                );
+                                // Skip the stale outcome check and proceed with the outcome
+                                // by treating it as if the task is still InReview
+                                current_status = Some(crate::store::TaskStatus::InReview);
+                                current_block_reason = None;
+                            }
+                        }
 
                         if !matches!(current_status, Some(crate::store::TaskStatus::InReview)) {
                             let ci_blocked = matches!(
