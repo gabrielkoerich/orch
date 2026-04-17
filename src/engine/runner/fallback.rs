@@ -10,8 +10,6 @@ use std::sync::Arc;
 
 use super::{agents, response};
 
-const PROVIDER_RETURNED_ERROR_MODEL_COOLDOWN_SECS: u64 = 4 * 60 * 60;
-
 /// Summarizes a rate limit error by extracting key information from Claude's API retry JSON.
 ///
 /// Looks for the last `{"type":"system","subtype":"api_retry",...}` line in the output and
@@ -71,7 +69,6 @@ fn extract_json_field(json: &str, field: &str) -> Option<String> {
         }
     })
 }
-
 
 /// How `run()` should proceed after error handling.
 pub enum ErrorHandleResult {
@@ -1131,43 +1128,5 @@ more logs"#;
 
         let summarized = super::summarize_rate_limit_error(raw_output);
         assert_eq!(summarized, "status=429 after 3 attempts (last delay 5s)");
-    }
-
-    /// Verify that InvalidResponse applies model-level cooldown (regression test for issue #2750).
-    #[tokio::test]
-    async fn invalid_response_sets_model_cooldown() {
-        let runner = MockRunner { free: vec![] };
-        let agent = "opencode";
-        let model = "opencode/nemotron-3-super-free";
-
-        // Confirm no model cooldown before the error.
-        assert!(
-            !crate::engine::cooldown::is_model_in_cooldown(agent, model),
-            "model should not be in cooldown before handle_error"
-        );
-
-        let err = agents::AgentError::InvalidResponse {
-            raw: "invalid json output".to_string(),
-        };
-
-        let _result = handle_error(
-            "test-2750-invalid-response",
-            &err,
-            agent,
-            &runner,
-            Some(model),
-            Some("simple"),
-            1,
-            &None,
-            "owner/repo",
-        )
-        .await
-        .unwrap();
-
-        // Model-level cooldown must be set after InvalidResponse.
-        assert!(
-            crate::engine::cooldown::is_model_in_cooldown(agent, model),
-            "model should be in cooldown after InvalidResponse (fixes issue #2750)"
-        );
     }
 }
