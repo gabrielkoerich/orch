@@ -292,10 +292,17 @@ pub async fn handle_error(
             response::RetryableError::Failed,
             format!("permission denied: {message}"),
         ),
-        agents::AgentError::InvalidResponse { .. } => (
-            response::RetryableError::Failed,
-            format!("{agent_name} invalid response"),
-        ),
+        agents::AgentError::InvalidResponse { .. } => {
+            // Record model-specific cooldown so the same model that produced an
+            // unparseable response isn't immediately retried on the next task.
+            if let Some(model) = model_name {
+                response::record_model_failure(agent_name, model).await;
+            }
+            (
+                response::RetryableError::Failed,
+                format!("{agent_name} invalid response"),
+            )
+        }
         agents::AgentError::AgentFailed { message } => {
             // "Provider returned error" (opencode) and similar upstream failures.
             // Record model+agent cooldowns so the router skips this model on retry,
@@ -972,6 +979,48 @@ mod tests {
         assert!(
             matches!(result, ErrorHandleResult::Continue { .. }),
             "expected Continue (fallthrough to failover) when no free models available"
+        );
+    }
+
+    /// Verify that InvalidResponse applies model-level cooldown.
+    ///
+    /// This fixes issue #2750: InvalidResponse used to skip model-level cooldown,
+    /// allowing models that produced unparseable responses to be immediately
+    /// retried on the next task without any backoff.
+    #[tokio::test]
+    async fn invalid_response_sets_model_cooldown() {
+        let runner = MockRunner { free: vec![] };
+        let agent = "opencode";
+        let model = "opencode/nemotron-3-super-free";
+
+        // Confirm no model cooldown before the error.
+        assert!(
+            !crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            "model should not be in cooldown before handle_error"
+        );
+
+        let err = AgentError::InvalidResponse {
+            raw: "invalid json output".to_string(),
+        };
+
+        let _result = handle_error(
+            "test-2750-invalid-response",
+            &err,
+            agent,
+            &runner,
+            Some(model),
+            Some("simple"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        // Model-level cooldown must be set after InvalidResponse.
+        assert!(
+            crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            "model should be in cooldown after InvalidResponse (fixes issue #2750)"
         );
     }
 }
