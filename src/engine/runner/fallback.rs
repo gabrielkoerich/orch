@@ -10,6 +10,66 @@ use std::sync::Arc;
 
 use super::{agents, response};
 
+const PROVIDER_RETURNED_ERROR_MODEL_COOLDOWN_SECS: u64 = 4 * 60 * 60;
+
+/// Summarizes a rate limit error by extracting key information from Claude's API retry JSON.
+///
+/// Looks for the last `{"type":"system","subtype":"api_retry",...}` line in the output and
+/// extracts `error_status`, `attempt`, `retry_delay_ms` to return a compact summary.
+/// Returns the original message if no api_retry JSON is found.
+fn summarize_rate_limit_error(raw_output: &str) -> String {
+    // Find the last api_retry JSON object in the output
+    if let Some(last_json) = raw_output
+        .lines()
+        .rev()
+        .find(|line| line.contains("\"type\":\"system\"") && line.contains("\"subtype\":\"api_retry\""))
+    {
+        // Extract key fields from the JSON
+        let error_status = extract_json_field(last_json, "\"error_status\":")
+            .unwrap_or_else(|| "unknown".to_string());
+        let attempt = extract_json_field(last_json, "\"attempt\":")
+            .unwrap_or_else(|| "unknown".to_string());
+        let retry_delay_ms = extract_json_field(last_json, "\"retry_delay_ms\":")
+            .unwrap_or_else(|| "0".to_string());
+
+        // Convert delay to seconds for readability
+        let retry_delay_s = retry_delay_ms.parse::<f64>().unwrap_or(0.0) / 1000.0;
+        let retry_delay_s = retry_delay_s as u64;
+
+        format!("status={} after {} attempts (last delay {}s)", error_status, attempt, retry_delay_s)
+    } else {
+        // Fall back to original behavior if no api_retry JSON found
+        raw_output.to_string()
+    }
+}
+
+/// Extracts a JSON field value as a string, handling both quoted strings and raw numbers.
+fn extract_json_field(json: &str, field: &str) -> Option<String> {
+    json.find(field)
+        .and_then(|start| {
+            let value_start = start + field.len();
+            let value_str = &json[value_start..];
+
+            // Handle quoted strings
+            if value_str.starts_with('"') {
+                value_str
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .and_then(|s| s.strip_suffix(','))
+                    .map(|s| s.to_string())
+            }
+            // Handle raw numbers (integers or floats)
+            else {
+                let end = value_str
+                    .find(|c: char| !c.is_ascii_digit() && c != '.')
+                    .unwrap_or(value_str.len());
+                let num_str = &value_str[..end];
+                num_str.strip_suffix(',').map(|s| s.to_string()).or_else(|| Some(num_str.to_string()))
+            }
+        })
+}
+
+
 /// How `run()` should proceed after error handling.
 pub enum ErrorHandleResult {
     /// Task was rerouted — `run()` should record metrics then return early.
@@ -151,7 +211,7 @@ pub async fn handle_error(
             }
             (
                 response::RetryableError::UsageLimit,
-                format!("{agent_name} rate limit: {message}"),
+                format!("{agent_name} rate limit: {}", summarize_rate_limit_error(&message)),
             )
         }
         agents::AgentError::Auth { message } => {
@@ -418,9 +478,19 @@ pub async fn handle_error(
                     return Ok(result);
                 }
             }
+            
+            // Handle JSON cost telemetry in stdout for non-zero exits
+            // If the message looks like Claude's cost JSON, replace with a generic message
+            let error_message = if *exit_code != 0 && message.contains("\"costUSD\":") {
+                // Extract just the essential info: exit code and that cost telemetry was present
+                format!("{} exited with non-zero status (cost telemetry in stdout, no error message)", agent_name)
+            } else {
+                format!("{agent_name} exit {exit_code}: {message}")
+            };
+            
             (
                 response::RetryableError::Failed,
-                format!("{agent_name} exit {exit_code}: {message}"),
+                error_message,
             )
         }
     };
@@ -1014,5 +1084,46 @@ mod tests {
             crate::engine::cooldown::is_model_in_cooldown(agent, model),
             "model should be in cooldown after InvalidResponse (fixes issue #2750)"
         );
+    }
+
+    #[tokio::test]
+    async fn summarize_rate_limit_error_extracts_api_retry_info() {
+        let raw_output = r#"some log lines
+{"type":"system","subtype":"api_retry","attempt":6,"max_retries":10,"retry_delay_ms":17266.789,"error_status":429,"error":"rate_limit","session_id":"331c099b-..."}
+{"type":"system","subtype":"api_retry","attempt":7,"max_retries":10,"retry_delay_ms":35162.66,"error_status":429,"error":"rate_limit","session_id":"331c099b-..."}
+more logs"#;
+
+        let summarized = super::summarize_rate_limit_error(raw_output);
+        assert_eq!(summarized, "status=429 after 7 attempts (last delay 35s)");
+    }
+
+    #[tokio::test]
+    async fn summarize_rate_limit_error_returns_original_when_no_api_retry() {
+        let raw_output = "some regular error message without api_retry JSON";
+
+        let summarized = super::summarize_rate_limit_error(raw_output);
+        assert_eq!(summarized, raw_output);
+    }
+
+    #[tokio::test]
+    async fn summarize_rate_limit_error_handles_malformed_json_gracefully() {
+        let raw_output = r#"some logs
+{"type":"system","subtype":"api_retry","attempt":"not_a_number","retry_delay_ms":invalid,"error_status":429}
+more logs"#;
+
+        let summarized = super::summarize_rate_limit_error(raw_output);
+        // Should still return a formatted string even with invalid numbers
+        assert!(summarized.starts_with("status="));
+        assert!(summarized.contains("after"));
+        assert!(summarized.contains("attempts"));
+        assert!(summarized.contains("(last delay"));
+    }
+
+    #[tokio::test]
+    async fn summarize_rate_limit_error_works_with_single_line() {
+        let raw_output = r#"{"type":"system","subtype":"api_retry","attempt":3,"max_retries":10,"retry_delay_ms":5000,"error_status":429,"error":"rate_limit"}"#;
+
+        let summarized = super::summarize_rate_limit_error(raw_output);
+        assert_eq!(summarized, "status=429 after 3 attempts (last delay 5s)");
     }
 }
