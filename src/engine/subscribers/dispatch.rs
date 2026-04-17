@@ -13,6 +13,25 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::sync::{mpsc, RwLock, Semaphore};
 
+type SessionMap = std::collections::HashMap<String, bool>;
+
+async fn prepare_dispatch_context<F>(
+    router_arc: &Arc<RwLock<Router>>,
+    session_map_fut: F,
+) -> (crate::engine::tick::DispatchMode, SessionMap)
+where
+    F: std::future::Future<Output = SessionMap>,
+{
+    // Keep lock scope minimal: snapshot router state, then drop the guard
+    // before awaiting session/dispatch work.
+    let dispatch_mode = {
+        let router_guard = router_arc.read().await;
+        crate::engine::tick::dispatch_mode_from_router(&router_guard)
+    };
+    let session_map = session_map_fut.await;
+    (dispatch_mode, session_map)
+}
+
 /// Spawn a task that listens for Routed events and dispatches agents.
 ///
 /// This mirrors the logic in `tick_dispatch_tasks` but triggers instantly
@@ -41,8 +60,8 @@ pub fn spawn(
                     // Delegate to existing dispatch logic.
                     // The dispatching set guard inside tick_dispatch_tasks
                     // prevents double-dispatch if the tick loop also picks this up.
-                    let router_guard = router_arc.read().await;
-                    let session_map = tmux.batch_session_active().await;
+                    let (dispatch_mode, session_map) =
+                        prepare_dispatch_context(&router_arc, tmux.batch_session_active()).await;
                     if let Err(e) = crate::engine::tick::tick_dispatch_tasks(
                         &backend,
                         &tmux,
@@ -52,7 +71,7 @@ pub fn spawn(
                         &semaphore,
                         &task_manager,
                         &weight_tx,
-                        &router_guard,
+                        dispatch_mode,
                         &dispatching,
                         &store,
                         &session_map,
@@ -70,4 +89,41 @@ pub fn spawn(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::router::{Router, RouterConfig};
+    use std::time::Duration;
+    use tokio::sync::{oneshot, Notify};
+
+    #[tokio::test]
+    async fn prepare_dispatch_context_drops_read_lock_before_awaiting_session_map() {
+        let router_arc = Arc::new(RwLock::new(Router::new(RouterConfig::default())));
+        let (tx, rx) = oneshot::channel::<SessionMap>();
+        let waiting = Arc::new(Notify::new());
+        let waiting_for_task = Arc::clone(&waiting);
+        let router_for_task = Arc::clone(&router_arc);
+
+        let task = tokio::spawn(async move {
+            prepare_dispatch_context(&router_for_task, async move {
+                waiting_for_task.notify_one();
+                rx.await.unwrap_or_default()
+            })
+            .await
+        });
+
+        // Wait until the function has entered its awaited session-map future.
+        waiting.notified().await;
+
+        // If the read guard leaked across the await above, this write lock would block.
+        let write_guard = tokio::time::timeout(Duration::from_secs(2), router_arc.write())
+            .await
+            .expect("router write lock blocked while dispatch subscriber awaited session map");
+        drop(write_guard);
+
+        let _ = tx.send(SessionMap::new());
+        let _ = task.await.expect("prepare_dispatch_context task panicked");
+    }
 }
