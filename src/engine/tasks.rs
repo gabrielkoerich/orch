@@ -251,25 +251,30 @@ impl TaskManager {
 
         // No status filter or --status all: return all tasks for the repo
         if filter.status.is_none() || is_all {
+            let mut has_external_in_store = false;
             let store_tasks = if let Some(ref store) = self.store {
                 if is_all {
-                    store.list_all(&self.repo).await?
+                    let tasks = store.list_all(&self.repo).await?;
+                    has_external_in_store = store.has_external_tasks(&self.repo).await;
+                    tasks
                 } else {
-                    store.list_active(&self.repo).await?
+                    let tasks = store.list_active(&self.repo).await?;
+                    has_external_in_store = store.has_external_tasks(&self.repo).await;
+                    tasks
                 }
             } else {
                 vec![]
             };
 
-            if !store_tasks.is_empty() {
-                for t in store_tasks {
-                    if t.origin == "internal" {
-                        tasks.push(Task::Internal(t));
-                    } else {
-                        tasks.push(Task::External(store_task_to_external(&t)));
-                    }
+            for t in store_tasks {
+                if t.origin == "internal" {
+                    tasks.push(Task::Internal(t));
+                } else {
+                    tasks.push(Task::External(store_task_to_external(&t)));
                 }
-            } else {
+            }
+
+            if !has_external_in_store {
                 let external_tasks = self.backend.list_all_tasks().await?;
                 for t in external_tasks {
                     tasks.push(Task::External(t));
@@ -1473,6 +1478,84 @@ mod tests {
         let all = tm.list_all_external_tasks().await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id.0, "200");
+    }
+
+    #[tokio::test]
+    async fn list_tasks_without_status_merges_backend_external_when_store_only_has_internal() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend = Arc::new(MockBackend::new().with_status_tasks(
+            Status::New,
+            vec![ExternalTask {
+                id: ExternalId("301".to_string()),
+                title: "Backend new".to_string(),
+                body: "".to_string(),
+                state: "open".to_string(),
+                labels: vec!["status:new".to_string()],
+                author: "bot".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                url: "".to_string(),
+            }],
+        ));
+        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+
+        let internal_id = store
+            .create_internal("owner/repo", "Internal task", "", "cron", "1", None)
+            .await
+            .unwrap();
+
+        let listed = tm.list_tasks(TaskFilter::default()).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|task| matches!(
+            task,
+            Task::External(external) if external.id.0 == "301"
+        )));
+        assert!(listed.iter().any(|task| matches!(
+            task,
+            Task::Internal(internal) if internal.id == internal_id
+        )));
+    }
+
+    #[tokio::test]
+    async fn list_tasks_status_all_merges_backend_external_when_store_only_has_internal() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend = Arc::new(MockBackend::new().with_status_tasks(
+            Status::Done,
+            vec![ExternalTask {
+                id: ExternalId("302".to_string()),
+                title: "Backend done".to_string(),
+                body: "".to_string(),
+                state: "closed".to_string(),
+                labels: vec!["status:done".to_string()],
+                author: "bot".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                url: "".to_string(),
+            }],
+        ));
+        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+
+        let internal_id = store
+            .create_internal("owner/repo", "Internal task", "", "cron", "1", None)
+            .await
+            .unwrap();
+
+        let listed = tm
+            .list_tasks(TaskFilter {
+                status: Some("all".to_string()),
+                source: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|task| matches!(
+            task,
+            Task::External(external) if external.id.0 == "302"
+        )));
+        assert!(listed.iter().any(|task| matches!(
+            task,
+            Task::Internal(internal) if internal.id == internal_id
+        )));
     }
 
     // ── store-first update_task_status ──────────────────────────────
