@@ -706,15 +706,41 @@ async fn find_existing_worktree(worktrees_base: &Path, task_id: &str) -> Option<
 
     let mut entries = match tokio::fs::read_dir(worktrees_base).await {
         Ok(e) => e,
-        Err(_) => return None,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %worktrees_base.display(),
+                "failed to read worktrees directory while searching for existing worktree"
+            );
+            return None;
+        }
     };
-    while let Some(entry) = entries.next_entry().await.ok().flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
+    loop {
+        let next_entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(e) => {
+                // Log the error but continue scanning - a single entry error shouldn't stop us
+                tracing::warn!(error = %e, "failed to read directory entry while searching for worktree");
+                continue;
+            }
+        };
+
+        let name = next_entry.file_name().to_string_lossy().to_string();
         let matches =
             name.starts_with(&prefix_new) || legacy_prefixes.iter().any(|p| name.starts_with(p));
-        // Use async metadata for is_dir check
-        if matches && entry.metadata().await.map(|m| m.is_dir()).unwrap_or(false) {
-            return Some(entry.path());
+        if matches {
+            match next_entry.metadata().await {
+                Ok(metadata) if metadata.is_dir() => return Some(next_entry.path()),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %next_entry.path().display(),
+                        "failed to read metadata for candidate worktree entry"
+                    );
+                }
+            }
         }
     }
 
