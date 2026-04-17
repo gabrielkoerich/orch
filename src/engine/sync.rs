@@ -1503,22 +1503,20 @@ async fn scan_comments(
                     // Do NOT advance the cursor or call handle_slash_command — the GitHub
                     // reaction was never posted. Retry on next tick once the network
                     // glitch has resolved.
-                } else if let Err(e) = handle_slash_command(
-                    backend,
-                    store,
-                    repo,
-                    task_manager,
-                    &gh,
-                    comment,
-                    &command,
-                    &mut last_success_ts,
-                )
-                .await
-                {
-                    // Parent lookup failed — propagate error to scan_comments so it returns
-                    // early without advancing the cursor past this mention. The mention will
-                    // be retried on the next sync.
-                    return Err(e);
+                } else {
+                    // Parent lookup failure propagates via `?` — scan_comments returns early
+                    // without advancing the cursor so the mention is retried on next sync.
+                    handle_slash_command(
+                        backend,
+                        store,
+                        repo,
+                        task_manager,
+                        &gh,
+                        comment,
+                        &command,
+                        &mut last_success_ts,
+                    )
+                    .await?;
                 }
             }
 
