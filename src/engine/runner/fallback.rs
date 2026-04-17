@@ -10,8 +10,6 @@ use std::sync::Arc;
 
 use super::{agents, response};
 
-const PROVIDER_RETURNED_ERROR_MODEL_COOLDOWN_SECS: u64 = 4 * 60 * 60;
-
 /// How `run()` should proceed after error handling.
 pub enum ErrorHandleResult {
     /// Task was rerouted — `run()` should record metrics then return early.
@@ -143,13 +141,9 @@ pub async fn handle_error(
                 if let Some(model) = model_name {
                     if is_provider_returned_error {
                         // Opaque provider failures can remain unstable for hours.
-                        // Keep this model out longer to avoid repeated wasted runs.
-                        crate::engine::cooldown::set_model_cooldown(
-                            agent_name,
-                            model,
-                            PROVIDER_RETURNED_ERROR_MODEL_COOLDOWN_SECS,
-                        )
-                        .await;
+                        // Use longer exponential model backoff to avoid repeated runs.
+                        crate::engine::cooldown::record_persistent_model_failure(agent_name, model)
+                            .await;
                     } else {
                         response::record_model_failure(agent_name, model).await;
                     }
@@ -391,11 +385,9 @@ pub async fn handle_error(
                     || message.starts_with("empty-output-exit0:"))
             {
                 if let Some(m) = model_name {
-                    // Use a 4-hour cooldown for silent exits instead of the default 1-hour
-                    // model cooldown.  These models (especially github-copilot/* in opencode)
-                    // fail consistently across multiple hours; a 1-hour window means ~12
-                    // wasted 2-minute attempts per day per model.  4 hours cuts that to ~3.
-                    crate::engine::cooldown::set_model_cooldown(agent_name, m, 4 * 3600).await;
+                    // Silent exits can remain broken for long periods. Start with 4h,
+                    // then escalate using exponential backoff for persistent failures.
+                    crate::engine::cooldown::record_persistent_model_failure(agent_name, m).await;
                 }
                 // Before falling through to handle_failover() (which tries claude/codex),
                 // check whether this agent has any free models that haven't been tried yet.
@@ -756,7 +748,7 @@ mod tests {
 
         // Allow a wider margin for scheduler/runtime jitter in concurrent test runs.
         assert!(
-            remaining >= PROVIDER_RETURNED_ERROR_MODEL_COOLDOWN_SECS as i64 - 30,
+            remaining >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
             "expected ~4h model cooldown, got {remaining}s"
         );
     }
