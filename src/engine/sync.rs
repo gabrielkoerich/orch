@@ -344,28 +344,25 @@ fn classify_failure_from_run(run: &crate::store::TaskRun) -> Option<FailureCateg
 ///
 /// - If the mention is on a PR, look up the task that owns that PR via `pr_number`.
 /// - If the mention is on an issue, look up the task by external_id (issue number).
+///
+/// Returns:
+/// - `Ok(Some(id))` — parent found
+/// - `Ok(None)` — no matching parent (genuine miss, e.g. unknown issue/PR)
+/// - `Err(_)` — lookup failed (DB error); caller should defer/retry
 async fn resolve_mention_parent_id(
     store: &crate::store::TaskStore,
     repo: &str,
     issue_num: &str,
     is_pr: bool,
-) -> Option<i64> {
+) -> anyhow::Result<Option<i64>> {
     if is_pr {
         if let Ok(pr_num) = issue_num.parse::<i32>() {
-            store
-                .resolve_id_by_pr_number(repo, pr_num)
-                .await
-                .ok()
-                .flatten()
+            store.resolve_id_by_pr_number(repo, pr_num).await
         } else {
-            None
+            Ok(None)
         }
     } else {
-        store
-            .resolve_id_by_external(repo, issue_num)
-            .await
-            .ok()
-            .flatten()
+        store.resolve_id_by_external(repo, issue_num).await
     }
 }
 
@@ -511,9 +508,20 @@ async fn handle_slash_command(
         }
     };
 
-    // Record a sentinel task for the mention (with correct parent_id)
+    // Record a sentinel task for the mention (with correct parent_id).
+    // On DB lookup failure, defer so the mention can be retried on next sync.
     if let Some(s) = store {
-        let parent_id = resolve_mention_parent_id(s, repo, &issue_num, is_pr).await;
+        let parent_id = match resolve_mention_parent_id(s, repo, &issue_num, is_pr).await {
+            Ok(parent_id) => parent_id,
+            Err(e) => {
+                tracing::warn!(
+                    comment_id = %mention.id,
+                    err = %e,
+                    "deferring mention task due to parent lookup failure"
+                );
+                return;
+            }
+        };
 
         let (title, body) = match &outcome {
             CommandOutcome::NotOpen { .. } => (
@@ -1538,10 +1546,26 @@ async fn scan_comments(
                     };
 
                     if let Some(s) = store {
-                        let parent_id = if let Some(ref num) = issue_num {
-                            resolve_mention_parent_id(s, repo, num, is_pr).await
-                        } else {
-                            None
+                        // On DB lookup failure, do NOT record the mention task or advance
+                        // the cursor — the mention will be retried on next sync.
+                        let parent_id = match issue_num {
+                            Some(ref num) => {
+                                match resolve_mention_parent_id(s, repo, num, is_pr).await {
+                                    Ok(id) => id,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            mention_id = %comment.id,
+                                            err = %e,
+                                            "deferring mention task due to parent lookup failure"
+                                        );
+                                        return Err(anyhow::anyhow!(
+                                            "deferring mention {} due to parent lookup failure",
+                                            comment.id
+                                        ));
+                                    }
+                                }
+                            }
+                            None => None,
                         };
                         record_mention_task(
                             s,
