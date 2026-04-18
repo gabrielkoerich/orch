@@ -329,6 +329,26 @@ impl RouterConfig {
         // Parse agents list from top-level `agents:` config key
         config.agents = crate::engine::configured_agents();
 
+        // Temporary operational toggle: allow disabling/deprioritizing the
+        // third-party "glm" agent without editing config files. This is
+        // controlled by the environment variable `ORCH_TEMP_DEPRIORITIZE_GLM`.
+        // When set (any non-empty value), remove `glm` from the configured
+        // agents so it will not be considered by the router. This keeps the
+        // change reversible (unset the env var to restore behavior) and avoids
+        // editing user config files.
+        if std::env::var("ORCH_TEMP_DEPRIORITIZE_GLM").is_ok() {
+            if config.agents.iter().any(|a| a == "glm") {
+                tracing::warn!(
+                    "ORCH_TEMP_DEPRIORITIZE_GLM set: temporarily removing 'glm' from router agents"
+                );
+                config.agents.retain(|a| a != "glm");
+            } else {
+                tracing::debug!(
+                    "ORCH_TEMP_DEPRIORITIZE_GLM set but 'glm' not present in configured agents"
+                );
+            }
+        }
+
         if let Ok(max_attempts) = crate::config::get("router.max_route_attempts") {
             if let Ok(n) = max_attempts.parse::<u32>() {
                 config.max_route_attempts = n;
