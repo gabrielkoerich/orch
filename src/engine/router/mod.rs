@@ -444,7 +444,6 @@ impl Router {
 
     /// Check if the system is in degraded mode (fewer than threshold healthy agents).
     /// Uses "simple" complexity as the baseline since it has the widest model support.
-    #[allow(dead_code)]
     pub fn is_degraded(&self, threshold: usize) -> bool {
         self.healthy_agent_count("simple") < threshold
     }
