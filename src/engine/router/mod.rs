@@ -1579,10 +1579,11 @@ mod tests {
 
     #[test]
     fn default_agents_constant() {
-        assert_eq!(DEFAULT_AGENTS.len(), 5);
+        assert_eq!(DEFAULT_AGENTS.len(), 6);
         assert!(DEFAULT_AGENTS.contains(&"claude"));
         assert!(DEFAULT_AGENTS.contains(&"kimi"));
         assert!(DEFAULT_AGENTS.contains(&"minimax"));
+        assert!(DEFAULT_AGENTS.contains(&"glm"));
     }
 
     #[test]
@@ -1651,13 +1652,14 @@ mod tests {
         assert!(!config.allowed_tools.is_empty());
         assert!(!config.default_skills.is_empty());
 
-        // Verify configurable agents list includes all 5 agents
-        assert_eq!(config.agents.len(), 5);
+        // Verify configurable agents list includes all 6 agents
+        assert_eq!(config.agents.len(), 6);
         assert!(config.agents.contains(&"claude".to_string()));
         assert!(config.agents.contains(&"codex".to_string()));
         assert!(config.agents.contains(&"opencode".to_string()));
         assert!(config.agents.contains(&"kimi".to_string()));
         assert!(config.agents.contains(&"minimax".to_string()));
+        assert!(config.agents.contains(&"glm".to_string()));
     }
 
     #[test]
