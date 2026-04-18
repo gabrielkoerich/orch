@@ -508,6 +508,33 @@ impl TaskRunner {
                     },
                 }));
             }
+            task_init::BudgetCheckOutcome::StoreReadError => {
+                tracing::error!(
+                    task_id,
+                    "token budget check failed due to store read error — blocking task"
+                );
+                if let Some(b) = backend {
+                    let id = crate::backends::ExternalId(task_id.to_string());
+                    if let Err(e) = b.update_status(&id, crate::backends::Status::Blocked).await {
+                        tracing::warn!(task_id, err = %e, "failed to update backend status to Blocked after budget check error");
+                    }
+                }
+                return Ok(Some(RunExecution {
+                    status: "blocked".to_string(),
+                    exit_code: None,
+                    audit: RunAudit {
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        parsed_response: String::new(),
+                        outcome: "failed".to_string(),
+                        error: "token budget check failed: store read error".to_string(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        total_cost_usd: 0.0,
+                        duration_secs: 0.0,
+                    },
+                }));
+            }
         }
 
         // Resolve project directory

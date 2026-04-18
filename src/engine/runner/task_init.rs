@@ -94,6 +94,8 @@ pub enum BudgetCheckOutcome {
     Proceed,
     /// Budget is exceeded; task should be blocked.
     Exceeded { total_tokens: u64, max_tokens: u64 },
+    /// Store read failed; task should be blocked to avoid proceeding on uncertain budget state.
+    StoreReadError,
 }
 
 /// Check if the task has exceeded its token budget before running.
@@ -116,7 +118,14 @@ pub async fn check_token_budget(
         return BudgetCheckOutcome::Proceed;
     }
 
-    let (total_tokens, cost) = store::get_token_summary(store, repo, task_id).await;
+    let (total_tokens, cost) = match store::get_token_summary_result(store, repo, task_id).await {
+        Ok(Some((tokens, cost))) => (tokens, cost),
+        Ok(None) => (0, Default::default()),
+        Err(e) => {
+            tracing::error!(task_id, error = %e, "failed to read token summary from store — blocking task to prevent uncertain budget execution");
+            return BudgetCheckOutcome::StoreReadError;
+        }
+    };
 
     if total_tokens > max_tokens {
         tracing::warn!(

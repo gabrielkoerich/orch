@@ -8,6 +8,9 @@ use crate::store::{CostEstimate, MemoryEntry, Task, TaskStore, TokenUsage};
 use anyhow::anyhow;
 use std::sync::Arc;
 
+/// Result type for helpers that distinguish "not found" from "read error".
+pub type StoreResult<T> = anyhow::Result<Option<T>>;
+
 fn token_i64_to_u64_non_negative(tokens: i64) -> u64 {
     u64::try_from(tokens.max(0)).unwrap_or(0)
 }
@@ -359,43 +362,83 @@ pub async fn store_reset_failure_counters(
     }
 }
 
+/// Get token usage from the store, surfacing DB read errors.
+pub async fn get_token_usage_result(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+) -> StoreResult<TokenUsage> {
+    let s = store
+        .as_ref()
+        .ok_or_else(|| anyhow!("task store unavailable"))?;
+    let store_id = s
+        .resolve_task_id(repo, task_id)
+        .await?
+        .ok_or_else(|| anyhow!("task {}/{} not found in store", repo, task_id))?;
+    let task = s.get(store_id).await?;
+    Ok(Some(TokenUsage {
+        input_tokens: token_i64_to_u64_non_negative(task.input_tokens),
+        output_tokens: token_i64_to_u64_non_negative(task.output_tokens),
+    }))
+}
+
 /// Get token usage from the store.
+///
+/// Returns `TokenUsage::default()` when the store is unavailable or the task is not found.
+/// DB read errors are logged as warnings and return the default.
 pub async fn get_token_usage(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
     task_id: &str,
 ) -> TokenUsage {
-    if let Some(ref s) = store {
-        if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
-            if let Ok(task) = s.get(store_id).await {
-                return TokenUsage {
-                    input_tokens: token_i64_to_u64_non_negative(task.input_tokens),
-                    output_tokens: token_i64_to_u64_non_negative(task.output_tokens),
-                };
-            }
+    match get_token_usage_result(store, repo, task_id).await {
+        Ok(Some(usage)) => usage,
+        Ok(None) => TokenUsage::default(),
+        Err(e) => {
+            tracing::warn!(task_id, error = %e, "get_token_usage failed — returning zero usage");
+            TokenUsage::default()
         }
     }
-    TokenUsage::default()
+}
+
+/// Get cost estimate from the store, surfacing DB read errors.
+pub async fn get_cost_estimate_result(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+) -> StoreResult<CostEstimate> {
+    let s = store
+        .as_ref()
+        .ok_or_else(|| anyhow!("task store unavailable"))?;
+    let store_id = s
+        .resolve_task_id(repo, task_id)
+        .await?
+        .ok_or_else(|| anyhow!("task {}/{} not found in store", repo, task_id))?;
+    let task = s.get(store_id).await?;
+    Ok(Some(CostEstimate {
+        input_cost_usd: task.input_cost_usd,
+        output_cost_usd: task.output_cost_usd,
+        total_cost_usd: task.total_cost_usd,
+    }))
 }
 
 /// Get cost estimate from the store.
+///
+/// Returns `CostEstimate::default()` when the store is unavailable or the task is not found.
+/// DB read errors are logged as warnings and return the default.
 pub async fn get_cost_estimate(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
     task_id: &str,
 ) -> CostEstimate {
-    if let Some(ref s) = store {
-        if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
-            if let Ok(task) = s.get(store_id).await {
-                return CostEstimate {
-                    input_cost_usd: task.input_cost_usd,
-                    output_cost_usd: task.output_cost_usd,
-                    total_cost_usd: task.total_cost_usd,
-                };
-            }
+    match get_cost_estimate_result(store, repo, task_id).await {
+        Ok(Some(cost)) => cost,
+        Ok(None) => CostEstimate::default(),
+        Err(e) => {
+            tracing::warn!(task_id, error = %e, "get_cost_estimate failed — returning zero cost");
+            CostEstimate::default()
         }
     }
-    CostEstimate::default()
 }
 
 pub async fn get_total_tokens(store: &Option<Arc<TaskStore>>, repo: &str, task_id: &str) -> u64 {
@@ -403,42 +446,86 @@ pub async fn get_total_tokens(store: &Option<Arc<TaskStore>>, repo: &str, task_i
     usage.total_tokens()
 }
 
+/// Get both total tokens and cost estimate in a single store read, surfacing DB errors.
+pub async fn get_token_summary_result(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+) -> StoreResult<(u64, CostEstimate)> {
+    let s = store
+        .as_ref()
+        .ok_or_else(|| anyhow!("task store unavailable"))?;
+    let store_id = s
+        .resolve_task_id(repo, task_id)
+        .await?
+        .ok_or_else(|| anyhow!("task {}/{} not found in store", repo, task_id))?;
+    let task = s.get(store_id).await?;
+    let usage = TokenUsage {
+        input_tokens: token_i64_to_u64_non_negative(task.input_tokens),
+        output_tokens: token_i64_to_u64_non_negative(task.output_tokens),
+    };
+    let total = usage.total_tokens();
+    let cost = CostEstimate {
+        input_cost_usd: task.input_cost_usd,
+        output_cost_usd: task.output_cost_usd,
+        total_cost_usd: task.total_cost_usd,
+    };
+    Ok(Some((total, cost)))
+}
+
 /// Get both total tokens and cost estimate in a single store read.
+///
+/// Returns `(0, CostEstimate::default())` when the store is unavailable or the task is not found.
+/// DB read errors are logged as warnings and return the default.
 pub async fn get_token_summary(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
     task_id: &str,
 ) -> (u64, CostEstimate) {
-    if let Some(ref s) = store {
-        if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
-            if let Ok(task) = s.get(store_id).await {
-                let usage = TokenUsage {
-                    input_tokens: token_i64_to_u64_non_negative(task.input_tokens),
-                    output_tokens: token_i64_to_u64_non_negative(task.output_tokens),
-                };
-                let total = usage.total_tokens();
-                let cost = CostEstimate {
-                    input_cost_usd: task.input_cost_usd,
-                    output_cost_usd: task.output_cost_usd,
-                    total_cost_usd: task.total_cost_usd,
-                };
-                return (total, cost);
-            }
+    match get_token_summary_result(store, repo, task_id).await {
+        Ok(Some(summary)) => summary,
+        Ok(None) => (0, CostEstimate::default()),
+        Err(e) => {
+            tracing::warn!(task_id, error = %e, "get_token_summary failed — returning zero tokens/cost");
+            (0, CostEstimate::default())
         }
     }
-    (0, CostEstimate::default())
 }
 
+/// Get recent memory entries for a task, surfacing DB read errors.
+pub async fn get_recent_memory_result(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+    max: usize,
+) -> StoreResult<Vec<MemoryEntry>> {
+    let s = store
+        .as_ref()
+        .ok_or_else(|| anyhow!("task store unavailable"))?;
+    let store_id = s
+        .resolve_task_id(repo, task_id)
+        .await?
+        .ok_or_else(|| anyhow!("task {}/{} not found in store", repo, task_id))?;
+    let entries = s.recent_memory(store_id, max).await?;
+    Ok(Some(entries))
+}
+
+/// Get recent memory entries for a task.
+///
+/// Returns an empty vec when the store is unavailable or the task is not found.
+/// DB read errors are logged as warnings and return an empty vec.
 pub async fn get_recent_memory(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
     task_id: &str,
     max: usize,
 ) -> Vec<MemoryEntry> {
-    if let Some(ref s) = store {
-        if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
-            return s.recent_memory(store_id, max).await.unwrap_or_default();
+    match get_recent_memory_result(store, repo, task_id, max).await {
+        Ok(Some(entries)) => entries,
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            tracing::warn!(task_id, error = %e, "get_recent_memory failed — returning empty memory");
+            Vec::new()
         }
     }
-    Vec::new()
 }

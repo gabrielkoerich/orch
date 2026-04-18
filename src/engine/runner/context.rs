@@ -310,7 +310,16 @@ pub async fn build_memory_context(
 ) -> (String, Vec<crate::store::MemoryEntry>) {
     const MAX_MEMORY_ENTRIES: usize = 3;
 
-    let memory = store::get_recent_memory(store, repo, task_id, MAX_MEMORY_ENTRIES).await;
+    let memory = match store::get_recent_memory_result(store, repo, task_id, MAX_MEMORY_ENTRIES)
+        .await
+    {
+        Ok(Some(entries)) => entries,
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            tracing::warn!(task_id, error = %e, "build_memory_context: failed to read memory from store — proceeding without prior learnings");
+            Vec::new()
+        }
+    };
 
     if memory.is_empty() {
         return (String::new(), vec![]);
