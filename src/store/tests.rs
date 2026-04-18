@@ -4938,6 +4938,57 @@ async fn metrics_summary_by_repo_filters_correctly() {
 }
 
 #[tokio::test]
+async fn metrics_summary_rate_limits_are_repo_scoped() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let id1 = store
+        .create_internal("owner/orch", "Task A", "", "test", "", None)
+        .await
+        .unwrap();
+    let id2 = store
+        .create_internal("owner/bean", "Task B", "", "test", "", None)
+        .await
+        .unwrap();
+
+    store
+        .record_rate_limit("claude", "rate_limit", Some(&id1.to_string()))
+        .await
+        .unwrap();
+    store
+        .record_rate_limit("claude", "rate_limit", Some(&id1.to_string()))
+        .await
+        .unwrap();
+    store
+        .record_rate_limit("codex", "rate_limit", Some(&id2.to_string()))
+        .await
+        .unwrap();
+
+    let orch_summary = store
+        .get_metrics_summary_by_repo("owner/orch", 24)
+        .await
+        .unwrap();
+    assert_eq!(
+        orch_summary.rate_limits_24h, 2,
+        "orch should only see its own 2 rate limits"
+    );
+
+    let bean_summary = store
+        .get_metrics_summary_by_repo("owner/bean", 24)
+        .await
+        .unwrap();
+    assert_eq!(
+        bean_summary.rate_limits_24h, 1,
+        "bean should only see its own 1 rate limit"
+    );
+
+    let all_summary = store.get_metrics_summary_24h().await.unwrap();
+    assert_eq!(
+        all_summary.rate_limits_24h, 3,
+        "global should see all 3 rate limits"
+    );
+}
+
+#[tokio::test]
 async fn subscription_round_trip_with_multiple_channels() {
     let store = TaskStore::open_memory().await.unwrap();
 

@@ -434,9 +434,14 @@ impl TaskStore {
             .collect();
 
         let rate_limits: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM rate_limits WHERE occurred_at >= datetime('now', ?)",
+            "SELECT COUNT(*)
+             FROM rate_limits r
+             INNER JOIN tasks t ON r.task_id = CAST(t.id AS TEXT) OR r.task_id = t.external_id
+             WHERE r.occurred_at >= datetime('now', ?)
+             AND t.repo = ?",
         )
         .bind(&interval)
+        .bind(repo)
         .fetch_one(&self.pool)
         .await?;
 
