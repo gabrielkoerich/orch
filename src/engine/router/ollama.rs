@@ -68,6 +68,10 @@ impl OllamaRouter {
         task: &ExternalTask,
         config: &RouterConfig,
     ) -> anyhow::Result<RouteResult> {
+        if config.agents.is_empty() {
+            anyhow::bail!("no agent CLIs found in PATH");
+        }
+
         // Build routing prompt
         let prompt = self.build_routing_prompt(task, config)?;
 
@@ -381,5 +385,19 @@ mod tests {
         let router = make_router();
         assert_eq!(router.url, "http://localhost:11434");
         assert_eq!(router.model, "qwen2.5-coder:3b-instruct");
+    }
+
+    #[tokio::test]
+    async fn route_bails_when_no_agents_configured() {
+        let router = make_router();
+        let task = make_task("Title", "Body", vec![]);
+        let mut config = RouterConfig::default();
+        config.agents.clear();
+        let result = router.route(&task, &config).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "no agent CLIs found in PATH"
+        );
     }
 }
