@@ -1579,10 +1579,11 @@ mod tests {
 
     #[test]
     fn default_agents_constant() {
-        assert_eq!(DEFAULT_AGENTS.len(), 5);
+        assert_eq!(DEFAULT_AGENTS.len(), 6);
         assert!(DEFAULT_AGENTS.contains(&"claude"));
         assert!(DEFAULT_AGENTS.contains(&"kimi"));
         assert!(DEFAULT_AGENTS.contains(&"minimax"));
+        assert!(DEFAULT_AGENTS.contains(&"glm"));
     }
 
     #[test]

@@ -103,11 +103,11 @@ pub fn max_tasks_per_routing_tick() -> usize {
 
 /// Default agents to check in PATH.
 ///
-/// All 5 agents are listed, but availability is checked at runtime via
-/// `which::which()`. Agents not installed (e.g. kimi, minimax) are
+/// All 6 agents are listed, but availability is checked at runtime via
+/// `which::which()`. Agents not installed (e.g. kimi, minimax, glm) are
 /// automatically skipped during routing. Users can customize this list
 /// in their `config.yml` under `routing.agents`.
-pub const DEFAULT_AGENTS: &[&str] = &["claude", "codex", "opencode", "kimi", "minimax"];
+pub const DEFAULT_AGENTS: &[&str] = &["claude", "codex", "opencode", "kimi", "minimax", "glm"];
 
 /// Router configuration.
 #[derive(Debug, Clone)]
