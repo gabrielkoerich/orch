@@ -1100,6 +1100,7 @@ pub(crate) async fn tick_route_tasks(
                             ?e,
                             "failed to set internal status:routed"
                         );
+                        continue;
                     }
                 } else {
                     // Fire-and-forget: label operations are cosmetic (routing already
@@ -1149,6 +1150,7 @@ pub(crate) async fn tick_route_tasks(
                         .await
                     {
                         tracing::warn!(task_id = task.id.0, ?e, "failed to set status:routed");
+                        continue;
                     }
                 }
 
