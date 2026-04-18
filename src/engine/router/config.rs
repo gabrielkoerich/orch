@@ -329,22 +329,28 @@ impl RouterConfig {
         // Parse agents list from top-level `agents:` config key
         config.agents = crate::engine::configured_agents();
 
-        // Temporary operational toggle: allow disabling/deprioritizing the
-        // third-party "glm" agent without editing config files. This is
-        // controlled by the environment variable `ORCH_TEMP_DEPRIORITIZE_GLM`.
-        // When set (any non-empty value), remove `glm` from the configured
-        // agents so it will not be considered by the router. This keeps the
-        // change reversible (unset the env var to restore behavior) and avoids
-        // editing user config files.
-        if std::env::var("ORCH_TEMP_DEPRIORITIZE_GLM").is_ok() {
-            if config.agents.iter().any(|a| a == "glm") {
+        // Temporary operational toggle: allow disabling agents without editing
+        // config files. Controlled by ORCH_EXCLUDE_AGENTS env var (comma-separated
+        // list of agent names to exclude from routing). This keeps changes reversible
+        // (unset the env var to restore behavior) and avoids editing user config files.
+        // Example: ORCH_EXCLUDE_AGENTS=glm,some-other-agent
+        let exclude_agents = std::env::var("ORCH_EXCLUDE_AGENTS")
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !exclude_agents.is_empty() {
+            let original_len = config.agents.len();
+            config.agents.retain(|a| !exclude_agents.contains(a));
+            let removed_count = original_len - config.agents.len();
+            if removed_count > 0 {
                 tracing::warn!(
-                    "ORCH_TEMP_DEPRIORITIZE_GLM set: temporarily removing 'glm' from router agents"
-                );
-                config.agents.retain(|a| a != "glm");
-            } else {
-                tracing::debug!(
-                    "ORCH_TEMP_DEPRIORITIZE_GLM set but 'glm' not present in configured agents"
+                    "ORCH_EXCLUDE_AGENTS={}: temporarily removing {} agent(s) from router",
+                    exclude_agents.join(","),
+                    removed_count
                 );
             }
         }
