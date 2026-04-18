@@ -1931,16 +1931,32 @@ impl TaskStore {
                 .try_get("id")
                 .map_err(|e| anyhow::anyhow!("task row missing id: {e}"))?,
             external_id: row.try_get("external_id").unwrap_or(None),
-            repo: row.try_get("repo").unwrap_or_default(),
-            origin: row.try_get("origin").unwrap_or_default(),
-            title: row.try_get("title").unwrap_or_default(),
-            body: row.try_get("body").unwrap_or_default(),
+            repo: row
+                .try_get("repo")
+                .map_err(|e| anyhow::anyhow!("task row missing or invalid repo: {e}"))?,
+            origin: row
+                .try_get("origin")
+                .map_err(|e| anyhow::anyhow!("task row missing or invalid origin: {e}"))?,
+            title: row
+                .try_get("title")
+                .map_err(|e| anyhow::anyhow!("task row missing or invalid title: {e}"))?,
+            body: row
+                .try_get("body")
+                .map_err(|e| anyhow::anyhow!("task row missing or invalid body: {e}"))?,
             status: TaskStatus::from_str(&status_str)
                 .ok_or_else(|| anyhow::anyhow!("unknown task status: '{status_str}'"))?,
-            source: row.try_get("source").unwrap_or_default(),
-            source_id: row.try_get("source_id").unwrap_or_default(),
-            author: row.try_get("author").unwrap_or_default(),
-            url: row.try_get("url").unwrap_or_default(),
+            source: row
+                .try_get("source")
+                .map_err(|e| anyhow::anyhow!("task row missing or invalid source: {e}"))?,
+            source_id: row
+                .try_get("source_id")
+                .map_err(|e| anyhow::anyhow!("task row missing or invalid source_id: {e}"))?,
+            author: row
+                .try_get("author")
+                .map_err(|e| anyhow::anyhow!("task row missing or invalid author: {e}"))?,
+            url: row
+                .try_get("url")
+                .map_err(|e| anyhow::anyhow!("task row missing or invalid url: {e}"))?,
             labels: serde_json::from_str(&labels_str)
                 .inspect_err(
                     |e| tracing::warn!(error = %e, "corrupt labels JSON, defaulting to empty"),
@@ -2125,5 +2141,114 @@ impl TaskStore {
                 )
                 .unwrap_or_else(|_| serde_json::json!({})),
         })
+    }
+}
+
+#[cfg(test)]
+mod row_to_task_tests {
+    use super::*;
+
+    async fn store_with_task() -> (crate::store::TaskStore, i64) {
+        let store = crate::store::TaskStore::open_memory().await.unwrap();
+        let id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Test task".to_string(),
+                body: "Test body".to_string(),
+                source: "cron".to_string(),
+                source_id: "test-1".to_string(),
+                author: "tester".to_string(),
+                url: "https://example.com/1".to_string(),
+                labels: vec![],
+                parent_id: None,
+            })
+            .await
+            .unwrap();
+        (store, id)
+    }
+
+    // Each test selects all previously-required columns so that exactly the
+    // column under test is absent and triggers the Err path.
+    macro_rules! missing_column_test {
+        ($name:ident, $col:literal, $select:literal) => {
+            #[tokio::test]
+            async fn $name() {
+                let (store, id) = store_with_task().await;
+                let sql = format!("{} WHERE id = {id}", $select);
+                let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+                let err = TaskStore::row_to_task(&row).unwrap_err();
+                assert!(
+                    err.to_string().contains($col),
+                    "expected '{}' in error message, got: {err}",
+                    $col
+                );
+            }
+        };
+    }
+
+    missing_column_test!(
+        row_to_task_fails_on_missing_repo,
+        "repo",
+        "SELECT id, status FROM tasks"
+    );
+    missing_column_test!(
+        row_to_task_fails_on_missing_origin,
+        "origin",
+        "SELECT id, repo, status FROM tasks"
+    );
+    missing_column_test!(
+        row_to_task_fails_on_missing_title,
+        "title",
+        "SELECT id, repo, origin, status FROM tasks"
+    );
+    missing_column_test!(
+        row_to_task_fails_on_missing_body,
+        "body",
+        "SELECT id, repo, origin, title, status FROM tasks"
+    );
+    missing_column_test!(
+        row_to_task_fails_on_missing_source,
+        "source",
+        "SELECT id, repo, origin, title, body, status FROM tasks"
+    );
+    missing_column_test!(
+        row_to_task_fails_on_missing_source_id,
+        "source_id",
+        "SELECT id, repo, origin, title, body, source, status FROM tasks"
+    );
+    missing_column_test!(
+        row_to_task_fails_on_missing_author,
+        "author",
+        "SELECT id, repo, origin, title, body, source, source_id, status FROM tasks"
+    );
+    missing_column_test!(
+        row_to_task_fails_on_missing_url,
+        "url",
+        "SELECT id, repo, origin, title, body, source, source_id, author, status FROM tasks"
+    );
+
+    // Decode-error test: inject a BLOB with invalid UTF-8 bytes for the `repo`
+    // column. SQLite's type coercion converts NULL and integers to strings, so
+    // they don't produce a decode error. A raw BLOB that is not valid UTF-8
+    // (X'DEADBEEF') does cause `try_get::<String>` to fail with a ColumnDecode
+    // error, exercising the decode-error-propagation path that is distinct from
+    // the missing-column (ColumnNotFound) path tested above.
+    #[tokio::test]
+    async fn row_to_task_fails_on_decode_error_invalid_utf8_repo() {
+        let (store, id) = store_with_task().await;
+        // X'DEADBEEF' is a 4-byte BLOB; bytes 0xDE 0xAD 0xBE 0xEF are not
+        // valid UTF-8, so try_get::<String>("repo") will fail with a decode error.
+        let sql = format!(
+            "SELECT id, X'DEADBEEF' as repo, origin, title, body, status, \
+             source, source_id, author, url FROM tasks WHERE id = {id}"
+        );
+        let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+        let err = TaskStore::row_to_task(&row).unwrap_err();
+        assert!(
+            err.to_string().contains("repo"),
+            "expected 'repo' in error message, got: {err}"
+        );
     }
 }
