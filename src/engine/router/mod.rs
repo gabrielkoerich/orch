@@ -564,7 +564,13 @@ impl Router {
     ) -> Option<Vec<String>> {
         let no_code_agent = get_task_field_direct(store, repo, task_id, "no_code_last_agent")
             .await
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    task_id,
+                    "no_code_last_agent DB read returned None — loop detection may be impaired"
+                );
+                String::new()
+            });
         if no_code_agent.is_empty() || !candidates.iter().any(|a| a == &no_code_agent) {
             return None;
         }
@@ -853,9 +859,12 @@ impl Router {
                     // If the LLM selected the no-code agent, filter it out and
                     // pick an alternative (#2410). Re-use the existing fallback logic.
                     let no_code_agent =
-                        get_task_field_direct(store, repo, &task.id.0, "no_code_last_agent")
-                            .await
-                            .unwrap_or_default();
+                         get_task_field_direct(store, repo, &task.id.0, "no_code_last_agent")
+                             .await
+                             .unwrap_or_else(|| {
+                                 tracing::warn!(task_id = %task.id.0, "no_code_last_agent DB read returned None — loop detection may be impaired");
+                                 String::new()
+                             });
                     if result.agent == no_code_agent {
                         // Pick the first agent that isn't the no-code agent.
                         let fallback_agent = candidates
