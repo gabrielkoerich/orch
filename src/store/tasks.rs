@@ -1686,10 +1686,18 @@ impl TaskStore {
         .execute(&self.pool)
         .await?;
         if let Some(run_ctx) = run_ctx {
-            let task_id: i64 = run_ctx.try_get("task_id").unwrap_or(0);
-            let run_type: String = run_ctx.try_get("run_type").unwrap_or_default();
-            let agent: String = run_ctx.try_get("agent").unwrap_or_default();
-            let model: String = run_ctx.try_get("model").unwrap_or_default();
+            let task_id: i64 = run_ctx.try_get("task_id").map_err(|e| {
+                anyhow::anyhow!("failed to decode task_id from run_id {}: {e}", run.run_id)
+            })?;
+            let run_type: String = run_ctx.try_get("run_type").map_err(|e| {
+                anyhow::anyhow!("failed to decode run_type from run_id {}: {e}", run.run_id)
+            })?;
+            let agent: String = run_ctx.try_get("agent").map_err(|e| {
+                anyhow::anyhow!("failed to decode agent from run_id {}: {e}", run.run_id)
+            })?;
+            let model: String = run_ctx.try_get("model").map_err(|e| {
+                anyhow::anyhow!("failed to decode model from run_id {}: {e}", run.run_id)
+            })?;
             if run.outcome == "timeout" {
                 self.append_activity(
                     task_id,
