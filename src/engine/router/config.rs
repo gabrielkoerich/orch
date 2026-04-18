@@ -329,6 +329,32 @@ impl RouterConfig {
         // Parse agents list from top-level `agents:` config key
         config.agents = crate::engine::configured_agents();
 
+        // Temporary operational toggle: allow disabling agents without editing
+        // config files. Controlled by ORCH_EXCLUDE_AGENTS env var (comma-separated
+        // list of agent names to exclude from routing). This keeps changes reversible
+        // (unset the env var to restore behavior) and avoids editing user config files.
+        // Example: ORCH_EXCLUDE_AGENTS=glm,some-other-agent
+        let exclude_agents = std::env::var("ORCH_EXCLUDE_AGENTS")
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !exclude_agents.is_empty() {
+            let original_len = config.agents.len();
+            config.agents.retain(|a| !exclude_agents.contains(a));
+            let removed_count = original_len - config.agents.len();
+            if removed_count > 0 {
+                tracing::warn!(
+                    "ORCH_EXCLUDE_AGENTS={}: temporarily removing {} agent(s) from router",
+                    exclude_agents.join(","),
+                    removed_count
+                );
+            }
+        }
+
         if let Ok(max_attempts) = crate::config::get("router.max_route_attempts") {
             if let Ok(n) = max_attempts.parse::<u32>() {
                 config.max_route_attempts = n;
