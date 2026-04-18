@@ -378,7 +378,10 @@ impl TaskStore {
                 SELECT m.outcome, m.complexity, m.duration_seconds, m.agent,
                     COALESCE(NULLIF(m.repo, ''), t.repo) AS resolved_repo
                 FROM task_metrics m
-                LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
+                LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT)
+                    OR (m.task_id = t.external_id AND NOT EXISTS (
+                        SELECT 1 FROM tasks t2 WHERE t2.id = CAST(m.task_id AS INTEGER) AND t2.repo = t.repo
+                    ))
                 WHERE m.completed_at >= datetime('now', ?)
             )
             SELECT
@@ -405,7 +408,10 @@ impl TaskStore {
             "SELECT m.agent, COUNT(*) as total,
                 SUM(CASE WHEN m.outcome = 'success' THEN 1 ELSE 0 END) as success_count
              FROM task_metrics m
-             LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
+             LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT)
+                 OR (m.task_id = t.external_id AND NOT EXISTS (
+                     SELECT 1 FROM tasks t2 WHERE t2.id = CAST(m.task_id AS INTEGER) AND t2.repo = t.repo
+                 ))
              WHERE m.completed_at >= datetime('now', ?)
              AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?
              GROUP BY m.agent",
@@ -475,7 +481,10 @@ impl TaskStore {
                 COALESCE(SUM(m.total_cost_usd), 0.0) as total_cost_usd,
                 COUNT(*) as task_count
          FROM task_metrics m
-         LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
+         LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT)
+             OR (m.task_id = t.external_id AND NOT EXISTS (
+                 SELECT 1 FROM tasks t2 WHERE t2.id = CAST(m.task_id AS INTEGER) AND t2.repo = t.repo
+             ))
          WHERE m.completed_at >= datetime('now', ?)
          AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
         )
