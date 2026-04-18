@@ -2228,4 +2228,27 @@ mod row_to_task_tests {
         "url",
         "SELECT id, repo, origin, title, body, source, source_id, author, status FROM tasks"
     );
+
+    // Decode-error test: inject a BLOB with invalid UTF-8 bytes for the `repo`
+    // column. SQLite's type coercion converts NULL and integers to strings, so
+    // they don't produce a decode error. A raw BLOB that is not valid UTF-8
+    // (X'DEADBEEF') does cause `try_get::<String>` to fail with a ColumnDecode
+    // error, exercising the decode-error-propagation path that is distinct from
+    // the missing-column (ColumnNotFound) path tested above.
+    #[tokio::test]
+    async fn row_to_task_fails_on_decode_error_invalid_utf8_repo() {
+        let (store, id) = store_with_task().await;
+        // X'DEADBEEF' is a 4-byte BLOB; bytes 0xDE 0xAD 0xBE 0xEF are not
+        // valid UTF-8, so try_get::<String>("repo") will fail with a decode error.
+        let sql = format!(
+            "SELECT id, X'DEADBEEF' as repo, origin, title, body, status, \
+             source, source_id, author, url FROM tasks WHERE id = {id}"
+        );
+        let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+        let err = TaskStore::row_to_task(&row).unwrap_err();
+        assert!(
+            err.to_string().contains("repo"),
+            "expected 'repo' in error message, got: {err}"
+        );
+    }
 }
