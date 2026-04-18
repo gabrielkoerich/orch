@@ -39,12 +39,14 @@ mod tasks;
 pub use control::{parse_since_duration, ChatCostSummary, ControlMessage, MemoryEntry};
 #[allow(unused_imports)]
 pub use helpers::{
-    get_cost_estimate, get_recent_memory, get_task_field, get_task_field_direct, get_token_summary,
-    get_token_usage, get_total_tokens, opt_store_get_task, opt_store_get_task_by_id,
-    resolve_store_id, review_session_expected, set_review_session_expected, store_increment,
-    store_increment_by_id, store_log_activity, store_reset_counters, store_reset_failure_counters,
-    store_set, store_set_by_id, store_set_result, store_set_result_by_id, store_touch_updated_at,
-    store_touch_updated_at_by_id,
+    get_cost_estimate, get_cost_estimate_result, get_recent_memory, get_recent_memory_result,
+    get_task_field, get_task_field_direct, get_token_summary, get_token_summary_result,
+    get_token_usage, get_token_usage_result, get_total_tokens, opt_store_get_task,
+    opt_store_get_task_by_id, resolve_store_id, review_session_expected,
+    set_review_session_expected, store_increment, store_increment_by_id, store_log_activity,
+    store_reset_counters, store_reset_failure_counters, store_set, store_set_by_id,
+    store_set_result, store_set_result_by_id, store_touch_updated_at, store_touch_updated_at_by_id,
+    StoreResult,
 };
 #[allow(unused_imports)]
 pub use jobs::JobState;

@@ -5990,3 +5990,118 @@ async fn task_row_deserialization_no_oob_panic() {
     assert_eq!(task.auto_unblock_count, 0);
     assert_eq!(task.ci_recovery_count, 0);
 }
+
+// Tests for the *_result variants — verify they propagate errors instead of
+// returning defaults, so callers like check_token_budget() can fail-safe.
+
+#[tokio::test]
+async fn helper_get_token_usage_result_without_store_returns_err() {
+    let store: Option<Arc<TaskStore>> = None;
+    let res = get_token_usage_result(&store, "owner/repo", "any").await;
+    assert!(res.is_err());
+}
+
+#[tokio::test]
+async fn helper_get_cost_estimate_result_without_store_returns_err() {
+    let store: Option<Arc<TaskStore>> = None;
+    let res = get_cost_estimate_result(&store, "owner/repo", "any").await;
+    assert!(res.is_err());
+}
+
+#[tokio::test]
+async fn helper_get_token_summary_result_without_store_returns_err() {
+    let store: Option<Arc<TaskStore>> = None;
+    let res = get_token_summary_result(&store, "owner/repo", "any").await;
+    assert!(res.is_err());
+}
+
+#[tokio::test]
+async fn helper_get_recent_memory_result_without_store_returns_err() {
+    let store: Option<Arc<TaskStore>> = None;
+    let res = get_recent_memory_result(&store, "owner/repo", "any", 10).await;
+    assert!(res.is_err());
+}
+
+#[tokio::test]
+async fn helper_get_token_summary_result_not_found_returns_err() {
+    // Store is available but the task doesn't exist — result variant returns error
+    // (not Ok(None)), so callers can distinguish not-found from store-error.
+    let store = Arc::new(TaskStore::open_memory().await.unwrap());
+    store
+        .create(&NewTask {
+            external_id: Some("not-this-task".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Different task".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let opt_store = Some(store);
+    let res = get_token_summary_result(&opt_store, "owner/repo", "nonexistent-task-12345").await;
+    assert!(
+        res.is_err(),
+        "get_token_summary_result should return error for missing task, not Ok(None)"
+    );
+}
+
+#[tokio::test]
+async fn helper_get_recent_memory_result_not_found_returns_err() {
+    let store = Arc::new(TaskStore::open_memory().await.unwrap());
+    store
+        .create(&NewTask {
+            external_id: Some("not-this-task".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Different task".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let opt_store = Some(store);
+    let res =
+        get_recent_memory_result(&opt_store, "owner/repo", "nonexistent-task-12345", 10).await;
+    assert!(
+        res.is_err(),
+        "get_recent_memory_result should return error for missing task, not Ok(None)"
+    );
+}
+
+#[tokio::test]
+async fn helper_get_token_summary_result_happy_path() {
+    let store = Arc::new(TaskStore::open_memory().await.unwrap());
+    let id = store
+        .create(&NewTask {
+            external_id: Some("token-summary-test".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Token summary test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    store
+        .set_fields(
+            id,
+            &[
+                ("input_tokens", serde_json::json!(100)),
+                ("output_tokens", serde_json::json!(200)),
+                ("input_cost_usd", serde_json::json!(0.01)),
+                ("output_cost_usd", serde_json::json!(0.02)),
+                ("total_cost_usd", serde_json::json!(0.03)),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let opt_store = Some(store);
+    let res = get_token_summary_result(&opt_store, "owner/repo", "token-summary-test")
+        .await
+        .unwrap();
+    let (tokens, cost) = res.unwrap();
+    assert_eq!(tokens, 300);
+    assert!((cost.total_cost_usd - 0.03).abs() < f64::EPSILON);
+}
