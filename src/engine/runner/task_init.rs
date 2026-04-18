@@ -5,7 +5,7 @@
 
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask};
 use crate::config;
-use crate::engine::router::get_route_result;
+use crate::engine::router::{get_route_result, RouteResultError};
 use crate::store;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
@@ -237,9 +237,40 @@ pub async fn prepare_task(
     // This prevents non-fast-forward push failures when the task is re-dispatched.
     git_ops::rebase_on_default(&wt.work_dir, &wt.default_branch).await;
 
-    // Get routing result
+    // Get routing result — distinguish between "no route" and store errors
     let route_result = if let Some(ref s) = store {
-        get_route_result(s, repo, task_id).await.ok()
+        match get_route_result(s, repo, task_id).await {
+            Ok(r) => Some(r),
+            // NoAgent means the router hasn't set a route for this task yet;
+            // fall back to the default agent (caller may re-route later).
+            Err(RouteResultError::NoAgent { .. }) => {
+                tracing::warn!(task_id, "routed task has no agent — using fallback");
+                None
+            }
+            // Any other error indicates a store/IO problem — surface it so the
+            // caller doesn't silently proceed with an incorrect fallback.
+            Err(e) => {
+                tracing::error!(task_id, error = %e, "failed to get route result from store — blocking task");
+                // Persist the error to the task result so operators can see it.
+                let err_msg = format!("failed to read routing result: {e}");
+                if let Err(set_err) = store::store_set_result(
+                    store,
+                    repo,
+                    task_id,
+                    &[("last_error", serde_json::json!(err_msg.clone()))],
+                )
+                .await
+                {
+                    tracing::warn!(task_id, err = %set_err, "failed to write route read error to store");
+                }
+                // Attempt to clean up the worktree we created to avoid leaving
+                // partial artifacts behind.
+                if let Some(s) = store {
+                    let _ = crate::engine::cleanup::cleanup_task_worktree(task_id, repo, s).await;
+                }
+                return Err(anyhow::anyhow!(err_msg));
+            }
+        }
     } else {
         None
     };
