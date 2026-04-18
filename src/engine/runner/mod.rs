@@ -752,6 +752,13 @@ impl TaskRunner {
                     fallback::ErrorHandleResult::EarlyReturn { status } => {
                         // Task rerouted — clean up tmux session and env secrets
                         session::cleanup_session(task_id, &tmux, &tmux_session).await;
+                        // The fallback handler already writes a sanitized `last_error`
+                        // into the store for EarlyReturn paths (reroutes / needs_review).
+                        // Passing the raw agent_err here would record noisy provider
+                        // payloads (e.g. full api_retry NDJSON). Leave error_override
+                        // as None so build_run_audit will prefer the store's last_error
+                        // (see src/engine/runner/fallback.rs which persists a compact
+                        // summary for rate-limit and reroute cases).
                         let audit = self
                             .build_run_audit(RunAuditInput {
                                 task_id,
@@ -760,7 +767,7 @@ impl TaskRunner {
                                 raw_stdout: &session_output.raw_stdout,
                                 raw_stderr: &session_output.raw_stderr,
                                 started_at,
-                                error_override: Some(agent_err.to_string()),
+                                error_override: None,
                                 elapsed_secs: session_output.elapsed_secs,
                                 push_failed: false,
                                 budget_exceeded: false,
