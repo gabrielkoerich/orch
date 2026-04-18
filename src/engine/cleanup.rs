@@ -222,6 +222,9 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     );
 
     // Prefetch all cleaned external IDs in one query instead of N+1 per-task lookups.
+    // NOTE: This is now primarily a hint to skip processing, NOT a correctness
+    // guarantee — tasks with external_id NOT in the store at all (or mismatched
+    // repo) will still be cleaned by iterating all worktree directories.
     let already_cleaned = store.cleaned_external_ids(repo).await.unwrap_or_default();
 
     let mut cleaned_any = false;
@@ -239,6 +242,94 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
             }
             Err(e) => {
                 tracing::warn!(task_id, err = %e, "worktree cleanup failed for task");
+            }
+        }
+    }
+
+    // ── Orphaned worktree scanner ─────────────────────────────────────────────
+    //
+    // Even if every task in our list was already cleaned (or had no worktree),
+    // there may be worktree directories on disk that are not owned by any task.
+    // This happens when a task was ingested into the store but its worktree_cleaned
+    // flag was never set — e.g. because the task was never in `list_all_by_status`
+    // (unknown repo / missing from store at cleanup time), or the cleanup skipped
+    // due to TTL guard and never retried.
+    //
+    // We scan all worktree directories in this repo's worktrees subdirectory and
+    // remove any that are not referenced by an existing task. This catches the
+    // "done but worktree not cleaned" case that `orch doctor` reports.
+    let worktrees_base = match crate::home::worktrees_dir() {
+        Ok(base) => Some(base),
+        Err(e) => {
+            tracing::debug!(err = %e, "worktrees_dir() unavailable — skipping orphan scan");
+            None
+        }
+    };
+
+    if let Some(base) = worktrees_base {
+        let project = repo
+            .rsplit('/')
+            .next()
+            .unwrap_or(repo)
+            .trim_end_matches(".git");
+        let repo_worktrees = base.join(project);
+
+        // Build set of all known worktree paths for this repo (all statuses).
+        let mut combined: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Ok(tasks) = store.list_all(repo).await {
+            for t in tasks {
+                if !t.worktree.is_empty() {
+                    combined.insert(t.worktree);
+                }
+            }
+        }
+
+        // Also include active worktrees (in case task is in-memory but has a dir).
+        if let Ok(project_dir) = resolve_project_dir_for_repo(repo) {
+            if let Ok(active_wts) =
+                crate::engine::runner::worktree::list_project_worktrees(&project_dir).await
+            {
+                for wt in active_wts {
+                    combined.insert(wt.to_string_lossy().to_string());
+                }
+            }
+        }
+
+        // Scan all branch directories and remove orphaned ones.
+        if let Ok(mut entries) = tokio::fs::read_dir(&repo_worktrees).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let entry_meta = match entry.metadata().await {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if !entry_meta.is_dir() {
+                    continue;
+                }
+                let wt_path = entry.path().to_string_lossy().to_string();
+                if combined.contains(&wt_path) {
+                    continue;
+                }
+                tracing::info!(worktree = %wt_path, "found orphaned worktree — attempting cleanup");
+                match resolve_repo_root_for_orphaned_worktree(&entry.path()).await {
+                    Ok(repo_root) => {
+                        let removed = remove_worktree_and_branch(
+                            "orphan-scan",
+                            &entry.path(),
+                            None,
+                            std::path::Path::new(&repo_root),
+                            false,
+                        )
+                        .await;
+                        if removed {
+                            tracing::info!(worktree = %wt_path, "orphaned worktree removed");
+                        } else {
+                            tracing::warn!(worktree = %wt_path, "orphaned worktree could not be removed");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(worktree = %wt_path, err = %e, "could not resolve repo root for orphaned worktree");
+                    }
+                }
             }
         }
     }
@@ -1038,6 +1129,50 @@ pub(crate) async fn resolve_repo_root(repo: &str) -> anyhow::Result<String> {
         paths.len(),
         bare.display()
     )
+}
+
+/// Resolve the project directory for a given repo string.
+///
+/// Replicates the logic from `TaskRunner::resolve_project_dir()` without requiring
+/// a Runner instance. Used by the orphan scanner to enumerate active worktrees.
+fn resolve_project_dir_for_repo(repo: &str) -> anyhow::Result<std::path::PathBuf> {
+    // Check PROJECT_DIR env var first
+    if let Ok(dir) = std::env::var("PROJECT_DIR") {
+        if !dir.is_empty() {
+            return Ok(std::path::PathBuf::from(dir));
+        }
+    }
+
+    // Look up registered projects in config
+    if let Ok(paths) = crate::config::get_project_paths() {
+        for path_str in &paths {
+            let path = std::path::Path::new(path_str);
+            let orch_yml = path.join(".orch.yml");
+            let legacy = path.join(".orchestrator.yml");
+            let config_file = if std::path::Path::new(&orch_yml).exists() {
+                orch_yml
+            } else if std::path::Path::new(&legacy).exists() {
+                legacy
+            } else {
+                continue;
+            };
+            if let Ok(content) = std::fs::read_to_string(&config_file) {
+                if let Ok(doc) = serde_norway::from_str::<serde_norway::Value>(&content) {
+                    if let Some(r) = doc
+                        .get("gh")
+                        .and_then(|gh| gh.get("repo"))
+                        .and_then(|r| r.as_str())
+                    {
+                        if r == repo {
+                            return Ok(path_str.clone().into());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    anyhow::bail!("project dir not found for repo: {repo}")
 }
 
 /// Check for merged PRs and update task status accordingly.
