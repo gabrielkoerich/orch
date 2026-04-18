@@ -1577,19 +1577,6 @@ pub async fn serve() -> anyhow::Result<()> {
         tokio::select! {
             _ = interval.tick() => {
                 let tick_start = std::time::Instant::now();
-                // Drain any pending weight signals from completed tasks
-                while let Ok(signal) = weight_rx.try_recv() {
-                    let mut rw = router.write().await;
-                    match signal {
-                        WeightSignal::RateLimited { ref agent } => {
-                            rw.record_rate_limit(agent);
-                        }
-                        WeightSignal::Success { ref agent } => {
-                            rw.record_success(agent);
-                        }
-                        WeightSignal::Blocked | WeightSignal::None => {}
-                    }
-                }
 
                 // Tick weight recovery for rate-limited agents
                 {
@@ -1638,6 +1625,21 @@ pub async fn serve() -> anyhow::Result<()> {
                         }).await;
                     }
                     drop(router_guard);
+
+                    // Drain pending weight signals after tick processing so the router
+                    // learns from outcomes produced by this iteration's task dispatches.
+                    while let Ok(signal) = weight_rx.try_recv() {
+                        let mut rw = router.write().await;
+                        match signal {
+                            WeightSignal::RateLimited { ref agent } => {
+                                rw.record_rate_limit(agent);
+                            }
+                            WeightSignal::Success { ref agent } => {
+                                rw.record_success(agent);
+                            }
+                            WeightSignal::Blocked | WeightSignal::None => {}
+                        }
+                    }
 
                     // Periodic sync (less frequent) — spawned as a background task so it
                     // cannot block the main tick loop. A stalled sync (hung HTTP call, slow
@@ -1797,6 +1799,20 @@ pub async fn serve() -> anyhow::Result<()> {
                         }).await;
                     }
                     drop(router_guard);
+
+                    // Drain pending weight signals after webhook-triggered tick processing.
+                    while let Ok(signal) = weight_rx.try_recv() {
+                        let mut rw = router.write().await;
+                        match signal {
+                            WeightSignal::RateLimited { ref agent } => {
+                                rw.record_rate_limit(agent);
+                            }
+                            WeightSignal::Success { ref agent } => {
+                                rw.record_success(agent);
+                            }
+                            WeightSignal::Blocked | WeightSignal::None => {}
+                        }
+                    }
                 }
 
                 // Also reset the interval so we don't get a redundant tick right after
