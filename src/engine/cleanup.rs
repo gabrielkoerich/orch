@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::sleep;
+use tokio::time::timeout;
 
 use super::sync::ReviewTaskSnapshot;
 
@@ -337,38 +338,52 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     // Prune stale worktree metadata and pull main after cleanup.
     if cleaned_any && !opts.dry_run {
         if let Ok(repo_root) = resolve_repo_root(repo).await {
+            const GIT_TIMEOUT: Duration = Duration::from_secs(60);
+
             // Prune stale .git/worktrees/ entries whose directories no longer exist.
-            let prune_result = Command::new("git")
-                .args(["-C", &repo_root, "worktree", "prune"])
-                .output_with_context()
-                .await;
+            let prune_result = timeout(
+                GIT_TIMEOUT,
+                Command::new("git")
+                    .args(["-C", &repo_root, "worktree", "prune"])
+                    .output_with_context(),
+            )
+            .await;
             match prune_result {
-                Ok(output) if output.status.success() => {
+                Ok(Ok(output)) if output.status.success() => {
                     tracing::debug!(%repo, "pruned stale worktree metadata");
                 }
-                Ok(output) => {
+                Ok(Ok(output)) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     tracing::warn!(%repo, err = %stderr, "git worktree prune failed");
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::warn!(%repo, err = %e, "git worktree prune failed");
+                }
+                Err(_) => {
+                    tracing::warn!(%repo, "git worktree prune timed out after 60s");
                 }
             }
 
-            let pull_result = Command::new("git")
-                .args(["-C", &repo_root, "pull", "--ff-only"])
-                .output_with_context()
-                .await;
+            let pull_result = timeout(
+                GIT_TIMEOUT,
+                Command::new("git")
+                    .args(["-C", &repo_root, "pull", "--ff-only"])
+                    .output_with_context(),
+            )
+            .await;
             match pull_result {
-                Ok(output) if output.status.success() => {
+                Ok(Ok(output)) if output.status.success() => {
                     tracing::info!(%repo, "pulled main after worktree cleanup");
                 }
-                Ok(output) => {
+                Ok(Ok(output)) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     tracing::debug!(%repo, err = %stderr, "git pull skipped after cleanup");
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::debug!(%repo, err = %e, "git pull failed after cleanup");
+                }
+                Err(_) => {
+                    tracing::debug!(%repo, "git pull timed out after 60s");
                 }
             }
         }
@@ -401,10 +416,29 @@ pub(crate) async fn cleanup_task_worktree(
     // Only pull if cleanup actually happened (not skipped due to active session).
     if cleaned {
         if let Ok(repo_root) = resolve_repo_root(repo).await {
-            let _ = Command::new("git")
-                .args(["-C", &repo_root, "pull", "--ff-only"])
-                .output_with_context()
-                .await;
+            const GIT_TIMEOUT: Duration = Duration::from_secs(60);
+            let pull_result = timeout(
+                GIT_TIMEOUT,
+                Command::new("git")
+                    .args(["-C", &repo_root, "pull", "--ff-only"])
+                    .output_with_context(),
+            )
+            .await;
+            match pull_result {
+                Ok(Ok(output)) if output.status.success() => {
+                    tracing::debug!(%repo, "pulled main after task cleanup");
+                }
+                Ok(Ok(output)) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::debug!(%repo, err = %stderr, "git pull skipped after task cleanup");
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(%repo, err = %e, "git pull failed after task cleanup");
+                }
+                Err(_) => {
+                    tracing::debug!(%repo, "git pull timed out after 60s");
+                }
+            }
         }
     }
 
