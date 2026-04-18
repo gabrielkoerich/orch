@@ -381,7 +381,7 @@ pub(crate) async fn tick_detect_silent_agents(
                 // directly without an LLM re-routing cycle. Clearing model forces
                 // model_for_complexity to pick the best available model for the new agent.
                 store_set_by_id(
-                    &Some(Arc::clone(store)),
+                    &Some(store),
                     store_id,
                     &[
                         ("agent", serde_json::json!(fallback)),
@@ -398,7 +398,7 @@ pub(crate) async fn tick_detect_silent_agents(
                 .await;
             } else {
                 store_set_by_id(
-                    &Some(Arc::clone(store)),
+                    &Some(store),
                     store_id,
                     &[
                         ("agent", serde_json::Value::Null),
@@ -638,7 +638,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
         };
         if let Some(store_id) = resolved_store_id {
             store_set_by_id(
-                &Some(Arc::clone(store)),
+                &Some(store),
                 store_id,
                 &[
                     ("agent", serde_json::Value::Null),
@@ -830,7 +830,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
         };
         if let Some(store_id) = resolved_store_id {
             store_set_by_id(
-                &Some(Arc::clone(store)),
+                &Some(store),
                 store_id,
                 &[
                     ("agent", serde_json::Value::Null),

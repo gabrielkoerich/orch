@@ -533,7 +533,7 @@ async fn helper_store_set_by_id_writes_fields() {
 
     let opt_store = Some(store.clone());
     store_set_by_id(
-        &opt_store,
+        &opt_store.as_ref(),
         id,
         &[
             ("branch", serde_json::json!("fix-bug-by-id")),

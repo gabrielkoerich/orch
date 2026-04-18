@@ -194,7 +194,7 @@ impl<'a> StoreCtx<'a> {
     /// Write fields, using the pre-resolved `store_id` when available.
     async fn set(&self, fields: &[(&str, serde_json::Value)]) {
         if let Some(store_id) = self.store_id_opt {
-            store::store_set_by_id(self.store, store_id, fields).await;
+            store::store_set_by_id(&self.store.as_ref(), store_id, fields).await;
         } else {
             store::store_set(self.store, self.repo, self.task_id, fields).await;
         }
