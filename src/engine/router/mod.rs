@@ -863,15 +863,23 @@ impl Router {
                             .find(|a| a.as_str() != no_code_agent)
                             .cloned()
                             .unwrap_or_else(|| candidates[0].clone());
-                        if fallback_agent != result.agent {
-                            tracing::info!(
+                        if fallback_agent.as_str() == no_code_agent {
+                            tracing::warn!(
                                 task_id = %task.id.0,
-                                llm_selected = %result.agent,
-                                skipped = %no_code_agent,
-                                fallback = %fallback_agent,
-                                "LLM selected the no-code agent — routing to alternative"
+                                no_code_agent = %no_code_agent,
+                                complexity = %result.complexity,
+                                "all available agents are the no-code agent — waiting for another agent"
                             );
+                            self.wait_for_cooldown(Some(&result.complexity)).await?;
+                            continue;
                         }
+                        tracing::info!(
+                            task_id = %task.id.0,
+                            llm_selected = %result.agent,
+                            skipped = %no_code_agent,
+                            fallback = %fallback_agent,
+                            "LLM selected the no-code agent — routing to alternative"
+                        );
                         let fallback_model = self.config.model_for_complexity(
                             &fallback_agent,
                             &result.complexity,
