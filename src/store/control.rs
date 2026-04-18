@@ -218,10 +218,10 @@ impl TaskStore {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| r.try_get::<String, _>("summary").unwrap_or_default())
-            .collect())
+        rows.iter()
+            .map(|r| r.try_get::<String, _>("summary"))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     fn row_to_control_message(

@@ -5365,6 +5365,52 @@ async fn control_recent_summaries() {
 }
 
 #[tokio::test]
+async fn control_recent_summaries_propagates_decode_errors() {
+    // Regression: rows with non-string summary (BLOB) must not be silently
+    // defaulted to empty string — the error must propagate.
+    let store = TaskStore::open_memory().await.unwrap();
+
+    // Insert a valid summary row first.
+    store
+        .insert_control_message(
+            "default",
+            "assistant",
+            "cli",
+            None,
+            "valid",
+            Some("summary that is a real string"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Insert a row with a BLOB value in the summary column (not valid UTF-8).
+    // SQLite stores this as BLOB; reading it as String via try_get fails.
+    sqlx::query(
+        "INSERT INTO control_messages
+         (session_id, role, channel, content, summary, created_at)
+         VALUES ('default', 'assistant', 'cli', 'msg', X'01020304', datetime('now'))",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    // The decode error on the BLOB row must propagate, NOT produce an
+    // empty-string entry or silently succeed.
+    let result = store.control_recent_summaries("default", 10).await;
+    assert!(
+        result.is_err(),
+        "expected decode error for BLOB summary row, got Ok: {:?}",
+        result
+    );
+}
+
+#[tokio::test]
 async fn control_sessions_are_isolated() {
     let store = TaskStore::open_memory().await.unwrap();
     store
