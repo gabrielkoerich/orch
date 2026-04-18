@@ -1050,12 +1050,11 @@ pub(crate) async fn resolve_repo_root_for_orphaned_worktree(
                     .map(|d| d.join(parts[0]).join(format!("{}.git", parts[1])))
                     .unwrap_or_default()
             } else {
-                crate::home::projects_dir()
-                    .map(|d| {
-                        d.join("gabrielkoerich")
-                            .join(format!("{}.git", project_name))
-                    })
-                    .unwrap_or_default()
+                return Err(anyhow::anyhow!(
+                    "cannot determine owner for single-segment project name '{}' — \
+                     bare repo location is ambiguous; register the project with 'owner/repo' format",
+                    project_name
+                ));
             };
             if tokio::fs::try_exists(&bare).await.unwrap_or(false) {
                 return Ok(bare.display().to_string());
