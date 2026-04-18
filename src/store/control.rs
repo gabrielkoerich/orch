@@ -230,19 +230,19 @@ impl TaskStore {
         use sqlx::Row;
         Ok(ControlMessage {
             id: row.try_get("id")?,
-            session_id: row.try_get("session_id").unwrap_or_default(),
-            role: row.try_get("role").unwrap_or_default(),
-            channel: row.try_get("channel").unwrap_or_default(),
-            channel_thread: row.try_get("channel_thread").unwrap_or(None),
-            content: row.try_get("content").unwrap_or_default(),
-            summary: row.try_get("summary").unwrap_or(None),
-            model: row.try_get("model").unwrap_or(None),
-            agent: row.try_get("agent").unwrap_or(None),
-            input_tokens: row.try_get("input_tokens").unwrap_or(None),
-            output_tokens: row.try_get("output_tokens").unwrap_or(None),
-            tokens_used: row.try_get("tokens_used").unwrap_or(None),
-            cost_usd: row.try_get("cost_usd").unwrap_or(None),
-            created_at: row.try_get("created_at").unwrap_or_default(),
+            session_id: row.try_get("session_id")?,
+            role: row.try_get("role")?,
+            channel: row.try_get("channel")?,
+            channel_thread: row.try_get::<Option<String>, _>("channel_thread")?,
+            content: row.try_get("content")?,
+            summary: row.try_get::<Option<String>, _>("summary")?,
+            model: row.try_get::<Option<String>, _>("model")?,
+            agent: row.try_get::<Option<String>, _>("agent")?,
+            input_tokens: row.try_get::<Option<i64>, _>("input_tokens")?,
+            output_tokens: row.try_get::<Option<i64>, _>("output_tokens")?,
+            tokens_used: row.try_get::<Option<i64>, _>("tokens_used")?,
+            cost_usd: row.try_get::<Option<f64>, _>("cost_usd")?,
+            created_at: row.try_get("created_at")?,
         })
     }
 }
@@ -410,4 +410,129 @@ pub fn parse_since_duration(s: &str) -> anyhow::Result<String> {
     .map_err(|_| anyhow::anyhow!("--since value is too large"))?;
 
     Ok((Utc::now() - Duration::seconds(secs)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: open an in-memory store and insert one control message via the public API.
+    async fn store_with_message() -> (TaskStore, i64) {
+        let store = TaskStore::open_memory().await.unwrap();
+        let id = store
+            .insert_control_message(
+                "sess1",
+                "user",
+                "cli",
+                None,
+                "hello world",
+                Some("a summary"),
+                Some("sonnet"),
+                Some("claude"),
+                Some(10),
+                Some(20),
+                Some(30),
+                Some(0.001),
+            )
+            .await
+            .unwrap();
+        (store, id)
+    }
+
+    /// All required fields must decode to their actual values, not silently default.
+    #[tokio::test]
+    async fn row_to_control_message_decodes_required_fields() {
+        let (store, _) = store_with_message().await;
+        let msgs = store
+            .list_control_messages("sess1", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(msgs.len(), 1);
+        let m = &msgs[0];
+        assert_eq!(m.session_id, "sess1");
+        assert_eq!(m.role, "user");
+        assert_eq!(m.channel, "cli");
+        assert_eq!(m.content, "hello world");
+        assert!(!m.created_at.is_empty());
+    }
+
+    /// Optional fields must be `Some(value)` when present and `None` when NULL.
+    #[tokio::test]
+    async fn row_to_control_message_decodes_optional_fields() {
+        let (store, _) = store_with_message().await;
+        let msgs = store
+            .list_control_messages("sess1", None, 10)
+            .await
+            .unwrap();
+        let m = &msgs[0];
+        assert_eq!(m.summary, Some("a summary".to_string()));
+        assert_eq!(m.model, Some("sonnet".to_string()));
+        assert_eq!(m.agent, Some("claude".to_string()));
+        assert_eq!(m.input_tokens, Some(10));
+        assert_eq!(m.output_tokens, Some(20));
+        assert_eq!(m.tokens_used, Some(30));
+        assert_eq!(m.cost_usd, Some(0.001));
+        assert_eq!(m.channel_thread, None);
+    }
+
+    /// Optional fields must be `None` when all nullable columns are NULL.
+    #[tokio::test]
+    async fn row_to_control_message_null_optional_fields_are_none() {
+        let store = TaskStore::open_memory().await.unwrap();
+        store
+            .insert_control_message(
+                "s",
+                "assistant",
+                "cli",
+                None,
+                "hi",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let msgs = store.list_control_messages("s", None, 10).await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        let m = &msgs[0];
+        assert!(m.summary.is_none());
+        assert!(m.model.is_none());
+        assert!(m.agent.is_none());
+        assert!(m.input_tokens.is_none());
+        assert!(m.output_tokens.is_none());
+        assert!(m.tokens_used.is_none());
+        assert!(m.cost_usd.is_none());
+        assert!(m.channel_thread.is_none());
+    }
+
+    /// Verify that decode errors from missing columns propagate via `?`.
+    ///
+    /// SQLite's loose type system coerces NULL to an empty string for TEXT columns,
+    /// so NULL-in-required-column does not produce a SQLx decode error. However,
+    /// a missing column (ColumnNotFound) does. This test confirms the `?` operator
+    /// actually propagates errors rather than swallowing them.
+    #[tokio::test]
+    async fn row_to_control_message_missing_column_propagates_error() {
+        let store = TaskStore::open_memory().await.unwrap();
+        // Select a row that omits the required `role` column entirely.
+        let rows = sqlx::query(
+            "SELECT 1 as id, 'sess' as session_id, 'cli' as channel, \
+             NULL as channel_thread, 'content' as content, NULL as summary, \
+             NULL as model, NULL as agent, NULL as input_tokens, NULL as output_tokens, \
+             NULL as tokens_used, NULL as cost_usd, '2024-01-01T00:00:00Z' as created_at",
+        )
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        let result = TaskStore::row_to_control_message(&rows[0]);
+        assert!(
+            result.is_err(),
+            "expected Err when required column `role` is missing, got Ok"
+        );
+    }
 }
