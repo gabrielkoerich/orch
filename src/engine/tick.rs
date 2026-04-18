@@ -1250,8 +1250,9 @@ pub(crate) struct DispatchMode {
 pub(crate) fn dispatch_mode_from_router(router: &Router) -> DispatchMode {
     let threshold = crate::engine::router::config::min_healthy_agents_threshold();
     let healthy_agents = router.healthy_agent_count("simple");
+    let is_degraded = router.is_degraded(threshold);
     DispatchMode {
-        is_degraded: healthy_agents < threshold,
+        is_degraded,
         healthy_agents,
         threshold,
     }
