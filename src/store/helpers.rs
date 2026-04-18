@@ -78,11 +78,11 @@ pub async fn opt_store_get_task(
 ///
 /// `store` may be None if the store isn't initialized yet.
 pub async fn store_set_by_id(
-    store: &Option<Arc<TaskStore>>,
+    store: &Option<&Arc<TaskStore>>,
     store_id: i64,
     store_fields: &[(&str, serde_json::Value)],
 ) {
-    if let Some(ref store) = store {
+    if let Some(store) = store {
         if let Err(e) = store.set_fields(store_id, store_fields).await {
             tracing::warn!(store_id, error = %e, "store set_fields failed");
         }
