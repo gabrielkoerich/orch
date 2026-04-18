@@ -73,7 +73,7 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
     let mut saw_jsonish_candidate = false;
     for candidate in json_candidates(raw) {
         match parse_candidate(&candidate) {
-            Ok(resp) => return Ok(resp),
+            Ok(resp) => return Ok(normalize_status(resp)),
             Err(err) => {
                 if err.to_string() != "invalid agent response candidate" {
                     saw_jsonish_candidate = true;
@@ -97,6 +97,45 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
         "agent output is not valid JSON or a supported JSON wrapper: {}",
         raw.trim()
     )
+}
+
+/// Map known non-canonical agent statuses to their canonical equivalents.
+///
+/// Agents sometimes return statuses like `"ok"`, `"success"`, or `"completed"`
+/// that are semantically equivalent to `"done"`. Normalizing them here ensures
+/// that `classify_run_outcome` correctly classifies the run as success and
+/// prevents opaque `"no error info available"` failures when an agent returns
+/// a valid but non-canonical status.
+///
+/// Unknown statuses are kept as-is so that downstream code can distinguish
+/// them from canonical ones (e.g. for debugging/metrics).
+fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
+    resp.status = match resp.status.as_str() {
+        // Canonical completion statuses.
+        "done" | "completed" | "ok" | "success" => "done".to_string(),
+        // Canonical progress statuses.
+        "in_progress" | "running" => "in_progress".to_string(),
+        "in_review" | "reviewing" => "in_review".to_string(),
+        "needs_review" | "pending_review" => "needs_review".to_string(),
+        // Canonical error statuses.
+        "blocked" | "error" | "failed" => "blocked".to_string(),
+        // Passthrough: known canonical statuses (already canonical, keep as-is).
+        s if s == "new"
+            || s == "routed"
+            || s == "in_progress"
+            || s == "done"
+            || s == "blocked"
+            || s == "in_review"
+            || s == "needs_review" =>
+        {
+            s.to_string()
+        }
+        // Unknown non-canonical status — keep as-is so the audit trail records
+        // exactly what the agent returned. This lets operators identify which
+        // statuses need to be added to the normalization map.
+        other => other.to_string(),
+    };
+    resp
 }
 
 /// Extract the first JSON code block from markdown.
@@ -775,5 +814,90 @@ Some output here.
         assert_eq!(resp.status, "needs_review");
         assert_eq!(resp.summary, "All tests pass");
         assert_eq!(resp.files, vec!["src/lib.rs"]);
+    }
+
+    // ── normalize_status tests ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_normalizes_ok_alias_to_done() {
+        let input =
+            r#"{"status":"ok","summary":"all good","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
+    fn parse_normalizes_success_alias_to_done() {
+        let input = r#"{"status":"success","summary":"fixed it","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
+    fn parse_normalizes_completed_alias_to_done() {
+        let input = r#"{"status":"completed","summary":"done","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
+    fn parse_normalizes_running_alias_to_in_progress() {
+        let input = r#"{"status":"running","summary":"working","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "in_progress");
+    }
+
+    #[test]
+    fn parse_normalizes_reviewing_alias_to_in_review() {
+        let input = r#"{"status":"reviewing","summary":"reviewing","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "in_review");
+    }
+
+    #[test]
+    fn parse_normalizes_pending_review_alias_to_needs_review() {
+        let input = r#"{"status":"pending_review","summary":"ready","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "needs_review");
+    }
+
+    #[test]
+    fn parse_normalizes_error_alias_to_blocked() {
+        let input =
+            r#"{"status":"error","summary":"failed","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "blocked");
+    }
+
+    #[test]
+    fn parse_keeps_canonical_statuses_unchanged() {
+        for status in &[
+            "new",
+            "routed",
+            "in_progress",
+            "done",
+            "blocked",
+            "in_review",
+            "needs_review",
+        ] {
+            let input = format!(
+                r#"{{"status":"{status}","summary":"test","accomplished":[],"remaining":[],"files":[]}}"#
+            );
+            let resp = parse(&input).unwrap();
+            assert_eq!(
+                resp.status, *status,
+                "canonical status '{status}' should be unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_keeps_non_canonical_status_as_is_for_audit_trail() {
+        // Non-canonical statuses that are not in the alias map are kept as-is
+        // so operators can identify which statuses need to be added to normalize_status.
+        let input = r#"{"status":"fix_deployed","summary":"deployed","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        // Kept as-is (not normalized away) so build_run_audit can report it explicitly.
+        assert_eq!(resp.status, "fix_deployed");
     }
 }
