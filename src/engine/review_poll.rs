@@ -146,6 +146,62 @@ async fn handle_merge_conflict(
     ConflictAction::RetryReview
 }
 
+#[async_trait]
+trait ReviewBatchFailCounterStore: Send + Sync {
+    async fn kv_delete(&self, key: &str) -> anyhow::Result<()>;
+    async fn kv_set(&self, key: &str, value: &str) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+impl ReviewBatchFailCounterStore for TaskStore {
+    async fn kv_delete(&self, key: &str) -> anyhow::Result<()> {
+        TaskStore::kv_delete(self, key).await
+    }
+
+    async fn kv_set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        TaskStore::kv_set(self, key, value).await
+    }
+}
+
+/// Reset the review polling batch-failure counter after a successful batch fetch.
+///
+/// Prefer deleting the key to keep the KV namespace clean. If delete fails,
+/// write an explicit `0` to prevent stale counters from causing false degraded
+/// alerts on the next isolated failure.
+async fn reset_batch_fail_counter(
+    store: &dyn ReviewBatchFailCounterStore,
+    batch_fail_key: &str,
+) -> bool {
+    match store.kv_delete(batch_fail_key).await {
+        Ok(()) => true,
+        Err(delete_err) => {
+            tracing::warn!(
+                key = %batch_fail_key,
+                err = %delete_err,
+                "failed to clear review batch failure counter, falling back to zero reset"
+            );
+            match store.kv_set(batch_fail_key, "0").await {
+                Ok(()) => {
+                    tracing::warn!(
+                        key = %batch_fail_key,
+                        "review batch failure counter reset to 0 after delete failure"
+                    );
+                    true
+                }
+                Err(set_err) => {
+                    tracing::error!(
+                        key = %batch_fail_key,
+                        delete_err = %delete_err,
+                        set_err = %set_err,
+                        "failed to reset review batch failure counter; stale value may cause false degradation"
+                    );
+                    false
+                }
+            }
+        }
+    }
+}
+
 /// Review open PRs - re-dispatch agent to address review feedback.
 ///
 /// Lists tasks in review, fetches PR reviews, and re-dispatches the agent
@@ -430,7 +486,7 @@ pub(crate) async fn review_open_prs(
     let batch_fail_key = format!("review_batch_fail:{repo}");
     let batch = match gh.batch_fetch_pr_review_data(repo, &pr_numbers).await {
         Ok(data) => {
-            store.kv_delete(&batch_fail_key).await.ok();
+            let _ = reset_batch_fail_counter(store.as_ref(), &batch_fail_key).await;
             data
         }
         Err(e) => {
@@ -982,7 +1038,9 @@ mod tests {
     use async_trait::async_trait;
     use dashmap::{DashMap, DashSet};
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use tracing::Level;
+    use tracing_subscriber::EnvFilter;
 
     // ─── Mock GhReviewClient ─────────────────────────────────────────────────
 
@@ -1157,6 +1215,70 @@ mod tests {
 
     fn default_config() -> EngineConfig {
         EngineConfig::default()
+    }
+
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            CaptureWriter(self.0.clone())
+        }
+    }
+
+    fn with_captured_warn_logs<F>(f: F) -> String
+    where
+        F: FnOnce(),
+    {
+        let output: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env().add_directive(Level::WARN.into()))
+            .with_writer(CaptureWriter(Arc::clone(&output)))
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        f();
+        drop(guard);
+        let captured = String::from_utf8_lossy(&output.lock().unwrap()).to_string();
+        captured
+    }
+
+    #[derive(Clone)]
+    struct MockBatchFailStore {
+        delete_error: Option<String>,
+        set_error: Option<String>,
+        set_calls: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    #[async_trait]
+    impl ReviewBatchFailCounterStore for MockBatchFailStore {
+        async fn kv_delete(&self, _key: &str) -> anyhow::Result<()> {
+            if let Some(msg) = &self.delete_error {
+                anyhow::bail!("{msg}");
+            }
+            Ok(())
+        }
+
+        async fn kv_set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+            self.set_calls
+                .lock()
+                .unwrap()
+                .push((key.to_string(), value.to_string()));
+            if let Some(msg) = &self.set_error {
+                anyhow::bail!("{msg}");
+            }
+            Ok(())
+        }
     }
 
     // ─── automated_review_from_comments ──────────────────────────────────────
@@ -1710,6 +1832,64 @@ mod tests {
         // Task status must be unchanged.
         let after = store.get(task_id).await.unwrap();
         assert_eq!(after.status, TaskStatus::InReview);
+    }
+
+    #[test]
+    fn reset_batch_fail_counter_delete_failure_falls_back_to_zero_and_logs_warning() {
+        let key = "review_batch_fail:owner/repo";
+        let calls: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let store = MockBatchFailStore {
+            delete_error: Some("simulated delete failure".to_string()),
+            set_error: None,
+            set_calls: Arc::clone(&calls),
+        };
+
+        let logs = with_captured_warn_logs(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let ok = rt.block_on(reset_batch_fail_counter(&store, key));
+            assert!(ok, "fallback zero-reset should succeed");
+        });
+
+        let set_calls = calls.lock().unwrap();
+        assert_eq!(set_calls.len(), 1);
+        assert_eq!(set_calls[0], (key.to_string(), "0".to_string()));
+        assert!(
+            logs.contains("falling back to zero reset"),
+            "expected warning log to mention fallback reset, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn reset_batch_fail_counter_delete_and_set_failure_logs_error() {
+        let key = "review_batch_fail:owner/repo";
+        let calls: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let store = MockBatchFailStore {
+            delete_error: Some("simulated delete failure".to_string()),
+            set_error: Some("simulated set failure".to_string()),
+            set_calls: Arc::clone(&calls),
+        };
+
+        let logs = with_captured_warn_logs(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let ok = rt.block_on(reset_batch_fail_counter(&store, key));
+            assert!(
+                !ok,
+                "double failure should be surfaced as unsuccessful reset"
+            );
+        });
+
+        let set_calls = calls.lock().unwrap();
+        assert_eq!(set_calls.len(), 1);
+        assert!(
+            logs.contains("failed to reset review batch failure counter"),
+            "expected error log when both delete and set fail, got: {logs}"
+        );
     }
 
     // ─── review_open_prs: watermark dedup — review_ts_map skips old reviews ──
