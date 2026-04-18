@@ -5,7 +5,7 @@
 
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask};
 use crate::config;
-use crate::engine::router::get_route_result;
+use crate::engine::router::{get_route_result, RouteResultError};
 use crate::store;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
@@ -237,9 +237,19 @@ pub async fn prepare_task(
     // This prevents non-fast-forward push failures when the task is re-dispatched.
     git_ops::rebase_on_default(&wt.work_dir, &wt.default_branch).await;
 
-    // Get routing result
+    // Get routing result — distinguish between "no route" and store errors
     let route_result = if let Some(ref s) = store {
-        get_route_result(s, repo, task_id).await.ok()
+        match get_route_result(s, repo, task_id).await {
+            Ok(r) => Some(r),
+            Err(RouteResultError::NoAgent { .. }) => {
+                tracing::warn!(task_id, "routed task has no agent — using fallback");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(task_id, error = %e, "failed to get route result from store — using fallback");
+                None
+            }
+        }
     } else {
         None
     };
