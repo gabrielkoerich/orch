@@ -35,6 +35,43 @@ fn is_trusted_comment_author(c: &crate::github::types::GitHubComment) -> bool {
         .unwrap_or(false)
 }
 
+fn active_status_from_label(label: &str) -> Option<Status> {
+    match label {
+        "status:routed" => Some(Status::Routed),
+        "status:in_progress" => Some(Status::InProgress),
+        "status:needs_review" => Some(Status::NeedsReview),
+        "status:in_review" => Some(Status::InReview),
+        "status:blocked" => Some(Status::Blocked),
+        _ => None,
+    }
+}
+
+fn classify_active_open_issue(
+    issue: crate::github::types::GitHubIssue,
+) -> Option<(ExternalTask, Option<Status>)> {
+    // Guard: open issues tagged as done should never be re-ingested as new.
+    if issue.labels.iter().any(|l| l.name == "status:done") {
+        return None;
+    }
+
+    let status = issue
+        .labels
+        .iter()
+        .find_map(|l| active_status_from_label(&l.name));
+    let task = ExternalTask {
+        id: ExternalId(issue.number.to_string()),
+        title: issue.title,
+        body: issue.body.unwrap_or_default(),
+        state: issue.state,
+        labels: issue.labels.into_iter().map(|l| l.name).collect(),
+        author: issue.user.login,
+        created_at: issue.created_at,
+        updated_at: issue.updated_at,
+        url: issue.html_url,
+    };
+    Some((task, status))
+}
+
 pub struct GitHubBackend {
     repo: String,
     gh: GhHttp,
@@ -439,41 +476,11 @@ impl ExternalBackend for GitHubBackend {
     ) -> anyhow::Result<Vec<(ExternalTask, Option<crate::backends::Status>)>> {
         let issues = self.gh.list_all_open_issues(&self.repo, since).await?;
 
-        let active_status_from_label = |label: &str| -> Option<crate::backends::Status> {
-            match label {
-                "status:routed" => Some(crate::backends::Status::Routed),
-                "status:in_progress" => Some(crate::backends::Status::InProgress),
-                "status:needs_review" => Some(crate::backends::Status::NeedsReview),
-                "status:in_review" => Some(crate::backends::Status::InReview),
-                "status:blocked" => Some(crate::backends::Status::Blocked),
-                _ => None,
-            }
-        };
-
         Ok(issues
             .into_iter()
             .filter(|issue| issue.pull_request.is_none()) // Exclude PRs
             .filter(is_trusted_author) // Only trusted authors
-            .filter(|issue| !issue.labels.iter().any(|l| l.name == "status:done")) // Skip already-done issues
-            .map(|issue| {
-                // Detect active (non-new) status from labels; None = unlabeled or status:new.
-                let status = issue
-                    .labels
-                    .iter()
-                    .find_map(|l| active_status_from_label(&l.name));
-                let task = ExternalTask {
-                    id: ExternalId(issue.number.to_string()),
-                    title: issue.title,
-                    body: issue.body.unwrap_or_default(),
-                    state: issue.state,
-                    labels: issue.labels.into_iter().map(|l| l.name).collect(),
-                    author: issue.user.login,
-                    created_at: issue.created_at,
-                    updated_at: issue.updated_at,
-                    url: issue.html_url,
-                };
-                (task, status)
-            })
+            .filter_map(classify_active_open_issue)
             .collect())
     }
 
@@ -865,22 +872,19 @@ mod tests {
         assert!(!is_trusted_comment_author(&c));
     }
 
-    // --- status:done filter in list_active_open_issues ---
-
-    /// Open issues carrying `status:done` must be excluded from active-open ingest.
-    /// Regression: before the fix, unrecognised labels (including "status:done") resolved
-    /// to None, collapsing them into the unlabeled/new bucket and triggering re-ingest.
-    #[test]
-    fn status_done_label_is_excluded_by_active_open_filter() {
-        let make_issue = |label: &str| GitHubIssue {
+    fn make_test_issue(labels: &[&str]) -> GitHubIssue {
+        GitHubIssue {
             number: 1,
             title: "t".to_string(),
             body: None,
             state: "open".to_string(),
-            labels: vec![crate::github::types::GitHubLabel {
-                name: label.to_string(),
-                color: None,
-            }],
+            labels: labels
+                .iter()
+                .map(|label| crate::github::types::GitHubLabel {
+                    name: (*label).to_string(),
+                    color: None,
+                })
+                .collect(),
             user: GitHubUser {
                 login: "u".to_string(),
             },
@@ -890,18 +894,34 @@ mod tests {
             node_id: None,
             pull_request: None,
             author_association: Some("OWNER".to_string()),
-        };
+        }
+    }
 
-        let done_issue = make_issue("status:done");
-        let new_issue = make_issue("status:new");
+    /// Open issues carrying `status:done` must be excluded from active-open ingest.
+    #[test]
+    fn classify_active_open_issue_excludes_status_done() {
+        assert!(classify_active_open_issue(make_test_issue(&["status:done"])).is_none());
+        assert!(
+            classify_active_open_issue(make_test_issue(&["status:routed", "status:done"]))
+                .is_none()
+        );
+    }
 
-        assert!(
-            done_issue.labels.iter().any(|l| l.name == "status:done"),
-            "status:done issue should be caught by the filter predicate"
-        );
-        assert!(
-            !new_issue.labels.iter().any(|l| l.name == "status:done"),
-            "status:new issue should not be caught by the filter predicate"
-        );
+    #[test]
+    fn classify_active_open_issue_preserves_unlabeled_and_new_as_none_status() {
+        let unlabeled = classify_active_open_issue(make_test_issue(&[]))
+            .expect("unlabeled issue should still be ingested");
+        assert_eq!(unlabeled.1, None);
+
+        let status_new = classify_active_open_issue(make_test_issue(&["status:new"]))
+            .expect("status:new issue should still be ingested");
+        assert_eq!(status_new.1, None);
+    }
+
+    #[test]
+    fn classify_active_open_issue_maps_active_status() {
+        let routed = classify_active_open_issue(make_test_issue(&["status:routed"]))
+            .expect("active status issue should be ingested");
+        assert_eq!(routed.1, Some(Status::Routed));
     }
 }
