@@ -454,6 +454,7 @@ impl ExternalBackend for GitHubBackend {
             .into_iter()
             .filter(|issue| issue.pull_request.is_none()) // Exclude PRs
             .filter(is_trusted_author) // Only trusted authors
+            .filter(|issue| !issue.labels.iter().any(|l| l.name == "status:done")) // Skip already-done issues
             .map(|issue| {
                 // Detect active (non-new) status from labels; None = unlabeled or status:new.
                 let status = issue
@@ -862,5 +863,45 @@ mod tests {
             author_association: Some("MEMBER".to_string()),
         };
         assert!(!is_trusted_comment_author(&c));
+    }
+
+    // --- status:done filter in list_active_open_issues ---
+
+    /// Open issues carrying `status:done` must be excluded from active-open ingest.
+    /// Regression: before the fix, unrecognised labels (including "status:done") resolved
+    /// to None, collapsing them into the unlabeled/new bucket and triggering re-ingest.
+    #[test]
+    fn status_done_label_is_excluded_by_active_open_filter() {
+        let make_issue = |label: &str| GitHubIssue {
+            number: 1,
+            title: "t".to_string(),
+            body: None,
+            state: "open".to_string(),
+            labels: vec![crate::github::types::GitHubLabel {
+                name: label.to_string(),
+                color: None,
+            }],
+            user: GitHubUser {
+                login: "u".to_string(),
+            },
+            created_at: "".to_string(),
+            updated_at: "".to_string(),
+            html_url: "".to_string(),
+            node_id: None,
+            pull_request: None,
+            author_association: Some("OWNER".to_string()),
+        };
+
+        let done_issue = make_issue("status:done");
+        let new_issue = make_issue("status:new");
+
+        assert!(
+            done_issue.labels.iter().any(|l| l.name == "status:done"),
+            "status:done issue should be caught by the filter predicate"
+        );
+        assert!(
+            !new_issue.labels.iter().any(|l| l.name == "status:done"),
+            "status:new issue should not be caught by the filter predicate"
+        );
     }
 }
