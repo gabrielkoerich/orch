@@ -416,7 +416,7 @@ fn map_generic_response(val: &serde_json::Value) -> anyhow::Result<AgentResponse
         .get("status")
         .or_else(|| obj.get("result"))
         .and_then(|v| v.as_str())
-        .unwrap_or("done")
+        .context("agent response is missing required 'status' or 'result' field")?
         .to_string();
 
     let summary = obj
@@ -899,5 +899,39 @@ Some output here.
         let resp = parse(input).unwrap();
         // Kept as-is (not normalized away) so build_run_audit can report it explicitly.
         assert_eq!(resp.status, "fix_deployed");
+    }
+
+    #[test]
+    fn parse_fails_when_summary_present_but_status_missing() {
+        // Payload contains a supported field but omits status/result — should NOT
+        // be treated as done. Regression test for gh-issue-2835.
+        let input = r#"{"summary":"still working","accomplished":[],"remaining":[],"files":[]}"#;
+        let result = parse(input);
+        assert!(
+            result.is_err(),
+            "missing status should error, not default to done"
+        );
+    }
+
+    #[test]
+    fn parse_fails_when_files_present_but_status_missing() {
+        // Payload contains files/summary but no status — should not default to done.
+        let input = r#"{"summary":"partial output","files":["src/foo.rs"]}"#;
+        let result = parse(input);
+        assert!(
+            result.is_err(),
+            "missing status should error, not default to done"
+        );
+    }
+
+    #[test]
+    fn parse_fails_when_only_message_present_without_status() {
+        // Payload contains only a message field, no status — should not default to done.
+        let input = r#"{"message":"working on it"}"#;
+        let result = parse(input);
+        assert!(
+            result.is_err(),
+            "missing status should error, not default to done"
+        );
     }
 }
