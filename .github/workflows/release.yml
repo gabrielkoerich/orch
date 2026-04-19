@@ -64,6 +64,14 @@ jobs:
           fi
           echo "✓ No SELECT * found in store files"
 
+      - name: Install zola
+        uses: taiki-e/install-action@v2
+        with:
+          tool: zola@0.22.1
+
+      - name: Check Zola docs build
+        run: zola --root docs build
+
       - name: Run tests with coverage
         run: cargo llvm-cov nextest --lcov --output-path lcov.info
 
