@@ -5110,6 +5110,42 @@ async fn metrics_summary_rate_limits_are_repo_scoped() {
 }
 
 #[tokio::test]
+async fn metrics_summary_rate_limits_no_duplication_on_id_external_id_collision() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let id1 = store
+        .create_internal("owner/orch", "Task A", "", "test", "", None)
+        .await
+        .unwrap();
+    let id2 = store
+        .create_internal("owner/orch", "Task B", "", "test", "", None)
+        .await
+        .unwrap();
+
+    // Force an id/external_id collision across two different tasks.
+    store
+        .update_external_id(id2, &id1.to_string())
+        .await
+        .unwrap();
+
+    // This event references task A by numeric id; without the NOT EXISTS guard
+    // it would fan out to task A (id match) and task B (external_id match).
+    store
+        .record_rate_limit("claude", "rate_limit", Some(&id1.to_string()))
+        .await
+        .unwrap();
+
+    let orch_summary = store
+        .get_metrics_summary_by_repo("owner/orch", 24)
+        .await
+        .unwrap();
+    assert_eq!(
+        orch_summary.rate_limits_24h, 1,
+        "rate limit event must not be double-counted on id/external_id collision"
+    );
+}
+
+#[tokio::test]
 async fn subscription_round_trip_with_multiple_channels() {
     let store = TaskStore::open_memory().await.unwrap();
 

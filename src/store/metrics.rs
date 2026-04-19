@@ -442,7 +442,10 @@ impl TaskStore {
         let rate_limits: (i64,) = sqlx::query_as(
             "SELECT COUNT(*)
              FROM rate_limits r
-             INNER JOIN tasks t ON r.task_id = CAST(t.id AS TEXT) OR r.task_id = t.external_id
+             LEFT JOIN tasks t ON r.task_id = CAST(t.id AS TEXT)
+                 OR (r.task_id = t.external_id AND NOT EXISTS (
+                     SELECT 1 FROM tasks t2 WHERE t2.id = CAST(r.task_id AS INTEGER)
+                 ))
              WHERE r.occurred_at >= datetime('now', ?)
              AND t.repo = ?",
         )
