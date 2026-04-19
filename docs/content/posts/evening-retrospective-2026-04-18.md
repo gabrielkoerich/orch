@@ -1,8 +1,8 @@
-++
++++
 title = "Evening Retrospective — 2026-04-18"
 date = 2026-04-18
 description = "Daily evening retrospective: commits, what succeeded, failures, routing accuracy, and priorities for tomorrow."
-++ 
++++
 
 # Evening Retrospective — 2026-04-18
 
