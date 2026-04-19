@@ -615,9 +615,15 @@ impl TaskStore {
             .bind(id)
             .fetch_one(&self.pool)
             .await?;
-        let from_status: String = previous.try_get("status").unwrap_or_default();
-        let agent: Option<String> = previous.try_get("agent").unwrap_or(None);
-        let model: Option<String> = previous.try_get("model").unwrap_or(None);
+        let from_status: String = previous
+            .try_get("status")
+            .map_err(|e| anyhow::anyhow!("failed to read status column before update: {e}"))?;
+        let agent: Option<String> = previous
+            .try_get("agent")
+            .map_err(|e| anyhow::anyhow!("failed to read agent column before update: {e}"))?;
+        let model: Option<String> = previous
+            .try_get("model")
+            .map_err(|e| anyhow::anyhow!("failed to read model column before update: {e}"))?;
 
         let mut set_parts = Vec::new();
         let mut values: Vec<Option<String>> = Vec::new();
@@ -678,8 +684,12 @@ impl TaskStore {
         let from_status: String = previous
             .try_get("status")
             .map_err(|e| anyhow::anyhow!("failed to read status column before update: {e}"))?;
-        let agent: Option<String> = previous.try_get("agent").unwrap_or(None);
-        let model: Option<String> = previous.try_get("model").unwrap_or(None);
+        let agent: Option<String> = previous
+            .try_get("agent")
+            .map_err(|e| anyhow::anyhow!("failed to read agent column before update: {e}"))?;
+        let model: Option<String> = previous
+            .try_get("model")
+            .map_err(|e| anyhow::anyhow!("failed to read model column before update: {e}"))?;
         let sql = if status == TaskStatus::Blocked {
             "UPDATE tasks SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?"
         } else {
@@ -733,8 +743,12 @@ impl TaskStore {
         let from_status: String = previous
             .try_get("status")
             .map_err(|e| anyhow::anyhow!("failed to read status column before update: {e}"))?;
-        let agent: Option<String> = previous.try_get("agent").unwrap_or(None);
-        let model: Option<String> = previous.try_get("model").unwrap_or(None);
+        let agent: Option<String> = previous
+            .try_get("agent")
+            .map_err(|e| anyhow::anyhow!("failed to read agent column before update: {e}"))?;
+        let model: Option<String> = previous
+            .try_get("model")
+            .map_err(|e| anyhow::anyhow!("failed to read model column before update: {e}"))?;
         let sql = if status == TaskStatus::Blocked {
             "UPDATE tasks SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ? AND status = ?"
         } else {
@@ -788,8 +802,12 @@ impl TaskStore {
         let from_status: String = previous
             .try_get("status")
             .map_err(|e| anyhow::anyhow!("failed to read status column before update: {e}"))?;
-        let agent: Option<String> = previous.try_get("agent").unwrap_or(None);
-        let model: Option<String> = previous.try_get("model").unwrap_or(None);
+        let agent: Option<String> = previous
+            .try_get("agent")
+            .map_err(|e| anyhow::anyhow!("failed to read agent column before update: {e}"))?;
+        let model: Option<String> = previous
+            .try_get("model")
+            .map_err(|e| anyhow::anyhow!("failed to read model column before update: {e}"))?;
         sqlx::query(
             "UPDATE tasks SET status = 'new', branch = '', worktree = '', worktree_cleaned = 0, block_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
         )

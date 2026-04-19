@@ -861,3 +861,157 @@ async fn router_healthy_agent_count() {
         "is_degraded(1) should be false unless no healthy agents"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests for update_status_and_fields decode-error propagation.
+//
+// Before the fix, `try_get("status").unwrap_or_default()` / `unwrap_or(None)`
+// would silently mask column decode failures and still write an activity row
+// with defaulted (""/None) pre-update values.  The fix replaces every
+// `unwrap_or_*` with `.map_err(…)?` so any failure surfaces to the caller.
+// ---------------------------------------------------------------------------
+
+/// Verify that update_status_and_fields records activity with the correct
+/// pre-update values (from_status / agent / model) read from the row.
+///
+/// This is the happy-path regression: the function must not default these
+/// values silently — it must read them and pass them through.
+#[tokio::test]
+async fn update_status_and_fields_records_pre_update_values_in_activity() {
+    use orch::store::{TaskActivity, TaskStatus};
+
+    let tmp = std::env::temp_dir().join(format!("orch-update-activity-{}.db", std::process::id()));
+    let store = TaskStore::open_single(&tmp).await.expect("open store");
+
+    let id = store
+        .create_internal("test/repo", "decode-error test", "", "test", "job:1", None)
+        .await
+        .expect("create task");
+
+    // Task starts as 'new'. Transition to 'routed' and check activity.
+    store
+        .update_status_and_fields(
+            id,
+            TaskStatus::Routed,
+            &[("summary", serde_json::json!("initial summary"))],
+        )
+        .await
+        .expect("update_status_and_fields should succeed");
+
+    let activity: Vec<TaskActivity> = store.get_activity(id, None).await.expect("get_activity");
+
+    assert_eq!(activity.len(), 1, "expected one activity entry");
+    let entry = &activity[0];
+    assert_eq!(entry.event_type, "status_change");
+    // from_status must be the real pre-update value, not an empty default.
+    assert_eq!(
+        entry.from_status.as_deref(),
+        Some("new"),
+        "from_status must be read from the row, not defaulted"
+    );
+    assert_eq!(entry.to_status.as_deref(), Some("routed"));
+    // agent and model are NULL at this point — they should be recorded as None,
+    // not silently set to Some("") by a stale unwrap_or_default.
+    assert_eq!(entry.agent, None, "agent should be None, not a default");
+    assert_eq!(entry.model, None, "model should be None, not a default");
+
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
+    let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+}
+
+/// Verify that update_status_and_fields propagates errors instead of silently
+/// continuing.  When the pre-update fetch fails (e.g. the row does not exist),
+/// the function must return Err rather than proceeding with defaulted values.
+#[tokio::test]
+async fn update_status_and_fields_propagates_fetch_error_on_missing_row() {
+    use orch::store::TaskStatus;
+
+    let tmp = std::env::temp_dir().join(format!("orch-update-norow-{}.db", std::process::id()));
+    let store = TaskStore::open_single(&tmp).await.expect("open store");
+
+    // Row id 9999 does not exist — fetch_one will return RowNotFound, which
+    // must propagate as Err rather than being swallowed.
+    let result = store
+        .update_status_and_fields(9999, TaskStatus::Routed, &[])
+        .await;
+
+    assert!(
+        result.is_err(),
+        "update_status_and_fields must return Err when the row does not exist"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
+    let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+}
+
+/// Verify that update_status_and_fields propagates column decode errors instead
+/// of silently defaulting.  When `try_get` fails (type mismatch, corruption,
+/// non-UTF8 bytes in a TEXT column), the function must return Err — and no
+/// activity row may be written from defaulted values.
+///
+/// This is the critical regression: before the fix, `unwrap_or_default()` /
+/// `unwrap_or(None)` on `try_get` calls would swallow decode failures, write
+/// an activity row with defaulted pre-update fields, and return Ok.
+#[tokio::test]
+async fn update_status_and_fields_propagates_column_decode_error() {
+    use orch::store::{TaskActivity, TaskStatus};
+
+    let tmp = std::env::temp_dir().join(format!("orch-update-decode-{}.db", std::process::id()));
+    let store = TaskStore::open_single(&tmp).await.expect("open store");
+
+    let id = store
+        .create_internal("test/repo", "decode-error test", "", "test", "job:1", None)
+        .await
+        .expect("create task");
+
+    // Inject raw binary bytes into the `status` column. SQLite's type affinity
+    // allows BLOB data in a TEXT column. sqlx's `try_get::<_, String>` will then
+    // fail trying to decode non-UTF8 bytes — this is the pre-update column
+    // decode failure the bug describes.
+    sqlx::query("UPDATE tasks SET status = X'FFFFFFFF' WHERE id = ?")
+        .bind(id)
+        .execute(store.pool())
+        .await
+        .expect("inject non-UTF8 status");
+
+    // Update must fail rather than silently defaulting.
+    let result = store
+        .update_status_and_fields(id, TaskStatus::Routed, &[])
+        .await;
+
+    assert!(
+        result.is_err(),
+        "update_status_and_fields must return Err when status column decode fails"
+    );
+
+    // Crucially, no incorrect activity row may have been written.
+    let activity: Vec<TaskActivity> = store.get_activity(id, None).await.expect("get_activity");
+    assert!(
+        activity.is_empty(),
+        "no activity should be written when pre-update column decode fails"
+    );
+
+    // Verify the task row itself is unchanged (no partial update).
+    // We use raw SQL rather than store.get() because the latter uses a full row
+    // decoder that would also fail on the corrupted status blob. Fetch the raw
+    // status as bytes — if the update failed before writing, it will still be the
+    // original "new" value (or the injected blob if we want to check that too).
+    let status_row: (Vec<u8>,) = sqlx::query_as("SELECT status FROM tasks WHERE id = ?")
+        .bind(id)
+        .fetch_one(store.pool())
+        .await
+        .expect("fetch status raw");
+    // After the failed update, status should still be the original value.
+    // We inject X'FFFF' (2 bytes) — check it's not "routed" (6 bytes ASCII).
+    assert_ne!(
+        std::str::from_utf8(&status_row.0).ok(),
+        Some("routed"),
+        "task status must remain unchanged when decode fails"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
+    let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+}
