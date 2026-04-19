@@ -861,3 +861,87 @@ async fn router_healthy_agent_count() {
         "is_degraded(1) should be false unless no healthy agents"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests for update_status_and_fields decode-error propagation.
+//
+// Before the fix, `try_get("status").unwrap_or_default()` / `unwrap_or(None)`
+// would silently mask column decode failures and still write an activity row
+// with defaulted (""/None) pre-update values.  The fix replaces every
+// `unwrap_or_*` with `.map_err(…)?` so any failure surfaces to the caller.
+// ---------------------------------------------------------------------------
+
+/// Verify that update_status_and_fields records activity with the correct
+/// pre-update values (from_status / agent / model) read from the row.
+///
+/// This is the happy-path regression: the function must not default these
+/// values silently — it must read them and pass them through.
+#[tokio::test]
+async fn update_status_and_fields_records_pre_update_values_in_activity() {
+    use orch::store::{TaskActivity, TaskStatus};
+
+    let tmp = std::env::temp_dir().join(format!("orch-update-activity-{}.db", std::process::id()));
+    let store = TaskStore::open_single(&tmp).await.expect("open store");
+
+    let id = store
+        .create_internal("test/repo", "decode-error test", "", "test", "job:1", None)
+        .await
+        .expect("create task");
+
+    // Task starts as 'new'. Transition to 'routed' and check activity.
+    store
+        .update_status_and_fields(
+            id,
+            TaskStatus::Routed,
+            &[("summary", serde_json::json!("initial summary"))],
+        )
+        .await
+        .expect("update_status_and_fields should succeed");
+
+    let activity: Vec<TaskActivity> = store.get_activity(id, None).await.expect("get_activity");
+
+    assert_eq!(activity.len(), 1, "expected one activity entry");
+    let entry = &activity[0];
+    assert_eq!(entry.event_type, "status_change");
+    // from_status must be the real pre-update value, not an empty default.
+    assert_eq!(
+        entry.from_status.as_deref(),
+        Some("new"),
+        "from_status must be read from the row, not defaulted"
+    );
+    assert_eq!(entry.to_status.as_deref(), Some("routed"));
+    // agent and model are NULL at this point — they should be recorded as None,
+    // not silently set to Some("") by a stale unwrap_or_default.
+    assert_eq!(entry.agent, None, "agent should be None, not a default");
+    assert_eq!(entry.model, None, "model should be None, not a default");
+
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
+    let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+}
+
+/// Verify that update_status_and_fields propagates errors instead of silently
+/// continuing.  When the pre-update fetch fails (e.g. the row does not exist),
+/// the function must return Err rather than proceeding with defaulted values.
+#[tokio::test]
+async fn update_status_and_fields_propagates_fetch_error_on_missing_row() {
+    use orch::store::TaskStatus;
+
+    let tmp = std::env::temp_dir().join(format!("orch-update-norow-{}.db", std::process::id()));
+    let store = TaskStore::open_single(&tmp).await.expect("open store");
+
+    // Row id 9999 does not exist — fetch_one will return RowNotFound, which
+    // must propagate as Err rather than being swallowed.
+    let result = store
+        .update_status_and_fields(9999, TaskStatus::Routed, &[])
+        .await;
+
+    assert!(
+        result.is_err(),
+        "update_status_and_fields must return Err when the row does not exist"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
+    let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+}
