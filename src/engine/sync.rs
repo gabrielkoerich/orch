@@ -374,26 +374,51 @@ async fn record_mention_task(
     title: &str,
     body: &str,
     parent_id: Option<i64>,
-    last_success_ts: &mut Option<String>,
-) {
+    cursor: &mut MentionCursor,
+) -> bool {
     match store
         .create_internal(repo, title, body, "mention", &mention.id, parent_id)
         .await
     {
         Ok(task_id) => {
             tracing::info!(task_id, mention_id = %mention.id, "created mention task");
-            advance_cursor(last_success_ts, &mention.created_at);
+            cursor.advance(&mention.created_at);
+            true
         }
         Err(e) => {
             tracing::warn!(mention_id = %mention.id, err = %e, "failed to create mention task");
+            false
         }
     }
 }
 
 /// Advance the mention cursor if the timestamp is newer.
-fn advance_cursor(last_success_ts: &mut Option<String>, ts: &str) {
-    if last_success_ts.as_deref() < Some(ts) {
-        *last_success_ts = Some(ts.to_string());
+fn advance_cursor(last_safe_ts: &mut Option<String>, ts: &str) {
+    if last_safe_ts.as_deref() < Some(ts) {
+        *last_safe_ts = Some(ts.to_string());
+    }
+}
+
+#[derive(Debug, Default)]
+struct MentionCursor {
+    last_safe_ts: Option<String>,
+    blocked_by_gap: bool,
+}
+
+impl MentionCursor {
+    fn advance(&mut self, ts: &str) {
+        if self.blocked_by_gap {
+            return;
+        }
+        advance_cursor(&mut self.last_safe_ts, ts);
+    }
+
+    fn block_on_gap(&mut self) {
+        self.blocked_by_gap = true;
+    }
+
+    fn into_last_safe_ts(self) -> Option<String> {
+        self.last_safe_ts
     }
 }
 
@@ -461,7 +486,8 @@ pub(crate) fn classify_comment(
 /// Execute a slash command mentioned by `@orch` on a comment.
 ///
 /// Returns:
-/// - `Ok(())` — command processed (mention task recorded if applicable)
+/// - `Ok(true)` — command processed and cursor may continue advancing
+/// - `Ok(false)` — mention task insert failed; caller must stop cursor advancement
 /// - `Err(_)` — DB lookup failed for parent_id; caller must NOT advance cursor
 ///   so this mention is retried on the next sync
 async fn handle_slash_command(
@@ -472,8 +498,8 @@ async fn handle_slash_command(
     gh: &crate::github::http::GhHttp,
     mention: &Mention,
     command: &crate::engine::commands::OwnerCommand,
-    last_success_ts: &mut Option<String>,
-) -> anyhow::Result<()> {
+    cursor: &mut MentionCursor,
+) -> anyhow::Result<bool> {
     let issue_num = match mention
         .issue_url
         .as_deref()
@@ -482,7 +508,7 @@ async fn handle_slash_command(
         Some(num) => num,
         None => {
             tracing::warn!(comment_id = %mention.id, "slash command without valid issue number");
-            return Ok(());
+            return Ok(true);
         }
     };
 
@@ -510,8 +536,8 @@ async fn handle_slash_command(
             // The mention was already acknowledged; the worst case is the command was
             // not executed but the mention is marked as processed — acceptable vs
             // an infinite retry loop.
-            advance_cursor(last_success_ts, &mention.created_at);
-            return Ok(());
+            cursor.advance(&mention.created_at);
+            return Ok(true);
         }
     };
 
@@ -563,13 +589,16 @@ async fn handle_slash_command(
             ),
             CommandOutcome::FetchFailed | CommandOutcome::CollaboratorCheckFailed => {
                 tracing::debug!("skipping mention task record due to earlier command failure");
-                return Ok(());
+                return Ok(true);
             }
         };
 
-        record_mention_task(s, repo, mention, &title, &body, parent_id, last_success_ts).await;
+        let created = record_mention_task(s, repo, mention, &title, &body, parent_id, cursor).await;
+        if !created {
+            return Ok(false);
+        }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn auto_unblock_cooldown_elapsed(count: i32, last_at: &str) -> bool {
@@ -1472,12 +1501,12 @@ async fn scan_comments(
         .zip(is_pr_values)
         .collect();
 
-    let mut last_success_ts: Option<String> = None;
+    let mut cursor = MentionCursor::default();
 
     for (comment_idx, (comment, action)) in comments.iter().zip(actions).enumerate() {
         match action {
             CommentAction::Skip => {
-                advance_cursor(&mut last_success_ts, &comment.created_at);
+                cursor.advance(&comment.created_at);
             }
 
             CommentAction::ExecuteCommand { command, issue_num } => {
@@ -1496,7 +1525,7 @@ async fn scan_comments(
                 .await;
                 // Always advance cursor: the outcome comment (success or error) was
                 // already posted to GitHub, so re-processing would create duplicates.
-                advance_cursor(&mut last_success_ts, &comment.created_at);
+                cursor.advance(&comment.created_at);
             }
 
             CommentAction::ExecuteCommandForMention { command, .. } => {
@@ -1508,7 +1537,7 @@ async fn scan_comments(
                 } else {
                     // Parent lookup failure propagates via `?` — scan_comments returns early
                     // without advancing the cursor so the mention is retried on next sync.
-                    handle_slash_command(
+                    let advanced_safely = handle_slash_command(
                         backend,
                         store,
                         repo,
@@ -1516,9 +1545,13 @@ async fn scan_comments(
                         &gh,
                         comment,
                         &command,
-                        &mut last_success_ts,
+                        &mut cursor,
                     )
                     .await?;
+                    if !advanced_safely {
+                        cursor.block_on_gap();
+                        break;
+                    }
                 }
             }
 
@@ -1578,23 +1611,27 @@ async fn scan_comments(
                             }
                             None => None,
                         };
-                        record_mention_task(
+                        if !record_mention_task(
                             s,
                             repo,
                             comment,
                             &title,
                             &task_body,
                             parent_id,
-                            &mut last_success_ts,
+                            &mut cursor,
                         )
-                        .await;
+                        .await
+                        {
+                            cursor.block_on_gap();
+                            break;
+                        }
                     }
                 }
             }
         }
     }
 
-    if let Some(ts) = last_success_ts {
+    if let Some(ts) = cursor.into_last_safe_ts() {
         kv_set_prefer_store(&store, "mentions_last_checked", &ts).await;
     }
 
@@ -3848,7 +3885,7 @@ mod tests {
 
     // ── classify_comment tests ──────────────────────────────────────────
 
-    use super::{classify_comment, CommentAction};
+    use super::{classify_comment, CommentAction, MentionCursor};
     use crate::engine::commands::OwnerCommand;
 
     #[test]
@@ -3951,6 +3988,33 @@ mod tests {
         // @mention + command but no issue URL → can't run command, create mention task
         let action = classify_comment("@orch /retry", None, "@bot", false);
         assert_eq!(action, CommentAction::CreateMentionTask { issue_num: None });
+    }
+
+    #[test]
+    fn mention_cursor_stops_advancing_after_gap() {
+        let mut cursor = MentionCursor::default();
+        cursor.advance("2026-01-01T00:00:00Z");
+        cursor.block_on_gap();
+        cursor.advance("2026-01-02T00:00:00Z");
+
+        assert_eq!(
+            cursor.into_last_safe_ts().as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn mention_cursor_tracks_max_timestamp_until_gap() {
+        let mut cursor = MentionCursor::default();
+        cursor.advance("2026-01-01T00:00:00Z");
+        cursor.advance("2026-01-01T00:05:00Z");
+        cursor.block_on_gap();
+        cursor.advance("2026-01-01T00:10:00Z");
+
+        assert_eq!(
+            cursor.into_last_safe_ts().as_deref(),
+            Some("2026-01-01T00:05:00Z")
+        );
     }
 
     // ── scan_comments: acknowledge_mention failure does not advance cursor ────
