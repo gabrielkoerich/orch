@@ -49,12 +49,9 @@ fn extract_json_field(json: &str, field: &str) -> Option<String> {
         let value_str = &json[value_start..];
 
         // Handle quoted strings
-        if value_str.starts_with('"') {
-            value_str
-                .strip_prefix('"')
-                .and_then(|s| s.strip_suffix('"'))
-                .and_then(|s| s.strip_suffix(','))
-                .map(|s| s.to_string())
+        if let Some(rest) = value_str.strip_prefix('"') {
+            let end = rest.find('"')?; // find closing quote
+            Some(rest[..end].to_string())
         }
         // Handle raw numbers (integers or floats)
         else {
@@ -1128,5 +1125,37 @@ more logs"#;
 
         let summarized = super::summarize_rate_limit_error(raw_output);
         assert_eq!(summarized, "status=429 after 3 attempts (last delay 5s)");
+    }
+
+    /// Verify extract_json_field correctly handles quoted string values.
+    /// Previously it stripped from the wrong end (strip_suffix), returning None for
+    /// any field that isn't the last one in the JSON object (fixes issue #2817).
+    #[tokio::test]
+    async fn extract_json_field_handles_quoted_strings() {
+        let json = r#"{"error_status":429,"attempt":7,"retry_delay_ms":35162.66,"error":"rate_limit","session_id":"331c099b-..."}"#;
+
+        assert_eq!(
+            super::extract_json_field(json, "\"error\":"),
+            Some("rate_limit".to_string()),
+            "quoted string field mid-object should be extracted correctly"
+        );
+        assert_eq!(
+            super::extract_json_field(json, "\"session_id\":"),
+            Some("331c099b-...".to_string()),
+            "quoted string field at end of object (no trailing comma) should be extracted"
+        );
+        // Numeric fields should still work (regression check)
+        assert_eq!(
+            super::extract_json_field(json, "\"error_status\":"),
+            Some("429".to_string())
+        );
+        assert_eq!(
+            super::extract_json_field(json, "\"attempt\":"),
+            Some("7".to_string())
+        );
+        assert_eq!(
+            super::extract_json_field(json, "\"retry_delay_ms\":"),
+            Some("35162.66".to_string())
+        );
     }
 }
