@@ -123,9 +123,11 @@ static LEAK_PATTERNS: LazyLock<Vec<(&str, Regex, bool)>> =
 /// - `//` (C-style comments)
 /// - `#` (shell/Python comments)
 /// - `<!--` (HTML comments)
-fn is_comment_line(trimmed: &str) -> bool {
-    trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with("<!--")
-}
+// Previously we skipped lines that looked like code comments which could
+// hide real secrets (eg. `# GITHUB_TOKEN=ghp_...`). That produced a confusing
+// situation where `has_leaks()` returned true but `scan()` returned 0 matches.
+// Align behavior: do not skip comment-like lines in `scan()` — check every
+// line so `scan()` and `has_leaks()` are consistent.
 
 /// Scan text for potential leaked secrets.
 ///
@@ -135,11 +137,7 @@ pub fn scan(text: &str) -> Vec<LeakMatch> {
     let mut matches = Vec::new();
 
     for (line_num, line) in text.lines().enumerate() {
-        let trimmed = line.trim();
-        // Skip lines that look like code comments explaining patterns
-        if is_comment_line(trimmed) {
-            continue;
-        }
+        let _trimmed = line.trim();
 
         for (rule, pattern, _high_conf) in LEAK_PATTERNS.iter() {
             if let Some(m) = pattern.find(line) {
@@ -234,8 +232,11 @@ mod tests {
     #[test]
     fn ignores_comments() {
         let text = "// Example: OPENAI_API_KEY=sk-proj-1234567890abcdefghijklmn";
+        // We no longer skip comment-like lines in `scan()`; secrets in comments
+        // should be detected just like in normal text so `has_leaks()` and
+        // `scan()` remain consistent.
         let matches = scan(text);
-        assert!(matches.is_empty());
+        assert!(!matches.is_empty());
     }
 
     #[test]
