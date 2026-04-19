@@ -648,11 +648,25 @@ fn read_project_channel_config(project_dir: &std::path::Path) -> ProjectChannelC
     }
     let content = match std::fs::read_to_string(&config_path) {
         Ok(c) => c,
-        Err(_) => return ProjectChannelConfig::default(),
+        Err(e) => {
+            tracing::warn!(
+                path = %config_path.display(),
+                error = %e,
+                "failed to read .orch.yml; channel config will use defaults"
+            );
+            return ProjectChannelConfig::default();
+        }
     };
     let val: serde_norway::Value = match serde_norway::from_str(&content) {
         Ok(v) => v,
-        Err(_) => return ProjectChannelConfig::default(),
+        Err(e) => {
+            tracing::warn!(
+                path = %config_path.display(),
+                error = %e,
+                "failed to parse .orch.yml; channel config will use defaults"
+            );
+            return ProjectChannelConfig::default();
+        }
     };
     let channels = match val.get("channels") {
         Some(c) => c,
@@ -2213,8 +2227,28 @@ mod tests {
         let orch_yml = dir.path().join(".orch.yml");
         std::fs::write(&orch_yml, "channels: [\nbad yaml").expect("write .orch.yml");
         let cfg = read_project_channel_config(dir.path());
-        // Should silently return defaults rather than panic.
+        // Should return defaults (not panic) and emit a warn! log with the parse error.
         assert!(cfg.telegram_topic_id.is_none());
         assert!(cfg.discord_channel_id.is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_project_channel_config_handles_unreadable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let orch_yml = dir.path().join(".orch.yml");
+        std::fs::write(&orch_yml, "channels:\n  telegram:\n    topic_id: \"1\"\n")
+            .expect("write .orch.yml");
+        // Make the file unreadable.
+        std::fs::set_permissions(&orch_yml, std::fs::Permissions::from_mode(0o000))
+            .expect("set permissions");
+        let cfg = read_project_channel_config(dir.path());
+        // Should return defaults (not panic) and emit a warn! log with the read error.
+        assert!(cfg.telegram_topic_id.is_none());
+        assert!(cfg.discord_channel_id.is_none());
+        // Restore permissions so tempdir cleanup succeeds.
+        std::fs::set_permissions(&orch_yml, std::fs::Permissions::from_mode(0o644))
+            .expect("restore permissions");
     }
 }
