@@ -1274,8 +1274,22 @@ pub(crate) async fn sync_tick(
                 continue;
             }
 
-            // Fire: increment counter (this also updates updated_at, giving the task a fresh
-            // timestamp so subsequent ticks don't immediately re-fire it again).
+            // Fire: attempt the status update first. Only increment the counter on
+            // success so that transient DB failures don't artificially inflate
+            // needs_review_refires and cause premature Blocked escalation.
+            if let Err(e) = task_manager
+                .update_task_status(&task.external.id, Status::NeedsReview)
+                .await
+            {
+                tracing::warn!(
+                    task_id = task.task_id(),
+                    err = %e,
+                    "sync catch-up: failed to re-fire NeedsReview event — not incrementing counter"
+                );
+                continue;
+            }
+
+            // Increment only after the re-fire succeeds (mirrors the escalation path).
             let fired_refires = match crate::store::store_increment(
                 &Some(Arc::clone(store)),
                 repo,
@@ -1289,9 +1303,9 @@ pub(crate) async fn sync_tick(
                     tracing::warn!(
                         task_id = task.task_id(),
                         err = %e,
-                        "failed to increment needs_review_refires — deferring re-fire to next tick"
+                        "failed to increment needs_review_refires after re-fire"
                     );
-                    continue;
+                    current_refires + 1
                 }
             };
 
@@ -1302,17 +1316,6 @@ pub(crate) async fn sync_tick(
                 required_minutes,
                 "sync catch-up: re-firing NeedsReview event for stale task"
             );
-
-            if let Err(e) = task_manager
-                .update_task_status(&task.external.id, Status::NeedsReview)
-                .await
-            {
-                tracing::warn!(
-                    task_id = task.task_id(),
-                    err = %e,
-                    "sync catch-up: failed to re-fire NeedsReview event"
-                );
-            }
         }
     }
 
