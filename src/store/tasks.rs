@@ -675,7 +675,9 @@ impl TaskStore {
             .bind(id)
             .fetch_one(&self.pool)
             .await?;
-        let from_status: String = previous.try_get("status").unwrap_or_default();
+        let from_status: String = previous
+            .try_get("status")
+            .map_err(|e| anyhow::anyhow!("failed to read status column before update: {e}"))?;
         let agent: Option<String> = previous.try_get("agent").unwrap_or(None);
         let model: Option<String> = previous.try_get("model").unwrap_or(None);
         let sql = if status == TaskStatus::Blocked {
@@ -728,7 +730,9 @@ impl TaskStore {
             .bind(id)
             .fetch_one(&self.pool)
             .await?;
-        let from_status: String = previous.try_get("status").unwrap_or_default();
+        let from_status: String = previous
+            .try_get("status")
+            .map_err(|e| anyhow::anyhow!("failed to read status column before update: {e}"))?;
         let agent: Option<String> = previous.try_get("agent").unwrap_or(None);
         let model: Option<String> = previous.try_get("model").unwrap_or(None);
         let sql = if status == TaskStatus::Blocked {
@@ -781,7 +785,9 @@ impl TaskStore {
             .bind(id)
             .fetch_one(&self.pool)
             .await?;
-        let from_status: String = previous.try_get("status").unwrap_or_default();
+        let from_status: String = previous
+            .try_get("status")
+            .map_err(|e| anyhow::anyhow!("failed to read status column before update: {e}"))?;
         let agent: Option<String> = previous.try_get("agent").unwrap_or(None);
         let model: Option<String> = previous.try_get("model").unwrap_or(None);
         sqlx::query(
