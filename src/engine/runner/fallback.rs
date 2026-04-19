@@ -12,33 +12,65 @@ use super::{agents, response};
 
 /// Summarizes a rate limit error by extracting key information from Claude's API retry JSON.
 ///
-/// Looks for the last `{"type":"system","subtype":"api_retry",...}` line in the output and
-/// extracts `error_status`, `attempt`, `retry_delay_ms` to return a compact summary.
-/// Returns the original message if no api_retry JSON is found.
+/// Looks for the last `{"type":"system","subtype":"api_retry",...}` line (or a partial
+/// fragment containing `"subtype":"api_retry"`) and extracts `error_status`, `attempt`,
+/// `retry_delay_ms` to return a compact summary.
+/// Returns a compact fallback if no api_retry JSON is found.
 fn summarize_rate_limit_error(raw_output: &str) -> String {
-    // Find the last api_retry JSON object in the output
-    if let Some(last_json) = raw_output.lines().rev().find(|line| {
-        line.contains("\"type\":\"system\"") && line.contains("\"subtype\":\"api_retry\"")
-    }) {
-        // Extract key fields from the JSON
-        let error_status = extract_json_field(last_json, "\"error_status\":")
-            .unwrap_or_else(|| "unknown".to_string());
-        let attempt =
-            extract_json_field(last_json, "\"attempt\":").unwrap_or_else(|| "unknown".to_string());
-        let retry_delay_ms =
-            extract_json_field(last_json, "\"retry_delay_ms\":").unwrap_or_else(|| "0".to_string());
+    // Find the last line containing "subtype":"api_retry"
+    // This handles both complete JSON objects and truncated fragments that begin
+    // mid-object (e.g. `,"subtype":"api_retry","attempt":5...`).
+    let last_json = raw_output
+        .lines()
+        .rev()
+        .find(|line| line.contains("\"subtype\":\"api_retry\""));
 
-        // Convert delay to seconds for readability
-        let retry_delay_s = retry_delay_ms.parse::<f64>().unwrap_or(0.0) / 1000.0;
-        let retry_delay_s = retry_delay_s as u64;
+    match last_json {
+        Some(line) => {
+            let error_status = extract_json_field(line, "\"error_status\":")
+                .unwrap_or_else(|| "unknown".to_string());
+            let attempt =
+                extract_json_field(line, "\"attempt\":").unwrap_or_else(|| "unknown".to_string());
+            let retry_delay_ms =
+                extract_json_field(line, "\"retry_delay_ms\":").unwrap_or_else(|| "0".to_string());
 
-        format!(
-            "status={} after {} attempts (last delay {}s)",
-            error_status, attempt, retry_delay_s
-        )
-    } else {
-        // Fall back to original behavior if no api_retry JSON found
-        raw_output.to_string()
+            // Check if we extracted at least one meaningful numeric field.
+            let has_field = error_status != "unknown"
+                || attempt != "unknown"
+                || (retry_delay_ms != "0" && retry_delay_ms != "unknown");
+
+            if has_field {
+                // Convert delay to seconds for readability
+                let retry_delay_s = retry_delay_ms.parse::<f64>().unwrap_or(0.0) / 1000.0;
+                let retry_delay_s = retry_delay_s as u64;
+
+                format!(
+                    "status={} after {} attempts (last delay {}s)",
+                    error_status, attempt, retry_delay_s
+                )
+            } else {
+                // Fields not extractable from a partial fragment — emit a compact
+                // summary instead of a raw JSON blob to avoid leaking noisy data into
+                // task_runs.error and downstream cooldown parsing.
+                let status_hint = extract_json_field(line, "\"status\":")
+                    .or_else(|| extract_json_field(line, "\"error\":"))
+                    .unwrap_or_else(|| "429".to_string());
+                format!("status={} (api_retry fragment)", status_hint)
+            }
+        }
+        None => {
+            // No api_retry JSON found — emit compact summary, not raw passthrough.
+            let first_line = raw_output.lines().next().unwrap_or(raw_output);
+            if first_line.len() > 120 {
+                format!(
+                    "{}... (+{} more chars)",
+                    &first_line[..120],
+                    raw_output.len() - 120
+                )
+            } else {
+                first_line.to_string()
+            }
+        }
     }
 }
 
@@ -1157,5 +1189,77 @@ more logs"#;
             super::extract_json_field(json, "\"retry_delay_ms\":"),
             Some("35162.66".to_string())
         );
+    }
+
+    /// Truncated fragment starting mid-object with ,"subtype":"api_retry"...
+    /// Should NOT return raw JSON blob (regression test for issue #2839).
+    #[tokio::test]
+    async fn summarize_rate_limit_error_handles_truncated_fragment_with_subtype() {
+        // Real-world truncated fragment from GLM runs (no "type":"system" prefix)
+        let raw_output = r#"some log context
+,"subtype":"api_retry","attempt":5,"retry_delay_ms":20000,"error_status":429,"error":"rate_limit"
+more context"#;
+
+        let summarized = super::summarize_rate_limit_error(raw_output);
+        assert!(
+            !summarized.contains("subtype"),
+            "summarized output must not contain raw 'subtype' JSON fragment"
+        );
+        assert!(
+            !summarized.contains("{"),
+            "summarized output must not contain JSON braces"
+        );
+        assert!(
+            summarized.starts_with("status="),
+            "summarized output should start with 'status=' — got: {summarized}"
+        );
+        // Note: "api_retry" is only included when fields are not extractable
+        // (the fragment fallback path). When attempt/delay are extractable,
+        // the summary is "status=X after N attempts (last delay Ys)" with no "api_retry".
+    }
+
+    /// Fragment with attempt and delay fields extractable from mid-fragment.
+    #[tokio::test]
+    async fn summarize_rate_limit_error_handles_fragment_with_extractable_fields() {
+        let raw_output = r#"log output
+,"subtype":"api_retry","attempt":5,"retry_delay_ms":20000,"error_status":429,"error":"rate_limit","session_id":"abc123","max_retries":10}
+rest of output"#;
+
+        let summarized = super::summarize_rate_limit_error(raw_output);
+        assert_eq!(summarized, "status=429 after 5 attempts (last delay 20s)");
+    }
+
+    /// Complete JSON (no truncation) still works after removing "type":"system" requirement.
+    #[tokio::test]
+    async fn summarize_rate_limit_error_complete_json_still_works() {
+        let raw_output = r#"some log lines
+{"type":"system","subtype":"api_retry","attempt":6,"max_retries":10,"retry_delay_ms":17266.789,"error_status":429,"error":"rate_limit","session_id":"331c099b-..."}
+{"type":"system","subtype":"api_retry","attempt":7,"max_retries":10,"retry_delay_ms":35162.66,"error_status":429,"error":"rate_limit","session_id":"331c099b-..."}
+more logs"#;
+
+        let summarized = super::summarize_rate_limit_error(raw_output);
+        assert_eq!(summarized, "status=429 after 7 attempts (last delay 35s)");
+    }
+
+    /// When no api_retry JSON is found at all, should NOT return raw passthrough.
+    #[tokio::test]
+    async fn summarize_rate_limit_error_no_api_retry_no_raw_passthrough() {
+        let raw_output = "some regular error message without api_retry JSON that is quite long and should be truncated";
+
+        let summarized = super::summarize_rate_limit_error(raw_output);
+        // Should be truncated to first line, not the full raw_output
+        assert!(
+            summarized.len() <= 140,
+            "expected truncated first-line, got: {summarized}"
+        );
+    }
+
+    /// Short error without api_retry: should return the line as-is (no truncation needed).
+    #[tokio::test]
+    async fn summarize_rate_limit_error_no_api_retry_short() {
+        let raw_output = "rate limit exceeded";
+
+        let summarized = super::summarize_rate_limit_error(raw_output);
+        assert_eq!(summarized, raw_output);
     }
 }
