@@ -46,13 +46,13 @@ const LEAK_PATTERN_SPECS: &[LeakPatternSpec] = &[
         high_confidence: true,
     },
     LeakPatternSpec {
-        rule: "openai_api_key",
-        pattern: r"sk-[A-Za-z0-9\-]{20,}",
+        rule: "anthropic_api_key",
+        pattern: r"sk-ant-[A-Za-z0-9\-]{20,}",
         high_confidence: true,
     },
     LeakPatternSpec {
-        rule: "anthropic_api_key",
-        pattern: r"sk-ant-[A-Za-z0-9\-]{20,}",
+        rule: "openai_api_key",
+        pattern: r"sk-[A-Za-z0-9\-]{20,}",
         high_confidence: true,
     },
     LeakPatternSpec {
@@ -131,8 +131,20 @@ pub fn scan(text: &str) -> Vec<LeakMatch> {
     let mut matches = Vec::new();
 
     for (line_num, line) in text.lines().enumerate() {
+        // Track matched byte ranges per line so more-specific patterns (listed first)
+        // win over broader ones that overlap (e.g. anthropic_api_key before openai_api_key).
+        let mut matched_ranges: Vec<(usize, usize)> = Vec::new();
+
         for (rule, pattern, _high_conf) in LEAK_PATTERNS.iter() {
             if let Some(m) = pattern.find(line) {
+                // Skip if this match overlaps with an already-matched range on this line.
+                if matched_ranges
+                    .iter()
+                    .any(|&(s, e)| m.start() < e && m.end() > s)
+                {
+                    continue;
+                }
+                matched_ranges.push((m.start(), m.end()));
                 let matched = m.as_str();
                 // Redact: show first 4 chars + ... + last 2 chars (safe UTF-8 boundaries)
                 let redacted = if matched.len() > 8 {
@@ -207,6 +219,20 @@ mod tests {
         let text = "OPENAI_API_KEY=sk-proj-1234567890abcdefghijklmn";
         let matches = scan(text);
         assert!(matches.iter().any(|m| m.rule == "openai_api_key"));
+    }
+
+    #[test]
+    fn anthropic_key_matches_only_anthropic_rule() {
+        // An Anthropic API key must match only `anthropic_api_key`, not `openai_api_key`.
+        let text = "ANTHROPIC_API_KEY=sk-ant-api03-xxxxxxxxxxxxxxxxxxxxxxxx";
+        let matches = scan(text);
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one match, got: {:?}",
+            matches.iter().map(|m| m.rule).collect::<Vec<_>>()
+        );
+        assert_eq!(matches[0].rule, "anthropic_api_key");
     }
 
     #[test]
