@@ -117,12 +117,6 @@ fn build_leak_patterns(specs: &[LeakPatternSpec]) -> Vec<(&'static str, Regex, b
 static LEAK_PATTERNS: LazyLock<Vec<(&str, Regex, bool)>> =
     LazyLock::new(|| build_leak_patterns(LEAK_PATTERN_SPECS));
 
-/// Check if a trimmed line is a comment that should be skipped.
-///
-/// Skips lines that look like code comments explaining patterns:
-/// - `//` (C-style comments)
-/// - `#` (shell/Python comments)
-/// - `<!--` (HTML comments)
 // Previously we skipped lines that looked like code comments which could
 // hide real secrets (eg. `# GITHUB_TOKEN=ghp_...`). That produced a confusing
 // situation where `has_leaks()` returned true but `scan()` returned 0 matches.
@@ -137,8 +131,6 @@ pub fn scan(text: &str) -> Vec<LeakMatch> {
     let mut matches = Vec::new();
 
     for (line_num, line) in text.lines().enumerate() {
-        let _trimmed = line.trim();
-
         for (rule, pattern, _high_conf) in LEAK_PATTERNS.iter() {
             if let Some(m) = pattern.find(line) {
                 let matched = m.as_str();
