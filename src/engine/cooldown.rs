@@ -338,6 +338,8 @@ pub fn detect_credit_exhaustion(error_message: &str) -> Option<CreditExhaustionR
         "quota will be refreshed",
         "next billing cycle",
         "refreshed in the next cycle",
+        "weekly/monthly limit exhausted",
+        "limit will reset at",
     ];
 
     if billing_cycle_patterns.iter().any(|p| lower.contains(p)) {
@@ -1039,7 +1041,7 @@ pub fn github_circuit_remaining_secs() -> u64 {
     0
 }
 
-/// Parse a "try again at {date}" or "try again after {time}" from an error message.
+/// Parse a "try again at {date}" or "reset at {date}" from an error message.
 ///
 /// Returns a Unix timestamp if a retry-at date is found.
 fn parse_retry_at(error_message: &str) -> Option<i64> {
@@ -1047,66 +1049,70 @@ fn parse_retry_at(error_message: &str) -> Option<i64> {
         return None;
     }
 
-    // Look for "try again at {date}" pattern
     let lower = error_message.to_lowercase();
-    let retry_marker = "try again at ";
-    if let Some(idx) = lower.find(retry_marker) {
-        let date_str = &lower[idx + retry_marker.len()..];
-        // Take until period, newline, or end
-        let date_str = date_str
-            .split(['.', '\n'])
-            .next()
-            .unwrap_or(date_str)
-            .trim();
+    for retry_marker in ["try again at ", "reset at "] {
+        if let Some(idx) = lower.find(retry_marker) {
+            let date_str = &lower[idx + retry_marker.len()..];
+            // Take until period, newline, or end
+            let date_str = date_str
+                .split(['.', '\n'])
+                .next()
+                .unwrap_or(date_str)
+                .trim();
 
-        // Try common date formats
-        // "Mar 26th, 2026 5:55 AM" → strip ordinal suffixes
-        let cleaned = date_str
-            .replace("st,", ",")
-            .replace("nd,", ",")
-            .replace("rd,", ",")
-            .replace("th,", ",");
+            // Try common date formats
+            // "Mar 26th, 2026 5:55 AM" → strip ordinal suffixes
+            let cleaned = date_str
+                .replace("st,", ",")
+                .replace("nd,", ",")
+                .replace("rd,", ",")
+                .replace("th,", ",");
 
-        for fmt in &[
-            "%b %d, %Y %I:%M %p", // Mar 26, 2026 5:55 AM
-            "%b %d, %Y %I:%M%p",  // Mar 26, 2026 5:55AM
-            "%B %d, %Y %I:%M %p", // March 26, 2026 5:55 AM
-            "%Y-%m-%dT%H:%M:%S",  // 2026-03-26T05:55:00
-            "%Y-%m-%d %H:%M",     // 2026-03-26 05:55
-        ] {
-            if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&cleaned, fmt) {
-                // Vendor messages (e.g. Codex) emit times in the machine's local
-                // timezone, not UTC.  Interpret the naive datetime as local time
-                // and convert to UTC so the cooldown expires at the right moment.
-                use chrono::TimeZone;
-                let utc = match chrono::Local.from_local_datetime(&dt) {
-                    chrono::LocalResult::Single(local_dt) => local_dt.with_timezone(&chrono::Utc),
-                    chrono::LocalResult::Ambiguous(earliest, _) => {
-                        // DST fold: pick the earlier (conservative) interpretation
-                        earliest.with_timezone(&chrono::Utc)
-                    }
-                    chrono::LocalResult::None => {
-                        // DST gap: fall back to treating as UTC to avoid panic
-                        dt.and_utc()
-                    }
-                };
-                tracing::info!(
-                    retry_at = %utc,
-                    raw = date_str,
-                    "parsed rate limit retry-at date"
-                );
-                return Some(utc.timestamp());
+            for fmt in &[
+                "%b %d, %Y %I:%M %p", // Mar 26, 2026 5:55 AM
+                "%b %d, %Y %I:%M%p",  // Mar 26, 2026 5:55AM
+                "%B %d, %Y %I:%M %p", // March 26, 2026 5:55 AM
+                "%Y-%m-%dT%H:%M:%S",  // 2026-03-26T05:55:00
+                "%Y-%m-%d %H:%M:%S",  // 2026-03-26 05:55:00
+                "%Y-%m-%d %H:%M",     // 2026-03-26 05:55
+            ] {
+                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&cleaned, fmt) {
+                    // Vendor messages (e.g. Codex/GLM) emit times in the machine's
+                    // local timezone, not UTC. Interpret naive datetime as local time.
+                    use chrono::TimeZone;
+                    let utc = match chrono::Local.from_local_datetime(&dt) {
+                        chrono::LocalResult::Single(local_dt) => {
+                            local_dt.with_timezone(&chrono::Utc)
+                        }
+                        chrono::LocalResult::Ambiguous(earliest, _) => {
+                            // DST fold: pick the earlier (conservative) interpretation
+                            earliest.with_timezone(&chrono::Utc)
+                        }
+                        chrono::LocalResult::None => {
+                            // DST gap: fall back to treating as UTC to avoid panic
+                            dt.and_utc()
+                        }
+                    };
+                    tracing::info!(
+                        retry_at = %utc,
+                        raw = date_str,
+                        marker = retry_marker,
+                        "parsed rate limit retry-at date"
+                    );
+                    return Some(utc.timestamp());
+                }
             }
+            tracing::debug!(
+                raw = date_str,
+                marker = retry_marker,
+                "could not parse retry-at date"
+            );
         }
-        tracing::debug!(raw = date_str, "could not parse retry-at date");
     }
 
-    // Without a specific "try again at" date, return None and let the caller
-    // use its default cooldown (exponential backoff).  Only codex
-    // provides exact retry dates in its rate-limit messages; other agents
-    // (claude, opencode, kimi, minimax) have temporary limits that clear
-    // within minutes.  A blanket 24 h fallback here caused false billing-
-    // cycle cooldowns on agents that don't have billing cycles (#1292).
+    // Without a specific retry/reset date, return None and let the caller use
+    // its default cooldown (exponential backoff). A blanket long fallback here
+    // would cause false billing-cycle cooldowns on agents without those limits.
     None
 }
 
@@ -1255,6 +1261,29 @@ mod tests {
     fn parse_retry_at_no_date() {
         assert!(parse_retry_at("generic rate limit error").is_none());
         assert!(parse_retry_at("").is_none());
+    }
+
+    #[test]
+    fn parse_retry_at_glm_reset_format_with_seconds() {
+        let msg = "Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-04-23 18:33:48";
+        let ts = parse_retry_at(msg).expect("should parse GLM reset-at date");
+
+        use chrono::TimeZone;
+        let naive = chrono::NaiveDateTime::new(
+            chrono::NaiveDate::from_ymd_opt(2026, 4, 23).expect("valid date"),
+            chrono::NaiveTime::from_hms_opt(18, 33, 48).expect("valid time"),
+        );
+        let expected_utc = match chrono::Local.from_local_datetime(&naive) {
+            chrono::LocalResult::Single(local_dt) => local_dt.with_timezone(&chrono::Utc),
+            chrono::LocalResult::Ambiguous(earliest, _) => earliest.with_timezone(&chrono::Utc),
+            chrono::LocalResult::None => naive.and_utc(),
+        };
+
+        assert_eq!(
+            ts,
+            expected_utc.timestamp(),
+            "timestamp should reflect local-timezone interpretation of vendor reset date"
+        );
     }
 
     #[test]
@@ -1763,6 +1792,12 @@ mod tests {
         );
         assert_eq!(
             detect_credit_exhaustion("monthly quota exceeded"),
+            Some(CreditExhaustionReason::BillingCycleExhausted)
+        );
+        assert_eq!(
+            detect_credit_exhaustion(
+                "Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-04-23 18:33:48"
+            ),
             Some(CreditExhaustionReason::BillingCycleExhausted)
         );
     }
