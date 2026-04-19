@@ -1008,10 +1008,13 @@ impl TaskStore {
             sqlx::query("SELECT DISTINCT repo FROM tasks WHERE repo IS NOT NULL AND repo != ''")
                 .fetch_all(&self.pool)
                 .await?;
-        Ok(rows
-            .iter()
-            .filter_map(|r| r.try_get::<String, _>("repo").ok())
-            .collect())
+        let mut repos = Vec::new();
+        for row in &rows {
+            repos.push(row.try_get::<String, _>("repo").map_err(|e| {
+                anyhow::anyhow!("distinct_repos: failed to decode 'repo' column: {e}")
+            })?);
+        }
+        Ok(repos)
     }
 
     /// List all active (non-done) tasks across all repos.
@@ -2344,6 +2347,39 @@ mod row_to_task_tests {
         assert!(
             err.to_string().contains("repo"),
             "expected 'repo' in error message, got: {err}"
+        );
+    }
+
+    // ── distinct_repos decode-error tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn distinct_repos_fails_on_decode_error() {
+        let store = crate::store::TaskStore::open_memory().await.unwrap();
+        let id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Test task".to_string(),
+                body: "Test body".to_string(),
+                source: "cron".to_string(),
+                source_id: "test-1".to_string(),
+                author: "tester".to_string(),
+                url: "https://example.com/1".to_string(),
+                labels: vec![],
+                parent_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Inject an invalid UTF-8 BLOB as repo — try_get::<String> will fail.
+        let sql = format!("UPDATE tasks SET repo = X'DEADBEEF' WHERE id = {id}");
+        sqlx::query(&sql).execute(store.pool()).await.unwrap();
+
+        let err = store.distinct_repos().await.unwrap_err();
+        assert!(
+            err.to_string().contains("distinct_repos") && err.to_string().contains("repo"),
+            "expected 'distinct_repos' and 'repo' in error message, got: {err}"
         );
     }
 
