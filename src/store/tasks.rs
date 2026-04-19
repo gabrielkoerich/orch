@@ -1867,8 +1867,16 @@ impl TaskStore {
             }
             let rows = query.fetch_all(&self.pool).await?;
             for row in &rows {
-                let external_id: String = row.try_get("external_id").unwrap_or_default();
-                let status_str: String = row.try_get("status").unwrap_or_default();
+                let external_id: Option<String> = row.try_get("external_id").ok();
+                let status_str: Option<String> = row.try_get("status").ok();
+                let (Some(external_id), Some(status_str)) = (external_id, status_str) else {
+                    tracing::warn!("skipping task row with decode error for external_id or status");
+                    continue;
+                };
+                if external_id.is_empty() {
+                    tracing::warn!(status = %status_str, "skipping task row with empty external_id");
+                    continue;
+                }
                 if let Some(status) = TaskStatus::from_str(&status_str) {
                     result.insert(external_id, status);
                 } else {
@@ -2126,13 +2134,19 @@ impl TaskStore {
         Ok(TaskRun {
             id: row
                 .try_get("id")
-                .map_err(|e| anyhow::anyhow!("run row missing id: {e}"))?,
+                .map_err(|e| anyhow::anyhow!("run row decode error for id: {e}"))?,
             task_id: row
                 .try_get("task_id")
-                .map_err(|e| anyhow::anyhow!("run row missing task_id: {e}"))?,
-            attempt: row.try_get("attempt").unwrap_or(0),
-            run_type: row.try_get("run_type").unwrap_or_default(),
-            agent: row.try_get("agent").unwrap_or_default(),
+                .map_err(|e| anyhow::anyhow!("run row decode error for task_id: {e}"))?,
+            attempt: row
+                .try_get("attempt")
+                .map_err(|e| anyhow::anyhow!("run row decode error for attempt: {e}"))?,
+            run_type: row
+                .try_get("run_type")
+                .map_err(|e| anyhow::anyhow!("run row decode error for run_type: {e}"))?,
+            agent: row
+                .try_get("agent")
+                .map_err(|e| anyhow::anyhow!("run row decode error for agent: {e}"))?,
             model: row.try_get("model").unwrap_or_default(),
             command: row.try_get("command").unwrap_or_default(),
             prompt: row.try_get("prompt").unwrap_or_default(),
@@ -2147,31 +2161,38 @@ impl TaskStore {
             output_tokens: row.try_get("output_tokens").unwrap_or(0),
             total_cost_usd: row.try_get("total_cost_usd").unwrap_or(0.0),
             duration_secs: row.try_get("duration_secs").unwrap_or(0.0),
-            started_at: row.try_get("started_at").unwrap_or_default(),
+            started_at: row
+                .try_get("started_at")
+                .map_err(|e| anyhow::anyhow!("run row decode error for started_at: {e}"))?,
             completed_at: row.try_get("completed_at").unwrap_or(None),
         })
     }
 
     fn row_to_activity(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskActivity> {
-        let details_str: String = row.try_get("details").unwrap_or_else(|_| "{}".to_string());
+        let details_str: String = row
+            .try_get("details")
+            .map_err(|e| anyhow::anyhow!("activity row decode error for details: {e}"))?;
+        let details = serde_json::from_str::<serde_json::Value>(&details_str).inspect_err(
+            |e| tracing::warn!(error = %e, "corrupt activity details JSON, skipping field"),
+        )?;
         Ok(TaskActivity {
             id: row
                 .try_get("id")
-                .map_err(|e| anyhow::anyhow!("activity row missing id: {e}"))?,
+                .map_err(|e| anyhow::anyhow!("activity row decode error for id: {e}"))?,
             task_id: row
                 .try_get("task_id")
-                .map_err(|e| anyhow::anyhow!("activity row missing task_id: {e}"))?,
-            timestamp: row.try_get("timestamp").unwrap_or_default(),
-            event_type: row.try_get("event_type").unwrap_or_default(),
+                .map_err(|e| anyhow::anyhow!("activity row decode error for task_id: {e}"))?,
+            timestamp: row
+                .try_get("timestamp")
+                .map_err(|e| anyhow::anyhow!("activity row decode error for timestamp: {e}"))?,
+            event_type: row
+                .try_get("event_type")
+                .map_err(|e| anyhow::anyhow!("activity row decode error for event_type: {e}"))?,
             from_status: row.try_get("from_status").unwrap_or(None),
             to_status: row.try_get("to_status").unwrap_or(None),
             agent: row.try_get("agent").unwrap_or(None),
             model: row.try_get("model").unwrap_or(None),
-            details: serde_json::from_str(&details_str)
-                .inspect_err(
-                    |e| tracing::warn!(error = %e, "corrupt activity details JSON, defaulting to empty"),
-                )
-                .unwrap_or_else(|_| serde_json::json!({})),
+            details,
         })
     }
 }
@@ -2281,6 +2302,189 @@ mod row_to_task_tests {
         assert!(
             err.to_string().contains("repo"),
             "expected 'repo' in error message, got: {err}"
+        );
+    }
+
+    // ── row_to_run decode-error tests ────────────────────────────────────────
+
+    async fn store_with_run() -> (crate::store::TaskStore, i64, i64) {
+        let store = crate::store::TaskStore::open_memory().await.unwrap();
+        let task_id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Test task".to_string(),
+                body: "Test body".to_string(),
+                source: "cron".to_string(),
+                source_id: "test-1".to_string(),
+                author: "tester".to_string(),
+                url: "https://example.com/1".to_string(),
+                labels: vec![],
+                parent_id: None,
+            })
+            .await
+            .unwrap();
+        let run_id = store
+            .start_run(&crate::store::StartRun {
+                task_id,
+                attempt: 1,
+                run_type: "agent",
+                agent: "claude",
+                model: "sonnet",
+                command: "claude -p ...",
+                prompt: "system prompt",
+            })
+            .await
+            .unwrap();
+        (store, task_id, run_id)
+    }
+
+    // NOTE: Unlike the task table (where all required columns are TEXT and NULL
+    // propagates a ColumnNotFound error), the task_runs table has INTEGER and REAL
+    // columns (id, task_id, attempt, started_at). SQLite coerces NULL/INTEGER to
+    // String when try_get::<String> is called, so we cannot use the missing-column
+    // pattern here. Instead, we use BLOB injection to trigger actual decode errors
+    // that propagate through map_err.
+    macro_rules! run_blob_decode_test {
+        ($name:ident, $col:literal, $select:literal) => {
+            #[tokio::test]
+            async fn $name() {
+                let (store, _task_id, run_id) = store_with_run().await;
+                let sql = format!($select, run_id = run_id);
+                let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+                let err = TaskStore::row_to_run(&row).unwrap_err();
+                assert!(
+                    err.to_string().contains($col),
+                    "expected '{0}' in error message, got: {err}",
+                    $col
+                );
+            }
+        };
+    }
+
+    run_blob_decode_test!(
+        row_to_run_fails_on_decode_error_invalid_utf8_id,
+        "id",
+        "SELECT X'DEADBEEF' as id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, stdout, stderr, parsed_response, outcome, error, input_tokens, output_tokens, total_cost_usd, duration_secs, started_at, completed_at FROM task_runs WHERE id = {run_id}"
+    );
+    run_blob_decode_test!(
+        row_to_run_fails_on_decode_error_invalid_utf8_task_id,
+        "task_id",
+        "SELECT id, X'DEADBEEF' as task_id, attempt, run_type, agent, model, command, prompt, env_vars, stdout, stderr, parsed_response, outcome, error, input_tokens, output_tokens, total_cost_usd, duration_secs, started_at, completed_at FROM task_runs WHERE id = {run_id}"
+    );
+    run_blob_decode_test!(
+        row_to_run_fails_on_decode_error_invalid_utf8_started_at,
+        "started_at",
+        "SELECT id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, stdout, stderr, parsed_response, outcome, error, input_tokens, output_tokens, total_cost_usd, duration_secs, X'DEADBEEF' as started_at, completed_at FROM task_runs WHERE id = {run_id}"
+    );
+
+    // ── row_to_activity decode-error tests ───────────────────────────────────
+
+    async fn store_with_activity() -> (crate::store::TaskStore, i64, i64) {
+        let store = crate::store::TaskStore::open_memory().await.unwrap();
+        let task_id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Test task".to_string(),
+                body: "Test body".to_string(),
+                source: "cron".to_string(),
+                source_id: "test-1".to_string(),
+                author: "tester".to_string(),
+                url: "https://example.com/1".to_string(),
+                labels: vec![],
+                parent_id: None,
+            })
+            .await
+            .unwrap();
+        store
+            .append_activity(task_id, "created", None, Some("new"), None, None, None)
+            .await
+            .unwrap();
+        (store, task_id, 1)
+    }
+
+    // Each test drops exactly one column from the full TASK_ACTIVITY_COLS so that
+    // the first missing-column try_get (id) propagates the error.
+    #[tokio::test]
+    async fn row_to_activity_fails_on_decode_error_invalid_utf8_id() {
+        let (store, _task_id, activity_id) = store_with_activity().await;
+        let sql = format!(
+            "SELECT X'DEADBEEF' as id, task_id, timestamp, event_type, from_status, to_status, agent, model, details FROM task_activity WHERE id = {activity_id}"
+        );
+        let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+        let err = TaskStore::row_to_activity(&row).unwrap_err();
+        assert!(
+            err.to_string().contains("id"),
+            "expected 'id' in error message, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn row_to_activity_fails_on_decode_error_invalid_utf8_task_id() {
+        let (store, _task_id, activity_id) = store_with_activity().await;
+        let sql = format!(
+            "SELECT id, X'DEADBEEF' as task_id, timestamp, event_type, from_status, to_status, agent, model, details FROM task_activity WHERE id = {activity_id}"
+        );
+        let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+        let err = TaskStore::row_to_activity(&row).unwrap_err();
+        assert!(
+            err.to_string().contains("task_id"),
+            "expected 'task_id' in error message, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn row_to_activity_fails_on_decode_error_invalid_utf8_timestamp() {
+        let (store, _task_id, activity_id) = store_with_activity().await;
+        let sql = format!(
+            "SELECT id, task_id, X'DEADBEEF' as timestamp, event_type, from_status, to_status, agent, model, details FROM task_activity WHERE id = {activity_id}"
+        );
+        let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+        let err = TaskStore::row_to_activity(&row).unwrap_err();
+        assert!(
+            err.to_string().contains("timestamp"),
+            "expected 'timestamp' in error message, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn row_to_activity_fails_on_decode_error_invalid_utf8_event_type() {
+        let (store, _task_id, activity_id) = store_with_activity().await;
+        let sql = format!(
+            "SELECT id, task_id, timestamp, X'DEADBEEF' as event_type, from_status, to_status, agent, model, details FROM task_activity WHERE id = {activity_id}"
+        );
+        let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+        let err = TaskStore::row_to_activity(&row).unwrap_err();
+        assert!(
+            err.to_string().contains("event_type"),
+            "expected 'event_type' in error message, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn row_to_activity_fails_on_corrupt_details_json() {
+        let (store, task_id, _activity_id) = store_with_activity().await;
+        // Insert a row with invalid JSON in details
+        sqlx::query("INSERT INTO task_activity (task_id, event_type, details) VALUES (?, ?, ?)")
+            .bind(task_id)
+            .bind("test")
+            .bind("not valid json {{{")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let row = sqlx::query(&format!(
+            "SELECT {TASK_ACTIVITY_COLS} FROM task_activity WHERE task_id = {task_id} ORDER BY id DESC LIMIT 1"
+        ))
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        let err = TaskStore::row_to_activity(&row).unwrap_err();
+        assert!(
+            err.to_string().contains("details") || err.to_string().contains("json") || err.to_string().contains("expected"),
+            "expected 'details', 'json', or 'expected' in error message, got: {err}"
         );
     }
 }
