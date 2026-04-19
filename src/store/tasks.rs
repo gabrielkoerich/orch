@@ -1867,20 +1867,26 @@ impl TaskStore {
             }
             let rows = query.fetch_all(&self.pool).await?;
             for row in &rows {
-                let external_id: Option<String> = row.try_get("external_id").ok();
-                let status_str: Option<String> = row.try_get("status").ok();
-                let (Some(external_id), Some(status_str)) = (external_id, status_str) else {
-                    tracing::warn!("skipping task row with decode error for external_id or status");
-                    continue;
-                };
-                if external_id.is_empty() {
-                    tracing::warn!(status = %status_str, "skipping task row with empty external_id");
-                    continue;
-                }
-                if let Some(status) = TaskStatus::from_str(&status_str) {
-                    result.insert(external_id, status);
-                } else {
-                    tracing::warn!(external_id = %external_id, status = %status_str, "unknown status value in tasks table");
+                let external_id: Result<String, _> = row.try_get("external_id");
+                let status_str: Result<String, _> = row.try_get("status");
+                match (external_id, status_str) {
+                    (Ok(ext_id), Ok(sts)) => {
+                        if ext_id.is_empty() {
+                            tracing::warn!(status = %sts, "skipping task row with empty external_id");
+                            continue;
+                        }
+                        if let Some(status) = TaskStatus::from_str(&sts) {
+                            result.insert(ext_id, status);
+                        } else {
+                            tracing::warn!(external_id = %ext_id, status = %sts, "unknown status value in tasks table");
+                        }
+                    }
+                    (Err(e), _) => {
+                        tracing::warn!(error = %e, "skipping task row with decode error for external_id");
+                    }
+                    (_, Err(e)) => {
+                        tracing::warn!(error = %e, "skipping task row with decode error for status");
+                    }
                 }
             }
         }
@@ -2147,20 +2153,48 @@ impl TaskStore {
             agent: row
                 .try_get("agent")
                 .map_err(|e| anyhow::anyhow!("run row decode error for agent: {e}"))?,
-            model: row.try_get("model").unwrap_or_default(),
-            command: row.try_get("command").unwrap_or_default(),
-            prompt: row.try_get("prompt").unwrap_or_default(),
-            env_vars: row.try_get("env_vars").unwrap_or_default(),
-            exit_code: row.try_get("exit_code").unwrap_or(None),
-            stdout: row.try_get("stdout").unwrap_or_default(),
-            stderr: row.try_get("stderr").unwrap_or_default(),
-            parsed_response: row.try_get("parsed_response").unwrap_or_default(),
-            outcome: row.try_get("outcome").unwrap_or_default(),
-            error: row.try_get("error").unwrap_or_default(),
-            input_tokens: row.try_get("input_tokens").unwrap_or(0),
-            output_tokens: row.try_get("output_tokens").unwrap_or(0),
-            total_cost_usd: row.try_get("total_cost_usd").unwrap_or(0.0),
-            duration_secs: row.try_get("duration_secs").unwrap_or(0.0),
+            model: row
+                .try_get("model")
+                .map_err(|e| anyhow::anyhow!("run row decode error for model: {e}"))?,
+            command: row
+                .try_get("command")
+                .map_err(|e| anyhow::anyhow!("run row decode error for command: {e}"))?,
+            prompt: row
+                .try_get("prompt")
+                .map_err(|e| anyhow::anyhow!("run row decode error for prompt: {e}"))?,
+            env_vars: row
+                .try_get("env_vars")
+                .map_err(|e| anyhow::anyhow!("run row decode error for env_vars: {e}"))?,
+            exit_code: row
+                .try_get("exit_code")
+                .map_err(|e| anyhow::anyhow!("run row decode error for exit_code: {e}"))?,
+            stdout: row
+                .try_get("stdout")
+                .map_err(|e| anyhow::anyhow!("run row decode error for stdout: {e}"))?,
+            stderr: row
+                .try_get("stderr")
+                .map_err(|e| anyhow::anyhow!("run row decode error for stderr: {e}"))?,
+            parsed_response: row
+                .try_get("parsed_response")
+                .map_err(|e| anyhow::anyhow!("run row decode error for parsed_response: {e}"))?,
+            outcome: row
+                .try_get("outcome")
+                .map_err(|e| anyhow::anyhow!("run row decode error for outcome: {e}"))?,
+            error: row
+                .try_get("error")
+                .map_err(|e| anyhow::anyhow!("run row decode error for error: {e}"))?,
+            input_tokens: row
+                .try_get("input_tokens")
+                .map_err(|e| anyhow::anyhow!("run row decode error for input_tokens: {e}"))?,
+            output_tokens: row
+                .try_get("output_tokens")
+                .map_err(|e| anyhow::anyhow!("run row decode error for output_tokens: {e}"))?,
+            total_cost_usd: row
+                .try_get("total_cost_usd")
+                .map_err(|e| anyhow::anyhow!("run row decode error for total_cost_usd: {e}"))?,
+            duration_secs: row
+                .try_get("duration_secs")
+                .map_err(|e| anyhow::anyhow!("run row decode error for duration_secs: {e}"))?,
             started_at: row
                 .try_get("started_at")
                 .map_err(|e| anyhow::anyhow!("run row decode error for started_at: {e}"))?,
@@ -2188,10 +2222,18 @@ impl TaskStore {
             event_type: row
                 .try_get("event_type")
                 .map_err(|e| anyhow::anyhow!("activity row decode error for event_type: {e}"))?,
-            from_status: row.try_get("from_status").unwrap_or(None),
-            to_status: row.try_get("to_status").unwrap_or(None),
-            agent: row.try_get("agent").unwrap_or(None),
-            model: row.try_get("model").unwrap_or(None),
+            from_status: row
+                .try_get("from_status")
+                .map_err(|e| anyhow::anyhow!("activity row decode error for from_status: {e}"))?,
+            to_status: row
+                .try_get("to_status")
+                .map_err(|e| anyhow::anyhow!("activity row decode error for to_status: {e}"))?,
+            agent: row
+                .try_get("agent")
+                .map_err(|e| anyhow::anyhow!("activity row decode error for agent: {e}"))?,
+            model: row
+                .try_get("model")
+                .map_err(|e| anyhow::anyhow!("activity row decode error for model: {e}"))?,
             details,
         })
     }
@@ -2366,17 +2408,17 @@ mod row_to_task_tests {
     run_blob_decode_test!(
         row_to_run_fails_on_decode_error_invalid_utf8_id,
         "id",
-        "SELECT X'DEADBEEF' as id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, stdout, stderr, parsed_response, outcome, error, input_tokens, output_tokens, total_cost_usd, duration_secs, started_at, completed_at FROM task_runs WHERE id = {run_id}"
+        "SELECT X'DEADBEEF' as id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, exit_code, stdout, stderr, parsed_response, outcome, error, input_tokens, output_tokens, total_cost_usd, duration_secs, started_at, completed_at FROM task_runs WHERE id = {run_id}"
     );
     run_blob_decode_test!(
         row_to_run_fails_on_decode_error_invalid_utf8_task_id,
         "task_id",
-        "SELECT id, X'DEADBEEF' as task_id, attempt, run_type, agent, model, command, prompt, env_vars, stdout, stderr, parsed_response, outcome, error, input_tokens, output_tokens, total_cost_usd, duration_secs, started_at, completed_at FROM task_runs WHERE id = {run_id}"
+        "SELECT id, X'DEADBEEF' as task_id, attempt, run_type, agent, model, command, prompt, env_vars, exit_code, stdout, stderr, parsed_response, outcome, error, input_tokens, output_tokens, total_cost_usd, duration_secs, started_at, completed_at FROM task_runs WHERE id = {run_id}"
     );
     run_blob_decode_test!(
         row_to_run_fails_on_decode_error_invalid_utf8_started_at,
         "started_at",
-        "SELECT id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, stdout, stderr, parsed_response, outcome, error, input_tokens, output_tokens, total_cost_usd, duration_secs, X'DEADBEEF' as started_at, completed_at FROM task_runs WHERE id = {run_id}"
+        "SELECT id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, exit_code, stdout, stderr, parsed_response, outcome, error, input_tokens, output_tokens, total_cost_usd, duration_secs, X'DEADBEEF' as started_at, completed_at FROM task_runs WHERE id = {run_id}"
     );
 
     // ── row_to_activity decode-error tests ───────────────────────────────────
@@ -2483,8 +2525,187 @@ mod row_to_task_tests {
         .unwrap();
         let err = TaskStore::row_to_activity(&row).unwrap_err();
         assert!(
-            err.to_string().contains("details") || err.to_string().contains("json") || err.to_string().contains("expected"),
+            err.to_string().contains("details")
+                || err.to_string().contains("json")
+                || err.to_string().contains("expected"),
             "expected 'details', 'json', or 'expected' in error message, got: {err}"
+        );
+    }
+
+    // ── row_to_run: remaining fields with map_err ──────────────────────────────
+
+    run_blob_decode_test!(
+        row_to_run_fails_on_decode_error_invalid_utf8_model,
+        "model",
+        "SELECT id, task_id, attempt, run_type, agent, X'DeadbEEF' as model, command, prompt, env_vars, exit_code, stdout, stderr, parsed_response, outcome, error, input_tokens, output_tokens, total_cost_usd, duration_secs, started_at, completed_at FROM task_runs WHERE id = {run_id}"
+    );
+    run_blob_decode_test!(
+        row_to_run_fails_on_decode_error_invalid_utf8_command,
+        "command",
+        "SELECT id, task_id, attempt, run_type, agent, model, X'DeadbEEF' as command, prompt, env_vars, exit_code, stdout, stderr, parsed_response, outcome, error, input_tokens, output_tokens, total_cost_usd, duration_secs, started_at, completed_at FROM task_runs WHERE id = {run_id}"
+    );
+    run_blob_decode_test!(
+        row_to_run_fails_on_decode_error_invalid_utf8_prompt,
+        "prompt",
+        "SELECT id, task_id, attempt, run_type, agent, model, command, X'DeadbEEF' as prompt, env_vars, exit_code, stdout, stderr, parsed_response, outcome, error, input_tokens, output_tokens, total_cost_usd, duration_secs, started_at, completed_at FROM task_runs WHERE id = {run_id}"
+    );
+    run_blob_decode_test!(
+        row_to_run_fails_on_decode_error_invalid_utf8_env_vars,
+        "env_vars",
+        "SELECT id, task_id, attempt, run_type, agent, model, command, prompt, X'DeadbEEF' as env_vars, exit_code, stdout, stderr, parsed_response, outcome, error, input_tokens, output_tokens, total_cost_usd, duration_secs, started_at, completed_at FROM task_runs WHERE id = {run_id}"
+    );
+    run_blob_decode_test!(
+        row_to_run_fails_on_decode_error_invalid_utf8_stdout,
+        "stdout",
+        "SELECT id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, exit_code, X'DeadbEEF' as stdout, stderr, parsed_response, outcome, error, input_tokens, output_tokens, total_cost_usd, duration_secs, started_at, completed_at FROM task_runs WHERE id = {run_id}"
+    );
+    run_blob_decode_test!(
+        row_to_run_fails_on_decode_error_invalid_utf8_stderr,
+        "stderr",
+        "SELECT id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, exit_code, stdout, X'DeadbEEF' as stderr, parsed_response, outcome, error, input_tokens, output_tokens, total_cost_usd, duration_secs, started_at, completed_at FROM task_runs WHERE id = {run_id}"
+    );
+    run_blob_decode_test!(
+        row_to_run_fails_on_decode_error_invalid_utf8_parsed_response,
+        "parsed_response",
+        "SELECT id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, exit_code, stdout, stderr, X'DeadbEEF' as parsed_response, outcome, error, input_tokens, output_tokens, total_cost_usd, duration_secs, started_at, completed_at FROM task_runs WHERE id = {run_id}"
+    );
+    run_blob_decode_test!(
+        row_to_run_fails_on_decode_error_invalid_utf8_outcome,
+        "outcome",
+        "SELECT id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, exit_code, stdout, stderr, parsed_response, X'DeadbEEF' as outcome, error, input_tokens, output_tokens, total_cost_usd, duration_secs, started_at, completed_at FROM task_runs WHERE id = {run_id}"
+    );
+    run_blob_decode_test!(
+        row_to_run_fails_on_decode_error_invalid_utf8_error,
+        "error",
+        "SELECT id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, exit_code, stdout, stderr, parsed_response, outcome, X'DeadbEEF' as error, input_tokens, output_tokens, total_cost_usd, duration_secs, started_at, completed_at FROM task_runs WHERE id = {run_id}"
+    );
+    run_blob_decode_test!(
+        row_to_run_fails_on_decode_error_invalid_utf8_input_tokens,
+        "input_tokens",
+        "SELECT id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, exit_code, stdout, stderr, parsed_response, outcome, error, X'DeadbEEF' as input_tokens, output_tokens, total_cost_usd, duration_secs, started_at, completed_at FROM task_runs WHERE id = {run_id}"
+    );
+    run_blob_decode_test!(
+        row_to_run_fails_on_decode_error_invalid_utf8_output_tokens,
+        "output_tokens",
+        "SELECT id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, exit_code, stdout, stderr, parsed_response, outcome, error, input_tokens, X'DeadbEEF' as output_tokens, total_cost_usd, duration_secs, started_at, completed_at FROM task_runs WHERE id = {run_id}"
+    );
+    run_blob_decode_test!(
+        row_to_run_fails_on_decode_error_invalid_utf8_total_cost_usd,
+        "total_cost_usd",
+        "SELECT id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, exit_code, stdout, stderr, parsed_response, outcome, error, input_tokens, output_tokens, X'DeadbEEF' as total_cost_usd, duration_secs, started_at, completed_at FROM task_runs WHERE id = {run_id}"
+    );
+    run_blob_decode_test!(
+        row_to_run_fails_on_decode_error_invalid_utf8_duration_secs,
+        "duration_secs",
+        "SELECT id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, exit_code, stdout, stderr, parsed_response, outcome, error, input_tokens, output_tokens, total_cost_usd, X'DeadbEEF' as duration_secs, started_at, completed_at FROM task_runs WHERE id = {run_id}"
+    );
+    run_blob_decode_test!(
+        row_to_run_fails_on_decode_error_invalid_utf8_exit_code,
+        "exit_code",
+        "SELECT id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, exit_code, stdout, stderr, parsed_response, outcome, error, input_tokens, output_tokens, total_cost_usd, duration_secs, started_at, X'DeadbEEF' as exit_code, completed_at FROM task_runs WHERE id = {run_id}"
+    );
+
+    // ── row_to_activity: nullable columns with map_err ────────────────────────
+
+    // from_status, to_status, agent, model are nullable (Option<String>) but their
+    // decode errors should still propagate via map_err, not be masked as None.
+    // Each test injects BLOB into exactly one column and NULL into the rest so
+    // the error always references the intended column (the first failing map_err).
+    #[tokio::test]
+    async fn row_to_activity_fails_on_decode_error_invalid_utf8_from_status() {
+        let (store, _task_id, activity_id) = store_with_activity().await;
+        let sql = format!(
+            "SELECT id, task_id, timestamp, event_type, \
+             X'DeadbEEF' as from_status, NULL as to_status, \
+             NULL as agent, NULL as model, details \
+             FROM task_activity WHERE id = {activity_id}"
+        );
+        let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+        let err = TaskStore::row_to_activity(&row).unwrap_err();
+        assert!(
+            err.to_string().contains("from_status"),
+            "expected 'from_status' in error message, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn row_to_activity_fails_on_decode_error_invalid_utf8_to_status() {
+        let (store, _task_id, activity_id) = store_with_activity().await;
+        let sql = format!(
+            "SELECT id, task_id, timestamp, event_type, \
+             NULL as from_status, X'DeadbEEF' as to_status, \
+             NULL as agent, NULL as model, details \
+             FROM task_activity WHERE id = {activity_id}"
+        );
+        let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+        let err = TaskStore::row_to_activity(&row).unwrap_err();
+        assert!(
+            err.to_string().contains("to_status"),
+            "expected 'to_status' in error message, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn row_to_activity_fails_on_decode_error_invalid_utf8_agent() {
+        let (store, _task_id, activity_id) = store_with_activity().await;
+        let sql = format!(
+            "SELECT id, task_id, timestamp, event_type, \
+             NULL as from_status, NULL as to_status, \
+             X'DeadbEEF' as agent, NULL as model, details \
+             FROM task_activity WHERE id = {activity_id}"
+        );
+        let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+        let err = TaskStore::row_to_activity(&row).unwrap_err();
+        assert!(
+            err.to_string().contains("agent"),
+            "expected 'agent' in error message, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn row_to_activity_fails_on_decode_error_invalid_utf8_model() {
+        let (store, _task_id, activity_id) = store_with_activity().await;
+        let sql = format!(
+            "SELECT id, task_id, timestamp, event_type, \
+             NULL as from_status, NULL as to_status, \
+             NULL as agent, X'DeadbEEF' as model, details \
+             FROM task_activity WHERE id = {activity_id}"
+        );
+        let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+        let err = TaskStore::row_to_activity(&row).unwrap_err();
+        assert!(
+            err.to_string().contains("model"),
+            "expected 'model' in error message, got: {err}"
+        );
+    }
+
+    // ── get_statuses_by_external_ids: decode-failure rows are skipped ───────────
+
+    #[tokio::test]
+    async fn get_statuses_by_external_ids_skips_rows_with_decode_error() {
+        // Insert a task row with a BLOB value in the external_id column (valid
+        // SQLite but not valid UTF-8 TEXT), so row.try_get("external_id") fails
+        // with a decode error. The method should skip this row (not panic) and
+        // continue processing the remaining rows.
+        let store = crate::store::TaskStore::open_memory().await.unwrap();
+        sqlx::query("INSERT INTO tasks (repo, external_id, status, title, origin) VALUES ('owner/repo', X'DeadbEEF', 'new', '', 'internal')")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        // A second row with a valid external_id should be returned.
+        sqlx::query("INSERT INTO tasks (repo, external_id, status, title, origin) VALUES ('owner/repo', 'valid-id', 'done', '', 'internal')")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let result = store
+            .get_statuses_by_external_ids("owner/repo", &["valid-id"])
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1, "expected exactly one result for valid-id");
+        assert_eq!(
+            result.get("valid-id"),
+            Some(&crate::store::TaskStatus::Done)
         );
     }
 }
