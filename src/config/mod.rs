@@ -150,8 +150,14 @@ fn watch_file(path: &PathBuf) {
             // Add to notify watcher
             if let Ok(mut guard) = FILE_WATCHER.lock() {
                 if let Some(ref mut watcher) = *guard {
-                    let _ = watcher.watch(path, RecursiveMode::NonRecursive);
-                    tracing::debug!("now watching config file: {}", path.display());
+                    match watcher.watch(path, RecursiveMode::NonRecursive) {
+                        Ok(()) => tracing::debug!("now watching config file: {}", path.display()),
+                        Err(e) => tracing::warn!(
+                            "failed to register config file watcher for {}: {}",
+                            path.display(),
+                            e
+                        ),
+                    }
                 }
             }
         }
