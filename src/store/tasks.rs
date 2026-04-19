@@ -1354,8 +1354,14 @@ impl TaskStore {
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          WHERE id = ?",
         )
-        .bind(i64::try_from(input).unwrap_or(i64::MAX))
-        .bind(i64::try_from(output).unwrap_or(i64::MAX))
+        .bind(i64::try_from(input).unwrap_or_else(|_| {
+            tracing::warn!(input, "input_tokens overflows i64, clamping to MAX");
+            i64::MAX
+        }))
+        .bind(i64::try_from(output).unwrap_or_else(|_| {
+            tracing::warn!(output, "output_tokens overflows i64, clamping to MAX");
+            i64::MAX
+        }))
         .bind(cost.input_cost_usd)
         .bind(cost.output_cost_usd)
         .bind(cost.total_cost_usd)
@@ -1684,8 +1690,20 @@ impl TaskStore {
         .bind(run.parsed)
         .bind(run.outcome)
         .bind(run.error)
-        .bind(i64::try_from(run.tokens.input_tokens).unwrap_or(i64::MAX))
-        .bind(i64::try_from(run.tokens.output_tokens).unwrap_or(i64::MAX))
+        .bind(i64::try_from(run.tokens.input_tokens).unwrap_or_else(|_| {
+            tracing::warn!(
+                run.tokens.input_tokens,
+                "input_tokens overflows i64, clamping to MAX"
+            );
+            i64::MAX
+        }))
+        .bind(i64::try_from(run.tokens.output_tokens).unwrap_or_else(|_| {
+            tracing::warn!(
+                run.tokens.output_tokens,
+                "output_tokens overflows i64, clamping to MAX"
+            );
+            i64::MAX
+        }))
         .bind(run.tokens.total_cost_usd)
         .bind(run.tokens.duration_secs)
         .bind(run.run_id)
