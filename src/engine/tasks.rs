@@ -206,7 +206,11 @@ impl TaskManager {
 
         if let Some(status_str) = &filter.status {
             if !is_all {
-                let task_status = TaskStatus::from_str(status_str).unwrap_or(TaskStatus::New);
+                let task_status = TaskStatus::from_str(status_str)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "invalid status: '{}'. allowed: new, routed, in_progress, needs_review, in_review, blocked, done, all",
+                        status_str
+                    ))?;
                 let backend_status = match status_str.as_str() {
                     "new" => Status::New,
                     "routed" => Status::Routed,
@@ -215,7 +219,7 @@ impl TaskManager {
                     "blocked" => Status::Blocked,
                     "in_review" => Status::InReview,
                     "needs_review" => Status::NeedsReview,
-                    _ => Status::New,
+                    _ => unreachable!(),
                 };
 
                 // Get internal tasks from store
