@@ -128,9 +128,9 @@ impl TaskStore {
 
         use sqlx::Row;
         Ok((
-            row.try_get::<i64, _>("total_input").unwrap_or(0),
-            row.try_get::<i64, _>("total_output").unwrap_or(0),
-            row.try_get::<f64, _>("total_cost").unwrap_or(0.0),
+            row.try_get::<i64, _>("total_input")?,
+            row.try_get::<i64, _>("total_output")?,
+            row.try_get::<f64, _>("total_cost")?,
         ))
     }
 
@@ -151,8 +151,8 @@ impl TaskStore {
         use sqlx::Row;
         let mut map = std::collections::HashMap::new();
         for row in &rows {
-            let status: String = row.try_get("status").unwrap_or_default();
-            let count: i64 = row.try_get("cnt").unwrap_or(0);
+            let status: String = row.try_get("status")?;
+            let count: i64 = row.try_get("cnt")?;
             map.insert(status, count);
         }
         Ok(map)
@@ -189,7 +189,7 @@ impl TaskStore {
     .bind(metric.total_cost_usd)
     .fetch_one(&self.pool)
     .await?;
-        Ok(row.try_get("id").unwrap_or(0))
+        Ok(row.try_get("id")?)
     }
 
     /// Get aggregated metrics for a configurable time window.
@@ -201,8 +201,8 @@ impl TaskStore {
 
         let row = sqlx::query(
             "SELECT
-                SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS completed,
-                SUM(CASE WHEN outcome != 'success' THEN 1 ELSE 0 END) AS failed,
+                COALESCE(SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END), 0) AS completed,
+                COALESCE(SUM(CASE WHEN outcome != 'success' THEN 1 ELSE 0 END), 0) AS failed,
                 AVG(CASE WHEN complexity = 'simple' THEN duration_seconds END) AS avg_simple,
                 AVG(CASE WHEN complexity = 'medium' THEN duration_seconds END) AS avg_medium,
                 AVG(CASE WHEN complexity = 'complex' THEN duration_seconds END) AS avg_complex
@@ -213,15 +213,16 @@ impl TaskStore {
         .fetch_one(&self.pool)
         .await?;
 
-        let completed: i64 = row.try_get("completed").unwrap_or(0);
-        let failed: i64 = row.try_get("failed").unwrap_or(0);
-        let avg_simple: Option<f64> = row.try_get("avg_simple").ok();
-        let avg_medium: Option<f64> = row.try_get("avg_medium").ok();
-        let avg_complex: Option<f64> = row.try_get("avg_complex").ok();
+        let completed: i64 = row.try_get("completed")?;
+        let failed: i64 = row.try_get("failed")?;
+        // AVG over a filtered subset is legitimately NULL when no rows match the complexity.
+        let avg_simple: Option<f64> = row.try_get("avg_simple")?;
+        let avg_medium: Option<f64> = row.try_get("avg_medium")?;
+        let avg_complex: Option<f64> = row.try_get("avg_complex")?;
 
         let agent_rows = sqlx::query(
             "SELECT agent, COUNT(*) as total,
-                SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) as success_count
+                COALESCE(SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END), 0) as success_count
              FROM task_metrics
              WHERE completed_at >= datetime('now', ?)
              GROUP BY agent",
@@ -233,10 +234,10 @@ impl TaskStore {
         let agent_stats: Vec<AgentStat> = agent_rows
             .iter()
             .map(|row| {
-                let total: i64 = row.try_get("total").unwrap_or(0);
-                let success: i64 = row.try_get("success_count").unwrap_or(0);
-                AgentStat {
-                    agent: row.try_get("agent").unwrap_or_default(),
+                let total: i64 = row.try_get("total")?;
+                let success: i64 = row.try_get("success_count")?;
+                Ok::<AgentStat, sqlx::Error>(AgentStat {
+                    agent: row.try_get("agent")?,
                     total_runs: total,
                     success_count: success,
                     success_rate: if total > 0 {
@@ -244,9 +245,9 @@ impl TaskStore {
                     } else {
                         0.0
                     },
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         let rate_limit_count: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM rate_limits WHERE occurred_at >= datetime('now', ?)",
@@ -299,8 +300,8 @@ impl TaskStore {
                 WHERE m.completed_at >= datetime('now', ?)
             )
             SELECT
-                SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS completed,
-                SUM(CASE WHEN outcome != 'success' THEN 1 ELSE 0 END) AS failed,
+                COALESCE(SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END), 0) AS completed,
+                COALESCE(SUM(CASE WHEN outcome != 'success' THEN 1 ELSE 0 END), 0) AS failed,
                 AVG(CASE WHEN complexity = 'simple' THEN duration_seconds END) AS avg_simple,
                 AVG(CASE WHEN complexity = 'medium' THEN duration_seconds END) AS avg_medium,
                 AVG(CASE WHEN complexity = 'complex' THEN duration_seconds END) AS avg_complex
@@ -312,15 +313,16 @@ impl TaskStore {
         .fetch_one(&self.pool)
         .await?;
 
-        let completed: i64 = rows.try_get("completed").unwrap_or(0);
-        let failed: i64 = rows.try_get("failed").unwrap_or(0);
-        let avg_simple: Option<f64> = rows.try_get("avg_simple").ok();
-        let avg_medium: Option<f64> = rows.try_get("avg_medium").ok();
-        let avg_complex: Option<f64> = rows.try_get("avg_complex").ok();
+        let completed: i64 = rows.try_get("completed")?;
+        let failed: i64 = rows.try_get("failed")?;
+        // AVG over a filtered subset is legitimately NULL when no rows match the complexity.
+        let avg_simple: Option<f64> = rows.try_get("avg_simple")?;
+        let avg_medium: Option<f64> = rows.try_get("avg_medium")?;
+        let avg_complex: Option<f64> = rows.try_get("avg_complex")?;
 
         let agent_rows = sqlx::query(
             "SELECT m.agent, COUNT(*) as total,
-                SUM(CASE WHEN m.outcome = 'success' THEN 1 ELSE 0 END) as success_count
+                COALESCE(SUM(CASE WHEN m.outcome = 'success' THEN 1 ELSE 0 END), 0) as success_count
              FROM task_metrics m
              LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT)
                  OR (m.task_id = t.external_id AND NOT EXISTS (
@@ -338,10 +340,10 @@ impl TaskStore {
         let agent_stats: Vec<AgentStat> = agent_rows
             .iter()
             .map(|row| {
-                let total: i64 = row.try_get("total").unwrap_or(0);
-                let success: i64 = row.try_get("success_count").unwrap_or(0);
-                AgentStat {
-                    agent: row.try_get("agent").unwrap_or_default(),
+                let total: i64 = row.try_get("total")?;
+                let success: i64 = row.try_get("success_count")?;
+                Ok::<AgentStat, sqlx::Error>(AgentStat {
+                    agent: row.try_get("agent")?,
                     total_runs: total,
                     success_count: success,
                     success_rate: if total > 0 {
@@ -349,9 +351,9 @@ impl TaskStore {
                     } else {
                         0.0
                     },
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         let rate_limits: (i64,) = sqlx::query_as(
             "SELECT COUNT(*)
@@ -419,12 +421,12 @@ impl TaskStore {
                 } else {
                     format!("{hours}h")
                 },
-                input_tokens: row.try_get("input_tokens").unwrap_or(0),
-                output_tokens: row.try_get("output_tokens").unwrap_or(0),
-                input_cost_usd: row.try_get("input_cost_usd").unwrap_or(0.0),
-                output_cost_usd: row.try_get("output_cost_usd").unwrap_or(0.0),
-                total_cost_usd: row.try_get("total_cost_usd").unwrap_or(0.0),
-                task_count: row.try_get("task_count").unwrap_or(0),
+                input_tokens: row.try_get("input_tokens")?,
+                output_tokens: row.try_get("output_tokens")?,
+                input_cost_usd: row.try_get("input_cost_usd")?,
+                output_cost_usd: row.try_get("output_cost_usd")?,
+                total_cost_usd: row.try_get("total_cost_usd")?,
+                task_count: row.try_get("task_count")?,
             }],
         })
     }
@@ -450,7 +452,7 @@ impl TaskStore {
         .bind(task_id)
         .fetch_one(&self.pool)
         .await?;
-        Ok(row.try_get("id").unwrap_or(0))
+        Ok(row.try_get("id")?)
     }
 
     /// Count recent rate limit events per agent within the given window (in hours).
@@ -478,8 +480,8 @@ impl TaskStore {
 
         let mut map = std::collections::HashMap::new();
         for row in &rows {
-            let agent: String = row.try_get("agent").unwrap_or_default();
-            let cnt: i64 = row.try_get("cnt").unwrap_or(0);
+            let agent: String = row.try_get("agent")?;
+            let cnt: i64 = row.try_get("cnt")?;
             map.insert(agent, cnt);
         }
         Ok(map)
@@ -499,15 +501,17 @@ impl TaskStore {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows
-            .iter()
-            .map(|row| SlowTaskInfo {
-                task_id: row.try_get("task_id").unwrap_or_default(),
-                agent: row.try_get("agent").unwrap_or_default(),
-                complexity: row.try_get("complexity").unwrap_or(None),
-                duration_seconds: row.try_get("duration_seconds").unwrap_or(0.0),
+        rows.iter()
+            .map(|row| {
+                Ok(SlowTaskInfo {
+                    task_id: row.try_get("task_id")?,
+                    agent: row.try_get("agent")?,
+                    // complexity is a nullable column — NULL is a valid value
+                    complexity: row.try_get("complexity")?,
+                    duration_seconds: row.try_get("duration_seconds")?,
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Get slow tasks (top 10 longest running) from the last 7 days.
@@ -524,15 +528,17 @@ impl TaskStore {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows
-            .iter()
-            .map(|row| SlowTaskInfo {
-                task_id: row.try_get("task_id").unwrap_or_default(),
-                agent: row.try_get("agent").unwrap_or_default(),
-                complexity: row.try_get("complexity").unwrap_or(None),
-                duration_seconds: row.try_get("duration_seconds").unwrap_or(0.0),
+        rows.iter()
+            .map(|row| {
+                Ok(SlowTaskInfo {
+                    task_id: row.try_get("task_id")?,
+                    agent: row.try_get("agent")?,
+                    // complexity is a nullable column — NULL is a valid value
+                    complexity: row.try_get("complexity")?,
+                    duration_seconds: row.try_get("duration_seconds")?,
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Get error type distribution for a configurable time window.
@@ -551,13 +557,15 @@ impl TaskStore {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows
-            .iter()
-            .map(|row| ErrorStat {
-                error_type: row.try_get("error_type").unwrap_or(None),
-                count: row.try_get("count").unwrap_or(0),
+        rows.iter()
+            .map(|row| {
+                Ok(ErrorStat {
+                    // error_type is a nullable column — NULL is a valid value
+                    error_type: row.try_get("error_type")?,
+                    count: row.try_get("count")?,
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Get cost summary over multiple time windows (24h, 7d, 30d).
@@ -607,12 +615,12 @@ impl TaskStore {
             let row = sqlx::query(query).fetch_one(&self.pool).await?;
             periods.push(CostPeriod {
                 label: label.to_string(),
-                input_tokens: row.try_get("input_tokens").unwrap_or(0),
-                output_tokens: row.try_get("output_tokens").unwrap_or(0),
-                input_cost_usd: row.try_get("input_cost_usd").unwrap_or(0.0),
-                output_cost_usd: row.try_get("output_cost_usd").unwrap_or(0.0),
-                total_cost_usd: row.try_get("total_cost_usd").unwrap_or(0.0),
-                task_count: row.try_get("task_count").unwrap_or(0),
+                input_tokens: row.try_get("input_tokens")?,
+                output_tokens: row.try_get("output_tokens")?,
+                input_cost_usd: row.try_get("input_cost_usd")?,
+                output_cost_usd: row.try_get("output_cost_usd")?,
+                total_cost_usd: row.try_get("total_cost_usd")?,
+                task_count: row.try_get("task_count")?,
             });
         }
 
@@ -634,16 +642,17 @@ impl TaskStore {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows
-            .iter()
-            .map(|row| CostByGroup {
-                name: row.try_get("name").unwrap_or_default(),
-                input_tokens: row.try_get("input_tokens").unwrap_or(0),
-                output_tokens: row.try_get("output_tokens").unwrap_or(0),
-                total_cost_usd: row.try_get("total_cost_usd").unwrap_or(0.0),
-                task_count: row.try_get("task_count").unwrap_or(0),
+        rows.iter()
+            .map(|row| {
+                Ok(CostByGroup {
+                    name: row.try_get("name")?,
+                    input_tokens: row.try_get("input_tokens")?,
+                    output_tokens: row.try_get("output_tokens")?,
+                    total_cost_usd: row.try_get("total_cost_usd")?,
+                    task_count: row.try_get("task_count")?,
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Get cost breakdown by model.
@@ -661,16 +670,17 @@ impl TaskStore {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows
-            .iter()
-            .map(|row| CostByGroup {
-                name: row.try_get("name").unwrap_or_default(),
-                input_tokens: row.try_get("input_tokens").unwrap_or(0),
-                output_tokens: row.try_get("output_tokens").unwrap_or(0),
-                total_cost_usd: row.try_get("total_cost_usd").unwrap_or(0.0),
-                task_count: row.try_get("task_count").unwrap_or(0),
+        rows.iter()
+            .map(|row| {
+                Ok(CostByGroup {
+                    name: row.try_get("name")?,
+                    input_tokens: row.try_get("input_tokens")?,
+                    output_tokens: row.try_get("output_tokens")?,
+                    total_cost_usd: row.try_get("total_cost_usd")?,
+                    task_count: row.try_get("task_count")?,
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Get the duration_seconds from the most recent metric row for a task.
@@ -713,15 +723,17 @@ impl TaskStore {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows
-            .iter()
-            .map(|row| HighReviewCycleTask {
-                external_id: row.try_get("external_id").unwrap_or(None),
-                agent: row.try_get("agent").unwrap_or(None),
-                review_cycles: row.try_get("review_cycles").unwrap_or(0),
-                title: row.try_get("title").unwrap_or_default(),
+        rows.iter()
+            .map(|row| {
+                Ok(HighReviewCycleTask {
+                    // external_id and agent are nullable columns — NULL is a valid value
+                    external_id: row.try_get("external_id")?,
+                    agent: row.try_get("agent")?,
+                    review_cycles: row.try_get("review_cycles")?,
+                    title: row.try_get("title")?,
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Get tasks with high review cycle counts (persistent review loops) from the last 7 days.
@@ -739,15 +751,17 @@ impl TaskStore {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows
-            .iter()
-            .map(|row| HighReviewCycleTask {
-                external_id: row.try_get("external_id").unwrap_or(None),
-                agent: row.try_get("agent").unwrap_or(None),
-                review_cycles: row.try_get("review_cycles").unwrap_or(0),
-                title: row.try_get("title").unwrap_or_default(),
+        rows.iter()
+            .map(|row| {
+                Ok(HighReviewCycleTask {
+                    // external_id and agent are nullable columns — NULL is a valid value
+                    external_id: row.try_get("external_id")?,
+                    agent: row.try_get("agent")?,
+                    review_cycles: row.try_get("review_cycles")?,
+                    title: row.try_get("title")?,
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Increment the self-improvement issue counter for the current week.
