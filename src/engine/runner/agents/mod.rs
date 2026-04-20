@@ -780,8 +780,14 @@ pub fn get_runner(agent_name: &str) -> Box<dyn AgentRunner> {
 ///
 /// Shared by all agents that emit NDJSON output (Codex, OpenCode, etc.).
 /// Lines that are empty or unparseable are silently skipped with a debug log.
+///
+/// For fragmented streams where complete JSON objects span multiple lines,
+/// we also attempt to concatenate non-empty lines and parse them as a stream
+/// of JSON objects to handle edge cases where models emit partial NDJSON.
 pub(crate) fn parse_ndjson(raw: &str) -> Vec<serde_json::Value> {
-    raw.lines()
+    // Fast path: try parsing each line individually (handles most cases)
+    let events: Vec<serde_json::Value> = raw
+        .lines()
         .filter(|line| !line.trim().is_empty())
         .filter_map(|line| match serde_json::from_str(line) {
             Ok(val) => Some(val),
@@ -790,7 +796,109 @@ pub(crate) fn parse_ndjson(raw: &str) -> Vec<serde_json::Value> {
                 None
             }
         })
-        .collect()
+        .collect();
+
+    // If we got events, return them. Otherwise, try the accumulation fallback
+    // for edge cases where models emit fragmented JSON (e.g., partial objects
+    // that get split across lines, or streams with embedded newlines in strings).
+    if !events.is_empty() {
+        return events;
+    }
+
+    // Fallback: accumulate all non-empty, non-comment lines and try to extract
+    // JSON objects by scanning for balanced braces. This handles edge cases like:
+    // - Closing fence inside JSON strings: {"text": "```json\n{\"status\": \"done\"}\n```"}
+    // - Fragmented NDJSON where incomplete objects span multiple lines
+    // - Model outputs with embedded newlines in text fields
+    let acc: String = raw
+        .lines()
+        .filter(|line| {
+            let t = line.trim();
+            !t.is_empty() && !t.starts_with("//") && !t.starts_with('#')
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if acc.is_empty() {
+        return Vec::new();
+    }
+
+    // Fallback: try to parse the accumulated text directly as a JSON value.
+    // This handles multi-line JSON objects that don't fit on single lines.
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(acc.trim()) {
+        // Check if stripping ALL whitespace makes it a single JSON object with
+        // the same content. If so, the input was plain multi-line JSON (not
+        // fragmented NDJSON), and we should return empty to preserve original
+        // behavior — callers then treat it as plain text.
+        let stripped: String = acc.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        if let Ok(stripped_val) = serde_json::from_str::<serde_json::Value>(&stripped) {
+            // Only return empty if the stripped version parses identically,
+            // meaning whitespace was insignificant. If they differ, whitespace
+            // matters and this is likely fragmented input.
+            if stripped_val == val {
+                return Vec::new();
+            }
+        }
+        return vec![val];
+    }
+
+    // Direct parse failed — try to extract JSON objects by scanning for balanced
+    // braces. This handles cases like embedded JSON within text:
+    // `{"text": "```json\n{\"status\": \"done\"}\n```"}`
+    extract_json_objects(&acc)
+}
+
+/// Extract complete JSON objects from a string by scanning for balanced braces.
+///
+/// This is a fallback for fragmented NDJSON streams where complete objects
+/// don't appear on single lines. Returns all parseable objects found.
+fn extract_json_objects(text: &str) -> Vec<serde_json::Value> {
+    let mut results = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (idx, ch) in text.char_indices() {
+        if let Some(start_idx) = start {
+            if in_string {
+                if escape {
+                    escape = false;
+                } else if ch == '\\' {
+                    escape = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+
+            match ch {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let candidate = &text[start_idx..=idx];
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(candidate) {
+                            results.push(val);
+                        }
+                        start = None;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if ch == '{' {
+            start = Some(idx);
+            depth = 1;
+            in_string = false;
+            escape = false;
+        }
+    }
+
+    results
 }
 
 /// Generate a complete, delegating `AgentRunner` impl for a wrapper struct.
@@ -2070,6 +2178,61 @@ mod tests {
             response.status, "done",
             "\"All tests pass. The fix is clean and working.\" must be classified as done"
         );
+    }
+
+    // ── parse_ndjson edge cases ───────────────────────────────────
+
+    #[test]
+    fn parse_ndjson_handles_standard_lines() {
+        let raw = r#"{"type":"text","text":"hello"}
+{"type":"text","text":"world"}"#;
+        let events = parse_ndjson(raw);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].get("type").unwrap().as_str(), Some("text"));
+        assert_eq!(events[1].get("type").unwrap().as_str(), Some("text"));
+    }
+
+    #[test]
+    fn parse_ndjson_skips_empty_lines() {
+        let raw = r#"{"type":"text"}
+
+{"type":"text"}
+"#;
+        let events = parse_ndjson(raw);
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn parse_ndjson_skips_malformed_lines() {
+        let raw = r#"{"type":"valid"}
+not json at all
+{"type":"also_valid"}"#;
+        let events = parse_ndjson(raw);
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn parse_ndjson_fallback_extracts_embedded_json() {
+        // Edge case: JSON with closing fence inside string field
+        let raw =
+            r#"text: {"text": "here is the result: ```json\n{\"status\":\"done\"}\n```"} more"#;
+        let events = parse_ndjson(raw);
+        // Should have extracted the embedded JSON object
+        assert!(
+            !events.is_empty(),
+            "should extract JSON objects via fallback"
+        );
+    }
+
+    #[test]
+    fn parse_ndjson_fallback_handles_fragmented_objects() {
+        // Edge case: JSON object spread across multiple lines (fragmented NDJSON)
+        let raw = r#"{"type": "text
+", "content": "hello
+world"}"#;
+        let events = parse_ndjson(raw);
+        // Should still extract the JSON via fallback
+        assert!(!events.is_empty(), "should handle fragmented JSON");
     }
 
     // ── PermissionRules defaults ────────────────────────────────
