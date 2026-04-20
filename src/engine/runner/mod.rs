@@ -1235,62 +1235,23 @@ impl TaskRunner {
         if is_rerouted && !is_internal_id(task_id) {
             let new_agent = self.get_field(task_id, "agent").await.unwrap_or_default();
             if !new_agent.is_empty() && new_agent != agent_name {
-                // Remove old agent label, ensure new one exists, then add it.
-                // set_labels (add_labels) fails with 422 if the label doesn't exist
-                // in the repo yet — ensure_label creates it first.
-                let old_label = format!("agent:{agent_name}");
-                if let Err(e) = backend.remove_label(&task.id, &old_label).await {
-                    tracing::warn!(task_id = ?task.id, label = old_label, error = %e, "failed to remove old agent label during re-route");
-                }
-                let new_label = format!("agent:{new_agent}");
-                let label_updated = match crate::github::http::GhHttp::new() {
-                    Ok(gh) => {
-                        if let Err(e) = gh
-                            .ensure_label(
-                                &self.repo,
-                                &new_label,
-                                crate::github::http::status_label_color(&new_label),
-                                &format!("Agent: {new_agent}"),
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                task_id = ?task.id,
-                                label = %new_label,
-                                error = %e,
-                                "ensure_label failed during agent label update after failover"
-                            );
-                        }
-                        if let Err(e) = backend
-                            .set_labels(&task.id, std::slice::from_ref(&new_label))
-                            .await
-                        {
-                            tracing::warn!(
-                                task_id = ?task.id,
-                                label = %new_label,
-                                error = %e,
-                                "set_labels failed during agent label update after failover"
-                            );
-                            return Ok(weight_signal);
-                        }
-                        true
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            task_id = ?task.id,
-                            err = %e,
-                            "GhHttp::new() failed — agent label not updated after failover"
-                        );
-                        return Ok(weight_signal);
-                    }
-                };
-                if label_updated {
+                let updated = update_agent_label_after_reroute(
+                    &self.repo,
+                    task,
+                    backend,
+                    &agent_name,
+                    &new_agent,
+                )
+                .await;
+                if updated {
                     tracing::info!(
                         task_id,
                         from = %agent_name,
                         to = %new_agent,
                         "updated GitHub agent label after failover"
                     );
+                } else {
+                    return Ok(weight_signal);
                 }
             }
         }
@@ -1551,6 +1512,71 @@ impl TaskRunner {
 
         // Fall back to current directory
         Ok(std::env::current_dir()?)
+    }
+}
+
+/// Update the GitHub agent label on an external task when it is rerouted to a new agent.
+///
+/// Removes the old `agent:<old_agent>` label, ensures the new `agent:<new_agent>` label exists
+/// in the repo, then applies it. Returns `true` on success, `false` on any failure (failures are
+/// logged as warnings; the caller decides whether to propagate or continue).
+async fn update_agent_label_after_reroute(
+    repo: &str,
+    task: &ExternalTask,
+    backend: &Arc<dyn ExternalBackend>,
+    old_agent: &str,
+    new_agent: &str,
+) -> bool {
+    let old_label = format!("agent:{old_agent}");
+    if let Err(e) = backend.remove_label(&task.id, &old_label).await {
+        tracing::warn!(
+            task_id = ?task.id,
+            label = old_label,
+            error = %e,
+            "failed to remove old agent label during re-route"
+        );
+    }
+    let new_label = format!("agent:{new_agent}");
+    match crate::github::http::GhHttp::new() {
+        Ok(gh) => {
+            if let Err(e) = gh
+                .ensure_label(
+                    repo,
+                    &new_label,
+                    crate::github::http::status_label_color(&new_label),
+                    &format!("Agent: {new_agent}"),
+                )
+                .await
+            {
+                tracing::warn!(
+                    task_id = ?task.id,
+                    label = %new_label,
+                    error = %e,
+                    "ensure_label failed during agent label update after failover"
+                );
+            }
+            if let Err(e) = backend
+                .set_labels(&task.id, std::slice::from_ref(&new_label))
+                .await
+            {
+                tracing::warn!(
+                    task_id = ?task.id,
+                    label = %new_label,
+                    error = %e,
+                    "set_labels failed during agent label update after failover"
+                );
+                return false;
+            }
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                task_id = ?task.id,
+                err = %e,
+                "GhHttp::new() failed — agent label not updated after failover"
+            );
+            false
+        }
     }
 }
 
@@ -2594,92 +2620,61 @@ mod tests {
         }
     }
 
-    #[allow(clippy::await_holding_lock)]
+    /// `update_agent_label_after_reroute` returns `false` when `set_labels` fails.
+    ///
+    /// This tests the extracted helper directly, bypassing the full `run_with_context`
+    /// path (which would fail earlier on worktree setup in a unit-test environment).
     #[tokio::test]
-    async fn reroute_does_not_log_success_when_set_labels_fails() {
-        // When set_labels fails during agent label update after reroute,
-        // the success log "updated GitHub agent label after failover" must NOT be emitted.
-        // The fix gates the success log behind a `label_updated` flag that is only true
-        // when both ensure_label and set_labels succeed. On set_labels failure,
-        // the function returns early with a warn log instead.
-        let _guard = ENV_LOCK.lock().unwrap();
-        let temp_home = TempDir::new().unwrap();
-        let orch_home = temp_home.path().join(".orch");
-        tokio::fs::create_dir_all(&orch_home).await.unwrap();
-        let old_orch_home = std::env::var("ORCH_HOME").ok();
-        std::env::set_var("ORCH_HOME", &orch_home);
-
-        let repo = "owner/repo";
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
-
-        // Task has status "routed" so is_rerouted = true, triggering the label update path.
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+    async fn update_agent_label_returns_false_on_set_labels_failure() {
         let task = ExternalTask {
-            id: ExternalId(format!("reroute-label-{}", unique)),
-            title: "Test reroute label".to_string(),
+            id: ExternalId("test-reroute-1".to_string()),
+            title: "Test".to_string(),
             body: "body".to_string(),
             state: "open".to_string(),
-            labels: vec!["status:routed".to_string()],
+            labels: vec![],
             author: "bot".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             url: "".to_string(),
         };
-        let row_id = store.ensure_external_task(repo, &task).await.unwrap();
+        let backend: Arc<dyn crate::backends::ExternalBackend> =
+            Arc::new(LabelFailingBackend::new().with_set_labels_err("network error"));
 
-        store
-            .update_status(row_id, crate::store::TaskStatus::Routed)
-            .await
-            .unwrap();
-        store
-            .set_fields(
-                row_id,
-                &[
-                    ("agent", serde_json::json!("codex")),
-                    ("model", serde_json::json!("default")),
-                ],
-            )
-            .await
-            .unwrap();
+        let result =
+            update_agent_label_after_reroute("owner/repo", &task, &backend, "claude", "codex")
+                .await;
 
-        let mut runner = TaskRunner::new(repo.to_string());
-        runner = runner.with_store(store.clone());
-
-        // Inject set_labels failure to verify the success log is NOT emitted.
-        let backend = Arc::new(LabelFailingBackend::new().with_set_labels_err("network error"));
-        let backend_dyn: Arc<dyn crate::backends::ExternalBackend> = backend.clone();
-
-        // The critical assertion: run_with_context must return Ok even when set_labels fails.
-        // The fix changes the behavior so that on set_labels failure, we return early
-        // (non-fatal) instead of swallowing the error and still logging success.
-        let result = runner
-            .run_with_context(
-                &task,
-                &backend_dyn,
-                &Arc::new(crate::tmux::TmuxManager::new()),
-                None,
-            )
-            .await;
-
-        // Label failure is non-fatal — run_with_context completes and returns Ok.
-        // The old behavior would also return Ok (swallowing errors), but now the
-        // success log is correctly suppressed. The unit test in backends/mod.rs
-        // (`update_status_retries_on_transient_set_labels_failure`) tests the
-        // retry loop — here we test that the reroute label path correctly bails
-        // out without emitting a false success log.
         assert!(
-            result.is_ok(),
-            "run_with_context should return Ok even when label update fails, got: {:?}",
-            result
+            !result,
+            "update_agent_label_after_reroute should return false when set_labels fails"
         );
+    }
 
-        if let Some(old) = old_orch_home {
-            std::env::set_var("ORCH_HOME", old);
-        } else {
-            std::env::remove_var("ORCH_HOME");
-        }
+    /// `update_agent_label_after_reroute` returns `true` when `set_labels` succeeds.
+    #[tokio::test]
+    async fn update_agent_label_returns_true_on_success() {
+        let task = ExternalTask {
+            id: ExternalId("test-reroute-2".to_string()),
+            title: "Test".to_string(),
+            body: "body".to_string(),
+            state: "open".to_string(),
+            labels: vec![],
+            author: "bot".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: "".to_string(),
+        };
+        // LabelFailingBackend with no injected error delegates to TrackingBackend (always Ok).
+        let backend: Arc<dyn crate::backends::ExternalBackend> =
+            Arc::new(LabelFailingBackend::new());
+
+        let result =
+            update_agent_label_after_reroute("owner/repo", &task, &backend, "claude", "codex")
+                .await;
+
+        assert!(
+            result,
+            "update_agent_label_after_reroute should return true when set_labels succeeds"
+        );
     }
 }
