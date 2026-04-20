@@ -5146,6 +5146,57 @@ async fn metrics_summary_rate_limits_no_duplication_on_id_external_id_collision(
 }
 
 #[tokio::test]
+async fn metrics_summary_rate_limits_cross_repo_numeric_collision() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    // Create an internal task in repo B which will get id = 1
+    let id_b = store
+        .create_internal("owner/bean", "Task B", "", "test", "", None)
+        .await
+        .unwrap();
+
+    // Upsert an external task in repo A with external_id equal to id_b (numeric string)
+    let id_a = store
+        .upsert_external(&UpsertExternal {
+            repo: "owner/orch",
+            ext_id: &id_b.to_string(),
+            title: "External A",
+            body: "",
+            author: "user",
+            url: "https://github.com/owner/orch/issues/1",
+            labels: &[],
+            origin: "github",
+        })
+        .await
+        .unwrap();
+
+    // Record a rate limit event that references task_id = "<id_b>" — it should
+    // resolve to the external task in owner/orch, not be suppressed by the
+    // existence of an unrelated internal task with the same numeric id in owner/bean.
+    store
+        .record_rate_limit("claude", "rate_limit", Some(&id_b.to_string()))
+        .await
+        .unwrap();
+
+    let orch_summary = store
+        .get_metrics_summary_by_repo("owner/orch", 24)
+        .await
+        .unwrap();
+
+    assert_eq!(orch_summary.rate_limits_24h, 1,
+        "orch should see its rate limit event even when an unrelated repo has the same numeric id");
+
+    let bean_summary = store
+        .get_metrics_summary_by_repo("owner/bean", 24)
+        .await
+        .unwrap();
+
+    // bean should not see the orch event (it belongs to orch)
+    assert_eq!(bean_summary.rate_limits_24h, 0,
+        "bean must not see orch's rate limit event")
+}
+
+#[tokio::test]
 async fn subscription_round_trip_with_multiple_channels() {
     let store = TaskStore::open_memory().await.unwrap();
 

@@ -356,10 +356,16 @@ impl TaskStore {
         let rate_limits: (i64,) = sqlx::query_as(
             "SELECT COUNT(*)
              FROM rate_limits r
-             LEFT JOIN tasks t ON r.task_id = CAST(t.id AS TEXT)
-                 OR (r.task_id = t.external_id AND NOT EXISTS (
-                     SELECT 1 FROM tasks t2 WHERE t2.id = CAST(r.task_id AS INTEGER)
-                 ))
+             LEFT JOIN tasks t ON (
+                 -- If any task exists with this value as an external_id, prefer
+                 -- external_id matching (global preference). This avoids mapping a
+                 -- rate-limit that references an external task to an unrelated
+                 -- repo that merely happens to have an internal numeric id equal
+                 -- to the same string.
+                 (EXISTS (SELECT 1 FROM tasks te WHERE te.external_id = r.task_id) AND r.task_id = t.external_id)
+                 OR
+                 (NOT EXISTS (SELECT 1 FROM tasks te WHERE te.external_id = r.task_id) AND r.task_id = CAST(t.id AS TEXT))
+             )
              WHERE r.occurred_at >= datetime('now', ?)
              AND t.repo = ?",
         )
