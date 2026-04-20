@@ -1235,7 +1235,7 @@ impl TaskRunner {
         if is_rerouted && !is_internal_id(task_id) {
             let new_agent = self.get_field(task_id, "agent").await.unwrap_or_default();
             if !new_agent.is_empty() && new_agent != agent_name {
-                let updated = update_agent_label_after_reroute(
+                update_agent_label_after_reroute(
                     &self.repo,
                     task,
                     backend,
@@ -1243,16 +1243,6 @@ impl TaskRunner {
                     &new_agent,
                 )
                 .await;
-                if updated {
-                    tracing::info!(
-                        task_id,
-                        from = %agent_name,
-                        to = %new_agent,
-                        "updated GitHub agent label after failover"
-                    );
-                } else {
-                    return Ok(weight_signal);
-                }
             }
         }
 
@@ -1518,8 +1508,8 @@ impl TaskRunner {
 /// Update the GitHub agent label on an external task when it is rerouted to a new agent.
 ///
 /// Removes the old `agent:<old_agent>` label, ensures the new `agent:<new_agent>` label exists
-/// in the repo, then applies it. Returns `true` on success, `false` on any failure (failures are
-/// logged as warnings; the caller decides whether to propagate or continue).
+/// in the repo, then applies it. Returns `true` only when both `ensure_label` (repo label creation)
+/// and `set_labels` (issue label assignment) succeed. `remove_label` failures are non-fatal.
 async fn update_agent_label_after_reroute(
     repo: &str,
     task: &ExternalTask,
@@ -1539,7 +1529,7 @@ async fn update_agent_label_after_reroute(
     let new_label = format!("agent:{new_agent}");
     match crate::github::http::GhHttp::new() {
         Ok(gh) => {
-            if let Err(e) = gh
+            let ensure_label_ok = gh
                 .ensure_label(
                     repo,
                     &new_label,
@@ -1547,11 +1537,11 @@ async fn update_agent_label_after_reroute(
                     &format!("Agent: {new_agent}"),
                 )
                 .await
-            {
+                .is_ok();
+            if !ensure_label_ok {
                 tracing::warn!(
                     task_id = ?task.id,
                     label = %new_label,
-                    error = %e,
                     "ensure_label failed during agent label update after failover"
                 );
             }
@@ -1567,7 +1557,7 @@ async fn update_agent_label_after_reroute(
                 );
                 return false;
             }
-            true
+            ensure_label_ok
         }
         Err(e) => {
             tracing::warn!(
