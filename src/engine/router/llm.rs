@@ -1035,12 +1035,41 @@ impl LlmRouter {
                     // No parseable NDJSON lines — treat as plain text
                     Ok(raw.to_string())
                 } else {
+                    // Check if these look like actual opencode NDJSON events (have known
+                    // event types). If they don't, they're likely plain JSON that got
+                    // parsed via the fragmented NDJSON fallback, so fall back to raw text.
+                    let looks_like_opencode_ndjson = events.iter().any(|e| {
+                        e.get("type")
+                            .and_then(|v| v.as_str())
+                            .map(|t| {
+                                matches!(
+                                    t,
+                                    "step_start"
+                                        | "step_finish"
+                                        | "text"
+                                        | "message"
+                                        | "assistant"
+                                        | "error"
+                                        | "system"
+                                ) || t.contains("step")
+                                    || t.contains("text")
+                                    || t.contains("error")
+                            })
+                            .unwrap_or(false)
+                    });
+
                     match opencode::extract_ndjson_text(&events) {
                         Some(text) => Ok(text),
                         None => {
-                            anyhow::bail!(
-                                "opencode produced no text output (NDJSON had no text events)"
-                            )
+                            if looks_like_opencode_ndjson {
+                                // Real opencode NDJSON events but no text payload — clear error
+                                anyhow::bail!(
+                                    "opencode produced no text output (NDJSON had no text events)"
+                                )
+                            } else {
+                                // Not opencode NDJSON — likely plain JSON from fragmented fallback
+                                Ok(raw.to_string())
+                            }
                         }
                     }
                 }

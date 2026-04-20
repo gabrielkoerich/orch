@@ -823,7 +823,28 @@ pub(crate) fn parse_ndjson(raw: &str) -> Vec<serde_json::Value> {
         return Vec::new();
     }
 
-    // Try to extract individual JSON objects by scanning for balanced braces
+    // Fallback: try to parse the accumulated text directly as a JSON value.
+    // This handles multi-line JSON objects that don't fit on single lines.
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(acc.trim()) {
+        // Check if stripping ALL whitespace makes it a single JSON object with
+        // the same content. If so, the input was plain multi-line JSON (not
+        // fragmented NDJSON), and we should return empty to preserve original
+        // behavior — callers then treat it as plain text.
+        let stripped: String = acc.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        if let Ok(stripped_val) = serde_json::from_str::<serde_json::Value>(&stripped) {
+            // Only return empty if the stripped version parses identically,
+            // meaning whitespace was insignificant. If they differ, whitespace
+            // matters and this is likely fragmented input.
+            if stripped_val == val {
+                return Vec::new();
+            }
+        }
+        return vec![val];
+    }
+
+    // Direct parse failed — try to extract JSON objects by scanning for balanced
+    // braces. This handles cases like embedded JSON within text:
+    // `{"text": "```json\n{\"status\": \"done\"}\n```"}`
     extract_json_objects(&acc)
 }
 
