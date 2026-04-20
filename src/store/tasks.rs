@@ -2120,8 +2120,12 @@ impl TaskStore {
             no_code_last_agent: row
                 .try_get::<String, _>("no_code_last_agent")
                 .unwrap_or_default(),
-            created_at: row.try_get::<String, _>("created_at").unwrap_or_default(),
-            updated_at: row.try_get::<String, _>("updated_at").unwrap_or_default(),
+            created_at: row
+                .try_get::<String, _>("created_at")
+                .map_err(|e| anyhow::anyhow!("task row missing created_at: {e}"))?,
+            updated_at: row
+                .try_get::<String, _>("updated_at")
+                .map_err(|e| anyhow::anyhow!("task row missing updated_at: {e}"))?,
         })
     }
     pub async fn ensure_external_task(
