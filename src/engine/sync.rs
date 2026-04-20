@@ -641,6 +641,111 @@ fn auto_unblock_cooldown_elapsed(count: i32, last_at: &str) -> bool {
     }
 }
 
+fn is_ci_failure_block(task: &crate::store::Task) -> bool {
+    let reason = task.block_reason.as_deref().unwrap_or("");
+    reason.contains("CI failure limit") || reason.contains("CI checks timed out")
+}
+
+fn ci_failure_unblock_cooldown_elapsed(task: &crate::store::Task) -> bool {
+    if task.auto_unblock_count == 0 {
+        return true;
+    }
+
+    let required = match task.auto_unblock_count {
+        1 => chrono::Duration::hours(24),
+        2 => chrono::Duration::days(3),
+        _ => return false,
+    };
+
+    let last_at = &task.auto_unblock_last_at;
+    if last_at.trim().is_empty() {
+        return true;
+    }
+
+    match chrono::DateTime::parse_from_rfc3339(last_at) {
+        Ok(ts) => chrono::Utc::now() - ts.with_timezone(&chrono::Utc) >= required,
+        Err(_) => true,
+    }
+}
+
+async fn try_unblock_ci_failure_task(
+    gh: &crate::github::http::GhHttp,
+    repo: &str,
+    task_manager: &Arc<TaskManager>,
+    store: &Arc<TaskStore>,
+    task: &crate::store::Task,
+) -> anyhow::Result<bool> {
+    let pr_number = match task.pr_number {
+        Some(n) => n,
+        None => {
+            tracing::debug!(
+                task_id = task.id,
+                "CI failure blocked task has no PR number"
+            );
+            return Ok(false);
+        }
+    };
+
+    let pr = match gh.get_pr(repo, pr_number as u64).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(task_id = task.id, pr_number, err = %e, "failed to get PR status for CI failure block");
+            return Ok(false);
+        }
+    };
+
+    tracing::debug!(
+        task_id = task.id,
+        pr_number,
+        merged = pr.merged,
+        state = ?pr.state,
+        "verifying PR state for CI failure blocked task"
+    );
+
+    if pr.merged.unwrap_or(false) || pr.state.eq_ignore_ascii_case("closed") {
+        tracing::info!(
+            task_id = task.id,
+            pr_number,
+            merged = pr.merged,
+            state = %pr.state,
+            "PR merged/closed — unblocking CI failure blocked task"
+        );
+        let ext_id = task
+            .external_id
+            .clone()
+            .unwrap_or_else(|| format!("internal:{}", task.id));
+        task_manager
+            .update_task_status(&crate::backends::ExternalId(ext_id), Status::Done)
+            .await?;
+        let fields = vec![
+            ("block_reason", serde_json::Value::Null),
+            ("auto_unblock_count", serde_json::json!(0)),
+            ("auto_unblock_last_at", serde_json::json!("")),
+            ("auto_unblock_last_reason", serde_json::json!("")),
+        ];
+        store.set_fields(task.id, &fields).await?;
+        return Ok(true);
+    }
+
+    let pr_state = pr.state.as_str();
+    let new_reason = format!(
+        "CI failure limit reached during auto-merge (PR #{} still open, state: {})",
+        pr_number, pr_state
+    );
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    // Increment auto_unblock_count so the cooldown backoff (24h, 3d, never) kicks in
+    // and we don't hammer the GitHub API every tick for a PR that stays open.
+    let new_count = task.auto_unblock_count.saturating_add(1);
+    let fields = vec![
+        ("block_reason", serde_json::json!(&new_reason)),
+        ("auto_unblock_count", serde_json::json!(new_count)),
+        ("auto_unblock_last_at", serde_json::json!(&now)),
+    ];
+    store.set_fields(task.id, &fields).await?;
+
+    Ok(false)
+}
+
 async fn auto_unblock_blocked_tasks(
     repo: &str,
     task_manager: &Arc<TaskManager>,
@@ -669,7 +774,34 @@ async fn auto_unblock_blocked_tasks(
         }
     };
 
-    for task in blocked {
+    // Separate CI-failure blocked tasks from other blocked tasks.
+    let (ci_failure_tasks, other_blocked): (Vec<_>, Vec<_>) =
+        blocked.into_iter().partition(is_ci_failure_block);
+
+    // Handle CI-failure blocked tasks by verifying PR state.
+    if !ci_failure_tasks.is_empty() {
+        let gh = match crate::github::http::GhHttp::new() {
+            Ok(g) => Some(g),
+            Err(e) => {
+                tracing::warn!(err = %e, "failed to create GhHttp — skipping CI failure unblock this tick");
+                None
+            }
+        };
+        for task in ci_failure_tasks {
+            if ci_failure_unblock_cooldown_elapsed(&task) {
+                if let Some(ref gh) = gh {
+                    if let Err(e) =
+                        try_unblock_ci_failure_task(gh, repo, task_manager, store, &task).await
+                    {
+                        tracing::warn!(task_id = task.id, err = %e, "CI failure unblock check failed");
+                    }
+                }
+            }
+        }
+    }
+
+    // Process regular blocked tasks (those without a block_reason).
+    for task in other_blocked {
         if task.block_reason.is_some() {
             continue;
         }
@@ -4328,5 +4460,142 @@ mod tests {
             Some(initial_ts),
             "cursor must not advance when acknowledge_mention fails for ExecuteCommandForMention"
         );
+    }
+
+    // ── is_ci_failure_block ────────────────────────────────────────────────
+
+    fn make_task(block_reason: Option<String>) -> crate::store::Task {
+        crate::store::Task {
+            id: 1,
+            external_id: None,
+            repo: "owner/repo".to_string(),
+            origin: String::new(),
+            title: String::new(),
+            body: String::new(),
+            status: crate::store::TaskStatus::Blocked,
+            source: String::new(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
+            labels: vec![],
+            agent: None,
+            model: None,
+            complexity: String::new(),
+            estimate: 0,
+            route_reason: String::new(),
+            agent_profile: String::new(),
+            selected_skills: String::new(),
+            route_attempts: 0,
+            attempts: 0,
+            branch: String::new(),
+            worktree: String::new(),
+            worktree_cleaned: false,
+            summary: String::new(),
+            last_error: String::new(),
+            parent_id: None,
+            block_reason,
+            pr_number: Some(42),
+            pr_review_context: String::new(),
+            last_review_ts: String::new(),
+            review_ts_map: String::new(),
+            last_comment_review_ts: String::new(),
+            merge_conflict_retries: 0,
+            ci_merge_failures: 0,
+            pr_create_failures: 0,
+            push_failures: 0,
+            network_retries: 0,
+            review_agent_failures: 0,
+            review_cycles: 0,
+            review_invocations: 0,
+            review_session_expected: false,
+            needs_review_refires: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            input_cost_usd: 0.0,
+            output_cost_usd: 0.0,
+            total_cost_usd: 0.0,
+            model_reroute_chain: String::new(),
+            limit_reroute_chain: String::new(),
+            budget_warning: String::new(),
+            budget_exceeded: false,
+            memory: vec![],
+            delegations: vec![],
+            auto_unblock_count: 0,
+            auto_unblock_last_at: String::new(),
+            auto_unblock_last_reason: String::new(),
+            ci_recovery_count: 0,
+            no_code_reroutes: 0,
+            no_code_last_agent: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn is_ci_failure_block_matches_ci_failure_limit() {
+        let task = make_task(Some(
+            "CI failure limit (3) reached during auto-merge".to_string(),
+        ));
+        assert!(is_ci_failure_block(&task));
+    }
+
+    #[test]
+    fn is_ci_failure_block_matches_ci_checks_timeout() {
+        let task = make_task(Some(
+            "CI checks timed out after 3 auto-merge failures".to_string(),
+        ));
+        assert!(is_ci_failure_block(&task));
+    }
+
+    #[test]
+    fn is_ci_failure_block_false_for_regular_block() {
+        let task = make_task(Some("waiting on input".to_string()));
+        assert!(!is_ci_failure_block(&task));
+    }
+
+    #[test]
+    fn is_ci_failure_block_false_for_none_reason() {
+        let task = make_task(None);
+        assert!(!is_ci_failure_block(&task));
+    }
+
+    // ── ci_failure_unblock_cooldown_elapsed ────────────────────────────────
+
+    #[test]
+    fn ci_failure_cooldown_zero_count_immediate() {
+        // count=0 means never attempted — always allow immediate attempt
+        let task = make_task(None);
+        assert!(ci_failure_unblock_cooldown_elapsed(&task));
+    }
+
+    #[test]
+    fn ci_failure_cooldown_empty_last_at_immediate() {
+        // count=1 but empty last_at means it was never recorded — allow immediate
+        let mut task = make_task(None);
+        task.auto_unblock_count = 1;
+        assert!(ci_failure_unblock_cooldown_elapsed(&task));
+    }
+
+    #[test]
+    fn ci_failure_cooldown_count_3_never() {
+        // count=3 or more means permanent block
+        let mut task = make_task(None);
+        task.auto_unblock_count = 3;
+        task.auto_unblock_last_at = "2020-01-01T00:00:00Z".to_string();
+        assert!(!ci_failure_unblock_cooldown_elapsed(&task));
+
+        let mut task = make_task(None);
+        task.auto_unblock_count = 99;
+        task.auto_unblock_last_at = "2020-01-01T00:00:00Z".to_string();
+        assert!(!ci_failure_unblock_cooldown_elapsed(&task));
+    }
+
+    #[test]
+    fn ci_failure_cooldown_invalid_timestamp_immediate() {
+        // invalid timestamp should not block
+        let mut task = make_task(None);
+        task.auto_unblock_count = 1;
+        task.auto_unblock_last_at = "not-a-timestamp".to_string();
+        assert!(ci_failure_unblock_cooldown_elapsed(&task));
     }
 }
