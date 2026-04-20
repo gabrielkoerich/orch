@@ -922,19 +922,23 @@ impl TaskStore {
         rows.iter().map(Self::row_to_task).collect()
     }
 
-    /// Return only the `source_id` values for internal tasks with a specific source.
+    /// Return only the `source_id` values for internal tasks with a specific source,
+    /// created within the last `since_days` days.
     /// Use this instead of `list_internal_by_source` when only deduplication is needed —
-    /// avoids fetching all 57 task columns.
+    /// avoids fetching all 57 task columns and bounds memory usage to a rolling window.
     pub async fn list_source_ids_by_source(
         &self,
         repo: &str,
         source: &str,
+        since_days: i64,
     ) -> anyhow::Result<Vec<String>> {
+        let cutoff = format!("-{since_days} days");
         let rows = sqlx::query(
-            "SELECT source_id FROM tasks WHERE repo = ? AND origin = 'internal' AND source = ?",
+            "SELECT source_id FROM tasks WHERE repo = ? AND origin = 'internal' AND source = ? AND created_at >= datetime('now', ?)",
         )
         .bind(repo)
         .bind(source)
+        .bind(&cutoff)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.iter().map(|r| r.get::<String, _>(0)).collect())
