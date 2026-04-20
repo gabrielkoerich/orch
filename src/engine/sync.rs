@@ -702,7 +702,7 @@ async fn try_unblock_ci_failure_task(
         "verifying PR state for CI failure blocked task"
     );
 
-    if pr.merged.unwrap_or(false) || pr.state == "CLOSED" {
+    if pr.merged.unwrap_or(false) || pr.state.eq_ignore_ascii_case("closed") {
         tracing::info!(
             task_id = task.id,
             pr_number,
