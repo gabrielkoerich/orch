@@ -5156,7 +5156,7 @@ async fn metrics_summary_rate_limits_cross_repo_numeric_collision() {
         .unwrap();
 
     // Upsert an external task in repo A with external_id equal to id_b (numeric string)
-    let id_a = store
+    let _id_a = store
         .upsert_external(&UpsertExternal {
             repo: "owner/orch",
             ext_id: &id_b.to_string(),
@@ -5183,8 +5183,10 @@ async fn metrics_summary_rate_limits_cross_repo_numeric_collision() {
         .await
         .unwrap();
 
-    assert_eq!(orch_summary.rate_limits_24h, 1,
-        "orch should see its rate limit event even when an unrelated repo has the same numeric id");
+    assert_eq!(
+        orch_summary.rate_limits_24h, 1,
+        "orch should see its rate limit event even when an unrelated repo has the same numeric id"
+    );
 
     let bean_summary = store
         .get_metrics_summary_by_repo("owner/bean", 24)
@@ -5192,8 +5194,10 @@ async fn metrics_summary_rate_limits_cross_repo_numeric_collision() {
         .unwrap();
 
     // bean should not see the orch event (it belongs to orch)
-    assert_eq!(bean_summary.rate_limits_24h, 0,
-        "bean must not see orch's rate limit event")
+    assert_eq!(
+        bean_summary.rate_limits_24h, 0,
+        "bean must not see orch's rate limit event"
+    )
 }
 
 #[tokio::test]
