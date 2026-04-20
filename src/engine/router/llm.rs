@@ -288,7 +288,7 @@ fn classify_router_llm_failure(agent: &str, stdout: &str, stderr: &str) -> Strin
     // No useful error from stdout — fall back to stderr
     let stderr_trimmed = stderr.trim();
     if !stderr_trimmed.is_empty() {
-        let stderr_preview = stderr_trimmed[..stderr_trimmed.len().min(200)].to_string();
+        let stderr_preview = stderr_trimmed[..stderr_trimmed.floor_char_boundary(200)].to_string();
         return stderr_preview;
     }
 
@@ -907,7 +907,7 @@ impl LlmRouter {
             Ok(None) => {
                 anyhow::bail!(
                     "could not parse LLM response as JSON: {}",
-                    &text[..text.len().min(200)]
+                    &text[..text.floor_char_boundary(200)]
                 )
             }
             Err(e) => anyhow::bail!("router LLM returned error payload: {e}"),
