@@ -3161,9 +3161,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Set counter to MAX-1 (4) so incrementing hits MAX (5) and escalates
+        // Set counter to MAX (5) so incrementing to MAX+1 (6) triggers escalation.
+        // With the fix (new_refires > MAX), escalation happens at the 6th attempt
+        // (current=5 -> new=6), allowing exactly 5 refires before blocking.
         store
-            .set_fields(id, &[("needs_review_refires", serde_json::json!(4))])
+            .set_fields(id, &[("needs_review_refires", serde_json::json!(5))])
             .await
             .unwrap();
         // Backdate updated_at so age check passes
@@ -3190,6 +3192,75 @@ mod tests {
         let after = store.get(id).await.unwrap();
         assert_eq!(after.status, crate::store::TaskStatus::Blocked);
         assert!(after.block_reason.is_some());
+    }
+
+    /// Verify that exactly MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS refires are allowed
+    /// before escalation. Task should still be NeedsReview at 5 refires,
+    /// only block at the 6th attempt.
+    #[tokio::test]
+    async fn needs_review_allows_max_refires_before_escalation() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(TmuxManager::new());
+        let router = Arc::new(RwLock::new(crate::engine::router::Router::from_config()));
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+        let auto_merge_in_flight: Arc<DashSet<String>> = Arc::new(DashSet::new());
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "204",
+                title: "Max refires test",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::NeedsReview)
+            .await
+            .unwrap();
+
+        // Set counter to MAX-1 (4) so incrementing hits MAX (5) but does NOT escalate.
+        // With new_refires > MAX, escalation happens at 6, so 5 should still be safe.
+        store
+            .set_fields(id, &[("needs_review_refires", serde_json::json!(4))])
+            .await
+            .unwrap();
+        // Backdate updated_at so age check passes
+        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        sync_tick(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &EngineConfig::default(),
+            &router,
+            &task_manager,
+            &store,
+            &dispatching,
+            &auto_merge_in_flight,
+        )
+        .await
+        .unwrap();
+
+        let after = store.get(id).await.unwrap();
+        // Task should still be NeedsReview at 5 refires (MAX), not Blocked
+        assert_eq!(after.status, crate::store::TaskStatus::NeedsReview);
+        assert_eq!(after.needs_review_refires, 5);
+        assert!(after.block_reason.is_none());
     }
 
     /// A fresh InReview task (<1 min old) should NOT be reset — the review
