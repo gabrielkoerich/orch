@@ -641,6 +641,103 @@ fn auto_unblock_cooldown_elapsed(count: i32, last_at: &str) -> bool {
     }
 }
 
+fn is_ci_failure_block(task: &crate::store::Task) -> bool {
+    let reason = task.block_reason.as_deref().unwrap_or("");
+    reason.contains("CI failure limit") || reason.contains("CI checks timed out")
+}
+
+fn ci_failure_unblock_cooldown_elapsed(task: &crate::store::Task) -> bool {
+    if task.auto_unblock_count == 0 {
+        return true;
+    }
+
+    let required = match task.auto_unblock_count {
+        1 => chrono::Duration::hours(24),
+        2 => chrono::Duration::days(3),
+        _ => return false,
+    };
+
+    let last_at = &task.auto_unblock_last_at;
+    if last_at.trim().is_empty() {
+        return true;
+    }
+
+    match chrono::DateTime::parse_from_rfc3339(last_at) {
+        Ok(ts) => chrono::Utc::now() - ts.with_timezone(&chrono::Utc) >= required,
+        Err(_) => true,
+    }
+}
+
+async fn try_unblock_ci_failure_task(
+    gh: &crate::github::http::GhHttp,
+    repo: &str,
+    task_manager: &Arc<TaskManager>,
+    store: &Arc<TaskStore>,
+    task: &crate::store::Task,
+) -> anyhow::Result<bool> {
+    let pr_number = match task.pr_number {
+        Some(n) => n,
+        None => {
+            tracing::debug!(
+                task_id = task.id,
+                "CI failure blocked task has no PR number"
+            );
+            return Ok(false);
+        }
+    };
+
+    let pr = match gh.get_pr(repo, pr_number as u64).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(task_id = task.id, pr_number, err = %e, "failed to get PR status for CI failure block");
+            return Ok(false);
+        }
+    };
+
+    tracing::debug!(
+        task_id = task.id,
+        pr_number,
+        merged = pr.merged,
+        state = ?pr.state,
+        "verifying PR state for CI failure blocked task"
+    );
+
+    if pr.merged.unwrap_or(false) || pr.state == "CLOSED" {
+        tracing::info!(
+            task_id = task.id,
+            pr_number,
+            merged = pr.merged,
+            state = %pr.state,
+            "PR merged/closed — unblocking CI failure blocked task"
+        );
+        let ext_id = task
+            .external_id
+            .clone()
+            .unwrap_or_else(|| format!("internal:{}", task.id));
+        task_manager
+            .update_task_status(&crate::backends::ExternalId(ext_id), Status::Done)
+            .await?;
+        let fields = vec![
+            ("block_reason", serde_json::Value::Null),
+            ("auto_unblock_count", serde_json::json!(0)),
+            ("auto_unblock_last_at", serde_json::json!("")),
+            ("auto_unblock_last_reason", serde_json::json!("")),
+        ];
+        store.set_fields(task.id, &fields).await?;
+        return Ok(true);
+    }
+
+    let pr_state = pr.state.as_str();
+    let new_reason = format!(
+        "CI failure limit reached during auto-merge (PR #{} still open, state: {})",
+        pr_number, pr_state
+    );
+    let fields = vec![("block_reason", serde_json::json!(&new_reason))];
+    store.set_fields(task.id, &fields).await?;
+
+    Ok(false)
+}
+
 async fn auto_unblock_blocked_tasks(
     repo: &str,
     task_manager: &Arc<TaskManager>,
@@ -669,7 +766,34 @@ async fn auto_unblock_blocked_tasks(
         }
     };
 
-    for task in blocked {
+    // Separate CI-failure blocked tasks from other blocked tasks.
+    let (ci_failure_tasks, other_blocked): (Vec<_>, Vec<_>) =
+        blocked.into_iter().partition(is_ci_failure_block);
+
+    // Handle CI-failure blocked tasks by verifying PR state.
+    if !ci_failure_tasks.is_empty() {
+        let gh = match crate::github::http::GhHttp::new() {
+            Ok(g) => Some(g),
+            Err(e) => {
+                tracing::warn!(err = %e, "failed to create GhHttp — skipping CI failure unblock this tick");
+                None
+            }
+        };
+        for task in ci_failure_tasks {
+            if ci_failure_unblock_cooldown_elapsed(&task) {
+                if let Some(ref gh) = gh {
+                    if let Err(e) =
+                        try_unblock_ci_failure_task(gh, repo, task_manager, store, &task).await
+                    {
+                        tracing::warn!(task_id = task.id, err = %e, "CI failure unblock check failed");
+                    }
+                }
+            }
+        }
+    }
+
+    // Process regular blocked tasks (those without a block_reason).
+    for task in other_blocked {
         if task.block_reason.is_some() {
             continue;
         }
