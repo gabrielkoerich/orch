@@ -143,11 +143,10 @@ fn detect_error_envelope(value: &serde_json::Value) -> Option<String> {
     }
 
     // Error message substring detection (defense in depth).
-    // Use case-insensitive regex against the original `raw` string so that
-    // match byte offsets are always valid for `raw`, even when it contains
-    // non-ASCII (multi-byte) characters. Lowercasing can change byte lengths
-    // and make offsets from the lowercased string invalid for the original.
+    // Since all error indicators are plain ASCII, we can use simple string search
+    // on the lowercased input for better performance.
     let raw = serde_json::to_string(value).ok()?;
+    let raw_lower = raw.to_ascii_lowercase();
     let error_indicators = [
         "rate limit",
         "overloaded",
@@ -165,13 +164,11 @@ fn detect_error_envelope(value: &serde_json::Value) -> Option<String> {
         "max_tokens",
     ];
     for indicator in &error_indicators {
-        // SAFETY: all indicators are plain ASCII strings; regex::escape + (?i) is safe.
-        let re = regex::Regex::new(&format!("(?i){}", regex::escape(indicator)))
-            .expect("static indicator pattern must compile");
-        if let Some(m) = re.find(&raw) {
+        if let Some(pos) = raw_lower.find(indicator) {
             // Use char-boundary-aware extension to avoid slicing mid-codepoint.
-            let start = raw.floor_char_boundary(m.start().saturating_sub(30));
-            let end = raw.ceil_char_boundary((m.end() + 30).min(raw.len()));
+            // Since indicators are ASCII, byte offsets are the same in both strings.
+            let start = raw.floor_char_boundary(pos.saturating_sub(30));
+            let end = raw.ceil_char_boundary((pos + indicator.len() + 30).min(raw.len()));
             let snippet = &raw[start..end];
             return Some(format!(
                 "error indicator '{indicator}' found near: {snippet}"
@@ -258,8 +255,9 @@ fn classify_router_llm_failure(agent: &str, stdout: &str, stderr: &str) -> Strin
         }
 
         // Last resort: check for common error indicators in stdout.
-        // Use case-insensitive regex on the original string to avoid byte-offset
-        // mismatches that arise when lowercasing non-ASCII content.
+        // Since all error indicators are plain ASCII, we can use simple string search
+        // on the lowercased input for better performance.
+        let stdout_lower = stdout_trimmed.to_ascii_lowercase();
         let error_indicators = [
             "rate limit",
             "overloaded",
@@ -277,9 +275,7 @@ fn classify_router_llm_failure(agent: &str, stdout: &str, stderr: &str) -> Strin
             "max_tokens",
         ];
         for indicator in &error_indicators {
-            let re = regex::Regex::new(&format!("(?i){}", regex::escape(indicator)))
-                .expect("static indicator pattern must compile");
-            if re.is_match(stdout_trimmed) {
+            if stdout_lower.contains(indicator) {
                 return format!("error indicator '{indicator}' found in stdout");
             }
         }
