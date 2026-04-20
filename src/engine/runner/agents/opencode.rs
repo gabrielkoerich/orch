@@ -444,8 +444,15 @@ printf '%s\n' {sq_permission_json} > .orch-opencode/opencode/opencode.json || {{
 
     fn parse_response(&self, raw: &str) -> Result<ParsedResponse, AgentError> {
         let trimmed = raw.trim();
+        // Empty output with exit code 0 is a silent failure — return Unknown with
+        // a deterministic message matching what fallback.rs expects so the model
+        // gets a cooldown and free-model retry is attempted.
         if trimmed.is_empty() {
-            return Err(AgentError::InvalidResponse { raw: String::new() });
+            return Err(AgentError::Unknown {
+                exit_code: 0,
+                message: "empty-output-exit0: opencode returned exit 0 with empty stdout"
+                    .to_string(),
+            });
         }
 
         let events = super::parse_ndjson(trimmed);
@@ -1086,9 +1093,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_opencode_empty() {
+    fn parse_opencode_empty_returns_silent_failure() {
         let err = runner().parse_response("").unwrap_err();
-        assert!(matches!(err, AgentError::InvalidResponse { .. }));
+        // Empty output with exit 0 is treated as silent failure so fallback.rs
+        // can apply model cooldown and retry with free models
+        assert!(matches!(err, AgentError::Unknown { exit_code: 0, .. }));
     }
 
     #[test]
