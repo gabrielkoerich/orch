@@ -142,9 +142,12 @@ fn detect_error_envelope(value: &serde_json::Value) -> Option<String> {
         return Some(format!("error: {err_str}"));
     }
 
-    // Error message substring detection (defense in depth)
+    // Error message substring detection (defense in depth).
+    // Use case-insensitive regex against the original `raw` string so that
+    // match byte offsets are always valid for `raw`, even when it contains
+    // non-ASCII (multi-byte) characters. Lowercasing can change byte lengths
+    // and make offsets from the lowercased string invalid for the original.
     let raw = serde_json::to_string(value).ok()?;
-    let raw_lower = raw.to_lowercase();
     let error_indicators = [
         "rate limit",
         "overloaded",
@@ -162,16 +165,17 @@ fn detect_error_envelope(value: &serde_json::Value) -> Option<String> {
         "max_tokens",
     ];
     for indicator in &error_indicators {
-        if raw_lower.contains(indicator) {
-            // Extract a short snippet around the indicator
-            if let Some(pos) = raw_lower.find(indicator) {
-                let start = pos.saturating_sub(30);
-                let end = (pos + indicator.len() + 30).min(raw.len());
-                let snippet = &raw[start..end];
-                return Some(format!(
-                    "error indicator '{indicator}' found near: {snippet}"
-                ));
-            }
+        // SAFETY: all indicators are plain ASCII strings; regex::escape + (?i) is safe.
+        let re = regex::Regex::new(&format!("(?i){}", regex::escape(indicator)))
+            .expect("static indicator pattern must compile");
+        if let Some(m) = re.find(&raw) {
+            // Use char-boundary-aware extension to avoid slicing mid-codepoint.
+            let start = raw.floor_char_boundary(m.start().saturating_sub(30));
+            let end = raw.ceil_char_boundary((m.end() + 30).min(raw.len()));
+            let snippet = &raw[start..end];
+            return Some(format!(
+                "error indicator '{indicator}' found near: {snippet}"
+            ));
         }
     }
 
@@ -253,8 +257,9 @@ fn classify_router_llm_failure(agent: &str, stdout: &str, stderr: &str) -> Strin
             }
         }
 
-        // Last resort: check for common error indicators in stdout
-        let stdout_lower = stdout_trimmed.to_lowercase();
+        // Last resort: check for common error indicators in stdout.
+        // Use case-insensitive regex on the original string to avoid byte-offset
+        // mismatches that arise when lowercasing non-ASCII content.
         let error_indicators = [
             "rate limit",
             "overloaded",
@@ -272,7 +277,9 @@ fn classify_router_llm_failure(agent: &str, stdout: &str, stderr: &str) -> Strin
             "max_tokens",
         ];
         for indicator in &error_indicators {
-            if stdout_lower.contains(indicator) {
+            let re = regex::Regex::new(&format!("(?i){}", regex::escape(indicator)))
+                .expect("static indicator pattern must compile");
+            if re.is_match(stdout_trimmed) {
                 return format!("error indicator '{indicator}' found in stdout");
             }
         }
@@ -1828,5 +1835,78 @@ mod tests {
         let stderr = "some warning here";
         let result = classify_router_llm_failure("opencode", stdout, stderr);
         assert_eq!(result, "router LLM produced only system/startup envelope");
+    }
+
+    // ── Unicode / multi-byte safety ───────────────────────────────────────────
+
+    #[test]
+    fn detect_error_envelope_unicode_before_indicator_no_panic() {
+        // Non-ASCII characters before the indicator used to cause panics or
+        // corrupted snippets because the lowercased-string byte offset was used
+        // to slice the original string. Verify no panic and that the indicator
+        // is found.
+        let json: serde_json::Value =
+            serde_json::from_str(r#"{"message":"ééé RATE LIMIT quota exceeded for model"}"#)
+                .unwrap();
+        let result = detect_error_envelope(&json);
+        assert!(result.is_some(), "should detect rate limit indicator");
+        let msg = result.unwrap();
+        // The returned snippet must contain the indicator we matched on.
+        assert!(
+            msg.to_lowercase().contains("rate limit") || msg.to_lowercase().contains("quota"),
+            "snippet must contain matched indicator: {msg}"
+        );
+    }
+
+    #[test]
+    fn detect_error_envelope_emoji_before_indicator_no_panic() {
+        // Emoji are 4 bytes each in UTF-8; ensure offsets are safe.
+        let json: serde_json::Value =
+            serde_json::from_str(r#"{"message":"🙂🙂🙂 rate limit encountered by the service"}"#)
+                .unwrap();
+        let result = detect_error_envelope(&json);
+        assert!(result.is_some(), "should detect 'rate limit' after emoji");
+        let msg = result.unwrap();
+        assert!(
+            msg.to_lowercase().contains("rate limit"),
+            "snippet must contain 'rate limit': {msg}"
+        );
+    }
+
+    #[test]
+    fn detect_error_envelope_unicode_indicator_position_no_corrupted_snippet() {
+        // The snippet must be valid UTF-8 (no corrupted multi-byte sequences).
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"info":"Données système","status":503,"detail":"service overloaded temporarily"}"#,
+        )
+        .unwrap();
+        let result = detect_error_envelope(&json);
+        assert!(result.is_some(), "should detect 503 or overloaded");
+        // Ensure the returned string is valid (would panic if slice is misaligned)
+        let msg = result.unwrap();
+        assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn classify_router_llm_failure_unicode_stdout_no_panic() {
+        // Verify classify_router_llm_failure does not panic on non-ASCII stdout.
+        let stdout = "ééé authentication failed: invalid token";
+        let stderr = "";
+        let result = classify_router_llm_failure("claude", stdout, stderr);
+        assert!(
+            result.to_lowercase().contains("authentication"),
+            "should detect authentication indicator: {result}"
+        );
+    }
+
+    #[test]
+    fn classify_router_llm_failure_emoji_stdout_no_panic() {
+        let stdout = "🚀🚀 rate limit exceeded on this endpoint 🚀";
+        let stderr = "";
+        let result = classify_router_llm_failure("claude", stdout, stderr);
+        assert!(
+            result.to_lowercase().contains("rate limit"),
+            "should detect rate limit indicator: {result}"
+        );
     }
 }
