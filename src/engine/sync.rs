@@ -1232,7 +1232,10 @@ pub(crate) async fn sync_tick(
             let new_refires = current_refires + 1;
 
             // If we've exceeded max attempts, escalate the task to Blocked with a clear reason.
-            if new_refires >= MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS {
+            // Allow exactly MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS refires; only escalate when
+            // the new_refires value exceeds that budget (fix off-by-one where `>=` would
+            // escalate one attempt too early).
+            if new_refires > MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS {
                 tracing::warn!(
                     task_id = task.task_id(),
                     new_refires,
