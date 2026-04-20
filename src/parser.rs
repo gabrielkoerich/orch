@@ -67,13 +67,51 @@ pub fn parse_and_print(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Known canonical statuses - used to prefer better candidates.
+/// NOTE: Does NOT include aliases like "ready_for_review" - those are
+/// normalized to canonical forms in normalize_status().
+fn status_is_known(status: &str) -> bool {
+    matches!(
+        status,
+        "new"
+            | "routed"
+            | "in_progress"
+            | "done"
+            | "completed"
+            | "ok"
+            | "success"
+            | "running"
+            | "blocked"
+            | "error"
+            | "failed"
+            | "in_review"
+            | "reviewing"
+            | "needs_review"
+            | "pending_review"
+    )
+}
+
 /// Parse raw agent output into a normalized response.
 pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
     let mut last_err: Option<anyhow::Error> = None;
     let mut saw_jsonish_candidate = false;
+    let mut best_candidate: Option<AgentResponse> = None;
+    let mut best_status_known = false;
+
     for candidate in json_candidates(raw) {
         match parse_candidate(&candidate) {
-            Ok(resp) => return Ok(normalize_status(resp)),
+            Ok(mut resp) => {
+                resp = normalize_status(resp);
+                // If status is known, return immediately (good candidate found).
+                if status_is_known(&resp.status) {
+                    return Ok(resp);
+                }
+                // Non-canonical status - remember it but keep looking for better.
+                if best_candidate.is_none() || !best_status_known {
+                    best_candidate = Some(resp);
+                    best_status_known = false;
+                }
+            }
             Err(err) => {
                 if err.to_string() != "invalid agent response candidate" {
                     saw_jsonish_candidate = true;
@@ -81,6 +119,12 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
                 }
             }
         }
+    }
+
+    // If we found a candidate with non-canonical status but no known-status
+    // candidate was found, use the best one we have.
+    if let Some(resp) = best_candidate {
+        return Ok(resp);
     }
 
     if saw_jsonish_candidate {
@@ -116,7 +160,7 @@ fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
         // Canonical progress statuses.
         "in_progress" | "running" => "in_progress".to_string(),
         "in_review" | "reviewing" => "in_review".to_string(),
-        "needs_review" | "pending_review" => "needs_review".to_string(),
+        "needs_review" | "pending_review" | "ready_for_review" => "needs_review".to_string(),
         // Canonical error statuses.
         "blocked" | "error" | "failed" => "blocked".to_string(),
         // Passthrough: known canonical statuses (already canonical, keep as-is).
@@ -387,37 +431,53 @@ fn repair_json_like(text: &str) -> String {
     repaired
 }
 
+/// Fields that indicate a substantive agent response (not just a status blob).
+/// NOTE: We don't include "output" or "message" here because those are
+/// handled via summary extraction in map_generic_response. This list is for
+/// validating that the payload has meaningful agent response structure beyond
+/// just a status field.
+const SUBSTANTIVE_RESPONSE_FIELDS: &[&str] = &[
+    "summary",
+    "message",
+    "accomplished",
+    "remaining",
+    "files",
+    "files_changed",
+    "learnings",
+    "delegations",
+    "output",
+];
+
 /// Map a generic JSON object to AgentResponse.
+///
+/// Requires stricter shape checking: the object must have:
+/// 1. A status/result field
+/// 2. AND at least one substantive field OR an error field
+///
+/// This prevents acceptance of non-response JSON blobs (telemetry, tool outputs)
+/// that happen to contain a status field.
 fn map_generic_response(val: &serde_json::Value) -> anyhow::Result<AgentResponse> {
     let obj = val.as_object().context("expected JSON object")?;
 
-    let has_supported_fields = [
-        "status",
-        "result",
-        "summary",
-        "message",
-        "output",
-        "accomplished",
-        "remaining",
-        "files",
-        "files_changed",
-        "error",
-        "learnings",
-        "delegations",
-    ]
-    .iter()
-    .any(|key| obj.contains_key(*key));
-
-    if !has_supported_fields {
-        anyhow::bail!("JSON object does not contain any supported agent response fields");
-    }
-
+    // Check for status or result field first.
     let status = obj
         .get("status")
         .or_else(|| obj.get("result"))
         .and_then(|v| v.as_str())
         .context("agent response is missing required 'status' or 'result' field")?
         .to_string();
+
+    // Require at least one substantive field OR an error field.
+    // This prevents accepting telemetry/event JSON blobs that happen to have
+    // a status field but are not actual agent responses.
+    let has_substantive_field = SUBSTANTIVE_RESPONSE_FIELDS
+        .iter()
+        .any(|key| obj.contains_key(*key));
+    let has_error = obj.contains_key("error");
+
+    if !has_substantive_field && !has_error {
+        anyhow::bail!("JSON object lacks substantive response fields");
+    }
 
     let summary = obj
         .get("summary")
@@ -672,9 +732,12 @@ Thanks"#;
     fn parse_empty_object() {
         let input = "{}";
         let err = parse(input).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("JSON object does not contain any supported agent response fields"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("agent response is missing required")
+                || msg.contains("JSON object lacks substantive"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
@@ -933,5 +996,73 @@ Some output here.
             result.is_err(),
             "missing status should error, not default to done"
         );
+    }
+
+    // ── Regression tests for gh-issue-2880 ───────────────────────────────
+
+    #[test]
+    fn parse_regression_2880_ready_for_review_normalized() {
+        // ready_for_review should be normalized to needs_review.
+        let input = r#"{"status":"ready_for_review","summary":"Ready for review","accomplished":["done"],"remaining":[],"files":["src/main.rs"]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "needs_review");
+    }
+
+    #[test]
+    fn parse_regression_2880_status_with_output_accepted() {
+        // status + output SHOULD be accepted (output is a substantive field).
+        // This was already supported via summary extraction in map_generic_response.
+        let input = r#"{"status":"done","output":"All tests passed"}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
+    fn parse_regression_2880_mixed_ndjson_chooses_best_candidate() {
+        // In a mixed NDJSON stream:
+        // - First blob: file path as status (like the bug)
+        // - Later blob: proper response with done status
+        // The parser should prefer the one with known status.
+        let input = r#"{"status":"src/channels/discord_ws.rs","summary":"","accomplished":[],"remaining":[],"files":[]}
+{"status":"done","summary":"Fixed websocket timeout","accomplished":["fixed"],"remaining":[],"files":["src/channels/discord_ws.rs"]}"#;
+        let resp = parse(input).unwrap();
+        // The parser now prefers known statuses, so it should pick the "done" one.
+        assert_eq!(resp.status, "done");
+        assert_eq!(resp.summary, "Fixed websocket timeout");
+    }
+
+    #[test]
+    fn parse_regression_2880_normalize_aliases() {
+        // Verify all status aliases are normalized correctly.
+        for (input, expected) in [
+            ("ok", "done"),
+            ("success", "done"),
+            ("completed", "done"),
+            ("running", "in_progress"),
+            ("reviewing", "in_review"),
+            ("pending_review", "needs_review"),
+            ("ready_for_review", "needs_review"),
+            ("error", "blocked"),
+            ("failed", "blocked"),
+        ] {
+            let input = format!(
+                r#"{{"status":"{input}","summary":"test","accomplished":[],"remaining":[],"files":[]}}"#
+            );
+            let resp = parse(&input).unwrap();
+            assert_eq!(
+                resp.status, expected,
+                "status '{input}' should normalize to '{expected}'"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_regression_2880_telemetry_skipped() {
+        // Telemetry objects without proper response structure should be ignored.
+        let input = r#"{"type":"telemetry","event":"tool_call"}
+{"status":"done","summary":"Work complete","accomplished":["done"],"remaining":[],"files":["src/main.rs"]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+        assert_eq!(resp.summary, "Work complete");
     }
 }
