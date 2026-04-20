@@ -124,7 +124,11 @@ impl ReviewTaskSnapshot {
 async fn prefetch_review_tasks(
     store: &Arc<TaskStore>,
     repo: &str,
-) -> anyhow::Result<(Vec<ReviewTaskSnapshot>, Vec<ReviewTaskSnapshot>)> {
+) -> anyhow::Result<(
+    Vec<ReviewTaskSnapshot>,
+    Vec<ReviewTaskSnapshot>,
+    Vec<ReviewTaskSnapshot>,
+)> {
     let in_review = store
         .list_by_status(repo, TaskStatus::InReview)
         .await?
@@ -143,7 +147,22 @@ async fn prefetch_review_tasks(
             stored,
         })
         .collect();
-    Ok((in_review, needs_review))
+
+    // Also prefetch blocked tasks that have a branch or PR number recorded.
+    // These can be merged externally (or manually) but previously were invisible
+    // to the merged-PR checker, leaving tasks stuck in Blocked after merges.
+    let blocked_candidates = store
+        .list_by_status(repo, TaskStatus::Blocked)
+        .await?
+        .into_iter()
+        .filter(|stored| stored.pr_number.is_some() || !stored.branch.is_empty())
+        .map(|stored| ReviewTaskSnapshot {
+            external: crate::engine::tasks::store_task_to_external(&stored),
+            stored,
+        })
+        .collect();
+
+    Ok((in_review, needs_review, blocked_candidates))
 }
 
 async fn fetch_comments_since(
@@ -876,12 +895,12 @@ pub(crate) async fn sync_tick(
         });
     }
 
-    let (mut in_review_tasks, mut needs_review_tasks) =
+    let (mut in_review_tasks, mut needs_review_tasks, blocked_review_candidates) =
         match prefetch_review_tasks(store, repo).await {
             Ok(tasks) => tasks,
             Err(e) => {
                 tracing::warn!(err = %e, "failed to prefetch review tasks");
-                (vec![], vec![])
+                (vec![], vec![], vec![])
             }
         };
 
@@ -893,6 +912,10 @@ pub(crate) async fn sync_tick(
         let shared_since = mention_since.clone();
 
         let cached_router_config = router.read().await.config.clone();
+        // Include blocked tasks that have branch/pr info when checking for merged PRs.
+        let mut combined_needs = needs_review_tasks.clone();
+        combined_needs.extend(blocked_review_candidates.clone());
+
         let (merge_result, comments_result, review_result) = tokio::join!(
             check_merged_prs(
                 backend,
@@ -900,7 +923,7 @@ pub(crate) async fn sync_tick(
                 store,
                 task_manager,
                 &in_review_tasks,
-                &needs_review_tasks,
+                &combined_needs,
             ),
             fetch_comments_since(backend, &shared_since),
             async {
@@ -951,7 +974,7 @@ pub(crate) async fn sync_tick(
         }
 
         match prefetch_review_tasks(store, repo).await {
-            Ok((latest_in_review, latest_needs_review)) => {
+            Ok((latest_in_review, latest_needs_review, _latest_blocked_candidates)) => {
                 in_review_tasks = latest_in_review;
                 needs_review_tasks = latest_needs_review;
             }
