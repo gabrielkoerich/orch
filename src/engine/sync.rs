@@ -1445,7 +1445,7 @@ async fn scan_comments(
 
     // Dedup set: mention tasks already created (by source_id).
     let existing_mentions: std::collections::HashSet<String> = if let Some(s) = store {
-        match s.list_source_ids_by_source(repo, "mention").await {
+        match s.list_source_ids_by_source(repo, "mention", 30).await {
             Ok(ids) => ids.into_iter().collect(),
             Err(e) => {
                 tracing::warn!(err = %e, "failed to load mention source IDs — skipping to prevent duplicates");
