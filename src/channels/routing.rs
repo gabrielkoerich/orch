@@ -129,12 +129,6 @@ impl ChannelRouter {
     pub fn projects(&self) -> &[String] {
         &self.project_list
     }
-
-    /// Get the General channel ID for a channel type.
-    #[allow(dead_code)]
-    pub fn general_target(&self, channel: &str) -> Option<&str> {
-        self.general.get(channel).map(|s| s.as_str())
-    }
 }
 
 #[cfg(test)]
