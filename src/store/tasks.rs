@@ -941,7 +941,16 @@ impl TaskStore {
         .bind(&cutoff)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.iter().map(|r| r.get::<String, _>(0)).collect())
+
+        let mut ids = Vec::with_capacity(rows.len());
+        for row in &rows {
+            ids.push(row.try_get::<String, _>("source_id").map_err(|e| {
+                anyhow::anyhow!(
+                    "list_source_ids_by_source: failed to decode source_id for repo={repo}, source={source}: {e}"
+                )
+            })?);
+        }
+        Ok(ids)
     }
 
     /// List all active (non-done) tasks for a repo.
