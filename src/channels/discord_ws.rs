@@ -37,6 +37,10 @@ const GATEWAY_INTENTS: u64 = 1 | (1 << 9) | (1 << 15);
 
 const DEFAULT_GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
 
+/// Timeout for websocket send operations.
+/// Must be less than heartbeat interval to fail fast before zombie detection.
+const SEND_TIMEOUT_SECS: u64 = 10;
+
 // ── Public struct ────────────────────────────────────────────────────────────
 
 /// Discord Gateway websocket client.
@@ -381,10 +385,13 @@ async fn handle_connection(
         })
     };
 
-    write
-        .send(Message::Text(payload.to_string()))
-        .await
-        .map_err(|e| anyhow::anyhow!("identify send failed: {e}"))?;
+    tokio::time::timeout(
+        Duration::from_secs(SEND_TIMEOUT_SECS),
+        write.send(Message::Text(payload.to_string())),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("identify send timed out"))?
+    .map_err(|e| anyhow::anyhow!("identify send failed: {e}"))?;
 
     // ── Step 3: Event loop ───────────────────────────────────────────────────
     let mut hb_ticker = tokio::time::interval(Duration::from_millis(hb_interval_ms));
@@ -441,12 +448,13 @@ async fn handle_connection(
                                     .last_seq
                                     .map(|s| serde_json::json!(s))
                                     .unwrap_or(Value::Null);
-                                write
-                                    .send(Message::Text(
-                                        serde_json::json!({"op": OP_HEARTBEAT, "d": d}).to_string(),
-                                    ))
+                                let hb_payload = Message::Text(
+                                    serde_json::json!({"op": OP_HEARTBEAT, "d": d}).to_string(),
+                                );
+                                tokio::time::timeout(Duration::from_secs(SEND_TIMEOUT_SECS), write.send(hb_payload))
                                     .await
-                                    .map_err(|e| anyhow::anyhow!("heartbeat send failed: {e}"))?;
+                                    .map_err(|_| anyhow::anyhow!("server heartbeat send timed out"))?
+                                    .map_err(|e| anyhow::anyhow!("server heartbeat send failed: {e}"))?;
                             }
                             OP_HEARTBEAT_ACK => {
                                 ack_received = true;
@@ -486,9 +494,9 @@ async fn handle_connection(
                         return Ok(resumable);
                     }
                     Message::Ping(data) => {
-                        write
-                            .send(Message::Pong(data))
+                        tokio::time::timeout(Duration::from_secs(SEND_TIMEOUT_SECS), write.send(Message::Pong(data)))
                             .await
+                            .map_err(|_| anyhow::anyhow!("pong send timed out"))?
                             .map_err(|e| anyhow::anyhow!("pong send failed: {e}"))?;
                     }
                     _ => {}
@@ -507,12 +515,13 @@ async fn handle_connection(
                     .last_seq
                     .map(|s| serde_json::json!(s))
                     .unwrap_or(Value::Null);
-                write
-                    .send(Message::Text(
-                        serde_json::json!({"op": OP_HEARTBEAT, "d": d}).to_string(),
-                    ))
+                let hb_payload = Message::Text(
+                    serde_json::json!({"op": OP_HEARTBEAT, "d": d}).to_string(),
+                );
+                tokio::time::timeout(Duration::from_secs(SEND_TIMEOUT_SECS), write.send(hb_payload))
                     .await
-                    .map_err(|e| anyhow::anyhow!("heartbeat send failed: {e}"))?;
+                    .map_err(|_| anyhow::anyhow!("periodic heartbeat send timed out"))?
+                    .map_err(|e| anyhow::anyhow!("periodic heartbeat send failed: {e}"))?;
             }
         }
     }
