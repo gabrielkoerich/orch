@@ -199,47 +199,32 @@ impl TaskStore {
     pub async fn get_metrics_summary(&self, hours: u32) -> anyhow::Result<MetricsSummary> {
         let interval = format!("-{hours} hours");
 
-        let completed: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM task_metrics WHERE completed_at >= datetime('now', ?) AND outcome = 'success'",
+        let row = sqlx::query(
+            "SELECT
+                SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS completed,
+                SUM(CASE WHEN outcome != 'success' THEN 1 ELSE 0 END) AS failed,
+                AVG(CASE WHEN complexity = 'simple' THEN duration_seconds END) AS avg_simple,
+                AVG(CASE WHEN complexity = 'medium' THEN duration_seconds END) AS avg_medium,
+                AVG(CASE WHEN complexity = 'complex' THEN duration_seconds END) AS avg_complex
+             FROM task_metrics
+             WHERE completed_at >= datetime('now', ?)",
         )
         .bind(&interval)
         .fetch_one(&self.pool)
         .await?;
 
-        let failed: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM task_metrics WHERE completed_at >= datetime('now', ?) AND outcome != 'success'",
-        )
-        .bind(&interval)
-        .fetch_one(&self.pool)
-        .await?;
-
-        let avg_simple: Option<(f64,)> = sqlx::query_as(
-            "SELECT AVG(duration_seconds) FROM task_metrics WHERE completed_at >= datetime('now', ?) AND complexity = 'simple'",
-        )
-        .bind(&interval)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        let avg_medium: Option<(f64,)> = sqlx::query_as(
-            "SELECT AVG(duration_seconds) FROM task_metrics WHERE completed_at >= datetime('now', ?) AND complexity = 'medium'",
-        )
-        .bind(&interval)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        let avg_complex: Option<(f64,)> = sqlx::query_as(
-            "SELECT AVG(duration_seconds) FROM task_metrics WHERE completed_at >= datetime('now', ?) AND complexity = 'complex'",
-        )
-        .bind(&interval)
-        .fetch_optional(&self.pool)
-        .await?;
+        let completed: i64 = row.try_get("completed").unwrap_or(0);
+        let failed: i64 = row.try_get("failed").unwrap_or(0);
+        let avg_simple: Option<f64> = row.try_get("avg_simple").ok();
+        let avg_medium: Option<f64> = row.try_get("avg_medium").ok();
+        let avg_complex: Option<f64> = row.try_get("avg_complex").ok();
 
         let agent_rows = sqlx::query(
             "SELECT agent, COUNT(*) as total,
                 SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) as success_count
-         FROM task_metrics
-         WHERE completed_at >= datetime('now', ?)
-         GROUP BY agent",
+             FROM task_metrics
+             WHERE completed_at >= datetime('now', ?)
+             GROUP BY agent",
         )
         .bind(&interval)
         .fetch_all(&self.pool)
@@ -271,93 +256,22 @@ impl TaskStore {
         .await?;
 
         Ok(MetricsSummary {
-            tasks_completed_24h: completed.0,
-            tasks_failed_24h: failed.0,
-            avg_duration_simple: avg_simple.map(|r| r.0),
-            avg_duration_medium: avg_medium.map(|r| r.0),
-            avg_duration_complex: avg_complex.map(|r| r.0),
+            tasks_completed_24h: completed,
+            tasks_failed_24h: failed,
+            avg_duration_simple: avg_simple,
+            avg_duration_medium: avg_medium,
+            avg_duration_complex: avg_complex,
             agent_stats,
             rate_limits_24h: rate_limit_count.0,
         })
     }
 
     /// Get aggregated metrics for the last 24 hours.
-    /// Test-only convenience wrapper.
+    /// Test-only convenience wrapper — delegates to `get_metrics_summary(24)` so the
+    /// test exercises the same code path as production.
     #[cfg(test)]
     pub async fn get_metrics_summary_24h(&self) -> anyhow::Result<MetricsSummary> {
-        let completed: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM task_metrics WHERE completed_at >= datetime('now', '-24 hours') AND outcome = 'success'",
-    )
-    .fetch_one(&self.pool)
-    .await?;
-
-        let failed: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM task_metrics WHERE completed_at >= datetime('now', '-24 hours') AND outcome != 'success'",
-    )
-    .fetch_one(&self.pool)
-    .await?;
-
-        let avg_simple: Option<(f64,)> = sqlx::query_as(
-        "SELECT AVG(duration_seconds) FROM task_metrics WHERE completed_at >= datetime('now', '-24 hours') AND complexity = 'simple'",
-    )
-    .fetch_optional(&self.pool)
-    .await?;
-
-        let avg_medium: Option<(f64,)> = sqlx::query_as(
-        "SELECT AVG(duration_seconds) FROM task_metrics WHERE completed_at >= datetime('now', '-24 hours') AND complexity = 'medium'",
-    )
-    .fetch_optional(&self.pool)
-    .await?;
-
-        let avg_complex: Option<(f64,)> = sqlx::query_as(
-        "SELECT AVG(duration_seconds) FROM task_metrics WHERE completed_at >= datetime('now', '-24 hours') AND complexity = 'complex'",
-    )
-    .fetch_optional(&self.pool)
-    .await?;
-
-        let agent_rows = sqlx::query(
-            "SELECT agent, COUNT(*) as total,
-                SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) as success_count
-         FROM task_metrics
-         WHERE completed_at >= datetime('now', '-24 hours')
-         GROUP BY agent",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        let agent_stats: Vec<AgentStat> = agent_rows
-            .iter()
-            .map(|row| {
-                let total: i64 = row.try_get("total").unwrap_or(0);
-                let success: i64 = row.try_get("success_count").unwrap_or(0);
-                AgentStat {
-                    agent: row.try_get("agent").unwrap_or_default(),
-                    total_runs: total,
-                    success_count: success,
-                    success_rate: if total > 0 {
-                        (success as f64 / total as f64) * 100.0
-                    } else {
-                        0.0
-                    },
-                }
-            })
-            .collect();
-
-        let rate_limit_count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM rate_limits WHERE occurred_at >= datetime('now', '-24 hours')",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(MetricsSummary {
-            tasks_completed_24h: completed.0,
-            tasks_failed_24h: failed.0,
-            avg_duration_simple: avg_simple.map(|r| r.0),
-            avg_duration_medium: avg_medium.map(|r| r.0),
-            avg_duration_complex: avg_complex.map(|r| r.0),
-            agent_stats,
-            rate_limits_24h: rate_limit_count.0,
-        })
+        self.get_metrics_summary(24).await
     }
 
     /// Get metrics summary for a configurable time window, filtered by repo.
