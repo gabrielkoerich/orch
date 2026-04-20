@@ -871,7 +871,19 @@ pub(crate) mod patterns {
         ];
         // Find the earliest match position so we can extract context around the
         // actual error message rather than the tail (which may be unrelated JSON).
-        let match_pos = patterns.iter().filter_map(|p| lower.find(p)).min();
+        // Map the byte offset from `lower` back to `text` via char-count to avoid
+        // using a lowercased byte index on the original string (Unicode case-folding
+        // can change byte lengths, e.g. İ→i̇).
+        let match_pos = patterns
+            .iter()
+            .filter_map(|p| lower.find(p))
+            .min()
+            .map(|lower_pos| {
+                let char_idx = lower[..lower_pos].chars().count();
+                text.char_indices()
+                    .nth(char_idx)
+                    .map_or(text.len(), |(i, _)| i)
+            });
         let has_429 = lower.contains("429");
         // HTTP 529 is used by Cloudflare for rate limiting. Only match in HTTP status
         // contexts (e.g. "HTTP 529", "status: 529") to avoid false positives from bare
@@ -897,10 +909,9 @@ pub(crate) mod patterns {
 
     /// Extract up to `window` bytes of context centred around `byte_pos`.
     ///
-    /// Because `byte_pos` is derived from a lowercased copy, it is exact for
-    /// ASCII patterns (the vast majority of agent output).  For non-ASCII edge
-    /// cases the window may shift slightly but remains far more useful than
-    /// `safe_tail`.
+    /// `byte_pos` must be a valid byte offset in `text` (not derived from a
+    /// transformed copy).  Both ends are snapped to char boundaries to avoid
+    /// splitting multi-byte codepoints.
     fn extract_context_around(text: &str, byte_pos: usize, window: usize) -> String {
         let half = window / 2;
         let start = byte_pos.saturating_sub(half);
@@ -992,7 +1003,18 @@ pub(crate) mod patterns {
             "econnrefused",
             "network unreachable",
         ];
-        let match_pos = patterns.iter().filter_map(|p| lower.find(p)).min();
+        // Map the byte offset from `lower` back to `text` via char-count (same
+        // rationale as detect_rate_limit: Unicode case-folding can change byte lengths).
+        let match_pos = patterns
+            .iter()
+            .filter_map(|p| lower.find(p))
+            .min()
+            .map(|lower_pos| {
+                let char_idx = lower[..lower_pos].chars().count();
+                text.char_indices()
+                    .nth(char_idx)
+                    .map_or(text.len(), |(i, _)| i)
+            });
         if let Some(pos) = match_pos {
             return Some(AgentError::NetworkError {
                 message: extract_context_around(text, pos, 300),
