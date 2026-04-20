@@ -738,7 +738,14 @@ impl TaskManager {
                 };
                 (snapshot, Some(store_id))
             }
-            Err(_) => (TaskSnapshot::default(), None),
+            Err(e) => {
+                tracing::warn!(
+                    task_id = store_id,
+                    err = %e,
+                    "failed to read task snapshot for event enrichment — event context will be empty"
+                );
+                (TaskSnapshot::default(), None)
+            }
         }
     }
 
