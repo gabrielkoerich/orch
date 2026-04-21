@@ -96,7 +96,6 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
     let mut last_err: Option<anyhow::Error> = None;
     let mut saw_jsonish_candidate = false;
     let mut best_candidate: Option<AgentResponse> = None;
-    let mut best_status_known = false;
 
     for candidate in json_candidates(raw) {
         match parse_candidate(&candidate) {
@@ -107,9 +106,8 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
                     return Ok(resp);
                 }
                 // Non-canonical status - remember it but keep looking for better.
-                if best_candidate.is_none() || !best_status_known {
+                if best_candidate.is_none() {
                     best_candidate = Some(resp);
-                    best_status_known = false;
                 }
             }
             Err(err) => {
