@@ -158,8 +158,8 @@ pub struct Router {
 }
 
 #[derive(Debug)]
-struct AllCooledError {
-    scope: String,
+pub struct AllCooledError {
+    pub scope: String,
 }
 
 impl std::fmt::Display for AllCooledError {

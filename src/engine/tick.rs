@@ -1234,7 +1234,17 @@ pub(crate) async fn tick_route_tasks(
                 );
             }
             Err(e) => {
-                tracing::error!(task_id = task.id.0, ?e, "routing failed, skipping task");
+                // AllCooledError is an expected transient state — downgrade to WARN.
+                // Other routing errors (LLM failure, config error, etc.) remain ERROR.
+                if let Some(err) = e.downcast_ref::<crate::engine::router::AllCooledError>() {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        scope = %err.scope,
+                        "routing unavailable: all agents cooled, will retry"
+                    );
+                } else {
+                    tracing::error!(task_id = task.id.0, ?e, "routing failed, skipping task");
+                }
             }
         }
     }
