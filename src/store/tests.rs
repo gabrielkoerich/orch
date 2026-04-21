@@ -477,7 +477,10 @@ async fn append_memory_fails_on_corrupt_memory_and_preserves_db_value() {
         .await
         .unwrap();
     let mem: String = row.try_get("memory").unwrap();
-    assert_eq!(mem, corrupt, "corrupt memory payload should be preserved in DB");
+    assert_eq!(
+        mem, corrupt,
+        "corrupt memory payload should be preserved in DB"
+    );
 }
 
 #[tokio::test]
@@ -503,7 +506,10 @@ async fn recent_memory_errors_on_corrupt_json() {
         .unwrap();
 
     let res = store.recent_memory(id, 10).await;
-    assert!(res.is_err(), "recent_memory must return error on corrupt JSON");
+    assert!(
+        res.is_err(),
+        "recent_memory must return error on corrupt JSON"
+    );
 }
 
 #[tokio::test]

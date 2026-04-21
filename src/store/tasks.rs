@@ -1377,9 +1377,8 @@ impl TaskStore {
         let mut memory: Vec<MemoryEntry> = if memory_str.trim().is_empty() {
             Vec::new()
         } else {
-            serde_json::from_str(&memory_str).map_err(|e| {
-                anyhow::anyhow!("failed to parse memory JSON for task {id}: {e}")
-            })?
+            serde_json::from_str(&memory_str)
+                .map_err(|e| anyhow::anyhow!("failed to parse memory JSON for task {id}: {e}"))?
         };
         memory.push(entry.clone());
         let new_json = serde_json::to_string(&memory)?;
@@ -1411,9 +1410,8 @@ impl TaskStore {
         let mut memory: Vec<MemoryEntry> = if memory_str.trim().is_empty() {
             Vec::new()
         } else {
-            serde_json::from_str(&memory_str).map_err(|e| {
-                anyhow::anyhow!("failed to parse memory JSON for task {id}: {e}")
-            })?
+            serde_json::from_str(&memory_str)
+                .map_err(|e| anyhow::anyhow!("failed to parse memory JSON for task {id}: {e}"))?
         };
 
         memory.sort_by_key(|m| m.attempt);
