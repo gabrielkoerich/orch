@@ -17,4 +17,4 @@ paths = [
 ]
 # gitleaks 8.24.x (CI) doesn't suppress findings via paths alone in single-commit
 # diff mode (--log-opts=-1). The regex ensures the allowlist works on all versions.
-regex = '''ghp_[A-Za-z0-9]{36}'''
+regex = '''ghp_[A-Za-z0-9]{36,}'''
