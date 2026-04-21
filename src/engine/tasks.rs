@@ -585,9 +585,6 @@ impl TaskManager {
                 .ok_or_else(|| anyhow::anyhow!("store required for internal task status update"))?;
             let store_id = snapshot_store_id
                 .ok_or_else(|| anyhow::anyhow!("internal task {} not found in store", id.0))?;
-            if task_status != crate::store::TaskStatus::Blocked {
-                store.set_block_reason(store_id, None).await?;
-            }
             let updated = store
                 .update_status_if(store_id, task_status, expected_task_status)
                 .await?;
@@ -605,9 +602,6 @@ impl TaskManager {
         // a no-op instead of assuming the update succeeded.
         if let Some(ref store) = self.store {
             if let Some(store_id) = snapshot_store_id {
-                if task_status != crate::store::TaskStatus::Blocked {
-                    store.set_block_reason(store_id, None).await?;
-                }
                 let updated = store
                     .update_status_if(store_id, task_status, expected_task_status)
                     .await?;
