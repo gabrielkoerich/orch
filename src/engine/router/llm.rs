@@ -15,6 +15,7 @@ use super::{AgentProfile, RouteResult, RouterConfig};
 use crate::backends::ExternalTask;
 use crate::engine::runner::agents::{self, claude, opencode, AgentError};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Prefix used to identify router LLM timeout errors in error messages.
@@ -379,7 +380,9 @@ pub(super) fn apply_self_routing_penalty(
 /// `Router` holds a `LlmRouter` and delegates `route_with_llm` to it.
 pub(super) struct LlmRouter {
     /// Cached skills catalog loaded once to avoid repeated blocking I/O.
-    skills_catalog: tokio::sync::Mutex<Option<String>>,
+    /// OnceLock guarantees single initialization without any locking on hot path.
+    /// Wrapped in Mutex so invalidation can reset the cache.
+    skills_catalog: std::sync::Mutex<OnceLock<String>>,
 }
 
 /// Scan a skills directory for skill subdirectories containing SKILL.md files.
@@ -438,7 +441,7 @@ fn scan_skills_directory(skills_dir: &std::path::Path) -> Option<String> {
 impl LlmRouter {
     pub fn new() -> Self {
         Self {
-            skills_catalog: tokio::sync::Mutex::new(None),
+            skills_catalog: std::sync::Mutex::new(OnceLock::new()),
         }
     }
 
@@ -681,20 +684,18 @@ impl LlmRouter {
     ///
     /// Called after `skills_sync()` updates skill files on disk.
     pub async fn invalidate_skills_catalog(&self) {
-        let mut cache = self.skills_catalog.lock().await;
-        *cache = None;
+        let mut guard = self.skills_catalog.lock().unwrap();
+        *guard = OnceLock::new();
     }
 
     /// Load skills catalog from skills.yml or skills directory.
     /// Cached after first load to avoid blocking I/O in async context.
+    /// Uses OnceLock — only one thread ever enters the init path; others wait for free.
     async fn load_skills_catalog(&self) -> anyhow::Result<String> {
-        // First, check the cache with a short-lived lock
-        {
-            let cache = self.skills_catalog.lock().await;
-            if let Some(ref catalog) = *cache {
-                return Ok(catalog.clone());
-            }
-        } // Lock is dropped here
+        // Fast path: cache hit without any lock.
+        if let Some(catalog) = self.skills_catalog.lock().unwrap().get() {
+            return Ok(catalog.clone());
+        }
 
         // Cache miss — offload loading to blocking thread pool.
         // Capture only what we need to avoid holding any locks across the await.
@@ -734,10 +735,11 @@ impl LlmRouter {
         .await
         .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?;
 
-        // Update the cache with a second short-lived lock
-        let mut cache = self.skills_catalog.lock().await;
-        *cache = Some(catalog.clone());
-
+        // Update the cache. get_or_init ensures exactly one write.
+        self.skills_catalog
+            .lock()
+            .unwrap()
+            .get_or_init(|| catalog.clone());
         Ok(catalog)
     }
 
