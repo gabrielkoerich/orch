@@ -2,6 +2,34 @@
 
 You are reviewing a PR created by an AI agent. Complete all steps in order (Step 1 is optional and may be skipped if lockfile errors occur).
 
+## Output Format (Read First)
+
+You MUST output exactly one JSON object and nothing else.
+- Do NOT use markdown fences.
+- Do NOT include prose before or after the JSON.
+- Always include all required fields.
+
+```json
+{
+  "decision": "approve|request_changes",
+  "notes": "Detailed review feedback",
+  "test_results": "pass|fail|skipped",
+  "issues": [
+    {
+      "file": "src/foo.rs",
+      "line": 42,
+      "severity": "error|warning",
+      "description": "What's wrong and how to fix it"
+    }
+  ]
+}
+```
+
+Decision rules:
+- **approve**: Required GitHub CI checks pass, branch is rebased, code meets requirements, no major issues
+- **request_changes**: Required GitHub CI checks fail on PR-related code, there are bugs, scope creep, or the code doesn't meet requirements
+- **Do NOT** request changes solely because non-required checks are failing
+
 ### Step 1: Rebase onto default branch (optional)
 
 Keep the branch up to date — other PRs may have merged since this was created:
@@ -104,27 +132,6 @@ Flag `request_changes` if the PR:
 {{GIT_LOG}}
 
 {{/if}}
-## Output Format
-
-You MUST output the JSON block below even if you already ran this review earlier.
-Do NOT respond with prose summaries.
-
-```json
-{
-  "decision": "approve|request_changes",
-  "notes": "Detailed review feedback",
-  "test_results": "pass|fail|skipped",
-  "issues": [
-    {
-      "file": "src/foo.rs",
-      "line": 42,
-      "severity": "error|warning",
-      "description": "What's wrong and how to fix it"
-    }
-  ]
-}
-```
-
 ### Examples
 
 **Example 1: Approve with no issues**
@@ -136,8 +143,3 @@ Do NOT respond with prose summaries.
 ```json
 {"decision":"request_changes","notes":"Off-by-one in loop bound causes panic on empty input.","test_results":"fail","issues":[{"file":"src/engine/tick.rs","line":142,"severity":"error","description":"Loop iterates to `len` instead of `len-1`, causing index-out-of-bounds on the last element."}]}
 ```
-
-Decision rules:
-- **approve**: Required GitHub CI checks pass, branch is rebased, code meets requirements, no major issues
-- **request_changes**: Required GitHub CI checks fail on PR-related code, there are bugs, scope creep, or the code doesn't meet requirements
-- **Do NOT** request changes solely because non-required checks are failing

@@ -619,8 +619,14 @@ pub fn parse_review_response(text: &str) -> anyhow::Result<ReviewResponse> {
 
 fn infer_review_response_from_text(text: &str) -> Option<ReviewResponse> {
     let lower = text.to_ascii_lowercase();
-    let has_changes_requested =
-        lower.contains("changes requested") || lower.contains("request_changes");
+    let has_changes_requested = lower.contains("changes requested")
+        || lower.contains("request_changes")
+        || lower.contains("request changes")
+        || lower.contains("needs changes")
+        || lower.contains("cannot approve")
+        || lower.contains("can't approve")
+        || lower.contains("do not approve")
+        || lower.contains("not approving");
     if has_changes_requested {
         return Some(ReviewResponse {
             decision: "request_changes".to_string(),
@@ -1323,10 +1329,8 @@ That's all."#;
 
     #[test]
     fn infer_review_response_negation_not_approving() {
-        assert!(
-            parse_review_plain("I am not approving this PR.").is_err(),
-            "\"not approving\" should not infer approval"
-        );
+        let resp = parse_review_plain("I am not approving this PR.").unwrap();
+        assert_eq!(resp.decision, "request_changes");
     }
 
     /// Positive plain-text approval signals must still work.
@@ -1410,6 +1414,20 @@ That's all."#;
             parse_review_plain(text).is_err(),
             "negative context with backtick approve must not infer approval"
         );
+    }
+
+    #[test]
+    fn infer_review_response_request_changes_phrase() {
+        let text = "CI failed and there is a correctness bug, so I request changes.";
+        let resp = parse_review_plain(text).unwrap();
+        assert_eq!(resp.decision, "request_changes");
+    }
+
+    #[test]
+    fn infer_review_response_needs_changes_phrase() {
+        let text = "Needs changes before merge due to failing tests.";
+        let resp = parse_review_plain(text).unwrap();
+        assert_eq!(resp.decision, "request_changes");
     }
 
     // ── review parsing via find_agent_result + parse_review_response ────
