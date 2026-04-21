@@ -94,7 +94,6 @@ impl TaskStore {
         Ok(row.try_get("id")?)
     }
 
-    
     /// Delete a control message by ID. Used to roll back an orphaned user message
     /// when the agent invocation fails permanently (e.g. not a recoverable timeout
     /// or stale-session error).
