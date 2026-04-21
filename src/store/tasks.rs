@@ -1365,12 +1365,22 @@ impl TaskStore {
             .fetch_one(&mut *tx)
             .await?;
 
-        let memory_str: String = row.try_get("memory").unwrap_or_default();
-        let mut memory: Vec<MemoryEntry> = serde_json::from_str(&memory_str)
-            .inspect_err(
-                |e| tracing::warn!(task_id = id, error = %e, "corrupt memory JSON, resetting"),
-            )
-            .unwrap_or_default();
+        // Propagate decode errors from the DB (e.g. invalid BLOB/UTF-8). We
+        // intentionally do not treat decode/parse failures as an empty memory
+        // because that would allow append_memory to overwrite a corrupt value
+        // with a new array containing only the new entry (data loss).
+        let memory_opt: Option<String> = row
+            .try_get::<Option<String>, _>("memory")
+            .map_err(|e| anyhow::anyhow!("failed to read memory column for task {id}: {e}"))?;
+        let memory_str = memory_opt.unwrap_or_default();
+
+        let mut memory: Vec<MemoryEntry> = if memory_str.trim().is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(&memory_str).map_err(|e| {
+                anyhow::anyhow!("failed to parse memory JSON for task {id}: {e}")
+            })?
+        };
         memory.push(entry.clone());
         let new_json = serde_json::to_string(&memory)?;
 
@@ -1393,10 +1403,18 @@ impl TaskStore {
             .fetch_one(&self.pool)
             .await?;
 
-        let memory_str: String = row.try_get("memory").unwrap_or_default();
-        let mut memory: Vec<MemoryEntry> = serde_json::from_str(&memory_str)
-            .inspect_err(|e| tracing::warn!(task_id = id, error = %e, "corrupt memory JSON"))
-            .unwrap_or_default();
+        let memory_opt: Option<String> = row
+            .try_get::<Option<String>, _>("memory")
+            .map_err(|e| anyhow::anyhow!("failed to read memory column for task {id}: {e}"))?;
+        let memory_str = memory_opt.unwrap_or_default();
+
+        let mut memory: Vec<MemoryEntry> = if memory_str.trim().is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(&memory_str).map_err(|e| {
+                anyhow::anyhow!("failed to parse memory JSON for task {id}: {e}")
+            })?
+        };
 
         memory.sort_by_key(|m| m.attempt);
         if memory.len() > max {
