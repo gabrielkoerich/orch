@@ -389,6 +389,40 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Append a lifecycle activity event for a task within a transaction.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn append_activity_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        task_id: i64,
+        event_type: &str,
+        from_status: Option<&str>,
+        to_status: Option<&str>,
+        agent: Option<&str>,
+        model: Option<&str>,
+        details: Option<&serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        let details_json = match details {
+            Some(v) => serde_json::to_string(v)?,
+            None => "{}".to_string(),
+        };
+        sqlx::query(
+            "INSERT INTO task_activity
+              (task_id, event_type, from_status, to_status, agent, model, details)
+              VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(task_id)
+        .bind(event_type)
+        .bind(from_status)
+        .bind(to_status)
+        .bind(agent)
+        .bind(model)
+        .bind(details_json)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
     /// Get task activity timeline in chronological order.
     pub async fn get_activity(
         &self,
@@ -611,9 +645,10 @@ impl TaskStore {
             );
         }
 
+        let mut tx = self.pool.begin().await?;
         let previous = sqlx::query("SELECT status, agent, model FROM tasks WHERE id = ?")
             .bind(id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
         let from_status: String = previous
             .try_get("status")
@@ -660,9 +695,10 @@ impl TaskStore {
             query = query.bind(v.as_deref());
         }
         query = query.bind(id);
-        query.execute(&self.pool).await?;
+        query.execute(&mut *tx).await?;
 
-        self.append_activity(
+        Self::append_activity_tx(
+            &mut tx,
             id,
             "status_change",
             Some(from_status.as_str()),
@@ -672,14 +708,16 @@ impl TaskStore {
             None,
         )
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
     /// Update the status of a task.
     pub async fn update_status(&self, id: i64, status: TaskStatus) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
         let previous = sqlx::query("SELECT status, agent, model FROM tasks WHERE id = ?")
             .bind(id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
         let from_status: String = previous
             .try_get("status")
@@ -698,10 +736,11 @@ impl TaskStore {
         sqlx::query(sql)
             .bind(status.as_str())
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
-        self.append_activity(
+        Self::append_activity_tx(
+            &mut tx,
             id,
             "status_change",
             Some(from_status.as_str()),
@@ -711,6 +750,7 @@ impl TaskStore {
             None,
         )
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -736,9 +776,10 @@ impl TaskStore {
         status: TaskStatus,
         expected: TaskStatus,
     ) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
         let previous = sqlx::query("SELECT status, agent, model FROM tasks WHERE id = ?")
             .bind(id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
         let from_status: String = previous
             .try_get("status")
@@ -758,12 +799,13 @@ impl TaskStore {
             .bind(status.as_str())
             .bind(id)
             .bind(expected.as_str())
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         if result.rows_affected() == 0 {
             return Ok(false);
         }
-        self.append_activity(
+        Self::append_activity_tx(
+            &mut tx,
             id,
             "status_change",
             Some(from_status.as_str()),
@@ -773,6 +815,7 @@ impl TaskStore {
             None,
         )
         .await?;
+        tx.commit().await?;
         Ok(true)
     }
 
@@ -795,9 +838,10 @@ impl TaskStore {
 
     /// Reset a task back to `new`.
     pub async fn reset_to_new(&self, id: i64) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
         let previous = sqlx::query("SELECT status, agent, model FROM tasks WHERE id = ?")
             .bind(id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
         let from_status: String = previous
             .try_get("status")
@@ -812,10 +856,11 @@ impl TaskStore {
             "UPDATE tasks SET status = 'new', branch = '', worktree = '', worktree_cleaned = 0, block_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
         )
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         let details = serde_json::json!({ "op": "reset_to_new" });
-        self.append_activity(
+        Self::append_activity_tx(
+            &mut tx,
             id,
             "status_change",
             Some(from_status.as_str()),
@@ -825,6 +870,7 @@ impl TaskStore {
             Some(&details),
         )
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
