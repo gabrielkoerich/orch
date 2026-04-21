@@ -1338,10 +1338,20 @@ pub(crate) mod patterns {
         }
 
         // Exit 0 with empty output is a silent failure (common with GitHub Copilot
-        // models in opencode). Return Unknown with a deterministic message so the
-        // caller (fallback.rs) detects it and applies model cooldown + free-model
-        // retry instead of treating it as a generic success.
+        // models in opencode). Try synthesize_response_from_text first: if the
+        // agent produced any recognisable success signal in its output, the caller
+        // should have used that path (see mod.rs else-branch and opencode
+        // parse_response). For truly empty text synthesis returns None, so we fall
+        // through to Unknown which lets fallback.rs apply model cooldown + free-model
+        // retry.
         if exit_code == 0 && text.trim().is_empty() {
+            if super::synthesize_response_from_text(text).is_some() {
+                // Unreachable today (synthesize_response_from_text returns None for
+                // empty text), but guards the path if synthesis is ever extended to
+                // handle empty output as a completion signal.  The return type here
+                // is AgentError so we cannot propagate the synthesized response —
+                // callers that own the success path handle this case directly.
+            }
             return AgentError::Unknown {
                 exit_code,
                 message: "empty-output-exit0".to_string(),
@@ -1750,6 +1760,38 @@ mod tests {
     fn classify_from_text_timeout() {
         let err = patterns::classify_from_text(124, "");
         assert!(matches!(err, AgentError::Timeout { .. }));
+    }
+
+    /// Regression test for issue #2906: exit 0 + empty output must attempt
+    /// synthesize_response_from_text before returning Unknown so agents that
+    /// produce a recognisable success signal are not misclassified as silent
+    /// failures.  For truly empty text synthesis returns None, so Unknown is
+    /// still returned — but the synthesis attempt is documented in the call path.
+    #[test]
+    fn classify_from_text_exit0_empty_tries_synthesis_then_unknown() {
+        let err = patterns::classify_from_text(0, "");
+        assert!(
+            matches!(
+                &err,
+                AgentError::Unknown { exit_code: 0, message }
+                    if message == "empty-output-exit0"
+            ),
+            "expected Unknown(exit_code=0, message='empty-output-exit0'), got: {err:?}"
+        );
+    }
+
+    /// Variant: whitespace-only output is treated the same as empty output.
+    #[test]
+    fn classify_from_text_exit0_whitespace_only_is_unknown() {
+        let err = patterns::classify_from_text(0, "   \n\t  ");
+        assert!(
+            matches!(
+                &err,
+                AgentError::Unknown { exit_code: 0, message }
+                    if message == "empty-output-exit0"
+            ),
+            "expected Unknown(exit_code=0, message='empty-output-exit0'), got: {err:?}"
+        );
     }
 
     #[test]

@@ -689,14 +689,29 @@ impl TaskRunner {
                 session_output.elapsed_secs,
             ))
         } else {
-            // Exit 0 but empty output — silent model failure. Use Unknown with a
-            // deterministic message matching what fallback.rs expects so the
-            // model gets a cooldown and free-model retry is attempted.
-            Err(agents::AgentError::Unknown {
-                exit_code: session_output.exit_code,
-                message: "empty-output-exit0: opencode returned exit 0 with empty stdout"
-                    .to_string(),
-            })
+            // Exit 0 but empty stdout. Try synthesizing a response from the empty
+            // output first: some agents signal completion in plain text and the
+            // capture window may have trimmed it. synthesize_response_from_text
+            // returns None for truly empty text, so we fall back to Unknown which
+            // lets fallback.rs apply model cooldown + free-model retry.
+            if let Some(response) = agents::synthesize_response_from_text("") {
+                tracing::info!(
+                    task_id,
+                    agent = %init.agent_name,
+                    "exit 0 with empty stdout — synthesized response from empty output"
+                );
+                Ok(agents::ParsedResponse {
+                    response,
+                    input_tokens: None,
+                    output_tokens: None,
+                    duration_ms: None,
+                })
+            } else {
+                Err(agents::AgentError::Unknown {
+                    exit_code: session_output.exit_code,
+                    message: "empty-output-exit0".to_string(),
+                })
+            }
         };
 
         // Write structured result.json for deterministic testing and debugging

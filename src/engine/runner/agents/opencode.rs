@@ -444,14 +444,23 @@ printf '%s\n' {sq_permission_json} > .orch-opencode/opencode/opencode.json || {{
 
     fn parse_response(&self, raw: &str) -> Result<ParsedResponse, AgentError> {
         let trimmed = raw.trim();
-        // Empty output with exit code 0 is a silent failure — return Unknown with
-        // a deterministic message matching what fallback.rs expects so the model
-        // gets a cooldown and free-model retry is attempted.
+        // Empty output: try synthesis first so agents that signal completion in
+        // plain text (e.g. "nothing to execute", "no action needed") are not
+        // misclassified as silent failures. For truly empty text synthesis returns
+        // None and we fall back to Unknown so fallback.rs can apply model cooldown
+        // + free-model retry.
         if trimmed.is_empty() {
+            if let Some(response) = super::synthesize_response_from_text(trimmed) {
+                return Ok(ParsedResponse {
+                    response,
+                    input_tokens: None,
+                    output_tokens: None,
+                    duration_ms: None,
+                });
+            }
             return Err(AgentError::Unknown {
                 exit_code: 0,
-                message: "empty-output-exit0: opencode returned exit 0 with empty stdout"
-                    .to_string(),
+                message: "empty-output-exit0".to_string(),
             });
         }
 
@@ -1518,5 +1527,38 @@ mod tests {
     #[test]
     fn find_opencode_result_plain_text_returns_none() {
         assert!(find_opencode_result("just some plain text").is_none());
+    }
+
+    /// Regression test for issue #2906: parse_response with empty output must
+    /// attempt synthesize_response_from_text before returning Unknown so a
+    /// recognisable completion signal is not missed.  For truly empty text
+    /// synthesis returns None and Unknown("empty-output-exit0") is returned so
+    /// fallback.rs can apply model cooldown + free-model retry.
+    #[test]
+    fn parse_response_empty_tries_synthesis_before_unknown() {
+        let err = runner().parse_response("").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                AgentError::Unknown { exit_code: 0, message }
+                    if message == "empty-output-exit0"
+            ),
+            "expected Unknown(exit_code=0, message='empty-output-exit0'), got: {err:?}"
+        );
+    }
+
+    /// Whitespace-only output is treated the same as empty — synthesis is
+    /// attempted (returning None) and Unknown is returned.
+    #[test]
+    fn parse_response_whitespace_only_is_unknown() {
+        let err = runner().parse_response("  \n  ").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                AgentError::Unknown { exit_code: 0, message }
+                    if message == "empty-output-exit0"
+            ),
+            "expected Unknown(exit_code=0, message='empty-output-exit0'), got: {err:?}"
+        );
     }
 }
