@@ -571,6 +571,9 @@ impl TmuxManager {
     ///
     /// This is a convenience method that sets GH_TOKEN (and optionally
     /// GITHUB_TOKEN) for agent sessions.
+    /// NOTE: Prefer passing GH_TOKEN via `create_session` for the initial pane.
+    /// This method is only useful for NEW panes/windows created after the session.
+    #[allow(dead_code)]
     pub async fn set_github_token(
         &self,
         session: &str,

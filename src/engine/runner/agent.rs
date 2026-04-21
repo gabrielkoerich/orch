@@ -193,6 +193,9 @@ exit $CMD_STATUS
     let command = format!("bash \"{}\"", script_path.display());
 
     // Resolve GitHub token via the process-wide shared resolver (cached after first call)
+    // NOTE: We must pass GH_TOKEN via create_session (not set_env after) because
+    // tmux set-environment only affects NEW panes/windows, not the initial pane
+    // where the runner command executes.
     let github_token = match crate::github::token::shared().get_token().await {
         Ok(Some(token)) => {
             tracing::debug!("Resolved GitHub token via TokenResolver for agent session");
@@ -210,6 +213,12 @@ exit $CMD_STATUS
         }
     };
 
+    // Add GH_TOKEN to env if available (injected before runner starts in initial pane)
+    // This must be done BEFORE create_session because set_env only applies to new panes.
+    if let Some(ref token) = github_token {
+        env.insert("GH_TOKEN".to_string(), token.clone());
+    }
+
     // Convert env to a slice of (&str, &str) pairs for tmux.create_session.
     let env_vec: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
@@ -224,15 +233,11 @@ exit $CMD_STATUS
         .await?;
 
     // Ensure non-secret environment variables are set in the session (best-effort).
+    // GH_TOKEN is already set via create_session above. This is for variables
+    // that need to be available in new panes/windows.
     for (k, v) in &env {
-        tmux.set_session_env(&session, k, v).await.ok();
-    }
-
-    // Inject GitHub token into tmux session environment (if available)
-    // This keeps tokens out of runner scripts and disk
-    if let Some(token) = github_token {
-        if let Err(e) = tmux.set_github_token(&session, &token, false).await {
-            tracing::warn!(error = %e, session, "Failed to set GitHub token in tmux session");
+        if k != "GH_TOKEN" {
+            tmux.set_session_env(&session, k, v).await.ok();
         }
     }
 
