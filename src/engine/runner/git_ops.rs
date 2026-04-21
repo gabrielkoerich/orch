@@ -431,21 +431,48 @@ pub async fn auto_commit(
             .output_with_context()
             .await;
         match restore {
-            Ok(o) if !o.status.success() => {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                let restore_stderr = String::from_utf8_lossy(&o.stderr).to_string();
                 tracing::warn!(
                     task_id,
-                    stderr = %String::from_utf8_lossy(&o.stderr),
-                    "git restore --staged failed after commit failure — files remain staged"
+                    stderr = %restore_stderr,
+                    "git restore --staged failed after commit failure; falling back to git reset HEAD -- ."
                 );
+                let reset = Command::new("git")
+                    .args(["reset", "HEAD", "--", "."])
+                    .current_dir(dir)
+                    .output_with_context()
+                    .await?;
+                if !reset.status.success() {
+                    anyhow::bail!(
+                        "git commit failed and cleanup failed (git restore --staged + git reset HEAD -- .): commit stderr: {}; restore stderr: {}; reset stderr: {}",
+                        stderr.trim(),
+                        restore_stderr.trim(),
+                        String::from_utf8_lossy(&reset.stderr).trim()
+                    );
+                }
             }
             Err(e) => {
                 tracing::warn!(
                     task_id,
                     error = %e,
-                    "git restore --staged command failed after commit failure — files remain staged"
+                    "git restore --staged command failed after commit failure; falling back to git reset HEAD -- ."
                 );
+                let reset = Command::new("git")
+                    .args(["reset", "HEAD", "--", "."])
+                    .current_dir(dir)
+                    .output_with_context()
+                    .await?;
+                if !reset.status.success() {
+                    anyhow::bail!(
+                        "git commit failed and cleanup failed (git restore --staged command error + git reset HEAD -- .): commit stderr: {}; restore error: {}; reset stderr: {}",
+                        stderr.trim(),
+                        e,
+                        String::from_utf8_lossy(&reset.stderr).trim()
+                    );
+                }
             }
-            _ => {}
         }
         return Ok(false);
     }
