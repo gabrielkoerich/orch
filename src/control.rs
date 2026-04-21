@@ -674,8 +674,10 @@ pub async fn send_message(
     };
     let _guard = session_lock.lock().await;
 
-    // Store user message
-    store
+    // Store user message — capture the ID so we can roll it back if the agent
+    // invocation fails permanently (stale-session and timeout errors already retry
+    // with a fresh session, so they don't leave orphans).
+    let user_msg_id = store
         .insert_control_message(
             session_id,
             "user",
@@ -763,6 +765,9 @@ pub async fn send_message(
                     fresh_result
                 }
             } else {
+                // Permanent failure (not stale-session or timeout): roll back the
+                // orphaned user message so the conversation history stays well-formed.
+                let _ = store.delete_control_message(user_msg_id).await;
                 return Err(e);
             }
         }

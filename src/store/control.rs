@@ -94,6 +94,18 @@ impl TaskStore {
         Ok(row.try_get("id")?)
     }
 
+    
+    /// Delete a control message by ID. Used to roll back an orphaned user message
+    /// when the agent invocation fails permanently (e.g. not a recoverable timeout
+    /// or stale-session error).
+    pub async fn delete_control_message(&self, id: i64) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM control_messages WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// List the most recent control messages for a session (chronological order).
     ///
     /// If `since` is provided, only messages created at or after that RFC3339/ISO8601
