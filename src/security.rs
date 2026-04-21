@@ -136,7 +136,7 @@ pub fn scan(text: &str) -> Vec<LeakMatch> {
         let mut matched_ranges: Vec<(usize, usize)> = Vec::new();
 
         for (rule, pattern, _high_conf) in LEAK_PATTERNS.iter() {
-            if let Some(m) = pattern.find(line) {
+            for m in pattern.find_iter(line) {
                 // Skip if this match overlaps with an already-matched range on this line.
                 if matched_ranges
                     .iter()
@@ -321,6 +321,32 @@ mod tests {
         assert!(
             has_leaks(text),
             "openai_api_key (high confidence) should trigger has_leaks"
+        );
+    }
+
+    #[test]
+    fn detects_multiple_secrets_per_line() {
+        let text = "key1=ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa and token2=ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let matches = scan(text);
+        assert_eq!(
+            matches.len(),
+            2,
+            "expected two github_token matches, got: {:?}",
+            matches
+        );
+    }
+
+    #[test]
+    fn detects_multiple_different_secrets_per_line() {
+        let text = "token=ghp_abcdefghijklmnopqrstuvwxyz1234567890ABC token2=sk-proj-1234567890abcdefghijklmn";
+        let matches = scan(text);
+        assert!(
+            matches.iter().any(|m| m.rule == "github_token"),
+            "should detect github_token"
+        );
+        assert!(
+            matches.iter().any(|m| m.rule == "openai_api_key"),
+            "should detect openai_api_key"
         );
     }
 }
