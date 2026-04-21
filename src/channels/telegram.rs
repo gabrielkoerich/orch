@@ -38,6 +38,9 @@ pub struct TelegramChannel {
     pub client: Client,
     pub chat_id: Option<String>,
     pub offset: std::sync::Arc<tokio::sync::Mutex<i64>>,
+    // Base URL for Telegram API. Defaults to https://api.telegram.org but
+    // made configurable to allow tests to point at a mock HTTP server.
+    pub api_base: String,
 }
 
 #[derive(Deserialize)]
@@ -96,11 +99,38 @@ impl TelegramChannel {
             client,
             chat_id,
             offset: std::sync::Arc::new(tokio::sync::Mutex::new(0)),
+            api_base: "https://api.telegram.org".to_string(),
         })
     }
 
     fn api_url(&self, method: &str) -> String {
-        format!("https://api.telegram.org/bot{}/{}", self.token, method)
+        format!("{}/bot{}/{}", self.api_base, self.token, method)
+    }
+
+    // Parse a Telegram API response body (already checked for HTTP success) and
+    // ensure the returned JSON `ok` field is true. On ok=false we return an
+    // anyhow::Error containing the Telegram `description` and `error_code` when
+    // available. Returns the parsed JSON on success.
+    async fn parse_telegram_response(
+        &self,
+        response: reqwest::Response,
+    ) -> anyhow::Result<serde_json::Value> {
+        let value: serde_json::Value = response.json().await?;
+        let ok = value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !ok {
+            let desc = value
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("telegram returned ok=false");
+            let code = value.get("error_code").and_then(|c| c.as_i64());
+            if let Some(code) = code {
+                anyhow::bail!("telegram API returned ok=false ({}): {}", code, desc);
+            } else {
+                anyhow::bail!("telegram API returned ok=false: {}", desc);
+            }
+        }
+
+        Ok(value)
     }
 
     async fn get_updates(&self, offset: i64) -> anyhow::Result<Vec<Update>> {
@@ -179,13 +209,13 @@ impl TelegramChannel {
         }
 
         let response = self.client.post(&url).json(&params).send().await?;
-
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
             anyhow::bail!("telegram API error: {}", body);
         }
 
-        Ok(())
+        // Ensure Telegram's `ok` JSON field is true
+        self.parse_telegram_response(response).await.map(|_| ())
     }
 
     #[allow(dead_code)]
@@ -221,8 +251,13 @@ impl TelegramChannel {
             let body = response.text().await.unwrap_or_default();
             anyhow::bail!("telegram API error: {}", body);
         }
-        let result: serde_json::Value = response.json().await?;
-        let message_id = result["result"]["message_id"].as_i64().unwrap_or(0);
+
+        let result = self.parse_telegram_response(response).await?;
+        // Require a message_id — don't silently return 0 when Telegram rejects
+        // the request with ok=true but missing fields.
+        let message_id = result["result"]["message_id"]
+            .as_i64()
+            .ok_or_else(|| anyhow::anyhow!("telegram response missing result.message_id"))?;
         Ok(message_id)
     }
 
@@ -242,7 +277,8 @@ impl TelegramChannel {
             let body = response.text().await.unwrap_or_default();
             anyhow::bail!("telegram API error: {}", body);
         }
-        Ok(())
+
+        self.parse_telegram_response(response).await.map(|_| ())
     }
 }
 
@@ -275,6 +311,7 @@ impl Channel for TelegramChannel {
             client: client.clone(),
             chat_id: chat_id.clone(),
             offset: offset.clone(),
+            api_base: "https://api.telegram.org".to_string(),
         };
 
         tokio::spawn(async move {
@@ -462,6 +499,11 @@ impl Channel for TelegramChannel {
             anyhow::bail!("telegram health check failed: {}", body);
         }
 
+        // Also validate Telegram's `ok` payload
+        self.parse_telegram_response(response)
+            .await
+            .context("telegram health check failed")?;
+
         tracing::info!("telegram bot health check passed");
         Ok(())
     }
@@ -504,5 +546,138 @@ mod tests {
         };
 
         assert!(is_preformatted_html(&msg));
+    }
+
+    // Integration-style async tests using wiremock to simulate Telegram
+    #[tokio::test]
+    async fn send_formatted_message_ok_false_is_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Telegram often returns HTTP 200 with { ok: false, description: "..." }
+        Mock::given(method("POST"))
+            .and(path("/botTOK/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "Bad Request: can't parse entities"
+            })))
+            .mount(&mock)
+            .await;
+
+        let channel = TelegramChannel {
+            token: "TOK".to_string(),
+            client: Client::new(),
+            chat_id: Some("123".to_string()),
+            offset: std::sync::Arc::new(tokio::sync::Mutex::new(0)),
+            api_base: mock.uri(),
+        };
+
+        let res = channel.send_formatted_message(123, "<b>x</b>", None).await;
+
+        assert!(res.is_err());
+        let err = format!("{}", res.unwrap_err());
+        assert!(err.contains("400") && err.contains("can't parse entities"));
+    }
+
+    #[tokio::test]
+    async fn send_inline_keyboard_ok_false_is_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/botTOK/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 403,
+                "description": "Forbidden: bot was blocked by the user"
+            })))
+            .mount(&mock)
+            .await;
+
+        let channel = TelegramChannel {
+            token: "TOK".to_string(),
+            client: Client::new(),
+            chat_id: Some("123".to_string()),
+            offset: std::sync::Arc::new(tokio::sync::Mutex::new(0)),
+            api_base: mock.uri(),
+        };
+
+        let buttons = vec![("a".to_string(), "d".to_string())];
+        let res = channel
+            .send_inline_keyboard(123, None, "hi", &buttons)
+            .await;
+        assert!(res.is_err());
+        let err = format!("{}", res.unwrap_err());
+        assert!(err.contains("403") && err.contains("bot was blocked"));
+    }
+
+    #[tokio::test]
+    async fn send_inline_keyboard_missing_message_id_is_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/botTOK/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "chat": { "id": 123 }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        let channel = TelegramChannel {
+            token: "TOK".to_string(),
+            client: Client::new(),
+            chat_id: Some("123".to_string()),
+            offset: std::sync::Arc::new(tokio::sync::Mutex::new(0)),
+            api_base: mock.uri(),
+        };
+
+        let buttons = vec![("a".to_string(), "d".to_string())];
+        let res = channel
+            .send_inline_keyboard(123, None, "hi", &buttons)
+            .await;
+        assert!(res.is_err());
+        assert!(format!("{}", res.unwrap_err()).contains("missing result.message_id"));
+    }
+
+    #[tokio::test]
+    async fn answer_callback_query_ok_false_is_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/botTOK/answerCallbackQuery"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 409,
+                "description": "Conflict: query is too old"
+            })))
+            .mount(&mock)
+            .await;
+
+        let channel = TelegramChannel {
+            token: "TOK".to_string(),
+            client: Client::new(),
+            chat_id: Some("123".to_string()),
+            offset: std::sync::Arc::new(tokio::sync::Mutex::new(0)),
+            api_base: mock.uri(),
+        };
+
+        let res = channel.answer_callback_query("cb", "msg").await;
+        assert!(res.is_err());
+        let err = format!("{}", res.unwrap_err());
+        assert!(err.contains("409") && err.contains("too old"));
     }
 }
