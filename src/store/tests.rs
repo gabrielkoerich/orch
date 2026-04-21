@@ -1,4 +1,5 @@
 use super::*;
+use sqlx::Row;
 use std::sync::Arc;
 
 #[tokio::test]
@@ -431,6 +432,84 @@ async fn helper_get_recent_memory_from_store() {
     assert_eq!(memory[1].attempt, 2);
     assert_eq!(memory[0].agent, "claude");
     assert_eq!(memory[1].agent, "codex");
+}
+
+#[tokio::test]
+async fn append_memory_fails_on_corrupt_memory_and_preserves_db_value() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let id = store
+        .create(&NewTask {
+            repo: "owner/repo".to_string(),
+            origin: "internal".to_string(),
+            title: "Corrupt memory test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // Inject invalid JSON into the memory column directly
+    let corrupt = "not valid json {{{";
+    sqlx::query("UPDATE tasks SET memory = ? WHERE id = ?")
+        .bind(corrupt)
+        .bind(id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let entry = MemoryEntry {
+        attempt: 1,
+        agent: "claude".to_string(),
+        model: None,
+        learnings: vec![],
+        error: None,
+        files_modified: vec![],
+        approach: "attempt".to_string(),
+        timestamp: "".to_string(),
+    };
+
+    // append_memory should return an error and must not overwrite the DB value
+    let res = store.append_memory(id, &entry).await;
+    assert!(res.is_err(), "append_memory must fail on corrupt JSON");
+
+    let row = sqlx::query("SELECT memory FROM tasks WHERE id = ?")
+        .bind(id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    let mem: String = row.try_get("memory").unwrap();
+    assert_eq!(
+        mem, corrupt,
+        "corrupt memory payload should be preserved in DB"
+    );
+}
+
+#[tokio::test]
+async fn recent_memory_errors_on_corrupt_json() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let id = store
+        .create(&NewTask {
+            repo: "owner/repo".to_string(),
+            origin: "internal".to_string(),
+            title: "Recent memory corrupt test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // Inject invalid JSON into the memory column directly
+    let corrupt = "[ this is not valid json";
+    sqlx::query("UPDATE tasks SET memory = ? WHERE id = ?")
+        .bind(corrupt)
+        .bind(id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let res = store.recent_memory(id, 10).await;
+    assert!(
+        res.is_err(),
+        "recent_memory must return error on corrupt JSON"
+    );
 }
 
 #[tokio::test]
