@@ -60,6 +60,7 @@ impl TmuxManager {
     ///
     /// Note: For secrets like GH_TOKEN, use [`set_env`] after session creation
     /// instead of passing them here. This avoids exposing secrets in process arguments.
+    #[allow(dead_code)]
     pub async fn create_session(
         &self,
         repo: &str,
@@ -154,7 +155,10 @@ impl TmuxManager {
         cmd.args(["new-window", "-d", "-t", session, "-c", working_dir]);
         cmd.arg(command);
 
-        let output = cmd.output_with_context().await.context("creating tmux window")?;
+        let output = cmd
+            .output_with_context()
+            .await
+            .context("creating tmux window")?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("tmux new-window failed: {stderr}");
@@ -166,7 +170,7 @@ impl TmuxManager {
 
     /// Set an environment variable in an existing tmux session.
     ///
-    /// This is preferred over passing secrets via [`create_session`] because
+    /// This is preferred over passing secrets via `set_github_token` because
     /// it avoids exposing secrets in process arguments and on-disk runner scripts.
     ///
     /// Uses: `tmux set-environment -t <session> <key> <value>`
@@ -635,7 +639,7 @@ impl TmuxManager {
     ///
     /// This is a convenience method that sets GH_TOKEN (and optionally
     /// GITHUB_TOKEN) for agent sessions.
-    /// NOTE: Prefer passing GH_TOKEN via `create_session` for the initial pane.
+    /// NOTE: Prefer `create_session_detached` + `create_window` for the initial pane.
     /// This method is only useful for NEW panes/windows created after the session.
     #[allow(dead_code)]
     pub async fn set_github_token(

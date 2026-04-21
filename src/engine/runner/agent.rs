@@ -193,7 +193,7 @@ exit $CMD_STATUS
     let command = format!("bash \"{}\"", script_path.display());
 
     // Resolve GitHub token via the process-wide shared resolver (cached after first call)
-    // NOTE: We must pass GH_TOKEN via create_session (not set_env after) because
+    // NOTE: We must pass GH_TOKEN via create_session_detached + create_window (not set_env after) because
     // tmux set-environment only affects NEW panes/windows, not the initial pane
     // where the runner command executes.
     let github_token = match crate::github::token::shared().get_token().await {
@@ -256,8 +256,7 @@ exit $CMD_STATUS
 
     // Start the agent command in a new detached window in the session. The new
     // window will inherit the session env including GH_TOKEN that we just set.
-    tmux
-        .create_window(&session, &inv.work_dir.to_string_lossy(), &command)
+    tmux.create_window(&session, &inv.work_dir.to_string_lossy(), &command)
         .await?;
 
     tracing::info!(
