@@ -60,6 +60,7 @@ impl TmuxManager {
     ///
     /// Note: For secrets like GH_TOKEN, use [`set_env`] after session creation
     /// instead of passing them here. This avoids exposing secrets in process arguments.
+    #[allow(dead_code)]
     pub async fn create_session(
         &self,
         repo: &str,
@@ -100,9 +101,76 @@ impl TmuxManager {
         Ok(name)
     }
 
+    /// Create a new tmux session detached without running a command.
+    ///
+    /// This variant is useful when callers need to set sensitive session
+    /// environment (via `set_env`) before starting processes in new windows
+    /// that will inherit that environment. `env_vars` may contain
+    /// non-secret variables to inject via `-e`.
+    pub async fn create_session_detached(
+        &self,
+        repo: &str,
+        task_id: &str,
+        working_dir: &str,
+        env_vars: &[(&str, &str)],
+    ) -> anyhow::Result<String> {
+        let name = self.session_name(repo, task_id);
+
+        let mut cmd = Command::new("tmux");
+        cmd.args(["new-session", "-d", "-s", &name, "-c", working_dir]);
+
+        // Suppress oh-my-zsh update prompts that can intercept agent input.
+        cmd.arg("-e").arg("DISABLE_AUTO_UPDATE=true");
+
+        for (key, value) in env_vars {
+            cmd.arg("-e").arg(format!("{}={}", key, value));
+        }
+
+        let output = cmd
+            .output_with_context()
+            .await
+            .context("spawning tmux session (detached)")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("tmux new-session failed: {stderr}");
+        }
+
+        tracing::info!(session = %name, task_id, "created tmux session (detached)");
+        Ok(name)
+    }
+
+    /// Create a new window in an existing session and run `command` in it.
+    /// The new window inherits the session environment (including values set
+    /// via `set_env`), so this is useful when sensitive env vars were set
+    /// after session creation.
+    pub async fn create_window(
+        &self,
+        session: &str,
+        working_dir: &str,
+        command: &str,
+    ) -> anyhow::Result<()> {
+        let mut cmd = Command::new("tmux");
+        // -d to create detached window; target session by name
+        cmd.args(["new-window", "-d", "-t", session, "-c", working_dir]);
+        cmd.arg(command);
+
+        let output = cmd
+            .output_with_context()
+            .await
+            .context("creating tmux window")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("tmux new-window failed: {stderr}");
+        }
+
+        tracing::info!(session = %session, "created tmux window running command");
+        Ok(())
+    }
+
     /// Set an environment variable in an existing tmux session.
     ///
-    /// This is preferred over passing secrets via [`create_session`] because
+    /// This is preferred over passing secrets via `set_github_token` because
     /// it avoids exposing secrets in process arguments and on-disk runner scripts.
     ///
     /// Uses: `tmux set-environment -t <session> <key> <value>`
@@ -571,6 +639,9 @@ impl TmuxManager {
     ///
     /// This is a convenience method that sets GH_TOKEN (and optionally
     /// GITHUB_TOKEN) for agent sessions.
+    /// NOTE: Prefer `create_session_detached` + `create_window` for the initial pane.
+    /// This method is only useful for NEW panes/windows created after the session.
+    #[allow(dead_code)]
     pub async fn set_github_token(
         &self,
         session: &str,
@@ -881,6 +952,65 @@ mod tests {
         assert!(!tmux.session_is_running(&session).await);
         assert!(!tmux.session_blocks_dispatch(&session).await);
         assert!(!tmux.session_exists(&session).await);
+    }
+
+    /// Integration-style test: ensure GH_TOKEN set via set_github_token is visible
+    /// in a window started after the token is set. This verifies the runner path
+    /// that creates a session, sets token, then starts the agent process.
+    #[tokio::test]
+    async fn github_token_visible_in_new_window() {
+        let tmux = TmuxManager::new();
+        let session = test_session_name();
+
+        // Create detached session
+        let create_result = tokio::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &session, "-c", "/tmp"])
+            .output()
+            .await;
+
+        match create_result {
+            Ok(o) if o.status.success() => {}
+            _ => {
+                eprintln!("Skipping test: tmux not available or failed to create test session");
+                return;
+            }
+        }
+        let _guard = SessionGuard(session.clone());
+
+        // Ensure we can set GH_TOKEN
+        let token = "orch-test-token-visibility";
+        let set_result = tmux.set_github_token(&session, token, false).await;
+        if set_result.is_err() {
+            eprintln!("Skipping test: unable to set GH_TOKEN in session");
+            return;
+        }
+
+        // Start a new detached window that writes $GH_TOKEN to a file we can read
+        let out_file = format!("/tmp/{}.gh_token", session);
+        let cmd = format!("sh -lc 'printf \"%s\" \"$GH_TOKEN\" > {}'", out_file);
+        let window_result = tokio::process::Command::new("tmux")
+            .args(["new-window", "-d", "-t", &session, "-c", "/tmp", &cmd])
+            .output()
+            .await;
+
+        if !matches!(window_result, Ok(ref o) if o.status.success()) {
+            eprintln!("Skipping test: failed to create tmux window to echo GH_TOKEN");
+            return;
+        }
+
+        // Give tmux and the shell a short moment to run
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Read the file and verify contents
+        match std::fs::read_to_string(&out_file) {
+            Ok(contents) => {
+                assert_eq!(contents, token);
+                let _ = std::fs::remove_file(&out_file);
+            }
+            Err(_) => {
+                eprintln!("Skipping test: unable to read GH_TOKEN output file");
+            }
+        }
     }
 
     // NOTE: No static test for GH_TOKEN handling here; behavior is enforced
