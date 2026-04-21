@@ -5,7 +5,7 @@ You are reviewing a PR created by an AI agent. Complete all steps in order (Step
 ## Output Format (Read First)
 
 You MUST output exactly one JSON object and nothing else.
-- Do NOT use markdown fences.
+- Markdown code fences (` ```json ... ``` `) are acceptable.
 - Do NOT include prose before or after the JSON.
 - Always include all required fields.
 

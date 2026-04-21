@@ -638,9 +638,17 @@ fn infer_review_response_from_text(text: &str) -> Option<ReviewResponse> {
 
     let positive_approval = lower.contains("lgtm")
         || lower.contains("looks good")
+        || lower.contains("looks correct")
+        || lower.contains("looks great")
         || lower.contains("all checks passed")
         || lower.contains("all tests passed")
         || lower.contains("no issues found")
+        || lower.contains("no issues detected")
+        || lower.contains("ready to merge")
+        || lower.contains("i approve")
+        || lower.contains("we approve")
+        || lower.contains("recommend approving")
+        || lower.contains("recommend approval")
         // "decision is `approve`" or "decision: `approve`" — LLMs often echo the JSON field value
         || lower.contains("decision is `approve`")
         || lower.contains("decision: `approve`")
@@ -651,7 +659,11 @@ fn infer_review_response_from_text(text: &str) -> Option<ReviewResponse> {
             && !lower.contains("unapproved")
             && !lower.contains("not approving")
             && !lower.contains("cannot approve")
-            && !lower.contains("can't approve"));
+            && !lower.contains("can't approve"))
+        || (lower.contains("approving")
+            && !lower.contains("not approving")
+            && !lower.contains("cannot approving")
+            && !lower.contains("can't approving"));
     if positive_approval {
         return Some(ReviewResponse {
             decision: "approve".to_string(),
@@ -1428,6 +1440,43 @@ That's all."#;
         let text = "Needs changes before merge due to failing tests.";
         let resp = parse_review_plain(text).unwrap();
         assert_eq!(resp.decision, "request_changes");
+    }
+
+    #[test]
+    fn infer_review_response_i_approve_phrase() {
+        let resp = parse_review_plain("After reviewing the diff, I approve this PR.").unwrap();
+        assert_eq!(resp.decision, "approve");
+    }
+
+    #[test]
+    fn infer_review_response_ready_to_merge_phrase() {
+        let resp = parse_review_plain("CI is green, no issues. Ready to merge.").unwrap();
+        assert_eq!(resp.decision, "approve");
+    }
+
+    #[test]
+    fn infer_review_response_looks_correct_phrase() {
+        let resp = parse_review_plain("The logic looks correct and all tests pass.").unwrap();
+        assert_eq!(resp.decision, "approve");
+    }
+
+    #[test]
+    fn infer_review_response_approving_phrase() {
+        let resp = parse_review_plain("Approving this PR, all checks passed.").unwrap();
+        assert_eq!(resp.decision, "approve");
+    }
+
+    #[test]
+    fn infer_review_response_not_approving_negates_approving() {
+        // "not approving" must override "approving"
+        assert!(
+            parse_review_plain("I am not approving this because of test failures.").is_err()
+                || parse_review_plain("I am not approving this because of test failures.")
+                    .unwrap()
+                    .decision
+                    == "request_changes",
+            "not approving should not infer approval"
+        );
     }
 
     // ── review parsing via find_agent_result + parse_review_response ────
