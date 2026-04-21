@@ -8,6 +8,7 @@ use crate::store;
 use crate::store::TaskStore;
 use std::sync::Arc;
 
+use super::agents::patterns::safe_tail;
 use super::{agents, response};
 
 /// Summarizes a rate limit error by extracting key information from Claude's API retry JSON.
@@ -15,15 +16,35 @@ use super::{agents, response};
 /// Looks for the last `{"type":"system","subtype":"api_retry",...}` line (or a partial
 /// fragment containing `"subtype":"api_retry"`) and extracts `error_status`, `attempt`,
 /// `retry_delay_ms` to return a compact summary.
-/// Returns a compact fallback if no api_retry JSON is found.
-fn summarize_rate_limit_error(raw_output: &str) -> String {
+///
+/// This function is called from `handle_error()` with `AgentError::RateLimit { message }` — the
+/// message is the formatted agent error string, NOT raw NDJSON. The message may be a short
+/// plain string ("Provider returned error"), a JSON fragment with leading comma, or raw multi-line
+/// Claude stderr. To avoid spending CPU iterating irrelevant lines, we apply `safe_tail` first:
+/// if the message is already short and contains no JSON markers, return it directly.
+fn summarize_rate_limit_error(message: &str) -> String {
+    // Fast path: if the message is too short to contain structured NDJSON, return as-is.
+    // This catches "Provider returned error" (21 bytes) and similar already-summarized strings.
+    const SHORT_MSG_THRESHOLD: usize = 80;
+    if message.len() <= SHORT_MSG_THRESHOLD
+        && !message.contains("\"subtype\":\"api_retry\"")
+        && !message.contains("{\"type\":\"system\"")
+    {
+        return message.to_string();
+    }
+
+    // Apply safe_tail so we don't waste CPU iterating thousands of irrelevant log lines.
+    // For Claude stderr with NDJSON api_retry events, the relevant line is at or near the
+    // end. For JSON fragments with leading comma, safe_tail captures the trailing fragment.
+    let tail = safe_tail(message, 300);
+
     // Find the last line containing "subtype":"api_retry"
     // This handles both complete JSON objects and truncated fragments that begin
     // mid-object (e.g. `,"subtype":"api_retry","attempt":5...`).
-    let last_json = raw_output
+    let last_json = tail
         .lines()
         .rev()
-        .find(|line| line.contains("\"subtype\":\"api_retry\""));
+        .find(|line: &&str| line.contains(r#""subtype":"api_retry""#));
 
     match last_json {
         Some(line) => {
@@ -59,13 +80,13 @@ fn summarize_rate_limit_error(raw_output: &str) -> String {
             }
         }
         None => {
-            // No api_retry JSON found — emit compact summary, not raw passthrough.
-            let first_line = raw_output.lines().next().unwrap_or(raw_output);
+            // No api_retry JSON found in the tail window — emit compact summary, not raw passthrough.
+            let first_line = tail.lines().next().unwrap_or(tail);
             if first_line.len() > 120 {
                 format!(
                     "{}... (+{} more chars)",
                     &first_line[..120],
-                    raw_output.len() - 120
+                    tail.len() - 120
                 )
             } else {
                 first_line.to_string()
@@ -247,10 +268,6 @@ pub async fn handle_error(
             )
         }
         agents::AgentError::Auth { message } => {
-            // Check for credit exhaustion first — those need longer agent-wide cooldowns.
-            // For plain auth failures (expired key, wrong token, etc.) record both the
-            // agent-level and model-level cooldowns so the router can observe them before
-            // concurrent tasks start another run against the same unavailable model.
             if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
                 crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await;
             } else {
@@ -260,9 +277,10 @@ pub async fn handle_error(
                     response::record_model_failure(agent_name, model).await;
                 }
             }
+            let truncated = safe_tail(message, 200);
             (
                 response::RetryableError::AuthError,
-                format!("{agent_name} auth error: {message}"),
+                format!("{agent_name} auth error: {truncated}"),
             )
         }
         agents::AgentError::Timeout { elapsed } => (
@@ -1261,5 +1279,41 @@ more logs"#;
 
         let summarized = super::summarize_rate_limit_error(raw_output);
         assert_eq!(summarized, raw_output);
+    }
+
+    /// "Provider returned error" - short opaque message from OpenCode, should return as-is.
+    /// This is the actual bug case from issue #2881.
+    #[tokio::test]
+    async fn summarize_rate_limit_error_short_provider_error() {
+        let message = "Provider returned error";
+
+        let summarized = super::summarize_rate_limit_error(message);
+        assert_eq!(summarized, message, "short message should return as-is");
+    }
+
+    /// JSON fragment with leading comma (real-world GLM case) - should NOT leak raw JSON into task_runs.error.
+    #[tokio::test]
+    async fn summarize_rate_limit_error_json_fragment_with_leading_comma() {
+        let raw_output = r#", "subtype":"api_retry","attempt":1,"retry_delay_ms":2000,"error_status":429,"error":"rate_limit""#;
+
+        let summarized = super::summarize_rate_limit_error(raw_output);
+        // The summary should be compact, not a raw JSON blob
+        assert!(
+            !summarized.contains("subtype"),
+            "summarized output must not contain raw JSON keys: {summarized}"
+        );
+    }
+
+    /// Message just under the size threshold - should NOT trigger heavy processing.
+    #[tokio::test]
+    async fn summarize_rate_limit_error_just_under_threshold() {
+        // Create a message that's under 80 bytes so it takes the fast path
+        let message = "rate limit: you have exceeded your API usage limit";
+
+        let summarized = super::summarize_rate_limit_error(message);
+        assert!(
+            summarized.len() <= message.len() + 10,
+            "fast path should return: {summarized}"
+        );
     }
 }
