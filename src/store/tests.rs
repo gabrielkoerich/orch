@@ -1,4 +1,5 @@
 use super::*;
+use sqlx::Row;
 use std::sync::Arc;
 
 #[tokio::test]
