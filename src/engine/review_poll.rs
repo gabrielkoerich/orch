@@ -34,6 +34,7 @@ use async_trait::async_trait;
 use dashmap::{DashMap, DashSet};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::sync::ReviewTaskSnapshot;
 
@@ -947,13 +948,22 @@ pub(crate) async fn review_open_prs(
             if let Some(ref ts) = new_comment_review_ts {
                 fields.push(("last_comment_review_ts", serde_json::json!(ts)));
             }
-            if let Err(e) =
-                store_set_result_by_id(&Some(Arc::clone(store)), task_info.store_id, &fields).await
-            {
-                tracing::warn!(
+            // Retry the watermark save a few times before giving up
+            let mut save_ok = false;
+            for _ in 0..3 {
+                if store_set_result_by_id(&Some(Arc::clone(store)), task_info.store_id, &fields)
+                    .await
+                    .is_ok()
+                {
+                    save_ok = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            if !save_ok {
+                tracing::error!(
                     task_id,
-                    err = %e,
-                    "failed to persist review watermark — will retry next tick"
+                    "failed to persist review watermark after retries — next tick will re-dispatch same review"
                 );
                 continue;
             }
