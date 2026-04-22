@@ -29,7 +29,13 @@ pub fn normalize_dow(expression: &str) -> String {
             if part == "0" {
                 "7".to_string()
             } else if let Some(rest) = part.strip_prefix("0-") {
-                format!("1-{rest},7")
+                if rest == "0" {
+                    // 0-0 means only Sunday — same as plain 0
+                    "7".to_string()
+                } else {
+                    // 0-N (N > 0): split into Mon-N plus Sunday
+                    format!("1-{rest},7")
+                }
             } else {
                 part.to_string()
             }
@@ -336,6 +342,16 @@ mod tests {
         // "0-4" = Sunday through Thursday in standard cron
         let result = check("0 9 * * 0-4", None);
         assert!(result.is_ok(), "DOW range 0-4 should parse: {result:?}");
+    }
+
+    #[test]
+    fn normalize_dow_degenerate_zero_to_zero() {
+        // "0-0" means only Sunday — should normalize to "7", not "1-0,7"
+        let normalized = normalize_dow("* * * * 0-0");
+        assert_eq!(normalized, "* * * * 7");
+        // Also verify it parses correctly
+        let result = check("0 9 * * 0-0", None);
+        assert!(result.is_ok(), "DOW range 0-0 should parse: {result:?}");
     }
 
     #[test]
