@@ -1859,6 +1859,49 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Abort incomplete runs for given task IDs.
+    ///
+    /// This is called during graceful shutdown to ensure all task_runs have a terminal
+    /// outcome. Runs with `outcome IS NULL` are marked as `aborted` with a structured
+    /// error message and `completed_at` timestamp.
+    ///
+    /// Returns the count of runs that were aborted.
+    pub async fn abort_runs_for_tasks(
+        &self,
+        task_ids: &[i64],
+        reason: &str,
+    ) -> anyhow::Result<usize> {
+        if task_ids.is_empty() {
+            return Ok(0);
+        }
+
+        // Chunk task IDs to avoid SQLite parameter limits (commonly 999)
+        const CHUNK_SIZE: usize = 500;
+        let mut aborted_count = 0;
+
+        for chunk in task_ids.chunks(CHUNK_SIZE) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "UPDATE task_runs SET
+                outcome = 'aborted',
+                error = ?,
+                completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                WHERE task_id IN ({placeholders}) AND outcome IS NULL"
+            );
+
+            let mut query = sqlx::query(&sql).bind(reason);
+            for &task_id in chunk {
+                query = query.bind(task_id);
+            }
+
+            let result: sqlx::sqlite::SqliteQueryResult = query.execute(&self.pool).await?;
+
+            aborted_count += result.rows_affected() as usize;
+        }
+
+        Ok(aborted_count)
+    }
+
     /// Get all runs for a task, ordered by attempt.
     pub async fn get_runs(&self, task_id: i64) -> anyhow::Result<Vec<TaskRun>> {
         let rows = sqlx::query(&format!(

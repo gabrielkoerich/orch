@@ -1007,16 +1007,61 @@ impl TaskRunner {
             None
         };
 
-        // Run the task
-        let run_result = self
+        // Run the task. We wrap this to capture errors and ensure we always call complete_run.
+        let run_result = match self
             .run(task_id, agent, model, Some(&**backend), &started_at)
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // On error, complete the run with the error before propagating
+                if let (Some(run_id), Some(store)) = (run_audit_id, self.store.as_ref()) {
+                    let _ = store
+                        .complete_run(&crate::store::CompleteRun {
+                            run_id,
+                            exit_code: None,
+                            stdout: "",
+                            stderr: "",
+                            parsed: &serde_json::json!({"error": e.to_string()}).to_string(),
+                            outcome: "failed",
+                            error: &format!("run() failed: {e}"),
+                            tokens: crate::store::RunTokenUsage {
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                total_cost_usd: 0.0,
+                                duration_secs: run_duration_secs(&started_at),
+                            },
+                        })
+                        .await;
+                }
+                return Err(e.context("task execution failed"));
+            }
+        };
 
-        // If the runner guard skipped the task, do not re-post stale data as a new comment.
+        // If the runner guard skipped the task, mark it as skipped and return early.
         let (status, exit_code_opt, run_audit) = match run_result {
             Some(result) => (result.status, result.exit_code, result.audit),
             None => {
                 tracing::info!(task_id, "guard skipped task — not posting stale result");
+                if let (Some(run_id), Some(store)) = (run_audit_id, self.store.as_ref()) {
+                    let _ = store
+                        .complete_run(&crate::store::CompleteRun {
+                            run_id,
+                            exit_code: None,
+                            stdout: "",
+                            stderr: "",
+                            parsed: &serde_json::json!({"skipped": true}).to_string(),
+                            outcome: "skipped",
+                            error: "task skipped by guard (max attempts, budget exceeded, etc.)",
+                            tokens: crate::store::RunTokenUsage {
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                total_cost_usd: 0.0,
+                                duration_secs: run_duration_secs(&started_at),
+                            },
+                        })
+                        .await;
+                }
                 return Ok(WeightSignal::None);
             }
         };

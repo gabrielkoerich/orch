@@ -1895,9 +1895,14 @@ pub async fn serve() -> anyhow::Result<()> {
                         // tmux sessions will be killed when the process exits.
                         let mut reset_count = 0u32;
                         let mut review_reset_count = 0u32;
+                        let mut task_ids_to_abort: Vec<i64> = Vec::new();
+
                         for engine in &project_engines {
                             if let Ok(tasks) = engine.task_manager.list_external_by_status(Status::InProgress).await {
                                 for task in &tasks {
+                                    if let Ok(Some(store_id)) = engine.store.resolve_task_id(&engine.repo, &task.id.0).await {
+                                        task_ids_to_abort.push(store_id);
+                                    }
                                     if let Err(e) = engine.task_manager.update_task_status(&task.id, Status::Routed).await {
                                         tracing::warn!(task_id = task.id.0, ?e, "failed to reset task on shutdown");
                                     } else {
@@ -1908,6 +1913,7 @@ pub async fn serve() -> anyhow::Result<()> {
                             // Also reset internal in_progress tasks
                             if let Ok(tasks) = engine.store.list_internal_by_status(&engine.repo, crate::store::TaskStatus::InProgress).await {
                                 for task in &tasks {
+                                    task_ids_to_abort.push(task.id);
                                     let task_id = format!("internal:{}", task.id);
                                     if let Err(e) = engine.task_manager.update_task_status(
                                         &crate::backends::ExternalId(task_id.clone()),
@@ -1922,6 +1928,9 @@ pub async fn serve() -> anyhow::Result<()> {
                             // Reset in_review tasks — review agent sessions die on shutdown
                             if let Ok(tasks) = engine.task_manager.list_external_by_status(Status::InReview).await {
                                 for task in &tasks {
+                                    if let Ok(Some(store_id)) = engine.store.resolve_task_id(&engine.repo, &task.id.0).await {
+                                        task_ids_to_abort.push(store_id);
+                                    }
                                     if let Err(e) = engine.task_manager.update_task_status(&task.id, Status::NeedsReview).await {
                                         tracing::warn!(task_id = task.id.0, ?e, "failed to reset in_review task on shutdown");
                                     } else {
@@ -1933,6 +1942,7 @@ pub async fn serve() -> anyhow::Result<()> {
                             // Also reset internal in_review tasks
                             if let Ok(tasks) = engine.store.list_internal_by_status(&engine.repo, crate::store::TaskStatus::InReview).await {
                                 for task in &tasks {
+                                    task_ids_to_abort.push(task.id);
                                     let task_id = format!("internal:{}", task.id);
                                     if let Err(e) = engine.task_manager.update_task_status(
                                         &crate::backends::ExternalId(task_id.clone()),
@@ -1951,6 +1961,23 @@ pub async fn serve() -> anyhow::Result<()> {
                         }
                         if review_reset_count > 0 {
                             tracing::info!(review_reset_count, "reset in_review tasks to needs_review for re-dispatch");
+                        }
+
+                        // Abort incomplete runs for all tasks being reset.
+                        // This ensures no task_runs have outcome IS NULL after shutdown.
+                        if !task_ids_to_abort.is_empty() {
+                            if let Some(first_engine) = project_engines.first() {
+                                match first_engine.store.abort_runs_for_tasks(&task_ids_to_abort, "graceful shutdown: task reset to routed/needs_review").await {
+                                    Ok(aborted) => {
+                                        if aborted > 0 {
+                                            tracing::info!(aborted, "aborted incomplete task_runs during shutdown");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "failed to abort incomplete task_runs during shutdown");
+                                    }
+                                }
+                            }
                         }
 
                         // Kill all orch-managed tmux sessions so stale sessions don't
