@@ -193,7 +193,7 @@ impl Default for EngineConfig {
             auto_create_followup_on_changes: true,
             auto_close_task_on_approval: false,
             graceful_shutdown_timeout: std::time::Duration::from_secs(600),
-            silence_grace_period: 120,
+            silence_grace_period: 300,
             silence_cooldown: 3600,
         }
     }
