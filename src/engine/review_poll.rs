@@ -1220,7 +1220,10 @@ mod tests {
     struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
     impl std::io::Write for CaptureWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
             Ok(buf.len())
         }
 
@@ -1249,7 +1252,8 @@ mod tests {
         let guard = tracing::subscriber::set_default(subscriber);
         f();
         drop(guard);
-        let captured = String::from_utf8_lossy(&output.lock().unwrap()).to_string();
+        let captured =
+            String::from_utf8_lossy(&output.lock().unwrap_or_else(|e| e.into_inner())).to_string();
         captured
     }
 
@@ -1853,7 +1857,7 @@ mod tests {
             assert!(ok, "fallback zero-reset should succeed");
         });
 
-        let set_calls = calls.lock().unwrap();
+        let set_calls = calls.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(set_calls.len(), 1);
         assert_eq!(set_calls[0], (key.to_string(), "0".to_string()));
         assert!(
@@ -1884,7 +1888,7 @@ mod tests {
             );
         });
 
-        let set_calls = calls.lock().unwrap();
+        let set_calls = calls.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(set_calls.len(), 1);
         assert!(
             logs.contains("failed to reset review batch failure counter"),
