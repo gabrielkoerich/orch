@@ -189,7 +189,9 @@ impl Transport {
         if chunk.content.is_empty() {
             let bindings = self.bindings.read().await;
             if let Some(binding) = bindings.get(&skey) {
-                let _ = binding.output_tx.send(chunk.clone());
+                if let Err(e) = binding.output_tx.send(chunk.clone()) {
+                    tracing::warn!(repo = %repo, task_id = %task_id, error = %e, "all broadcast receivers dropped — output chunk lost");
+                }
             }
             return;
         }
@@ -204,7 +206,9 @@ impl Transport {
             };
             let bindings = self.bindings.read().await;
             if let Some(binding) = bindings.get(&skey) {
-                let _ = binding.output_tx.send(part_chunk.clone());
+                if let Err(e) = binding.output_tx.send(part_chunk.clone()) {
+                    tracing::warn!(repo = %repo, task_id = %task_id, error = %e, "all broadcast receivers dropped — output chunk lost");
+                }
             }
         }
     }
