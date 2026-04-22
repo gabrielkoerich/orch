@@ -1116,8 +1116,23 @@ impl TaskRunner {
             }
         }
         let weight_signal = if is_rerouted {
-            WeightSignal::RateLimited {
-                agent: agent_name.clone(),
+            // Only emit RateLimited when the reroute was caused by a genuine rate-limit
+            // error.  Non-rate-limit reroutes (silence detection, timeout, parser errors)
+            // must NOT feed into router weight/cooldown degradation — they do not indicate
+            // that the agent or model is rate-limited or unavailable.
+            //
+            // Using the same detection heuristic as the needs_review branch below:
+            // last_error text containing "rate limit" or "usage limit" → genuine rate limit.
+            let has_rate_limit_error =
+                last_error.contains("rate limit") || last_error.contains("usage limit");
+            if has_rate_limit_error {
+                WeightSignal::RateLimited {
+                    agent: agent_name.clone(),
+                }
+            } else {
+                // Silence-detection reroute, timeout, parse error, etc. — do not penalize
+                // agent weights.  The reroute is not caused by the agent being unavailable.
+                WeightSignal::None
             }
         } else if status == "needs_review" {
             // Rate limit errors that escalate to needs_review must NOT reset backoff
@@ -2273,10 +2288,14 @@ mod tests {
 
     // ── weight signal logic ───────────────────────────────────────────────────
 
-    fn weight_signal_for(status: &str, _is_rate_limited: bool, agent: &str) -> WeightSignal {
+    fn weight_signal_for(status: &str, is_rate_limited: bool, agent: &str) -> WeightSignal {
         if status == "new" || status == "routed" {
-            WeightSignal::RateLimited {
-                agent: agent.to_string(),
+            if is_rate_limited {
+                WeightSignal::RateLimited {
+                    agent: agent.to_string(),
+                }
+            } else {
+                WeightSignal::None
             }
         } else if status == "done"
             || status == "needs_review"
@@ -2329,8 +2348,25 @@ mod tests {
     }
 
     #[test]
-    fn weight_signal_rate_limited_for_rerouted_status() {
+    fn weight_signal_none_for_rerouted_status_without_rate_limit() {
+        // Non-rate-limit reroute (e.g. silence detection) must NOT produce RateLimited —
+        // that would falsely degrade agent weights and cause cooldown cascades (#2936).
         let signal = weight_signal_for("routed", false, "claude");
+        assert!(matches!(signal, WeightSignal::None));
+    }
+
+    #[test]
+    fn weight_signal_none_for_new_status_without_rate_limit() {
+        // Same regression guard for "new" reroute status (#2936).
+        let signal = weight_signal_for("new", false, "minimax");
+        assert!(matches!(signal, WeightSignal::None));
+    }
+
+    #[test]
+    fn weight_signal_rate_limited_for_rerouted_status_with_rate_limit() {
+        // Genuine rate-limit reroute must still produce RateLimited so router weight
+        // degradation fires correctly.
+        let signal = weight_signal_for("routed", true, "claude");
         assert!(matches!(signal, WeightSignal::RateLimited { .. }));
     }
 
