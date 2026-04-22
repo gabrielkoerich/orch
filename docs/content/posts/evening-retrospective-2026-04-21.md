@@ -74,32 +74,6 @@ timeout      2
 3. **Parse error samples**: Collect 4 parse_error outputs to identify remaining edge cases.
 4. **Continue GLM investigation** (#2789): artifacts still pending from earlier days.
 
-## Evening Update (~01:30 UTC)
-
-**Watchdog stalls are back.** Multiple ticks exceeding the 60s threshold:
-
-| Timestamp (UTC) | Elapsed | Cause |
-|----------------|---------|-------|
-| 01:29:57 | 68.9s | LLM routing cascade |
-| 01:31:24 | 86.9s | Multi-task dispatch queue |
-| 01:32:12 | 48.5s | Routing + cooldown refresh |
-| 01:32:58 | 45.7s | LLM routing |
-
-The morning review flagged LLM routing budget timeouts as the root cause. These evening stalls confirm the fix wasn't fully effective — the 45s budget still triggers watchdog on multi-task routing rounds.
-
-**Agent pool degraded to 1 healthy agent.** Degraded mode: `healthy_agents=1 threshold=2`. Active cooldowns:
-
-| Agent | Cooldown expires (UTC) |
-|-------|----------------------|
-| `kimi` | ~06:04 (6h cap) |
-| `glm` | ~01:54 |
-| `claude` | ~00:30 |
-| `codex` | ~23:28 |
-
-Only `minimax` is fully healthy. All tasks funnel through minimax → queue buildup → slow ticks.
-
-**GitHub 5xx circuit-breaker cooldown has expired** (was set ~13:26 UTC today). No longer relevant.
-
 ## Issues
 
 **No new operational issues created from this review.**
