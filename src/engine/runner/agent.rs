@@ -193,9 +193,6 @@ exit $CMD_STATUS
     let command = format!("bash \"{}\"", script_path.display());
 
     // Resolve GitHub token via the process-wide shared resolver (cached after first call)
-    // NOTE: We must pass GH_TOKEN via create_session_detached + create_window (not set_env after) because
-    // tmux set-environment only affects NEW panes/windows, not the initial pane
-    // where the runner command executes.
     let github_token = match crate::github::token::shared().get_token().await {
         Ok(Some(token)) => {
             tracing::debug!("Resolved GitHub token via TokenResolver for agent session");
@@ -213,50 +210,32 @@ exit $CMD_STATUS
         }
     };
 
-    // Add GH_TOKEN to env if available (injected before runner starts in initial pane)
-    // This must be done BEFORE create_session because set_env only applies to new panes.
+    // Inject GH_TOKEN into env so it's passed via `tmux new-session -e` along
+    // with everything else. The `-e` flag sets variables in the *initial* pane
+    // environment, so the agent process sees it immediately on startup.
+    //
+    // IMPORTANT: Do NOT use create_session_detached + set_env + create_window
+    // to inject GH_TOKEN. That approach creates a 2-window session (window 0 =
+    // idle shell, window 1 = agent). All tmux monitoring (is_session_active,
+    // capture_pane, batch_session_active) targets the session without a window
+    // index, which defaults to the *active* window — the idle shell. This
+    // breaks completion detection (shell never exits → pane_dead always 0),
+    // output capture (reads the shell prompt, not agent output), and silence
+    // detection. See the revert of PR #2903.
     if let Some(ref token) = github_token {
         env.insert("GH_TOKEN".to_string(), token.clone());
     }
 
-    // Convert non-secret env to a slice for passing via -e to new-session.
-    // We avoid passing GH_TOKEN via process args to keep secrets out of ps output.
-    let env_vec: Vec<(&str, &str)> = env
-        .iter()
-        .filter(|(k, _)| k.as_str() != "GH_TOKEN")
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
+    let env_vec: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
-    // Create a detached session first (without running the command) so we can
-    // set sensitive environment variables into the session before starting the
-    // agent process. This keeps GH_TOKEN out of process arguments.
     let session = tmux
-        .create_session_detached(
+        .create_session(
             &inv.repo,
             &inv.task_id,
             &inv.work_dir.to_string_lossy(),
+            &command,
             env_vec.as_slice(),
         )
-        .await?;
-
-    // Inject GH_TOKEN into the session environment if available. This uses
-    // tmux set-environment which affects processes started after this call.
-    if let Some(ref token) = github_token {
-        if let Err(e) = tmux.set_github_token(&session, token, false).await {
-            tracing::warn!(error = %e, session = %session, "Failed to set GitHub token in tmux session");
-        }
-    }
-
-    // Ensure remaining non-secret env vars are set in the session (best-effort).
-    for (k, v) in &env {
-        if k != "GH_TOKEN" {
-            tmux.set_session_env(&session, k, v).await.ok();
-        }
-    }
-
-    // Start the agent command in a new detached window in the session. The new
-    // window will inherit the session env including GH_TOKEN that we just set.
-    tmux.create_window(&session, &inv.work_dir.to_string_lossy(), &command)
         .await?;
 
     tracing::info!(
