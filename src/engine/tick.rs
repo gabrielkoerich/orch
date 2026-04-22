@@ -2450,14 +2450,14 @@ mod tests {
 
         let task = store.get(internal_id).await.unwrap();
         // Silence detection now uses failover: if a fallback agent is found → Routed,
-        // otherwise → NeedsReview. Either is acceptable; the key invariant is that the
-        // task is no longer InProgress.
+        // otherwise → New (reset for re-routing when cooldowns expire). Either is
+        // acceptable; the key invariant is that the task is no longer InProgress.
         assert!(
             matches!(
                 task.status,
-                crate::store::TaskStatus::Routed | crate::store::TaskStatus::NeedsReview
+                crate::store::TaskStatus::Routed | crate::store::TaskStatus::New
             ),
-            "internal task should be routed to fallback or needs_review, got {:?}",
+            "internal task should be routed to fallback or reset to new, got {:?}",
             task.status
         );
     }
