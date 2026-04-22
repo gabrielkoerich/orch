@@ -1585,6 +1585,10 @@ mod tests {
 
     static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn ok_parse_result(status: &str) -> Result<agents::ParsedResponse, agents::AgentError> {
         Ok(agents::ParsedResponse {
             response: AgentResponse {
@@ -2140,7 +2144,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn process_delegations_creates_subtasks_and_blocks_parent() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let temp_home = TempDir::new().unwrap();
         let orch_home = temp_home.path().join(".orch");
         tokio::fs::create_dir_all(&orch_home).await.unwrap();
@@ -2171,7 +2175,10 @@ mod tests {
             .unwrap();
 
         // Two sub-tasks should have been created
-        let created = backend.sub_tasks_created.lock().unwrap();
+        let created = backend
+            .sub_tasks_created
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert_eq!(created.len(), 2);
         assert_eq!(created[0].1, "99", "parent id should be 99");
         assert!(
@@ -2185,7 +2192,10 @@ mod tests {
         drop(created);
 
         // Parent should be marked blocked
-        let updates = backend.status_updates.lock().unwrap();
+        let updates = backend
+            .status_updates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert!(
             updates
                 .iter()
@@ -2195,7 +2205,7 @@ mod tests {
         drop(updates);
 
         // A comment summarising the delegations should be posted
-        let comments = backend.comments.lock().unwrap();
+        let comments = backend.comments.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             !comments.is_empty(),
             "a delegation summary comment should be posted"
@@ -2220,7 +2230,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn process_delegations_single_subtask() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let temp_home = TempDir::new().unwrap();
         let orch_home = temp_home.path().join(".orch");
         tokio::fs::create_dir_all(&orch_home).await.unwrap();
@@ -2243,12 +2253,18 @@ mod tests {
             .await
             .unwrap();
 
-        let created = backend.sub_tasks_created.lock().unwrap();
+        let created = backend
+            .sub_tasks_created
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert_eq!(created.len(), 1);
         assert_eq!(created[0].0, "Only Child");
         drop(created);
 
-        let updates = backend.status_updates.lock().unwrap();
+        let updates = backend
+            .status_updates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert!(
             updates
                 .iter()
@@ -2257,7 +2273,7 @@ mod tests {
         );
         drop(updates);
 
-        let comments = backend.comments.lock().unwrap();
+        let comments = backend.comments.lock().unwrap_or_else(|e| e.into_inner());
         let body = &comments[0].1;
         assert!(
             body.contains("1 subtask"),
@@ -2457,7 +2473,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_with_context_blocks_when_budget_exceeded_pre_run() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let temp_home = TempDir::new().unwrap();
         let orch_home = temp_home.path().join(".orch");
         tokio::fs::create_dir_all(&orch_home).await.unwrap();
@@ -2504,7 +2520,10 @@ mod tests {
 
         assert!(matches!(result, WeightSignal::Blocked));
 
-        let updates = backend.status_updates.lock().unwrap();
+        let updates = backend
+            .status_updates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert!(updates
             .iter()
             .any(|(id, s)| id == task_id && *s == crate::backends::Status::Blocked));

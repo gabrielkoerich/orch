@@ -772,7 +772,10 @@ async fn set_cooldown_async(key: &str, cooldown_until: i64, reason: &str) -> boo
     true
 }
 
-/// Helper to acquire the cooldown map lock, logging and recovering on poison.
+/// Poison-safe lock acquisition for the cooldown map.
+///
+/// Used by both production code and tests. Replaces bare `.lock().unwrap()`
+/// with a recovery path that logs on poison and recovers the inner data.
 fn cooldown_lock() -> std::sync::MutexGuard<'static, HashMap<String, CooldownEntry>> {
     cooldowns().lock().unwrap_or_else(|e| {
         tracing::error!("cooldown map lock poisoned — recovering with partial state; backoff and degraded-agent decisions may be incorrect");
@@ -780,7 +783,7 @@ fn cooldown_lock() -> std::sync::MutexGuard<'static, HashMap<String, CooldownEnt
     })
 }
 
-/// Helper to acquire the degraded agents lock, logging and recovering on poison.
+/// Poison-safe lock acquisition for the degraded agents set.
 fn degraded_agents_lock() -> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
     degraded_agents().lock().unwrap_or_else(|e| {
         tracing::error!("degraded agents lock poisoned — recovering with partial state; health check decisions may be incorrect");
@@ -788,18 +791,22 @@ fn degraded_agents_lock() -> std::sync::MutexGuard<'static, std::collections::Ha
     })
 }
 
-/// Helper to acquire the GitHub 5xx timestamps lock, logging and recovering on poison.
+/// Poison-safe lock acquisition for GitHub 5xx circuit timestamps.
 fn github_5xx_timestamps_lock() -> std::sync::MutexGuard<'static, Vec<i64>> {
     github_5xx_timestamps().lock().unwrap_or_else(|e| {
-        tracing::error!("github 5xx timestamps lock poisoned — recovering with partial state; circuit breaker may operate incorrectly");
+        tracing::error!(
+            "github 5xx timestamps lock poisoned — recovering with partial state; circuit breaker may operate incorrectly"
+        );
         e.into_inner()
     })
 }
 
-/// Helper to acquire the GitHub 5xx circuit open lock, logging and recovering on poison.
+/// Poison-safe lock acquisition for the GitHub 5xx circuit open flag.
 fn github_5xx_circuit_open_lock() -> std::sync::MutexGuard<'static, Option<i64>> {
     github_5xx_circuit_open().lock().unwrap_or_else(|e| {
-        tracing::error!("github 5xx circuit open lock poisoned — recovering with partial state; circuit breaker may operate incorrectly");
+        tracing::error!(
+            "github 5xx circuit open lock poisoned — recovering with partial state; circuit breaker may operate incorrectly"
+        );
         e.into_inner()
     })
 }
@@ -1364,7 +1371,7 @@ mod tests {
         let agent = "test_agent_no_shorten";
         set_agent_cooldown(agent, 24 * 60 * 60).await;
         let initial = {
-            let map = cooldowns().lock().unwrap();
+            let map = cooldown_lock();
             map.get(agent)
                 .expect("cooldown entry should exist")
                 .cooldown_until
@@ -1373,7 +1380,7 @@ mod tests {
         // Shorter cooldown attempt should not override the existing one.
         record_agent_failure_with_message(agent, "rate limit").await;
         let after = {
-            let map = cooldowns().lock().unwrap();
+            let map = cooldown_lock();
             map.get(agent)
                 .expect("cooldown entry should exist")
                 .cooldown_until
@@ -1393,7 +1400,7 @@ mod tests {
         assert!(is_agent_in_cooldown(agent));
 
         // Verify it's a short cooldown (120s), not the exponential backoff one
-        let map = cooldowns().lock().unwrap();
+        let map = cooldown_lock();
         let entry = map.get(agent).expect("should have cooldown entry");
         let now = chrono::Utc::now().timestamp();
         let remaining = entry.cooldown_until - now;
@@ -1421,7 +1428,7 @@ mod tests {
         assert!(is_model_in_cooldown(agent, model));
         let key = format!("{agent}:{model}");
         let remaining = {
-            let map = cooldowns().lock().unwrap();
+            let map = cooldown_lock();
             let entry = map.get(&key).expect("cooldown entry should exist");
             entry.cooldown_until - chrono::Utc::now().timestamp()
         };
@@ -1525,7 +1532,7 @@ mod tests {
         assert!(is_agent_in_cooldown(agent));
 
         let remaining = {
-            let map = cooldowns().lock().unwrap();
+            let map = cooldown_lock();
             let entry = map.get(agent).expect("cooldown entry should exist");
             entry.cooldown_until - chrono::Utc::now().timestamp()
         };
@@ -1549,7 +1556,7 @@ mod tests {
         assert!(is_agent_in_cooldown(agent));
 
         let remaining = {
-            let map = cooldowns().lock().unwrap();
+            let map = cooldown_lock();
             let entry = map.get(agent).expect("cooldown entry should exist");
             entry.cooldown_until - chrono::Utc::now().timestamp()
         };
@@ -1576,7 +1583,7 @@ mod tests {
         assert!(is_agent_in_cooldown(agent));
 
         let remaining = {
-            let map = cooldowns().lock().unwrap();
+            let map = cooldown_lock();
             let entry = map.get(agent).expect("cooldown entry should exist");
             entry.cooldown_until - chrono::Utc::now().timestamp()
         };
@@ -1601,7 +1608,7 @@ mod tests {
         // First failure: 24h
         record_credit_exhaustion(agent, CreditExhaustionReason::BillingCycleExhausted).await;
         let remaining_1 = {
-            let map = cooldowns().lock().unwrap();
+            let map = cooldown_lock();
             let entry = map.get(agent).expect("cooldown entry should exist");
             entry.cooldown_until - chrono::Utc::now().timestamp()
         };
@@ -1613,14 +1620,14 @@ mod tests {
 
         // Clear in-memory cooldown (but NOT failure count) to allow next set_cooldown_async
         {
-            let mut map = cooldowns().lock().unwrap();
+            let mut map = cooldown_lock();
             map.remove(agent);
         }
 
         // Second failure: 24h * 3 = 72h (3 days)
         record_credit_exhaustion(agent, CreditExhaustionReason::BillingCycleExhausted).await;
         let remaining_2 = {
-            let map = cooldowns().lock().unwrap();
+            let map = cooldown_lock();
             let entry = map.get(agent).expect("cooldown entry should exist");
             entry.cooldown_until - chrono::Utc::now().timestamp()
         };
@@ -1632,14 +1639,14 @@ mod tests {
 
         // Clear in-memory cooldown again
         {
-            let mut map = cooldowns().lock().unwrap();
+            let mut map = cooldown_lock();
             map.remove(agent);
         }
 
         // Third failure: 24h * 9 = 216h → capped at 7 days (168h)
         record_credit_exhaustion(agent, CreditExhaustionReason::BillingCycleExhausted).await;
         let remaining_3 = {
-            let map = cooldowns().lock().unwrap();
+            let map = cooldown_lock();
             let entry = map.get(agent).expect("cooldown entry should exist");
             entry.cooldown_until - chrono::Utc::now().timestamp()
         };
@@ -1776,7 +1783,7 @@ mod tests {
         // (simulating a stale entry that wasn't cleaned up)
         let expired_ts = chrono::Utc::now().timestamp() - 100; // 100 seconds ago
         {
-            let mut map = cooldowns().lock().unwrap();
+            let mut map = cooldown_lock();
             map.insert(
                 agent.to_string(),
                 CooldownEntry {
@@ -1808,7 +1815,7 @@ mod tests {
         // Cleanup
         clear_agent_degraded(agent);
         {
-            let mut map = cooldowns().lock().unwrap();
+            let mut map = cooldown_lock();
             map.remove(agent);
         }
     }
@@ -2001,7 +2008,7 @@ mod tests {
         // First failure: should be ~5 min (BACKOFF_BASE_SECS)
         record_agent_failure_with_message(agent, "").await;
         let remaining_1 = {
-            let map = cooldowns().lock().unwrap();
+            let map = cooldown_lock();
             let entry = map.get(agent).expect("should have cooldown");
             entry.cooldown_until - chrono::Utc::now().timestamp()
         };
@@ -2012,14 +2019,14 @@ mod tests {
 
         // Clear the cooldown (but NOT failure count) to allow the next set_cooldown_async to apply
         {
-            let mut map = cooldowns().lock().unwrap();
+            let mut map = cooldown_lock();
             map.remove(agent);
         }
 
         // Second failure: should be ~15 min (5 * 3)
         record_agent_failure_with_message(agent, "").await;
         let remaining_2 = {
-            let map = cooldowns().lock().unwrap();
+            let map = cooldown_lock();
             let entry = map.get(agent).expect("should have cooldown");
             entry.cooldown_until - chrono::Utc::now().timestamp()
         };
@@ -2180,9 +2187,9 @@ mod tests {
     async fn github_circuit_stays_closed_below_threshold() {
         // Reset circuit breaker state
         {
-            let mut open = github_5xx_circuit_open().lock().unwrap();
+            let mut open = github_5xx_circuit_open_lock();
             *open = None;
-            let mut ts = github_5xx_timestamps().lock().unwrap();
+            let mut ts = github_5xx_timestamps_lock();
             ts.clear();
             // Also clear any generic cooldown map entry for the github 5xx
             // circuit so tests are isolated from other tests that may have
@@ -2232,7 +2239,7 @@ mod tests {
 
         // Clean up
         {
-            let mut open = github_5xx_circuit_open().lock().unwrap();
+            let mut open = github_5xx_circuit_open_lock();
             *open = None;
         }
     }
@@ -2270,7 +2277,7 @@ mod tests {
 
         // Clean up
         {
-            let mut open = github_5xx_circuit_open().lock().unwrap();
+            let mut open = github_5xx_circuit_open_lock();
             *open = None;
         }
     }
@@ -2289,7 +2296,7 @@ mod tests {
 
         // Set the circuit to an expired cooldown
         {
-            let mut open = github_5xx_circuit_open().lock().unwrap();
+            let mut open = github_5xx_circuit_open_lock();
             *open = Some(chrono::Utc::now().timestamp() - 1);
         }
 
@@ -2314,7 +2321,7 @@ mod tests {
 
         // Record errors that are outside the window
         {
-            let mut ts = github_5xx_timestamps().lock().unwrap();
+            let mut ts = github_5xx_timestamps_lock();
             let old = chrono::Utc::now().timestamp() - GITHUB_5XX_WINDOW_SECS - 10;
             for _ in 0..GITHUB_5XX_THRESHOLD {
                 ts.push(old);

@@ -1473,7 +1473,10 @@ mod tests {
         struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for CaptureWriter {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(buf);
                 Ok(buf.len())
             }
             fn flush(&mut self) -> std::io::Result<()> {
@@ -1499,7 +1502,7 @@ mod tests {
         }
 
         let captured = {
-            let guard = output.lock().unwrap();
+            let guard = output.lock().unwrap_or_else(|e| e.into_inner());
             String::from_utf8_lossy(&guard).to_string()
         };
         assert!(
