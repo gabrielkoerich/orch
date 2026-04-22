@@ -1348,8 +1348,7 @@ pub async fn serve() -> anyhow::Result<()> {
                 tokio::task::spawn_blocking(|| Router::new(RouterConfig::default()))
                     .await
                     .unwrap_or_else(|e2| {
-                        tracing::error!(?e2, "router default init also panicked in spawn_blocking");
-                        Router::new(RouterConfig::default())
+                        panic!("router default init also panicked in spawn_blocking — cannot start engine without a router: {e2:?}");
                     })
             }
         },
