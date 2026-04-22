@@ -29,7 +29,13 @@ pub fn normalize_dow(expression: &str) -> String {
             if part == "0" {
                 "7".to_string()
             } else if let Some(rest) = part.strip_prefix("0-") {
-                format!("1-{rest},7")
+                if rest == "0" {
+                    // 0-0 means only Sunday — same as plain 0
+                    "7".to_string()
+                } else {
+                    // 0-N (N > 0): split into Mon-N plus Sunday
+                    format!("1-{rest},7")
+                }
             } else {
                 part.to_string()
             }
@@ -356,6 +362,23 @@ mod tests {
             normalized.ends_with("1-4,7"),
             "Expected DOW field to be '1-4,7' but got: {normalized}"
         );
+    }
+
+    #[test]
+    fn normalize_dow_range_zero_to_zero_only_sunday() {
+        // "0-0" means only Sunday; should normalize to "7" (not invalid "1-0,7")
+        let normalized = normalize_dow("0 9 * * 0-0");
+        assert!(
+            normalized.ends_with("7"),
+            "Expected DOW field to be '7' but got: {normalized}"
+        );
+    }
+
+    #[test]
+    fn dow_range_zero_to_zero_parses() {
+        // "0-0" should be a valid cron expression meaning "only Sunday"
+        let result = check("0 9 * * 0-0", None);
+        assert!(result.is_ok(), "DOW range 0-0 should parse: {result:?}");
     }
 
     #[test]
