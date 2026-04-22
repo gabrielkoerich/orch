@@ -15,6 +15,7 @@ use super::{AgentProfile, RouteResult, RouterConfig};
 use crate::backends::ExternalTask;
 use crate::engine::runner::agents::{self, claude, opencode, AgentError};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -380,9 +381,18 @@ pub(super) fn apply_self_routing_penalty(
 /// `Router` holds a `LlmRouter` and delegates `route_with_llm` to it.
 pub(super) struct LlmRouter {
     /// Cached skills catalog loaded once to avoid repeated blocking I/O.
-    /// OnceLock guarantees single initialization without any locking on hot path.
-    /// Wrapped in Mutex so invalidation can reset the cache.
-    skills_catalog: std::sync::Mutex<OnceLock<String>>,
+    ///
+    /// Reads are effectively lock-free: clone the Arc (atomic refcount increment)
+    /// and call `OnceLock::get()` which uses atomic compare-and-swap.
+    ///
+    /// The `RwLock` is ONLY used for cache invalidation, which is rare
+    /// (only after `skills_sync()` updates skill files). The write lock is held
+    /// briefly to swap in a new Arc<OnceLock>.
+    ///
+    /// Tradeoff: small RwLock overhead on reads for safe invalidation.
+    /// Alternative would require unsafe atomic pointer swap or Router-level
+    /// coordination; this approach is simple, safe, and correct.
+    skills_catalog: std::sync::RwLock<Arc<OnceLock<String>>>,
 }
 
 /// Scan a skills directory for skill subdirectories containing SKILL.md files.
@@ -441,7 +451,7 @@ fn scan_skills_directory(skills_dir: &std::path::Path) -> Option<String> {
 impl LlmRouter {
     pub fn new() -> Self {
         Self {
-            skills_catalog: std::sync::Mutex::new(OnceLock::new()),
+            skills_catalog: std::sync::RwLock::new(Arc::new(OnceLock::new())),
         }
     }
 
@@ -683,17 +693,41 @@ impl LlmRouter {
     /// Invalidate the skills catalog cache so the next routing call reloads from disk.
     ///
     /// Called after `skills_sync()` updates skill files on disk.
+    ///
+    /// # Implementation details
+    ///
+    /// Acquires the write lock briefly to swap in a new `Arc<OnceLock>`.
+    /// This is safe because:
+    /// 1. Invalidation is rare (only after skills_sync)
+    /// 2. In-flight reads hold their own Arc clones and aren't blocked
+    /// 3. Next reads will get the new Arc with a fresh OnceLock
+    ///
+    /// The write lock is held for O(1) time - just an Arc swap.
     pub async fn invalidate_skills_catalog(&self) {
-        let mut guard = self.skills_catalog.lock().unwrap();
-        *guard = OnceLock::new();
+        let mut guard = self.skills_catalog.write().unwrap();
+        *guard = Arc::new(OnceLock::new());
     }
 
     /// Load skills catalog from skills.yml or skills directory.
     /// Cached after first load to avoid blocking I/O in async context.
-    /// Uses OnceLock — only one thread ever enters the init path; others wait for free.
+    ///
+    /// # Implementation details
+    ///
+    /// Uses `Arc<OnceLock<String>>` for effectively lock-free reads:
+    /// 1. Clone the Arc from RwLock read guard (atomic refcount increment)
+    /// 2. Drop the read guard immediately (no lock held across await)
+    /// 3. Call `OnceLock::get()` — reads are lock-free via atomic CAS
+    ///
+    /// The RwLock is ONLY used for cache invalidation, which is rare.
     async fn load_skills_catalog(&self) -> anyhow::Result<String> {
-        // Fast path: cache hit without any lock.
-        if let Some(catalog) = self.skills_catalog.lock().unwrap().get() {
+        // Fast path: clone Arc from read lock and drop guard immediately.
+        // RwLock read is a brief atomic increment - not held across await.
+        let catalog_ref = {
+            let guard = self.skills_catalog.read().unwrap();
+            Arc::clone(&guard)
+        };
+        // Now check the cache with zero locks held.
+        if let Some(catalog) = catalog_ref.get() {
             return Ok(catalog.clone());
         }
 
@@ -735,12 +769,17 @@ impl LlmRouter {
         .await
         .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?;
 
-        // Update the cache. get_or_init ensures exactly one write.
-        self.skills_catalog
-            .lock()
-            .unwrap()
-            .get_or_init(|| catalog.clone());
-        Ok(catalog)
+        // Update the cache. Clone Arc and drop the guard before calling
+        // get_or_init — the OnceLock method borrows self, so the RwLock guard
+        // must not be alive.
+        let catalog_arc = {
+            let guard = self.skills_catalog.read().unwrap();
+            Arc::clone(&guard)
+        };
+        let result = catalog_arc.get_or_init(|| catalog.clone());
+
+        // Return the cached value (may be ours from get_or_init, or another thread's)
+        Ok(result.clone())
     }
 
     /// Call the specified router LLM to classify the task.
