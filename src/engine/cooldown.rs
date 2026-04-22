@@ -191,6 +191,22 @@ pub async fn init_cooldown_store(store: Arc<crate::store::TaskStore>) {
     *cooldown_store().lock().await = Some(store);
 }
 
+/// Failure count threshold (times at max backoff) for first extended tier (24h).
+///
+/// After a model has been at the max cap this many times, apply a 6x multiplier.
+const EXTENDED_TIER_1_THRESHOLD: u64 = 2;
+
+/// Multiplier for first extended tier (6x = 24h when max=4h).
+const EXTENDED_TIER_1_MULTIPLIER: i64 = 6;
+
+/// Failure count threshold (times at max backoff) for second extended tier (48h).
+///
+/// After a model has been at the max cap this many times, apply a 12x multiplier.
+const EXTENDED_TIER_2_THRESHOLD: u64 = 5;
+
+/// Multiplier for second extended tier (12x = 48h when max=4h).
+const EXTENDED_TIER_2_MULTIPLIER: i64 = 12;
+
 /// Compute exponential backoff duration using base-3 growth.
 ///
 /// Returns `min(base * 3^(count-1), max)` for count >= 1.
@@ -203,13 +219,51 @@ pub async fn init_cooldown_store(store: Arc<crate::store::TaskStore>) {
 /// | 2     | 300       | 900    |
 /// | 3     | 300       | 2700   |
 /// | 4     | 300       | 8100 → capped |
+/// | 5-7   | 14400     | 14400 (max, not yet extended) |
+/// | 8-11  | 86400     | 86400 (24h extended tier) |
+/// | 12+   | 172800    | 172800 (48h extended tier) |
+///
+/// The extended tier applies when the model has hit the max cap multiple times,
+/// indicating a persistently broken model that won't self-resolve quickly.
 pub fn compute_backoff(count: u64, base: i64, max: i64) -> i64 {
     if count <= 1 {
         return base;
     }
     let exp = count.saturating_sub(1).min(u32::MAX as u64) as u32;
     let factor = 3_i64.saturating_pow(exp);
-    base.saturating_mul(factor).min(max)
+    let standard = base.saturating_mul(factor).min(max);
+
+    // Extended tier: after N failures at max backoff, apply longer window
+    // to reduce noise from persistently broken models.
+    //
+    // First find the count at which exponential growth first hits max:
+    // solve: base * 3^(first_max-1) >= max
+    // => 3^(first_max-1) >= max / base
+    // => first_max-1 >= log_3(max / base)
+    // => first_max >= 1 + log_3(max / base)
+    let first_max = if base <= 0 {
+        0
+    } else {
+        // Use integer approximation: count where base * 3^(count-1) would first exceed max
+        let mut accumulated = base;
+        let mut first_max_count = 1u64;
+        while accumulated < max && first_max_count < count {
+            accumulated = accumulated.saturating_mul(3);
+            first_max_count += 1;
+        }
+        first_max_count
+    };
+
+    // Times we've been at the max cap (excluding the first time we hit it)
+    let times_at_max = count.saturating_sub(first_max);
+
+    if standard == max && times_at_max >= EXTENDED_TIER_2_THRESHOLD {
+        max.saturating_mul(EXTENDED_TIER_2_MULTIPLIER)
+    } else if standard == max && times_at_max >= EXTENDED_TIER_1_THRESHOLD {
+        max.saturating_mul(EXTENDED_TIER_1_MULTIPLIER)
+    } else {
+        standard
+    }
 }
 
 /// Read the failure count for a key from KV, increment it, write it back, and return the new count.
@@ -1775,6 +1829,105 @@ mod tests {
     }
 
     #[test]
+    fn compute_backoff_extended_tier_1_applies_24h() {
+        // With base=300, max=14400:
+        // count=4: 8100s (not yet at max)
+        // count=5: 14400s (first time at max, times_at_max=0, no extension)
+        // count=6: 14400s (times_at_max=1, no extension yet, need >=2)
+        // count=7: 86400s (times_at_max=2, extended tier 1: 6x = 24h)
+        assert_eq!(
+            compute_backoff(5, 300, 14400),
+            14400,
+            "first at max, not extended"
+        );
+        assert_eq!(
+            compute_backoff(6, 300, 14400),
+            14400,
+            "times_at_max=1, not extended"
+        );
+        assert_eq!(
+            compute_backoff(7, 300, 14400),
+            86400,
+            "times_at_max=2, extended 6x"
+        );
+        assert_eq!(
+            compute_backoff(8, 300, 14400),
+            86400,
+            "times_at_max=3, still extended 6x"
+        );
+    }
+
+    #[test]
+    fn compute_backoff_extended_tier_2_applies_48h() {
+        // With base=300, max=14400:
+        // count=10: times_at_max=5 (first_max=5, count=10), extended tier 2: 12x = 48h
+        assert_eq!(
+            compute_backoff(9, 300, 14400),
+            86400,
+            "times_at_max=4, still tier 1"
+        );
+        assert_eq!(
+            compute_backoff(10, 300, 14400),
+            172800,
+            "times_at_max=5, extended 12x"
+        );
+        assert_eq!(
+            compute_backoff(15, 300, 14400),
+            172800,
+            "times_at_max=10, still tier 2"
+        );
+        assert_eq!(
+            compute_backoff(20, 300, 14400),
+            172800,
+            "times_at_max=15, still tier 2"
+        );
+    }
+
+    #[test]
+    fn compute_backoff_extended_tier_with_different_base_max() {
+        // With base=60, max=3600:
+        // count=3: 60*9=540 < 3600
+        // count=4: 60*27=1620 < 3600
+        // count=5: 60*81=4860 → capped at 3600
+        // count=6: times_at_max=1, still 3600
+        // count=7: times_at_max=2, extended 6x = 21600 (6h)
+        assert_eq!(compute_backoff(5, 60, 3600), 3600, "first at max");
+        assert_eq!(compute_backoff(6, 60, 3600), 3600, "times_at_max=1");
+        assert_eq!(
+            compute_backoff(7, 60, 3600),
+            21600,
+            "times_at_max=2, extended 6x"
+        );
+    }
+
+    #[test]
+    fn compute_backoff_extended_tier_persistent_fails_example() {
+        // Real-world example from issue: glm:haiku with 21 failures
+        // With base=300, max=14400:
+        // count=21 → times_at_max=16 (first_max=5), extended tier 2: 12x = 48h
+        assert_eq!(
+            compute_backoff(21, 300, 14400),
+            172800,
+            "21 failures should get 48h extended cooldown"
+        );
+
+        // kimi:haiku with 36 failures
+        assert_eq!(
+            compute_backoff(36, 300, 14400),
+            172800,
+            "36 failures should also get 48h extended cooldown"
+        );
+    }
+
+    #[test]
+    fn compute_backoff_extended_tier_zero_base() {
+        // Zero base should still work without panicking
+        assert_eq!(compute_backoff(1, 0, 14400), 0);
+        assert_eq!(compute_backoff(5, 0, 14400), 0);
+        assert_eq!(compute_backoff(10, 0, 14400), 0);
+    }
+
+    #[test]
     fn detect_credit_exhaustion_billing_cycle() {
         assert_eq!(
             detect_credit_exhaustion("billing cycle"),
@@ -2006,13 +2159,13 @@ mod tests {
 
     #[test]
     fn compute_backoff_saturates_on_large_counts() {
-        // Very large count should not overflow, just hit the cap
+        // Very large count should not overflow — extended tier applies 48h
         assert_eq!(
             compute_backoff(100, BACKOFF_BASE_SECS, BACKOFF_MAX_SECS),
-            BACKOFF_MAX_SECS
+            BACKOFF_MAX_SECS * 12
         );
-        assert_eq!(compute_backoff(u32::MAX as u64, 300, 14400), 14400);
-        assert_eq!(compute_backoff(u64::MAX, 300, 14400), 14400);
+        assert_eq!(compute_backoff(u32::MAX as u64, 300, 14400), 172800);
+        assert_eq!(compute_backoff(u64::MAX, 300, 14400), 172800);
     }
 
     #[test]
