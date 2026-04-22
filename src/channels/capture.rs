@@ -211,6 +211,26 @@ impl CaptureService {
                     "session seen-alive but now dead with no output, treating as silent exit"
                 );
             }
+
+            // Re-check the current generation to avoid silencing sessions that were
+            // re-registered (e.g., after a retry/dispatch). If the generation has
+            // changed, the session was restarted and the old entry is stale.
+            let skey = session_key(&buf.repo, &buf.task_id);
+            let current_generation = {
+                let buffers = self.buffers.read().await;
+                buffers.get(&skey).map(|b| b.generation)
+            };
+            if current_generation != Some(buf.generation) {
+                tracing::debug!(
+                    task_id = buf.task_id,
+                    session = buf.session,
+                    old_gen = buf.generation,
+                    new_gen = current_generation,
+                    "session generation changed, skipping silence detection (was re-registered)"
+                );
+                continue;
+            }
+
             let age = now.signed_duration_since(buf.registered_at);
             if age.num_seconds() > grace_period.as_secs() as i64 {
                 silent.push((buf.task_id.clone(), buf.session.clone(), age.num_seconds()));
@@ -739,5 +759,46 @@ mod tests {
         // New suffix is only whitespace
         let result = buf.diff_and_update("hello   \n");
         assert_eq!(result, None);
+    }
+
+    /// Regression test for issue #2932.
+    ///
+    /// When a session is re-registered (e.g., after retry/dispatch), the old
+    /// buffer entry has a stale generation. Silence detection must not kill the
+    /// NEW session just because an older entry with the same task_id was registered
+    /// before the grace period elapsed. The re-registered session should be
+    /// treated as fresh — it has a higher generation and different session name.
+    #[tokio::test]
+    async fn get_silent_sessions_skips_stale_generation() {
+        let transport = Arc::new(Transport::new());
+        let svc = CaptureService::new(transport);
+        let repo = "owner/repo";
+
+        // Register task once with a session, backdate it past grace period.
+        svc.register_session(repo, "task-42", "orch-old-session")
+            .await;
+        svc.set_buffer_state_for_test(
+            repo,
+            "task-42",
+            false,
+            false,
+            Utc::now() - chrono::Duration::seconds(500),
+        )
+        .await;
+
+        // Re-register the same task with a new session (generation incremented).
+        svc.register_session(repo, "task-42", "orch-new-session")
+            .await;
+
+        let grace = std::time::Duration::from_secs(120);
+        let silent = svc.get_silent_sessions_for_repo(repo, grace).await;
+
+        // The stale old-generation entry must be skipped.
+        // The re-registered session has generation=1 and is fresh (< 120s old),
+        // so it must NOT appear in the silent list.
+        assert!(
+            silent.is_empty(),
+            "re-registered session should not be silenced; stale entry should be skipped"
+        );
     }
 }
