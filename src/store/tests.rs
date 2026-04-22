@@ -611,7 +611,7 @@ async fn helper_store_set_by_id_writes_fields() {
         .unwrap();
 
     let opt_store = Some(store.clone());
-    store_set_by_id(
+    let _ = store_set_by_id(
         &opt_store.as_ref(),
         id,
         &[

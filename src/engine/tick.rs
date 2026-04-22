@@ -380,7 +380,7 @@ pub(crate) async fn tick_detect_silent_agents(
                 // Write the fallback agent into the store so dispatch can proceed
                 // directly without an LLM re-routing cycle. Clearing model forces
                 // model_for_complexity to pick the best available model for the new agent.
-                store_set_by_id(
+                let _ = store_set_by_id(
                     &Some(store),
                     store_id,
                     &[
@@ -397,7 +397,7 @@ pub(crate) async fn tick_detect_silent_agents(
                 )
                 .await;
             } else {
-                store_set_by_id(
+                let _ = store_set_by_id(
                     &Some(store),
                     store_id,
                     &[
@@ -637,7 +637,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
             },
         };
         if let Some(store_id) = resolved_store_id {
-            store_set_by_id(
+            if let Err(e) = store_set_by_id(
                 &Some(store),
                 store_id,
                 &[
@@ -646,7 +646,15 @@ pub(crate) async fn tick_recover_stuck_tasks(
                     ("route_attempts", serde_json::json!(0)),
                 ],
             )
-            .await;
+            .await
+            {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    ?e,
+                    "failed to clear routing fields for stuck task — will retry next tick"
+                );
+                continue;
+            }
         }
         if let Err(e) = task_manager.update_task_status(&task.id, Status::New).await {
             tracing::warn!(task_id = task.id.0, ?e, "failed to reset stuck task status");
@@ -829,7 +837,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
             },
         };
         if let Some(store_id) = resolved_store_id {
-            store_set_by_id(
+            if let Err(e) = store_set_by_id(
                 &Some(store),
                 store_id,
                 &[
@@ -838,7 +846,15 @@ pub(crate) async fn tick_recover_stuck_tasks(
                     ("route_attempts", serde_json::json!(0)),
                 ],
             )
-            .await;
+            .await
+            {
+                tracing::warn!(
+                    task_id,
+                    ?e,
+                    "failed to clear routing fields for stuck internal task — will retry next tick"
+                );
+                continue;
+            }
         }
         if let Err(e) = task_manager
             .update_task_status(&ExternalId(task_id.clone()), Status::New)
