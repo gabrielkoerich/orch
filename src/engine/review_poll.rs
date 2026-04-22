@@ -1428,7 +1428,7 @@ mod tests {
             })
             .await
             .unwrap();
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_store_id,
             &[("branch", serde_json::json!("my-branch"))],
@@ -1500,7 +1500,7 @@ mod tests {
             })
             .await
             .unwrap();
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
@@ -1563,7 +1563,7 @@ mod tests {
             })
             .await
             .unwrap();
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
@@ -1625,7 +1625,7 @@ mod tests {
             })
             .await
             .unwrap();
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
@@ -1638,7 +1638,7 @@ mod tests {
 
         // Pre-set no_code_reroutes to a high value that exceeds any configured max after increment.
         // The default max is 3; use 99 to be robust against any real config on the test machine.
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[("no_code_reroutes", serde_json::json!(99i64))],
@@ -1724,7 +1724,7 @@ mod tests {
             })
             .await
             .unwrap();
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
@@ -1784,14 +1784,14 @@ mod tests {
             })
             .await
             .unwrap();
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
         )
         .await;
         // Set pr_number so task reaches Phase 4.
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[("pr_number", serde_json::json!(99i64))],
@@ -1915,7 +1915,7 @@ mod tests {
             .unwrap();
         // Pre-set review_ts_map so the reviewer's review is already watermarked.
         let ts = "2026-01-05T00:00:00Z";
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[
@@ -1993,13 +1993,13 @@ mod tests {
             })
             .await
             .unwrap();
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
         )
         .await;
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[("pr_number", serde_json::json!(20i64))],
@@ -2007,7 +2007,7 @@ mod tests {
         .await;
         // Set last_comment_review_ts to match the comment's created_at so it is deduplicated.
         let ts = "2026-01-05T00:00:00Z";
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[("last_comment_review_ts", serde_json::json!(ts))],
