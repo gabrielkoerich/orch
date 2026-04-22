@@ -342,9 +342,9 @@ pub(crate) async fn tick_detect_silent_agents(
         } else {
             tracing::warn!(
                 task_id,
-                "silence detection: no fallback agents available, marking needs_review"
+                "silence detection: no fallback agents available, resetting to new for re-routing"
             );
-            (Status::NeedsReview, None)
+            (Status::New, None)
         };
 
         if use_backend {
