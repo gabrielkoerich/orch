@@ -2072,7 +2072,7 @@ mod tests {
         async fn post_comment(&self, id: &ExternalId, body: &str) -> anyhow::Result<()> {
             self.comments
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .push((id.0.clone(), body.to_string()));
             Ok(())
         }
@@ -2094,7 +2094,7 @@ mod tests {
         ) -> anyhow::Result<ExternalId> {
             self.sub_tasks_created
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .push((title.to_string(), parent.0.clone()));
             Ok(ExternalId(format!("child-{}", title)))
         }
@@ -2119,7 +2119,7 @@ mod tests {
         async fn update_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
             self.status_updates
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .push((id.0.clone(), status));
             Ok(())
         }
