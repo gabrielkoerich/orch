@@ -333,10 +333,21 @@ pub async fn record_agent_success(agent_name: &str, model: &str) {
 /// If `error_message` contains "try again at {date}", that vendor date is used
 /// instead of the computed backoff (vendor dates are always authoritative).
 pub async fn record_agent_failure_with_message(agent_name: &str, error_message: &str) {
-    // Vendor-specified retry date takes priority over backoff.
+    // Vendor-specified retry date takes priority over backoff — but only
+    // if it is in the present or future. If the parsed timestamp is in the
+    // past (stale vendor message), fall through to the exponential backoff
+    // path instead of returning early and bypassing backoff entirely.
     if let Some(cooldown_until) = parse_retry_at(error_message) {
-        set_cooldown_async(agent_name, cooldown_until, "agent_error").await;
-        return;
+        let now = chrono::Utc::now().timestamp();
+        if cooldown_until > now {
+            set_cooldown_async(agent_name, cooldown_until, "agent_error").await;
+            return;
+        }
+        tracing::debug!(
+            agent = agent_name,
+            cooldown_until,
+            "vendor retry_at is in the past — using backoff instead"
+        );
     }
 
     let store_opt = cooldown_store().lock().await.clone();
