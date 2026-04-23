@@ -468,7 +468,12 @@ pub(crate) async fn review_open_prs(
                         .update_task_status(&task_info.task.id, Status::Routed)
                         .await
                     {
-                        tracing::warn!(task_id, err = %e, "failed to update status to routed");
+                        tracing::warn!(task_id, err = %e, "failed to update status to routed — will retry next tick");
+                        // Do not consume the persistent no_code_reroutes counter when the
+                        // status update fails (e.g. transient DB error). Retry on the
+                        // next tick so the counter only increments after a successful
+                        // re-dispatch.
+                        continue;
                     }
                 }
             }
