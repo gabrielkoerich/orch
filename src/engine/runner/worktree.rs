@@ -174,11 +174,17 @@ pub async fn detect_default_branch(project_dir: &Path) -> String {
     match output {
         Ok(o) if o.status.success() => {
             let branch = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            // strip "origin/" prefix if present
-            branch
-                .strip_prefix("origin/")
+            // Handle both "remotes/origin/<branch>" and "origin/<branch>" formats
+            let stripped = branch
+                .strip_prefix("remotes/origin/")
+                .or_else(|| branch.strip_prefix("origin/"))
                 .unwrap_or(&branch)
-                .to_string()
+                .trim();
+            if stripped.is_empty() {
+                "main".to_string()
+            } else {
+                stripped.to_string()
+            }
         }
         _ => "main".to_string(),
     }
