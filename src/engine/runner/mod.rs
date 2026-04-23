@@ -1115,9 +1115,20 @@ impl TaskRunner {
                 );
             }
         }
+        // Determine weight signal based on outcome.
+        // Reroutes should only emit RateLimited when the underlying error is genuinely
+        // a rate limit (not silence detection, timeouts, parse errors, etc.). This prevents
+        // false cooldown cascades where non-rate-limit failures are treated as rate limits.
+        let is_rate_limit_error = classify_run_error_type(&last_error) == "rate_limit";
         let weight_signal = if is_rerouted {
-            WeightSignal::RateLimited {
-                agent: agent_name.clone(),
+            if is_rate_limit_error {
+                WeightSignal::RateLimited {
+                    agent: agent_name.clone(),
+                }
+            } else {
+                // Non-rate-limit reroutes (silence, timeout, parse error) should not trigger
+                // weight degradation — they're not provider-side limits.
+                WeightSignal::None
             }
         } else if status == "needs_review" {
             // Rate limit errors that escalate to needs_review must NOT reset backoff
@@ -2273,10 +2284,18 @@ mod tests {
 
     // ── weight signal logic ───────────────────────────────────────────────────
 
-    fn weight_signal_for(status: &str, _is_rate_limited: bool, agent: &str) -> WeightSignal {
-        if status == "new" || status == "routed" {
-            WeightSignal::RateLimited {
-                agent: agent.to_string(),
+    /// Test helper that mirrors the weight signal logic from `run_with_context`.
+    /// Reroutes only emit `RateLimited` when the error type is genuinely "rate_limit".
+    fn weight_signal_for(status: &str, error_type: &str, agent: &str) -> WeightSignal {
+        let is_rerouted = status == "new" || status == "routed";
+        let is_rate_limit_error = error_type == "rate_limit";
+        if is_rerouted {
+            if is_rate_limit_error {
+                WeightSignal::RateLimited {
+                    agent: agent.to_string(),
+                }
+            } else {
+                WeightSignal::None
             }
         } else if status == "done"
             || status == "needs_review"
@@ -2297,7 +2316,7 @@ mod tests {
     fn weight_signal_success_includes_needs_review() {
         // The normal happy-path for code tasks: agent reports done, has a PR,
         // so handle_success returns "needs_review". This must map to Success.
-        let signal = weight_signal_for("needs_review", false, "claude");
+        let signal = weight_signal_for("needs_review", "success", "claude");
         assert!(
             matches!(signal, WeightSignal::Success { agent } if agent == "claude"),
             "needs_review should produce WeightSignal::Success"
@@ -2307,7 +2326,7 @@ mod tests {
     #[test]
     fn weight_signal_success_for_all_done_statuses() {
         for status in ["done", "needs_review", "in_progress", "in_review"] {
-            let signal = weight_signal_for(status, false, "codex");
+            let signal = weight_signal_for(status, "success", "codex");
             assert!(
                 matches!(signal, WeightSignal::Success { agent } if agent == "codex"),
                 "{status} should produce WeightSignal::Success"
@@ -2316,22 +2335,37 @@ mod tests {
     }
 
     #[test]
-    fn weight_signal_rate_limited_overrides_success() {
-        // Rate limit on "new" status (rerouted back) should be RateLimited.
-        let signal = weight_signal_for("new", true, "claude");
-        assert!(matches!(signal, WeightSignal::RateLimited { .. }));
+    fn weight_signal_rate_limited_for_reroute_with_rate_limit_error() {
+        // Reroute due to rate limit should emit RateLimited.
+        let signal = weight_signal_for("new", "rate_limit", "claude");
+        assert!(matches!(signal, WeightSignal::RateLimited { agent } if agent == "claude"));
+    }
+
+    #[test]
+    fn weight_signal_rate_limited_for_routed_status_with_rate_limit_error() {
+        let signal = weight_signal_for("routed", "rate_limit", "claude");
+        assert!(matches!(signal, WeightSignal::RateLimited { agent } if agent == "claude"));
+    }
+
+    #[test]
+    fn weight_signal_none_for_reroute_without_rate_limit_error() {
+        // Reroute due to silence detection, timeout, or other non-rate-limit errors
+        // should NOT emit RateLimited (fixes false cooldown cascades).
+        for error_type in ["timeout", "silence detected", "parse_error", "failed"] {
+            for status in ["new", "routed"] {
+                let signal = weight_signal_for(status, error_type, "claude");
+                assert!(
+                    matches!(signal, WeightSignal::None),
+                    "{status} with error_type={error_type} should produce WeightSignal::None, not RateLimited"
+                );
+            }
+        }
     }
 
     #[test]
     fn weight_signal_blocked_status() {
-        let signal = weight_signal_for("blocked", false, "claude");
+        let signal = weight_signal_for("blocked", "success", "claude");
         assert!(matches!(signal, WeightSignal::Blocked));
-    }
-
-    #[test]
-    fn weight_signal_rate_limited_for_rerouted_status() {
-        let signal = weight_signal_for("routed", false, "claude");
-        assert!(matches!(signal, WeightSignal::RateLimited { .. }));
     }
 
     // ── parse_success_output token extraction ────────────────────────────────
