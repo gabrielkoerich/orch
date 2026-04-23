@@ -586,12 +586,19 @@ async fn create_pr_with_log(
                 serde_json::json!(format!("create PR failed: {e}")),
             )])
             .await;
-            // 422 from the GitHub PR API often means the PR request is
-            // invalid (for example: no commits between branches, invalid
-            // head, or invalid base). Treat these cases as terminal/no-op
-            // for PR creation so the task does not re-dispatch in a loop.
-            // Clear has_pushed so we fall through to the "done" path
+            // 422 from the GitHub PR API indicates the request is invalid
+            // (for example: no commits between branches, invalid head, or
+            // invalid base). These are terminal/no-op conditions for PR
+            // creation and should not trigger a reroute loop. Clear
+            // has_pushed so the flow falls through to the "done" path
             // instead of spinning in the review gate indefinitely.
+            //
+            // Be defensive: treat any 422 from the PR API that mentions the
+            // common failure indicators as terminal. This covers "base"
+            // invalid (reported in the original bug), "head", and the
+            // "No commits between" message. It is intentionally conservative
+            // to avoid infinite re-dispatch loops when the PR cannot be
+            // created due to repository state.
             if err_str.contains("422")
                 && (err_str.contains("No commits between")
                     || err_str.contains("head")
