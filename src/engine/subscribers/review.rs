@@ -160,6 +160,51 @@ pub fn spawn(
                         continue;
                     };
 
+                    if let Some(stored) =
+                        opt_store_get_task(&Some(store.clone()), &repo, &task.id.0).await
+                    {
+                        let no_code_review = stored.worktree.trim().is_empty()
+                            && stored.branch.trim().is_empty()
+                            && stored.pr_number.is_none();
+                        if no_code_review {
+                            tracing::info!(
+                                task_id,
+                                "no worktree/branch/pr for needs_review task — skipping review dispatch and marking done"
+                            );
+                            crate::store::store_reset_failure_counters(
+                                &Some(store.clone()),
+                                &repo,
+                                &task.id.0,
+                            )
+                            .await;
+                            if let Err(e) = crate::store::store_set_result(
+                                &Some(store.clone()),
+                                &repo,
+                                &task.id.0,
+                                &[("needs_review_refires", serde_json::json!(0))],
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    task_id,
+                                    err = %e,
+                                    "failed to reset needs_review_refires while skipping no-code review"
+                                );
+                            }
+                            if let Err(e) = task_manager
+                                .update_task_status(&task.id, Status::Done)
+                                .await
+                            {
+                                tracing::error!(
+                                    task_id,
+                                    err = %e,
+                                    "failed to mark no-code needs_review task as done"
+                                );
+                            }
+                            continue;
+                        }
+                    }
+
                     // If no agents are currently routable (all cooled, degraded, or without
                     // an available review model), wait until the earliest cooldown expires.
                     // Using router.healthy_agent_count covers agent cooldowns, degradation,

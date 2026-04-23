@@ -297,6 +297,27 @@ async fn build_review_context(
         }
     };
 
+    let no_code_review = stored_task.as_ref().is_some_and(|t| {
+        t.worktree.trim().is_empty() && t.branch.trim().is_empty() && t.pr_number.is_none()
+    });
+    if no_code_review {
+        tracing::info!(
+            task_id = task.id.0,
+            "no worktree/branch/pr for needs_review task — skipping review and marking done"
+        );
+        if let Err(e) = task_manager
+            .update_task_status(&task.id, Status::Done)
+            .await
+        {
+            tracing::error!(
+                task_id = task.id.0,
+                err = %e,
+                "update_task_status(Done) failed for no-code review skip"
+            );
+        }
+        return Ok(ReviewPhase::EarlyReturn(ReviewDecision::Skipped));
+    }
+
     let mut worktree_path = match stored_task.as_ref().map(|t| t.worktree.as_str()) {
         Some(w) if !w.is_empty() => std::path::PathBuf::from(w),
         _ => {
