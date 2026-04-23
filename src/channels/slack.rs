@@ -46,10 +46,17 @@ struct SlackMessage {
 }
 
 #[derive(Deserialize)]
+struct ResponseMetadata {
+    next_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct ConversationsHistoryResponse {
     ok: bool,
     messages: Option<Vec<SlackMessage>>,
     error: Option<String>,
+    has_more: Option<bool>,
+    response_metadata: Option<ResponseMetadata>,
 }
 
 #[derive(Deserialize)]
@@ -83,44 +90,69 @@ impl SlackChannel {
         format!("https://slack.com/api/{}", method)
     }
 
-    /// Fetch recent messages from a channel.
+    /// Fetch all messages newer than `oldest` from a channel, following pagination.
     ///
-    /// Uses `oldest` to retrieve only messages newer than `last_ts`.
-    async fn get_messages(&self, channel_id: &str) -> anyhow::Result<Vec<SlackMessage>> {
-        let mut params = vec![
-            ("channel", channel_id.to_string()),
-            ("limit", "50".to_string()),
-        ];
+    /// `oldest` is the Slack `ts` of the last processed message (exclusive lower bound).
+    /// Loops through pages until `has_more` is false or `next_cursor` is empty, so no
+    /// messages are dropped regardless of how many arrived since the last poll.
+    async fn get_messages(
+        &self,
+        channel_id: &str,
+        oldest: Option<String>,
+    ) -> anyhow::Result<Vec<SlackMessage>> {
+        let mut all_messages: Vec<SlackMessage> = Vec::new();
+        let mut cursor: Option<String> = None;
 
-        {
-            let last = self.last_ts.lock().await;
-            if let Some(ref ts) = *last {
-                // `oldest` is exclusive — add a tiny epsilon to avoid re-fetching the last msg
+        loop {
+            let mut params = vec![
+                ("channel", channel_id.to_string()),
+                ("limit", "200".to_string()),
+            ];
+
+            if let Some(ref ts) = oldest {
                 params.push(("oldest", ts.clone()));
             }
+
+            if let Some(ref c) = cursor {
+                params.push(("cursor", c.clone()));
+            }
+
+            let response = self
+                .client
+                .get(self.api_url("conversations.history"))
+                .bearer_auth(&self.bot_token)
+                .query(&params)
+                .send()
+                .await?;
+
+            if !response.status().is_success() {
+                let body = response.text().await.unwrap_or_default();
+                anyhow::bail!("slack API HTTP error: {}", body);
+            }
+
+            let result: ConversationsHistoryResponse = response.json().await?;
+
+            if !result.ok {
+                let err = result.error.as_deref().unwrap_or("unknown");
+                anyhow::bail!("slack conversations.history error: {}", err);
+            }
+
+            all_messages.extend(result.messages.unwrap_or_default());
+
+            let has_more = result.has_more.unwrap_or(false);
+            let next_cursor = result
+                .response_metadata
+                .and_then(|m| m.next_cursor)
+                .filter(|c| !c.is_empty());
+
+            if !has_more || next_cursor.is_none() {
+                break;
+            }
+
+            cursor = next_cursor;
         }
 
-        let response = self
-            .client
-            .get(self.api_url("conversations.history"))
-            .bearer_auth(&self.bot_token)
-            .query(&params)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("slack API HTTP error: {}", body);
-        }
-
-        let result: ConversationsHistoryResponse = response.json().await?;
-
-        if !result.ok {
-            let err = result.error.as_deref().unwrap_or("unknown");
-            anyhow::bail!("slack conversations.history error: {}", err);
-        }
-
-        Ok(result.messages.unwrap_or_default())
+        Ok(all_messages)
     }
 
     async fn send_message(&self, channel_id: &str, text: &str) -> anyhow::Result<()> {
@@ -206,7 +238,10 @@ impl Channel for SlackChannel {
                     last_ts: last_ts.clone(),
                 };
 
-                let messages = match channel.get_messages(&channel_id).await {
+                // Snapshot the cursor once so all pagination pages use the same lower bound.
+                let oldest = last_ts.lock().await.clone();
+
+                let messages = match channel.get_messages(&channel_id, oldest).await {
                     Ok(m) => m,
                     Err(e) => {
                         tracing::warn!(?e, "failed to get slack messages");
@@ -336,5 +371,56 @@ mod tests {
         let older = "1700000000.000100".to_string();
         let newer = "1700000001.000000".to_string();
         assert!(newer > older);
+    }
+
+    #[test]
+    fn conversations_history_response_deserializes_pagination_fields() {
+        // Response with more pages available
+        let json = r#"{
+            "ok": true,
+            "messages": [{"type": "message", "ts": "1700000001.000000", "text": "hello"}],
+            "has_more": true,
+            "response_metadata": {"next_cursor": "bmV4dF90czoxNzAwMDAwMDAxLjAwMDAwMA=="}
+        }"#;
+        let resp: ConversationsHistoryResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.ok);
+        assert_eq!(resp.has_more, Some(true));
+        let meta = resp.response_metadata.unwrap();
+        assert_eq!(
+            meta.next_cursor.as_deref(),
+            Some("bmV4dF90czoxNzAwMDAwMDAxLjAwMDAwMA==")
+        );
+    }
+
+    #[test]
+    fn conversations_history_response_last_page_has_no_cursor() {
+        // Final page: has_more=false, empty next_cursor
+        let json = r#"{
+            "ok": true,
+            "messages": [{"type": "message", "ts": "1700000002.000000", "text": "last"}],
+            "has_more": false,
+            "response_metadata": {"next_cursor": ""}
+        }"#;
+        let resp: ConversationsHistoryResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.has_more, Some(false));
+        let next = resp
+            .response_metadata
+            .and_then(|m| m.next_cursor)
+            .filter(|c| !c.is_empty());
+        assert!(
+            next.is_none(),
+            "empty next_cursor should be treated as no more pages"
+        );
+    }
+
+    #[test]
+    fn conversations_history_response_missing_pagination_fields() {
+        // Older API responses may omit has_more and response_metadata entirely
+        let json = r#"{"ok": true, "messages": []}"#;
+        let resp: ConversationsHistoryResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.has_more, None);
+        assert!(resp.response_metadata.is_none());
+        // has_more defaults to false — no pagination loop
+        assert!(!resp.has_more.unwrap_or(false));
     }
 }
