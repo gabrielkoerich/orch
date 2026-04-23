@@ -717,7 +717,7 @@ async fn create_pr_with_log(
                         "PR creation returned 422/no-commits/head-invalid — agent made no code changes or branch merged, marking done"
                     );
                     has_pushed = false;
-                } else if err_str.contains("base") {
+                } else if git_ops::is_invalid_base_error(&err_str) {
                     tracing::error!(
                         task_id = ctx.task_id,
                         "PR creation failed with invalid base branch — blocking task"
