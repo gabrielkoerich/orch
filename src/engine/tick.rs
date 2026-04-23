@@ -19,7 +19,7 @@ use crate::engine::cooldown::{
 };
 use crate::engine::dispatch_guard::DispatchGuard;
 use crate::engine::jobs;
-use crate::engine::router::{get_route_result, RouteResultError, Router};
+use crate::engine::router::{get_route_result, AllAgentsCooledError, RouteResultError, Router};
 use crate::engine::runner::{TaskRunner, WeightSignal};
 use crate::engine::tasks::{is_internal_id, TaskManager};
 use crate::repo_context::REPO_CONTEXT;
@@ -1072,10 +1072,20 @@ pub(crate) async fn tick_route_tasks(
     let max_per_tick = crate::engine::router::config::max_tasks_per_routing_tick();
     for task in routable.into_iter().take(max_per_tick) {
         let _task_span = tracing::info_span!("engine.route", task_id = %task.id.0).entered();
+        if let Some(remaining_secs) = route_defer_remaining_secs(store, repo, &task.id.0).await {
+            tracing::debug!(
+                task_id = %task.id.0,
+                remaining_secs,
+                "routing deferred while all agents are cooled"
+            );
+            continue;
+        }
+
         let task_start = Instant::now();
         match router.route(task, store, repo).await {
             Ok(result) => {
                 tracing::debug!(task_id = %task.id.0, duration_ms = task_start.elapsed().as_millis(), "route completed");
+                clear_route_defer(store, repo, &task.id.0).await;
                 // Store route result in store
                 if let Err(e) = router
                     .store_route_result(&task.id.0, &result, store, repo)
@@ -1234,11 +1244,77 @@ pub(crate) async fn tick_route_tasks(
                 );
             }
             Err(e) => {
+                if let Some(cooled) = e.downcast_ref::<AllAgentsCooledError>() {
+                    let defer_secs = compute_route_defer_secs(cooled.remaining_secs());
+                    set_route_defer_until(store, repo, &task.id.0, defer_secs).await;
+                    tracing::warn!(
+                        task_id = %task.id.0,
+                        scope = %cooled.scope(),
+                        remaining_secs = ?cooled.remaining_secs(),
+                        defer_secs,
+                        "all agents cooled — deferring task routing"
+                    );
+                    continue;
+                }
                 tracing::error!(task_id = task.id.0, ?e, "routing failed, skipping task");
             }
         }
     }
     Ok(())
+}
+
+fn route_defer_key(repo: &str, task_id: &str) -> String {
+    format!("route_defer_until:{repo}:{task_id}")
+}
+
+fn compute_route_defer_secs(remaining_secs: Option<u64>) -> u64 {
+    match remaining_secs {
+        Some(remaining) if remaining > 0 => remaining.saturating_div(2).max(10),
+        _ => 30,
+    }
+}
+
+async fn route_defer_remaining_secs(store: &TaskStore, repo: &str, task_id: &str) -> Option<u64> {
+    let key = route_defer_key(repo, task_id);
+    let value = match store.kv_get(&key).await {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(task_id, error = %err, "failed to read route defer key");
+            return None;
+        }
+    }?;
+
+    let until = match value.parse::<i64>() {
+        Ok(ts) => ts,
+        Err(err) => {
+            tracing::warn!(task_id, value, error = %err, "invalid route defer timestamp; clearing key");
+            let _ = store.kv_delete(&key).await;
+            return None;
+        }
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    if until <= now {
+        let _ = store.kv_delete(&key).await;
+        return None;
+    }
+
+    Some((until - now) as u64)
+}
+
+async fn set_route_defer_until(store: &TaskStore, repo: &str, task_id: &str, defer_secs: u64) {
+    let key = route_defer_key(repo, task_id);
+    let until = chrono::Utc::now().timestamp() + defer_secs as i64;
+    if let Err(err) = store.kv_set(&key, &until.to_string()).await {
+        tracing::warn!(task_id, error = %err, "failed to persist route defer key");
+    }
+}
+
+async fn clear_route_defer(store: &TaskStore, repo: &str, task_id: &str) {
+    let key = route_defer_key(repo, task_id);
+    if let Err(err) = store.kv_delete(&key).await {
+        tracing::warn!(task_id, error = %err, "failed to clear route defer key");
+    }
 }
 
 /// Phase 3b of tick: spawn agents for all status:routed tasks up to the parallel limit.
@@ -2181,6 +2257,39 @@ mod tests {
         assert_eq!(updates.len(), 1, "stuck InReview task should be recovered");
         assert_eq!(updates[0].0, "99");
         assert_eq!(updates[0].1, Status::NeedsReview);
+    }
+
+    #[test]
+    fn compute_route_defer_secs_halves_remaining_with_floor() {
+        assert_eq!(compute_route_defer_secs(Some(120)), 60);
+        assert_eq!(compute_route_defer_secs(Some(17)), 10);
+        assert_eq!(compute_route_defer_secs(Some(1)), 10);
+        assert_eq!(compute_route_defer_secs(None), 30);
+    }
+
+    #[tokio::test]
+    async fn route_defer_remaining_secs_clears_expired_key() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let repo = "owner/repo";
+        let task_id = "123";
+
+        set_route_defer_until(&store, repo, task_id, 30).await;
+        let remaining = route_defer_remaining_secs(&store, repo, task_id).await;
+        assert!(
+            matches!(remaining, Some(secs) if secs > 0),
+            "expected positive defer window, got {remaining:?}"
+        );
+
+        let key = route_defer_key(repo, task_id);
+        let past = chrono::Utc::now().timestamp() - 1;
+        store.kv_set(&key, &past.to_string()).await.unwrap();
+
+        let expired = route_defer_remaining_secs(&store, repo, task_id).await;
+        assert!(expired.is_none(), "expired defer key should be ignored");
+        assert!(
+            store.kv_get(&key).await.unwrap().is_none(),
+            "expired defer key should be deleted"
+        );
     }
 
     #[tokio::test]
