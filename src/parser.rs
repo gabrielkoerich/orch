@@ -78,6 +78,7 @@ fn status_is_known(status: &str) -> bool {
             | "in_progress"
             | "done"
             | "completed"
+            | "complete"
             | "ok"
             | "success"
             | "running"
@@ -154,7 +155,7 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
 fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
     resp.status = match resp.status.as_str() {
         // Canonical completion statuses.
-        "done" | "completed" | "ok" | "success" => "done".to_string(),
+        "done" | "completed" | "complete" | "ok" | "success" => "done".to_string(),
         // Canonical progress statuses.
         "in_progress" | "running" => "in_progress".to_string(),
         "in_review" | "reviewing" => "in_review".to_string(),
@@ -1036,6 +1037,7 @@ Some output here.
             ("ok", "done"),
             ("success", "done"),
             ("completed", "done"),
+            ("complete", "done"),
             ("running", "in_progress"),
             ("reviewing", "in_review"),
             ("pending_review", "needs_review"),
