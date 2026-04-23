@@ -1084,15 +1084,55 @@ async fn restore_review_config_if_needed(
     }
 }
 
+fn is_missing_path_error_message(err: &str) -> bool {
+    err.to_ascii_lowercase()
+        .contains("no such file or directory")
+}
+
 async fn push_review_branch(
     task: &ExternalTask,
     repo: &str,
     ctx: &ReviewContext,
     store: &Arc<TaskStore>,
 ) -> Result<(), String> {
-    match runner::git_ops::push_branch(&ctx.worktree_path, &ctx.branch_name, &ctx.default_branch)
-        .await
-    {
+    let mut worktree_path = ctx.worktree_path.clone();
+    let mut branch_name = ctx.branch_name.clone();
+    let mut retried_missing_worktree = false;
+
+    let push_result = loop {
+        match runner::git_ops::push_branch(&worktree_path, &branch_name, &ctx.default_branch).await
+        {
+            Ok(ok) => break Ok(ok),
+            Err(e)
+                if !retried_missing_worktree
+                    && !worktree_path.exists()
+                    && is_missing_path_error_message(&e.to_string()) =>
+            {
+                retried_missing_worktree = true;
+                tracing::warn!(
+                    task_id = task.id.0,
+                    worktree = %worktree_path.display(),
+                    branch = %branch_name,
+                    "review push failed because worktree disappeared; attempting one-time recovery"
+                );
+                match recover_missing_review_worktree(task, repo, store).await {
+                    Ok(recovered) => {
+                        worktree_path = recovered.work_dir;
+                        branch_name = recovered.branch;
+                        continue;
+                    }
+                    Err(recover_err) => {
+                        break Err(anyhow::anyhow!(
+                            "missing review worktree recovery failed after push error: {recover_err}"
+                        ));
+                    }
+                }
+            }
+            Err(e) => break Err(e),
+        }
+    };
+
+    match push_result {
         Ok(_) => {
             store_log_activity(
                 &Some(Arc::clone(store)),
@@ -1105,7 +1145,7 @@ async fn push_review_branch(
                 ctx.review_model.as_deref(),
                 Some(&serde_json::json!({
                     "status": "ok",
-                    "branch": ctx.branch_name.clone(),
+                    "branch": branch_name.clone(),
                     "default_branch": ctx.default_branch.clone(),
                     "phase": "review",
                 })),
@@ -1140,7 +1180,7 @@ async fn push_review_branch(
                 ctx.review_model.as_deref(),
                 Some(&serde_json::json!({
                     "status": "error",
-                    "branch": ctx.branch_name.clone(),
+                    "branch": branch_name.clone(),
                     "default_branch": ctx.default_branch.clone(),
                     "phase": "review",
                     "error": e.to_string(),
