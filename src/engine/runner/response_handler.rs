@@ -343,7 +343,75 @@ enum PushResult {
     Success,
     Rebased,
     Failed,
-    NoCommits, // agent made no code changes
+    NoCommits,       // agent made no code changes
+    WorktreeMissing, // retry after rebuilding missing worktree
+}
+
+fn is_missing_path_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|ioe| ioe.kind() == std::io::ErrorKind::NotFound)
+    }) || err
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("no such file or directory")
+}
+
+async fn recover_missing_worktree_for_push(
+    ctx: &StoreCtx<'_>,
+    wt: &worktree::WorktreeSetup,
+    task_title: &str,
+    agent_name: &str,
+    model_name: Option<&str>,
+) -> anyhow::Result<worktree::WorktreeSetup> {
+    tracing::warn!(
+        task_id = ctx.task_id,
+        worktree = %wt.work_dir.display(),
+        branch = wt.branch,
+        "worktree missing during push; attempting one-time recovery"
+    );
+    ctx.append_activity(
+        "push_recover_worktree",
+        Some(agent_name),
+        model_name,
+        Some(&serde_json::json!({
+            "status": "start",
+            "worktree": wt.work_dir.display().to_string(),
+            "branch": wt.branch,
+        })),
+    )
+    .await;
+
+    let recovered = worktree::setup_worktree(
+        ctx.task_id,
+        task_title,
+        &wt.main_project_dir,
+        ctx.store,
+        ctx.repo,
+    )
+    .await?;
+
+    if !recovered.work_dir.exists() {
+        anyhow::bail!(
+            "recovered worktree path is still missing: {}",
+            recovered.work_dir.display()
+        );
+    }
+
+    ctx.append_activity(
+        "push_recover_worktree",
+        Some(agent_name),
+        model_name,
+        Some(&serde_json::json!({
+            "status": "ok",
+            "worktree": recovered.work_dir.display().to_string(),
+            "branch": recovered.branch,
+        })),
+    )
+    .await;
+
+    Ok(recovered)
 }
 
 async fn push_branch_with_log(
@@ -379,6 +447,28 @@ async fn push_branch_with_log(
         Err(e) => {
             let err_str = e.to_string();
             tracing::error!(task_id = ctx.task_id, error = ?e, "push failed");
+
+            if is_missing_path_error(&e) && !work_dir.exists() {
+                tracing::warn!(
+                    task_id = ctx.task_id,
+                    worktree = %work_dir.display(),
+                    "push failed because worktree path disappeared; will attempt recovery"
+                );
+                ctx.append_activity(
+                    "push",
+                    Some(agent_name),
+                    model_name,
+                    Some(&serde_json::json!({
+                        "status": "retry",
+                        "branch": branch,
+                        "default_branch": default_branch,
+                        "reason": "worktree_missing",
+                        "error": err_str,
+                    })),
+                )
+                .await;
+                return PushResult::WorktreeMissing;
+            }
 
             // Check if this is a non-fast-forward error that we can recover from.
             let is_diverged = err_str.contains("non-fast-forward")
@@ -617,7 +707,8 @@ async fn run_git_ops(
 ) -> GitOpsResult {
     auto_commit_changes(ctx, &wt.work_dir, task_title, agent_name, new_attempts).await;
 
-    let has_commits =
+    let mut recovered_wt: Option<worktree::WorktreeSetup> = None;
+    let mut has_commits =
         check_commits_and_clear_stale_errors(ctx, &wt.work_dir, &wt.default_branch).await;
 
     // Skip push + PR if there are no commits ahead of the default branch.
@@ -653,6 +744,64 @@ async fn run_git_ops(
         )
         .await
     };
+    let push_result = if matches!(push_result, PushResult::WorktreeMissing) {
+        match recover_missing_worktree_for_push(ctx, wt, task_title, agent_name, model_name).await {
+            Ok(recovered) => {
+                recovered_wt = Some(recovered);
+                let wt_for_ops = recovered_wt.as_ref().expect("just set");
+                has_commits = check_commits_and_clear_stale_errors(
+                    ctx,
+                    &wt_for_ops.work_dir,
+                    &wt_for_ops.default_branch,
+                )
+                .await;
+                if !has_commits {
+                    PushResult::NoCommits
+                } else {
+                    push_branch_with_log(
+                        ctx,
+                        &wt_for_ops.work_dir,
+                        &wt_for_ops.branch,
+                        &wt_for_ops.default_branch,
+                        agent_name,
+                        model_name,
+                    )
+                    .await
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    task_id = ctx.task_id,
+                    err = %e,
+                    "worktree recovery before push failed"
+                );
+                ctx.append_activity(
+                    "push_recover_worktree",
+                    Some(agent_name),
+                    model_name,
+                    Some(&serde_json::json!({
+                        "status": "error",
+                        "worktree": wt.work_dir.display().to_string(),
+                        "branch": wt.branch,
+                        "error": e.to_string(),
+                    })),
+                )
+                .await;
+                ctx.set(&[(
+                    "last_error",
+                    serde_json::json!(format!(
+                        "push failed: worktree disappeared and recovery failed: {e}"
+                    )),
+                )])
+                .await;
+                PushResult::Failed
+            }
+        }
+    } else {
+        push_result
+    };
+
+    let wt_for_ops = recovered_wt.as_ref().unwrap_or(wt);
 
     let mut has_pushed = matches!(push_result, PushResult::Success);
     let mut has_pr = false;
@@ -684,7 +833,7 @@ async fn run_git_ops(
         );
     } else {
         let (pr, updated_pushed) = create_pr_with_log(
-            ctx, wt, task_title, resp, agent_name, model_name, has_pushed,
+            ctx, wt_for_ops, task_title, resp, agent_name, model_name, has_pushed,
         )
         .await;
         has_pr = pr;
@@ -1311,6 +1460,21 @@ pub async fn handle_success(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_path_error_detects_io_not_found() {
+        let err = anyhow::Error::from(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "simulated missing path",
+        ));
+        assert!(is_missing_path_error(&err));
+    }
+
+    #[test]
+    fn missing_path_error_detects_message_fallback() {
+        let err = anyhow::anyhow!("push failed: No such file or directory (os error 2)");
+        assert!(is_missing_path_error(&err));
+    }
 
     // ── classify_final_status — one test per decision branch ─────────────────
 
