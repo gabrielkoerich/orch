@@ -141,8 +141,14 @@ async fn handle_merge_conflict(
         .update_task_status(id, Status::NeedsReview)
         .await
     {
-        tracing::warn!(task_id, err = %e, "failed to set NeedsReview for conflict retry");
+        tracing::warn!(task_id, err = %e, "failed to set NeedsReview for conflict retry — blocking to prevent counter inflation");
+        // If we cannot update the task status, do not consume a retry attempt
+        // (which was already incremented). Block for human review so we don't
+        // repeatedly inflate the counter on subsequent ticks when the DB or
+        // task manager is temporarily unavailable.
+        return ConflictAction::BlockForHuman;
     }
+
     ConflictAction::RetryReview
 }
 
