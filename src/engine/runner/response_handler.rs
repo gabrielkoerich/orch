@@ -586,17 +586,20 @@ async fn create_pr_with_log(
                 serde_json::json!(format!("create PR failed: {e}")),
             )])
             .await;
-            // 422 "No commits between main and branch" means the agent
-            // made no code changes — the task is done without a PR.
-            // Also handles the "head" invalid variant (already merged).
+            // 422 from the GitHub PR API often means the PR request is
+            // invalid (for example: no commits between branches, invalid
+            // head, or invalid base). Treat these cases as terminal/no-op
+            // for PR creation so the task does not re-dispatch in a loop.
             // Clear has_pushed so we fall through to the "done" path
             // instead of spinning in the review gate indefinitely.
             if err_str.contains("422")
-                && (err_str.contains("No commits between") || err_str.contains("head"))
+                && (err_str.contains("No commits between")
+                    || err_str.contains("head")
+                    || err_str.contains("base"))
             {
                 tracing::info!(
                     task_id = ctx.task_id,
-                    "PR creation returned 422/no-commits — agent made no code changes, marking done"
+                    "PR creation returned 422 (no-commits/head/base) — agent made no code changes or PR is invalid, marking done"
                 );
                 has_pushed = false;
             }
