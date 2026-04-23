@@ -76,16 +76,16 @@ impl GhReviewClient for GhHttp {
 /// Action to take when a PR has merge conflicts after approval.
 #[derive(Debug, Clone, Copy)]
 enum ConflictAction {
-    /// Retry review by re-triggering the review agent to rebase.
-    RetryReview,
+    /// Re-dispatch the task agent to resolve merge conflicts (set Routed status).
+    RerouteToAgent,
     /// Block the task for human review (retry limit exceeded).
     BlockForHuman,
 }
 
 /// Handle a merge conflict detected in a fully-approved PR.
 ///
-/// Returns the action to take: either retry review (increment counter + set
-/// NeedsReview) or block for human (write block_reason + set Blocked).
+/// Returns the action to take: either re-route the task agent (increment counter
+/// + set Routed) or block for human (write block_reason + set Blocked).
 async fn handle_merge_conflict(
     id: &ExternalId,
     pr_number: u64,
@@ -126,11 +126,32 @@ async fn handle_merge_conflict(
         }
         return ConflictAction::BlockForHuman;
     }
+    let _repo = "TEMP"; // will use store_id-based path below
+    if let Err(e) = store_set_result_by_id(
+        &Some(Arc::clone(store)),
+        store_id,
+        &[
+            (
+                "last_error",
+                serde_json::json!(
+                    "merge conflict detected in review_poll; task agent must rebase and resolve conflicts"
+                ),
+            ),
+            (
+                "route_reason",
+                serde_json::json!("re-dispatch after merge conflict detected in review_poll"),
+            ),
+        ],
+    )
+    .await
+    {
+        tracing::warn!(task_id, err = %e, "store write failed");
+    }
     tracing::info!(
         task_id,
         pr_number,
         retries,
-        "PR approved but has merge conflicts — re-triggering review agent to rebase"
+        "PR approved but has merge conflicts — re-routing task agent to resolve"
     );
     if let Err(e) =
         store_increment_by_id(&Some(Arc::clone(store)), store_id, "merge_conflict_retries").await
@@ -138,13 +159,10 @@ async fn handle_merge_conflict(
         tracing::warn!(task_id, err = %e, "failed to increment merge_conflict_retries — skipping dispatch to avoid bypassing retry limit");
         return ConflictAction::BlockForHuman;
     }
-    if let Err(e) = task_manager
-        .update_task_status(id, Status::NeedsReview)
-        .await
-    {
-        tracing::warn!(task_id, err = %e, "failed to set NeedsReview for conflict retry");
+    if let Err(e) = task_manager.update_task_status(id, Status::Routed).await {
+        tracing::warn!(task_id, err = %e, "failed to set Routed for conflict retry");
     }
-    ConflictAction::RetryReview
+    ConflictAction::RerouteToAgent
 }
 
 #[async_trait]
@@ -649,7 +667,7 @@ pub(crate) async fn review_open_prs(
                     .await
                     {
                         ConflictAction::BlockForHuman => continue,
-                        ConflictAction::RetryReview => {}
+                        ConflictAction::RerouteToAgent => {}
                     }
                 }
 
@@ -754,7 +772,7 @@ pub(crate) async fn review_open_prs(
                     .await
                     {
                         ConflictAction::BlockForHuman => continue,
-                        ConflictAction::RetryReview => {}
+                        ConflictAction::RerouteToAgent => {}
                     }
                 }
 
