@@ -954,6 +954,106 @@ async fn complete_run_stores_null_error_for_empty_string() {
 }
 
 #[tokio::test]
+async fn finalize_incomplete_runs_marks_open_runs_aborted() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let task_id = store
+        .create(&NewTask {
+            repo: "owner/repo".to_string(),
+            origin: "internal".to_string(),
+            title: "Test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let _agent_run = store
+        .start_run(&StartRun {
+            task_id,
+            attempt: 1,
+            run_type: "agent",
+            agent: "claude",
+            model: "sonnet",
+            command: "claude -p ...",
+            prompt: "system prompt",
+        })
+        .await
+        .unwrap();
+
+    let _review_run = store
+        .start_run(&StartRun {
+            task_id,
+            attempt: 1,
+            run_type: "review",
+            agent: "codex",
+            model: "gpt-5.3-codex",
+            command: "codex --model gpt-5.3-codex",
+            prompt: "review prompt",
+        })
+        .await
+        .unwrap();
+
+    let finalized = store
+        .finalize_incomplete_runs(task_id, "aborted", "graceful shutdown")
+        .await
+        .unwrap();
+    assert_eq!(finalized, 2);
+
+    let runs = store.get_runs(task_id).await.unwrap();
+    assert_eq!(runs.len(), 2);
+    assert!(runs.iter().all(|r| r.outcome == "aborted"));
+    assert!(runs.iter().all(|r| r.completed_at.is_some()));
+    assert!(runs.iter().all(|r| r.exit_code == Some(-1)));
+}
+
+#[tokio::test]
+async fn finalize_incomplete_runs_ignores_completed_runs() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let task_id = store
+        .create(&NewTask {
+            repo: "owner/repo".to_string(),
+            origin: "internal".to_string(),
+            title: "Test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let run_id = store
+        .start_run(&StartRun {
+            task_id,
+            attempt: 1,
+            run_type: "agent",
+            agent: "claude",
+            model: "sonnet",
+            command: "claude -p ...",
+            prompt: "system prompt",
+        })
+        .await
+        .unwrap();
+    store
+        .complete_run(&CompleteRun {
+            run_id,
+            exit_code: Some(0),
+            stdout: "",
+            stderr: "",
+            parsed: "{}",
+            outcome: "success",
+            error: "",
+            tokens: RunTokenUsage::default(),
+        })
+        .await
+        .unwrap();
+
+    let finalized = store
+        .finalize_incomplete_runs(task_id, "aborted", "graceful shutdown")
+        .await
+        .unwrap();
+    assert_eq!(finalized, 0);
+}
+
+#[tokio::test]
 async fn set_fields_updates_task() {
     let store = TaskStore::open_memory().await.unwrap();
 

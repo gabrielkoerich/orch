@@ -1900,6 +1900,25 @@ pub async fn serve() -> anyhow::Result<()> {
                                     if let Err(e) = engine.task_manager.update_task_status(&task.id, Status::Routed).await {
                                         tracing::warn!(task_id = task.id.0, ?e, "failed to reset task on shutdown");
                                     } else {
+                                        if let Ok(Some(store_id)) =
+                                            engine.store.resolve_task_id(&engine.repo, &task.id.0).await
+                                        {
+                                            if let Err(e) = engine
+                                                .store
+                                                .finalize_incomplete_runs(
+                                                    store_id,
+                                                    "aborted",
+                                                    "graceful shutdown: reset in_progress task to routed",
+                                                )
+                                                .await
+                                            {
+                                                tracing::warn!(
+                                                    task_id = task.id.0,
+                                                    ?e,
+                                                    "failed to finalize incomplete runs on shutdown"
+                                                );
+                                            }
+                                        }
                                         reset_count += 1;
                                     }
                                 }
@@ -1914,6 +1933,21 @@ pub async fn serve() -> anyhow::Result<()> {
                                     ).await {
                                         tracing::warn!(task_id, ?e, "failed to reset internal task on shutdown");
                                     } else {
+                                        if let Err(e) = engine
+                                            .store
+                                            .finalize_incomplete_runs(
+                                                task.id,
+                                                "aborted",
+                                                "graceful shutdown: reset in_progress task to routed",
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                task_id,
+                                                ?e,
+                                                "failed to finalize incomplete internal runs on shutdown"
+                                            );
+                                        }
                                         reset_count += 1;
                                     }
                                 }
@@ -1925,6 +1959,25 @@ pub async fn serve() -> anyhow::Result<()> {
                                         tracing::warn!(task_id = task.id.0, ?e, "failed to reset in_review task on shutdown");
                                     } else {
                                         set_review_session_expected(&engine.store, &engine.repo, &task.id.0, false).await;
+                                        if let Ok(Some(store_id)) =
+                                            engine.store.resolve_task_id(&engine.repo, &task.id.0).await
+                                        {
+                                            if let Err(e) = engine
+                                                .store
+                                                .finalize_incomplete_runs(
+                                                    store_id,
+                                                    "aborted",
+                                                    "graceful shutdown: reset in_review task to needs_review",
+                                                )
+                                                .await
+                                            {
+                                                tracing::warn!(
+                                                    task_id = task.id.0,
+                                                    ?e,
+                                                    "failed to finalize incomplete review runs on shutdown"
+                                                );
+                                            }
+                                        }
                                         review_reset_count += 1;
                                     }
                                 }
@@ -1940,6 +1993,21 @@ pub async fn serve() -> anyhow::Result<()> {
                                         tracing::warn!(task_id, ?e, "failed to reset internal in_review task on shutdown");
                                     } else {
                                         set_review_session_expected(&engine.store, &engine.repo, &task_id, false).await;
+                                        if let Err(e) = engine
+                                            .store
+                                            .finalize_incomplete_runs(
+                                                task.id,
+                                                "aborted",
+                                                "graceful shutdown: reset in_review task to needs_review",
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                task_id,
+                                                ?e,
+                                                "failed to finalize incomplete internal review runs on shutdown"
+                                            );
+                                        }
                                         review_reset_count += 1;
                                     }
                                 }
