@@ -163,31 +163,100 @@ fn sanitize_task_id(task_id: &str) -> String {
     task_id.replace(':', "-")
 }
 
+/// Normalize a git ref output to a plain branch name.
+///
+/// Handles the various output formats that different git versions and
+/// configurations can produce for remote HEAD refs:
+/// - `origin/main` → `main`
+/// - `refs/remotes/origin/main` → `main`
+/// - `remotes/origin/main` → `main`
+/// - `main` → `main`
+fn normalize_branch_name(raw: &str) -> Option<String> {
+    let branch = raw.trim();
+    if branch.is_empty() {
+        return None;
+    }
+
+    // Strip known prefixes in order of specificity.
+    let cleaned = branch
+        .strip_prefix("refs/remotes/origin/")
+        .or_else(|| branch.strip_prefix("remotes/origin/"))
+        .or_else(|| branch.strip_prefix("refs/heads/"))
+        .or_else(|| branch.strip_prefix("origin/"))
+        .unwrap_or(branch);
+
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(cleaned.to_string())
+}
+
 /// Detect the default branch of a repository.
+///
+/// Tries multiple strategies and normalizes the result so callers always
+/// receive a clean branch name like `"main"`, never a raw ref path.
 pub async fn detect_default_branch(project_dir: &Path) -> String {
-    let output = Command::new("git")
+    // Strategy 1: symbolic-ref (fast, works when origin/HEAD is set).
+    let symref = Command::new("git")
         .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
         .current_dir(project_dir)
         .output_with_context()
         .await;
 
-    match output {
-        Ok(o) if o.status.success() => {
-            let branch = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            // Handle both "remotes/origin/<branch>" and "origin/<branch>" formats
-            let stripped = branch
-                .strip_prefix("remotes/origin/")
-                .or_else(|| branch.strip_prefix("origin/"))
-                .unwrap_or(&branch)
-                .trim();
-            if stripped.is_empty() {
-                "main".to_string()
-            } else {
-                stripped.to_string()
+    if let Ok(o) = &symref {
+        if o.status.success() {
+            let raw = String::from_utf8_lossy(&o.stdout);
+            if let Some(branch) = normalize_branch_name(&raw) {
+                return branch;
             }
         }
-        _ => "main".to_string(),
     }
+
+    // Strategy 2: rev-parse --abbrev-ref (resolves symref to target).
+    let revparse = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "refs/remotes/origin/HEAD"])
+        .current_dir(project_dir)
+        .output_with_context()
+        .await;
+
+    if let Ok(o) = &revparse {
+        if o.status.success() {
+            let raw = String::from_utf8_lossy(&o.stdout);
+            if let Some(branch) = normalize_branch_name(&raw) {
+                return branch;
+            }
+        }
+    }
+
+    // Strategy 3: parse `git remote show origin` output.
+    let remote_show = Command::new("git")
+        .args(["remote", "show", "origin"])
+        .current_dir(project_dir)
+        .output_with_context()
+        .await;
+
+    if let Ok(o) = &remote_show {
+        if o.status.success() {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            for line in stdout.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("HEAD branch:") {
+                    if let Some(branch) = trimmed.split(':').nth(1) {
+                        let branch = branch.trim();
+                        if !branch.is_empty() && branch != "(unknown)" {
+                            return branch.to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::warn!(
+        project_dir = %project_dir.display(),
+        "could not detect default branch from git, falling back to 'main'"
+    );
+    "main".to_string()
 }
 
 /// Resolve PROJECT_DIR to the main repo if it's inside a worktree.
@@ -1213,6 +1282,60 @@ mod tests {
         assert!(
             results.is_ok(),
             "concurrent worktree checks timed out (starvation?)"
+        );
+    }
+
+    // --- normalize_branch_name tests ---
+
+    #[test]
+    fn normalize_branch_name_strips_origin_prefix() {
+        assert_eq!(
+            normalize_branch_name("origin/main"),
+            Some("main".to_string())
+        );
+        assert_eq!(
+            normalize_branch_name("origin/develop"),
+            Some("develop".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_branch_name_strips_full_ref_path() {
+        assert_eq!(
+            normalize_branch_name("refs/remotes/origin/main"),
+            Some("main".to_string())
+        );
+        assert_eq!(
+            normalize_branch_name("refs/remotes/origin/develop"),
+            Some("develop".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_branch_name_strips_remotes_prefix() {
+        assert_eq!(
+            normalize_branch_name("remotes/origin/main"),
+            Some("main".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_branch_name_passes_through_plain_branch() {
+        assert_eq!(normalize_branch_name("main"), Some("main".to_string()));
+        assert_eq!(normalize_branch_name("master"), Some("master".to_string()));
+        assert_eq!(
+            normalize_branch_name("feature/foo"),
+            Some("feature/foo".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_branch_name_rejects_empty_and_refs_only() {
+        assert_eq!(normalize_branch_name(""), None);
+        assert_eq!(normalize_branch_name("   "), None);
+        assert_eq!(
+            normalize_branch_name("refs/heads/main"),
+            Some("main".to_string())
         );
     }
 }
