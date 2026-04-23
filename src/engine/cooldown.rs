@@ -2064,7 +2064,10 @@ mod tests {
         // After handling a past vendor timestamp, we should have applied
         // exponential backoff (base = BACKOFF_BASE_SECS) and a persisted
         // failure count of 1.
-        assert!(is_agent_in_cooldown(agent), "agent should be in cooldown after failure");
+        assert!(
+            is_agent_in_cooldown(agent),
+            "agent should be in cooldown after failure"
+        );
 
         let remaining = {
             let map = cooldowns().lock().unwrap();
@@ -2079,7 +2082,11 @@ mod tests {
 
         // Verify the failure count was incremented and persisted to KV
         let kv_key = format!("{FAILURE_COUNT_PREFIX}{agent}");
-        let stored = store.kv_get(&kv_key).await.unwrap().expect("failure count should be stored");
+        let stored = store
+            .kv_get(&kv_key)
+            .await
+            .unwrap()
+            .expect("failure count should be stored");
         assert_eq!(stored, "1");
     }
 
