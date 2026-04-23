@@ -1585,6 +1585,19 @@ impl GhHttp {
             .ok_or_else(|| anyhow::anyhow!("failed to get PR URL from response: {:?}", pr))
     }
 
+    /// Get the repository's default branch from the GitHub API.
+    ///
+    /// Used as a fallback when local git detection yields an invalid base
+    /// branch for PR creation.
+    pub async fn get_default_branch(&self, repo: &str) -> anyhow::Result<String> {
+        let url = format!("{GITHUB_API}/repos/{repo}");
+        let resp: serde_json::Value = self.get_json(&url).await?;
+        resp.get("default_branch")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("default_branch missing from repo response"))
+    }
+
     /// Get PR details by PR number.
     /// Returns the full PR object including the `mergeable` field.
     pub async fn get_pr(&self, repo: &str, pr_number: u64) -> anyhow::Result<GitHubPullRequest> {

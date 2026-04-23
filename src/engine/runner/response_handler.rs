@@ -679,14 +679,19 @@ async fn create_pr_with_log(
             // 422 "No commits between main and branch" means the agent
             // made no code changes — the task is done without a PR.
             // Also handles the "head" invalid variant (already merged).
+            // "base invalid" means the base branch name is wrong — after the
+            // GitHub API fallback in create_pr_if_needed also fails, clearing
+            // has_pushed prevents internal tasks from looping in re-dispatch.
             // Clear has_pushed so we fall through to the "done" path
             // instead of spinning in the review gate indefinitely.
             if err_str.contains("422")
-                && (err_str.contains("No commits between") || err_str.contains("head"))
+                && (err_str.contains("No commits between")
+                    || err_str.contains("head")
+                    || err_str.contains("base"))
             {
                 tracing::info!(
                     task_id = ctx.task_id,
-                    "PR creation returned 422/no-commits — agent made no code changes, marking done"
+                    "PR creation returned 422/no-commits/invalid-base — agent made no code changes or base is invalid, marking done"
                 );
                 has_pushed = false;
             }
