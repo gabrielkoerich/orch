@@ -23,7 +23,7 @@ pub struct AgentResponse {
     pub accomplished: Vec<String>,
     #[serde(default)]
     pub remaining: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "files_changed", alias = "files_modified")]
     pub files: Vec<String>,
     #[serde(default)]
     pub error: Option<String>,
@@ -441,15 +441,43 @@ const SUBSTANTIVE_RESPONSE_FIELDS: &[&str] = &[
     "remaining",
     "files",
     "files_changed",
+    "files_modified",
     "learnings",
     "delegations",
     "output",
+    "pr_url",
 ];
+
+/// Infer a canonical completion status from known non-standard completion envelope shapes.
+///
+/// Claude agents sometimes return JSON without a `status`/`result` field, using
+/// alternative completion indicators instead. This function maps those shapes to
+/// a canonical status so they are not misclassified as `InvalidResponse`.
+///
+/// Recognized patterns (all map to `"done"`):
+/// - `{"success": true, ...}` — explicit success boolean
+/// - `{"type": "task_complete", ...}` — explicit task_complete type string
+/// - `{"tests_passed": true, ...}` — tests-passed completion signal
+fn infer_completion_status(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    // success: true
+    if obj.get("success").and_then(|v| v.as_bool()) == Some(true) {
+        return Some("done".to_string());
+    }
+    // type: "task_complete"
+    if obj.get("type").and_then(|v| v.as_str()) == Some("task_complete") {
+        return Some("done".to_string());
+    }
+    // tests_passed: true
+    if obj.get("tests_passed").and_then(|v| v.as_bool()) == Some(true) {
+        return Some("done".to_string());
+    }
+    None
+}
 
 /// Map a generic JSON object to AgentResponse.
 ///
 /// Requires stricter shape checking: the object must have:
-/// 1. A status/result field
+/// 1. A status/result field (or a recognized completion envelope shape)
 /// 2. AND at least one substantive field OR an error field
 ///
 /// This prevents acceptance of non-response JSON blobs (telemetry, tool outputs)
@@ -457,13 +485,14 @@ const SUBSTANTIVE_RESPONSE_FIELDS: &[&str] = &[
 fn map_generic_response(val: &serde_json::Value) -> anyhow::Result<AgentResponse> {
     let obj = val.as_object().context("expected JSON object")?;
 
-    // Check for status or result field first.
+    // Check for status or result field first; fall back to known completion envelopes.
     let status = obj
         .get("status")
         .or_else(|| obj.get("result"))
         .and_then(|v| v.as_str())
-        .context("agent response is missing required 'status' or 'result' field")?
-        .to_string();
+        .map(String::from)
+        .or_else(|| infer_completion_status(obj))
+        .context("agent response is missing required 'status' or 'result' field")?;
 
     // Require at least one substantive field OR an error field.
     // This prevents accepting telemetry/event JSON blobs that happen to have
@@ -492,7 +521,12 @@ fn map_generic_response(val: &serde_json::Value) -> anyhow::Result<AgentResponse
         if !f.is_empty() {
             f
         } else {
-            extract_string_array(obj.get("files_changed"))
+            let fc = extract_string_array(obj.get("files_changed"));
+            if !fc.is_empty() {
+                fc
+            } else {
+                extract_string_array(obj.get("files_modified"))
+            }
         }
     };
     let error = obj.get("error").and_then(|v| v.as_str()).map(String::from);
@@ -1062,5 +1096,100 @@ Some output here.
         let resp = parse(input).unwrap();
         assert_eq!(resp.status, "done");
         assert_eq!(resp.summary, "Work complete");
+    }
+
+    // ── Regression tests for gh-issue-2979 ───────────────────────────────
+
+    #[test]
+    fn parse_regression_2979_success_true_envelope() {
+        // Claude returns prose + fenced JSON with `success: true` instead of `status`.
+        // Reproduces internal:148284 attempt 3.
+        let input = r#"The fix removes all actionable entry/SL/TP/R:R parameters from the bearish-mode trade section. The three candidates are now a plain watchlist table.
+
+```json
+{"success": true, "summary": "Fixed bearish/longs contradiction: replaced actionable long setups with a non-executable watchlist table."}
+```"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+        assert_eq!(
+            resp.summary,
+            "Fixed bearish/longs contradiction: replaced actionable long setups with a non-executable watchlist table."
+        );
+    }
+
+    #[test]
+    fn parse_regression_2979_type_task_complete_envelope() {
+        // Claude returns prose + fenced JSON with `type: "task_complete"` instead of `status`.
+        // Reproduces internal:147845 attempt 7.
+        let input = r#"The daily trending doc is complete at md/research/2026-04-22-daily-trending.md.
+
+```json
+{
+  "type": "task_complete",
+  "summary": "Fetched global trending topics and saved to md/research/2026-04-22-daily-trending.md.",
+  "files_changed": ["md/research/2026-04-22-daily-trending.md"]
+}
+```"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+        assert!(resp.summary.contains("Fetched global trending topics"));
+        assert_eq!(resp.files, vec!["md/research/2026-04-22-daily-trending.md"]);
+    }
+
+    #[test]
+    fn parse_regression_2979_tests_passed_envelope() {
+        // Claude returns prose + fenced JSON with `tests_passed: true` and `files_modified`.
+        // Reproduces task 2955 attempt 9.
+        let input = r#"PR created: gabrielkoerich/orch#2969
+
+The fix from attempt #8 was already committed. All quality gates pass.
+
+```json
+{
+  "summary": "Retry watermark persistence on store failure.",
+  "files_modified": ["src/engine/review_poll.rs"],
+  "pr_url": "https://github.com/gabrielkoerich/orch/pull/2969",
+  "tests_passed": true,
+  "quality_gates": ["cargo fmt", "cargo clippy", "cargo nextest run"]
+}
+```"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+        assert!(resp.summary.contains("Retry watermark persistence"));
+        assert_eq!(resp.files, vec!["src/engine/review_poll.rs"]);
+    }
+
+    #[test]
+    fn parse_regression_2979_success_false_does_not_infer_done() {
+        // success: false should NOT infer done — only success: true triggers inference.
+        let input = r#"```json
+{"success": false, "summary": "Could not complete the task."}
+```"#;
+        let result = parse(input);
+        // success: false has no `status` and `success` is not a valid status value,
+        // and infer_completion_status only fires for success=true, so this must error.
+        assert!(
+            result.is_err(),
+            "success: false should not be treated as done"
+        );
+    }
+
+    #[test]
+    fn parse_regression_2979_type_other_does_not_infer_done() {
+        // type: "something_else" should NOT infer done.
+        let input = r#"{"type": "tool_call", "summary": "calling bash"}"#;
+        let result = parse(input);
+        assert!(
+            result.is_err(),
+            "type other than task_complete should not be treated as done"
+        );
+    }
+
+    #[test]
+    fn parse_regression_2979_files_modified_alias() {
+        // files_modified should be picked up as the files list.
+        let input = r#"{"status": "done", "summary": "done", "files_modified": ["src/foo.rs", "src/bar.rs"]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.files, vec!["src/foo.rs", "src/bar.rs"]);
     }
 }
