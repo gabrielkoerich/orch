@@ -154,9 +154,16 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
 fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
     resp.status = match resp.status.as_str() {
         // Canonical completion statuses.
-        "done" | "completed" | "ok" | "success" => "done".to_string(),
+        // Some agents return `complete` or `no_changes_needed` to indicate
+        // a successful run with no further edits required — treat them as
+        // `done` so the run is classified as successful.
+        "done" | "completed" | "complete" | "ok" | "success" | "no_changes_needed" => {
+            "done".to_string()
+        }
         // Canonical progress statuses.
-        "in_progress" | "running" => "in_progress".to_string(),
+        // `partial` is used by some models to indicate partial progress —
+        // treat it as in_progress so the task remains open for follow-up.
+        "in_progress" | "running" | "partial" => "in_progress".to_string(),
         "in_review" | "reviewing" => "in_review".to_string(),
         "needs_review" | "pending_review" | "ready_for_review" => "needs_review".to_string(),
         // Canonical error statuses.
