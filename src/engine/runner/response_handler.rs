@@ -100,6 +100,10 @@ struct DecisionInput<'a> {
     has_delegations: bool,
     /// Commits were pushed to the remote branch successfully.
     has_pushed: bool,
+    /// PR creation failed because the base branch was invalid (even after
+    /// GitHub API fallback). This is a terminal error — the task should be
+    /// blocked rather than re-dispatched.
+    is_pr_base_invalid: bool,
     /// The task is external and requires a PR to be marked done.
     /// Always false for internal tasks.
     requires_pr: bool,
@@ -136,6 +140,15 @@ fn classify_final_status(input: &DecisionInput<'_>) -> String {
         "needs_review".to_string()
     } else if input.agent_status == "done" && !input.has_pr && input.has_delegations {
         "blocked".to_string()
+    } else if input.agent_status == "done"
+        && !input.has_pr
+        && input.has_pushed
+        && input.is_pr_base_invalid
+    {
+        // PR creation failed with an invalid base branch (even after GitHub API
+        // fallback).  This is a terminal configuration error — re-dispatching
+        // would just burn tokens on the same failure.
+        "blocked".to_string()
     } else if input.agent_status == "done" && !input.has_pr && input.has_pushed {
         "routed".to_string()
     } else if input.agent_status == "done" && input.requires_pr {
@@ -158,6 +171,12 @@ fn classify_final_status(input: &DecisionInput<'_>) -> String {
         "needs_review".to_string()
     } else if input.is_completed_status && !input.has_pr && input.has_delegations {
         // Agent said "completed" with delegations but no PR — blocked on children.
+        "blocked".to_string()
+    } else if input.is_completed_status
+        && !input.has_pr
+        && input.has_pushed
+        && input.is_pr_base_invalid
+    {
         "blocked".to_string()
     } else if input.is_completed_status && !input.has_pr && input.has_pushed {
         // Agent said "completed", commits pushed but no PR — re-dispatch for PR.
@@ -194,7 +213,7 @@ impl<'a> StoreCtx<'a> {
     /// Write fields, using the pre-resolved `store_id` when available.
     async fn set(&self, fields: &[(&str, serde_json::Value)]) {
         if let Some(store_id) = self.store_id_opt {
-            store::store_set_by_id(&self.store.as_ref(), store_id, fields).await;
+            let _ = store::store_set_by_id(&self.store.as_ref(), store_id, fields).await;
         } else {
             store::store_set(self.store, self.repo, self.task_id, fields).await;
         }
@@ -265,6 +284,10 @@ struct GitOpsResult {
     has_pr: bool,
     has_pushed: bool,
     has_commits: bool,
+    /// PR creation failed with an invalid base branch (after all retries
+    /// and the GitHub API fallback).  Used to block the task instead of
+    /// re-dispatching it indefinitely.
+    pr_base_invalid: bool,
 }
 
 /// Push-failure detection result.
@@ -343,7 +366,75 @@ enum PushResult {
     Success,
     Rebased,
     Failed,
-    NoCommits, // agent made no code changes
+    NoCommits,       // agent made no code changes
+    WorktreeMissing, // retry after rebuilding missing worktree
+}
+
+fn is_missing_path_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|ioe| ioe.kind() == std::io::ErrorKind::NotFound)
+    }) || err
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("no such file or directory")
+}
+
+async fn recover_missing_worktree_for_push(
+    ctx: &StoreCtx<'_>,
+    wt: &worktree::WorktreeSetup,
+    task_title: &str,
+    agent_name: &str,
+    model_name: Option<&str>,
+) -> anyhow::Result<worktree::WorktreeSetup> {
+    tracing::warn!(
+        task_id = ctx.task_id,
+        worktree = %wt.work_dir.display(),
+        branch = wt.branch,
+        "worktree missing during push; attempting one-time recovery"
+    );
+    ctx.append_activity(
+        "push_recover_worktree",
+        Some(agent_name),
+        model_name,
+        Some(&serde_json::json!({
+            "status": "start",
+            "worktree": wt.work_dir.display().to_string(),
+            "branch": wt.branch,
+        })),
+    )
+    .await;
+
+    let recovered = worktree::setup_worktree(
+        ctx.task_id,
+        task_title,
+        &wt.main_project_dir,
+        ctx.store,
+        ctx.repo,
+    )
+    .await?;
+
+    if !recovered.work_dir.exists() {
+        anyhow::bail!(
+            "recovered worktree path is still missing: {}",
+            recovered.work_dir.display()
+        );
+    }
+
+    ctx.append_activity(
+        "push_recover_worktree",
+        Some(agent_name),
+        model_name,
+        Some(&serde_json::json!({
+            "status": "ok",
+            "worktree": recovered.work_dir.display().to_string(),
+            "branch": recovered.branch,
+        })),
+    )
+    .await;
+
+    Ok(recovered)
 }
 
 async fn push_branch_with_log(
@@ -379,6 +470,28 @@ async fn push_branch_with_log(
         Err(e) => {
             let err_str = e.to_string();
             tracing::error!(task_id = ctx.task_id, error = ?e, "push failed");
+
+            if is_missing_path_error(&e) && !work_dir.exists() {
+                tracing::warn!(
+                    task_id = ctx.task_id,
+                    worktree = %work_dir.display(),
+                    "push failed because worktree path disappeared; will attempt recovery"
+                );
+                ctx.append_activity(
+                    "push",
+                    Some(agent_name),
+                    model_name,
+                    Some(&serde_json::json!({
+                        "status": "retry",
+                        "branch": branch,
+                        "default_branch": default_branch,
+                        "reason": "worktree_missing",
+                        "error": err_str,
+                    })),
+                )
+                .await;
+                return PushResult::WorktreeMissing;
+            }
 
             // Check if this is a non-fast-forward error that we can recover from.
             let is_diverged = err_str.contains("non-fast-forward")
@@ -500,8 +613,10 @@ async fn push_branch_with_log(
 
 /// Create (or find an existing) PR and log the activity.
 ///
-/// Returns `(has_pr, has_pushed)`. `has_pushed` may be set to `false` when a
-/// 422 "no commits" GitHub error indicates the branch was already merged.
+/// Returns `(has_pr, has_pushed, pr_base_invalid)`. `has_pushed` may be set to
+/// `false` when a 422 "no commits" GitHub error indicates the branch was
+/// already merged. `pr_base_invalid` is set when the base branch is rejected
+/// by GitHub (even after the API fallback), which is a terminal condition.
 async fn create_pr_with_log(
     ctx: &StoreCtx<'_>,
     wt: &worktree::WorktreeSetup,
@@ -510,7 +625,7 @@ async fn create_pr_with_log(
     agent_name: &str,
     model_name: Option<&str>,
     mut has_pushed: bool,
-) -> (bool, bool) {
+) -> (bool, bool, bool) {
     match git_ops::create_pr_if_needed(
         &wt.work_dir,
         &wt.branch,
@@ -565,7 +680,7 @@ async fn create_pr_with_log(
                 Some(&serde_json::json!({"status": "created", "url": url})),
             )
             .await;
-            (true, has_pushed)
+            (true, has_pushed, false)
         }
         Err(e) => {
             let err_str = format!("{e}");
@@ -586,21 +701,31 @@ async fn create_pr_with_log(
                 serde_json::json!(format!("create PR failed: {e}")),
             )])
             .await;
-            // 422 "No commits between main and branch" means the agent
-            // made no code changes — the task is done without a PR.
-            // Also handles the "head" invalid variant (already merged).
-            // Clear has_pushed so we fall through to the "done" path
-            // instead of spinning in the review gate indefinitely.
-            if err_str.contains("422")
-                && (err_str.contains("No commits between") || err_str.contains("head"))
-            {
-                tracing::info!(
-                    task_id = ctx.task_id,
-                    "PR creation returned 422/no-commits — agent made no code changes, marking done"
-                );
-                has_pushed = false;
+            // Distinguish between terminal 422 errors and recoverable ones.
+            // - "No commits between" / "head invalid" → agent made no code changes
+            //   or the branch was already merged.  Clearing has_pushed lets the
+            //   task fall through to the "done" path.
+            // - "base invalid" → the base branch name is wrong.  After the
+            //   GitHub API fallback in create_pr_if_needed also fails, this is a
+            //   terminal configuration error.  We set pr_base_invalid so the
+            //   classifier blocks the task instead of re-dispatching forever.
+            let mut pr_base_invalid = false;
+            if err_str.contains("422") {
+                if err_str.contains("No commits between") || err_str.contains("head") {
+                    tracing::info!(
+                        task_id = ctx.task_id,
+                        "PR creation returned 422/no-commits/head-invalid — agent made no code changes or branch merged, marking done"
+                    );
+                    has_pushed = false;
+                } else if git_ops::is_invalid_base_error(&err_str) {
+                    tracing::error!(
+                        task_id = ctx.task_id,
+                        "PR creation failed with invalid base branch — blocking task"
+                    );
+                    pr_base_invalid = true;
+                }
             }
-            (false, has_pushed)
+            (false, has_pushed, pr_base_invalid)
         }
     }
 }
@@ -617,7 +742,7 @@ async fn run_git_ops(
 ) -> GitOpsResult {
     auto_commit_changes(ctx, &wt.work_dir, task_title, agent_name, new_attempts).await;
 
-    let has_commits =
+    let mut has_commits =
         check_commits_and_clear_stale_errors(ctx, &wt.work_dir, &wt.default_branch).await;
 
     // Skip push + PR if there are no commits ahead of the default branch.
@@ -653,6 +778,61 @@ async fn run_git_ops(
         )
         .await
     };
+    let push_result = if matches!(push_result, PushResult::WorktreeMissing) {
+        match recover_missing_worktree_for_push(ctx, wt, task_title, agent_name, model_name).await {
+            Ok(recovered) => {
+                let wt_for_ops = &recovered;
+                has_commits = check_commits_and_clear_stale_errors(
+                    ctx,
+                    &wt_for_ops.work_dir,
+                    &wt_for_ops.default_branch,
+                )
+                .await;
+                if !has_commits {
+                    PushResult::NoCommits
+                } else {
+                    push_branch_with_log(
+                        ctx,
+                        &wt_for_ops.work_dir,
+                        &wt_for_ops.branch,
+                        &wt_for_ops.default_branch,
+                        agent_name,
+                        model_name,
+                    )
+                    .await
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    task_id = ctx.task_id,
+                    err = %e,
+                    "worktree recovery before push failed"
+                );
+                ctx.append_activity(
+                    "push_recover_worktree",
+                    Some(agent_name),
+                    model_name,
+                    Some(&serde_json::json!({
+                        "status": "error",
+                        "worktree": wt.work_dir.display().to_string(),
+                        "branch": wt.branch,
+                        "error": e.to_string(),
+                    })),
+                )
+                .await;
+                ctx.set(&[(
+                    "last_error",
+                    serde_json::json!(format!(
+                        "push failed: worktree disappeared and recovery failed: {e}"
+                    )),
+                )])
+                .await;
+                PushResult::Failed
+            }
+        }
+    } else {
+        push_result
+    };
 
     let mut has_pushed = matches!(push_result, PushResult::Success);
     let mut has_pr = false;
@@ -683,18 +863,25 @@ async fn run_git_ops(
             "skipping PR creation — repo is empty (internal task?)"
         );
     } else {
-        let (pr, updated_pushed) = create_pr_with_log(
+        let (pr, updated_pushed, pr_base_invalid) = create_pr_with_log(
             ctx, wt, task_title, resp, agent_name, model_name, has_pushed,
         )
         .await;
         has_pr = pr;
         has_pushed = updated_pushed;
+        return GitOpsResult {
+            has_pr,
+            has_pushed,
+            has_commits,
+            pr_base_invalid,
+        };
     }
 
     GitOpsResult {
         has_pr,
         has_pushed,
         has_commits,
+        pr_base_invalid: false,
     }
 }
 
@@ -814,6 +1001,7 @@ async fn apply_post_decision_effects(
     is_no_code_reroute: bool,
     has_pr: bool,
     has_pushed: bool,
+    is_pr_base_invalid: bool,
     has_delegations: bool,
     is_external: bool,
     no_code_reroutes: u64,
@@ -884,6 +1072,24 @@ async fn apply_post_decision_effects(
             task_id = ctx.task_id,
             "agent reported done with delegations but no PR — setting blocked"
         );
+    } else if (resp_status == "done" || resp_status == "completed")
+        && !has_pr
+        && has_pushed
+        && is_pr_base_invalid
+    {
+        tracing::error!(
+            task_id = ctx.task_id,
+            "PR creation failed with invalid base branch — blocking for human intervention"
+        );
+        ctx.set(&[(
+            "last_error",
+            serde_json::json!(
+                "PR creation failed: the base branch is invalid. The agent's commits were pushed successfully, \
+                 but GitHub rejected the PR because the base branch does not exist in the repository. \
+                 Verify the repository has a valid default branch and manually create the PR if needed."
+            ),
+        )])
+        .await;
     } else if resp_status == "done" && !has_pr && has_pushed {
         // Push succeeded but PR creation failed after retries.
         tracing::warn!(
@@ -1234,6 +1440,7 @@ pub async fn handle_success(
         has_pr: git.has_pr,
         has_delegations,
         has_pushed: git.has_pushed,
+        is_pr_base_invalid: git.pr_base_invalid,
         requires_pr,
         no_code_reroutes,
         max_reroutes,
@@ -1252,6 +1459,7 @@ pub async fn handle_success(
         is_no_code_reroute,
         git.has_pr,
         git.has_pushed,
+        git.pr_base_invalid,
         has_delegations,
         is_external,
         no_code_reroutes,
@@ -1311,6 +1519,21 @@ pub async fn handle_success(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_path_error_detects_io_not_found() {
+        let err = anyhow::Error::from(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "simulated missing path",
+        ));
+        assert!(is_missing_path_error(&err));
+    }
+
+    #[test]
+    fn missing_path_error_detects_message_fallback() {
+        let err = anyhow::anyhow!("push failed: No such file or directory (os error 2)");
+        assert!(is_missing_path_error(&err));
+    }
 
     // ── classify_final_status — one test per decision branch ─────────────────
 
@@ -1390,6 +1613,31 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(status, "routed");
+    }
+
+    /// Branch 5b: done + pushed + PR base invalid → block (terminal error).
+    #[test]
+    fn classify_done_pushed_pr_base_invalid_blocks() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "done",
+            has_pushed: true,
+            is_pr_base_invalid: true,
+            ..Default::default()
+        });
+        assert_eq!(status, "blocked");
+    }
+
+    /// Branch 5c: completed + pushed + PR base invalid → block (terminal error).
+    #[test]
+    fn classify_completed_pushed_pr_base_invalid_blocks() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "completed",
+            is_completed_status: true,
+            has_pushed: true,
+            is_pr_base_invalid: true,
+            ..Default::default()
+        });
+        assert_eq!(status, "blocked");
     }
 
     /// Branch 6a: done + requires_pr, under max reroutes → reroute.

@@ -1079,7 +1079,16 @@ pub(crate) mod patterns {
             "expired key",
             "expired token",
             "expired plan",
-            "billing",
+            // Use specific billing-related phrases instead of the bare word
+            // "billing" which produced false positives when agents mentioned
+            // billing in non-error contexts (e.g. reviews discussing billing).
+            "billing plan",
+            "billing error",
+            "billing suspended",
+            "billing expired",
+            "billing limit",
+            "billing failed",
+            "billing cycle exhausted",
             "insufficient credit",
             "credit balance too low",
             "payment required",

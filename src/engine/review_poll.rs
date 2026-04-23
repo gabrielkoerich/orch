@@ -34,6 +34,7 @@ use async_trait::async_trait;
 use dashmap::{DashMap, DashSet};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::sync::ReviewTaskSnapshot;
 
@@ -75,16 +76,16 @@ impl GhReviewClient for GhHttp {
 /// Action to take when a PR has merge conflicts after approval.
 #[derive(Debug, Clone, Copy)]
 enum ConflictAction {
-    /// Retry review by re-triggering the review agent to rebase.
-    RetryReview,
+    /// Re-dispatch the task agent to resolve merge conflicts (set Routed status).
+    RerouteToAgent,
     /// Block the task for human review (retry limit exceeded).
     BlockForHuman,
 }
 
 /// Handle a merge conflict detected in a fully-approved PR.
 ///
-/// Returns the action to take: either retry review (increment counter + set
-/// NeedsReview) or block for human (write block_reason + set Blocked).
+/// Returns the action to take: either re-route the task agent (increment counter
+/// + set Routed) or block for human (write block_reason + set Blocked).
 async fn handle_merge_conflict(
     id: &ExternalId,
     pr_number: u64,
@@ -125,11 +126,32 @@ async fn handle_merge_conflict(
         }
         return ConflictAction::BlockForHuman;
     }
+    let _repo = "TEMP"; // will use store_id-based path below
+    if let Err(e) = store_set_result_by_id(
+        &Some(Arc::clone(store)),
+        store_id,
+        &[
+            (
+                "last_error",
+                serde_json::json!(
+                    "merge conflict detected in review_poll; task agent must rebase and resolve conflicts"
+                ),
+            ),
+            (
+                "route_reason",
+                serde_json::json!("re-dispatch after merge conflict detected in review_poll"),
+            ),
+        ],
+    )
+    .await
+    {
+        tracing::warn!(task_id, err = %e, "store write failed");
+    }
     tracing::info!(
         task_id,
         pr_number,
         retries,
-        "PR approved but has merge conflicts — re-triggering review agent to rebase"
+        "PR approved but has merge conflicts — re-routing task agent to resolve"
     );
     if let Err(e) =
         store_increment_by_id(&Some(Arc::clone(store)), store_id, "merge_conflict_retries").await
@@ -137,13 +159,10 @@ async fn handle_merge_conflict(
         tracing::warn!(task_id, err = %e, "failed to increment merge_conflict_retries — skipping dispatch to avoid bypassing retry limit");
         return ConflictAction::BlockForHuman;
     }
-    if let Err(e) = task_manager
-        .update_task_status(id, Status::NeedsReview)
-        .await
-    {
-        tracing::warn!(task_id, err = %e, "failed to set NeedsReview for conflict retry");
+    if let Err(e) = task_manager.update_task_status(id, Status::Routed).await {
+        tracing::warn!(task_id, err = %e, "failed to set Routed for conflict retry");
     }
-    ConflictAction::RetryReview
+    ConflictAction::RerouteToAgent
 }
 
 #[async_trait]
@@ -468,7 +487,12 @@ pub(crate) async fn review_open_prs(
                         .update_task_status(&task_info.task.id, Status::Routed)
                         .await
                     {
-                        tracing::warn!(task_id, err = %e, "failed to update status to routed");
+                        tracing::warn!(task_id, err = %e, "failed to update status to routed — will retry next tick");
+                        // Do not consume the persistent no_code_reroutes counter when the
+                        // status update fails (e.g. transient DB error). Retry on the
+                        // next tick so the counter only increments after a successful
+                        // re-dispatch.
+                        continue;
                     }
                 }
             }
@@ -648,7 +672,7 @@ pub(crate) async fn review_open_prs(
                     .await
                     {
                         ConflictAction::BlockForHuman => continue,
-                        ConflictAction::RetryReview => {}
+                        ConflictAction::RerouteToAgent => {}
                     }
                 }
 
@@ -753,7 +777,7 @@ pub(crate) async fn review_open_prs(
                     .await
                     {
                         ConflictAction::BlockForHuman => continue,
-                        ConflictAction::RetryReview => {}
+                        ConflictAction::RerouteToAgent => {}
                     }
                 }
 
@@ -947,13 +971,22 @@ pub(crate) async fn review_open_prs(
             if let Some(ref ts) = new_comment_review_ts {
                 fields.push(("last_comment_review_ts", serde_json::json!(ts)));
             }
-            if let Err(e) =
-                store_set_result_by_id(&Some(Arc::clone(store)), task_info.store_id, &fields).await
-            {
-                tracing::warn!(
+            // Retry the watermark save a few times before giving up
+            let mut save_ok = false;
+            for _ in 0..3 {
+                if store_set_result_by_id(&Some(Arc::clone(store)), task_info.store_id, &fields)
+                    .await
+                    .is_ok()
+                {
+                    save_ok = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            if !save_ok {
+                tracing::error!(
                     task_id,
-                    err = %e,
-                    "failed to persist review watermark — will retry next tick"
+                    "failed to persist review watermark after retries — next tick will re-dispatch same review"
                 );
                 continue;
             }
@@ -1428,7 +1461,7 @@ mod tests {
             })
             .await
             .unwrap();
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_store_id,
             &[("branch", serde_json::json!("my-branch"))],
@@ -1500,7 +1533,7 @@ mod tests {
             })
             .await
             .unwrap();
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
@@ -1563,7 +1596,7 @@ mod tests {
             })
             .await
             .unwrap();
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
@@ -1625,7 +1658,7 @@ mod tests {
             })
             .await
             .unwrap();
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
@@ -1638,7 +1671,7 @@ mod tests {
 
         // Pre-set no_code_reroutes to a high value that exceeds any configured max after increment.
         // The default max is 3; use 99 to be robust against any real config on the test machine.
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[("no_code_reroutes", serde_json::json!(99i64))],
@@ -1724,7 +1757,7 @@ mod tests {
             })
             .await
             .unwrap();
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
@@ -1784,14 +1817,14 @@ mod tests {
             })
             .await
             .unwrap();
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
         )
         .await;
         // Set pr_number so task reaches Phase 4.
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[("pr_number", serde_json::json!(99i64))],
@@ -1915,7 +1948,7 @@ mod tests {
             .unwrap();
         // Pre-set review_ts_map so the reviewer's review is already watermarked.
         let ts = "2026-01-05T00:00:00Z";
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[
@@ -1993,13 +2026,13 @@ mod tests {
             })
             .await
             .unwrap();
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
         )
         .await;
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[("pr_number", serde_json::json!(20i64))],
@@ -2007,7 +2040,7 @@ mod tests {
         .await;
         // Set last_comment_review_ts to match the comment's created_at so it is deduplicated.
         let ts = "2026-01-05T00:00:00Z";
-        crate::store::store_set_by_id(
+        let _ = crate::store::store_set_by_id(
             &Some(&store),
             task_id,
             &[("last_comment_review_ts", serde_json::json!(ts))],

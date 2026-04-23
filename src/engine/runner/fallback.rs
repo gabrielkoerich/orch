@@ -273,9 +273,18 @@ pub async fn handle_error(
             response::RetryableError::MissingTooling,
             format!("missing tool: {tool}"),
         ),
-        agents::AgentError::ModelUnavailable { model, .. } => {
-            // Record model-specific cooldown with exponential backoff
-            response::record_model_failure(agent_name, model).await;
+        agents::AgentError::ModelUnavailable { model, message } => {
+            // "Model not found" is a permanent failure — the model has been decommissioned
+            // and will never return. Apply persistent backoff (4h base → 7d max) instead
+            // of the standard transient backoff (5min base → 4h max) to prevent indefinite
+            // 4h retry cycles against a dead model.
+            let lower = message.to_lowercase();
+            let is_permanently_gone = lower.contains("not found");
+            if is_permanently_gone {
+                crate::engine::cooldown::record_persistent_model_failure(agent_name, model).await;
+            } else {
+                response::record_model_failure(agent_name, model).await;
+            }
 
             // Try next model before switching agent
             let models = agent_runner.available_models();
@@ -1261,5 +1270,90 @@ more logs"#;
 
         let summarized = super::summarize_rate_limit_error(raw_output);
         assert_eq!(summarized, raw_output);
+    }
+
+    /// "Model not found" is a permanent failure — verify it applies the persistent (4h base)
+    /// cooldown rather than the standard transient (5min base) cooldown.
+    ///
+    /// Regression test for issue #2941: dead models were retried every 4h indefinitely
+    /// because "not found" was treated the same as a transient unavailability.
+    #[tokio::test]
+    async fn model_not_found_applies_persistent_cooldown() {
+        let runner = MockRunner { free: vec![] };
+        let agent = "opencode-2941-not-found";
+        let model = "github-copilot/claude-opus-4.6";
+        let key = format!("{agent}:{model}");
+
+        let err = AgentError::ModelUnavailable {
+            model: model.to_string(),
+            message: "Model not found: github-copilot/claude-opus-4.6".to_string(),
+        };
+
+        let _result = handle_error(
+            "test-2941-a",
+            &err,
+            agent,
+            &runner,
+            Some(model),
+            Some("complex"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let until = crate::engine::cooldown::cooldown_until(&key)
+            .expect("model not found should set model cooldown");
+        let remaining = until.saturating_sub(now);
+
+        // Persistent cooldown starts at 4h; transient starts at 5min.
+        // Verify we applied the persistent (4h base) path, not the short one.
+        assert!(
+            remaining >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
+            "expected ~4h (persistent) cooldown for 'Model not found', got {remaining}s — \
+             may have applied transient 5min cooldown instead"
+        );
+    }
+
+    /// Transient model unavailability (not "not found") should use the standard short cooldown.
+    #[tokio::test]
+    async fn model_unavailable_transient_applies_short_cooldown() {
+        let runner = MockRunner { free: vec![] };
+        let agent = "opencode-2941-transient";
+        let model = "github-copilot/gpt-4o";
+        let key = format!("{agent}:{model}");
+
+        let err = AgentError::ModelUnavailable {
+            model: model.to_string(),
+            message: "No endpoints found for github-copilot/gpt-4o.".to_string(),
+        };
+
+        let _result = handle_error(
+            "test-2941-b",
+            &err,
+            agent,
+            &runner,
+            Some(model),
+            Some("medium"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let until = crate::engine::cooldown::cooldown_until(&key)
+            .expect("transient model unavailability should set model cooldown");
+        let remaining = until.saturating_sub(now);
+
+        // Standard (transient) backoff base is 5min. Persistent base is 4h.
+        // Confirm we did NOT apply the long 4h cooldown for a transient error.
+        assert!(
+            remaining < crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS,
+            "transient unavailability should use short cooldown (<4h), got {remaining}s"
+        );
     }
 }

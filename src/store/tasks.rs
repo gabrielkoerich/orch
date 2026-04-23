@@ -1859,6 +1859,44 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Finalize all incomplete runs for a task.
+    ///
+    /// This is used on runner early-return/error paths and engine shutdown
+    /// paths to ensure every `start_run` has a terminal record.
+    pub async fn finalize_incomplete_runs(
+        &self,
+        task_id: i64,
+        outcome: &str,
+        error: &str,
+    ) -> anyhow::Result<u64> {
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT id FROM task_runs
+             WHERE task_id = ?
+               AND outcome IS NULL
+               AND completed_at IS NULL
+             ORDER BY id ASC",
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        for (run_id,) in &rows {
+            self.complete_run(&CompleteRun {
+                run_id: *run_id,
+                exit_code: Some(-1),
+                stdout: "",
+                stderr: "",
+                parsed: "",
+                outcome,
+                error,
+                tokens: RunTokenUsage::default(),
+            })
+            .await?;
+        }
+
+        Ok(rows.len() as u64)
+    }
+
     /// Get all runs for a task, ordered by attempt.
     pub async fn get_runs(&self, task_id: i64) -> anyhow::Result<Vec<TaskRun>> {
         let rows = sqlx::query(&format!(

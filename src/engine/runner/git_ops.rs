@@ -1255,10 +1255,12 @@ pub async fn create_pr_if_needed(
     let mut last_error: Option<anyhow::Error> = None;
     let mut created_url: Option<String> = None;
     let mut had_transient_error = false;
+    let mut effective_base = base_branch.to_string();
+    let mut tried_api_fallback = false;
 
     for attempt in 1..=MAX_RETRIES {
         match gh
-            .create_pr(repo, pr_title, &body, branch, base_branch)
+            .create_pr(repo, pr_title, &body, branch, &effective_base)
             .await
         {
             Ok(u) => {
@@ -1279,6 +1281,42 @@ pub async fn create_pr_if_needed(
                             "transient GitHub API error during PR creation — retrying"
                         );
                         tokio::time::sleep(delay).await;
+                    }
+                } else if is_invalid_base_error(&err_str) && !tried_api_fallback {
+                    // Local base branch detection was wrong (e.g. "remotes/origin/main").
+                    // Query GitHub API for the canonical default branch and retry once.
+                    tried_api_fallback = true;
+                    tracing::warn!(
+                        task_id,
+                        base_branch = %effective_base,
+                        error = %e,
+                        "PR creation failed with invalid base — fetching default branch from GitHub API"
+                    );
+                    match gh.get_default_branch(repo).await {
+                        Ok(api_default) if api_default != effective_base => {
+                            tracing::info!(
+                                task_id,
+                                old_base = %effective_base,
+                                new_base = %api_default,
+                                "retrying PR creation with GitHub API default branch"
+                            );
+                            effective_base = api_default;
+                            continue;
+                        }
+                        Ok(api_default) => {
+                            tracing::warn!(
+                                task_id,
+                                base_branch = %api_default,
+                                "GitHub API default branch matches local — no fallback possible"
+                            );
+                        }
+                        Err(api_err) => {
+                            tracing::warn!(
+                                task_id,
+                                error = %api_err,
+                                "failed to fetch default branch from GitHub API"
+                            );
+                        }
                     }
                 }
                 last_error = Some(e);
@@ -1434,6 +1472,16 @@ pub(crate) fn is_transient_github_error(err_str: &str) -> bool {
     }
 
     false
+}
+
+/// Returns true when the error indicates the PR base branch is invalid.
+///
+/// GitHub returns HTTP 422 with `PullRequest.base invalid` when the base
+/// branch name is not a valid ref in the repository. This is a terminal
+/// configuration error — retrying with the same base will never succeed.
+pub(crate) fn is_invalid_base_error(err_str: &str) -> bool {
+    let lower = err_str.to_lowercase();
+    lower.contains("422") && lower.contains("base") && lower.contains("invalid")
 }
 
 /// Returns true when an error looks like a transient *GitHub API/CLI* failure.
@@ -2170,5 +2218,35 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_invalid_base_error_detects_base_invalid() {
+        assert!(is_invalid_base_error(
+            "GitHub API POST https://api.github.com/repos/foo/bar/pulls failed (422): {\"errors\":[{\"resource\":\"PullRequest\",\"field\":\"base\",\"code\":\"invalid\"}]}"
+        ));
+        assert!(is_invalid_base_error(
+            "GitHub API POST .../pulls failed (422): Base field is invalid"
+        ));
+    }
+
+    #[test]
+    fn is_invalid_base_error_rejects_non_base_errors() {
+        // No-commits error should NOT match
+        assert!(!is_invalid_base_error(
+            "GitHub API POST .../pulls failed (422): No commits between main and branch"
+        ));
+        // Head invalid should NOT match
+        assert!(!is_invalid_base_error(
+            "GitHub API POST .../pulls failed (422): head is not a valid ref"
+        ));
+        // Transient 5xx should NOT match
+        assert!(!is_invalid_base_error(
+            "GitHub API POST .../pulls failed (502): Bad Gateway"
+        ));
+        // 404 should NOT match
+        assert!(!is_invalid_base_error(
+            "GitHub API POST .../pulls failed (404): Not Found"
+        ));
     }
 }

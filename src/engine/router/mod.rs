@@ -22,6 +22,43 @@ pub mod weights;
 pub use config::{parse_pool_entry, RouterConfig};
 pub use weights::AgentWeights;
 
+/// Error returned when all agents/models are in cooldown and routing is temporarily unavailable.
+///
+/// This is a transient error that should not count against `max_route_attempts` since
+/// no agent was actually invoked. The caller should back off and retry later.
+#[derive(Debug, thiserror::Error)]
+pub enum AllAgentsCooledError {
+    #[error("all agents/models in cooldown for {scope}")]
+    AllCooled {
+        scope: String,
+        remaining_secs: Option<u64>,
+    },
+}
+
+impl AllAgentsCooledError {
+    /// Create a new error for the given scope.
+    pub fn new(scope: String, remaining_secs: Option<u64>) -> Self {
+        Self::AllCooled {
+            scope,
+            remaining_secs,
+        }
+    }
+
+    /// Get the scope of the cooldown (e.g., "medium", "all agents", "router pool").
+    pub fn scope(&self) -> &str {
+        match self {
+            Self::AllCooled { scope, .. } => scope,
+        }
+    }
+
+    /// Remaining cooldown duration in seconds when available.
+    pub fn remaining_secs(&self) -> Option<u64> {
+        match self {
+            Self::AllCooled { remaining_secs, .. } => *remaining_secs,
+        }
+    }
+}
+
 /// Typed error returned by [`get_route_result`].
 #[derive(Debug, thiserror::Error)]
 pub enum RouteResultError {
@@ -156,19 +193,6 @@ pub struct Router {
     /// Current round-robin index into router_pool
     pub(crate) pool_index: usize,
 }
-
-#[derive(Debug)]
-struct AllCooledError {
-    scope: String,
-}
-
-impl std::fmt::Display for AllCooledError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "all agents/models in cooldown for {}", self.scope)
-    }
-}
-
-impl std::error::Error for AllCooledError {}
 
 impl Router {
     /// Create a new router with the given configuration.
@@ -503,9 +527,10 @@ impl Router {
         "all agents degraded (no cooldown timestamp available) — skipping task, will retry after backoff"
     );
             // Return an error similar to the cooldown case to trigger backoff in the tick loop
-            return Err(AllCooledError {
-                scope: complexity.unwrap_or("all agents").to_string(),
-            }
+            return Err(AllAgentsCooledError::new(
+                complexity.unwrap_or("all agents").to_string(),
+                None,
+            )
             .into());
         };
 
@@ -519,7 +544,7 @@ impl Router {
             );
             // Return a domain error indicating all candidates are cooled so the
             // caller can handle it (tick will skip this task and retry later).
-            return Err(AllCooledError { scope: scope_str }.into());
+            return Err(AllAgentsCooledError::new(scope_str, Some(remaining as u64)).into());
         }
 
         Ok(())
@@ -1017,8 +1042,8 @@ impl Router {
                     return Ok(result);
                 }
                 Err(e) => {
-                    if let Some(err) = e.downcast_ref::<AllCooledError>() {
-                        let scope = err.scope.as_str();
+                    if let Some(err) = e.downcast_ref::<AllAgentsCooledError>() {
+                        let scope = err.scope();
                         tracing::warn!(scope = %scope, "router cooldown gate tripped");
                         // "router pool" scope means all router LLM pool entries were pre-cooled.
                         // Pass None so wait_for_cooldown queries all agent+model cooldowns generically
@@ -1175,10 +1200,7 @@ impl Router {
             .cloned()
             .collect();
         if uncooled_agents.is_empty() {
-            return Err(AllCooledError {
-                scope: "all agents".to_string(),
-            }
-            .into());
+            return Err(AllAgentsCooledError::new("all agents".to_string(), None).into());
         }
         let llm_agents = uncooled_agents;
 
