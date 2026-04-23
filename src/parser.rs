@@ -950,6 +950,27 @@ Some output here.
     }
 
     #[test]
+    fn parse_normalizes_complete_alias_to_done() {
+        let input = r#"{"status":"complete","summary":"done","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
+    fn parse_normalizes_no_changes_needed_alias_to_done() {
+        let input = r#"{"status":"no_changes_needed","summary":"no changes","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
+    fn parse_normalizes_partial_alias_to_in_progress() {
+        let input = r#"{"status":"partial","summary":"partially done","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "in_progress");
+    }
+
+    #[test]
     fn parse_normalizes_reviewing_alias_to_in_review() {
         let input = r#"{"status":"reviewing","summary":"reviewing","accomplished":[],"remaining":[],"files":[]}"#;
         let resp = parse(input).unwrap();
