@@ -78,7 +78,7 @@ impl ExternalBackend for MockBackend {
 /// the checksum, and the engine loops forever on startup.
 #[tokio::test]
 async fn store_opens_and_migrates() {
-    let tmp = std::env::temp_dir().join(format!("orch-engine-open-{}.db", std::process::id()));
+    let tmp = temp_db("open");
     let store = TaskStore::open(&tmp).await;
     assert!(store.is_ok(), "TaskStore::open failed: {:?}", store.err());
     let _ = std::fs::remove_file(&tmp);
@@ -89,7 +89,7 @@ async fn store_opens_and_migrates() {
 /// Verify that TaskStore migrations are idempotent (open twice).
 #[tokio::test]
 async fn store_migrations_idempotent() {
-    let tmp = std::env::temp_dir().join(format!("orch-engine-test-{}.db", std::process::id()));
+    let tmp = temp_db("migrations");
 
     // First open (uses real open with max_connections(5) — production path)
     {
@@ -115,7 +115,7 @@ async fn store_migrations_idempotent() {
 /// Verify that tasks table exists and is queryable after migrations.
 #[tokio::test]
 async fn store_tasks_table_exists() {
-    let tmp = std::env::temp_dir().join(format!("orch-engine-table-{}.db", std::process::id()));
+    let tmp = temp_db("table");
     let store = TaskStore::open_single(&tmp).await.expect("open store");
 
     // Just verify the tasks table is queryable (schema is correct)
@@ -150,7 +150,7 @@ async fn mock_backend_health_check() {
 /// Verify that cooldown init works with an in-memory store.
 #[tokio::test]
 async fn cooldown_init_with_store() {
-    let tmp = std::env::temp_dir().join(format!("orch-engine-cooldown-{}.db", std::process::id()));
+    let tmp = temp_db("cooldown");
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
     orch::engine::cooldown::init_cooldown_store(store).await;
     let _ = std::fs::remove_file(&tmp);
@@ -880,7 +880,7 @@ async fn router_healthy_agent_count() {
 async fn update_status_and_fields_records_pre_update_values_in_activity() {
     use orch::store::{TaskActivity, TaskStatus};
 
-    let tmp = std::env::temp_dir().join(format!("orch-update-activity-{}.db", std::process::id()));
+    let tmp = temp_db("update-activity");
     let store = TaskStore::open_single(&tmp).await.expect("open store");
 
     let id = store
@@ -927,7 +927,7 @@ async fn update_status_and_fields_records_pre_update_values_in_activity() {
 async fn update_status_and_fields_propagates_fetch_error_on_missing_row() {
     use orch::store::TaskStatus;
 
-    let tmp = std::env::temp_dir().join(format!("orch-update-norow-{}.db", std::process::id()));
+    let tmp = temp_db("update-norow");
     let store = TaskStore::open_single(&tmp).await.expect("open store");
 
     // Row id 9999 does not exist — fetch_one will return RowNotFound, which
@@ -958,7 +958,7 @@ async fn update_status_and_fields_propagates_fetch_error_on_missing_row() {
 async fn update_status_and_fields_propagates_column_decode_error() {
     use orch::store::{TaskActivity, TaskStatus};
 
-    let tmp = std::env::temp_dir().join(format!("orch-update-decode-{}.db", std::process::id()));
+    let tmp = temp_db("update-decode");
     let store = TaskStore::open_single(&tmp).await.expect("open store");
 
     let id = store
