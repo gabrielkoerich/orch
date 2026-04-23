@@ -771,9 +771,10 @@ pub async fn send_message(
     // Parse response for summary and memory tags
     let parsed = parse_response(&result.text);
 
-    persist_memories(store, session_id, &parsed.memories).await?;
-
-    // Store assistant message with token usage
+    // Store assistant message with token usage.
+    // Must happen before persist_memories so that if the DB write fails the
+    // KV store is not left with orphaned memory keys that have no corresponding
+    // conversation history entry.
     let total_tokens =
         total_tokens_u64_to_i64_saturating(result.input_tokens, result.output_tokens);
     let input_tokens = opt_token_u64_to_i64_saturating(result.input_tokens);
@@ -805,6 +806,8 @@ pub async fn send_message(
             cost_usd,
         )
         .await?;
+
+    persist_memories(store, session_id, &parsed.memories).await?;
 
     // Release the per-session lock before eviction check.
     drop(_guard);

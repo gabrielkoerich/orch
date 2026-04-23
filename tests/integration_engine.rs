@@ -89,7 +89,7 @@ async fn store_opens_and_migrates() {
 /// Verify that TaskStore migrations are idempotent (open twice).
 #[tokio::test]
 async fn store_migrations_idempotent() {
-    let tmp = temp_db("migrations");
+    let tmp = temp_db("migration-idempotent");
 
     // First open (uses real open with max_connections(5) — production path)
     {
