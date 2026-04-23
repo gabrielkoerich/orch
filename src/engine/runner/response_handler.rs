@@ -594,11 +594,12 @@ async fn create_pr_with_log(
             // instead of spinning in the review gate indefinitely.
             //
             // Be defensive: treat any 422 from the PR API that mentions the
-            // common failure indicators as terminal. This covers "base"
-            // invalid (reported in the original bug), "head", and the
-            // "No commits between" message. It is intentionally conservative
-            // to avoid infinite re-dispatch loops when the PR cannot be
-            // created due to repository state.
+            // common failure indicators as terminal. This covers the original
+            // reported case ("base" invalid), the "head" variant, and the
+            // common "No commits between" message. Matching these textual
+            // indicators is conservative but avoids expensive infinite
+            // re-dispatch loops when the PR cannot be created due to repo
+            // state or configuration issues.
             if err_str.contains("422")
                 && (err_str.contains("No commits between")
                     || err_str.contains("head")
