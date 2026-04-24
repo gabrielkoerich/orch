@@ -1614,7 +1614,15 @@ async fn scan_comments(
         std::collections::HashSet::new()
     };
 
-    let gh = crate::github::http::GhHttp::new()?;
+    // Lazily create GhHttp — only allocate when we actually need to make GitHub
+    // API calls.  This avoids network initialization in test environments where
+    // the code path never reaches an API call.
+    let gh_cell: tokio::sync::OnceCell<crate::github::http::GhHttp> = tokio::sync::OnceCell::new();
+    let get_gh = || async {
+        gh_cell
+            .get_or_try_init(|| async { crate::github::http::GhHttp::new() })
+            .await
+    };
 
     // Pre-classify all comments up front so we can batch the is_pull_request
     // checks for CreateMentionTask entries before entering the main loop.
@@ -1648,12 +1656,18 @@ async fn scan_comments(
         })
         .collect();
 
-    let is_pr_values: Vec<bool> =
-        futures::future::join_all(pr_check_inputs.iter().map(|(_, num)| {
-            let gh = &gh;
-            async move { gh.is_pull_request(repo, num).await }
-        }))
-        .await;
+    // Only create GhHttp if we actually have PR checks to perform.
+    let is_pr_values: Vec<bool> = if pr_check_inputs.is_empty() {
+        Vec::new()
+    } else {
+        let gh = get_gh().await?;
+        futures::future::join_all(
+            pr_check_inputs
+                .iter()
+                .map(|(_, num)| async move { gh.is_pull_request(repo, num).await }),
+        )
+        .await
+    };
 
     // Build a lookup map: comment_index → is_pr.
     let is_pr_map: std::collections::HashMap<usize, bool> = pr_check_inputs
@@ -1673,9 +1687,10 @@ async fn scan_comments(
             CommentAction::ExecuteCommand { command, issue_num } => {
                 let store_opt: Option<Arc<dyn CommandStoreOps>> =
                     store.map(|s| Arc::clone(s) as Arc<dyn CommandStoreOps>);
+                let gh = get_gh().await?;
                 let _outcome = validate_and_run_command(
                     backend,
-                    &gh,
+                    gh,
                     repo,
                     &issue_num,
                     &command,
@@ -1698,12 +1713,13 @@ async fn scan_comments(
                 } else {
                     // Parent lookup failure propagates via `?` — scan_comments returns early
                     // without advancing the cursor so the mention is retried on next sync.
+                    let gh = get_gh().await?;
                     let advanced_safely = handle_slash_command(
                         backend,
                         store,
                         repo,
                         task_manager,
-                        &gh,
+                        gh,
                         comment,
                         &command,
                         &mut cursor,

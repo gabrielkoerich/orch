@@ -703,6 +703,16 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
+    /// Build a reqwest::Client that cannot make real network calls.
+    /// All external hosts resolve to 127.0.0.1:1 and connections time out in 1ms.
+    fn no_network_client() -> Client {
+        Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(1))
+            .resolve("discord.com", "127.0.0.1:1".parse().unwrap())
+            .build()
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn handle_dispatch_message_create_sends_to_channel() {
         let (tx, mut rx) = mpsc::channel(10);
@@ -716,7 +726,7 @@ mod tests {
 
         let mut session_id = None;
         let mut resume_url = None;
-        let client = Client::new();
+        let client = no_network_client();
 
         handle_dispatch(
             Some("MESSAGE_CREATE"),
@@ -754,7 +764,7 @@ mod tests {
 
         let mut session_id = None;
         let mut resume_url = None;
-        let client = Client::new();
+        let client = no_network_client();
 
         handle_dispatch(
             Some("MESSAGE_CREATE"),
@@ -784,7 +794,7 @@ mod tests {
 
         let mut session_id = None;
         let mut resume_url = None;
-        let client = Client::new();
+        let client = no_network_client();
 
         handle_dispatch(
             Some("MESSAGE_CREATE"),
@@ -817,7 +827,7 @@ mod tests {
 
         let mut session_id = None;
         let mut resume_url = None;
-        let client = Client::new();
+        let client = no_network_client();
 
         handle_dispatch(
             Some("READY"),
@@ -847,7 +857,7 @@ mod tests {
 
         let mut session_id = None;
         let mut resume_url = None;
-        let client = Client::new();
+        let client = no_network_client();
 
         handle_dispatch(
             Some("MESSAGE_CREATE"),
@@ -918,7 +928,7 @@ mod tests {
 
         let mut session_id = None;
         let mut resume_url = None;
-        let client = Client::new();
+        let client = no_network_client();
 
         handle_dispatch(
             Some("INTERACTION_CREATE"),
@@ -967,7 +977,7 @@ mod tests {
 
         let mut session_id = None;
         let mut resume_url = None;
-        let client = Client::new();
+        let client = no_network_client();
 
         handle_dispatch(
             Some("INTERACTION_CREATE"),
