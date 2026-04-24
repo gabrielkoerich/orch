@@ -168,9 +168,6 @@ pub struct EngineConfig {
     pub in_review_no_session_stuck_timeout: u64,
     /// Auto-create follow-up tasks when PR reviews request changes
     pub auto_create_followup_on_changes: bool,
-    /// Auto-close task (mark Done) when all PR reviews are approved.
-    /// Note: this does NOT merge the PR itself -- only updates the task status.
-    pub auto_close_task_on_approval: bool,
     /// Graceful shutdown timeout — how long to wait for running agents before exiting.
     pub graceful_shutdown_timeout: std::time::Duration,
     /// Grace period before silence detection kicks in (seconds).
@@ -191,7 +188,6 @@ impl Default for EngineConfig {
             no_session_stuck_timeout: 600,
             in_review_no_session_stuck_timeout: 1800,
             auto_create_followup_on_changes: true,
-            auto_close_task_on_approval: false,
             graceful_shutdown_timeout: std::time::Duration::from_secs(600),
             silence_grace_period: 300,
             silence_cooldown: 3600,
@@ -267,14 +263,6 @@ impl EngineConfig {
 
         if let Ok(val) = crate::config::get("workflow.auto_create_followup_on_changes") {
             config.auto_create_followup_on_changes = !val.eq_ignore_ascii_case("false");
-        }
-
-        // Check auto_close_task_on_approval first; fall back to workflow.auto_close
-        // (common config uses "auto_close: true" which should also enable approval handling)
-        if let Ok(val) = crate::config::get("workflow.auto_close_task_on_approval") {
-            config.auto_close_task_on_approval = val.eq_ignore_ascii_case("true");
-        } else if let Ok(val) = crate::config::get("workflow.auto_close") {
-            config.auto_close_task_on_approval = val.eq_ignore_ascii_case("true");
         }
 
         if let Ok(val) = crate::config::get("engine.graceful_shutdown_timeout") {

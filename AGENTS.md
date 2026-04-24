@@ -202,16 +202,13 @@ Orch re-routes tasks when PR reviews request changes, closing the feedback loop 
 workflow:
   # Max review cycles before escalating to human (default: 2)
   max_review_cycles: 2
-  # Auto-close task (mark Done) when all PR reviews are approved (default: false).
-  # Note: this does NOT merge the PR -- only updates the task status.
-  auto_close_task_on_approval: false
 ```
 
 ### Status Updates
 
 - Task is re-routed (`Routed`) when review requests changes — same branch/PR is reused
 - Task is blocked when max review cycles exceeded — requires human intervention
-- When a review is approved and `auto_close_task_on_approval` is enabled, the task is marked as `done`
+- Task is marked `done` only when the PR is actually merged (detected by `review_poll`)
 
 ## Complexity-based model routing
 

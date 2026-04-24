@@ -230,7 +230,7 @@ async fn reset_batch_fail_counter(
 pub(crate) async fn review_open_prs(
     backend: &Arc<dyn ExternalBackend>,
     repo: &str,
-    config: &EngineConfig,
+    _config: &EngineConfig,
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
     dispatching: &Arc<DashMap<String, String>>,
@@ -243,8 +243,6 @@ pub(crate) async fn review_open_prs(
         tracing::debug!(count = 0, "checking in_review tasks for PR reviews");
         return Ok(());
     }
-
-    let auto_close_task = config.auto_close_task_on_approval;
 
     tracing::info!(
         count = in_review_tasks.len(),
@@ -634,13 +632,12 @@ pub(crate) async fn review_open_prs(
         let comment_approved = automated_review.as_deref() == Some("approve");
         let comment_changes_requested = automated_review.as_deref() == Some("changes_requested");
 
-        // Handle fully-approved PRs (auto-close enabled).
+        // Handle fully-approved PRs: mark done only when actually merged,
+        // otherwise attempt auto-merge. Never mark done on approval alone.
         if (all_approved || comment_approved)
-            && auto_close_task
             && !comment_changes_requested
             && !any_changes_requested
         {
-            // Use batch data instead of a separate is_pr_merged REST call.
             let already_merged = batch_data.merged;
 
             if already_merged {
@@ -656,7 +653,6 @@ pub(crate) async fn review_open_prs(
                     tracing::warn!(task_id, err = %e, "failed to update task status to done");
                 }
             } else {
-                // Use batch data instead of a separate get_pr REST call.
                 let is_conflicting = batch_data.mergeable == Some(false);
 
                 if is_conflicting {
@@ -738,58 +734,6 @@ pub(crate) async fn review_open_prs(
                         }
                     });
                 }
-            }
-            continue;
-        }
-
-        // If the PR is fully approved but auto-close is disabled, the task stays
-        // in_review waiting for a human to merge the PR.  We must NOT mark it Done
-        // here — the PR has not been merged, so the work is not complete.
-        // Once the human merges the PR, `already_merged` will be true on the next
-        // poll tick and the task will transition to Done correctly.
-        if (all_approved || comment_approved)
-            && !comment_changes_requested
-            && !any_changes_requested
-        {
-            let already_merged = batch_data.merged;
-
-            if already_merged {
-                tracing::info!(task_id, branch = %task_info.branch, "PR already merged, marking done (auto_close disabled)");
-                if let Err(e) = task_manager
-                    .update_task_status(&task.id, Status::Done)
-                    .await
-                {
-                    tracing::warn!(task_id, err = %e, "failed to update status to done");
-                }
-            } else {
-                let is_conflicting = batch_data.mergeable == Some(false);
-
-                if is_conflicting {
-                    let retries = stored_task.merge_conflict_retries.max(0) as u64;
-                    match handle_merge_conflict(
-                        &task.id,
-                        pr_number,
-                        retries,
-                        task_manager,
-                        store,
-                        task_info.store_id,
-                    )
-                    .await
-                    {
-                        ConflictAction::BlockForHuman => continue,
-                        ConflictAction::RerouteToAgent => {}
-                    }
-                }
-
-                // PR approved but not yet merged and auto_close is disabled —
-                // leave task in in_review so a human can merge it manually.
-                // Do NOT mark Done: the PR merge is the actual completion signal.
-                tracing::info!(
-                    task_id,
-                    pr_number,
-                    comment_approved,
-                    "PR approved (auto_close disabled) — leaving task in_review until PR is merged"
-                );
             }
             continue;
         }

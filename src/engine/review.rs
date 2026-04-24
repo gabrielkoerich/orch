@@ -1328,61 +1328,41 @@ async fn apply_review_decision(
 
     match &parsed.decision {
         ReviewDecision::Approve => {
-            let auto_merge = crate::config::get("workflow.auto_close_task_on_approval")
-                .or_else(|_| crate::config::get("workflow.auto_close"))
-                .or_else(|_| crate::config::get("workflow.auto_merge"))
-                .map(|value| value.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-
-            if auto_merge {
-                if let Err(e) = auto_merge_pr(
-                    task,
-                    &ctx.branch_name,
-                    backend,
-                    repo,
-                    &ctx.review_agent,
-                    ctx.review_model_str(),
-                    task_manager,
-                    store,
-                )
-                .await
-                {
-                    let error_msg = e.to_string();
-                    if error_msg.contains("not yet computed") {
-                        tracing::warn!(
-                            task_id = task.id.0,
-                            pr_number = ctx.pr_number,
-                            branch = %ctx.branch_name,
-                            error = %e,
-                            "auto-merge deferred — PR mergeability not yet computed"
-                        );
-                    } else {
-                        tracing::error!(
-                            task_id = task.id.0,
-                            pr_number = ctx.pr_number,
-                            branch = %ctx.branch_name,
-                            error = %e,
-                            "auto-merge failed"
-                        );
-                    }
-                    return Ok(ReviewDecision::Failed(format!("merge failed: {e}")));
-                }
-            } else {
-                tracing::info!(
-                    task_id = task.id.0,
-                    pr_number = ctx.pr_number,
-                    "review approved, PR left open for human merge — marking task done"
-                );
-                if let Err(e) = task_manager
-                    .update_task_status(&task.id, Status::Done)
-                    .await
-                {
+            // Always attempt auto-merge on approval. Tasks are only marked
+            // Done when the PR is actually merged (detected by review_poll).
+            // Never mark Done on approval alone — that closes the issue
+            // before the code lands.
+            if let Err(e) = auto_merge_pr(
+                task,
+                &ctx.branch_name,
+                backend,
+                repo,
+                &ctx.review_agent,
+                ctx.review_model_str(),
+                task_manager,
+                store,
+            )
+            .await
+            {
+                let error_msg = e.to_string();
+                if error_msg.contains("not yet computed") {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        pr_number = ctx.pr_number,
+                        branch = %ctx.branch_name,
+                        error = %e,
+                        "auto-merge deferred — PR mergeability not yet computed"
+                    );
+                } else {
                     tracing::error!(
                         task_id = task.id.0,
-                        err = %e,
-                        "update_task_status(Done) failed — task may be stuck in InReview"
+                        pr_number = ctx.pr_number,
+                        branch = %ctx.branch_name,
+                        error = %e,
+                        "auto-merge failed"
                     );
                 }
+                return Ok(ReviewDecision::Failed(format!("merge failed: {e}")));
             }
             Ok(ReviewDecision::Approve)
         }

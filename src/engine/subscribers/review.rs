@@ -367,20 +367,14 @@ pub fn spawn(
                                     tracing::warn!(task_id = %tid, err = %e, "failed to write needs_review_refires to store");
                                 }
 
-                                // When auto_close_task_on_approval is disabled the PR
-                                // merge is the actual completion signal — the review
-                                // agent approval only means the code looks good.  Marking
-                                // Done here (before the merge) causes tasks to appear
-                                // complete when no PR was ever merged (#2705).
-                                //
-                                // Leave the task in InReview.  The review_open_prs polling
-                                // loop detects `batch_data.merged == true` on the next tick
-                                // and transitions the task to Done correctly.  The review
-                                // agent will NOT be re-dispatched because the task never
-                                // returns to NeedsReview.
+                                // Approval only means the code looks good — the PR
+                                // merge is the actual completion signal.  Leave the
+                                // task in InReview.  The review_open_prs polling loop
+                                // detects `batch_data.merged == true` on the next tick
+                                // and transitions the task to Done correctly.
                                 tracing::info!(
                                     task_id = tid,
-                                    "approval received (auto_close disabled) — leaving task in_review until PR is merged by a human"
+                                    "approval received — leaving task in_review until PR is merged"
                                 );
                                 ReviewOutcome::Ok
                             }
