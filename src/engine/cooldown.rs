@@ -333,10 +333,21 @@ pub async fn record_agent_success(agent_name: &str, model: &str) {
 /// If `error_message` contains "try again at {date}", that vendor date is used
 /// instead of the computed backoff (vendor dates are always authoritative).
 pub async fn record_agent_failure_with_message(agent_name: &str, error_message: &str) {
-    // Vendor-specified retry date takes priority over backoff.
+    // Vendor-specified retry date takes priority over backoff — but only
+    // if it is in the present or future. If the parsed timestamp is in the
+    // past (stale vendor message), fall through to the exponential backoff
+    // path instead of returning early and bypassing backoff entirely.
     if let Some(cooldown_until) = parse_retry_at(error_message) {
-        set_cooldown_async(agent_name, cooldown_until, "agent_error").await;
-        return;
+        let now = chrono::Utc::now().timestamp();
+        if cooldown_until > now {
+            set_cooldown_async(agent_name, cooldown_until, "agent_error").await;
+            return;
+        }
+        tracing::debug!(
+            agent = agent_name,
+            cooldown_until,
+            "vendor retry_at is in the past — using backoff instead"
+        );
     }
 
     let store_opt = cooldown_store().lock().await.clone();
@@ -2027,6 +2038,56 @@ mod tests {
             remaining_2 >= BACKOFF_BASE_SECS * 3 - 5,
             "second failure should be ~15 min, got {remaining_2}s"
         );
+    }
+
+    #[tokio::test]
+    async fn vendor_past_retry_falls_back_to_backoff() {
+        // If a vendor-provided "try again at" date is in the past, the
+        // code must NOT early-return and must instead apply the normal
+        // exponential backoff (increment failure count and set a future cooldown).
+        let store = test_store().await;
+        *cooldown_store().lock().await = Some(store.clone());
+
+        let agent = "test_vendor_past_retry";
+
+        // Ensure no pre-existing cooldown
+        {
+            let mut map = cooldowns().lock().unwrap();
+            map.remove(agent);
+        }
+
+        // A clearly past date that parse_retry_at can parse
+        let past_msg = "You've hit the limit; try again at Jan 01, 2000 01:00 AM.";
+
+        record_agent_failure_with_message(agent, past_msg).await;
+
+        // After handling a past vendor timestamp, we should have applied
+        // exponential backoff (base = BACKOFF_BASE_SECS) and a persisted
+        // failure count of 1.
+        assert!(
+            is_agent_in_cooldown(agent),
+            "agent should be in cooldown after failure"
+        );
+
+        let remaining = {
+            let map = cooldowns().lock().unwrap();
+            let entry = map.get(agent).expect("cooldown entry should exist");
+            entry.cooldown_until - chrono::Utc::now().timestamp()
+        };
+
+        assert!(
+            remaining >= BACKOFF_BASE_SECS - 5,
+            "expected backoff of ~{BACKOFF_BASE_SECS}s when vendor timestamp is past, got {remaining}s"
+        );
+
+        // Verify the failure count was incremented and persisted to KV
+        let kv_key = format!("{FAILURE_COUNT_PREFIX}{agent}");
+        let stored = store
+            .kv_get(&kv_key)
+            .await
+            .unwrap()
+            .expect("failure count should be stored");
+        assert_eq!(stored, "1");
     }
 
     #[tokio::test]
