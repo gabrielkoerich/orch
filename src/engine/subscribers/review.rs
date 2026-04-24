@@ -22,6 +22,8 @@ enum ReviewOutcome {
     /// PR was approved but mergeability not yet computed — retry the merge
     /// without resetting to NeedsReview (avoids spawning a redundant review agent).
     RetryMerge,
+    /// Re-route to the task agent (e.g. merge conflicts that need the agent to fix).
+    Reroute,
     Block(String),
     Ok,
 }
@@ -545,6 +547,26 @@ pub fn spawn(
                                     tracing::error!(task_id = %tid, err = %e, "update_task_status(NeedsReview) failed — task may be stuck in InReview");
                                 }
                             }
+                            ReviewOutcome::Reroute => {
+                                // Merge conflict or similar — route back to the
+                                // task agent so it can fix the issue.
+                                let stale_session =
+                                    tmux_c.session_name(&repo_s, &format!("{}-review", tid));
+                                tmux_c.kill_session(&stale_session).await.ok();
+                                tracing::info!(
+                                    task_id = tid,
+                                    "re-routing to task agent to resolve merge conflict"
+                                );
+                                if let Err(e) = task_manager_c
+                                    .update_task_status(
+                                        &ExternalId(tid.clone()),
+                                        Status::Routed,
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(task_id = %tid, err = %e, "update_task_status(Routed) failed");
+                                }
+                            }
                             ReviewOutcome::RetryMerge => {
                                 // PR was already approved; GitHub just hasn't computed
                                 // mergeability yet.  Keep the task in InReview and wait
@@ -681,8 +703,10 @@ async fn classify_review_failure(
         return ReviewOutcome::RetryMerge;
     }
 
-    // Merge conflicts are infrastructure failures, not review agent failures.
-    // The merge_conflict_retries counter handles these separately.
+    // Merge conflicts should be handled by handle_merge_conflict() in
+    // auto_merge.rs (which routes to the task agent). If a conflict error
+    // leaks here, route to the task agent instead of resetting to NeedsReview
+    // (which would re-spawn the review agent in a loop).
     if lower_reason.contains("merge conflict")
         || lower_reason.contains("not mergeable")
         || lower_reason.contains("merge failed")
@@ -690,9 +714,9 @@ async fn classify_review_failure(
         tracing::warn!(
             task_id,
             reason,
-            "{context} hit merge conflict — deferring to merge_conflict_retries handler"
+            "{context} hit merge conflict — routing to task agent to resolve"
         );
-        return ReviewOutcome::Reset;
+        return ReviewOutcome::Reroute;
     }
 
     if lower_reason.contains("rate limit") || lower_reason.contains("auth error") {

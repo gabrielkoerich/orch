@@ -377,56 +377,86 @@ async fn handle_merge_conflict(
         }
     }
 
-    // Rebase failed or no worktree or push failure — block
-    // Persist block_reason BEFORE transitioning to Blocked to avoid
-    // a race where auto_unblock sees a blocked task without a reason
-    // and immediately unblocks it.
-    let comment = if push_failed {
-        format!(
+    // Push failure after successful rebase is an infrastructure issue — block.
+    if push_failed {
+        let comment = format!(
             "Auto-merge failed (rebase succeeded but force-push failed): {}",
             push_err_msg
-        )
-    } else {
-        format!(
-            "Auto-merge failed (merge conflict, rebase unsuccessful): {}",
-            merge_error.unwrap_or("merge conflict")
-        )
-    };
-    let block_reason = if push_failed {
-        format!(
+        );
+        let block_reason = format!(
             "auto-merge force-push failed after rebase: {}",
             push_err_msg
-        )
-    } else {
-        format!(
-            "auto-merge rebase failed after merge conflict: {}",
-            merge_error.unwrap_or("merge conflict")
-        )
-    };
-    let fields = [("block_reason", serde_json::json!(block_reason))];
-    if let Err(e) = task_manager
-        .update_task_status_and_result(&task.id, Status::Blocked, &fields)
-        .await
-    {
-        tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason and set Blocked");
+        );
+        let fields = [("block_reason", serde_json::json!(block_reason))];
+        if let Err(e) = task_manager
+            .update_task_status_and_result(&task.id, Status::Blocked, &fields)
+            .await
+        {
+            tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason and set Blocked");
+            return Ok(());
+        }
+        let footer =
+            crate::engine::attribution_footer("Commented", review_agent, Some(review_model));
+        if let Err(e) = gh
+            .add_comment(
+                repo,
+                &pr_number.to_string(),
+                &format!("{}{}", comment, footer),
+            )
+            .await
+        {
+            tracing::warn!(
+                task_id = task.id.0,
+                pr_number,
+                err = %e,
+                "handle_merge_conflict: failed to post push failure comment on PR"
+            );
+        }
         return Ok(());
     }
-    let footer = crate::engine::attribution_footer("Commented", review_agent, Some(review_model));
-    if let Err(e) = gh
-        .add_comment(
-            repo,
-            &pr_number.to_string(),
-            &format!("{}{}", comment, footer),
-        )
-        .await
+
+    // No worktree, worktree missing, or fetch/IO error — re-route to the task
+    // agent so it can resolve the conflict in a fresh worktree.
+    tracing::info!(
+        task_id = task.id.0,
+        pr_number,
+        "merge conflict could not be auto-rebased — re-routing to task agent"
+    );
+    if let Err(e) = store_increment(
+        &Some(Arc::clone(store)),
+        repo,
+        &task.id.0,
+        "merge_conflict_retries",
+    )
+    .await
     {
-        tracing::warn!(
-            task_id = task.id.0,
-            pr_number,
-            err = %e,
-            "handle_merge_conflict: failed to post failure comment on PR"
-        );
+        tracing::warn!(task_id = task.id.0, err = %e, "failed to increment merge_conflict_retries — skipping dispatch to avoid bypassing retry limit");
+        return Ok(());
     }
+    if let Err(e) = store_set_result(
+        &Some(Arc::clone(store)),
+        repo,
+        &task.id.0,
+        &[
+            (
+                "last_error",
+                serde_json::json!(
+                    "merge conflict detected but auto-rebase was not possible (no worktree or IO error); agent must rebase and resolve conflicts"
+                ),
+            ),
+            (
+                "route_reason",
+                serde_json::json!("re-dispatch after merge conflict — auto-rebase unavailable"),
+            ),
+        ],
+    )
+    .await
+    {
+        tracing::warn!(task_id = task.id.0, err = %e, "store write failed");
+    }
+    task_manager
+        .update_task_status(&task.id, Status::Routed)
+        .await?;
 
     Ok(())
 }
