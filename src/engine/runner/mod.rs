@@ -102,17 +102,12 @@ fn classify_run_outcome(
         Ok(_)
             if matches!(
                 status,
-                "done"
-                    | "completed"
-                    | "in_progress"
-                    | "in_review"
-                    | "blocked"
-                    | "needs_review"
-                    | "routed"
+                "done" | "completed" | "in_progress" | "in_review" | "needs_review" | "routed"
             ) =>
         {
             "success"
         }
+        Ok(_) if status == "blocked" => "blocked",
         Ok(_) => "failed",
     }
 }
@@ -373,13 +368,19 @@ impl TaskRunner {
             };
 
             if error.is_empty() {
-                if matches!(
+                if input.status == "blocked" {
+                    match input.parse_result {
+                        Ok(parsed) if !parsed.response.summary.is_empty() => {
+                            parsed.response.summary.clone()
+                        }
+                        _ => "task blocked without explicit error".to_string(),
+                    }
+                } else if matches!(
                     input.status,
                     "done"
                         | "completed"
                         | "in_progress"
                         | "in_review"
-                        | "blocked"
                         | "needs_review"
                         | "routed"
                         | "new"
@@ -1914,6 +1915,15 @@ mod tests {
     }
 
     #[test]
+    fn classify_run_outcome_blocked_is_blocked() {
+        let parse_result = ok_parse_result("blocked");
+        assert_eq!(
+            classify_run_outcome("blocked", &parse_result, false, false),
+            "blocked"
+        );
+    }
+
+    #[test]
     fn classify_run_outcome_non_canonical_is_failed() {
         // Non-canonical statuses should be classified as "failed" in the audit.
         // The explicit error message is provided by build_run_audit.
@@ -2022,7 +2032,7 @@ mod tests {
     async fn build_run_audit_canonical_non_success_status_no_error_message() {
         // Canonical non-success statuses (e.g. "routed") should not produce
         // an error message — they're expected outcomes, not failures.
-        for status in &["routed", "blocked"] {
+        for status in &["routed"] {
             let runner = TaskRunner::new("owner/repo".to_string());
             let parse_result = ok_parse_result(status);
             let started_at = Utc::now();
@@ -2047,6 +2057,46 @@ mod tests {
                 "status={status}: no error for canonical status"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn build_run_audit_blocked_uses_summary_when_error_missing() {
+        let runner = TaskRunner::new("owner/repo".to_string());
+        let parse_result = Ok(agents::ParsedResponse {
+            response: AgentResponse {
+                status: "blocked".to_string(),
+                summary: "Could not proceed due to missing credentials".to_string(),
+                accomplished: vec![],
+                remaining: vec![],
+                files: vec![],
+                error: None,
+                input_tokens: None,
+                output_tokens: None,
+                learnings: vec![],
+                delegations: vec![],
+            },
+            input_tokens: None,
+            output_tokens: None,
+            duration_ms: None,
+        });
+        let started_at = Utc::now();
+        let audit = runner
+            .build_run_audit(RunAuditInput {
+                task_id: "1",
+                status: "blocked",
+                parse_result: &parse_result,
+                raw_stdout: "",
+                raw_stderr: "",
+                started_at: &started_at,
+                error_override: None,
+                elapsed_secs: Some(1),
+                push_failed: false,
+                budget_exceeded: false,
+            })
+            .await;
+
+        assert_eq!(audit.outcome, "blocked");
+        assert_eq!(audit.error, "Could not proceed due to missing credentials");
     }
 
     // ── resolve_project_dir ──────────────────────────────────────────────────
