@@ -991,6 +991,29 @@ async fn detect_no_code_reroutes(
 
 // ── Post-decision side-effect helpers ─────────────────────────────────────────
 
+/// Build a human-readable reason string from a "blocked" agent response.
+///
+/// Priority: explicit `error` field → `summary` → fallback.
+/// Appends `remaining` items if present so operators know what was left to do.
+fn agent_blocked_reason(resp: &crate::parser::AgentResponse) -> String {
+    let summary_opt = if !resp.summary.is_empty() {
+        Some(resp.summary.as_str())
+    } else {
+        None
+    };
+    let base = resp
+        .error
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or(summary_opt)
+        .unwrap_or("agent returned blocked status without a reason");
+    if resp.remaining.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}. Remaining: {}", resp.remaining.join("; "))
+    }
+}
+
 /// Apply tracing and store writes that depend on the final status decision.
 #[allow(clippy::too_many_arguments)]
 async fn apply_post_decision_effects(
@@ -1468,6 +1491,16 @@ pub async fn handle_success(
     )
     .await;
 
+    // When the agent explicitly returned "blocked", persist its explanation into
+    // last_error so `orch task get` surfaces the reason without requiring manual
+    // inspection of task_runs.parsed_response.  The apply_post_decision_effects
+    // branches above only fire on push/no-code scenarios; a raw agent-blocked
+    // response falls through all of them and would leave last_error empty.
+    if resp.status == "blocked" && final_status == "blocked" {
+        let reason = agent_blocked_reason(&resp);
+        ctx.set(&[("last_error", serde_json::json!(reason))]).await;
+    }
+
     ctx.set(&[("summary", serde_json::json!(resp.summary))])
         .await;
 
@@ -1878,5 +1911,64 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(status, "done");
+    }
+
+    // ── agent_blocked_reason — regression tests for issue #3012 ──────────────
+
+    /// Agent explicitly returned blocked with an error field — use error as reason.
+    #[test]
+    fn agent_blocked_reason_prefers_error_field() {
+        let resp = crate::parser::AgentResponse {
+            status: "blocked".to_string(),
+            error: Some("CDP endpoint not reachable".to_string()),
+            summary: "Could not complete research".to_string(),
+            remaining: vec!["Run x-twitter-brave with reachable endpoint".to_string()],
+            ..Default::default()
+        };
+        let reason = agent_blocked_reason(&resp);
+        assert!(
+            reason.contains("CDP endpoint not reachable"),
+            "reason: {reason}"
+        );
+        assert!(reason.contains("Remaining:"), "reason: {reason}");
+        assert!(reason.contains("x-twitter-brave"), "reason: {reason}");
+    }
+
+    /// No error field — falls back to summary.
+    #[test]
+    fn agent_blocked_reason_falls_back_to_summary() {
+        let resp = crate::parser::AgentResponse {
+            status: "blocked".to_string(),
+            error: None,
+            summary: "Could not access required data sources in sandboxed environment".to_string(),
+            remaining: vec![],
+            ..Default::default()
+        };
+        let reason = agent_blocked_reason(&resp);
+        assert_eq!(
+            reason,
+            "Could not access required data sources in sandboxed environment"
+        );
+    }
+
+    /// No error or summary — returns generic fallback.
+    #[test]
+    fn agent_blocked_reason_generic_fallback() {
+        let resp = crate::parser::AgentResponse {
+            status: "blocked".to_string(),
+            ..Default::default()
+        };
+        let reason = agent_blocked_reason(&resp);
+        assert_eq!(reason, "agent returned blocked status without a reason");
+    }
+
+    /// Agent-returned "blocked" status passes through classify_final_status unchanged.
+    #[test]
+    fn classify_agent_blocked_passes_through() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "blocked",
+            ..Default::default()
+        });
+        assert_eq!(status, "blocked");
     }
 }
