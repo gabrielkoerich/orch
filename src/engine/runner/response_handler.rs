@@ -1926,7 +1926,10 @@ mod tests {
             ..Default::default()
         };
         let reason = agent_blocked_reason(&resp);
-        assert!(reason.contains("CDP endpoint not reachable"), "reason: {reason}");
+        assert!(
+            reason.contains("CDP endpoint not reachable"),
+            "reason: {reason}"
+        );
         assert!(reason.contains("Remaining:"), "reason: {reason}");
         assert!(reason.contains("x-twitter-brave"), "reason: {reason}");
     }
@@ -1942,7 +1945,10 @@ mod tests {
             ..Default::default()
         };
         let reason = agent_blocked_reason(&resp);
-        assert_eq!(reason, "Could not access required data sources in sandboxed environment");
+        assert_eq!(
+            reason,
+            "Could not access required data sources in sandboxed environment"
+        );
     }
 
     /// No error or summary — returns generic fallback.
