@@ -243,9 +243,23 @@ impl AgentRunner for CodexRunner {
             format!("--ask-for-approval suggest --sandbox {sandbox}")
         };
 
+        // Extra writable dirs (e.g. the git common dir when running inside a
+        // worktree whose .git metadata lives outside the sandbox root).
+        let add_dir_flags: String = permissions
+            .extra_writable_dirs
+            .iter()
+            .map(|p| {
+                format!(
+                    "\\\n  --add-dir {}",
+                    super::shell_single_quote(&p.to_string_lossy())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
         format!(
             r#"cat "{sys_file}" "{msg_file}" | {timeout_cmd} codex {model_flag} \
-  {permission_flags} \
+  {permission_flags} {add_dir_flags}\
   -c 'sandbox_workspace_write.network_access=true' \
   -c 'shell_environment_policy.inherit=all' \
   exec --json -"#,
@@ -254,6 +268,7 @@ impl AgentRunner for CodexRunner {
             timeout_cmd = timeout_cmd,
             model_flag = model_flag,
             permission_flags = permission_flags,
+            add_dir_flags = add_dir_flags,
         )
     }
 
@@ -504,11 +519,58 @@ mod tests {
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
             deny_read_only: false,
+            extra_writable_dirs: vec![],
         };
         let cmd = runner().build_command(None, "", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
         assert!(
             cmd.contains("--dangerously-bypass-approvals-and-sandbox"),
             "full access codex should use dangerously-bypass, got: {cmd}"
+        );
+    }
+
+    #[test]
+    fn build_command_codex_extra_writable_dirs() {
+        // When the git common dir is outside the worktree sandbox root, the
+        // runner adds it to extra_writable_dirs and build_command must emit
+        // --add-dir flags so Codex can create index.lock there.
+        let perms = PermissionRules {
+            autonomous: true,
+            sandbox: SandboxLevel::WorkspaceWrite,
+            disallowed_tools: vec![],
+            allowed_tools: vec![],
+            allowed_edit_paths: vec![],
+            deny_read_only: false,
+            extra_writable_dirs: vec![std::path::PathBuf::from(
+                "/Users/gb/Projects/bean/.git/worktrees/task-123",
+            )],
+        };
+        let cmd = runner().build_command(None, "", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
+        assert!(
+            cmd.contains("--add-dir"),
+            "should include --add-dir flag, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("/Users/gb/Projects/bean/.git/worktrees/task-123"),
+            "should include the extra dir path, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("--full-auto"),
+            "should still include --full-auto, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("exec --json -"),
+            "should still include exec --json -, got: {cmd}"
+        );
+    }
+
+    #[test]
+    fn build_command_codex_no_extra_writable_dirs() {
+        // With no extra_writable_dirs, --add-dir must not appear in the command.
+        let perms = PermissionRules::default();
+        let cmd = runner().build_command(None, "", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
+        assert!(
+            !cmd.contains("--add-dir"),
+            "should not include --add-dir when no extra dirs, got: {cmd}"
         );
     }
 

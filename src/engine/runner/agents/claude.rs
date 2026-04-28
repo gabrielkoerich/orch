@@ -925,6 +925,7 @@ mod tests {
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
             deny_read_only: false,
+            extra_writable_dirs: vec![],
         };
         let cmd = r.build_command(
             Some("opus"),
@@ -950,6 +951,7 @@ mod tests {
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
             deny_read_only: false,
+            extra_writable_dirs: vec![],
         };
         let cmd = r.build_command(None, "", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
         assert!(cmd.contains("--permission-mode acceptEdits"));
@@ -970,6 +972,7 @@ mod tests {
             ],
             allowed_edit_paths: vec![std::path::PathBuf::from("/home/user/worktree")],
             deny_read_only: false,
+            extra_writable_dirs: vec![],
         };
         let cmd = r.build_command(None, "", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
 
@@ -1140,6 +1143,7 @@ mod tests {
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
             deny_read_only: false,
+            extra_writable_dirs: vec![],
         };
         let cmd = r.build_command(
             Some("sonnet"),
@@ -1170,6 +1174,7 @@ mod tests {
             ],
             allowed_edit_paths: vec![],
             deny_read_only: false,
+            extra_writable_dirs: vec![],
         };
         let cmd = r.build_command(None, "", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
 
@@ -1209,6 +1214,7 @@ mod tests {
             allowed_tools: vec![], // empty = use disallowed_tools
             allowed_edit_paths: vec![],
             deny_read_only: false,
+            extra_writable_dirs: vec![],
         };
         let cmd = r.build_command(None, "", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
 

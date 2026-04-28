@@ -43,6 +43,11 @@ pub struct PermissionRules {
     /// Agents translate this into their native permission model.
     #[allow(dead_code)]
     pub deny_read_only: bool,
+    /// Additional directories that must be writable (e.g. the git common dir
+    /// when running inside a worktree whose `.git` metadata lives outside the
+    /// sandbox root). Codex translates these into `--add-dir` flags; other
+    /// agents ignore the field.
+    pub extra_writable_dirs: Vec<PathBuf>,
 }
 
 /// Sandbox level — how much filesystem access the agent gets.
@@ -69,6 +74,7 @@ impl Default for PermissionRules {
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
             deny_read_only: false,
+            extra_writable_dirs: vec![],
         }
     }
 }
@@ -138,6 +144,7 @@ impl PermissionRules {
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
             deny_read_only: true,
+            extra_writable_dirs: vec![],
         }
     }
 }
@@ -2323,6 +2330,7 @@ world"}"#;
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
             deny_read_only: false,
+            extra_writable_dirs: vec![],
         };
         let sys = "/tmp/sys.md";
         let msg = "/tmp/msg.md";
@@ -2354,6 +2362,7 @@ world"}"#;
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
             deny_read_only: false,
+            extra_writable_dirs: vec![],
         };
         let sys = "/tmp/sys.md";
         let msg = "/tmp/msg.md";
@@ -2385,6 +2394,7 @@ world"}"#;
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
             deny_read_only: false,
+            extra_writable_dirs: vec![],
         };
         let codex = get_runner("codex");
         let cmd = codex.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
@@ -2409,6 +2419,7 @@ world"}"#;
             ],
             allowed_edit_paths: vec![PathBuf::from("/home/user/worktree")],
             deny_read_only: false,
+            extra_writable_dirs: vec![],
         };
         let claude = get_runner("claude");
         let cmd = claude.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
@@ -2436,6 +2447,7 @@ world"}"#;
             allowed_tools: vec![],
             allowed_edit_paths: vec![PathBuf::from("/home/user/project")],
             deny_read_only: false,
+            extra_writable_dirs: vec![],
         };
         let codex = get_runner("codex");
         let cmd = codex.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
@@ -2455,6 +2467,7 @@ world"}"#;
             allowed_tools: vec![],
             allowed_edit_paths: vec![PathBuf::from("/home/user/project")],
             deny_read_only: false,
+            extra_writable_dirs: vec![],
         };
         let opencode = get_runner("opencode");
         let cmd = opencode.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
@@ -2478,6 +2491,7 @@ world"}"#;
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
             deny_read_only: false,
+            extra_writable_dirs: vec![],
         };
         let claude = get_runner("claude");
         let cmd = claude.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
@@ -2496,6 +2510,7 @@ world"}"#;
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
             deny_read_only: false,
+            extra_writable_dirs: vec![],
         };
         let codex = get_runner("codex");
         let cmd = codex.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
@@ -2515,6 +2530,7 @@ world"}"#;
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
             deny_read_only: false,
+            extra_writable_dirs: vec![],
         };
         let claude = get_runner("claude");
         let cmd = claude.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
@@ -2534,6 +2550,7 @@ world"}"#;
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
             deny_read_only: false,
+            extra_writable_dirs: vec![],
         };
         let sys = "/tmp/sys.md";
         let msg = "/tmp/msg.md";
@@ -2562,6 +2579,7 @@ world"}"#;
             allowed_tools: vec!["Edit".to_string(), "Bash".to_string(), "git".to_string()],
             allowed_edit_paths: vec![],
             deny_read_only: false,
+            extra_writable_dirs: vec![],
         };
 
         for agent in &["kimi", "minimax"] {
@@ -2596,6 +2614,7 @@ world"}"#;
             ],
             allowed_edit_paths: vec![],
             deny_read_only: false,
+            extra_writable_dirs: vec![],
         };
 
         let claude = get_runner("claude");
@@ -2620,6 +2639,7 @@ world"}"#;
             allowed_tools: vec!["Edit".to_string(), "git".to_string()],
             allowed_edit_paths: vec![],
             deny_read_only: false,
+            extra_writable_dirs: vec![],
         };
 
         let codex = get_runner("codex");
