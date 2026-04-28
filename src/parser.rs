@@ -157,9 +157,13 @@ fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
         // Some agents return `complete` or `no_changes_needed` to indicate
         // a successful run with no further edits required — treat them as
         // `done` so the run is classified as successful.
-        "done" | "completed" | "complete" | "ok" | "success" | "no_changes_needed" => {
-            "done".to_string()
-        }
+        "done"
+        | "completed"
+        | "complete"
+        | "ok"
+        | "success"
+        | "no_changes_needed"
+        | "no_trades_no_positions" => "done".to_string(),
         // Canonical progress statuses.
         // `partial` is used by some models to indicate partial progress —
         // treat it as in_progress so the task remains open for follow-up.
@@ -1079,6 +1083,7 @@ Some output here.
             ("completed", "done"),
             ("complete", "done"),
             ("no_changes_needed", "done"),
+            ("no_trades_no_positions", "done"),
             ("running", "in_progress"),
             ("partial", "in_progress"),
             ("reviewing", "in_review"),
