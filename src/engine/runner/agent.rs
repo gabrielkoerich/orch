@@ -16,6 +16,37 @@ const ALLOWED_TOOLS_TEMPLATE: &str = include_str!("../../../prompts/allowed_tool
 const REVIEW_PROMPT_TEMPLATE: &str = include_str!("../../../prompts/review_task.md");
 const REVIEW_SYSTEM_TEMPLATE: &str = include_str!("../../../prompts/review_system.md");
 
+/// Run `git rev-parse --git-common-dir` from `work_dir` and canonicalize the
+/// result. Returns `Ok(None)` when git is not available or the command fails.
+async fn resolve_git_common_dir(work_dir: &std::path::Path) -> anyhow::Result<Option<PathBuf>> {
+    let output = tokio::process::Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(work_dir)
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+
+    // The path may be relative to work_dir; canonicalize to absolute.
+    let candidate = if std::path::Path::new(&raw).is_absolute() {
+        PathBuf::from(&raw)
+    } else {
+        work_dir.join(&raw)
+    };
+
+    let canonical = tokio::fs::canonicalize(&candidate)
+        .await
+        .unwrap_or(candidate);
+    Ok(Some(canonical))
+}
+
 fn render_prompt_template(template: &str, vars: HashMap<String, String>) -> String {
     match render_template_str(template, &vars) {
         Ok(rendered) => rendered,
@@ -76,6 +107,26 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
         }
     }
     permissions.allowed_edit_paths.push(inv.work_dir.clone());
+
+    // For Codex running in workspace-write sandbox mode, grant write access to
+    // the git common dir when it lives outside the worktree root. Without this,
+    // git operations that create index.lock under the main repo's .git/worktrees/
+    // directory fail with "Operation not permitted" inside the sandbox.
+    if inv.agent == "codex" {
+        match resolve_git_common_dir(&inv.work_dir).await {
+            Ok(Some(common_dir)) if !common_dir.starts_with(&inv.work_dir) => {
+                permissions.extra_writable_dirs.push(common_dir);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(
+                    work_dir = %inv.work_dir.display(),
+                    error = %e,
+                    "failed to resolve git common dir; skipping --add-dir"
+                );
+            }
+        }
+    }
 
     let sys_content = if !permissions.allowed_tools.is_empty() {
         let tools_list = permissions
