@@ -278,6 +278,33 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
+    /// Canonicalize known provider aliases that are syntactically valid but
+    /// not accepted by the target CLI/provider.
+    fn canonicalize_model_alias(agent: &str, model: &str) -> String {
+        if agent != "opencode" {
+            return model.to_string();
+        }
+
+        // OpenCode does not accept this legacy/copilot-prefixed identifier and
+        // suggests `gpt-5.3-codex` instead.
+        match model {
+            "github-copilot/gpt-5.3" | "opencode/github-copilot/gpt-5.3" => {
+                "gpt-5.3-codex".to_string()
+            }
+            _ => model.to_string(),
+        }
+    }
+
+    /// Reject known-unavailable aliases that would fail deterministically at
+    /// dispatch time.
+    fn is_known_unavailable_model(agent: &str, model: &str) -> bool {
+        agent == "opencode"
+            && matches!(
+                model,
+                "github-copilot/gpt-5.3" | "opencode/github-copilot/gpt-5.3"
+            )
+    }
+
     /// Load configuration from config files.
     pub fn from_config() -> Self {
         let mut config = Self::default();
@@ -606,10 +633,17 @@ impl RouterConfig {
         for model in pool {
             // Normalize the model identifier first to handle edge cases like trailing slashes
             let normalized = Self::normalize_model_identifier(model);
+            let canonical = Self::canonicalize_model_alias(agent, &normalized);
             if normalized == "opencode:free" {
                 has_free = true;
-            } else if Self::is_valid_model_identifier(&normalized) {
-                expanded_pool.push(normalized);
+            } else if Self::is_known_unavailable_model(agent, &canonical) {
+                tracing::debug!(
+                    agent,
+                    model = canonical,
+                    "skipping known-unavailable model alias in config"
+                );
+            } else if Self::is_valid_model_identifier(&canonical) {
+                expanded_pool.push(canonical);
             } else {
                 tracing::debug!(agent, model, "skipping invalid model identifier in config");
             }
@@ -1035,5 +1069,46 @@ model_map:
             "returned model should not have trailing slash, got: {}",
             model
         );
+    }
+
+    #[test]
+    fn expanded_model_pool_canonicalizes_dead_opencode_copilot_alias() {
+        let mut config = RouterConfig::default();
+        config
+            .model_map
+            .entry("complex".to_string())
+            .or_default()
+            .insert(
+                "opencode".to_string(),
+                vec!["github-copilot/gpt-5.3".to_string()],
+            );
+
+        let pool = config
+            .expanded_model_pool("opencode", "complex")
+            .expect("pool should exist");
+        assert_eq!(pool, vec!["gpt-5.3-codex".to_string()]);
+    }
+
+    #[test]
+    fn model_for_complexity_never_returns_dead_opencode_copilot_alias() {
+        let mut config = RouterConfig::default();
+        config
+            .model_map
+            .entry("simple".to_string())
+            .or_default()
+            .insert(
+                "opencode".to_string(),
+                vec![
+                    "github-copilot/gpt-5.3".to_string(),
+                    "mimo-v2-omni-free".to_string(),
+                ],
+            );
+
+        let selected = config
+            .model_for_complexity("opencode", "simple", "task-3017")
+            .expect("a model should be selected");
+
+        assert_ne!(selected, "github-copilot/gpt-5.3");
+        assert!(selected == "gpt-5.3-codex" || selected == "mimo-v2-omni-free");
     }
 }
