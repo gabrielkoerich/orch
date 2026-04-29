@@ -1506,6 +1506,12 @@ pub(crate) fn is_transient_github_api_error(err_str: &str) -> bool {
         || lower.contains("gh api")
         || lower.contains("gh pr")
         || lower.contains("gh error")
+        // `circuit-breaker` is orch's internal GitHub 5xx protection, set
+        // exclusively by GhHttp.  It can never originate from agent/runtime
+        // failures, so treating it as a GitHub-context marker is safe even
+        // when upstream wrapping strips the "GitHub API" prefix.
+        || lower.contains("circuit-breaker")
+        || lower.contains("circuit breaker")
 }
 
 /// Extract the HTTP status code from a GhHttp error string.
@@ -1868,6 +1874,27 @@ mod tests {
         ));
         assert!(!is_transient_github_api_error(
             "codex failed: Reconnecting... (stream disconnected before completion: Broken pipe)"
+        ));
+    }
+
+    #[test]
+    fn is_transient_github_api_error_matches_circuit_breaker() {
+        // Full message from GhHttp
+        assert!(is_transient_github_api_error(
+            "GitHub API transient 5xx circuit-breaker active for 240s"
+        ));
+        // Wrapped through PrCreateError + response_handler
+        assert!(is_transient_github_api_error(
+            "create PR failed: GitHub API error: GitHub API transient 5xx circuit-breaker active"
+        ));
+        // Shortened form where upstream wrapping stripped the "GitHub API" prefix —
+        // circuit-breaker alone must still be recognized as a GitHub signal.
+        assert!(is_transient_github_api_error(
+            "create PR failed: circuit-breaker"
+        ));
+        // Spaced variant
+        assert!(is_transient_github_api_error(
+            "create PR failed: circuit breaker tripped"
         ));
     }
 
