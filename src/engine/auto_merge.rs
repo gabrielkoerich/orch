@@ -940,8 +940,13 @@ pub(crate) async fn auto_merge_pr(
         let (state, total, passing, failing, pending) = {
             let _permit = ci_poll_semaphore().clone().acquire_owned().await;
             if required_contexts.is_empty() {
-                gh.get_combined_status(repo, &head_sha, repo_has_workflows)
-                    .await?
+                gh.get_combined_status(
+                    repo,
+                    &head_sha,
+                    repo_has_workflows,
+                    pr.mergeable_state.as_deref(),
+                )
+                .await?
             } else {
                 let check_runs = gh.get_check_runs(repo, &head_sha).await?;
                 let statuses = gh.get_commit_status_contexts(repo, &head_sha).await?;

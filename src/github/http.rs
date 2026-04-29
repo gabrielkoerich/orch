@@ -1786,11 +1786,21 @@ impl GhHttp {
         failing: u64,
         pending: u64,
         has_workflows: bool,
+        mergeable_state: Option<&str>,
     ) -> String {
         if failing > 0 {
             "failure".to_string()
-        } else if pending > 0 || (total == 0 && has_workflows) {
+        } else if pending > 0 {
             "pending".to_string()
+        } else if total == 0 && has_workflows {
+            // No check runs yet. If GitHub already reports mergeable_state="clean"
+            // the PR is ready (e.g. all workflows use paths-ignore and skipped this
+            // commit). Treating it as pending would stall auto-merge forever.
+            if mergeable_state == Some("clean") {
+                "success".to_string()
+            } else {
+                "pending".to_string()
+            }
         } else {
             "success".to_string()
         }
@@ -2370,6 +2380,7 @@ impl GhHttp {
         repo: &str,
         git_ref: &str,
         has_workflows: bool,
+        mergeable_state: Option<&str>,
     ) -> anyhow::Result<(String, u64, u64, u64, u64)> {
         let url = format!("{GITHUB_API}/repos/{repo}/commits/{git_ref}/check-runs");
         let resp: serde_json::Value = self.get_json(&url).await?;
@@ -2406,7 +2417,8 @@ impl GhHttp {
         }
 
         let total = runs.len() as u64;
-        let state = Self::combined_status_state(total, failing, pending, has_workflows);
+        let state =
+            Self::combined_status_state(total, failing, pending, has_workflows, mergeable_state);
 
         Ok((state, total, passing, failing, pending))
     }
@@ -3317,9 +3329,31 @@ mod tests {
 
     #[test]
     fn combined_status_state_treats_empty_checks_as_pending_when_workflows_exist() {
-        assert_eq!(GhHttp::combined_status_state(0, 0, 0, true), "pending");
-        assert_eq!(GhHttp::combined_status_state(0, 0, 0, false), "success");
-        assert_eq!(GhHttp::combined_status_state(3, 1, 0, true), "failure");
+        // No check runs yet and GitHub hasn't said it's clean → pending (wait for CI to queue)
+        assert_eq!(
+            GhHttp::combined_status_state(0, 0, 0, true, None),
+            "pending"
+        );
+        // No workflows configured → no need to wait
+        assert_eq!(
+            GhHttp::combined_status_state(0, 0, 0, false, None),
+            "success"
+        );
+        // Failing check → failure regardless
+        assert_eq!(
+            GhHttp::combined_status_state(3, 1, 0, true, None),
+            "failure"
+        );
+        // paths-ignore filtered out all workflows: no check runs but GitHub says "clean"
+        assert_eq!(
+            GhHttp::combined_status_state(0, 0, 0, true, Some("clean")),
+            "success"
+        );
+        // mergeable_state is dirty/blocked — still pending even with has_workflows
+        assert_eq!(
+            GhHttp::combined_status_state(0, 0, 0, true, Some("dirty")),
+            "pending"
+        );
     }
 
     #[test]
