@@ -194,9 +194,56 @@ fn classify_final_status(input: &DecisionInput<'_>) -> String {
         // Git ops already ran and detected no commits, so this is a legitimate
         // completion without code changes.
         "done".to_string()
+    } else if status_looks_like_descriptive_completion(input.agent_status) {
+        "done".to_string()
     } else {
         input.agent_status.to_string()
     }
+}
+
+fn status_looks_like_descriptive_completion(status: &str) -> bool {
+    let normalized = status.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    // Keep this conservative: only infer completion when we see clear success
+    // language and no clear failure/blocked cues.
+    let has_success_cue = [
+        "complete",
+        "completed",
+        "done",
+        "finished",
+        "success",
+        "succeeded",
+        "nothing to do",
+        "nothing to trade",
+        "no changes needed",
+        "already implemented",
+    ]
+    .iter()
+    .any(|cue| normalized.contains(cue));
+
+    if !has_success_cue {
+        return false;
+    }
+
+    let has_failure_cue = [
+        "error",
+        "failed",
+        "failure",
+        "blocked",
+        "cannot",
+        "can't",
+        "unable",
+        "retry",
+        "rate limit",
+        "timed out",
+    ]
+    .iter()
+    .any(|cue| normalized.contains(cue));
+
+    !has_failure_cue
 }
 
 // ── Internal context ──────────────────────────────────────────────────────────
@@ -1790,6 +1837,26 @@ mod tests {
                 "status '{status_str}' should pass through unchanged"
             );
         }
+    }
+
+    /// Descriptive completion text should normalize to done.
+    #[test]
+    fn classify_descriptive_completion_status_normalizes_to_done() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "Trading scan complete. Nothing to trade.",
+            ..Default::default()
+        });
+        assert_eq!(status, "done");
+    }
+
+    /// Do not normalize to done when completion-like text includes failure cues.
+    #[test]
+    fn classify_descriptive_completion_with_failure_cues_does_not_normalize() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "completed but failed to push branch due to error",
+            ..Default::default()
+        });
+        assert_eq!(status, "completed but failed to push branch due to error");
     }
 
     /// push_failed takes precedence over done+has_pr (push failure detected first).
