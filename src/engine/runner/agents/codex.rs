@@ -530,8 +530,8 @@ mod tests {
 
     #[test]
     fn build_command_codex_extra_writable_dirs() {
-        // When the git common dir is outside the worktree sandbox root, the
-        // runner adds it to extra_writable_dirs and build_command must emit
+        // When git metadata dirs are outside the worktree sandbox root, the
+        // runner adds them to extra_writable_dirs and build_command must emit
         // --add-dir flags so Codex can create index.lock there.
         let perms = PermissionRules {
             autonomous: true,
@@ -540,9 +540,10 @@ mod tests {
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
             deny_read_only: false,
-            extra_writable_dirs: vec![std::path::PathBuf::from(
-                "/Users/gb/Projects/bean/.git/worktrees/task-123",
-            )],
+            extra_writable_dirs: vec![
+                std::path::PathBuf::from("/Users/gb/Projects/bean/.git"),
+                std::path::PathBuf::from("/Users/gb/Projects/bean/.git/worktrees/task-123"),
+            ],
         };
         let cmd = runner().build_command(None, "", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
         assert!(
@@ -550,8 +551,17 @@ mod tests {
             "should include --add-dir flag, got: {cmd}"
         );
         assert!(
+            cmd.contains("/Users/gb/Projects/bean/.git'"),
+            "should include git common dir path, got: {cmd}"
+        );
+        assert!(
             cmd.contains("/Users/gb/Projects/bean/.git/worktrees/task-123"),
-            "should include the extra dir path, got: {cmd}"
+            "should include git dir path, got: {cmd}"
+        );
+        assert_eq!(
+            cmd.matches("--add-dir ").count(),
+            2,
+            "should include two --add-dir flags, got: {cmd}"
         );
         assert!(
             cmd.contains("--full-auto"),
