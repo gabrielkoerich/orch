@@ -119,6 +119,8 @@ struct DecisionInput<'a> {
     /// would have detected no-code reroutes. Pre-computed from agent_status
     /// by the caller so this function stays pure.
     is_completed_status: bool,
+    /// Agent explicitly returned blocked, but reason appears transient and retryable.
+    is_retryable_blocked: bool,
 }
 
 /// Determine the final task status from pre-computed state.
@@ -194,6 +196,8 @@ fn classify_final_status(input: &DecisionInput<'_>) -> String {
         // Git ops already ran and detected no commits, so this is a legitimate
         // completion without code changes.
         "done".to_string()
+    } else if input.agent_status == "blocked" && input.is_retryable_blocked {
+        "new".to_string()
     } else if status_looks_like_descriptive_completion(input.agent_status) {
         "done".to_string()
     } else {
@@ -1061,6 +1065,48 @@ fn agent_blocked_reason(resp: &crate::parser::AgentResponse) -> String {
     }
 }
 
+/// Heuristic classifier for agent-returned blocked reasons.
+///
+/// Returns true when the reason looks transient/retryable (network/provider/
+/// auth-temporary/environment availability issues), and false for likely
+/// permanent/input/configuration issues.
+fn is_retryable_blocked_reason(reason: &str) -> bool {
+    let r = reason.to_lowercase();
+
+    let permanent_patterns = [
+        "not found",
+        "does not exist",
+        "invalid",
+        "malformed",
+        "syntax error",
+        "unsupported",
+        "unimplemented",
+        "manual intervention required",
+        "human intervention required",
+    ];
+    if permanent_patterns.iter().any(|p| r.contains(p)) {
+        return false;
+    }
+
+    let transient_patterns = [
+        "unavailable",
+        "temporarily unavailable",
+        "timeout",
+        "timed out",
+        "connection reset",
+        "connection refused",
+        "network error",
+        "rate limit",
+        "try again",
+        "service down",
+        "permission denied",
+        "worktree lock",
+        "resource busy",
+        "could not resolve host",
+    ];
+    transient_patterns.iter().any(|p| r.contains(p))
+}
+
 /// Apply tracing and store writes that depend on the final status decision.
 #[allow(clippy::too_many_arguments)]
 async fn apply_post_decision_effects(
@@ -1484,6 +1530,16 @@ pub async fn handle_success(
     let no_code_reroutes =
         detect_no_code_reroutes(&ctx, is_no_code_reroute, new_attempts, max_reroutes).await;
 
+    let blocked_reason = if resp.status == "blocked" {
+        Some(agent_blocked_reason(&resp))
+    } else {
+        None
+    };
+    let is_retryable_blocked = blocked_reason
+        .as_deref()
+        .map(is_retryable_blocked_reason)
+        .unwrap_or(false);
+
     // ── Detect same-agent loop ───────────────────────────────────────────────
     //
     // If this is a no-code reroute and the agent is the same as the one that
@@ -1516,6 +1572,7 @@ pub async fn handle_success(
         max_reroutes,
         is_same_agent,
         is_completed_status: resp.status == "completed",
+        is_retryable_blocked,
     });
     let final_status = final_status_owned.as_str();
 
@@ -1543,9 +1600,34 @@ pub async fn handle_success(
     // inspection of task_runs.parsed_response.  The apply_post_decision_effects
     // branches above only fire on push/no-code scenarios; a raw agent-blocked
     // response falls through all of them and would leave last_error empty.
-    if resp.status == "blocked" && final_status == "blocked" {
-        let reason = agent_blocked_reason(&resp);
-        ctx.set(&[("last_error", serde_json::json!(reason))]).await;
+    if resp.status == "blocked" {
+        let reason = blocked_reason.unwrap_or_else(|| agent_blocked_reason(&resp));
+        if final_status == "new" {
+            // Retryable external block: cooldown failed agent/model, clear selection,
+            // and reroute after backoff instead of permanently blocking.
+            crate::engine::cooldown::record_agent_failure_with_message(agent_name, &reason).await;
+            if let Some(m) = model_name {
+                crate::engine::cooldown::record_model_failure(agent_name, m).await;
+            }
+            ctx.set(&[
+                (
+                    "last_error",
+                    serde_json::json!(format!(
+                        "transient blocker (auto-retry scheduled): {reason}"
+                    )),
+                ),
+                ("agent", serde_json::json!(null)),
+                ("model", serde_json::json!(null)),
+            ])
+            .await;
+            tracing::warn!(
+                task_id = ctx.task_id,
+                reason = %reason,
+                "agent returned retryable blocked status — rerouting as new with cooldown"
+            );
+        } else if final_status == "blocked" {
+            ctx.set(&[("last_error", serde_json::json!(reason))]).await;
+        }
     }
 
     ctx.set(&[("summary", serde_json::json!(resp.summary))])
@@ -2037,5 +2119,38 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(status, "blocked");
+    }
+
+    #[test]
+    fn classify_retryable_agent_blocked_reroutes() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "blocked",
+            is_retryable_blocked: true,
+            ..Default::default()
+        });
+        assert_eq!(status, "new");
+    }
+
+    #[test]
+    fn retryable_blocked_reason_detects_transient_patterns() {
+        assert!(is_retryable_blocked_reason(
+            "Twitter access unavailable: service timed out"
+        ));
+        assert!(is_retryable_blocked_reason(
+            "final commit blocked by git worktree lock permission error"
+        ));
+        assert!(is_retryable_blocked_reason(
+            "API rate limit hit, try again later"
+        ));
+    }
+
+    #[test]
+    fn retryable_blocked_reason_rejects_permanent_patterns() {
+        assert!(!is_retryable_blocked_reason(
+            "invalid request payload: malformed JSON"
+        ));
+        assert!(!is_retryable_blocked_reason(
+            "resource not found in repository"
+        ));
     }
 }
