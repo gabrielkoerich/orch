@@ -6,6 +6,7 @@
 use crate::engine::runner::agents::shell_single_quote;
 use crate::template::render_template_str;
 use crate::tmux::TmuxManager;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -16,11 +17,14 @@ const ALLOWED_TOOLS_TEMPLATE: &str = include_str!("../../../prompts/allowed_tool
 const REVIEW_PROMPT_TEMPLATE: &str = include_str!("../../../prompts/review_task.md");
 const REVIEW_SYSTEM_TEMPLATE: &str = include_str!("../../../prompts/review_system.md");
 
-/// Run `git rev-parse --git-common-dir` from `work_dir` and canonicalize the
+/// Run `git rev-parse <arg>` from `work_dir` and canonicalize the
 /// result. Returns `Ok(None)` when git is not available or the command fails.
-async fn resolve_git_common_dir(work_dir: &std::path::Path) -> anyhow::Result<Option<PathBuf>> {
+async fn resolve_git_dir_arg(
+    work_dir: &std::path::Path,
+    arg: &str,
+) -> anyhow::Result<Option<PathBuf>> {
     let output = tokio::process::Command::new("git")
-        .args(["rev-parse", "--git-common-dir"])
+        .args(["rev-parse", arg])
         .current_dir(work_dir)
         .output()
         .await?;
@@ -109,23 +113,32 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
     permissions.allowed_edit_paths.push(inv.work_dir.clone());
 
     // For Codex running in workspace-write sandbox mode, grant write access to
-    // the git common dir when it lives outside the worktree root. Without this,
-    // git operations that create index.lock under the main repo's .git/worktrees/
-    // directory fail with "Operation not permitted" inside the sandbox.
+    // git metadata dirs when they live outside the worktree root. We include
+    // both --git-common-dir and --git-dir because index.lock can be created
+    // under the worktree-specific git dir.
     if inv.agent == "codex" {
-        match resolve_git_common_dir(&inv.work_dir).await {
-            Ok(Some(common_dir)) if !common_dir.starts_with(&inv.work_dir) => {
-                permissions.extra_writable_dirs.push(common_dir);
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::debug!(
-                    work_dir = %inv.work_dir.display(),
-                    error = %e,
-                    "failed to resolve git common dir; skipping --add-dir"
-                );
+        let mut extra_dirs = BTreeSet::new();
+        for (arg, label) in [
+            ("--git-common-dir", "git common dir"),
+            ("--git-dir", "git dir"),
+        ] {
+            match resolve_git_dir_arg(&inv.work_dir, arg).await {
+                Ok(Some(dir)) if !dir.starts_with(&inv.work_dir) => {
+                    extra_dirs.insert(dir);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(
+                        work_dir = %inv.work_dir.display(),
+                        arg,
+                        error = %e,
+                        "failed to resolve {}; skipping --add-dir",
+                        label
+                    );
+                }
             }
         }
+        permissions.extra_writable_dirs.extend(extra_dirs);
     }
 
     let sys_content = if !permissions.allowed_tools.is_empty() {
