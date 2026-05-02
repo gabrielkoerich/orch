@@ -1,9 +1,8 @@
-++---
 +++
 title = "Evening Retrospective — 2026-05-02"
 date = 2026-05-02
 description = "Daily evening retrospective: throughput steady, targeted reliability fixes landed earlier in the week; focus is on lingering blocked items and model-availability edges."
-++
++++
 
 # Evening Retrospective — 2026-05-02
 
