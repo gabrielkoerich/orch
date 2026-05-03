@@ -1126,6 +1126,17 @@ pub(crate) mod patterns {
             "unable to connect",
             "econnrefused",
             "network unreachable",
+            // Socket / HTTP transport errors (Node fetch / undici / http module)
+            "socket connection was closed",
+            "socket hang up",
+            "econnreset",
+            "connection reset",
+            "etimedout",
+            "connect etimedout",
+            "aborterror",
+            "the operation was aborted",
+            "network request failed",
+            "fetch failed",
         ];
         // Map the byte offset from `lower` back to `text` via char-count (same
         // rationale as detect_rate_limit: Unicode case-folding can change byte lengths).
@@ -1988,6 +1999,46 @@ mod tests {
         assert!(
             err.to_string().contains("stale session"),
             "error display must contain 'stale session' for recovery code to trigger"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_detects_socket_closed() {
+        // Regression test for issue #3045: "socket connection was closed" must be
+        // classified as NetworkError, not Unknown.
+        let text = "API Error: The socket connection was closed unexpectedly. \
+             For more information, pass `verbose: true` in the second argument to fetch()";
+        let err = patterns::classify_from_text(1, text);
+        assert!(
+            matches!(err, AgentError::NetworkError { .. }),
+            "socket closed must be NetworkError, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_detects_socket_hang_up() {
+        let err = patterns::classify_from_text(1, "Error: socket hang up");
+        assert!(
+            matches!(err, AgentError::NetworkError { .. }),
+            "socket hang up must be NetworkError, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_detects_fetch_failed() {
+        let err = patterns::classify_from_text(1, "TypeError: fetch failed");
+        assert!(
+            matches!(err, AgentError::NetworkError { .. }),
+            "fetch failed must be NetworkError, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_detects_econnreset() {
+        let err = patterns::classify_from_text(1, "read ECONNRESET");
+        assert!(
+            matches!(err, AgentError::NetworkError { .. }),
+            "ECONNRESET must be NetworkError, got: {err:?}"
         );
     }
 
