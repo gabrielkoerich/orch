@@ -1227,12 +1227,14 @@ impl TaskStore {
         Ok(())
     }
 
-    /// Reset transient failure/retry counters to zero, preserving `review_cycles` and `ci_merge_failures`.
+    /// Reset transient failure/retry counters to zero, preserving
+    /// `review_cycles`, `ci_merge_failures`, and `merge_conflict_retries`.
     ///
     /// Use this after `RequestChanges` to clear per-attempt noise without
     /// undoing the review-cycle count that `handle_review_changes` just set.
-    /// `ci_merge_failures` is preserved here because it must accumulate across attempts
-    /// to enforce `MAX_CI_MERGE_FAILURES`, just like `review_cycles`.
+    /// `ci_merge_failures` and `merge_conflict_retries` are preserved here because
+    /// they must accumulate across attempts to enforce their circuit breakers,
+    /// just like `review_cycles`.
     ///
     /// NOTE: `attempts` is intentionally NOT reset here. It must increase monotonically
     /// across the task's lifetime so that `(task_id, attempt, run_type)` keys in
@@ -1244,7 +1246,6 @@ impl TaskStore {
             route_attempts = 0,
             review_agent_failures = 0,
             review_invocations = 0,
-            merge_conflict_retries = 0,
             pr_create_failures = 0,
             push_failures = 0,
             network_retries = 0,
@@ -1578,7 +1579,8 @@ impl TaskStore {
 
     /// Reset transient failure/retry counters for multiple tasks in a single transaction.
     ///
-    /// Preserves `review_cycles` and `ci_merge_failures` (same semantics as
+    /// Preserves `review_cycles`, `ci_merge_failures`, and
+    /// `merge_conflict_retries` (same semantics as
     /// [`reset_failure_counters`]).
     /// Test-only helper for bulk counter resets used by tests.
     #[cfg(test)]
@@ -1600,7 +1602,6 @@ impl TaskStore {
             route_attempts = 0,
             review_agent_failures = 0,
             review_invocations = 0,
-            merge_conflict_retries = 0,
             pr_create_failures = 0,
             push_failures = 0,
             network_retries = 0,
