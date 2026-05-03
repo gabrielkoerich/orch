@@ -523,7 +523,7 @@ External consumers (CLI, local debugging tools) connect via **localhost-only web
 LLM routing concurrency is governed by exactly two knobs:
 
 - **`router.max_tasks_per_tick`** (default: 1) — caps how many tasks enter the routing loop per tick. With the default of 1, only one LLM classification call can ever be in flight at a time.
-- **`router.llm_budget_secs`** (default: `timeout_seconds`, 45s) — total wall-clock budget for the entire pool cascade before falling back to round-robin. Prevents N pool entries × 45s/each from blocking the tick.
+- **`router.llm_budget_secs`** (default: 30s) — total wall-clock budget for the entire pool cascade before falling back to round-robin. Prevents tick stalls from exceeding the watchdog threshold (6 × tick_interval). The default of 30s ensures at most one slow pool entry can time out before round-robin fallback, preventing a single slow route call from blocking the tick loop.
 
 **Do not add a semaphore, worker pool, or `ORCH_ROUTER_MAX_PARALLEL_LLMS` env var.** Issue #2676 / PR #2677 introduced an `llm_semaphore` field on `Router` that was redundant with `max_tasks_per_tick=1` at its default value and added no protection that the budget timeout doesn't already provide. It was removed as dead complexity.
 
