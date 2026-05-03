@@ -207,8 +207,8 @@ pub struct RouterConfig {
     /// `timeout_seconds` is a *per-entry* limit; `llm_budget_secs` caps the *total*
     /// cascade. With a 3-entry pool each carrying a 45 s per-entry timeout, the
     /// cascade could block for up to 135 s without this budget. Setting the budget
-    /// to `timeout_seconds` (45 s default) ensures at most one entry can fully
-    /// time out before round-robin takes over.
+    /// to 30 s ensures round-robin takes over quickly, preventing tick stalls from
+    /// exceeding the watchdog threshold (6 × tick_interval).
     ///
     /// Configurable via `router.llm_budget_secs` (default: `timeout_seconds`).
     pub llm_budget_secs: u64,
@@ -272,7 +272,7 @@ impl Default for RouterConfig {
             ollama_url: "http://localhost:11434".to_string(),
             ollama_model: "qwen2.5-coder:3b-instruct".to_string(),
             ollama_timeout_seconds: 30,
-            llm_budget_secs: 45,
+            llm_budget_secs: 30,
         }
     }
 }
@@ -439,9 +439,9 @@ impl RouterConfig {
         }
 
         // Parse llm_budget_secs — total time cap for the entire pool cascade.
-        // Defaults to timeout_seconds (already resolved above) so the cascade
-        // can't exceed what a single pool entry would normally take.
-        config.llm_budget_secs = config.timeout_seconds;
+        // Default to 30s so round-robin takes over before tick exceeds watchdog
+        // threshold (6 × tick_interval). User config overrides this.
+        config.llm_budget_secs = 30;
         if let Ok(val) = crate::config::get("router.llm_budget_secs") {
             if let Ok(secs) = val.parse::<u64>() {
                 if secs > 0 {
@@ -530,9 +530,9 @@ impl RouterConfig {
         }
 
         // Parse llm_budget_secs — total time cap for the entire pool cascade.
-        // Defaults to timeout_seconds (already resolved above) so the cascade
-        // can't exceed what a single pool entry would normally take.
-        config.llm_budget_secs = config.timeout_seconds;
+        // Default to 30s so round-robin takes over before tick exceeds watchdog
+        // threshold (6 × tick_interval). User config overrides this.
+        config.llm_budget_secs = 30;
         if let Ok(val) = crate::config::get("router.llm_budget_secs") {
             if let Ok(secs) = val.parse::<u64>() {
                 if secs > 0 {
@@ -1139,5 +1139,18 @@ model_map:
             "gpt-5.3-codex is not a valid opencode model"
         );
         assert_eq!(selected, "mimo-v2-omni-free");
+    }
+
+    #[test]
+    fn default_llm_budget_secs_is_30() {
+        // Bug #3048: llm_budget_secs must be low enough that a single slow pool
+        // entry times out before the tick watchdog fires (6 × tick_interval = 60s).
+        // With a 5-entry pool and 90s per-entry timeout, 30s budget ensures at most
+        // one entry can time out before round-robin fallback, preventing tick stalls.
+        let config = RouterConfig::default();
+        assert_eq!(
+            config.llm_budget_secs, 30,
+            "llm_budget_secs default should be 30s to prevent tick watchdog stalls"
+        );
     }
 }
