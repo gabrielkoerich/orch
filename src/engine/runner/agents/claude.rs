@@ -386,7 +386,24 @@ impl AgentRunner for ClaudeRunner {
     }
 
     fn classify_error(&self, exit_code: i32, stdout: &str, stderr: &str) -> AgentError {
-        let combined = format!("{stdout}\n{stderr}");
+        // For claude-protocol agents the real error string lives in the `result`
+        // field of the NDJSON result line (when is_error=true). Prepend it to the
+        // combined text so the classifier sees it before the raw metadata tail.
+        let error_result: Option<String> = (|| {
+            let trimmed = stdout.trim();
+            let (line, _) = find_ndjson_result_line(trimmed)?;
+            let val: serde_json::Value = serde_json::from_str(line).ok()?;
+            let obj = val.as_object()?;
+            if obj.get("is_error").and_then(|v| v.as_bool()) != Some(true) {
+                return None;
+            }
+            let result_str = obj.get("result")?.as_str()?;
+            Some(result_str.to_string())
+        })();
+        let combined = match error_result {
+            Some(ref r) => format!("{r}\n{stdout}\n{stderr}"),
+            None => format!("{stdout}\n{stderr}"),
+        };
         super::patterns::classify_from_text(exit_code, &combined)
     }
 
