@@ -88,6 +88,13 @@ fn should_skip_ci_check(stored: &crate::store::Task) -> bool {
         || block_reason.contains("CI failure limit")
 }
 
+fn is_ssh_agent_fetch_failure(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("sign_and_send_pubkey")
+        || lower.contains("agent refused operation")
+        || lower.contains("communication with agent failed")
+}
+
 /// Record that CI was checked for this task, updating the timestamp in KV store.
 async fn record_ci_check(store: &Arc<TaskStore>, task_id: &str) -> anyhow::Result<()> {
     let key = format!("ci_check_ts:{}", task_id);
@@ -221,8 +228,53 @@ async fn handle_merge_conflict(
                     .await
                 }
                 Ok(out) => {
-                    // fetch failed — not a content conflict; leave task in InReview for retry
                     let stderr = String::from_utf8_lossy(&out.stderr);
+                    if is_ssh_agent_fetch_failure(&stderr) {
+                        let block_reason = format!(
+                            "auto-merge git fetch failed due to SSH agent error: {}",
+                            stderr.trim()
+                        );
+                        tracing::error!(
+                            task_id = task.id.0,
+                            stderr = %stderr,
+                            "git fetch failed before rebase due to SSH agent error — blocking for human review"
+                        );
+                        let fields = [("block_reason", serde_json::json!(block_reason.clone()))];
+                        if let Err(e) = task_manager
+                            .update_task_status_and_result(&task.id, Status::Blocked, &fields)
+                            .await
+                        {
+                            tracing::error!(task_id = task.id.0, err = %e, "failed to write SSH-fetch block_reason and set Blocked");
+                            return Ok(());
+                        }
+                        let footer = crate::engine::attribution_footer(
+                            "Commented",
+                            review_agent,
+                            Some(review_model),
+                        );
+                        let comment = format!(
+                            "Auto-merge could not rebase because `git fetch origin` failed with an SSH agent error: {}",
+                            stderr.trim()
+                        );
+                        if let Err(e) = gh
+                            .add_comment(
+                                repo,
+                                &pr_number.to_string(),
+                                &format!("{}{}", comment, footer),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                task_id = task.id.0,
+                                pr_number,
+                                err = %e,
+                                "handle_merge_conflict: failed to post SSH-fetch failure comment on PR"
+                            );
+                        }
+                        return Ok(());
+                    }
+
+                    // Fetch failed for a non-SSH reason — this is still not a content conflict.
                     tracing::warn!(
                         task_id = task.id.0,
                         stderr = %stderr,

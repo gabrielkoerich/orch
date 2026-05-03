@@ -90,11 +90,16 @@ async fn handle_merge_conflict(
     id: &ExternalId,
     pr_number: u64,
     retries: u64,
+    attempts: u64,
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
     store_id: i64,
 ) -> ConflictAction {
     let task_id = &id.0;
+    let max_attempts: u64 = config::get("workflow.max_attempts")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
     if retries >= MAX_MERGE_CONFLICT_RETRIES {
         tracing::error!(
             task_id,
@@ -123,6 +128,36 @@ async fn handle_merge_conflict(
             .await
         {
             tracing::error!(task_id, err = %e, "failed to write block_reason and set Blocked");
+        }
+        return ConflictAction::BlockForHuman;
+    }
+    if attempts >= max_attempts {
+        tracing::error!(
+            task_id,
+            pr_number,
+            attempts,
+            max_attempts,
+            "PR approved but merge-conflict reroute would exceed max attempts — blocking for human review"
+        );
+        let fields = [
+            (
+                "block_reason",
+                serde_json::json!(format!(
+                    "approved PR still needs merge-conflict resolution but task already hit max attempts ({attempts}/{max_attempts}); manual intervention required"
+                )),
+            ),
+            (
+                "last_error",
+                serde_json::json!(format!(
+                    "review_poll refused merge-conflict reroute because task exceeded max attempts ({attempts}/{max_attempts})"
+                )),
+            ),
+        ];
+        if let Err(e) = task_manager
+            .update_task_status_and_result(id, Status::Blocked, &fields)
+            .await
+        {
+            tracing::error!(task_id, err = %e, "failed to write max-attempts block_reason and set Blocked");
         }
         return ConflictAction::BlockForHuman;
     }
@@ -661,6 +696,7 @@ pub(crate) async fn review_open_prs(
                         &task.id,
                         pr_number,
                         retries,
+                        stored_task.attempts.max(0) as u64,
                         task_manager,
                         store,
                         task_info.store_id,
@@ -1809,6 +1845,96 @@ mod tests {
         // Task status must be unchanged.
         let after = store.get(task_id).await.unwrap();
         assert_eq!(after.status, TaskStatus::InReview);
+    }
+
+    #[tokio::test]
+    async fn review_open_prs_conflict_with_max_attempts_blocks_instead_of_reroute() {
+        let store = make_store().await;
+        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
+            "owner/repo".to_string(),
+        ));
+
+        let task_id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "task-conflict".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let _ = crate::store::store_set_by_id(
+            &Some(&store),
+            task_id,
+            &[
+                ("branch", serde_json::json!("feat-conflict")),
+                ("pr_number", serde_json::json!(77i64)),
+                ("attempts", serde_json::json!(99i64)),
+            ],
+        )
+        .await;
+        store
+            .update_status(task_id, TaskStatus::InReview)
+            .await
+            .unwrap();
+        let stored = store.get(task_id).await.unwrap();
+        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
+            external: crate::engine::tasks::store_task_to_external(&stored),
+            stored,
+        };
+
+        let mut gh = MockGh::default();
+        gh.batch_data.insert(
+            77,
+            PrReviewBatchData {
+                merged: false,
+                mergeable: Some(false),
+                reviews: vec![make_review(
+                    1,
+                    "reviewer",
+                    "APPROVED",
+                    "2026-01-01T00:00:00Z",
+                    None,
+                )],
+                review_comments: vec![],
+                issue_comments: vec![],
+            },
+        );
+
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+        let in_flight = Arc::new(DashSet::new());
+        review_open_prs(
+            &backend,
+            "owner/repo",
+            &default_config(),
+            &tm,
+            &store,
+            &dispatching,
+            &in_flight,
+            &[snapshot],
+            &gh,
+            &crate::engine::router::RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        let after = store.get(task_id).await.unwrap();
+        assert_eq!(after.status, TaskStatus::Blocked);
+        assert_eq!(
+            after.merge_conflict_retries, 0,
+            "review_poll must not increment merge_conflict_retries when reroute is impossible"
+        );
+        assert!(
+            after
+                .block_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("max attempts"),
+            "block_reason should explain that reroute was refused after max attempts"
+        );
     }
 
     #[test]
