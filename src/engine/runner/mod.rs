@@ -727,16 +727,13 @@ impl TaskRunner {
             // Exit 0 and empty output — silent failure marker used elsewhere.
             Err(agents::AgentError::Unknown {
                 exit_code: session_output.exit_code,
-                message: "empty-output-exit0: opencode returned exit 0 with empty stdout".to_string(),
+                message: "empty-output-exit0: opencode returned exit 0 with empty stdout"
+                    .to_string(),
             })
         }
 
-        let parse_result = parse_session_output(
-            task_id,
-            &init.agent_name,
-            &*agent_runner,
-            &session_output,
-        );
+        let parse_result =
+            parse_session_output(task_id, &init.agent_name, &*agent_runner, &session_output);
 
         // Write structured result.json for deterministic testing and debugging
         response_handler::write_result_json(
@@ -2659,7 +2656,9 @@ mod tests {
 
         // Call the helper we added via the task runner logic by reusing the
         // parse_success_output directly since it encapsulates the same behavior.
-        let parsed = parse_success_output("task-ndjson", "claude", &runner, &session_output.raw_stdout).expect("should parse NDJSON success");
+        let parsed =
+            parse_success_output("task-ndjson", "claude", &runner, &session_output.raw_stdout)
+                .expect("should parse NDJSON success");
         assert_eq!(parsed.response.status, "done");
         assert_eq!(parsed.response.summary, "All good");
         assert_eq!(parsed.input_tokens, Some(10));
