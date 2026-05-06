@@ -651,10 +651,14 @@ fn ci_failure_unblock_cooldown_elapsed(task: &crate::store::Task) -> bool {
         return true;
     }
 
+    // Short cooldowns — the PR may close quickly after the first check.
+    // We never permanently block (no `_ => return false`): eventually the PR
+    // will close or a human will intervene.
     let required = match task.auto_unblock_count {
-        1 => chrono::Duration::hours(24),
-        2 => chrono::Duration::days(3),
-        _ => return false,
+        1 => chrono::Duration::minutes(10),
+        2 => chrono::Duration::hours(1),
+        3 => chrono::Duration::hours(6),
+        _ => chrono::Duration::hours(24),
     };
 
     let last_at = &task.auto_unblock_last_at;
