@@ -636,12 +636,60 @@ async fn invoke_review_agent(
             ReviewPhase::Ready(ReviewRun { run_id })
         }
         Ok(Err(e)) => {
-            tracing::error!(task_id = task.id.0, error = %e, "review agent error");
+            tracing::warn!(task_id = task.id.0, error = %e, "review agent process exited with error");
             let _ = tmux.kill_session(&session).await;
+
+            // Before recording failure, check if this is a "successful exit with non-zero
+            // code" agent like kimi/minimax. Read the output file and check for a valid
+            // result with is_error=false — if found, treat as success and proceed to
+            // parse_review_output where the real result will be extracted.
+            let exit_code: i32 = tokio::task::spawn_blocking({
+                let review_attempt_dir = ctx.review_attempt_dir.clone();
+                move || {
+                    std::fs::read_to_string(review_attempt_dir.join("exit.txt"))
+                        .ok()
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(-1)
+                }
+            })
+            .await
+            .unwrap_or(-1);
+
+            if exit_code != 0 {
+                let output_exists = tokio::task::spawn_blocking({
+                    let output_file = ctx.output_file.clone();
+                    move || output_file.exists()
+                })
+                .await
+                .unwrap_or(false);
+
+                if output_exists {
+                    let raw_output = runner::response::read_output_file(
+                        &ctx.review_task_id,
+                        &ctx.output_file,
+                        repo,
+                    )
+                    .await;
+                    let agent_result =
+                        runner::agents::find_agent_result(&ctx.review_agent, &raw_output);
+                    // Treat as success if we found a valid result without is_error set
+                    if agent_result.as_ref().map(|r| !r.is_error).unwrap_or(false) {
+                        tracing::info!(
+                            task_id = task.id.0,
+                            agent = %ctx.review_agent,
+                            exit_code,
+                            "review agent succeeded despite non-zero exit — proceeding to parse output"
+                        );
+                        return ReviewPhase::Ready(ReviewRun { run_id });
+                    }
+                }
+            }
+
+            tracing::error!(task_id = task.id.0, error = %e, "review agent failed");
             complete_review_run(
                 store,
                 run_id,
-                Some(-1),
+                Some(exit_code),
                 "",
                 &e.to_string(),
                 "",
