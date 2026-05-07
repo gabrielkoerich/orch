@@ -4597,25 +4597,42 @@ mod tests {
     }
 
     #[test]
-    fn ci_failure_cooldown_count_3_never() {
-        // count=3 or more means permanent block
-        let mut task = make_task(None);
-        task.auto_unblock_count = 3;
-        task.auto_unblock_last_at = "2020-01-01T00:00:00Z".to_string();
-        assert!(!ci_failure_unblock_cooldown_elapsed(&task));
-
-        let mut task = make_task(None);
-        task.auto_unblock_count = 99;
-        task.auto_unblock_last_at = "2020-01-01T00:00:00Z".to_string();
-        assert!(!ci_failure_unblock_cooldown_elapsed(&task));
-    }
-
-    #[test]
     fn ci_failure_cooldown_invalid_timestamp_immediate() {
         // invalid timestamp should not block
         let mut task = make_task(None);
         task.auto_unblock_count = 1;
         task.auto_unblock_last_at = "not-a-timestamp".to_string();
         assert!(ci_failure_unblock_cooldown_elapsed(&task));
+    }
+
+    #[test]
+    fn ci_failure_cooldown_high_count_still_eventually_elapses() {
+        // count >= 3 must NOT be a permanent block — verify a sufficiently old
+        // timestamp eventually elapses the cooldown.
+        let long_ago = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        for count in [3i32, 5, 99] {
+            let mut task = make_task(None);
+            task.auto_unblock_count = count;
+            task.auto_unblock_last_at = long_ago.clone();
+            assert!(
+                ci_failure_unblock_cooldown_elapsed(&task),
+                "count={count} should eventually elapse"
+            );
+        }
+    }
+
+    #[test]
+    fn ci_failure_cooldown_recent_timestamp_still_blocks() {
+        // A recent timestamp should still gate the check at every count.
+        let just_now = chrono::Utc::now().to_rfc3339();
+        for count in [1i32, 2, 3, 99] {
+            let mut task = make_task(None);
+            task.auto_unblock_count = count;
+            task.auto_unblock_last_at = just_now.clone();
+            assert!(
+                !ci_failure_unblock_cooldown_elapsed(&task),
+                "count={count} should still be cooling down"
+            );
+        }
     }
 }
