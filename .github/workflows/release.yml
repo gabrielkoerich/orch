@@ -12,7 +12,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Run Rust formatting, lints, and test suite with code coverage.
+  # Check Rust formatting and lints
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+          rustflags: ""
+          components: clippy, rustfmt
+
+      - name: Install cargo-llvm-cov and nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-all-crates: true
+          # cache-workspace-crates: true
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  # Run Rust test suite with code coverage.
   # Produces an lcov artifact and posts a coverage report on PRs.
   # Uses cargo-llvm-cov for line/branch coverage — cheaper than tarpaulin.
   test:
@@ -75,9 +106,6 @@ jobs:
       - name: Run tests with coverage
         run: cargo llvm-cov nextest --lcov --output-path lcov.info
 
-      - name: Install lcov
-        run: sudo apt-get update && sudo apt-get install -y lcov
-
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
         with:
@@ -92,6 +120,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRANCH: ${{ github.ref_name }}
+
+      - name: Install lcov
+        if: steps.find-pr.outputs.pr_number != ''
+        run: sudo apt-get update && sudo apt-get install -y lcov
 
       - name: Report coverage on PR
         if: steps.find-pr.outputs.pr_number != ''
@@ -255,7 +287,7 @@ jobs:
 
   # Build Zola docs and deploy to GitHub Pages on every push to main.
   deploy:
-    needs: [test, secrets]
+    needs: [check, test, secrets]
     if: github.ref == 'refs/heads/main'
     concurrency:
       group: pages
