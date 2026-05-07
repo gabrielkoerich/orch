@@ -475,6 +475,29 @@ If you believe the generic system has a bug (e.g., cooldowns not being applied, 
 
 **The exponential backoff approach is settled — do not replace it with flat cooldowns or per-agent special cases.** The formula `min(base * 3^(attempt-1), max)` is in `compute_backoff()`. Failure counts are persisted in `failure_count:{key}` KV keys. Incremental improvements (e.g. tuning constants, adding decay windows, improving reset logic) are welcome as proposals, but the base mechanism must not be reverted.
 
+#### NEVER hardcode model names or aliases in router code
+
+There must be **zero literal model-identifier strings** in the routing/dispatch code paths (e.g. `"github-copilot/gpt-5.3"`, `"gpt-5.3-codex"`, `"opencode/..."`). No `match` arms keyed on specific models, no "known unavailable" allow/deny lists, no canonicalization tables that rewrite alias A → alias B, no per-model `if agent == "opencode" && model == "X"` branches anywhere in `src/engine/router/`, `src/engine/runner/`, or `src/engine/cooldown.rs`.
+
+When a model fails (including `Model not found` / `ProviderModelNotFoundError` / "model unavailable"), the **only** correct response is:
+
+1. The runner classifies the error as `AgentError::ModelUnavailable`.
+2. `cooldown::record_persistent_model_failure(agent, model)` puts that **specific model** into a long cooldown (4h base → 7d max).
+3. The router's next selection skips that model via `is_model_in_cooldown()` and picks the next entry in the pool — or fails over to a different agent if none remain.
+4. The agent itself is not penalized — its other models still route normally.
+
+That's it. There is no list to update, no alias to add, no `is_known_unavailable_model()` to extend. If the cooldown is being cleared too early, fix the cooldown duration. If the wrong error variant is returned, fix the parser in the agent runner. If the model keeps coming back from config, that's a **config** problem (`~/.orch/config.yml` is human-managed — see "Config files are off-limits").
+
+Cautionary tales — these are exactly the mistake to never repeat:
+
+- **PR #3020** (`fix(router): canonicalize dead opencode copilot model alias`) added `canonicalize_model_alias()` and `is_known_unavailable_model()` with hardcoded `"github-copilot/gpt-5.3"` → `"gpt-5.3-codex"` rewrites in `src/engine/router/config.rs`. Wrong on two counts: (a) the rewrite produced an identifier the target CLI also rejected, and (b) there should never have been a hardcoded model string in code in the first place.
+- **PR #3040** (`fix(router): filter dead github-copilot/gpt-5.3 alias …`) tried to "fix" #3020 by reordering the same hardcoded match arms. It compounded the mistake instead of removing it.
+- **Issue #3051** (`gpt-5.3-codex not filtered for opencode agent — is_known_unavailable_model only covers …`) proposed adding **another** model name to the same hardcoded list. Closed as invalid for the same reason.
+
+Both PRs were reverted. If you are tempted to add a model name to a `match` or a `Vec<&str>` of "bad models", **stop**: the generic per-model cooldown already handles it the moment the dispatch fails, and any list you write rots the next time a model is renamed/added/removed. Do not file issues like #3051; do not write code like #3020.
+
+If `record_persistent_model_failure` is somehow not firing for your scenario, file an issue about the **classifier** (why didn't `AgentError::ModelUnavailable` come back?) or about the **cooldown duration** (why is the model being retried too soon?) — never about adding a specific model name to a filter.
+
 #### Pre-emptive Routability and Circuit-Breaker Behavior
 
 The router now implements two key optimizations to prevent unnecessary agent invocations:
