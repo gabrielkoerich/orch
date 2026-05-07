@@ -341,7 +341,7 @@ pub async fn handle_error(
             }
 
             (
-                response::RetryableError::Failed,
+                response::RetryableError::ModelUnavailable,
                 format!("model {model} unavailable"),
             )
         }

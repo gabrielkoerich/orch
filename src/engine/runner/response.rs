@@ -319,6 +319,10 @@ pub enum RetryableError {
     Failed,
     /// Missing tooling - fallback might help if another agent has the tool.
     MissingTooling,
+    /// A specific model was unavailable (e.g. "Model not found"). The agent
+    /// itself is fine — only the model is in cooldown. Failover may still pick
+    /// a different agent, but we must not bump the agent-level failure counter.
+    ModelUnavailable,
 }
 
 impl RetryableError {
@@ -330,6 +334,7 @@ impl RetryableError {
             RetryableError::Timeout => "timeout",
             RetryableError::UsageLimit => "rate_limit",
             RetryableError::AuthError => "auth_error",
+            RetryableError::ModelUnavailable => "model_unavailable",
             RetryableError::Failed | RetryableError::MissingTooling => "failed",
         }
     }
@@ -422,16 +427,23 @@ pub async fn handle_failover(
             "failover: switching to fallback agent"
         );
 
-        // Record agent failure for cooldown tracking
-        // Skip cooldown for MissingTooling — it's permanent, not transient
-        if !matches!(error_type, RetryableError::MissingTooling) {
+        // Record agent failure for cooldown tracking.
+        // Skip for MissingTooling — it's permanent, not transient.
+        // Skip for ModelUnavailable — only the specific model is dead; the
+        // agent itself is fine and its other models still route normally
+        // (the model-level cooldown was already set by the caller).
+        if !matches!(
+            error_type,
+            RetryableError::MissingTooling | RetryableError::ModelUnavailable
+        ) {
             record_agent_failure_with_message(agent_name, error_message).await;
-        }
 
-        // Apply brief 120s cooldown on the failed agent so the router skips it
-        // on the next routing attempt. This prevents the router from immediately
-        // re-selecting the same agent after clearing both agent and model (#1492).
-        set_agent_cooldown(agent_name, 120).await;
+            // Apply brief 120s cooldown on the failed agent so the router skips it
+            // on the next routing attempt. This prevents the router from immediately
+            // re-selecting the same agent after clearing both agent and model (#1492).
+            // Also skipped for ModelUnavailable: the agent is healthy.
+            set_agent_cooldown(agent_name, 120).await;
+        }
 
         let msg = format!("{error_message}, clearing agent/model for re-route");
         if let Err(e) = store::store_set_result(
@@ -483,9 +495,13 @@ pub async fn handle_failover(
     // No fallback available
     tracing::warn!(task_id, agent = agent_name, "no fallback agents available");
 
-    // Record agent failure for cooldown tracking
-    // Skip cooldown for MissingTooling — it's permanent, not transient
-    if !matches!(error_type, RetryableError::MissingTooling) {
+    // Record agent failure for cooldown tracking.
+    // Skip for MissingTooling (permanent) and ModelUnavailable (agent is fine,
+    // only the specific model is dead — model-level cooldown was already set).
+    if !matches!(
+        error_type,
+        RetryableError::MissingTooling | RetryableError::ModelUnavailable
+    ) {
         record_agent_failure_with_message(agent_name, error_message).await;
     }
 
