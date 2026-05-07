@@ -31,11 +31,35 @@ jobs:
         with:
           tool: cargo-llvm-cov,cargo-nextest
 
+      - name: Install zola
+        uses: taiki-e/install-action@v2
+        with:
+          tool: zola@0.22.1
+
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
           cache-all-crates: true
           # cache-workspace-crates: true
+
+      - name: Check for SELECT * in store files
+        run: |
+          # Fail CI if any store file contains SELECT * (excluding comments)
+          # This prevents SQLite OOB panics when schema changes
+          # Filter out: // comments, /// doc comments, //! module docs (format: file.rs:line:// content)
+          MATCHES=$(grep -n 'SELECT \*' src/store/*.rs | grep -vE ':[0-9]+:\s*(//|///|//!|#|\*)' | grep -v 'COLUMN_COLS' || true)
+          if [ -n "$MATCHES" ]; then
+            echo "ERROR: Found SELECT * in src/store/ files. Use explicit column lists instead."
+            echo "Matches:"
+            echo "$MATCHES"
+            echo ""
+            echo "See TASK_COLS, CONTROL_MESSAGE_COLS, JOB_STATE_COLS for examples."
+            exit 1
+          fi
+          echo "✓ No SELECT * found in store files"
+
+      - name: Check Zola docs build
+        run: zola --root docs build
 
       - name: Check formatting
         run: cargo fmt -- --check
@@ -72,36 +96,6 @@ jobs:
           prefix-key: "v1-rust"
           cache-all-crates: true
           # cache-workspace-crates: true
-
-      - name: Check formatting
-        run: cargo fmt -- --check
-
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Check for SELECT * in store files
-        run: |
-          # Fail CI if any store file contains SELECT * (excluding comments)
-          # This prevents SQLite OOB panics when schema changes
-          # Filter out: // comments, /// doc comments, //! module docs (format: file.rs:line:// content)
-          MATCHES=$(grep -n 'SELECT \*' src/store/*.rs | grep -vE ':[0-9]+:\s*(//|///|//!|#|\*)' | grep -v 'COLUMN_COLS' || true)
-          if [ -n "$MATCHES" ]; then
-            echo "ERROR: Found SELECT * in src/store/ files. Use explicit column lists instead."
-            echo "Matches:"
-            echo "$MATCHES"
-            echo ""
-            echo "See TASK_COLS, CONTROL_MESSAGE_COLS, JOB_STATE_COLS for examples."
-            exit 1
-          fi
-          echo "✓ No SELECT * found in store files"
-
-      - name: Install zola
-        uses: taiki-e/install-action@v2
-        with:
-          tool: zola@0.22.1
-
-      - name: Check Zola docs build
-        run: zola --root docs build
 
       - name: Run tests with coverage
         run: cargo llvm-cov nextest --lcov --output-path lcov.info
