@@ -656,32 +656,25 @@ async fn invoke_review_agent(
             .unwrap_or(-1);
 
             if exit_code != 0 {
-                let output_exists = tokio::task::spawn_blocking({
-                    let output_file = ctx.output_file.clone();
-                    move || output_file.exists()
-                })
-                .await
-                .unwrap_or(false);
-
-                if output_exists {
-                    let raw_output = runner::response::read_output_file(
-                        &ctx.review_task_id,
-                        &ctx.output_file,
-                        repo,
-                    )
-                    .await;
-                    let agent_result =
-                        runner::agents::find_agent_result(&ctx.review_agent, &raw_output);
-                    // Treat as success if we found a valid result without is_error set
-                    if agent_result.as_ref().map(|r| !r.is_error).unwrap_or(false) {
-                        tracing::info!(
-                            task_id = task.id.0,
-                            agent = %ctx.review_agent,
-                            exit_code,
-                            "review agent succeeded despite non-zero exit — proceeding to parse output"
-                        );
-                        return ReviewPhase::Ready(ReviewRun { run_id });
-                    }
+                // Try reading output via read_output_file which checks both the primary path
+                // and all prior attempt dirs as a fallback. This handles agents like kimi/minimax
+                // that exit non-zero even on success, as well as cases where the current attempt's
+                // output.json was not written but a prior attempt's output contains a valid result.
+                let raw_output =
+                    runner::response::read_output_file(&ctx.review_task_id, &ctx.output_file, repo)
+                        .await;
+                let agent_result =
+                    runner::agents::find_agent_result(&ctx.review_agent, &raw_output);
+                // Treat as success if we found a valid result without is_error set
+                if agent_result.as_ref().map(|r| !r.is_error).unwrap_or(false) {
+                    tracing::info!(
+                        task_id = task.id.0,
+                        agent = %ctx.review_agent,
+                        exit_code,
+                        output_found = !raw_output.is_empty(),
+                        "review agent succeeded despite non-zero exit — proceeding to parse output"
+                    );
+                    return ReviewPhase::Ready(ReviewRun { run_id });
                 }
             }
 
