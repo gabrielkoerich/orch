@@ -1844,19 +1844,76 @@ pub async fn serve() -> anyhow::Result<()> {
                     }
                     drop(router_guard);
 
-                    // Drain pending weight signals after webhook-triggered tick processing.
-                    while let Ok(signal) = weight_rx.try_recv() {
-                        let mut rw = router.write().await;
-                        match signal {
-                            WeightSignal::RateLimited { ref agent } => {
-                                rw.record_rate_limit(agent);
-                            }
-                            WeightSignal::Success { ref agent } => {
-                                rw.record_success(agent);
-                            }
-                            WeightSignal::Blocked | WeightSignal::None => {}
+                // Drain pending weight signals after webhook-triggered tick processing.
+                while let Ok(signal) = weight_rx.try_recv() {
+                    let mut rw = router.write().await;
+                    match signal {
+                        WeightSignal::RateLimited { ref agent } => {
+                            rw.record_rate_limit(agent);
                         }
+                        WeightSignal::Success { ref agent } => {
+                            rw.record_success(agent);
+                        }
+                        WeightSignal::Blocked | WeightSignal::None => {}
                     }
+                }
+
+                // Also attempt to run an immediate sync (ingest/cleanup) in the
+                // background so webhook-driven events (e.g. new issues) are
+                // picked up without waiting for the periodic sync interval.
+                // Reuse the same sync_in_progress guard used by the periodic
+                // branch to avoid concurrent syncs.
+                if sync_in_progress.compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed,
+                ).is_ok() {
+                    // Clone everything sync_tick needs — it runs in a spawned task.
+                    let sync_engines: Vec<_> = project_engines.iter().map(|e| {
+                        (e.backend.clone(), e.repo.clone(), e.task_manager.clone(), e.store.clone())
+                    }).collect();
+                    let sync_tmux = Arc::clone(&tmux);
+                    let sync_config = config.clone();
+                    let sync_router = Arc::clone(&router);
+                    let sync_dispatching = Arc::clone(&dispatching);
+                    let sync_auto_merge = Arc::clone(&auto_merge_in_flight);
+                    let sync_guard = Arc::clone(&sync_in_progress);
+                    tokio::spawn(async move {
+                        let sync_start = std::time::Instant::now();
+                        for (backend, repo, task_manager, store) in &sync_engines {
+                            let repo = repo.clone();
+                            REPO_CONTEXT.scope(repo.clone(), async {
+                                if let Err(e) = sync::sync_tick(
+                                    backend, &sync_tmux, &repo, &sync_config,
+                                    &sync_router, task_manager, store,
+                                    &sync_dispatching, &sync_auto_merge,
+                                ).await {
+                                    tracing::error!(repo = %repo, ?e, "webhook immediate sync tick failed for project");
+                                }
+                            }).await;
+                        }
+                        // Emit degraded-agents metric/log once per sync cycle.
+                        if let Some((_, _, _, store)) = sync_engines.first() {
+                            let (available_agents, config) = {
+                                let r = sync_router.read().await;
+                                (r.available_agents.clone(), r.config.clone())
+                            };
+                            sync::emit_degraded_agents_if_needed(
+                                &available_agents,
+                                &config,
+                                Some(store),
+                            ).await;
+                        }
+                        let elapsed = sync_start.elapsed();
+                        tracing::info!(elapsed_ms = elapsed.as_millis() as u64, "webhook immediate sync tick complete");
+                        sync_guard.store(false, std::sync::atomic::Ordering::Release);
+                    });
+                    // Record schedule time so periodic sync doesn't immediately re-run.
+                    last_sync = std::time::Instant::now();
+                } else {
+                    tracing::debug!("sync tick still in progress, skipping webhook-triggered immediate sync");
+                }
                 }
 
                 // Also reset the interval so we don't get a redundant tick right after
