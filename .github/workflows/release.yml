@@ -149,7 +149,6 @@ jobs:
 
   # Determine if a release is needed and what version to use
   check-release:
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
       skip: ${{ steps.check.outputs.skip }}
