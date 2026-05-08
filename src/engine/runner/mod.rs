@@ -253,6 +253,34 @@ fn parse_success_output(
                         duration_ms: agent_result.duration_ms,
                     });
                 }
+
+                // NDJSON envelope fallback: the envelope explicitly reports
+                // success (is_error=false) but the result content is domain
+                // JSON or plain prose that doesn't match AgentResponse schema
+                // and doesn't contain completion keywords.  Rather than
+                // returning InvalidResponse (which causes the task to re-run),
+                // synthesize a minimal "done" response from the result text.
+                if !agent_result.is_error {
+                    let summary_end =
+                        agents::truncate_at_char_boundary(&agent_result.result_text, 500);
+                    let summary = agent_result.result_text[..summary_end].to_string();
+                    tracing::warn!(
+                        task_id,
+                        agent = agent_name,
+                        "NDJSON envelope indicates success but result lacks AgentResponse \
+                         schema — synthesizing done response"
+                    );
+                    return Ok(agents::ParsedResponse {
+                        response: crate::parser::AgentResponse {
+                            status: "done".to_string(),
+                            summary,
+                            ..Default::default()
+                        },
+                        input_tokens: agent_result.input_tokens,
+                        output_tokens: agent_result.output_tokens,
+                        duration_ms: agent_result.duration_ms,
+                    });
+                }
             }
         }
     }
@@ -2878,5 +2906,63 @@ mod tests {
             result,
             "update_agent_label_after_reroute should return true when set_labels succeeds"
         );
+    }
+
+    // ── NDJSON envelope fallback (issue #3078) ────────────────────────────────
+
+    /// Pattern A: agent emits domain JSON as result (no `status` field).
+    /// NDJSON envelope says is_error=false, subtype=success.
+    /// Was previously returning InvalidResponse → task re-ran.
+    #[test]
+    fn parse_success_output_ndjson_envelope_fallback_domain_json_result() {
+        let domain_result = r#"{"file_path":"md/journal/2026-05-08-morning-briefing.md","summary":"Morning briefing filed","health":{"status":"ok"},"priorities":[]}"#;
+        let ndjson = format!(
+            r#"{{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":{domain_result:?},"usage":{{"input_tokens":3000,"output_tokens":400}}}}"#
+        );
+
+        let runner = agents::get_runner("glm");
+        let parsed = parse_success_output("149200", "glm", &*runner, &ndjson)
+            .expect("should synthesize done from NDJSON envelope when result is domain JSON");
+
+        assert_eq!(parsed.response.status, "done");
+        assert!(
+            parsed.response.summary.contains("file_path") || !parsed.response.summary.is_empty(),
+            "summary should be populated from domain JSON result text"
+        );
+        assert_eq!(parsed.input_tokens, Some(3000));
+        assert_eq!(parsed.output_tokens, Some(400));
+    }
+
+    /// Pattern B: agent emits plain prose as result, no completion keywords.
+    /// NDJSON envelope says is_error=false, subtype=success.
+    /// Was previously returning InvalidResponse → task re-ran.
+    #[test]
+    fn parse_success_output_ndjson_envelope_fallback_plain_prose_result() {
+        let prose = "PR #1008 now has zero diff vs main. The reverted ledger changes are gone and the branch is clean.";
+        let ndjson = format!(
+            r#"{{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":{prose:?},"usage":{{"input_tokens":2500,"output_tokens":300}}}}"#
+        );
+
+        let runner = agents::get_runner("claude");
+        let parsed = parse_success_output("149164", "claude", &*runner, &ndjson)
+            .expect("should synthesize done from NDJSON envelope when result is plain prose");
+
+        assert_eq!(parsed.response.status, "done");
+        assert_eq!(parsed.response.summary, prose);
+        assert_eq!(parsed.input_tokens, Some(2500));
+        assert_eq!(parsed.output_tokens, Some(300));
+    }
+
+    /// Verify that is_error=true in NDJSON envelope still returns AgentFailed,
+    /// not "done" — the envelope fallback must not override explicit errors.
+    #[test]
+    fn parse_success_output_ndjson_envelope_fallback_skipped_when_is_error_true() {
+        let ndjson = r#"{"type":"result","subtype":"error","is_error":true,"result":"Something went wrong with no status"}"#;
+
+        let runner = agents::get_runner("claude");
+        let err = parse_success_output("149999", "claude", &*runner, ndjson)
+            .expect_err("is_error=true should return AgentFailed");
+
+        assert!(matches!(err, agents::AgentError::AgentFailed { .. }));
     }
 }
