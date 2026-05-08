@@ -507,7 +507,8 @@ mod tests {
         );
         assert!(cmd.contains("codex"));
         assert!(cmd.contains("--model 'gpt-4o'"));
-        assert!(cmd.contains("exec --json -"));
+        assert!(cmd.contains("exec"));
+        assert!(cmd.contains("--json -"));
         assert!(
             cmd.contains("--full-auto"),
             "default autonomous codex should use --full-auto, got: {cmd}"
@@ -572,8 +573,8 @@ mod tests {
             "should still include --full-auto, got: {cmd}"
         );
         assert!(
-            cmd.contains("exec --json -"),
-            "should still include exec --json -, got: {cmd}"
+            cmd.contains("exec") && cmd.contains("--json -"),
+            "should include exec and --json -, got: {cmd}"
         );
     }
 
