@@ -257,12 +257,16 @@ impl AgentRunner for CodexRunner {
             .collect::<Vec<_>>()
             .join(" ");
 
+        // Place permission flags (eg. --full-auto) and any --add-dir flags AFTER
+        // the `exec` subcommand. Recent codex CLI (0.128.0) treats flags placed
+        // before `exec` differently, causing autonomous dispatch to fail when
+        // `--full-auto` appears before `exec`. Moving these ensures compatibility
+        // with the newer CLI while keeping the rest of the invocation intact.
         format!(
             r#"cat "{sys_file}" "{msg_file}" | {timeout_cmd} codex {model_flag} \
-  {permission_flags} {add_dir_flags}\
   -c 'sandbox_workspace_write.network_access=true' \
   -c 'shell_environment_policy.inherit=all' \
-  exec --json -"#,
+  exec {permission_flags} {add_dir_flags} --json -"#,
             sys_file = sys_file,
             msg_file = msg_file,
             timeout_cmd = timeout_cmd,
@@ -503,7 +507,8 @@ mod tests {
         );
         assert!(cmd.contains("codex"));
         assert!(cmd.contains("--model 'gpt-4o'"));
-        assert!(cmd.contains("exec --json -"));
+        assert!(cmd.contains("exec"));
+        assert!(cmd.contains("--json -"));
         assert!(
             cmd.contains("--full-auto"),
             "default autonomous codex should use --full-auto, got: {cmd}"
@@ -568,8 +573,8 @@ mod tests {
             "should still include --full-auto, got: {cmd}"
         );
         assert!(
-            cmd.contains("exec --json -"),
-            "should still include exec --json -, got: {cmd}"
+            cmd.contains("exec") && cmd.contains("--json -"),
+            "should include exec and --json -, got: {cmd}"
         );
     }
 
