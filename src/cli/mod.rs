@@ -29,6 +29,7 @@ use tokio::sync::broadcast;
 ///
 /// Shows CLI version and, if the service is running, the service version.
 /// Warns when they differ so operators can detect CLI/service drift.
+/// Also fetches the latest GitHub release and warns when the local build is behind.
 pub fn version() {
     let cli_version = env!("ORCH_VERSION");
     println!("CLI:     {cli_version}");
@@ -48,6 +49,40 @@ pub fn version() {
         None => {
             println!("Service: not running (no service.version file)");
         }
+    }
+
+    if let Some(latest) = fetch_latest_release_version() {
+        if latest != cli_version {
+            println!("Latest:  {latest}  ⚠  upgrade available — run: brew update && brew upgrade orch && brew services restart orch");
+        } else {
+            println!("Latest:  {latest}  ✓ up to date");
+        }
+    }
+}
+
+/// Fetch the latest orch release tag from GitHub via the `gh` CLI.
+///
+/// Returns the version string (without the leading "v"), or `None` if the
+/// check fails (no network, unauthenticated, `gh` not installed, etc.).
+fn fetch_latest_release_version() -> Option<String> {
+    let output = std::process::Command::new("gh")
+        .args([
+            "api",
+            "repos/gabrielkoerich/orch/releases/latest",
+            "--jq",
+            ".tag_name",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let tag = String::from_utf8(output.stdout).ok()?;
+    let version = tag.trim().trim_start_matches('v').to_string();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version)
     }
 }
 

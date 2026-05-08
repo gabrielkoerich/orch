@@ -677,6 +677,33 @@ fn read_project_channel_config(project_dir: &std::path::Path) -> ProjectChannelC
     }
 }
 
+/// Fetch the latest orch release tag from GitHub via the `gh` CLI (async).
+///
+/// Returns the version string (without the leading "v"), or `None` when the
+/// check fails (no network, unauthenticated, `gh` not installed, etc.).
+async fn fetch_latest_release_version() -> Option<String> {
+    let output = Command::new("gh")
+        .args([
+            "api",
+            "repos/gabrielkoerich/orch/releases/latest",
+            "--jq",
+            ".tag_name",
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let tag = String::from_utf8(output.stdout).ok()?;
+    let version = tag.trim().trim_start_matches('v').to_string();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version)
+    }
+}
+
 /// Start the orch service.
 ///
 /// This is the main entry point — called by `orch serve`.
@@ -744,6 +771,22 @@ pub async fn serve() -> anyhow::Result<()> {
             ?e,
             "failed to start event websocket server, continuing without it"
         );
+    }
+
+    // Check for a newer orch release in the background and warn if the service is behind.
+    {
+        let current = env!("ORCH_VERSION").to_string();
+        tokio::spawn(async move {
+            if let Some(latest) = fetch_latest_release_version().await {
+                if latest != current {
+                    tracing::warn!(
+                        current_version = %current,
+                        latest_version = %latest,
+                        "orch service is behind the latest release — run: brew update && brew upgrade orch && brew services restart orch"
+                    );
+                }
+            }
+        });
     }
 
     // Re-create task managers with shared store and event bus
