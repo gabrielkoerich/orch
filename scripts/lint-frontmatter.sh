@@ -8,7 +8,7 @@ set -euo pipefail
 CONTENT_DIR="docs/content"
 ERRORS=0
 
-for file in $(find "$CONTENT_DIR" -name "*.md" 2>/dev/null); do
+while IFS= read -r -d '' file; do
     # Get first 30 lines for front matter analysis
     front_matter=$(head -n 30 "$file")
 
@@ -21,7 +21,7 @@ for file in $(find "$CONTENT_DIR" -name "*.md" 2>/dev/null); do
         # Exclude lines inside code blocks (between ``` or ```)
         in_code_block=false
         delimiter_count=0
-        for line in $front_matter; do
+        while IFS= read -r line; do
             if echo "$line" | grep -q '^```'; then
                 if [ "$in_code_block" = false ]; then
                     in_code_block=true
@@ -31,7 +31,7 @@ for file in $(find "$CONTENT_DIR" -name "*.md" 2>/dev/null); do
             elif [ "$in_code_block" = false ] && [ "$line" = "+++" ]; then
                 delimiter_count=$((delimiter_count + 1))
             fi
-        done
+        done <<< "$front_matter"
 
         if [ "$delimiter_count" -ne 2 ]; then
             echo "ERROR: $file has mismatched TOML front matter (+ count: $delimiter_count, expected 2)"
@@ -65,7 +65,7 @@ for file in $(find "$CONTENT_DIR" -name "*.md" 2>/dev/null); do
         echo "ERROR: $file is missing front matter (no +++ or --- delimiter found)"
         ERRORS=$((ERRORS + 1))
     fi
-done
+done < <(find "$CONTENT_DIR" -name "*.md" -print0 2>/dev/null)
 
 if [ "$ERRORS" -gt 0 ]; then
     echo ""
