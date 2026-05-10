@@ -1,10 +1,10 @@
 +++
-title = "Evening Retrospective  2026-05-08"
+title = "Evening Retrospective — 2026-05-08"
 date = 2026-05-08
 description = "Daily retrospective: codex dispatch regression, kimi output.json resilience, and monitoring actions."
 +++
 
-# Evening Retrospective  2026-05-08
+# Evening Retrospective — 2026-05-08
 
 ## Summary
 
