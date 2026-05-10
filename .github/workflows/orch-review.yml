@@ -12,6 +12,36 @@ permissions:
   issues: read
 
 jobs:
+  docs-build:
+    name: Docs Build (Zola)
+    runs-on: ubuntu-latest
+    if: github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect docs changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            docs:
+              - 'docs/**'
+
+      - name: Install zola
+        if: steps.changes.outputs.docs == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: zola@0.22.1
+
+      - name: Build docs
+        if: steps.changes.outputs.docs == 'true'
+        run: zola --root docs build
+
+      - name: Skip docs build when no docs changed
+        if: steps.changes.outputs.docs != 'true'
+        run: echo "No docs changes detected; skipping zola build."
+
   review-gate:
     runs-on: ubuntu-latest
     if: github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
