@@ -260,7 +260,16 @@ fn parse_success_output(
                 // and doesn't contain completion keywords.  Rather than
                 // returning InvalidResponse (which causes the task to re-run),
                 // synthesize a minimal "done" response from the result text.
-                if !agent_result.is_error {
+                //
+                // Guard against kimi/minimax edge case: when terminal_reason=completed
+                // but result text is empty, synthesize returns None, parse_success_output
+                // returns InvalidResponse, and parse_session_output can intercept it
+                // before classify_error. Requiring non-empty result here means the
+                // envelope fallback only fires when we have actual text to report.
+                if !agent_result.is_error
+                    && raw_stdout.contains("\"terminal_reason\":\"completed\"")
+                    && !agent_result.result_text.is_empty()
+                {
                     let summary_end =
                         agents::truncate_at_char_boundary(&agent_result.result_text, 500);
                     let summary = agent_result.result_text[..summary_end].to_string();
@@ -314,6 +323,80 @@ fn parse_success_output(
         }
         Err(err) => Err(err),
     }
+}
+
+/// Parse session output, handling the kimi/minimax exit-1-with-completed-edge case.
+///
+/// Tries `parse_success_output` first when stdout is non-empty. If that succeeds,
+/// returns success regardless of exit code. If it fails and `exit_code != 0`,
+/// checks for `"terminal_reason":"completed"` in stdout before falling back to
+/// `classify_error` — so valid sessions that exit 1 produce `InvalidResponse`
+/// (soft error, re-route) instead of a garbled `Unknown`/`Auth` error (hard failure
+/// with spurious cooldown).
+pub fn parse_session_output(
+    task_id: &str,
+    agent_name: &str,
+    agent_runner: &dyn agents::AgentRunner,
+    session_output: &session::SessionOutput,
+) -> Result<agents::ParsedResponse, agents::AgentError> {
+    if !session_output.raw_stdout.is_empty() {
+        match parse_success_output(
+            task_id,
+            agent_name,
+            agent_runner,
+            &session_output.raw_stdout,
+        ) {
+            Ok(parsed) => return Ok(parsed),
+            Err(err) => {
+                // If parse_success_output already returned AgentFailed (e.g. is_error=true
+                // in NDJSON envelope), propagate it directly — the session had an explicit
+                // error and we should not try to re-classify it or intercept it.
+                if matches!(err, agents::AgentError::AgentFailed { .. }) {
+                    return Err(err);
+                }
+                if session_output.exit_code != 0 {
+                    // kimi/minimax sometimes emit valid NDJSON with
+                    // "terminal_reason":"completed" but exit 1 due to a
+                    // post-session hook or minor CLI issue. Scanning the
+                    // tail would just grab JSON metadata, producing a
+                    // garbled error. Detect the explicit completion
+                    // signal and treat it as a soft parse error so the
+                    // task re-routes instead of hitting a false
+                    // cooldown from Unknown or Auth error variants.
+                    if session_output
+                        .raw_stdout
+                        .contains("\"terminal_reason\":\"completed\"")
+                    {
+                        let raw_tail = agents::patterns::safe_tail(&session_output.raw_stdout, 300);
+                        return Err(agents::AgentError::InvalidResponse {
+                            raw: raw_tail.to_string(),
+                        });
+                    }
+                    return Err(agent_runner.classify_error_with_elapsed(
+                        session_output.exit_code,
+                        &session_output.raw_stdout,
+                        &session_output.raw_stderr,
+                        session_output.elapsed_secs,
+                    ));
+                }
+                return Err(err);
+            }
+        }
+    }
+
+    if session_output.exit_code != 0 {
+        return Err(agent_runner.classify_error_with_elapsed(
+            session_output.exit_code,
+            &session_output.raw_stdout,
+            &session_output.raw_stderr,
+            session_output.elapsed_secs,
+        ));
+    }
+
+    Err(agents::AgentError::Unknown {
+        exit_code: session_output.exit_code,
+        message: "empty-output-exit0: opencode returned exit 0 with empty stdout".to_string(),
+    })
 }
 
 /// Task runner configuration.
@@ -708,58 +791,6 @@ impl TaskRunner {
         // back to error classification when parsing fails and the process exit
         // code indicates an error.
         let agent_runner = agents::get_runner(&init.agent_name);
-
-        fn parse_session_output(
-            task_id: &str,
-            agent_name: &str,
-            agent_runner: &dyn agents::AgentRunner,
-            session_output: &crate::engine::runner::session::SessionOutput,
-        ) -> Result<agents::ParsedResponse, agents::AgentError> {
-            // If there's stdout, try the unified success parser first.
-            if !session_output.raw_stdout.is_empty() {
-                match parse_success_output(
-                    task_id,
-                    agent_name,
-                    agent_runner,
-                    &session_output.raw_stdout,
-                ) {
-                    Ok(parsed) => return Ok(parsed),
-                    Err(err) => {
-                        // If the process exit code indicates failure, prefer the
-                        // classifier which examines stdout+stderr tail for CLI
-                        // style errors (rate limits, auth, missing tool, etc.).
-                        if session_output.exit_code != 0 {
-                            return Err(agent_runner.classify_error_with_elapsed(
-                                session_output.exit_code,
-                                &session_output.raw_stdout,
-                                &session_output.raw_stderr,
-                                session_output.elapsed_secs,
-                            ));
-                        }
-                        // Exit code 0 but parsing failed — propagate the parse error.
-                        return Err(err);
-                    }
-                }
-            }
-
-            // No stdout present
-            if session_output.exit_code != 0 {
-                return Err(agent_runner.classify_error_with_elapsed(
-                    session_output.exit_code,
-                    &session_output.raw_stdout,
-                    &session_output.raw_stderr,
-                    session_output.elapsed_secs,
-                ));
-            }
-
-            // Exit 0 and empty output — silent failure marker used elsewhere.
-            Err(agents::AgentError::Unknown {
-                exit_code: session_output.exit_code,
-                message: "empty-output-exit0: opencode returned exit 0 with empty stdout"
-                    .to_string(),
-            })
-        }
-
         let parse_result =
             parse_session_output(task_id, &init.agent_name, &*agent_runner, &session_output);
 
@@ -2964,5 +2995,63 @@ mod tests {
             .expect_err("is_error=true should return AgentFailed");
 
         assert!(matches!(err, agents::AgentError::AgentFailed { .. }));
+    }
+
+    // ── terminal_reason:completed + exit 1 detection (issue #3087) ─────────────
+
+    /// kimi/minimax sometimes emit valid NDJSON with terminal_reason=completed
+    /// but exit 1. In that case parse_success_output may fail (e.g. empty result
+    /// text that synthesize can't parse), then parse_session_output would
+    /// normally fall back to classify_error — grabbing a garbled JSON tail and
+    /// producing a spurious Unknown/Auth error. The fix intercepts this and
+    /// returns InvalidResponse (soft error, re-route) instead.
+    #[test]
+    fn parse_session_output_exit1_with_terminal_reason_completed_returns_invalid_response() {
+        // Empty result text causes synthesize_response_from_text to return None
+        // (empty/whitespace-only input), so parse_success_output returns
+        // InvalidResponse. With the fix, parse_session_output intercepts the
+        // "terminal_reason":"completed" signal before classify_error and
+        // returns InvalidResponse (re-route) instead of a garbled error.
+        let ndjson = r#"{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":"","usage":{"input_tokens":1000,"output_tokens":100}}"#;
+        let session = session::SessionOutput {
+            exit_code: 1,
+            raw_stdout: ndjson.to_string(),
+            raw_stderr: String::new(),
+            elapsed_secs: Some(30),
+        };
+
+        let runner = agents::get_runner("claude");
+        let result = parse_session_output("149298", "claude", &*runner, &session);
+
+        let err = result.expect_err("should be an error, not Ok");
+        assert!(
+            matches!(err, agents::AgentError::InvalidResponse { .. }),
+            "should be InvalidResponse, got {err:?}"
+        );
+    }
+
+    /// terminal_reason=completed must NOT override actual error conditions.
+    /// When is_error=true in the NDJSON envelope, AgentFailed must be returned
+    /// even if terminal_reason=completed is also present. Only kimi/minimax
+    /// agents use find_claude_result which extracts is_error, so use "kimi"
+    /// as agent_name.
+    #[test]
+    fn parse_session_output_exit1_preserves_error_when_is_error_true() {
+        let ndjson = r#"{"type":"result","subtype":"error","is_error":true,"terminal_reason":"completed","result":"failed"}"#;
+        let session = session::SessionOutput {
+            exit_code: 1,
+            raw_stdout: ndjson.to_string(),
+            raw_stderr: String::new(),
+            elapsed_secs: Some(30),
+        };
+
+        let runner = agents::get_runner("kimi");
+        let result = parse_session_output("149299", "kimi", &*runner, &session);
+
+        let err = result.expect_err("should be an error");
+        assert!(
+            matches!(err, agents::AgentError::AgentFailed { .. }),
+            "is_error=true should return AgentFailed, got {err:?}"
+        );
     }
 }
