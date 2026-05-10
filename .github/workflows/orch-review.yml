@@ -20,7 +20,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Lint docs front matter
-        run: scripts/lint-frontmatter.sh
+        run: |
+          chmod +x scripts/lint-frontmatter.sh
+          ./scripts/lint-frontmatter.sh
 
       - name: Check automated review status
         env:

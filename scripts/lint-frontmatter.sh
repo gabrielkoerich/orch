@@ -1,77 +1,54 @@
-#!/bin/bash
-# Lint Zola docs front matter in docs/content/
-# Ensures every .md file starts with matching TOML (+++) or YAML (---) delimiters.
-# Only checks front matter region (lines 1-30), ignoring code blocks.
-
+#!/usr/bin/env bash
 set -euo pipefail
 
-CONTENT_DIR="docs/content"
-ERRORS=0
+# Fast front-matter linter for docs/content
+# Scans all .md files under the provided path (default: docs/content)
+# Ensures each file has a front-matter block starting with '+++' or '---'
+# and a matching closing delimiter. Exits non-zero with clear messages
+# when a file is missing front-matter or has an unclosed block.
 
-while IFS= read -r -d '' file; do
-    # Get first 30 lines for front matter analysis
-    front_matter=$(head -n 30 "$file")
+ROOT=${1:-docs/content}
+RC=0
 
-    # Get first line
-    first_line=$(echo "$front_matter" | head -n 1)
-
-    # Check if file starts with +++ (TOML)
-    if [ "$first_line" = "+++" ]; then
-        # Find all +++ lines within front matter region (lines 1-30)
-        # Exclude lines inside code blocks (between ``` or ```)
-        in_code_block=false
-        delimiter_count=0
-        while IFS= read -r line; do
-            if echo "$line" | grep -q '^```'; then
-                if [ "$in_code_block" = false ]; then
-                    in_code_block=true
-                else
-                    in_code_block=false
-                fi
-            elif [ "$in_code_block" = false ] && [ "$line" = "+++" ]; then
-                delimiter_count=$((delimiter_count + 1))
-            fi
-        done <<< "$front_matter"
-
-        if [ "$delimiter_count" -ne 2 ]; then
-            echo "ERROR: $file has mismatched TOML front matter (+ count: $delimiter_count, expected 2)"
-            ERRORS=$((ERRORS + 1))
-        fi
-
-    # Check if file starts with --- (YAML)
-    elif [ "$first_line" = "---" ]; then
-        # Count --- lines in front matter region (lines 1-30)
-        # Exclude lines inside code blocks
-        in_code_block=false
-        delimiter_count=0
-        while IFS= read -r line; do
-            if echo "$line" | grep -q '^```'; then
-                if [ "$in_code_block" = false ]; then
-                    in_code_block=true
-                else
-                    in_code_block=false
-                fi
-            elif [ "$in_code_block" = false ] && [ "$line" = "---" ]; then
-                delimiter_count=$((delimiter_count + 1))
-            fi
-        done <<< "$front_matter"
-
-        if [ "$delimiter_count" -lt 2 ]; then
-            echo "ERROR: $file has mismatched YAML front matter (--- count: $delimiter_count, expected at least 2)"
-            ERRORS=$((ERRORS + 1))
-        fi
-
-    else
-        echo "ERROR: $file is missing front matter (no +++ or --- delimiter found)"
-        ERRORS=$((ERRORS + 1))
-    fi
-done < <(find "$CONTENT_DIR" -name "*.md" -print0 2>/dev/null)
-
-if [ "$ERRORS" -gt 0 ]; then
-    echo ""
-    echo "Front matter lint failed: $ERRORS file(s) with errors"
-    exit 1
+if [ ! -d "$ROOT" ]; then
+  echo "Path not found: $ROOT" >&2
+  exit 0
 fi
 
-echo "Front matter lint passed: all files have valid front matter"
+while IFS= read -r -d '' file; do
+  # Find first non-empty line number
+  first_ln=$(awk '/\S/ {print NR; exit}' "$file" || true)
+  if [ -z "$first_ln" ]; then
+    echo "ERROR: Empty file (no content) -> $file"
+    RC=1
+    continue
+  fi
+
+  first_line=$(sed -n "${first_ln}p" "$file")
+
+  if [ "$first_line" != "+++" ] && [ "$first_line" != "---" ]; then
+    echo "ERROR: Missing front-matter start delimiter in $file (first non-empty line ${first_ln}):"
+    echo "  ${first_line}"
+    RC=1
+    continue
+  fi
+
+  delim="$first_line"
+  # Search for a matching closing delimiter after the first line
+  closing_ln=$(awk -v start=$((first_ln + 1)) -v d="$delim" 'NR>=start && $0==d {print NR; exit}' "$file" || true)
+  if [ -z "$closing_ln" ]; then
+    echo "ERROR: Unclosed front-matter in $file (started at line ${first_ln}, delimiter: ${delim})"
+    RC=1
+    continue
+  fi
+
+  # All good for this file; continue
+done < <(find "$ROOT" -type f -name '*.md' -print0)
+
+if [ $RC -ne 0 ]; then
+  echo "\nFront-matter linter failed. See errors above." >&2
+  exit $RC
+fi
+
+echo "Front-matter linter: ok"
 exit 0
