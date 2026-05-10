@@ -17,7 +17,7 @@ fi
 
 while IFS= read -r -d '' file; do
   # Find first non-empty line number
-  first_ln=$(awk '/\S/ {print NR; exit}' "$file" || true)
+  first_ln=$(awk '/[^ \t]/ {print NR; exit}' "$file" || true)
   if [ -z "$first_ln" ]; then
     echo "ERROR: Empty file (no content) -> $file"
     RC=1

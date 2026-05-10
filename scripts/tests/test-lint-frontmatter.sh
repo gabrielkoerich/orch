@@ -9,23 +9,16 @@ trap cleanup EXIT
 mkdir -p "$TMPDIR/docs/content/sub"
 
 # Good file with +++
-cat > "$TMPDIR/docs/content/good1.md" <<'EOF'
-++
-++
-EOF
+echo -e "+++\n+++\nGood content" > "$TMPDIR/docs/content/good1.md"
 
 # Good file with ---
-cat > "$TMPDIR/docs/content/good2.md" <<'EOF'
-EOF
+echo -e "---\n---\nGood content" > "$TMPDIR/docs/content/good2.md"
 
 # Bad file: missing front matter
-cat > "$TMPDIR/docs/content/bad1.md" <<'EOF'
-EOF
+echo "Some text without front matter" > "$TMPDIR/docs/content/bad1.md"
 
 # Bad file: unclosed front matter
-cat > "$TMPDIR/docs/content/sub/bad2.md" <<'EOF'
-++
-EOF
+echo "+++" > "$TMPDIR/docs/content/sub/bad2.md"
 
 set +e
 "$(pwd)/scripts/lint-frontmatter.sh" "$TMPDIR/docs/content"
