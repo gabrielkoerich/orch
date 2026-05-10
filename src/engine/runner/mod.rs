@@ -325,14 +325,14 @@ fn parse_success_output(
     }
 }
 
-/// Parse session output, handling the kimi/minimax exit-1-with-completed-edge case.
+/// Parse session output, handling the kimi/minimax/glm exit-1-with-completed-edge case.
 ///
 /// Tries `parse_success_output` first when stdout is non-empty. If that succeeds,
 /// returns success regardless of exit code. If it fails and `exit_code != 0`,
-/// checks for `"terminal_reason":"completed"` in stdout before falling back to
-/// `classify_error` — so valid sessions that exit 1 produce `InvalidResponse`
-/// (soft error, re-route) instead of a garbled `Unknown`/`Auth` error (hard failure
-/// with spurious cooldown).
+/// checks for `"terminal_reason":"completed"` or cost-telemetry-only stdout
+/// (`"costUSD":`) in stdout before falling back to `classify_error` — so valid
+/// sessions that exit 1 produce `InvalidResponse` (soft error, re-route) instead
+/// of a garbled `Unknown`/`Auth` error (hard failure with spurious cooldown).
 pub fn parse_session_output(
     task_id: &str,
     agent_name: &str,
@@ -355,19 +355,25 @@ pub fn parse_session_output(
                     return Err(err);
                 }
                 if session_output.exit_code != 0 {
-                    // kimi/minimax sometimes emit valid NDJSON with
-                    // "terminal_reason":"completed" but exit 1 due to a
-                    // post-session hook or minor CLI issue. Scanning the
-                    // tail would just grab JSON metadata, producing a
-                    // garbled error. Detect the explicit completion
-                    // signal and treat it as a soft parse error so the
-                    // task re-routes instead of hitting a false
-                    // cooldown from Unknown or Auth error variants.
-                    if session_output
-                        .raw_stdout
-                        .contains("\"terminal_reason\":\"completed\"")
-                    {
-                        let raw_tail = agents::patterns::safe_tail(&session_output.raw_stdout, 300);
+                    // kimi/minimax/glm sometimes emit valid NDJSON with
+                    // "terminal_reason":"completed" or cost-only telemetry
+                    // ("costUSD":) but exit 1 due to a post-session hook or
+                    // minor CLI issue. Scanning the tail would just grab JSON
+                    // metadata, producing a garbled error. Detect either
+                    // completion signal and treat as a soft parse error so the
+                    // task re-routes instead of hitting a false cooldown from
+                    // Unknown or Auth error variants.
+                    let stdout = &session_output.raw_stdout;
+                    let is_completed_signal = stdout.contains("\"terminal_reason\":\"completed\"");
+                    // GLM emits a cost-telemetry JSON object (containing
+                    // "costUSD":) as its final stdout line on clean exit even
+                    // when the process exits with code 1. If the only content
+                    // is such telemetry (no is_error=true in the envelope),
+                    // treat it the same as terminal_reason:completed.
+                    let is_cost_telemetry_only =
+                        stdout.contains("\"costUSD\":") && !stdout.contains("\"is_error\":true");
+                    if is_completed_signal || is_cost_telemetry_only {
+                        let raw_tail = agents::patterns::safe_tail(stdout, 300);
                         return Err(agents::AgentError::InvalidResponse {
                             raw: raw_tail.to_string(),
                         });
@@ -3027,6 +3033,54 @@ mod tests {
         assert!(
             matches!(err, agents::AgentError::InvalidResponse { .. }),
             "should be InvalidResponse, got {err:?}"
+        );
+    }
+
+    // ── GLM cost-telemetry exit-1 detection (issue #3094) ──────────────────────
+
+    /// GLM exits with code 1 but stdout is only cost telemetry JSON (contains
+    /// "costUSD":). This must return InvalidResponse (soft re-route) instead of
+    /// a hard Failed classification with spurious agent cooldown.
+    #[test]
+    fn parse_session_output_exit1_with_cost_telemetry_returns_invalid_response() {
+        // GLM emits cost/usage JSON on clean exit; exit code 1 is a false failure.
+        let telemetry = r#"{"type":"result","subtype":"success","is_error":false,"result":"","costUSD":0.042,"usage":{"input_tokens":5000,"output_tokens":800}}"#;
+        let session = session::SessionOutput {
+            exit_code: 1,
+            raw_stdout: telemetry.to_string(),
+            raw_stderr: String::new(),
+            elapsed_secs: Some(120),
+        };
+
+        let runner = agents::get_runner("glm");
+        let result = parse_session_output("149347", "glm", &*runner, &session);
+
+        let err = result.expect_err("should be an error, not Ok");
+        assert!(
+            matches!(err, agents::AgentError::InvalidResponse { .. }),
+            "glm cost-telemetry exit-1 should return InvalidResponse, got {err:?}"
+        );
+    }
+
+    /// GLM with costUSD AND is_error:true — must propagate AgentFailed, not
+    /// silently swallow the error via the cost-telemetry guard.
+    #[test]
+    fn parse_session_output_exit1_cost_telemetry_with_is_error_true_propagates_failure() {
+        let telemetry = r#"{"type":"result","subtype":"error","is_error":true,"result":"tool failed","costUSD":0.01,"usage":{"input_tokens":100,"output_tokens":10}}"#;
+        let session = session::SessionOutput {
+            exit_code: 1,
+            raw_stdout: telemetry.to_string(),
+            raw_stderr: String::new(),
+            elapsed_secs: Some(15),
+        };
+
+        let runner = agents::get_runner("glm");
+        let result = parse_session_output("149348", "glm", &*runner, &session);
+
+        let err = result.expect_err("should be an error");
+        assert!(
+            matches!(err, agents::AgentError::AgentFailed { .. }),
+            "is_error=true with costUSD must still return AgentFailed, got {err:?}"
         );
     }
 
