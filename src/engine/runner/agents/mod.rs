@@ -1072,6 +1072,10 @@ pub(crate) mod patterns {
     }
 
     /// Check for auth / billing error patterns in text.
+    ///
+    /// Returns the line containing the match (not the tail) so the stored
+    /// error message is the actual error string rather than trailing output
+    /// (e.g. NDJSON session metadata that agents emit at exit).
     pub fn detect_auth_error(text: &str) -> Option<AgentError> {
         let lower = text.to_lowercase();
         let patterns = [
@@ -1100,19 +1104,97 @@ pub(crate) mod patterns {
             "credit balance too low",
             "payment required",
         ];
+        // Use standalone check for HTTP status codes (same rationale as
+        // detect_rate_limit: avoid matching port numbers, line numbers, etc.).
         let http_401 = contains_http_status(&lower, "401");
         let http_403 = contains_http_status(&lower, "403");
         let http_407 = contains_http_status(&lower, "407");
         let proxy_auth_required = lower.contains("proxy authentication required");
-        if patterns.iter().any(|p| lower.contains(p))
-            || http_401
-            || http_403
-            || http_407
-            || proxy_auth_required
+        if !patterns.iter().any(|p| lower.contains(p))
+            && !http_401
+            && !http_403
+            && !http_407
+            && !proxy_auth_required
         {
-            return Some(AgentError::Auth {
-                message: safe_tail(text, 300).to_string(),
-            });
+            return None;
+        }
+        // Find the first auth error match position to extract its line.
+        let first_match_pos =
+            patterns
+                .iter()
+                .filter_map(|p| lower.find(p))
+                .min()
+                .map(|lower_pos| {
+                    let char_idx = lower[..lower_pos].chars().count();
+                    text.char_indices()
+                        .nth(char_idx)
+                        .map_or(text.len(), |(i, _)| i)
+                });
+        // Also check HTTP status codes for standalone matches (not caught by
+        // pattern strings like "401" is too short to add as a pattern).
+        let http_match_pos = if http_401 {
+            lower.find("401 ").or_else(|| lower.find(": 401"))
+        } else {
+            None
+        };
+        let http_pos = http_match_pos.and_then(|rel| {
+            let char_idx = lower[..rel].chars().count();
+            text.char_indices().nth(char_idx).map(|(i, _)| i)
+        });
+        let match_pos = [first_match_pos, http_pos].into_iter().flatten().min();
+        let message = if let Some(pos) = match_pos {
+            find_line_containing(text, pos)
+        } else {
+            // Pattern matched but couldn't find position (e.g. 401 standalone).
+            // Fall back to scanning last 50 lines for the error line.
+            find_auth_line_scan(text).unwrap_or_else(|| safe_tail(text, 300).to_string())
+        };
+        Some(AgentError::Auth { message })
+    }
+
+    /// Returns the full line containing `byte_pos` in `text`.
+    fn find_line_containing(text: &str, byte_pos: usize) -> String {
+        let start = text[..byte_pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let end = text[byte_pos..]
+            .find('\n')
+            .map(|i| byte_pos + i)
+            .unwrap_or(text.len());
+        text[start..end].trim().to_string()
+    }
+
+    /// Scans the last 50 lines of `text` for a line containing an auth error
+    /// pattern (401, unauthorized, invalid api, etc.). Used as fallback when
+    /// match position is unavailable.
+    fn find_auth_line_scan(text: &str) -> Option<String> {
+        for line in text.lines().rev().take(50) {
+            let line_lower = line.to_lowercase();
+            if line_lower.contains("401")
+                || line_lower.contains("403")
+                || line_lower.contains("unauthorized")
+                || line_lower.contains("authentication required")
+                || line_lower.contains("invalid api")
+                || line_lower.contains("invalid key")
+                || line_lower.contains("invalid token")
+                || line_lower.contains("auth fail")
+                || line_lower.contains("no api key")
+                || line_lower.contains("no token")
+                || line_lower.contains("expired key")
+                || line_lower.contains("expired token")
+                || line_lower.contains("expired plan")
+                || line_lower.contains("billing plan")
+                || line_lower.contains("billing error")
+                || line_lower.contains("billing suspended")
+                || line_lower.contains("billing expired")
+                || line_lower.contains("billing limit")
+                || line_lower.contains("billing failed")
+                || line_lower.contains("billing cycle exhausted")
+                || line_lower.contains("insufficient credit")
+                || line_lower.contains("credit balance too low")
+                || line_lower.contains("payment required")
+                || line_lower.contains("proxy authentication required")
+            {
+                return Some(line.trim().to_string());
+            }
         }
         None
     }
@@ -1648,6 +1730,33 @@ mod tests {
         // ": 401" at end-of-string or followed by non-digit must still match.
         assert!(patterns::detect_auth_error("status: 401").is_some());
         assert!(patterns::detect_auth_error("error: 403").is_some());
+    }
+
+    #[test]
+    fn auth_error_message_contains_match_not_tail() {
+        // Simulate real agent output: auth error appears early, NDJSON session
+        // metadata at the end. Stored message must be the error line, not the
+        // trailing JSON that agents emit at exit.
+        let text = "some output\nunauthorized: your api key has expired\nx".repeat(400)
+            + r#","outputTokens":744,"cacheReadInputTokens":344785,"uuid":"86d13b1f-..."#;
+        let err = patterns::detect_auth_error(&text).expect("should detect auth error");
+        let AgentError::Auth { message } = err else {
+            panic!("expected Auth, got {err:?}");
+        };
+        assert!(
+            message.to_lowercase().contains("unauthorized"),
+            "stored message should contain the matched pattern, got: {message}"
+        );
+        assert!(
+            !message.contains("outputTokens"),
+            "stored message must not be the trailing NDJSON, got: {message}"
+        );
+        // The message should be the line containing the auth error, not the tail.
+        assert!(
+            message.lines().count() <= 2,
+            "message should be the auth line, not the full tail: {}",
+            message.len()
+        );
     }
 
     #[test]
