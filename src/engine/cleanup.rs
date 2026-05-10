@@ -11,14 +11,46 @@ use crate::store;
 use crate::store::store_log_activity;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
+use dashmap::DashSet;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::sleep;
 use tokio::time::timeout;
 
 use super::sync::ReviewTaskSnapshot;
+
+/// Reconciliation calls can be slow during GitHub instability.
+/// Bound list calls so cleanup never hangs for long.
+const RECONCILIATION_LIST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Per-repo in-flight guard for closed-issue reconciliation/cleanup.
+/// Prevents overlapping cleanup runs from piling up across sync cycles.
+static CLEANUP_IN_FLIGHT: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+
+struct CleanupInFlightGuard {
+    repo: String,
+}
+
+impl CleanupInFlightGuard {
+    fn try_acquire(repo: &str) -> Option<Self> {
+        if CLEANUP_IN_FLIGHT.insert(repo.to_string()) {
+            Some(Self {
+                repo: repo.to_string(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for CleanupInFlightGuard {
+    fn drop(&mut self) {
+        CLEANUP_IN_FLIGHT.remove(&self.repo);
+    }
+}
 
 /// Options controlling the worktree janitor.
 #[derive(Debug, Clone)]
@@ -164,6 +196,14 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     store: &Arc<TaskStore>,
     opts: &JanitorOptions,
 ) -> anyhow::Result<()> {
+    let Some(_guard) = CleanupInFlightGuard::try_acquire(repo) else {
+        tracing::debug!(
+            repo = %repo,
+            "cleanup already in progress for repo — skipping overlapping run"
+        );
+        return Ok(());
+    };
+
     // Read done tasks from the store first; fall back to backend before first sync.
     let done_tasks = task_manager.list_all_by_status(Status::Done).await?;
     tracing::debug!(count = done_tasks.len(), "checking done tasks for cleanup");
@@ -177,27 +217,73 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     // These orphaned worktrees accumulate unless we catch them here.
     // Note: This still queries the backend because GitHub `state` (open/closed)
     // is backend-specific and not tracked in the store.
-    match backend.list_all_tasks().await {
-        Ok(all_tasks) => {
+    match timeout(RECONCILIATION_LIST_TIMEOUT, backend.list_all_tasks()).await {
+        Ok(Ok(all_tasks)) => {
             reconcile_closed_tasks(&mut task_ids, &all_tasks, task_manager).await;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!(err = %e, "failed to list all tasks for closed-issue reconciliation");
-            match backend.list_reconciliation_candidates().await {
-                Ok(fallback_tasks) if !fallback_tasks.is_empty() => {
+            match timeout(
+                RECONCILIATION_LIST_TIMEOUT,
+                backend.list_reconciliation_candidates(),
+            )
+            .await
+            {
+                Ok(Ok(fallback_tasks)) if !fallback_tasks.is_empty() => {
                     tracing::info!(
                         count = fallback_tasks.len(),
                         "using fallback tasks for closed-issue reconciliation"
                     );
                     reconcile_closed_tasks(&mut task_ids, &fallback_tasks, task_manager).await;
                 }
-                Ok(_) => {
+                Ok(Ok(_)) => {
                     tracing::debug!("no fallback tasks available for closed-issue reconciliation");
                 }
-                Err(fallback_err) => {
+                Ok(Err(fallback_err)) => {
                     tracing::warn!(
                         err = %fallback_err,
                         "failed to list fallback tasks for closed-issue reconciliation"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_secs = RECONCILIATION_LIST_TIMEOUT.as_secs(),
+                        "timed out listing fallback tasks for closed-issue reconciliation"
+                    );
+                }
+            }
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = RECONCILIATION_LIST_TIMEOUT.as_secs(),
+                "timed out listing all tasks for closed-issue reconciliation"
+            );
+            match timeout(
+                RECONCILIATION_LIST_TIMEOUT,
+                backend.list_reconciliation_candidates(),
+            )
+            .await
+            {
+                Ok(Ok(fallback_tasks)) if !fallback_tasks.is_empty() => {
+                    tracing::info!(
+                        count = fallback_tasks.len(),
+                        "using fallback tasks for closed-issue reconciliation"
+                    );
+                    reconcile_closed_tasks(&mut task_ids, &fallback_tasks, task_manager).await;
+                }
+                Ok(Ok(_)) => {
+                    tracing::debug!("no fallback tasks available for closed-issue reconciliation");
+                }
+                Ok(Err(fallback_err)) => {
+                    tracing::warn!(
+                        err = %fallback_err,
+                        "failed to list fallback tasks for closed-issue reconciliation"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_secs = RECONCILIATION_LIST_TIMEOUT.as_secs(),
+                        "timed out listing fallback tasks for closed-issue reconciliation"
                     );
                 }
             }
