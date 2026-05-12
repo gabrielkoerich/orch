@@ -194,6 +194,49 @@ fn parse_success_output(
     agent_runner: &dyn agents::AgentRunner,
     raw_stdout: &str,
 ) -> Result<agents::ParsedResponse, agents::AgentError> {
+    // Quick NDJSON terminal_reason:completed shortcut: when the agent
+    // emitted a session envelope that explicitly signals completion we
+    // prefer to interpret that as a successful run (or at least a
+    // soft/empty success) rather than immediately classifying an error
+    // from the trailing process output.  Do not override explicit
+    // in-envelope `is_error: true` signals.
+    if raw_stdout.contains("\"terminal_reason\":\"completed\"")
+        && !raw_stdout.contains("\"is_error\":true")
+    {
+        // Try to recover a structured response from assistant messages first
+        let assistant_text = agents::collect_assistant_messages_text(agent_name, raw_stdout);
+        if !assistant_text.is_empty() {
+            if let Ok(response) = crate::parser::parse(&assistant_text) {
+                tracing::debug!(task_id, agent = agent_name, "found AgentResponse JSON in earlier assistant message (terminal_reason:completed)");
+                return Ok(agents::ParsedResponse {
+                    response,
+                    input_tokens: None,
+                    output_tokens: None,
+                    duration_ms: None,
+                });
+            }
+            if let Some(response) = agents::synthesize_response_from_text(&assistant_text) {
+                tracing::warn!(
+                    task_id,
+                    agent = agent_name,
+                    "synthesizing response from assistant message due to terminal_reason:completed"
+                );
+                return Ok(agents::ParsedResponse {
+                    response,
+                    input_tokens: None,
+                    output_tokens: None,
+                    duration_ms: None,
+                });
+            }
+        }
+        // If we couldn't recover structured data from earlier assistant
+        // messages, fall through and let the regular NDJSON envelope parsing
+        // / agent-specific parsers handle the terminal_reason case. This
+        // preserves the existing behavior where an empty `result` field
+        // combined with exit != 0 becomes an InvalidResponse that is then
+        // interpreted by parse_session_output (see tests).
+    }
+
     // 1. Try to use the unified agent result extractor first
     if let Some(agent_result) = agents::find_agent_result(agent_name, raw_stdout) {
         // Treat is_error as authoritative for the success path
