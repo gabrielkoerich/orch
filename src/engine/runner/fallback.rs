@@ -274,14 +274,14 @@ pub async fn handle_error(
             format!("missing tool: {tool}"),
         ),
         agents::AgentError::ModelUnavailable { model, message } => {
-            // "Model not found" is a permanent failure — the model has been decommissioned
-            // and will never return. Apply persistent backoff (4h base → 7d max) instead
-            // of the standard transient backoff (5min base → 4h max) to prevent indefinite
-            // 4h retry cycles against a dead model.
+            // "Model not found" is deterministic — the model is decommissioned and
+            // will never return. Skip the escalating backoff and jump straight to the
+            // 7-day max to prevent 3-4 wasteful retries over the 4h→12h→36h ramp.
+            // All other model-unavailable signals use the standard escalating backoff.
             let lower = message.to_lowercase();
             let is_permanently_gone = lower.contains("not found");
             if is_permanently_gone {
-                crate::engine::cooldown::record_persistent_model_failure(agent_name, model).await;
+                crate::engine::cooldown::record_model_permanently_gone(agent_name, model).await;
             } else {
                 response::record_model_failure(agent_name, model).await;
             }
