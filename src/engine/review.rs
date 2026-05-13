@@ -879,8 +879,16 @@ async fn parse_review_output(
                 );
                 response
             } else {
-                if let Some(runner::agents::AgentError::RateLimit { message }) =
-                    runner::agents::patterns::detect_rate_limit(&text_for_review)
+                // Guard: if the raw NDJSON signals a completed session
+                // (terminal_reason:completed without is_error:true), do NOT run
+                // generic pattern-based rate-limit detection over it.  Token
+                // counts in the telemetry blob can contain bare "429" values
+                // that would otherwise be misclassified as HTTP 429 errors.
+                let ndjson_completed = raw_output.contains("\"terminal_reason\":\"completed\"")
+                    && !raw_output.contains("\"is_error\":true");
+                if let Some(runner::agents::AgentError::RateLimit { message }) = (!ndjson_completed)
+                    .then(|| runner::agents::patterns::detect_rate_limit(&text_for_review))
+                    .flatten()
                 {
                     tracing::warn!(
                         task_id = task.id.0,

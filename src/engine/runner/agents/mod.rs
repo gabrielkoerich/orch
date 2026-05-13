@@ -3024,6 +3024,58 @@ world"}"#;
         assert_eq!(resp.status, "done", "expected done for 'Fixed.' text");
     }
 
+    // ── detect_rate_limit false-positive guard ────────────────────────────
+    // Regression: NDJSON telemetry blobs can contain "429" as a token count
+    // (e.g. "outputTokens":429). `detect_rate_limit` should still flag those
+    // because it cannot distinguish context without the terminal_reason guard.
+    // The guard lives in review.rs, but here we verify the raw detector
+    // behaviour so callers know they must apply the guard themselves.
+    #[test]
+    fn detect_rate_limit_fires_on_bare_429_in_token_count() {
+        // This SHOULD return Some — the generic detector has no context.
+        // The caller (review.rs) is responsible for suppressing it when
+        // terminal_reason:completed is present.
+        let payload = r#"{"type":"result","terminal_reason":"completed","outputTokens":429,"is_error":false}"#;
+        assert!(
+            patterns::detect_rate_limit(payload).is_some(),
+            "detect_rate_limit must still fire on bare 429 so callers apply the guard"
+        );
+    }
+
+    // Verify the guard logic that review.rs uses: when raw NDJSON has
+    // terminal_reason:completed without is_error:true, the result of
+    // detect_rate_limit should be suppressed.
+    #[test]
+    fn terminal_reason_completed_guard_suppresses_false_rate_limit() {
+        let raw_output = r#"{"type":"result","terminal_reason":"completed","outputTokens":429,"is_error":false}"#;
+        let ndjson_completed = raw_output.contains("\"terminal_reason\":\"completed\"")
+            && !raw_output.contains("\"is_error\":true");
+        // Apply the same guard that review.rs now uses.
+        let detected = (!ndjson_completed)
+            .then(|| patterns::detect_rate_limit(raw_output))
+            .flatten();
+        assert!(
+            detected.is_none(),
+            "guard must suppress rate-limit false positive from token-count 429 when terminal_reason:completed"
+        );
+    }
+
+    // Verify the guard does NOT suppress a real rate-limit error.
+    #[test]
+    fn terminal_reason_completed_guard_passes_real_rate_limit() {
+        // Real rate-limit output has no terminal_reason:completed.
+        let raw_output = "Error: 429 Too Many Requests — you have exceeded your quota";
+        let ndjson_completed = raw_output.contains("\"terminal_reason\":\"completed\"")
+            && !raw_output.contains("\"is_error\":true");
+        let detected = (!ndjson_completed)
+            .then(|| patterns::detect_rate_limit(raw_output))
+            .flatten();
+        assert!(
+            detected.is_some(),
+            "guard must NOT suppress a real rate-limit error"
+        );
+    }
+
     #[test]
     fn synthesize_no_false_positive_file_paths() {
         // URLs and version strings should not appear in files list.
