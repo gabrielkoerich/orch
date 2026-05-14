@@ -163,8 +163,15 @@ fn detect_error_envelope(value: &serde_json::Value) -> Option<String> {
                     match val {
                         serde_json::Value::String(s) => {
                             // Whitelist keys which commonly hold error text
-                            if matches!(kl,
-                                "message" | "error" | "result" | "detail" | "reason" | "name" | "type"
+                            if matches!(
+                                kl,
+                                "message"
+                                    | "error"
+                                    | "result"
+                                    | "detail"
+                                    | "reason"
+                                    | "name"
+                                    | "type"
                             ) {
                                 candidates.push(s.clone());
                             }
@@ -177,7 +184,10 @@ fn detect_error_envelope(value: &serde_json::Value) -> Option<String> {
                         serde_json::Value::Array(arr) => {
                             // Only inspect arrays for whitelisted keys; avoid arrays
                             // such as `tools` which contain identifiers we don't want.
-                            if matches!(kl, "message" | "error" | "result" | "detail" | "reason" | "name") {
+                            if matches!(
+                                kl,
+                                "message" | "error" | "result" | "detail" | "reason" | "name"
+                            ) {
                                 for e in arr {
                                     if let Some(s) = e.as_str() {
                                         candidates.push(s.to_string());
