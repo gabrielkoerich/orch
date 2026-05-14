@@ -382,12 +382,17 @@ pub fn parse_session_output(
     agent_runner: &dyn agents::AgentRunner,
     session_output: &session::SessionOutput,
 ) -> Result<agents::ParsedResponse, agents::AgentError> {
-    if !session_output.raw_stdout.is_empty() {
+    // Some agents may emit NDJSON/telemetry to stderr instead of stdout. Combine
+    // both streams so parse_success_output can inspect either place for the
+    // terminal_reason/cost telemetry envelope. Only skip parsing when both are
+    // empty so we still attempt recovery when stderr contains the envelope.
+    let combined_output = format!("{}{}", session_output.raw_stdout, session_output.raw_stderr);
+    if !(session_output.raw_stdout.is_empty() && session_output.raw_stderr.is_empty()) {
         match parse_success_output(
             task_id,
             agent_name,
             agent_runner,
-            &session_output.raw_stdout,
+            &combined_output,
         ) {
             Ok(parsed) => return Ok(parsed),
             Err(err) => {
@@ -405,18 +410,20 @@ pub fn parse_session_output(
                     // metadata, producing a garbled error. Detect either
                     // completion signal and treat as a soft parse error so the
                     // task re-routes instead of hitting a false cooldown from
-                    // Unknown or Auth error variants.
-                    let stdout = &session_output.raw_stdout;
-                    let is_completed_signal = stdout.contains("\"terminal_reason\":\"completed\"");
+                    // Unknown or Auth error variants. Use the combined output
+                    // (stdout+stderr) so envelopes written to stderr are
+                    // observed.
+                    let combined = &combined_output;
+                    let is_completed_signal = combined.contains("\"terminal_reason\":\"completed\"");
                     // GLM emits a cost-telemetry JSON object (containing
-                    // "costUSD":) as its final stdout line on clean exit even
-                    // when the process exits with code 1. If the only content
-                    // is such telemetry (no is_error=true in the envelope),
-                    // treat it the same as terminal_reason:completed.
+                    // "costUSD":) as its final stdout/stderr line on clean
+                    // exit even when the process exits with code 1. If the
+                    // only content is such telemetry (no is_error=true in the
+                    // envelope), treat it the same as terminal_reason:completed.
                     let is_cost_telemetry_only =
-                        stdout.contains("\"costUSD\":") && !stdout.contains("\"is_error\":true");
+                        combined.contains("\"costUSD\":") && !combined.contains("\"is_error\":true");
                     if is_completed_signal || is_cost_telemetry_only {
-                        let raw_tail = agents::patterns::safe_tail(stdout, 300);
+                        let raw_tail = agents::patterns::safe_tail(combined, 300);
                         return Err(agents::AgentError::InvalidResponse {
                             raw: raw_tail.to_string(),
                         });
