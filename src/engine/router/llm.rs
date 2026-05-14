@@ -143,10 +143,85 @@ fn detect_error_envelope(value: &serde_json::Value) -> Option<String> {
     }
 
     // Error message substring detection (defense in depth).
-    // Since all error indicators are plain ASCII, we can use simple string search
-    // on the lowercased input for better performance.
-    let raw = serde_json::to_string(value).ok()?;
-    let raw_lower = raw.to_ascii_lowercase();
+    // Instead of scanning the entire serialized JSON (which can contain
+    // unrelated identifiers like MCP tool names), only inspect likely
+    // error-bearing fields. Collect candidate strings from common keys
+    // such as `message`, `error`, `result`, `detail`, `reason`, and
+    // numeric `status` values. This avoids false positives when tool
+    // names or skill ids contain words like "authentication".
+    let mut candidates = Vec::new();
+
+    // Helper: recursively walk an object and collect strings/numbers for
+    // whitelisted keys. We still recurse into objects to find nested
+    // `error.data.message` etc., but we do NOT collect values for keys
+    // like `tools` which commonly contain MCP tool identifiers.
+    fn collect_error_candidates(v: &serde_json::Value, candidates: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, val) in map {
+                    let kl = k.as_str();
+                    match val {
+                        serde_json::Value::String(s) => {
+                            // Whitelist keys which commonly hold error text
+                            if matches!(
+                                kl,
+                                "message"
+                                    | "error"
+                                    | "result"
+                                    | "detail"
+                                    | "reason"
+                                    | "name"
+                                    | "type"
+                            ) {
+                                candidates.push(s.clone());
+                            }
+                        }
+                        serde_json::Value::Number(n) => {
+                            if matches!(kl, "status" | "code" | "status_code") {
+                                candidates.push(n.to_string());
+                            }
+                        }
+                        serde_json::Value::Array(arr) => {
+                            // Only inspect arrays for whitelisted keys; avoid arrays
+                            // such as `tools` which contain identifiers we don't want.
+                            if matches!(
+                                kl,
+                                "message" | "error" | "result" | "detail" | "reason" | "name"
+                            ) {
+                                for e in arr {
+                                    if let Some(s) = e.as_str() {
+                                        candidates.push(s.to_string());
+                                    } else if e.is_number() {
+                                        candidates.push(e.to_string());
+                                    }
+                                }
+                            } else {
+                                // Still recurse to find nested fields like error.data.message
+                                for e in arr {
+                                    collect_error_candidates(e, candidates);
+                                }
+                            }
+                        }
+                        serde_json::Value::Object(_) => {
+                            collect_error_candidates(val, candidates);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for e in arr {
+                    collect_error_candidates(e, candidates);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    collect_error_candidates(value, &mut candidates);
+
+    let joined = candidates.join(" \n ");
+    let raw_lower = joined.to_ascii_lowercase();
     let error_indicators = [
         "rate limit",
         "overloaded",
@@ -165,11 +240,10 @@ fn detect_error_envelope(value: &serde_json::Value) -> Option<String> {
     ];
     for indicator in &error_indicators {
         if let Some(pos) = raw_lower.find(indicator) {
-            // Use char-boundary-aware extension to avoid slicing mid-codepoint.
-            // Since indicators are ASCII, byte offsets are the same in both strings.
-            let start = raw.floor_char_boundary(pos.saturating_sub(30));
-            let end = raw.ceil_char_boundary((pos + indicator.len() + 30).min(raw.len()));
-            let snippet = &raw[start..end];
+            // Create a small snippet from the candidate text around the match.
+            let start = pos.saturating_sub(30);
+            let end = (pos + indicator.len() + 30).min(raw_lower.len());
+            let snippet = &joined[start..end];
             return Some(format!(
                 "error indicator '{indicator}' found near: {snippet}"
             ));
