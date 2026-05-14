@@ -2,7 +2,7 @@
 title = "Evening Retrospective — 2026-05-14"
 date = 2026-05-14
 description = "Daily evening retrospective and operational summary."
-++ 
+++
 
 # Evening Retrospective — 2026-05-14
 
