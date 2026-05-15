@@ -388,12 +388,7 @@ pub fn parse_session_output(
     // empty so we still attempt recovery when stderr contains the envelope.
     let combined_output = format!("{}{}", session_output.raw_stdout, session_output.raw_stderr);
     if !(session_output.raw_stdout.is_empty() && session_output.raw_stderr.is_empty()) {
-        match parse_success_output(
-            task_id,
-            agent_name,
-            agent_runner,
-            &combined_output,
-        ) {
+        match parse_success_output(task_id, agent_name, agent_runner, &combined_output) {
             Ok(parsed) => return Ok(parsed),
             Err(err) => {
                 // If parse_success_output already returned AgentFailed (e.g. is_error=true
@@ -414,14 +409,15 @@ pub fn parse_session_output(
                     // (stdout+stderr) so envelopes written to stderr are
                     // observed.
                     let combined = &combined_output;
-                    let is_completed_signal = combined.contains("\"terminal_reason\":\"completed\"");
+                    let is_completed_signal =
+                        combined.contains("\"terminal_reason\":\"completed\"");
                     // GLM emits a cost-telemetry JSON object (containing
                     // "costUSD":) as its final stdout/stderr line on clean
                     // exit even when the process exits with code 1. If the
                     // only content is such telemetry (no is_error=true in the
                     // envelope), treat it the same as terminal_reason:completed.
-                    let is_cost_telemetry_only =
-                        combined.contains("\"costUSD\":") && !combined.contains("\"is_error\":true");
+                    let is_cost_telemetry_only = combined.contains("\"costUSD\":")
+                        && !combined.contains("\"is_error\":true");
                     if is_completed_signal || is_cost_telemetry_only {
                         let raw_tail = agents::patterns::safe_tail(combined, 300);
                         return Err(agents::AgentError::InvalidResponse {
