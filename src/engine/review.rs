@@ -881,11 +881,67 @@ async fn parse_review_output(
             } else {
                 // Guard: if the raw NDJSON signals a completed session
                 // (terminal_reason:completed without is_error:true), do NOT run
-                // generic pattern-based rate-limit detection over it.  Token
+                // generic pattern-based rate-limit detection over it. Token
                 // counts in the telemetry blob can contain bare "429" values
                 // that would otherwise be misclassified as HTTP 429 errors.
                 let ndjson_completed = raw_output.contains("\"terminal_reason\":\"completed\"")
                     && !raw_output.contains("\"is_error\":true");
+
+                // When ndjson_completed is true, try to recover the review response
+                // from assistant messages first. This handles agents like kimi/minimax
+                // that exit with non-zero code but have valid responses embedded in
+                // earlier assistant messages (see PR #3130).
+                if ndjson_completed {
+                    let assistant_text = runner::agents::collect_assistant_messages_text(
+                        &ctx.review_agent,
+                        &raw_output,
+                    );
+                    if !assistant_text.is_empty() {
+                        if let Ok(response) =
+                            runner::response::parse_review_response(&assistant_text)
+                        {
+                            tracing::debug!(
+                                task_id = task.id.0,
+                                agent = %ctx.review_agent,
+                                "found review response JSON in assistant message (terminal_reason:completed)"
+                            );
+                            let review_notes_for_comment = response.notes.clone();
+                            let decision = review_decision_from_response(response);
+                            return ReviewPhase::Ready(ParsedReview {
+                                run_id: run.run_id,
+                                exit_code,
+                                stderr,
+                                raw_output,
+                                text_for_review: assistant_text,
+                                token_usage,
+                                review_notes_for_comment,
+                                decision,
+                            });
+                        }
+                        if let Some(response) =
+                            runner::response::infer_review_response(&assistant_text)
+                        {
+                            tracing::warn!(
+                                task_id = task.id.0,
+                                agent = %ctx.review_agent,
+                                "inferred review response from assistant message (terminal_reason:completed)"
+                            );
+                            let review_notes_for_comment = response.notes.clone();
+                            let decision = review_decision_from_response(response);
+                            return ReviewPhase::Ready(ParsedReview {
+                                run_id: run.run_id,
+                                exit_code,
+                                stderr,
+                                raw_output,
+                                text_for_review: assistant_text,
+                                token_usage,
+                                review_notes_for_comment,
+                                decision,
+                            });
+                        }
+                    }
+                }
+
                 if let Some(runner::agents::AgentError::RateLimit { message }) = (!ndjson_completed)
                     .then(|| runner::agents::patterns::detect_rate_limit(&text_for_review))
                     .flatten()
