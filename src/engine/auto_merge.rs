@@ -95,6 +95,122 @@ fn is_ssh_agent_fetch_failure(stderr: &str) -> bool {
         || lower.contains("communication with agent failed")
 }
 
+#[derive(Debug)]
+enum WorktreeRebaseOutcome {
+    RebasedAndPushed,
+    RebaseConflict(String),
+    PushFailed(String),
+    SshFetchFailed(String),
+    Unavailable(String),
+}
+
+fn is_pr_behind(pr: &GitHubPullRequest) -> bool {
+    pr.mergeable_state
+        .as_deref()
+        .is_some_and(|state| state.eq_ignore_ascii_case("behind"))
+}
+
+async fn attempt_worktree_rebase_and_force_push(
+    task_id: &str,
+    worktree_path: Option<String>,
+) -> WorktreeRebaseOutcome {
+    let Some(wt) = worktree_path else {
+        return WorktreeRebaseOutcome::Unavailable("no worktree available".to_string());
+    };
+
+    let wt_path = std::path::PathBuf::from(&wt);
+    if !wt_path.exists() {
+        return WorktreeRebaseOutcome::Unavailable(format!("worktree missing: {wt}"));
+    }
+
+    tracing::info!(task_id, worktree = %wt, "attempting automatic rebase recovery");
+
+    let default_branch = worktree::detect_default_branch(&wt_path).await;
+    let git_timeout = std::time::Duration::from_secs(120);
+    let fetch_result = tokio::time::timeout(
+        git_timeout,
+        tokio::process::Command::new("git")
+            .args(["fetch", "origin"])
+            .current_dir(&wt_path)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        tracing::warn!(
+            task_id,
+            "git fetch timed out in rebase recovery after {}s",
+            git_timeout.as_secs()
+        );
+        Err(std::io::Error::other("git fetch timed out"))
+    });
+
+    let rebase_result = match fetch_result {
+        Ok(out) if out.status.success() => {
+            git_ops::stash_rebase_restore(
+                &wt_path,
+                &format!("origin/{default_branch}"),
+                git_ops::StashRebaseOpts {
+                    disable_gpg_signing: true,
+                    abort_on_failure: false,
+                },
+            )
+            .await
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            if is_ssh_agent_fetch_failure(&stderr) {
+                return WorktreeRebaseOutcome::SshFetchFailed(stderr);
+            }
+
+            tracing::warn!(task_id, stderr = %stderr, "git fetch failed before rebase");
+            return WorktreeRebaseOutcome::Unavailable(format!("git fetch failed: {stderr}"));
+        }
+        Err(err) => {
+            let err = err.to_string();
+            tracing::warn!(task_id, error = %err, "git fetch errored before rebase");
+            return WorktreeRebaseOutcome::Unavailable(format!("git fetch failed: {err}"));
+        }
+    };
+
+    match rebase_result {
+        Ok(git_ops::RebaseOutcome::Succeeded) => {
+            let push_result = tokio::time::timeout(
+                git_timeout,
+                tokio::process::Command::new("git")
+                    .args(["push", "--force-with-lease"])
+                    .current_dir(&wt_path)
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                tracing::warn!(
+                    task_id,
+                    "git push timed out in rebase recovery after {}s",
+                    git_timeout.as_secs()
+                );
+                Err(std::io::Error::other("git push timed out"))
+            });
+
+            match push_result {
+                Ok(push_out) if push_out.status.success() => {
+                    WorktreeRebaseOutcome::RebasedAndPushed
+                }
+                Ok(push_out) => WorktreeRebaseOutcome::PushFailed(
+                    String::from_utf8_lossy(&push_out.stderr).trim().to_string(),
+                ),
+                Err(push_err) => WorktreeRebaseOutcome::PushFailed(push_err.to_string()),
+            }
+        }
+        Ok(git_ops::RebaseOutcome::Failed(stderr)) => WorktreeRebaseOutcome::RebaseConflict(stderr),
+        Ok(git_ops::RebaseOutcome::Skipped(reason)) => {
+            WorktreeRebaseOutcome::Unavailable(format!("rebase skipped: {reason}"))
+        }
+        Err(err) => WorktreeRebaseOutcome::Unavailable(format!("rebase command failed: {err}")),
+    }
+}
+
 /// Record that CI was checked for this task, updating the timestamp in KV store.
 async fn record_ci_check(store: &Arc<TaskStore>, task_id: &str) -> anyhow::Result<()> {
     let key = format!("ci_check_ts:{}", task_id);
@@ -113,7 +229,7 @@ async fn record_ci_check(store: &Arc<TaskStore>, task_id: &str) -> anyhow::Resul
 /// since the retry/block decision is made internally. Propagating would cause
 /// `classify_review_failure` to return `ReviewOutcome::Reset`, re-spawning the
 /// review agent in an infinite loop.
-async fn handle_merge_conflict(
+async fn handle_pr_rebase_recovery(
     task: &ExternalTask,
     repo: &str,
     pr_number: u64,
@@ -176,295 +292,173 @@ async fn handle_merge_conflict(
         return Ok(());
     }
 
-    // Try rebase in the worktree
     let worktree_path = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
         .await
         .map(|t| t.worktree)
         .filter(|wt| !wt.is_empty());
-    // Track whether a subsequent force-push failed after a successful rebase
-    // so we can report the correct reason to the PR instead of blaming
-    // the rebase/merge step. Declared here so it's visible after the worktree block.
-    let mut push_failed = false;
-    let mut push_err_msg = String::new();
-
-    if let Some(wt) = worktree_path {
-        let wt_path = std::path::PathBuf::from(&wt);
-        if wt_path.exists() {
+    match attempt_worktree_rebase_and_force_push(&task.id.0, worktree_path).await {
+        WorktreeRebaseOutcome::RebasedAndPushed => {
             tracing::info!(
                 task_id = task.id.0,
-                worktree = %wt,
-                "attempting rebase to resolve merge conflict"
+                "rebase succeeded — task stays in InReview for CI + auto-merge"
             );
-            let default_branch = worktree::detect_default_branch(&wt_path).await;
-            let git_timeout = std::time::Duration::from_secs(120);
-            let fetch_result = tokio::time::timeout(
-                git_timeout,
-                tokio::process::Command::new("git")
-                    .args(["fetch", "origin"])
-                    .current_dir(&wt_path)
-                    .kill_on_drop(true)
-                    .output(),
+            if let Err(e) = store_increment(
+                &Some(Arc::clone(store)),
+                repo,
+                &task.id.0,
+                "merge_conflict_retries",
             )
             .await
-            .unwrap_or_else(|_| {
-                tracing::warn!(
-                    task_id = task.id.0,
-                    "git fetch timed out in rebase recovery after {}s",
-                    git_timeout.as_secs()
-                );
-                Err(std::io::Error::other("git fetch timed out"))
-            });
-
-            let rebase_result = match fetch_result {
-                Ok(out) if out.status.success() => {
-                    git_ops::stash_rebase_restore(
-                        &wt_path,
-                        &format!("origin/{default_branch}"),
-                        git_ops::StashRebaseOpts {
-                            disable_gpg_signing: true,
-                            abort_on_failure: false,
-                        },
-                    )
-                    .await
-                }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    if is_ssh_agent_fetch_failure(&stderr) {
-                        let block_reason = format!(
-                            "auto-merge git fetch failed due to SSH agent error: {}",
-                            stderr.trim()
-                        );
-                        tracing::error!(
-                            task_id = task.id.0,
-                            stderr = %stderr,
-                            "git fetch failed before rebase due to SSH agent error — blocking for human review"
-                        );
-                        let fields = [("block_reason", serde_json::json!(block_reason.clone()))];
-                        if let Err(e) = task_manager
-                            .update_task_status_and_result(&task.id, Status::Blocked, &fields)
-                            .await
-                        {
-                            tracing::error!(task_id = task.id.0, err = %e, "failed to write SSH-fetch block_reason and set Blocked");
-                            return Ok(());
-                        }
-                        let footer = crate::engine::attribution_footer(
-                            "Commented",
-                            review_agent,
-                            Some(review_model),
-                        );
-                        let comment = format!(
-                            "Auto-merge could not rebase because `git fetch origin` failed with an SSH agent error: {}",
-                            stderr.trim()
-                        );
-                        if let Err(e) = gh
-                            .add_comment(
-                                repo,
-                                &pr_number.to_string(),
-                                &format!("{}{}", comment, footer),
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                task_id = task.id.0,
-                                pr_number,
-                                err = %e,
-                                "handle_merge_conflict: failed to post SSH-fetch failure comment on PR"
-                            );
-                        }
-                        return Ok(());
-                    }
-
-                    // Fetch failed for a non-SSH reason — this is still not a content conflict.
-                    tracing::warn!(
-                        task_id = task.id.0,
-                        stderr = %stderr,
-                        "git fetch failed before rebase — skipping rebase"
-                    );
-                    return Ok(());
-                }
-                Err(err) => Err(anyhow::anyhow!(err)),
-            };
-
-            let mut rebase_conflict = false;
-
-            match rebase_result {
-                Ok(git_ops::RebaseOutcome::Succeeded) => {
-                    let push_result = tokio::time::timeout(
-                        git_timeout,
-                        tokio::process::Command::new("git")
-                            .args(["push", "--force-with-lease"])
-                            .current_dir(&wt_path)
-                            .kill_on_drop(true)
-                            .output(),
-                    )
-                    .await
-                    .unwrap_or_else(|_| {
-                        tracing::warn!(
-                            task_id = task.id.0,
-                            "git push timed out in rebase recovery after {}s",
-                            git_timeout.as_secs()
-                        );
-                        Err(std::io::Error::other("git push timed out"))
-                    });
-
-                    match push_result {
-                        Ok(push_out) if push_out.status.success() => {
-                            tracing::info!(
-                                task_id = task.id.0,
-                                "rebase succeeded — task stays in InReview for CI + auto-merge"
-                            );
-                            if let Err(e) = store_increment(
-                                &Some(Arc::clone(store)),
-                                repo,
-                                &task.id.0,
-                                "merge_conflict_retries",
-                            )
-                            .await
-                            {
-                                tracing::warn!(task_id = task.id.0, err = %e, "failed to increment merge_conflict_retries — skipping dispatch to avoid bypassing retry limit");
-                                return Ok(());
-                            }
-                            // Enable auto-merge — GitHub merges once CI passes.
-                            // If auto-merge isn't available, keep task in InReview
-                            // so the sync tick retries merge on the next cycle.
-                            match gh.enable_auto_merge(repo, pr_number).await {
-                                Ok(_) => {
-                                    tracing::info!(
-                                        task_id = task.id.0,
-                                        "auto-merge enabled — task stays in InReview until GitHub merges"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        task_id = task.id.0,
-                                        error = %e,
-                                        "auto-merge unavailable — task stays in InReview for sync retry"
-                                    );
-                                }
-                            }
-                            return Ok(());
-                        }
-                        Ok(push_out) => {
-                            let stderr = String::from_utf8_lossy(&push_out.stderr).to_string();
-                            tracing::error!(
-                                task_id = task.id.0,
-                                stderr = %stderr,
-                                "force-push after rebase failed — blocking for human review"
-                            );
-                            push_failed = true;
-                            push_err_msg = stderr;
-                        }
-                        Err(push_err) => {
-                            let err_str = push_err.to_string();
-                            tracing::error!(
-                                task_id = task.id.0,
-                                error = %push_err,
-                                "force-push command error — blocking for human review"
-                            );
-                            push_failed = true;
-                            push_err_msg = err_str;
-                        }
-                    }
-                }
-                Ok(git_ops::RebaseOutcome::Failed(stderr)) => {
-                    tracing::warn!(
-                        task_id = task.id.0,
-                        stderr = %stderr,
-                        "rebase failed with content conflict — re-routing to agent"
-                    );
-                    rebase_conflict = true;
-                }
-                Ok(git_ops::RebaseOutcome::Skipped(_)) => {
-                    return Ok(());
-                }
-                Err(io_err) => {
-                    tracing::error!(
-                        task_id = task.id.0,
-                        error = %io_err,
-                        "fetch/rebase command error — blocking for human review"
-                    );
-                }
-            }
-
-            if rebase_conflict {
-                // Increment counter so retry limit fires if agent cannot resolve.
-                // This matches the CI failure pattern: increment before re-routing.
-                if let Err(e) = store_increment(
-                    &Some(Arc::clone(store)),
-                    repo,
-                    &task.id.0,
-                    "merge_conflict_retries",
-                )
-                .await
-                {
-                    tracing::warn!(task_id = task.id.0, err = %e, "failed to increment merge_conflict_retries — skipping dispatch to avoid bypassing retry limit");
-                    return Ok(());
-                }
-                if let Err(e) = store_set_result(
-                    &Some(Arc::clone(store)),
-                    repo,
-                    &task.id.0,
-                    &[
-                        (
-                            "last_error",
-                            serde_json::json!(
-                                "auto-merge rebase hit a content conflict; agent must resolve the in-progress rebase in the worktree"
-                            ),
-                        ),
-                        (
-                            "route_reason",
-                            serde_json::json!("re-dispatch after auto-merge rebase conflict"),
-                        ),
-                    ],
-                )
-                .await
-                {
-                    tracing::warn!(task_id = task.id.0, err = %e, "store write failed");
-                }
-                task_manager
-                    .update_task_status(&task.id, Status::Routed)
-                    .await?;
+            {
+                tracing::warn!(task_id = task.id.0, err = %e, "failed to increment merge_conflict_retries — skipping dispatch to avoid bypassing retry limit");
                 return Ok(());
             }
-        }
-    }
-
-    // Push failure after successful rebase is an infrastructure issue — block.
-    if push_failed {
-        let comment = format!(
-            "Auto-merge failed (rebase succeeded but force-push failed): {}",
-            push_err_msg
-        );
-        let block_reason = format!(
-            "auto-merge force-push failed after rebase: {}",
-            push_err_msg
-        );
-        let fields = [("block_reason", serde_json::json!(block_reason))];
-        if let Err(e) = task_manager
-            .update_task_status_and_result(&task.id, Status::Blocked, &fields)
-            .await
-        {
-            tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason and set Blocked");
+            match gh.enable_auto_merge(repo, pr_number).await {
+                Ok(_) => {
+                    tracing::info!(
+                        task_id = task.id.0,
+                        "auto-merge enabled — task stays in InReview until GitHub merges"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        error = %e,
+                        "auto-merge unavailable — task stays in InReview for sync retry"
+                    );
+                }
+            }
             return Ok(());
         }
-        let footer =
-            crate::engine::attribution_footer("Commented", review_agent, Some(review_model));
-        if let Err(e) = gh
-            .add_comment(
-                repo,
-                &pr_number.to_string(),
-                &format!("{}{}", comment, footer),
-            )
-            .await
-        {
+        WorktreeRebaseOutcome::RebaseConflict(stderr) => {
             tracing::warn!(
                 task_id = task.id.0,
-                pr_number,
-                err = %e,
-                "handle_merge_conflict: failed to post push failure comment on PR"
+                stderr = %stderr,
+                "rebase failed with content conflict — re-routing to agent"
+            );
+            // Increment counter so retry limit fires if agent cannot resolve.
+            // This matches the CI failure pattern: increment before re-routing.
+            if let Err(e) = store_increment(
+                &Some(Arc::clone(store)),
+                repo,
+                &task.id.0,
+                "merge_conflict_retries",
+            )
+            .await
+            {
+                tracing::warn!(task_id = task.id.0, err = %e, "failed to increment merge_conflict_retries — skipping dispatch to avoid bypassing retry limit");
+                return Ok(());
+            }
+            if let Err(e) = store_set_result(
+                &Some(Arc::clone(store)),
+                repo,
+                &task.id.0,
+                &[
+                    (
+                        "last_error",
+                        serde_json::json!(
+                            "auto-merge rebase hit a content conflict; agent must resolve the in-progress rebase in the worktree"
+                        ),
+                    ),
+                    (
+                        "route_reason",
+                        serde_json::json!("re-dispatch after auto-merge rebase conflict"),
+                    ),
+                ],
+            )
+            .await
+            {
+                tracing::warn!(task_id = task.id.0, err = %e, "store write failed");
+            }
+            task_manager
+                .update_task_status(&task.id, Status::Routed)
+                .await?;
+            return Ok(());
+        }
+        WorktreeRebaseOutcome::SshFetchFailed(stderr) => {
+            let block_reason = format!(
+                "auto-merge git fetch failed due to SSH agent error: {}",
+                stderr.trim()
+            );
+            tracing::error!(
+                task_id = task.id.0,
+                stderr = %stderr,
+                "git fetch failed before rebase due to SSH agent error — blocking for human review"
+            );
+            let fields = [("block_reason", serde_json::json!(block_reason.clone()))];
+            if let Err(e) = task_manager
+                .update_task_status_and_result(&task.id, Status::Blocked, &fields)
+                .await
+            {
+                tracing::error!(task_id = task.id.0, err = %e, "failed to write SSH-fetch block_reason and set Blocked");
+                return Ok(());
+            }
+            let footer =
+                crate::engine::attribution_footer("Commented", review_agent, Some(review_model));
+            let comment = format!(
+                "Auto-merge could not rebase because `git fetch origin` failed with an SSH agent error: {}",
+                stderr.trim()
+            );
+            if let Err(e) = gh
+                .add_comment(
+                    repo,
+                    &pr_number.to_string(),
+                    &format!("{}{}", comment, footer),
+                )
+                .await
+            {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    pr_number,
+                    err = %e,
+                    "handle_pr_rebase_recovery: failed to post SSH-fetch failure comment on PR"
+                );
+            }
+            return Ok(());
+        }
+        WorktreeRebaseOutcome::PushFailed(push_err_msg) => {
+            let comment = format!(
+                "Auto-merge failed (rebase succeeded but force-push failed): {}",
+                push_err_msg
+            );
+            let block_reason = format!(
+                "auto-merge force-push failed after rebase: {}",
+                push_err_msg
+            );
+            let fields = [("block_reason", serde_json::json!(block_reason))];
+            if let Err(e) = task_manager
+                .update_task_status_and_result(&task.id, Status::Blocked, &fields)
+                .await
+            {
+                tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason and set Blocked");
+                return Ok(());
+            }
+            let footer =
+                crate::engine::attribution_footer("Commented", review_agent, Some(review_model));
+            if let Err(e) = gh
+                .add_comment(
+                    repo,
+                    &pr_number.to_string(),
+                    &format!("{}{}", comment, footer),
+                )
+                .await
+            {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    pr_number,
+                    err = %e,
+                    "handle_pr_rebase_recovery: failed to post push failure comment on PR"
+                );
+            }
+            return Ok(());
+        }
+        WorktreeRebaseOutcome::Unavailable(reason) => {
+            tracing::warn!(
+                task_id = task.id.0,
+                reason = %reason,
+                "merge conflict could not be auto-rebased — re-routing to task agent"
             );
         }
-        return Ok(());
     }
 
     // No worktree, worktree missing, or fetch/IO error — re-route to the task
@@ -937,7 +931,7 @@ pub(crate) async fn auto_merge_pr(
     )
     .await?;
     if has_conflict {
-        handle_merge_conflict(
+        handle_pr_rebase_recovery(
             task,
             repo,
             pr_number,
@@ -1033,6 +1027,237 @@ pub(crate) async fn auto_merge_pr(
         match state.as_str() {
             "success" => break,
             "failure" => {
+                match gh.get_pr(repo, pr_number).await {
+                    Ok(current_pr) if is_pr_behind(&current_pr) => {
+                        tracing::info!(
+                            task_id = task.id.0,
+                            pr_number,
+                            mergeable_state = current_pr.mergeable_state.as_deref().unwrap_or(""),
+                            "CI failed while PR is behind base branch — attempting automatic rebase recovery"
+                        );
+
+                        let worktree_path =
+                            opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
+                                .await
+                                .map(|t| t.worktree)
+                                .filter(|wt| !wt.is_empty());
+
+                        match attempt_worktree_rebase_and_force_push(&task.id.0, worktree_path)
+                            .await
+                        {
+                            WorktreeRebaseOutcome::RebasedAndPushed => {
+                                if let Err(e) = store_set_result(
+                                    &Some(Arc::clone(store)),
+                                    repo,
+                                    &task.id.0,
+                                    &[("ci_merge_failures", serde_json::json!(0))],
+                                )
+                                .await
+                                {
+                                    tracing::warn!(task_id = task.id.0, err = %e, "failed to reset ci_merge_failures after behind-branch rebase");
+                                }
+
+                                match gh.enable_auto_merge(repo, pr_number).await {
+                                    Ok(_) => {
+                                        tracing::info!(
+                                            task_id = task.id.0,
+                                            "behind-branch rebase succeeded — auto-merge re-enabled"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            task_id = task.id.0,
+                                            error = %e,
+                                            "behind-branch rebase succeeded but auto-merge could not be re-enabled"
+                                        );
+                                    }
+                                }
+
+                                return Ok(());
+                            }
+                            WorktreeRebaseOutcome::RebaseConflict(stderr) => {
+                                tracing::warn!(
+                                    task_id = task.id.0,
+                                    stderr = %stderr,
+                                    "behind-branch rebase hit a content conflict — re-routing to agent"
+                                );
+                                if let Err(e) = store_increment(
+                                    &Some(Arc::clone(store)),
+                                    repo,
+                                    &task.id.0,
+                                    "merge_conflict_retries",
+                                )
+                                .await
+                                {
+                                    tracing::warn!(task_id = task.id.0, err = %e, "failed to increment merge_conflict_retries after behind-branch rebase conflict");
+                                    return Ok(());
+                                }
+                                if let Err(e) = store_set_result(
+                                    &Some(Arc::clone(store)),
+                                    repo,
+                                    &task.id.0,
+                                    &[
+                                        (
+                                            "ci_merge_failures",
+                                            serde_json::json!(0),
+                                        ),
+                                        (
+                                            "last_error",
+                                            serde_json::json!(
+                                                "PR fell behind the base branch and auto-rebase hit a content conflict; agent must resolve the in-progress rebase in the worktree"
+                                            ),
+                                        ),
+                                        (
+                                            "route_reason",
+                                            serde_json::json!("re-dispatch after behind-branch auto-rebase conflict"),
+                                        ),
+                                    ],
+                                )
+                                .await
+                                {
+                                    tracing::warn!(task_id = task.id.0, err = %e, "store write failed after behind-branch rebase conflict");
+                                }
+                                task_manager
+                                    .update_task_status(&task.id, Status::Routed)
+                                    .await?;
+                                return Ok(());
+                            }
+                            WorktreeRebaseOutcome::SshFetchFailed(stderr) => {
+                                let block_reason = format!(
+                                    "auto-merge git fetch failed due to SSH agent error: {}",
+                                    stderr.trim()
+                                );
+                                let fields =
+                                    [("block_reason", serde_json::json!(block_reason.clone()))];
+                                if let Err(e) = task_manager
+                                    .update_task_status_and_result(
+                                        &task.id,
+                                        Status::Blocked,
+                                        &fields,
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(task_id = task.id.0, err = %e, "failed to write SSH-fetch block_reason and set Blocked after behind-branch CI failure");
+                                    return Ok(());
+                                }
+                                let footer = crate::engine::attribution_footer(
+                                    "Commented",
+                                    review_agent,
+                                    Some(review_model),
+                                );
+                                let comment = format!(
+                                    "Auto-merge could not rebase the behind branch because `git fetch origin` failed with an SSH agent error: {}",
+                                    stderr.trim()
+                                );
+                                if let Err(e) = gh
+                                    .add_comment(
+                                        repo,
+                                        &pr_number.to_string(),
+                                        &format!("{}{}", comment, footer),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        task_id = task.id.0,
+                                        pr_number,
+                                        err = %e,
+                                        "auto_merge: failed to post behind-branch SSH-fetch failure comment on PR"
+                                    );
+                                }
+                                return Ok(());
+                            }
+                            WorktreeRebaseOutcome::PushFailed(push_err_msg) => {
+                                let comment = format!(
+                                    "Auto-merge failed (behind-branch rebase succeeded but force-push failed): {}",
+                                    push_err_msg
+                                );
+                                let block_reason = format!(
+                                    "auto-merge force-push failed after behind-branch rebase: {}",
+                                    push_err_msg
+                                );
+                                let fields = [("block_reason", serde_json::json!(block_reason))];
+                                if let Err(e) = task_manager
+                                    .update_task_status_and_result(
+                                        &task.id,
+                                        Status::Blocked,
+                                        &fields,
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason and set Blocked after behind-branch rebase push failure");
+                                    return Ok(());
+                                }
+                                let footer = crate::engine::attribution_footer(
+                                    "Commented",
+                                    review_agent,
+                                    Some(review_model),
+                                );
+                                if let Err(e) = gh
+                                    .add_comment(
+                                        repo,
+                                        &pr_number.to_string(),
+                                        &format!("{}{}", comment, footer),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        task_id = task.id.0,
+                                        pr_number,
+                                        err = %e,
+                                        "auto_merge: failed to post behind-branch push failure comment on PR"
+                                    );
+                                }
+                                return Ok(());
+                            }
+                            WorktreeRebaseOutcome::Unavailable(reason) => {
+                                tracing::warn!(
+                                    task_id = task.id.0,
+                                    reason = %reason,
+                                    "behind-branch auto-rebase unavailable — re-routing to agent instead of counting a CI failure"
+                                );
+                                if let Err(e) = store_set_result(
+                                    &Some(Arc::clone(store)),
+                                    repo,
+                                    &task.id.0,
+                                    &[
+                                        (
+                                            "ci_merge_failures",
+                                            serde_json::json!(0),
+                                        ),
+                                        (
+                                            "last_error",
+                                            serde_json::json!(format!(
+                                                "PR fell behind the base branch and auto-rebase was unavailable: {reason}"
+                                            )),
+                                        ),
+                                        (
+                                            "route_reason",
+                                            serde_json::json!("re-dispatch after behind-branch CI failure — auto-rebase unavailable"),
+                                        ),
+                                    ],
+                                )
+                                .await
+                                {
+                                    tracing::warn!(task_id = task.id.0, err = %e, "store write failed after unavailable behind-branch recovery");
+                                }
+                                task_manager
+                                    .update_task_status(&task.id, Status::Routed)
+                                    .await?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            task_id = task.id.0,
+                            pr_number,
+                            err = %e,
+                            "failed to refresh PR state before CI-failure handling"
+                        );
+                    }
+                }
+
                 // Check for billing failures before incrementing the code-quality
                 // failure counter.  Billing failures are infrastructure problems —
                 // no agent can fix them — so we block the task immediately and skip
@@ -1231,7 +1456,7 @@ pub(crate) async fn auto_merge_pr(
 
         if is_conflict {
             // Delegate to the shared helper — same logic as the poll_mergeable_until path.
-            handle_merge_conflict(
+            handle_pr_rebase_recovery(
                 task,
                 repo,
                 pr_number,
@@ -2340,6 +2565,36 @@ mod tests {
             "2024-01-16T00:00:01Z",
             "2024-01-15T23:59:59Z"
         ));
+    }
+
+    #[test]
+    fn is_pr_behind_matches_mergeable_state() {
+        let mut pr = GitHubPullRequest {
+            number: 1,
+            title: "Test PR".to_string(),
+            body: None,
+            state: "open".to_string(),
+            head: crate::github::types::GitHubBranchRef {
+                ref_: "feature/test".to_string(),
+                sha: "abc123".to_string(),
+            },
+            base: crate::github::types::GitHubBranchRef {
+                ref_: "main".to_string(),
+                sha: "def456".to_string(),
+            },
+            mergeable: Some(true),
+            mergeable_state: Some("behind".to_string()),
+            merged: Some(false),
+            html_url: "https://github.com/owner/repo/pull/1".to_string(),
+        };
+
+        assert!(is_pr_behind(&pr));
+
+        pr.mergeable_state = Some("clean".to_string());
+        assert!(!is_pr_behind(&pr));
+
+        pr.mergeable_state = None;
+        assert!(!is_pr_behind(&pr));
     }
 
     /// When the GitHub API is unavailable (no real token in unit tests),
