@@ -219,55 +219,35 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     // These orphaned worktrees accumulate unless we catch them here.
     // Note: This still queries the backend because GitHub `state` (open/closed)
     // is backend-specific and not tracked in the store.
-    let primary_ok = match timeout(RECONCILIATION_LIST_TIMEOUT, backend.list_all_tasks()).await {
-        Ok(Ok(all_tasks)) => {
-            reconcile_closed_tasks(&mut task_ids, &all_tasks, task_manager).await;
-            true
+    //
+    // Use list_reconciliation_candidates() (open + 30-day closed window) directly.
+    // list_all_tasks() fetches every issue ever created (state=all, all pages) and
+    // consistently times out on repos with many issues — it is not appropriate for
+    // a per-tick reconciliation path.
+    match timeout(
+        RECONCILIATION_LIST_TIMEOUT,
+        backend.list_reconciliation_candidates(),
+    )
+    .await
+    {
+        Ok(Ok(candidates)) if !candidates.is_empty() => {
+            tracing::debug!(
+                count = candidates.len(),
+                "reconciling closed issues from candidates"
+            );
+            reconcile_closed_tasks(&mut task_ids, &candidates, task_manager).await;
+        }
+        Ok(Ok(_)) => {
+            tracing::debug!("no reconciliation candidates found");
         }
         Ok(Err(e)) => {
-            tracing::warn!(err = %e, "failed to list all tasks for closed-issue reconciliation");
-            false
+            tracing::warn!(err = %e, "failed to list reconciliation candidates");
         }
         Err(_) => {
             tracing::warn!(
                 timeout_secs = RECONCILIATION_LIST_TIMEOUT.as_secs(),
-                "timed out listing all tasks for closed-issue reconciliation"
+                "timed out listing reconciliation candidates"
             );
-            false
-        }
-    };
-
-    // On primary failure (error or timeout), fall back to a cheaper paginated query
-    // that only fetches recently-updated issues instead of all pages.
-    if !primary_ok {
-        match timeout(
-            RECONCILIATION_LIST_TIMEOUT,
-            backend.list_reconciliation_candidates(),
-        )
-        .await
-        {
-            Ok(Ok(fallback_tasks)) if !fallback_tasks.is_empty() => {
-                tracing::info!(
-                    count = fallback_tasks.len(),
-                    "using fallback tasks for closed-issue reconciliation"
-                );
-                reconcile_closed_tasks(&mut task_ids, &fallback_tasks, task_manager).await;
-            }
-            Ok(Ok(_)) => {
-                tracing::debug!("no fallback tasks available for closed-issue reconciliation");
-            }
-            Ok(Err(fallback_err)) => {
-                tracing::warn!(
-                    err = %fallback_err,
-                    "failed to list fallback tasks for closed-issue reconciliation"
-                );
-            }
-            Err(_) => {
-                tracing::warn!(
-                    timeout_secs = RECONCILIATION_LIST_TIMEOUT.as_secs(),
-                    "timed out listing fallback tasks for closed-issue reconciliation"
-                );
-            }
         }
     }
 
