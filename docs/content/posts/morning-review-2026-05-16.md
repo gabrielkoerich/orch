@@ -1,9 +1,8 @@
-++
 +++
 title = "Morning Review — 2026-05-16"
 date = 2026-05-16
 description = "Daily operational morning review."
-++
++++
 
 # Morning Review — 2026-05-16
 
