@@ -1963,6 +1963,14 @@ struct DegradedAgentDetail {
     cooled_models: Vec<String>,
 }
 
+/// Per-agent pool health used for stale model pool detection.
+struct AgentPoolHealth {
+    agent: String,
+    cooled_models: Vec<String>,
+    persistent_failed_models: Vec<String>,
+    total_configured_models: usize,
+}
+
 /// Inspect router & cooldown state and emit metrics every tick.
 ///
 /// - `metrics:orch.agents_degraded.count` is written on every call with the
@@ -1978,24 +1986,41 @@ pub(crate) async fn emit_degraded_agents_if_needed(
 ) {
     // Complexity tiers to check for configured models.
     const COMPLEXITIES: &[&str] = &["simple", "medium", "complex", "review"];
+    const HEAVILY_COOLED_RATIO_THRESHOLD: f64 = 0.5;
 
     let mut details: Vec<DegradedAgentDetail> = Vec::new();
+    let mut pool_health: Vec<AgentPoolHealth> = Vec::new();
 
     for agent in available_agents {
         let agent_in_cd = is_agent_in_cooldown(agent);
 
         // Collect individually cooled models across all complexity tiers (deduped).
         let mut cooled_models: Vec<String> = Vec::new();
+        let mut persistent_failed_models: Vec<String> = Vec::new();
         let mut seen_models = std::collections::HashSet::new();
         for comp in COMPLEXITIES {
             if let Some(pool) = config.model_pool_for_complexity(agent, comp) {
                 for model in pool {
                     if seen_models.insert(model.clone()) && is_model_in_cooldown(agent, &model) {
+                        let key = format!("{agent}:{model}");
+                        if matches!(
+                            cooldown_reason(&key).as_deref(),
+                            Some("persistent_model_error") | Some("model_not_found")
+                        ) {
+                            persistent_failed_models.push(model.clone());
+                        }
                         cooled_models.push(model);
                     }
                 }
             }
         }
+        let total_configured_models = seen_models.len();
+        pool_health.push(AgentPoolHealth {
+            agent: agent.clone(),
+            cooled_models: cooled_models.clone(),
+            persistent_failed_models: persistent_failed_models.clone(),
+            total_configured_models,
+        });
 
         // An agent is degraded if it is in agent-level cooldown OR has no
         // available (non-cooled) model across any complexity tier.
@@ -2063,6 +2088,52 @@ pub(crate) async fn emit_degraded_agents_if_needed(
     {
         // Clear the alert metric when healthy.
         tracing::warn!(err = %e, "failed to clear degraded agents alert metric");
+    }
+
+    // Additional operator signal for dead/stale model pools:
+    // alert when any agent has at least 50% of configured models cooled and at
+    // least one persistent model failure marker in cooldown reason.
+    let heavily_cooled_agents: Vec<String> = pool_health
+        .iter()
+        .filter_map(|d| {
+            if d.total_configured_models == 0 || d.persistent_failed_models.is_empty() {
+                return None;
+            }
+            let ratio = d.cooled_models.len() as f64 / d.total_configured_models as f64;
+            (ratio >= HEAVILY_COOLED_RATIO_THRESHOLD).then(|| {
+                format!(
+                    "{}:{}/{}:{}",
+                    d.agent,
+                    d.cooled_models.len(),
+                    d.total_configured_models,
+                    d.persistent_failed_models.join(",")
+                )
+            })
+        })
+        .collect();
+
+    if !heavily_cooled_agents.is_empty() {
+        tracing::warn!(
+            affected_agents = ?heavily_cooled_agents,
+            "agent model pool appears stale: persistent model failures in heavily cooled pool"
+        );
+        if let Err(e) = try_kv_set_prefer_store(
+            &store,
+            "metrics:orch.model_pool_stale_persistent.alert",
+            "1",
+        )
+        .await
+        {
+            tracing::warn!(err = %e, "failed to persist stale model pool alert metric");
+        }
+    } else if let Err(e) = try_kv_set_prefer_store(
+        &store,
+        "metrics:orch.model_pool_stale_persistent.alert",
+        "0",
+    )
+    .await
+    {
+        tracing::warn!(err = %e, "failed to clear stale model pool alert metric");
     }
 }
 
@@ -4133,6 +4204,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(alert_val.as_deref(), Some("0"));
+
+        let stale_pool_alert = store
+            .kv_get("metrics:orch.model_pool_stale_persistent.alert")
+            .await
+            .unwrap();
+        assert_eq!(stale_pool_alert.as_deref(), Some("0"));
+    }
+
+    #[tokio::test]
+    async fn emit_degraded_agents_sets_stale_pool_alert_for_persistent_model_failures() {
+        use crate::engine::cooldown::record_persistent_model_failure;
+        use crate::engine::router::{Router, RouterConfig};
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        let mut config = RouterConfig::default();
+        config
+            .model_map
+            .entry("medium".to_string())
+            .or_default()
+            .insert(
+                "test-agent-stale".to_string(),
+                vec!["model-a".to_string(), "model-b".to_string()],
+            );
+        let mut router = Router::new(config);
+        router.available_agents = vec!["test-agent-stale".to_string()];
+
+        // 50% cooled + persistent reason should trigger stale-pool alert.
+        record_persistent_model_failure("test-agent-stale", "model-a").await;
+
+        emit_degraded_agents_if_needed(&router.available_agents, &router.config, Some(&store))
+            .await;
+
+        let stale_pool_alert = store
+            .kv_get("metrics:orch.model_pool_stale_persistent.alert")
+            .await
+            .unwrap();
+        assert_eq!(stale_pool_alert.as_deref(), Some("1"));
     }
 
     // ── classify_comment tests ──────────────────────────────────────────
