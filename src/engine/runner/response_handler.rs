@@ -1103,6 +1103,18 @@ fn is_retryable_blocked_reason(reason: &str) -> bool {
         "worktree lock",
         "resource busy",
         "could not resolve host",
+        // Credential providers in headless/tmux sessions can fail transiently
+        // when GPG agent/passphrase is unavailable.
+        "gpg decryption fails",
+        "gpg decryption failed",
+        "gpg agent",
+        "no passphrase available",
+        "passphrase unavailable",
+        "pass store",
+        "passwordstoreprovider",
+        "agentvaultprovider",
+        "onepasswordprovider",
+        "decryption failed in this agent session",
     ];
     transient_patterns.iter().any(|p| r.contains(p))
 }
@@ -2141,6 +2153,12 @@ mod tests {
         ));
         assert!(is_retryable_blocked_reason(
             "API rate limit hit, try again later"
+        ));
+        assert!(is_retryable_blocked_reason(
+            "Credential bean/hyperliquid-address exists in the pass store but GPG decryption fails in this agent session — no passphrase available."
+        ));
+        assert!(is_retryable_blocked_reason(
+            "credential resolution failed via PasswordStoreProvider; AgentVaultProvider unavailable"
         ));
     }
 
