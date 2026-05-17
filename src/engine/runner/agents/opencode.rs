@@ -34,6 +34,10 @@ use std::sync::{Mutex, OnceLock};
 /// Shared across all callers (router, runner, failover).
 static FREE_MODELS_CACHE: OnceLock<Mutex<(i64, Vec<String>)>> = OnceLock::new();
 static FREE_MODELS_REFRESH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+/// Module-level cache for all discovered opencode models.
+/// Shared across all callers (router, runner, failover).
+static ALL_MODELS_CACHE: OnceLock<Mutex<(i64, Vec<String>)>> = OnceLock::new();
+static ALL_MODELS_REFRESH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Runner for OpenCode agent.
 pub struct OpenCodeRunner;
@@ -818,7 +822,11 @@ pub fn discover_free_opencode_models() -> Vec<String> {
             let _guard = scopeguard::guard((), |_| {
                 FREE_MODELS_REFRESH_IN_PROGRESS.store(false, Ordering::Release);
             });
-            let discovered = run_opencode_models_discovery_async().await;
+            let discovered = run_opencode_models_discovery_async()
+                .await
+                .into_iter()
+                .filter(|m| m.to_lowercase().contains("free"))
+                .collect::<Vec<_>>();
             let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
             let now = chrono::Utc::now().timestamp();
             if let Ok(mut guard) = cache.lock() {
@@ -845,6 +853,49 @@ pub fn discover_free_opencode_models() -> Vec<String> {
     guard.1.clone()
 }
 
+/// Discover all opencode models, with 1-hour cache and background refresh.
+///
+/// Non-blocking: returns cached data immediately. When the cache is cold
+/// or expired, spawns a background refresh via `opencode models`.
+pub fn discover_opencode_models() -> Vec<String> {
+    let cache = ALL_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
+    let now = chrono::Utc::now().timestamp();
+
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let (ts, models) = &*guard;
+        if *ts != 0 && now.saturating_sub(*ts) < 3600 {
+            return models.clone();
+        }
+    }
+
+    if !ALL_MODELS_REFRESH_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        let refresh = async {
+            let _guard = scopeguard::guard((), |_| {
+                ALL_MODELS_REFRESH_IN_PROGRESS.store(false, Ordering::Release);
+            });
+            let discovered = run_opencode_models_discovery_async().await;
+            let cache = ALL_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
+            let now = chrono::Utc::now().timestamp();
+            if let Ok(mut guard) = cache.lock() {
+                *guard = (now, discovered);
+            }
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(refresh);
+        } else {
+            std::thread::spawn(move || {
+                if let Ok(rt) = tokio::runtime::Runtime::new() {
+                    rt.block_on(refresh);
+                }
+            });
+        }
+    }
+
+    let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    guard.1.clone()
+}
+
 /// Prime the free-model cache synchronously at startup.
 ///
 /// Called from `Router::new()` via `spawn_blocking` so the initial
@@ -853,7 +904,7 @@ pub fn discover_free_opencode_models() -> Vec<String> {
 /// own tokio runtime, avoiding `block_on` restrictions when called from within
 /// an existing runtime (e.g. `#[tokio::test]` or a nested runtime context).
 pub fn prime_free_model_cache() {
-    let discovered = std::thread::spawn(|| {
+    let discovered_all = std::thread::spawn(|| {
         if let Ok(rt) = tokio::runtime::Runtime::new() {
             rt.block_on(run_opencode_models_discovery_async())
         } else {
@@ -865,7 +916,18 @@ pub fn prime_free_model_cache() {
     let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
     let now = chrono::Utc::now().timestamp();
     if let Ok(mut guard) = cache.lock() {
-        *guard = (now, discovered);
+        *guard = (
+            now,
+            discovered_all
+                .iter()
+                .filter(|m| m.to_lowercase().contains("free"))
+                .cloned()
+                .collect(),
+        );
+    }
+    let all_cache = ALL_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
+    if let Ok(mut guard) = all_cache.lock() {
+        *guard = (now, discovered_all);
     }
 }
 
@@ -907,7 +969,6 @@ async fn run_opencode_models_discovery_async() -> Vec<String> {
                 };
                 return stdout
                     .lines()
-                    .filter(|l| l.to_lowercase().contains("free"))
                     .map(|l| l.trim().to_string())
                     .filter(|l| !l.is_empty())
                     .collect();
