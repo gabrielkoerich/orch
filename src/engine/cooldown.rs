@@ -417,6 +417,9 @@ pub fn detect_credit_exhaustion(error_message: &str) -> Option<CreditExhaustionR
         || lower.contains("no credits remaining")
         || lower.contains("insufficient_quota")
         || lower.contains("quota exceeded")
+        || lower.contains("insufficient balance")
+        || lower.contains("please recharge")
+        || lower.contains("no resource package")
     {
         return Some(CreditExhaustionReason::OutOfCredits);
     }
@@ -1553,6 +1556,29 @@ mod tests {
         assert_eq!(
             detect_credit_exhaustion(msg),
             Some(CreditExhaustionReason::OrgLevelDisabled)
+        );
+    }
+
+    #[test]
+    fn detect_credit_exhaustion_glm_insufficient_balance() {
+        // GLM/ZhipuAI 429: "Insufficient balance or no resource package. Please recharge."
+        assert_eq!(
+            detect_credit_exhaustion(
+                "API Error: Request rejected (429) · Insufficient balance or no resource package. Please recharge."
+            ),
+            Some(CreditExhaustionReason::OutOfCredits)
+        );
+        assert_eq!(
+            detect_credit_exhaustion("Insufficient balance"),
+            Some(CreditExhaustionReason::OutOfCredits)
+        );
+        assert_eq!(
+            detect_credit_exhaustion("please recharge your account"),
+            Some(CreditExhaustionReason::OutOfCredits)
+        );
+        assert_eq!(
+            detect_credit_exhaustion("no resource package available"),
+            Some(CreditExhaustionReason::OutOfCredits)
         );
     }
 
