@@ -495,6 +495,30 @@ impl RouterConfig {
             }
         }
 
+        // Startup config hygiene warning for opencode model_map entries that the provider
+        // model catalog does not currently report.
+        let discovered_opencode =
+            crate::engine::runner::agents::opencode::discover_opencode_models();
+        if !discovered_opencode.is_empty() {
+            let discovered: std::collections::HashSet<String> =
+                discovered_opencode.into_iter().collect();
+            for complexity in known_complexities {
+                if let Some(agent_models) = config.model_map.get(complexity) {
+                    if let Some(models) = agent_models.get("opencode") {
+                        for model in models {
+                            if model != "opencode:free" && !discovered.contains(model) {
+                                tracing::warn!(
+                                    complexity,
+                                    model,
+                                    "opencode model from config not present in provider model list"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Parse default_skills
         if let Ok(skills_str) = crate::config::get("router.default_skills") {
             if !skills_str.is_empty() && skills_str != "[]" {
@@ -622,6 +646,17 @@ impl RouterConfig {
 
         // Also filter out invalid discovered free models (should be valid but just in case)
         expanded_pool.retain(|m| Self::is_valid_model_identifier(m));
+
+        // For opencode, filter configured entries against the provider model catalog
+        // when available. This proactively avoids dispatching non-existent model IDs.
+        if agent == "opencode" {
+            let discovered = crate::engine::runner::agents::opencode::discover_opencode_models();
+            if !discovered.is_empty() {
+                let discovered_set: std::collections::HashSet<String> =
+                    discovered.into_iter().collect();
+                expanded_pool.retain(|m| discovered_set.contains(m));
+            }
+        }
 
         Some(expanded_pool)
     }
