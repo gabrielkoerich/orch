@@ -16,61 +16,78 @@ use super::{agents, response};
 /// fragment containing `"subtype":"api_retry"`) and extracts `error_status`, `attempt`,
 /// `retry_delay_ms` to return a compact summary.
 /// Returns a compact fallback if no api_retry JSON is found.
-fn summarize_rate_limit_error(raw_output: &str) -> String {
+///
+/// Exposed `pub(crate)` so the review pipeline (`engine::review`) reuses the same
+/// summariser as the task runner. Without this, review runs persisted raw
+/// api_retry JSON fragments into `task_runs.error` (issue #3149).
+pub(crate) fn summarize_rate_limit_error(raw_output: &str) -> String {
     // Find the last line containing "subtype":"api_retry"
     // This handles both complete JSON objects and truncated fragments that begin
     // mid-object (e.g. `,"subtype":"api_retry","attempt":5...`).
-    let last_json = raw_output
+    let last_api_retry_line = raw_output
         .lines()
         .rev()
         .find(|line| line.contains("\"subtype\":\"api_retry\""));
 
-    match last_json {
-        Some(line) => {
-            let error_status = extract_json_field(line, "\"error_status\":")
-                .unwrap_or_else(|| "unknown".to_string());
-            let attempt =
-                extract_json_field(line, "\"attempt\":").unwrap_or_else(|| "unknown".to_string());
-            let retry_delay_ms =
-                extract_json_field(line, "\"retry_delay_ms\":").unwrap_or_else(|| "0".to_string());
+    if let Some(line) = last_api_retry_line {
+        return summarise_api_retry_line(line);
+    }
 
-            // Check if we extracted at least one meaningful numeric field.
-            let has_field = error_status != "unknown"
-                || attempt != "unknown"
-                || (retry_delay_ms != "0" && retry_delay_ms != "unknown");
+    // No `"subtype":"api_retry"` marker but the payload may still be a truncated
+    // api_retry NDJSON fragment that lost the `"subtype"` key earlier in the
+    // stream. If any line contains the characteristic numeric fields
+    // (`error_status`, `attempt`, `retry_delay_ms`), summarise from that line
+    // instead of echoing the raw JSON into `task_runs.error` (issue #3149).
+    let api_retry_field_markers = ["\"error_status\":", "\"attempt\":", "\"retry_delay_ms\":"];
+    let field_line = raw_output
+        .lines()
+        .rev()
+        .find(|line| api_retry_field_markers.iter().any(|m| line.contains(m)));
+    if let Some(line) = field_line {
+        return summarise_api_retry_line(line);
+    }
 
-            if has_field {
-                // Convert delay to seconds for readability
-                let retry_delay_s = retry_delay_ms.parse::<f64>().unwrap_or(0.0) / 1000.0;
-                let retry_delay_s = retry_delay_s as u64;
+    // No api_retry JSON or field markers found — emit a compact first-line
+    // summary, never raw passthrough. Truncate to a tight byte cap so even
+    // long single-line provider payloads cannot bloat `task_runs.error`.
+    const FIRST_LINE_CAP: usize = 120;
+    let first_line = raw_output.lines().next().unwrap_or(raw_output);
+    if first_line.len() > FIRST_LINE_CAP {
+        let cutoff = agents::truncate_at_char_boundary(first_line, FIRST_LINE_CAP);
+        let remaining = raw_output.len().saturating_sub(cutoff);
+        format!("{}... (+{} more chars)", &first_line[..cutoff], remaining)
+    } else {
+        first_line.to_string()
+    }
+}
 
-                format!(
-                    "status={} after {} attempts (last delay {}s)",
-                    error_status, attempt, retry_delay_s
-                )
-            } else {
-                // Fields not extractable from a partial fragment — emit a compact
-                // summary instead of a raw JSON blob to avoid leaking noisy data into
-                // task_runs.error and downstream cooldown parsing.
-                let status_hint = extract_json_field(line, "\"status\":")
-                    .or_else(|| extract_json_field(line, "\"error\":"))
-                    .unwrap_or_else(|| "429".to_string());
-                format!("status={} (api_retry fragment)", status_hint)
-            }
-        }
-        None => {
-            // No api_retry JSON found — emit compact summary, not raw passthrough.
-            let first_line = raw_output.lines().next().unwrap_or(raw_output);
-            if first_line.len() > 120 {
-                format!(
-                    "{}... (+{} more chars)",
-                    &first_line[..120],
-                    raw_output.len() - 120
-                )
-            } else {
-                first_line.to_string()
-            }
-        }
+/// Extract `error_status`, `attempt`, and `retry_delay_ms` from a single
+/// `api_retry`-shaped JSON line (or fragment) and return a compact summary
+/// such as `"status=429 after 7 attempts (last delay 35s)"`. Falls back to
+/// `"status=… (api_retry fragment)"` when no numeric field is recoverable.
+fn summarise_api_retry_line(line: &str) -> String {
+    let error_status =
+        extract_json_field(line, "\"error_status\":").unwrap_or_else(|| "unknown".to_string());
+    let attempt = extract_json_field(line, "\"attempt\":").unwrap_or_else(|| "unknown".to_string());
+    let retry_delay_ms =
+        extract_json_field(line, "\"retry_delay_ms\":").unwrap_or_else(|| "0".to_string());
+
+    let has_field = error_status != "unknown"
+        || attempt != "unknown"
+        || (retry_delay_ms != "0" && retry_delay_ms != "unknown");
+
+    if has_field {
+        let retry_delay_s = retry_delay_ms.parse::<f64>().unwrap_or(0.0) / 1000.0;
+        let retry_delay_s = retry_delay_s as u64;
+        format!(
+            "status={} after {} attempts (last delay {}s)",
+            error_status, attempt, retry_delay_s
+        )
+    } else {
+        let status_hint = extract_json_field(line, "\"status\":")
+            .or_else(|| extract_json_field(line, "\"error\":"))
+            .unwrap_or_else(|| "429".to_string());
+        format!("status={} (api_retry fragment)", status_hint)
     }
 }
 

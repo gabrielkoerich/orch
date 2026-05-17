@@ -28,6 +28,28 @@ fn outcome_for_agent_error(err: &runner::agents::AgentError) -> &'static str {
     }
 }
 
+/// Format an [`AgentError`] as the compact string persisted to `task_runs.error`
+/// and surfaced via [`ReviewDecision::Failed`].
+///
+/// Mirrors the per-variant formatting in `runner::fallback::handle_error` so review
+/// runs never leak raw provider payloads (e.g. truncated `api_retry` NDJSON
+/// fragments) into the audit trail. Without this, `err.to_string()` would expand
+/// `AgentError::RateLimit { message }` via its `Display` impl and persist hundreds
+/// of bytes of raw JSON into `task_runs.error` (issue #3149, regression of #2881).
+fn format_review_error(agent: &str, err: &runner::agents::AgentError) -> String {
+    match err {
+        runner::agents::AgentError::RateLimit { message } => format!(
+            "{agent} rate limit: {}",
+            runner::fallback::summarize_rate_limit_error(message)
+        ),
+        runner::agents::AgentError::Auth { message } => format!("{agent} auth error: {message}"),
+        runner::agents::AgentError::Timeout { elapsed } => {
+            format!("{agent} timed out after {}s", elapsed.as_secs())
+        }
+        other => format!("{agent} agent error: {other}"),
+    }
+}
+
 /// Parse a PR number from a GitHub PR URL.
 ///
 /// Validates that the URL matches the expected GitHub PR URL format
@@ -840,6 +862,7 @@ async fn parse_review_output(
         let err = agent_runner.classify_error(exit_code, &raw_output, &stderr);
         record_review_agent_failure(&task.id.0, &ctx.review_agent, &err).await;
         tracing::error!(task_id = task.id.0, error = %err, "review agent failed");
+        let stored_error = format_review_error(&ctx.review_agent, &err);
         complete_review_run(
             store,
             run.run_id,
@@ -848,11 +871,11 @@ async fn parse_review_output(
             &stderr,
             "",
             outcome_for_agent_error(&err),
-            &err.to_string(),
+            &stored_error,
             token_usage,
         )
         .await;
-        return ReviewPhase::EarlyReturn(ReviewDecision::Failed(format!("agent error: {err}")));
+        return ReviewPhase::EarlyReturn(ReviewDecision::Failed(stored_error));
     }
 
     let text_for_review = agent_result
@@ -956,6 +979,8 @@ async fn parse_review_output(
                         &message,
                     )
                     .await;
+                    let summary = runner::fallback::summarize_rate_limit_error(&message);
+                    let stored_error = format!("{} rate limit: {summary}", ctx.review_agent);
                     complete_review_run(
                         store,
                         run.run_id,
@@ -964,13 +989,11 @@ async fn parse_review_output(
                         &stderr,
                         &text_for_review,
                         "rate_limit",
-                        &format!("rate limit: {message}"),
+                        &stored_error,
                         token_usage,
                     )
                     .await;
-                    return ReviewPhase::EarlyReturn(ReviewDecision::Failed(format!(
-                        "rate limit: {message}"
-                    )));
+                    return ReviewPhase::EarlyReturn(ReviewDecision::Failed(stored_error));
                 }
 
                 if let Some(runner::agents::AgentError::Auth { message }) =
@@ -2422,6 +2445,92 @@ mod tests {
         assert!(result
             .unwrap_err()
             .contains("does not start with 'https://github.com/'"));
+    }
+
+    // ── format_review_error ─────────────────────────────────────────────────
+    //
+    // Regression coverage for issue #3149: review runs were persisting raw
+    // `api_retry` NDJSON fragments into `task_runs.error` because the review
+    // pipeline formatted rate-limit errors with `err.to_string()` instead of
+    // routing the raw provider message through `summarize_rate_limit_error`.
+
+    #[test]
+    fn format_review_error_summarises_rate_limit_fragment_with_api_retry() {
+        // Real-world fragment captured from a minimax review run (issue #3149).
+        // The provider message contains a complete api_retry JSON line so the
+        // summariser should produce a clean `status=… after … attempts` summary.
+        let raw_fragment = "{\"attempt\":6,\"max_retries\":10,\"retry_delay_ms\":17266.789,\"error_status\":429,\"error\":\"rate_limit\",\"session_id\":\"5c7148ee\"}\n\
+                            {\"type\":\"system\",\"subtype\":\"api_retry\",\"attempt\":7,\"max_retries\":10,\"retry_delay_ms\":35162.66,\"error_status\":429,\"error\":\"rate_limit\",\"session_id\":\"5c7148ee\"}";
+        let err = runner::agents::AgentError::RateLimit {
+            message: raw_fragment.to_string(),
+        };
+
+        let stored = format_review_error("minimax", &err);
+
+        // Must not contain raw JSON braces or the api_retry marker — these are
+        // exactly the leaks that filled `task_runs.error` with noisy payloads.
+        assert!(
+            !stored.contains("{\"type\""),
+            "stored error must not contain raw NDJSON envelope, got: {stored}"
+        );
+        assert!(
+            !stored.contains("subtype"),
+            "stored error must not contain raw api_retry fragment, got: {stored}"
+        );
+        assert!(
+            !stored.contains("session_id"),
+            "stored error must not contain session_id from provider payload, got: {stored}"
+        );
+        assert_eq!(
+            stored,
+            "minimax rate limit: status=429 after 7 attempts (last delay 35s)"
+        );
+    }
+
+    #[test]
+    fn format_review_error_summarises_truncated_fragment_without_subtype_marker() {
+        // Mid-object fragment that begins after the `subtype` key was cut off — this
+        // is the shape that landed in `task_runs.error` for rows 13634/13542/9821
+        // before the fix. The summariser's fallback path should emit a compact
+        // hint rather than echoing the raw payload.
+        let raw_fragment = ",\"attempt\":5,\"max_retries\":10,\"retry_delay_ms\":9034.81,\"error_status\":429,\"error\":\"rate_limit\",\"session_id\":\"992e17d3\"";
+        let err = runner::agents::AgentError::RateLimit {
+            message: raw_fragment.to_string(),
+        };
+
+        let stored = format_review_error("glm", &err);
+
+        assert!(stored.starts_with("glm rate limit:"));
+        assert!(
+            !stored.contains("session_id"),
+            "stored error must not leak session_id from truncated fragment, got: {stored}"
+        );
+        // The fragment first-line truncation path is bounded — verify the stored
+        // string stays well under the 512-char cap suggested by the bug report.
+        assert!(
+            stored.len() <= 200,
+            "stored error should be compact (<=200 chars), got {} chars: {stored}",
+            stored.len()
+        );
+    }
+
+    #[test]
+    fn format_review_error_preserves_non_rate_limit_variants() {
+        let err = runner::agents::AgentError::Auth {
+            message: "invalid bearer token".to_string(),
+        };
+        assert_eq!(
+            format_review_error("kimi", &err),
+            "kimi auth error: invalid bearer token"
+        );
+
+        let err = runner::agents::AgentError::Timeout {
+            elapsed: std::time::Duration::from_secs(1801),
+        };
+        assert_eq!(
+            format_review_error("kimi", &err),
+            "kimi timed out after 1801s"
+        );
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) {
