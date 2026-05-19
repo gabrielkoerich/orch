@@ -848,7 +848,11 @@ async fn parse_review_output(
     };
 
     let agent_result_is_error = agent_result.as_ref().map(|r| r.is_error).unwrap_or(false);
-    let is_hard_failure = raw_output.is_empty() || agent_result_is_error;
+    let ndjson_completed_no_error = raw_output.contains("\"terminal_reason\":\"completed\"")
+        && !raw_output.contains("\"is_error\":true");
+    // Do not short-circuit completed NDJSON sessions before rescue parsing.
+    let is_hard_failure =
+        !ndjson_completed_no_error && (raw_output.is_empty() || agent_result_is_error);
 
     if is_hard_failure {
         tracing::warn!(
@@ -907,8 +911,7 @@ async fn parse_review_output(
                 // generic pattern-based rate-limit detection over it. Token
                 // counts in the telemetry blob can contain bare "429" values
                 // that would otherwise be misclassified as HTTP 429 errors.
-                let ndjson_completed = raw_output.contains("\"terminal_reason\":\"completed\"")
-                    && !raw_output.contains("\"is_error\":true");
+                let ndjson_completed = ndjson_completed_no_error;
 
                 // When ndjson_completed is true, try to recover the review response
                 // from assistant messages first. This handles agents like kimi/minimax
