@@ -175,6 +175,9 @@ pub struct EngineConfig {
     pub silence_grace_period: u64,
     /// Cooldown duration for a model detected as silent (seconds).
     pub silence_cooldown: u64,
+    /// How often to check for a newer orch release and notify channels (seconds).
+    /// Set to 0 to disable. Default: 3600 (1 hour).
+    pub upgrade_check_interval: u64,
 }
 
 impl Default for EngineConfig {
@@ -191,6 +194,7 @@ impl Default for EngineConfig {
             graceful_shutdown_timeout: std::time::Duration::from_secs(600),
             silence_grace_period: 300,
             silence_cooldown: 3600,
+            upgrade_check_interval: 3600,
         }
     }
 }
@@ -286,6 +290,14 @@ impl EngineConfig {
                 config.silence_cooldown = secs;
             } else {
                 tracing::warn!(key = "engine.silence_cooldown", value = %val, default = config.silence_cooldown, "invalid value for engine.silence_cooldown, using default");
+            }
+        }
+
+        if let Ok(val) = crate::config::get("engine.upgrade_check_interval") {
+            if let Ok(secs) = val.parse::<u64>() {
+                config.upgrade_check_interval = secs;
+            } else {
+                tracing::warn!(key = "engine.upgrade_check_interval", value = %val, default = config.upgrade_check_interval, "invalid value for engine.upgrade_check_interval, using default");
             }
         }
 
@@ -704,6 +716,115 @@ async fn fetch_latest_release_version() -> Option<String> {
     }
 }
 
+/// Check if a newer orch release is available and send channel notifications.
+///
+/// Uses the store's KV to throttle checks (`upgrade:last_check_at`) and
+/// deduplicate notifications (`upgrade:last_notified_version`). Each distinct
+/// latest version is notified about once; the notification repeats only when
+/// an even newer version is released.
+async fn check_and_notify_upgrade(
+    store: &Arc<TaskStore>,
+    channels: &Arc<ChannelRegistry>,
+    current_version: &str,
+    check_interval: std::time::Duration,
+) {
+    let last_check_key = "upgrade:last_check_at";
+    let last_notified_key = "upgrade:last_notified_version";
+
+    // Throttle: only check once per interval.
+    let now = chrono::Utc::now().timestamp();
+    if let Ok(Some(last_check_str)) = store.kv_get(last_check_key).await {
+        if let Ok(last_check) = last_check_str.parse::<i64>() {
+            if now - last_check < check_interval.as_secs() as i64 {
+                return;
+            }
+        }
+    }
+
+    // Record check timestamp (best-effort).
+    let _ = store.kv_set(last_check_key, &now.to_string()).await;
+
+    let latest = match fetch_latest_release_version().await {
+        Some(v) => v,
+        None => {
+            tracing::debug!("upgrade check: failed to fetch latest release version");
+            return;
+        }
+    };
+
+    if latest == current_version {
+        tracing::debug!(current = %current_version, "orch is up to date");
+        return;
+    }
+
+    // Deduplicate: don't re-notify for the same latest version.
+    if let Ok(Some(last_notified)) = store.kv_get(last_notified_key).await {
+        if last_notified == latest {
+            tracing::debug!(latest = %latest, "upgrade already notified");
+            return;
+        }
+    }
+
+    tracing::warn!(
+        current_version = %current_version,
+        latest_version = %latest,
+        "orch upgrade available"
+    );
+
+    let msg_telegram = format!(
+        "⚠️ <b>Orch Upgrade Available</b>\n\n\
+         Service: <code>{current_version}</code>\n\
+         Latest:  <code>{latest}</code>\n\n\
+         Run: <code>brew update && brew upgrade orch && brew services restart orch</code>"
+    );
+
+    let msg_discord = format!(
+        "⚠️ **Orch Upgrade Available**\n\n\
+         Service: `{current_version}`\n\
+         Latest:  `{latest}`\n\n\
+         Run: `brew update && brew upgrade orch && brew services restart orch`"
+    );
+
+    let msg_slack = format!(
+        "⚠️ *Orch Upgrade Available*\n\n\
+         Service: `{current_version}`\n\
+         Latest:  `{latest}`\n\n\
+         Run: `brew update && brew upgrade orch && brew services restart orch`"
+    );
+
+    for channel in channels.iter() {
+        let (body, metadata, topic_id) = match channel.name() {
+            "telegram" => (
+                msg_telegram.clone(),
+                serde_json::json!({"preformatted_html": true}),
+                None,
+            ),
+            "discord" => (msg_discord.clone(), serde_json::json!({}), None),
+            "slack" => (msg_slack.clone(), serde_json::json!({}), None),
+            _ => continue,
+        };
+
+        let msg = OutgoingMessage {
+            thread_id: "upgrade".to_string(),
+            body,
+            reply_to: None,
+            metadata,
+            topic_id,
+        };
+
+        if let Err(e) = channel.send(&msg).await {
+            tracing::warn!(
+                channel = channel.name(),
+                ?e,
+                "failed to send upgrade notification"
+            );
+        }
+    }
+
+    // Record that we notified for this latest version.
+    let _ = store.kv_set(last_notified_key, &latest).await;
+}
+
 /// Start the orch service.
 ///
 /// This is the main entry point — called by `orch serve`.
@@ -774,6 +895,8 @@ pub async fn serve() -> anyhow::Result<()> {
     }
 
     // Check for a newer orch release in the background and warn if the service is behind.
+    // Channels are not yet registered at this point, so this only logs. Channel notifications
+    // are sent by the periodic check in the main loop once channels are up.
     {
         let current = env!("ORCH_VERSION").to_string();
         tokio::spawn(async move {
@@ -1416,6 +1539,9 @@ pub async fn serve() -> anyhow::Result<()> {
     // Track sync interval
     let mut last_sync = std::time::Instant::now();
 
+    // Track upgrade check interval
+    let mut last_upgrade_check = std::time::Instant::now();
+
     // Channel for weight signals from task runners back to the router
     let (weight_tx, mut weight_rx) = mpsc::channel::<WeightSignal>(64);
 
@@ -1790,6 +1916,24 @@ pub async fn serve() -> anyhow::Result<()> {
                         }
                         last_webhook_health_check = std::time::Instant::now();
                     }
+                }
+
+                // Periodic upgrade check — notify channels when a newer release is available.
+                if config.upgrade_check_interval > 0
+                    && last_upgrade_check.elapsed()
+                        >= std::time::Duration::from_secs(config.upgrade_check_interval)
+                {
+                    if let Some(store) = project_engines.first().map(|e| e.store.clone()) {
+                        let channels = channel_registry.clone();
+                        let current = env!("ORCH_VERSION").to_string();
+                        let check_interval =
+                            std::time::Duration::from_secs(config.upgrade_check_interval);
+                        tokio::spawn(async move {
+                            check_and_notify_upgrade(&store, &channels, &current, check_interval)
+                                .await;
+                        });
+                    }
+                    last_upgrade_check = std::time::Instant::now();
                 }
 
                 // Update watchdog timestamp + log tick duration.
@@ -2189,6 +2333,7 @@ mod tests {
             config.graceful_shutdown_timeout,
             std::time::Duration::from_secs(600)
         );
+        assert_eq!(config.upgrade_check_interval, 3600);
     }
 
     #[test]
@@ -2204,6 +2349,7 @@ mod tests {
             config.graceful_shutdown_timeout,
             std::time::Duration::from_secs(600)
         );
+        assert_eq!(config.upgrade_check_interval, 3600);
     }
 
     #[test]
