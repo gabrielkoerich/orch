@@ -1,6 +1,7 @@
 use crate::config;
 use crate::engine::jobs::{self, Job, TaskTemplate};
 use anyhow::Context;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// List scheduled jobs (with runtime state from SQLite).
@@ -97,6 +98,7 @@ pub fn add(
             Some(TaskTemplate {
                 title: title.to_string(),
                 body: body.unwrap_or("").to_string(),
+                prompt: None,
                 labels: vec![],
                 agent: None,
             })
@@ -174,7 +176,7 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
     use crate::backends::ExternalBackend;
 
     // 1. If inside an orch project (or --project given), try that first
-    let mut resolved: Option<(String, jobs::Job)> = None;
+    let mut resolved: Option<(String, jobs::Job, PathBuf)> = None;
 
     if project.is_none() {
         // Check if CWD is inside an orch project
@@ -182,7 +184,11 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
             let jobs_path = jobs::resolve_jobs_path();
             if let Ok(all_jobs) = jobs::load_jobs(&jobs_path) {
                 if let Some(job) = all_jobs.into_iter().find(|j| j.id == job_id) {
-                    resolved = Some((cwd_repo, job));
+                    let base_dir = jobs_path
+                        .parent()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    resolved = Some((cwd_repo, job, base_dir));
                 }
             }
         }
@@ -190,7 +196,7 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
 
     // 2. If not resolved locally, search all projects
     if resolved.is_none() {
-        let mut matches: Vec<(String, jobs::Job)> = Vec::new();
+        let mut matches: Vec<(String, jobs::Job, PathBuf)> = Vec::new();
 
         let projects = crate::config::get_projects_with_paths().unwrap_or_default();
         for (repo, dir) in &projects {
@@ -203,7 +209,7 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
             if let Ok(all_jobs) = jobs::load_jobs(&orch_yml) {
                 for job in all_jobs {
                     if job.id == job_id {
-                        matches.push((repo.clone(), job));
+                        matches.push((repo.clone(), job, dir.clone()));
                     }
                 }
             }
@@ -213,7 +219,7 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
             0 => anyhow::bail!("job '{}' not found in any project", job_id),
             1 => resolved = matches.pop(),
             _ => {
-                let repos: Vec<&str> = matches.iter().map(|(r, _)| r.as_str()).collect();
+                let repos: Vec<&str> = matches.iter().map(|(r, _, _)| r.as_str()).collect();
                 anyhow::bail!(
                     "job '{}' exists in multiple projects: {}\nUse --project to specify which one, e.g.: orch job run {} --project {}",
                     job_id,
@@ -225,7 +231,7 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
         }
     }
 
-    let (repo, job) = match resolved {
+    let (repo, job, base_dir) = match resolved {
         Some(r) => r,
         None => anyhow::bail!("job '{}' not found", job_id),
     };
@@ -276,7 +282,16 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
     }
 
     // Execute the job (may mutate state.active_task_id / last_task_status).
-    jobs::execute_job(&job, &mut state, &backend, store.as_ref(), &repo, None).await;
+    jobs::execute_job(
+        &job,
+        &mut state,
+        &backend,
+        store.as_ref(),
+        &repo,
+        None,
+        &base_dir,
+    )
+    .await;
 
     let status = state.last_task_status.as_deref().unwrap_or("unknown");
     if let Some(ref task_id) = state.active_task_id {

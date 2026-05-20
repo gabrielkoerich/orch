@@ -62,10 +62,35 @@ pub struct TaskTemplate {
     pub title: String,
     #[serde(default)]
     pub body: String,
+    /// Path to a file (typically markdown) whose contents are used as the
+    /// task body. Resolved relative to the directory of the config file
+    /// that defines this job. Mutually exclusive with `body`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
     #[serde(default)]
     pub labels: Vec<String>,
     #[serde(default)]
     pub agent: Option<String>,
+}
+
+/// Resolve the body for a task template, reading from `prompt` if set.
+///
+/// `base_dir` is the directory containing the jobs config file (used to
+/// resolve relative `prompt` paths).
+pub fn resolve_template_body(template: &TaskTemplate, base_dir: &Path) -> anyhow::Result<String> {
+    match template.prompt.as_deref() {
+        Some(rel) => {
+            let path = Path::new(rel);
+            let full = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                base_dir.join(path)
+            };
+            std::fs::read_to_string(&full)
+                .with_context(|| format!("reading prompt file {}", full.display()))
+        }
+        None => Ok(template.body.clone()),
+    }
 }
 
 fn default_job_type() -> String {
@@ -129,6 +154,7 @@ pub fn load_jobs(path: &PathBuf) -> anyhow::Result<Vec<Job>> {
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let file: ConfigFile =
         serde_norway::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
     for job in &file.jobs {
         let expanded = crate::cron::expand_alias(&job.schedule).with_context(|| {
             format!("job '{}': invalid cron schedule '{}'", job.id, job.schedule)
@@ -138,6 +164,29 @@ pub fn load_jobs(path: &PathBuf) -> anyhow::Result<Vec<Job>> {
         Schedule::from_str(&full_expr).with_context(|| {
             format!("job '{}': invalid cron schedule '{}'", job.id, job.schedule)
         })?;
+        if let Some(template) = job.task.as_ref() {
+            if template.prompt.is_some() && !template.body.is_empty() {
+                anyhow::bail!(
+                    "job '{}': set either 'task.body' or 'task.prompt', not both",
+                    job.id
+                );
+            }
+            if let Some(rel) = template.prompt.as_deref() {
+                let candidate = Path::new(rel);
+                let full = if candidate.is_absolute() {
+                    candidate.to_path_buf()
+                } else {
+                    base_dir.join(candidate)
+                };
+                if !full.exists() {
+                    anyhow::bail!(
+                        "job '{}': prompt file not found: {}",
+                        job.id,
+                        full.display()
+                    );
+                }
+            }
+        }
     }
     Ok(file.jobs)
 }
@@ -380,7 +429,8 @@ pub async fn tick(
         }
 
         // Execute the job (may mutate state.active_task_id / last_task_status).
-        execute_job(job, &mut state, backend, store, repo, transport).await;
+        let base_dir = jobs_path.parent().unwrap_or_else(|| Path::new("."));
+        execute_job(job, &mut state, backend, store, repo, transport, base_dir).await;
 
         // Persist updated state (active_task_id, last_task_status) after execution.
         if let Some(s) = store {
@@ -408,10 +458,20 @@ pub async fn execute_job(
     store: Option<&Arc<crate::store::TaskStore>>,
     repo: &str,
     transport: Option<&Arc<Transport>>,
+    base_dir: &Path,
 ) {
     match job.r#type.as_str() {
         "task" => {
             if let Some(ref template) = job.task {
+                let body = match resolve_template_body(template, base_dir) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!(job_id = job.id, ?e, "failed to resolve task body");
+                        state.last_task_status = Some("failed".to_string());
+                        return;
+                    }
+                };
+
                 if job.external {
                     let mut labels = template.labels.clone();
                     labels.push("scheduled".to_string());
@@ -423,10 +483,7 @@ pub async fn execute_job(
                         }
                     }
 
-                    match backend
-                        .create_task(&template.title, &template.body, &labels)
-                        .await
-                    {
+                    match backend.create_task(&template.title, &body, &labels).await {
                         Ok(ext_id) => {
                             tracing::info!(
                                 job_id = job.id,
@@ -443,14 +500,7 @@ pub async fn execute_job(
                     }
                 } else if let Some(s) = store {
                     match s
-                        .create_internal(
-                            repo,
-                            &template.title,
-                            &template.body,
-                            "cron",
-                            &job.id,
-                            None,
-                        )
+                        .create_internal(repo, &template.title, &body, "cron", &job.id, None)
                         .await
                     {
                         Ok(internal_id) => {
@@ -574,3 +624,98 @@ pub async fn execute_job(
 // NOTE: self-review analysis is handled by scheduled `task` jobs configured
 // in `.orch.yml` and executed by agents. There is no embedded Rust logic
 // here — this module remains a generic job dispatcher.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn write_config(dir: &Path, content: &str) -> PathBuf {
+        let path = dir.join(".orch.yml");
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn load_jobs_reads_prompt_from_file() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir(tmp.path().join("prompts")).unwrap();
+        fs::write(tmp.path().join("prompts/hello.md"), "hello from file").unwrap();
+        let cfg = write_config(
+            tmp.path(),
+            r#"
+jobs:
+  - id: with-prompt
+    schedule: "0 9 * * *"
+    task:
+      title: "Daily"
+      prompt: prompts/hello.md
+"#,
+        );
+
+        let jobs = load_jobs(&cfg).unwrap();
+        assert_eq!(jobs.len(), 1);
+        let body = resolve_template_body(jobs[0].task.as_ref().unwrap(), tmp.path()).unwrap();
+        assert_eq!(body, "hello from file");
+    }
+
+    #[test]
+    fn load_jobs_rejects_both_body_and_prompt() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("p.md"), "x").unwrap();
+        let cfg = write_config(
+            tmp.path(),
+            r#"
+jobs:
+  - id: conflict
+    schedule: "0 9 * * *"
+    task:
+      title: "x"
+      body: "inline"
+      prompt: p.md
+"#,
+        );
+
+        let err = load_jobs(&cfg).unwrap_err().to_string();
+        assert!(err.contains("not both"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn load_jobs_rejects_missing_prompt_file() {
+        let tmp = tempdir().unwrap();
+        let cfg = write_config(
+            tmp.path(),
+            r#"
+jobs:
+  - id: missing
+    schedule: "0 9 * * *"
+    task:
+      title: "x"
+      prompt: does-not-exist.md
+"#,
+        );
+
+        let err = load_jobs(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("prompt file not found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_template_body_falls_back_to_inline_body() {
+        let tmp = tempdir().unwrap();
+        let template = TaskTemplate {
+            title: "t".to_string(),
+            body: "inline body".to_string(),
+            prompt: None,
+            labels: vec![],
+            agent: None,
+        };
+        assert_eq!(
+            resolve_template_body(&template, tmp.path()).unwrap(),
+            "inline body"
+        );
+    }
+}
