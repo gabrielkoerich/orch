@@ -306,7 +306,7 @@ impl Router {
             self.llm_bypass_until = Some(now + bypass_secs);
             tracing::warn!(
                 until = self.llm_bypass_until.unwrap(),
-                "router entering short-term LLM bypass due to repeated budget timeouts"
+                "router entering short-term LLM bypass due to repeated budget timeouts",
             );
             // reset counters so we don't immediately re-trigger
             self.llm_budget_fail_count = 0;
@@ -2107,6 +2107,9 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            llm_budget_fail_count: 0,
+            llm_budget_window_start: None,
+            llm_bypass_until: None,
         };
 
         let task = create_test_task("1", "Test task", vec![]);
@@ -2143,6 +2146,9 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            llm_budget_fail_count: 0,
+            llm_budget_window_start: None,
+            llm_bypass_until: None,
         };
 
         let task = create_test_task("1", "Test", vec!["agent:claude".to_string()]);
@@ -2200,6 +2206,9 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            llm_budget_fail_count: 0,
+            llm_budget_window_start: None,
+            llm_bypass_until: None,
         };
 
         // Reload — should re-read config and remain valid
@@ -2493,6 +2502,9 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            llm_budget_fail_count: 0,
+            llm_budget_window_start: None,
+            llm_bypass_until: None,
         };
 
         let task = create_test_task("1", "Test task", vec![]);
@@ -2535,6 +2547,9 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            llm_budget_fail_count: 0,
+            llm_budget_window_start: None,
+            llm_bypass_until: None,
         };
 
         // Label override should take precedence over weighted routing
@@ -2602,6 +2617,9 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            llm_budget_fail_count: 0,
+            llm_budget_window_start: None,
+            llm_bypass_until: None,
         };
 
         let a1 = router.next_round_robin_agent(&[], "medium").unwrap();
@@ -2644,6 +2662,9 @@ Hope that helps!"#;
             review_rr_index: 2,
             router_pool: vec![],
             pool_index: 0,
+            llm_budget_fail_count: 0,
+            llm_budget_window_start: None,
+            llm_bypass_until: None,
         };
 
         // All candidates excluded — should fall back to first candidate, not None
@@ -2688,6 +2709,9 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            llm_budget_fail_count: 0,
+            llm_budget_window_start: None,
+            llm_bypass_until: None,
         };
 
         // With the bug: index advances modulo 3 (available_agents.len()), so the
@@ -2751,6 +2775,9 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            llm_budget_fail_count: 0,
+            llm_budget_window_start: None,
+            llm_bypass_until: None,
         };
 
         assert!(router.last_agent.is_none());
