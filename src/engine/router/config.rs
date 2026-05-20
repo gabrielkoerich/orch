@@ -495,8 +495,11 @@ impl RouterConfig {
             }
         }
 
-        // Startup config hygiene warning for opencode model_map entries that the provider
-        // model catalog does not currently report.
+        // Startup config hygiene: warn about and prune opencode model_map entries that
+        // the provider catalog does not currently list.  Running this at load time avoids
+        // dispatching unavailable models during routing — the dynamic filter in
+        // `expanded_model_pool` also catches these, but fails open when discovery returns
+        // empty (e.g. during a background cache refresh), allowing stale models through.
         let discovered_opencode =
             crate::engine::runner::agents::opencode::discover_opencode_models();
         if !discovered_opencode.is_empty() {
@@ -510,12 +513,20 @@ impl RouterConfig {
                                 tracing::warn!(
                                     complexity,
                                     model,
-                                    "opencode model from config not present in provider model list"
+                                    "opencode model from config not present in provider model list; pruning from dispatch pool"
                                 );
                             }
                         }
                     }
                 }
+            }
+            let pruned =
+                Self::prune_unavailable_opencode_models(&mut config.model_map, &discovered);
+            if pruned > 0 {
+                tracing::info!(
+                    pruned_count = pruned,
+                    "model_pruned_unavailable: removed opencode models absent from provider catalog"
+                );
             }
         }
 
@@ -717,6 +728,26 @@ impl RouterConfig {
         }
         // All models cooled — return None so the caller can fall back to a different agent
         None
+    }
+
+    /// Remove `model_map` entries for the `opencode` agent whose identifiers do not
+    /// appear in `discovered`.  The sentinel value `"opencode:free"` is never pruned
+    /// because it is expanded at routing time and is not dispatched as a literal model ID.
+    ///
+    /// Returns the total number of model entries removed across all complexity tiers.
+    fn prune_unavailable_opencode_models(
+        model_map: &mut HashMap<String, HashMap<String, Vec<String>>>,
+        discovered: &std::collections::HashSet<String>,
+    ) -> usize {
+        let mut pruned = 0;
+        for agent_models in model_map.values_mut() {
+            if let Some(models) = agent_models.get_mut("opencode") {
+                let before = models.len();
+                models.retain(|m| m == "opencode:free" || discovered.contains(m));
+                pruned += before - models.len();
+            }
+        }
+        pruned
     }
 }
 
@@ -1083,5 +1114,119 @@ model_map:
             config.llm_budget_secs, 30,
             "llm_budget_secs default should be 30s to prevent tick watchdog stalls"
         );
+    }
+
+    // --- prune_unavailable_opencode_models regression tests (bug #3169) ---
+
+    #[test]
+    fn prune_unavailable_opencode_models_removes_missing_models() {
+        use std::collections::{HashMap, HashSet};
+
+        let mut model_map: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+        model_map.entry("complex".to_string()).or_default().insert(
+            "opencode".to_string(),
+            vec![
+                "available-model".to_string(),
+                "unavailable-model".to_string(),
+                "opencode:free".to_string(), // sentinel — must survive pruning
+            ],
+        );
+
+        let mut discovered = HashSet::new();
+        discovered.insert("available-model".to_string());
+        // "unavailable-model" intentionally absent
+
+        let pruned = RouterConfig::prune_unavailable_opencode_models(&mut model_map, &discovered);
+
+        assert_eq!(pruned, 1, "should prune exactly the one unavailable model");
+
+        let remaining = model_map["complex"]["opencode"].as_slice();
+        assert!(
+            remaining.contains(&"available-model".to_string()),
+            "available model should remain"
+        );
+        assert!(
+            remaining.contains(&"opencode:free".to_string()),
+            "opencode:free sentinel should never be pruned"
+        );
+        assert!(
+            !remaining.contains(&"unavailable-model".to_string()),
+            "unavailable model should be removed"
+        );
+    }
+
+    #[test]
+    fn prune_unavailable_opencode_models_noop_when_all_available() {
+        use std::collections::{HashMap, HashSet};
+
+        let mut model_map: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+        model_map.entry("simple".to_string()).or_default().insert(
+            "opencode".to_string(),
+            vec!["model-a".to_string(), "model-b".to_string()],
+        );
+
+        let discovered: HashSet<String> = ["model-a", "model-b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let pruned = RouterConfig::prune_unavailable_opencode_models(&mut model_map, &discovered);
+
+        assert_eq!(pruned, 0, "nothing to prune when all models are available");
+        assert_eq!(
+            model_map["simple"]["opencode"].len(),
+            2,
+            "both models should remain"
+        );
+    }
+
+    #[test]
+    fn prune_unavailable_opencode_models_preserves_non_opencode_agents() {
+        use std::collections::{HashMap, HashSet};
+
+        let mut model_map: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+        model_map
+            .entry("complex".to_string())
+            .or_default()
+            .insert("claude".to_string(), vec!["some-model".to_string()]);
+
+        // discovered is empty — irrelevant for non-opencode agents
+        let discovered: HashSet<String> = HashSet::new();
+
+        let pruned = RouterConfig::prune_unavailable_opencode_models(&mut model_map, &discovered);
+
+        assert_eq!(pruned, 0, "non-opencode agents must not be touched");
+        assert_eq!(
+            model_map["complex"]["claude"].len(),
+            1,
+            "claude model should be unchanged"
+        );
+    }
+
+    #[test]
+    fn prune_unavailable_opencode_models_covers_all_complexity_tiers() {
+        use std::collections::{HashMap, HashSet};
+
+        let mut model_map: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+        for tier in ["simple", "medium", "complex", "review"] {
+            model_map
+                .entry(tier.to_string())
+                .or_default()
+                .insert("opencode".to_string(), vec!["gone-model".to_string()]);
+        }
+
+        // "gone-model" is not in discovered
+        let discovered: HashSet<String> = HashSet::new();
+
+        let pruned = RouterConfig::prune_unavailable_opencode_models(&mut model_map, &discovered);
+
+        assert_eq!(pruned, 4, "should prune one entry per complexity tier");
+        for tier in ["simple", "medium", "complex", "review"] {
+            assert!(
+                model_map[tier]["opencode"].is_empty(),
+                "all entries for {} should be removed",
+                tier
+            );
+        }
     }
 }
