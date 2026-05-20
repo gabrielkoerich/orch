@@ -44,6 +44,46 @@ impl AllAgentsCooledError {
         }
     }
 
+    /// Helper: check whether LLM bypass is currently active (time-based).
+    fn llm_bypass_active(&self) -> bool {
+        if let Some(until) = self.llm_bypass_until {
+            let now = chrono::Utc::now().timestamp();
+            return now < until;
+        }
+        false
+    }
+
+    /// Record an LLM routing budget timeout occurrence. If enough timeouts
+    /// happen within the configured short window, enable a temporary bypass
+    /// that avoids calling LLM routing for a cooldown period.
+    fn record_llm_budget_timeout(&mut self) {
+        // Configurable thresholds — keep values conservative and in config.rs
+        // Window: 10 minutes, Fail threshold: 3, Bypass duration: 10 minutes
+        const WINDOW_SECS: i64 = 10 * 60;
+        const FAIL_THRESHOLD: u32 = 3;
+        const BYPASS_SECS: i64 = 10 * 60;
+
+        let now = chrono::Utc::now().timestamp();
+        match self.llm_budget_window_start {
+            Some(start) if now - start <= WINDOW_SECS => {
+                self.llm_budget_fail_count = self.llm_budget_fail_count.saturating_add(1);
+            }
+            _ => {
+                // reset window
+                self.llm_budget_window_start = Some(now);
+                self.llm_budget_fail_count = 1;
+            }
+        }
+
+        if self.llm_budget_fail_count >= FAIL_THRESHOLD {
+            self.llm_bypass_until = Some(now + BYPASS_SECS);
+            tracing::warn!(until = self.llm_bypass_until.unwrap(), "router entering short-term LLM bypass due to repeated budget timeouts");
+            // reset counters so we don't immediately re-trigger
+            self.llm_budget_fail_count = 0;
+            self.llm_budget_window_start = None;
+        }
+    }
+
     /// Get the scope of the cooldown (e.g., "medium", "all agents", "router pool").
     pub fn scope(&self) -> &str {
         match self {
@@ -192,6 +232,15 @@ pub struct Router {
     pub(crate) router_pool: Vec<(String, String)>,
     /// Current round-robin index into router_pool
     pub(crate) pool_index: usize,
+    /// Short-horizon LLM routing budget failure tracking: number of failures
+    /// observed within the configured window. Used to trigger a temporary
+    /// bypass of LLM routing to avoid repeatedly hitting the llm_budget_secs
+    /// timeout on many consecutive tasks.
+    llm_budget_fail_count: u32,
+    /// Window start timestamp (seconds since epoch) for llm_budget_fail_count.
+    llm_budget_window_start: Option<i64>,
+    /// When set, skip LLM routing until this timestamp (seconds since epoch).
+    llm_bypass_until: Option<i64>,
 }
 
 impl Router {
@@ -235,6 +284,9 @@ impl Router {
             review_rr_index: 0,
             router_pool,
             pool_index: 0,
+            llm_budget_fail_count: 0,
+            llm_budget_window_start: None,
+            llm_bypass_until: None,
         }
     }
 
@@ -841,6 +893,29 @@ impl Router {
             // Log routing start (before await)
             tracing::debug!(task_id = %task.id.0, "starting LLM routing");
 
+            // If router-level LLM bypass is active (short-circuit), skip the
+            // LLM cascade entirely and fall back to round-robin. This prevents
+            // repeatedly invoking slow/unstable routing LLMs during known
+            // degraded periods.
+            if self.llm_bypass_active() {
+                let until = self.llm_bypass_until.unwrap_or(0);
+                tracing::warn!(task_id = %task.id.0, until, "LLM routing bypass active — using round-robin instead of LLM routing");
+                let candidates = self.available_agents_for_complexity(&complexity);
+                if candidates.is_empty() {
+                    self.wait_for_cooldown(Some(&complexity)).await?;
+                    continue;
+                }
+                let result = strategies::route_via_round_robin_stateful(
+                    &candidates,
+                    &self.config,
+                    task,
+                    &mut self.rr_index,
+                    &mut self.last_agent,
+                )?;
+                self.log_route_activity(store, repo, &task.id.0, &result, None).await;
+                return Ok(result);
+            }
+
             let budget = std::time::Duration::from_secs(self.config.llm_budget_secs);
             let llm_result = tokio::time::timeout(budget, self.route_with_llm(task, repo)).await;
 
@@ -854,6 +929,8 @@ impl Router {
                     budget_secs = self.config.llm_budget_secs,
                     "LLM routing budget exceeded — falling back to round-robin immediately"
                 );
+                // Record the budget timeout and possibly enter bypass mode
+                self.record_llm_budget_timeout();
                 let candidates = self.available_agents_for_complexity(&complexity);
                 if candidates.is_empty() {
                     self.wait_for_cooldown(Some(&complexity)).await?;
@@ -3009,5 +3086,21 @@ Hope that helps!"#;
 
         // Cleanup
         clear_agent_degraded(agent);
+    }
+
+    #[test]
+    fn llm_bypass_triggers_after_consecutive_timeouts() {
+        let mut router = Router::new(RouterConfig::default());
+        // Ensure bypass not active initially
+        assert!(!router.llm_bypass_active());
+
+        // Simulate three timeouts within window
+        router.record_llm_budget_timeout();
+        router.record_llm_budget_timeout();
+        router.record_llm_budget_timeout();
+
+        // Now bypass should be set
+        assert!(router.llm_bypass_until.is_some());
+        assert!(router.llm_bypass_active());
     }
 }
