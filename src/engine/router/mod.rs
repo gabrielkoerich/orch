@@ -314,6 +314,15 @@ impl Router {
         }
     }
 
+    /// Reset the in-memory LLM budget failure counters.
+    ///
+    /// Called on successful LLM routing so only *consecutive* timeouts
+    /// contribute toward triggering the short-horizon bypass.
+    fn reset_llm_budget_counters(&mut self) {
+        self.llm_budget_fail_count = 0;
+        self.llm_budget_window_start = None;
+    }
+
     /// Discover available agent CLIs in PATH.
     /// Checks all agents from the configured list.
     fn discover_agents(configured_agents: &[String]) -> Vec<String> {
@@ -841,7 +850,12 @@ impl Router {
                     .as_ref()
                     .expect("ollama_router must be initialized in Router::new when mode=local");
                 match ollama_router.route(task, &self.config).await {
-                    Ok(result) => {
+                Ok(result) => {
+                        // Ollama produced a routing decision — treat this as a
+                        // successful LLM routing and reset the short-horizon
+                        // LLM budget failure counters so intermittent timeouts
+                        // don't accumulate toward the bypass threshold.
+                        self.reset_llm_budget_counters();
                         self.log_route_activity(store, repo, &task.id.0, &result, None)
                             .await;
                         return Ok(result);
@@ -1005,6 +1019,11 @@ impl Router {
                         );
 
                         self.set_route_attempts(&task.id.0, 0, store, repo).await;
+                        // Reset short-horizon LLM budget counters on this successful
+                        // LLM-driven decision (we routed to a fallback agent after
+                        // the LLM chose the no-code agent) so intermittent timeouts
+                        // don't accumulate toward the bypass threshold.
+                        self.reset_llm_budget_counters();
                         let result = RouteResult {
                             agent: fallback_agent.clone(),
                             model: fallback_model,
@@ -1080,6 +1099,9 @@ impl Router {
 
                         // Reset attempts on success
                         self.set_route_attempts(&task.id.0, 0, store, repo).await;
+                        // Reset the short-horizon LLM counters on this successful
+                        // LLM-derived reroute so only consecutive failures count.
+                        self.reset_llm_budget_counters();
 
                         let reason = if fallback_agent == result.agent {
                             format!(
@@ -1116,6 +1138,10 @@ impl Router {
 
                     // Reset attempts on success
                     self.set_route_attempts(&task.id.0, 0, store, repo).await;
+                    // Successful LLM routing should reset the short-horizon
+                    // llm budget failure counters so only *consecutive* timeouts
+                    // contribute to triggering the bypass.
+                    self.reset_llm_budget_counters();
                     tracing::info!(
                         task_id = %task.id.0,
                         agent = %result.agent,
