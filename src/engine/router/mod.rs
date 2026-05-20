@@ -44,45 +44,7 @@ impl AllAgentsCooledError {
         }
     }
 
-    /// Helper: check whether LLM bypass is currently active (time-based).
-    fn llm_bypass_active(&self) -> bool {
-        if let Some(until) = self.llm_bypass_until {
-            let now = chrono::Utc::now().timestamp();
-            return now < until;
-        }
-        false
-    }
-
-    /// Record an LLM routing budget timeout occurrence. If enough timeouts
-    /// happen within the configured short window, enable a temporary bypass
-    /// that avoids calling LLM routing for a cooldown period.
-    fn record_llm_budget_timeout(&mut self) {
-        // Configurable thresholds — keep values conservative and in config.rs
-        // Window: 10 minutes, Fail threshold: 3, Bypass duration: 10 minutes
-        const WINDOW_SECS: i64 = 10 * 60;
-        const FAIL_THRESHOLD: u32 = 3;
-        const BYPASS_SECS: i64 = 10 * 60;
-
-        let now = chrono::Utc::now().timestamp();
-        match self.llm_budget_window_start {
-            Some(start) if now - start <= WINDOW_SECS => {
-                self.llm_budget_fail_count = self.llm_budget_fail_count.saturating_add(1);
-            }
-            _ => {
-                // reset window
-                self.llm_budget_window_start = Some(now);
-                self.llm_budget_fail_count = 1;
-            }
-        }
-
-        if self.llm_budget_fail_count >= FAIL_THRESHOLD {
-            self.llm_bypass_until = Some(now + BYPASS_SECS);
-            tracing::warn!(until = self.llm_bypass_until.unwrap(), "router entering short-term LLM bypass due to repeated budget timeouts");
-            // reset counters so we don't immediately re-trigger
-            self.llm_budget_fail_count = 0;
-            self.llm_budget_window_start = None;
-        }
-    }
+    // LLM bypass helpers moved to `impl Router` so they can access Router fields.
 
     /// Get the scope of the cooldown (e.g., "medium", "all agents", "router pool").
     pub fn scope(&self) -> &str {
@@ -309,6 +271,47 @@ impl Router {
     fn advance_pool_index_after_attempt(&mut self, idx: usize, pool_len: usize) {
         debug_assert!(pool_len > 0, "router pool must not be empty");
         self.pool_index = (idx + 1) % pool_len;
+    }
+
+    /// Check whether the router-level LLM bypass is currently active.
+    fn llm_bypass_active(&self) -> bool {
+        if let Some(until) = self.llm_bypass_until {
+            let now = chrono::Utc::now().timestamp();
+            return now < until;
+        }
+        false
+    }
+
+    /// Record an LLM routing budget timeout occurrence. If enough timeouts
+    /// happen within the configured short window, enable a temporary bypass
+    /// that avoids calling LLM routing for a cooldown period.
+    fn record_llm_budget_timeout(&mut self) {
+        let window_secs = self.config.llm_bypass_window_secs as i64;
+        let fail_threshold = self.config.llm_bypass_fail_threshold;
+        let bypass_secs = self.config.llm_bypass_duration_secs as i64;
+
+        let now = chrono::Utc::now().timestamp();
+        match self.llm_budget_window_start {
+            Some(start) if now - start <= window_secs => {
+                self.llm_budget_fail_count = self.llm_budget_fail_count.saturating_add(1);
+            }
+            _ => {
+                // reset window
+                self.llm_budget_window_start = Some(now);
+                self.llm_budget_fail_count = 1;
+            }
+        }
+
+        if self.llm_budget_fail_count >= fail_threshold {
+            self.llm_bypass_until = Some(now + bypass_secs);
+            tracing::warn!(
+                until = self.llm_bypass_until.unwrap(),
+                "router entering short-term LLM bypass due to repeated budget timeouts"
+            );
+            // reset counters so we don't immediately re-trigger
+            self.llm_budget_fail_count = 0;
+            self.llm_budget_window_start = None;
+        }
     }
 
     /// Discover available agent CLIs in PATH.
@@ -899,7 +902,11 @@ impl Router {
             // degraded periods.
             if self.llm_bypass_active() {
                 let until = self.llm_bypass_until.unwrap_or(0);
-                tracing::warn!(task_id = %task.id.0, until, "LLM routing bypass active — using round-robin instead of LLM routing");
+                tracing::warn!(
+                    task_id = %task.id.0,
+                    until = until,
+                    "LLM routing bypass active — using round-robin instead of LLM routing",
+                );
                 let candidates = self.available_agents_for_complexity(&complexity);
                 if candidates.is_empty() {
                     self.wait_for_cooldown(Some(&complexity)).await?;
@@ -912,7 +919,9 @@ impl Router {
                     &mut self.rr_index,
                     &mut self.last_agent,
                 )?;
-                self.log_route_activity(store, repo, &task.id.0, &result, None).await;
+                self
+                    .log_route_activity(store, repo, &task.id.0, &result, None)
+                    .await;
                 return Ok(result);
             }
 
