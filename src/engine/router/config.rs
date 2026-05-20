@@ -212,6 +212,13 @@ pub struct RouterConfig {
     ///
     /// Configurable via `router.llm_budget_secs` (default: `timeout_seconds`).
     pub llm_budget_secs: u64,
+    /// Short-horizon LLM bypass: number of budget timeouts within `llm_bypass_window_secs`
+    /// required to trigger a temporary bypass of LLM routing.
+    pub llm_bypass_fail_threshold: u32,
+    /// Window in seconds for counting LLM budget timeouts for bypass triggering.
+    pub llm_bypass_window_secs: u64,
+    /// Duration in seconds to bypass LLM routing once the threshold is reached.
+    pub llm_bypass_duration_secs: u64,
 }
 
 /// Parse an `agent:model` pool entry string, splitting on the first colon.
@@ -273,6 +280,9 @@ impl Default for RouterConfig {
             ollama_model: "qwen2.5-coder:3b-instruct".to_string(),
             ollama_timeout_seconds: 30,
             llm_budget_secs: 30,
+            llm_bypass_fail_threshold: 3,
+            llm_bypass_window_secs: 10 * 60,
+            llm_bypass_duration_secs: 10 * 60,
         }
     }
 }
@@ -419,15 +429,22 @@ impl RouterConfig {
             }
         }
 
-        // Parse llm_budget_secs — total time cap for the entire pool cascade.
-        // Default to 30s so round-robin takes over before tick exceeds watchdog
-        // threshold (6 × tick_interval). User config overrides this.
-        config.llm_budget_secs = 30;
-        if let Ok(val) = crate::config::get("router.llm_budget_secs") {
-            if let Ok(secs) = val.parse::<u64>() {
-                if secs > 0 {
-                    config.llm_budget_secs = secs;
-                }
+        // Short-horizon LLM bypass configuration: trigger bypass after N
+        // `llm_budget` timeouts within a short window to avoid repeatedly
+        // invoking the routing LLM when it's clearly degraded.
+        if let Ok(val) = crate::config::get("router.llm_bypass_fail_threshold") {
+            if let Ok(n) = val.parse::<u32>() {
+                config.llm_bypass_fail_threshold = n.max(1);
+            }
+        }
+        if let Ok(val) = crate::config::get("router.llm_bypass_window_secs") {
+            if let Ok(n) = val.parse::<u64>() {
+                config.llm_bypass_window_secs = n.max(10);
+            }
+        }
+        if let Ok(val) = crate::config::get("router.llm_bypass_duration_secs") {
+            if let Ok(n) = val.parse::<u64>() {
+                config.llm_bypass_duration_secs = n.max(10);
             }
         }
 
