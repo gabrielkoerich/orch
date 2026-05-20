@@ -429,8 +429,6 @@ impl RouterConfig {
             }
         }
 
-        
-
         // Short-horizon LLM bypass configuration: trigger bypass after N
         // `llm_budget` timeouts within a short window to avoid repeatedly
         // invoking the routing LLM when it's clearly degraded.

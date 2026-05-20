@@ -919,8 +919,7 @@ impl Router {
                     &mut self.rr_index,
                     &mut self.last_agent,
                 )?;
-                self
-                    .log_route_activity(store, repo, &task.id.0, &result, None)
+                self.log_route_activity(store, repo, &task.id.0, &result, None)
                     .await;
                 return Ok(result);
             }
