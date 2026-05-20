@@ -160,6 +160,8 @@ fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
         "done"
         | "completed"
         | "complete"
+        | "skipped"
+        | "skip"
         | "ok"
         | "success"
         | "no_changes_needed"
@@ -1082,6 +1084,8 @@ Some output here.
             ("success", "done"),
             ("completed", "done"),
             ("complete", "done"),
+            ("skipped", "done"),
+            ("skip", "done"),
             ("no_changes_needed", "done"),
             ("no_trades_no_positions", "done"),
             ("running", "in_progress"),
