@@ -850,7 +850,7 @@ impl Router {
                     .as_ref()
                     .expect("ollama_router must be initialized in Router::new when mode=local");
                 match ollama_router.route(task, &self.config).await {
-                Ok(result) => {
+                    Ok(result) => {
                         // Ollama produced a routing decision — treat this as a
                         // successful LLM routing and reset the short-horizon
                         // LLM budget failure counters so intermittent timeouts
