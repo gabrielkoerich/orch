@@ -2459,12 +2459,20 @@ world"}"#;
             "claude default: expected rm disallowed, got: {cmd}"
         );
 
-        // Codex: should have --full-auto (autonomous + workspace-write)
+        // Codex: autonomous + workspace-write → --sandbox workspace-write --ask-for-approval never
         let codex = get_runner("codex");
         let cmd = codex.build_command(None, "", sys, msg, &perms);
         assert!(
-            cmd.contains("--full-auto"),
-            "codex default: expected --full-auto, got: {cmd}"
+            cmd.contains("--sandbox workspace-write"),
+            "codex default: expected --sandbox workspace-write, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("--ask-for-approval never"),
+            "codex default: expected --ask-for-approval never, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--full-auto"),
+            "codex default: --full-auto is deprecated and must not appear, got: {cmd}"
         );
 
         // OpenCode: should write permission config and override XDG_CONFIG_HOME
@@ -2544,9 +2552,9 @@ world"}"#;
         );
     }
 
-    /// Test SandboxLevel::None with autonomous falls back to --full-auto for Codex.
+    /// SandboxLevel::None with autonomous uses --sandbox workspace-write (same as WorkspaceWrite).
     #[test]
-    fn codex_sandbox_none_defaults_to_full_auto() {
+    fn codex_sandbox_none_uses_workspace_write() {
         let perms = PermissionRules {
             autonomous: true,
             sandbox: SandboxLevel::None,
@@ -2559,8 +2567,16 @@ world"}"#;
         let codex = get_runner("codex");
         let cmd = codex.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
         assert!(
-            cmd.contains("--full-auto"),
-            "codex sandbox::none + autonomous: should use --full-auto, got: {cmd}"
+            cmd.contains("--sandbox workspace-write"),
+            "codex sandbox::none + autonomous: should use --sandbox workspace-write, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("--ask-for-approval never"),
+            "codex sandbox::none + autonomous: should use --ask-for-approval never, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--full-auto"),
+            "codex sandbox::none: --full-auto is deprecated and must not appear, got: {cmd}"
         );
     }
 
@@ -2878,10 +2894,14 @@ world"}"#;
         let cmd = codex.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
 
         if perms.autonomous {
-            // autonomous codex uses --full-auto (sandbox::WorkspaceWrite default)
+            // autonomous codex uses --sandbox workspace-write --ask-for-approval never
             assert!(
-                cmd.contains("--full-auto"),
-                "autonomous config → --full-auto, got: {cmd}"
+                cmd.contains("--sandbox workspace-write"),
+                "autonomous config → --sandbox workspace-write, got: {cmd}"
+            );
+            assert!(
+                cmd.contains("--ask-for-approval never"),
+                "autonomous config → --ask-for-approval never, got: {cmd}"
             );
         } else {
             assert!(
