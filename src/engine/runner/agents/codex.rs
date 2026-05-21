@@ -225,15 +225,18 @@ impl AgentRunner for CodexRunner {
             .unwrap_or_default();
 
         // Codex permission mode:
-        // - autonomous → --full-auto (auto-approval + workspace-write sandbox)
+        // - autonomous → --sandbox workspace-write --ask-for-approval never
         // - supervised → --ask-for-approval suggest
         // - full access → --dangerously-bypass-approvals-and-sandbox
+        //
+        // Note: --full-auto is deprecated as of codex 0.128.0 and does not
+        // reliably honour --add-dir entries under the new seatbelt policy.
         let permission_flags = if permissions.autonomous {
             match permissions.sandbox {
                 SandboxLevel::FullAccess => {
                     "--dangerously-bypass-approvals-and-sandbox".to_string()
                 }
-                _ => "--full-auto".to_string(),
+                _ => "--sandbox workspace-write --ask-for-approval never".to_string(),
             }
         } else {
             let sandbox = match permissions.sandbox {
@@ -510,8 +513,16 @@ mod tests {
         assert!(cmd.contains("exec"));
         assert!(cmd.contains("--json -"));
         assert!(
-            cmd.contains("--full-auto"),
-            "default autonomous codex should use --full-auto, got: {cmd}"
+            cmd.contains("--sandbox workspace-write"),
+            "default autonomous codex should use --sandbox workspace-write, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("--ask-for-approval never"),
+            "default autonomous codex should use --ask-for-approval never, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--full-auto"),
+            "--full-auto is deprecated and must not appear in the command, got: {cmd}"
         );
     }
 
@@ -569,8 +580,16 @@ mod tests {
             "should include two --add-dir flags, got: {cmd}"
         );
         assert!(
-            cmd.contains("--full-auto"),
-            "should still include --full-auto, got: {cmd}"
+            cmd.contains("--sandbox workspace-write"),
+            "autonomous codex with extra dirs should use --sandbox workspace-write, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("--ask-for-approval never"),
+            "autonomous codex with extra dirs should use --ask-for-approval never, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--full-auto"),
+            "--full-auto is deprecated and must not appear, got: {cmd}"
         );
         assert!(
             cmd.contains("exec") && cmd.contains("--json -"),
