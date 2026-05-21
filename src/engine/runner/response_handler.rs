@@ -1101,6 +1101,9 @@ fn is_retryable_blocked_reason(reason: &str) -> bool {
         "service down",
         "permission denied",
         "worktree lock",
+        "git lock",
+        "lockfile permission",
+        "lock permission",
         "resource busy",
         "could not resolve host",
         // Credential providers in headless/tmux sessions can fail transiently
@@ -2150,6 +2153,12 @@ mod tests {
         ));
         assert!(is_retryable_blocked_reason(
             "final commit blocked by git worktree lock permission error"
+        ));
+        assert!(is_retryable_blocked_reason(
+            "could not commit due a worktree git lock permission error"
+        ));
+        assert!(is_retryable_blocked_reason(
+            "git lockfile permission restrictions in this environment"
         ));
         assert!(is_retryable_blocked_reason(
             "API rate limit hit, try again later"
