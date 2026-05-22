@@ -12,7 +12,7 @@
 //! Submodules handle the heavy lifting:
 //! - [`task_init`] — guard checks, worktree setup, and invocation building
 //! - [`session`] — tmux session lifecycle and output collection
-//! - [`response_handler`] — success path: commit, push, PR, token storage, budget
+//! - [`response_handler`] — success path: commit, push, PR, token storage
 //! - [`fallback`] — error classification and recovery strategies
 
 pub mod agent;
@@ -86,11 +86,7 @@ fn classify_run_outcome(
     status: &str,
     parse_result: &Result<agents::ParsedResponse, agents::AgentError>,
     push_failed: bool,
-    budget_exceeded: bool,
 ) -> &'static str {
-    if budget_exceeded {
-        return "budget_exceeded";
-    }
     if push_failed {
         return "push_failed";
     }
@@ -185,7 +181,6 @@ struct RunAuditInput<'a> {
     error_override: Option<String>,
     elapsed_secs: Option<u64>,
     push_failed: bool,
-    budget_exceeded: bool,
 }
 
 fn parse_success_output(
@@ -492,8 +487,6 @@ impl TaskRunner {
             "summary" => Some(task.summary),
             "last_error" => Some(task.last_error),
             "agent" => task.agent,
-            "budget_warning" => Some(task.budget_warning),
-            "budget_exceeded" => Some(task.budget_exceeded.to_string()),
             _ => None,
         }
     }
@@ -508,13 +501,8 @@ impl TaskRunner {
             .get_field(input.task_id, "last_error")
             .await
             .filter(|s| !s.is_empty());
-        let outcome = classify_run_outcome(
-            input.status,
-            input.parse_result,
-            input.push_failed,
-            input.budget_exceeded,
-        )
-        .to_string();
+        let outcome =
+            classify_run_outcome(input.status, input.parse_result, input.push_failed).to_string();
 
         let error = if outcome == "success" {
             String::new()
@@ -661,70 +649,6 @@ impl TaskRunner {
             Err(e) => return Err(e),
         };
 
-        // Check token budget before proceeding
-        match task_init::check_token_budget(task_id, &self.repo, &self.store).await {
-            task_init::BudgetCheckOutcome::Proceed => {}
-            task_init::BudgetCheckOutcome::Exceeded {
-                total_tokens,
-                max_tokens,
-            } => {
-                tracing::warn!(
-                    task_id,
-                    total_tokens,
-                    max_tokens,
-                    "token budget exceeded - blocking task"
-                );
-                if let Some(b) = backend {
-                    let id = crate::backends::ExternalId(task_id.to_string());
-                    if let Err(e) = b.update_status(&id, crate::backends::Status::Blocked).await {
-                        tracing::warn!(task_id, err = %e, "failed to update backend status to Blocked after token budget exceeded");
-                    }
-                }
-                return Ok(Some(RunExecution {
-                    status: "blocked".to_string(),
-                    exit_code: None,
-                    audit: RunAudit {
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        parsed_response: String::new(),
-                        outcome: "failed".to_string(),
-                        error: format!("token budget exceeded: {total_tokens}/{max_tokens}"),
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        total_cost_usd: 0.0,
-                        duration_secs: 0.0,
-                    },
-                }));
-            }
-            task_init::BudgetCheckOutcome::StoreReadError => {
-                tracing::error!(
-                    task_id,
-                    "token budget check failed due to store read error — blocking task"
-                );
-                if let Some(b) = backend {
-                    let id = crate::backends::ExternalId(task_id.to_string());
-                    if let Err(e) = b.update_status(&id, crate::backends::Status::Blocked).await {
-                        tracing::warn!(task_id, err = %e, "failed to update backend status to Blocked after budget check error");
-                    }
-                }
-                return Ok(Some(RunExecution {
-                    status: "blocked".to_string(),
-                    exit_code: None,
-                    audit: RunAudit {
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        parsed_response: String::new(),
-                        outcome: "failed".to_string(),
-                        error: "token budget check failed: store read error".to_string(),
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        total_cost_usd: 0.0,
-                        duration_secs: 0.0,
-                    },
-                }));
-            }
-        }
-
         // Resolve project directory
         let project_dir = self.resolve_project_dir().await?;
 
@@ -793,7 +717,6 @@ impl TaskRunner {
                         error_override: Some(format!("silence detection set task to {status_str}")),
                         elapsed_secs: session_output.elapsed_secs,
                         push_failed: false,
-                        budget_exceeded: false,
                     })
                     .await;
                 return Ok(Some(RunExecution {
@@ -866,9 +789,9 @@ impl TaskRunner {
         // so that stale `last_error` values from a previous agent's run are never written
         // into the current run's audit record (fixes misattribution bug: task_run shows
         // agent=kimi but error="minimax timed out...").
-        let (final_status, _budget_exceeded, push_failed, fallback_error) = match parse_result {
+        let (final_status, push_failed, fallback_error) = match parse_result {
             Ok(ref parsed) => {
-                let (status, budget_exceeded, push_failed) = response_handler::handle_success(
+                let (status, push_failed) = response_handler::handle_success(
                     task_id,
                     parsed.clone(),
                     &init.wt,
@@ -881,30 +804,7 @@ impl TaskRunner {
                     &session_output.raw_stdout,
                 )
                 .await?;
-                if budget_exceeded {
-                    // Token budget exceeded — clean up tmux session and env secrets
-                    session::cleanup_session(task_id, &tmux, &tmux_session).await;
-                    let audit = self
-                        .build_run_audit(RunAuditInput {
-                            task_id,
-                            status: &status,
-                            parse_result: &parse_result,
-                            raw_stdout: &session_output.raw_stdout,
-                            raw_stderr: &session_output.raw_stderr,
-                            started_at,
-                            error_override: None,
-                            elapsed_secs: session_output.elapsed_secs,
-                            push_failed,
-                            budget_exceeded,
-                        })
-                        .await;
-                    return Ok(Some(RunExecution {
-                        status,
-                        exit_code: Some(session_output.exit_code),
-                        audit,
-                    }));
-                }
-                (status, budget_exceeded, push_failed, None)
+                (status, push_failed, None)
             }
             Err(ref agent_err) => {
                 match fallback::handle_error(
@@ -941,7 +841,6 @@ impl TaskRunner {
                                 error_override: None,
                                 elapsed_secs: session_output.elapsed_secs,
                                 push_failed: false,
-                                budget_exceeded: false,
                             })
                             .await;
                         return Ok(Some(RunExecution {
@@ -951,7 +850,7 @@ impl TaskRunner {
                         }));
                     }
                     fallback::ErrorHandleResult::Continue { status, error } => {
-                        (status, false, false, Some(error))
+                        (status, false, Some(error))
                     }
                 }
             }
@@ -988,7 +887,6 @@ impl TaskRunner {
                 error_override: fallback_error,
                 elapsed_secs: session_output.elapsed_secs,
                 push_failed,
-                budget_exceeded: _budget_exceeded,
             })
             .await;
 
@@ -1496,16 +1394,6 @@ impl TaskRunner {
             );
         }
 
-        // Check for budget warnings and append to comment
-        let budget_warning = self
-            .get_field(task_id, "budget_warning")
-            .await
-            .unwrap_or_default();
-        let budget_exceeded = self
-            .get_field(task_id, "budget_exceeded")
-            .await
-            .unwrap_or_default();
-
         // Post comment (scan for secrets before posting to GitHub)
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
         let mut raw_comment = if !summary.is_empty() {
@@ -1515,18 +1403,6 @@ impl TaskRunner {
         } else {
             format!("[{now}] {status}")
         };
-
-        // Append budget warnings to the GitHub comment
-        if budget_exceeded == "true" {
-            let cost = store::get_cost_estimate(&self.store, &self.repo, task_id).await;
-            let total_tokens = store::get_total_tokens(&self.store, &self.repo, task_id).await;
-            raw_comment.push_str(&format!(
-                "\n\n> **Budget exceeded**: {} tokens used (${:.4}). Task paused for review.",
-                total_tokens, cost.total_cost_usd
-            ));
-        } else if !budget_warning.is_empty() {
-            raw_comment.push_str(&format!("\n\n> **Budget warning**: {budget_warning}"));
-        }
 
         // Append visible attribution footer (matches PR body style)
         let footer = crate::engine::attribution_footer("Created", &agent_name, model);
@@ -2055,7 +1931,7 @@ mod tests {
         // from genuine failures (#2801).
         let parse_result = ok_parse_result("routed");
         assert_eq!(
-            classify_run_outcome("routed", &parse_result, false, false),
+            classify_run_outcome("routed", &parse_result, false),
             "success"
         );
     }
@@ -2064,7 +1940,7 @@ mod tests {
     fn classify_run_outcome_blocked_is_blocked() {
         let parse_result = ok_parse_result("blocked");
         assert_eq!(
-            classify_run_outcome("blocked", &parse_result, false, false),
+            classify_run_outcome("blocked", &parse_result, false),
             "blocked"
         );
     }
@@ -2075,7 +1951,7 @@ mod tests {
         // The explicit error message is provided by build_run_audit.
         let parse_result = ok_parse_result("fix_deployed");
         assert_eq!(
-            classify_run_outcome("fix_deployed", &parse_result, false, false),
+            classify_run_outcome("fix_deployed", &parse_result, false),
             "failed"
         );
     }
@@ -2114,7 +1990,6 @@ mod tests {
                 error_override: None,
                 elapsed_secs: Some(1),
                 push_failed: false,
-                budget_exceeded: false,
             })
             .await;
 
@@ -2138,7 +2013,6 @@ mod tests {
                 error_override: None,
                 elapsed_secs: Some(1),
                 push_failed: false,
-                budget_exceeded: false,
             })
             .await;
 
@@ -2166,7 +2040,6 @@ mod tests {
                 error_override: None,
                 elapsed_secs: Some(1),
                 push_failed: false,
-                budget_exceeded: false,
             })
             .await;
 
@@ -2193,7 +2066,6 @@ mod tests {
                     error_override: None,
                     elapsed_secs: Some(1),
                     push_failed: false,
-                    budget_exceeded: false,
                 })
                 .await;
 
@@ -2237,7 +2109,6 @@ mod tests {
                 error_override: None,
                 elapsed_secs: Some(1),
                 push_failed: false,
-                budget_exceeded: false,
             })
             .await;
 
@@ -2774,69 +2645,6 @@ mod tests {
         assert_eq!(parsed.response.summary, "All good");
         assert_eq!(parsed.input_tokens, Some(10));
         assert_eq!(parsed.output_tokens, Some(5));
-    }
-
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn run_with_context_blocks_when_budget_exceeded_pre_run() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let temp_home = TempDir::new().unwrap();
-        let orch_home = temp_home.path().join(".orch");
-        tokio::fs::create_dir_all(&orch_home).await.unwrap();
-        let old_orch_home = std::env::var("ORCH_HOME").ok();
-        std::env::set_var("ORCH_HOME", &orch_home);
-
-        let repo = "owner/repo";
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
-
-        let task_id = "111";
-        let task = make_task(task_id);
-
-        let row_id = store.ensure_external_task(repo, &task).await.unwrap();
-
-        store
-            .set_fields(
-                row_id,
-                &[
-                    ("pr_number", serde_json::json!(42)),
-                    ("budget_exceeded", serde_json::json!(true)),
-                ],
-            )
-            .await
-            .unwrap();
-
-        store
-            .store_tokens(row_id, 100000, 100000, "haiku")
-            .await
-            .unwrap();
-
-        let mut runner = TaskRunner::new(repo.to_string());
-        runner = runner.with_store(store.clone());
-
-        std::env::set_var("ORCH_MAX_TOKENS_PER_TASK", "10");
-
-        let backend = Arc::new(TrackingBackend::new());
-        let backend_dyn: Arc<dyn crate::backends::ExternalBackend> = backend.clone();
-        let tmux = Arc::new(crate::tmux::TmuxManager::new());
-
-        let result = runner
-            .run_with_context(&task, &backend_dyn, &tmux, None)
-            .await
-            .unwrap();
-
-        assert!(matches!(result, WeightSignal::Blocked));
-
-        let updates = backend.status_updates.lock().unwrap();
-        assert!(updates
-            .iter()
-            .any(|(id, s)| id == task_id && *s == crate::backends::Status::Blocked));
-
-        std::env::remove_var("ORCH_MAX_TOKENS_PER_TASK");
-        if let Some(old) = old_orch_home {
-            std::env::set_var("ORCH_HOME", old);
-        } else {
-            std::env::remove_var("ORCH_HOME");
-        }
     }
 
     // ── agent label update after reroute ─────────────────────────────────────

@@ -1,8 +1,8 @@
-//! Success-path response handler — commit, push, PR, token storage, budget check.
+//! Success-path response handler — commit, push, PR, token storage.
 //!
 //! Extracted from `runner/mod.rs`. Handles the `Ok(parsed)` arm of the parse
-//! result, including git operations, delegation storage, and budget enforcement.
-//! Also owns `write_result_json`.
+//! result, including git operations and delegation storage. Also owns
+//! `write_result_json`.
 
 use crate::config;
 use crate::parser::AgentResponse;
@@ -1328,115 +1328,11 @@ async fn store_token_usage(
     }
 }
 
-/// Enforce the per-task token budget. Returns `(final_status, budget_exceeded)`.
+/// Handle a successful agent response: commit, push, PR, delegations, tokens.
 ///
-/// When the budget is exceeded, overrides `final_status` with `"needs_review"`
-/// if a PR exists, or keeps it unchanged for read-only tasks.
-async fn check_token_budget(
-    ctx: &StoreCtx<'_>,
-    max_tokens: u64,
-    has_pr: bool,
-    final_status: &str,
-) -> (String, bool) {
-    // Query total tokens and cost estimate together (single DB read)
-    let (total_tokens, cost) = if let Some(ref s) = ctx.store {
-        if let Some(store_id) = ctx.store_id_opt {
-            match s.get(store_id).await {
-                Ok(task) => {
-                    let usage = crate::store::TokenUsage {
-                        input_tokens: task.input_tokens as u64,
-                        output_tokens: task.output_tokens as u64,
-                    };
-                    let total = usage.total_tokens();
-                    let cost = crate::store::CostEstimate {
-                        input_cost_usd: task.input_cost_usd,
-                        output_cost_usd: task.output_cost_usd,
-                        total_cost_usd: task.total_cost_usd,
-                    };
-                    (total, cost)
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        task_id = ctx.task_id,
-                        err = %e,
-                        "store.get() failed in check_token_budget — falling back to get_token_summary"
-                    );
-                    store::get_token_summary(ctx.store, ctx.repo, ctx.task_id).await
-                }
-            }
-        } else {
-            store::get_token_summary(ctx.store, ctx.repo, ctx.task_id).await
-        }
-    } else {
-        store::get_token_summary(ctx.store, ctx.repo, ctx.task_id).await
-    };
-
-    let warning_threshold = (max_tokens as f64 * 0.8) as u64;
-
-    if total_tokens > max_tokens {
-        tracing::warn!(
-            ctx.task_id,
-            total_tokens,
-            max_tokens,
-            "exceeded token budget"
-        );
-        // Only override to needs_review if there's a PR to review;
-        // otherwise keep the already-computed final_status (e.g. "done" for
-        // read-only tasks with no code changes).
-        let budget_status = if has_pr { "needs_review" } else { final_status };
-        let budget_msg = format!(
-            "token budget exceeded: {}/{} tokens (${:.4})",
-            total_tokens, max_tokens, cost.total_cost_usd
-        );
-        if let Err(e) = store::store_set_result(
-            ctx.store,
-            ctx.repo,
-            ctx.task_id,
-            &[
-                ("last_error", serde_json::json!(budget_msg)),
-                ("budget_exceeded", serde_json::json!(true)),
-            ],
-        )
-        .await
-        {
-            tracing::error!(
-                task_id = ctx.task_id,
-                err = %e,
-                "CRITICAL: failed to write budget_exceeded — task may not be properly budget-gated"
-            );
-        }
-        (budget_status.to_string(), true) // signal early return to caller
-    } else {
-        if total_tokens > warning_threshold {
-            let pct = (total_tokens as f64 / max_tokens as f64 * 100.0) as u32;
-            tracing::warn!(
-                ctx.task_id,
-                total_tokens,
-                max_tokens,
-                pct,
-                "approaching token budget"
-            );
-            let warning_msg = format!(
-                "{}% of budget used ({}/{} tokens, ${:.4})",
-                pct, total_tokens, max_tokens, cost.total_cost_usd
-            );
-            store::store_set(
-                ctx.store,
-                ctx.repo,
-                ctx.task_id,
-                &[("budget_warning", serde_json::json!(warning_msg))],
-            )
-            .await;
-        }
-        (final_status.to_string(), false)
-    }
-}
-
-/// Handle a successful agent response: commit, push, PR, delegations, tokens, budget.
-///
-/// Returns `Ok((status, budget_exceeded, push_failed))` where `status` is the final task status
-/// string, `budget_exceeded` is `true` if `run()` should return early, and `push_failed`
-/// is `true` when a push was attempted but failed (for audit trail classification).
+/// Returns `Ok((status, push_failed))` where `status` is the final task status
+/// string and `push_failed` is `true` when a push was attempted but failed (for
+/// audit trail classification).
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_success(
     task_id: &str,
@@ -1449,7 +1345,7 @@ pub async fn handle_success(
     repo: &str,
     store: &Option<Arc<TaskStore>>,
     raw_stdout: &str,
-) -> anyhow::Result<(String, bool, bool)> {
+) -> anyhow::Result<(String, bool)> {
     // Extract token counts before consuming parsed.
     let input_tokens = parsed.input_tokens;
     let output_tokens = parsed.output_tokens;
@@ -1671,25 +1567,9 @@ pub async fn handle_success(
     )
     .await;
 
-    // Check token budget with warning thresholds
-    // Use the same config key as pre-run checks. If set to 0, disable budget
-    // enforcement so tasks may continue without token budget gating.
-    let max_tokens: u64 = config::get("workflow.max_tokens_per_task")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100_000);
-
-    if max_tokens == 0 {
-        // Budget checks disabled — nothing to do here.
-        return Ok((final_status.to_string(), false, push_state.push_failed));
-    }
-
-    let (budget_status, budget_exceeded) =
-        check_token_budget(&ctx, max_tokens, git.has_pr, final_status).await;
-
     // Note: done → in_review transition is handled by the engine
     // after triggering the review agent (engine/mod.rs)
-    Ok((budget_status, budget_exceeded, push_state.push_failed))
+    Ok((final_status.to_string(), push_state.push_failed))
 }
 
 /// Labels that indicate a task is non-code and can be marked done without a PR.

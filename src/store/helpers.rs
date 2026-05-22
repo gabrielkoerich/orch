@@ -440,57 +440,6 @@ pub async fn get_cost_estimate(
     }
 }
 
-pub async fn get_total_tokens(store: &Option<Arc<TaskStore>>, repo: &str, task_id: &str) -> u64 {
-    let usage = get_token_usage(store, repo, task_id).await;
-    usage.total_tokens()
-}
-
-/// Get both total tokens and cost estimate in a single store read, surfacing DB errors.
-pub async fn get_token_summary_result(
-    store: &Option<Arc<TaskStore>>,
-    repo: &str,
-    task_id: &str,
-) -> StoreResult<(u64, CostEstimate)> {
-    let s = store
-        .as_ref()
-        .ok_or_else(|| anyhow!("task store unavailable"))?;
-    let store_id = s
-        .resolve_task_id(repo, task_id)
-        .await?
-        .ok_or_else(|| anyhow!("task {}/{} not found in store", repo, task_id))?;
-    let task = s.get(store_id).await?;
-    let usage = TokenUsage {
-        input_tokens: token_i64_to_u64_non_negative(task.input_tokens),
-        output_tokens: token_i64_to_u64_non_negative(task.output_tokens),
-    };
-    let total = usage.total_tokens();
-    let cost = CostEstimate {
-        input_cost_usd: task.input_cost_usd,
-        output_cost_usd: task.output_cost_usd,
-        total_cost_usd: task.total_cost_usd,
-    };
-    Ok(Some((total, cost)))
-}
-
-/// Get both total tokens and cost estimate in a single store read.
-///
-/// Returns `(0, CostEstimate::default())` when the store is unavailable or the task is not found.
-/// DB read errors are logged as warnings and return the default.
-pub async fn get_token_summary(
-    store: &Option<Arc<TaskStore>>,
-    repo: &str,
-    task_id: &str,
-) -> (u64, CostEstimate) {
-    match get_token_summary_result(store, repo, task_id).await {
-        Ok(Some(summary)) => summary,
-        Ok(None) => (0, CostEstimate::default()),
-        Err(e) => {
-            tracing::warn!(task_id, error = %e, "get_token_summary failed — returning zero tokens/cost");
-            (0, CostEstimate::default())
-        }
-    }
-}
-
 /// Get recent memory entries for a task, surfacing DB read errors.
 pub async fn get_recent_memory_result(
     store: &Option<Arc<TaskStore>>,

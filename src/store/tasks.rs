@@ -17,13 +17,13 @@ pub(crate) const TASK_COLS: &str = "id, external_id, repo, origin, title, body, 
     last_comment_review_ts, merge_conflict_retries, ci_merge_failures, \
     pr_create_failures, review_agent_failures, review_cycles, input_tokens, \
     output_tokens, input_cost_usd, output_cost_usd, total_cost_usd, \
-    model_reroute_chain, limit_reroute_chain, budget_warning, budget_exceeded, \
+    model_reroute_chain, limit_reroute_chain, \
     memory, delegations, created_at, updated_at, review_session_expected, \
      review_invocations, needs_review_refires, push_failures, auto_unblock_count, auto_unblock_last_at, \
      ci_recovery_count, auto_unblock_last_reason, no_code_reroutes, network_retries, no_code_last_agent";
 
 /// Number of columns in TASK_COLS (used for diagnostic verification).
-pub(crate) const TASK_COLS_COUNT: usize = 62;
+pub(crate) const TASK_COLS_COUNT: usize = 60;
 
 /// Explicit column list for `SELECT` queries on the `task_runs` table.
 const TASK_RUN_COLS: &str =
@@ -73,8 +73,6 @@ const ALLOWED_FIELDS: &[&str] = &[
     "total_cost_usd",
     "model_reroute_chain",
     "limit_reroute_chain",
-    "budget_warning",
-    "budget_exceeded",
     "memory",
     "delegations",
     "source",
@@ -212,8 +210,6 @@ pub struct Task {
     // Recovery
     pub model_reroute_chain: String,
     pub limit_reroute_chain: String,
-    pub budget_warning: String,
-    pub budget_exceeded: bool,
 
     // Structured data
     pub memory: Vec<MemoryEntry>,
@@ -2193,8 +2189,6 @@ impl TaskStore {
             total_cost_usd: row.try_get("total_cost_usd").unwrap_or(0.0),
             model_reroute_chain: row.try_get("model_reroute_chain").unwrap_or_default(),
             limit_reroute_chain: row.try_get("limit_reroute_chain").unwrap_or_default(),
-            budget_warning: row.try_get("budget_warning").unwrap_or_default(),
-            budget_exceeded: row.try_get::<i32, _>("budget_exceeded").unwrap_or(0) != 0,
             memory: serde_json::from_str(&memory_str)
                 .inspect_err(
                     |e| tracing::warn!(error = %e, "corrupt memory JSON, defaulting to empty"),
