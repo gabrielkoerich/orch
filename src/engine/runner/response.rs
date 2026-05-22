@@ -929,8 +929,6 @@ mod tests {
             total_cost_usd: 0.0,
             model_reroute_chain: String::new(),
             limit_reroute_chain: "claude".to_string(),
-            budget_warning: String::new(),
-            budget_exceeded: false,
             memory: vec![],
             delegations: vec![],
             auto_unblock_count: 0,

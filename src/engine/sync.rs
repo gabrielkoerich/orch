@@ -192,7 +192,6 @@ enum FailureCategory {
     AllAgentsExhausted,
     ParseError,
     MaxAttempts,
-    TokenBudgetExceeded,
     PushFailed,
     PrCreateFailed,
     ModelUnavailable,
@@ -229,7 +228,6 @@ impl FailureCategory {
             FailureCategory::AllAgentsExhausted => "AllAgentsExhausted",
             FailureCategory::ParseError => "ParseError",
             FailureCategory::MaxAttempts => "MaxAttempts",
-            FailureCategory::TokenBudgetExceeded => "TokenBudgetExceeded",
             FailureCategory::PushFailed => "PushFailed",
             FailureCategory::PrCreateFailed => "PrCreateFailed",
             FailureCategory::ModelUnavailable => "ModelUnavailable",
@@ -258,10 +256,6 @@ fn classify_failure(error: &str, outcome: &str) -> FailureCategory {
 
     if error.trim().is_empty() {
         return FailureCategory::FalseFailure;
-    }
-
-    if lower.contains("token budget exceeded") {
-        return FailureCategory::TokenBudgetExceeded;
     }
 
     if lower.contains("all agents exhausted") {
@@ -810,15 +804,6 @@ async fn auto_unblock_blocked_tasks(
             continue;
         }
 
-        if task.budget_exceeded
-            || task
-                .last_error
-                .to_lowercase()
-                .contains("token budget exceeded")
-        {
-            continue;
-        }
-
         let task_id_str = task
             .external_id
             .clone()
@@ -900,7 +885,7 @@ async fn auto_unblock_blocked_tasks(
         };
 
         // First update the status; only increment the counter if this succeeds.
-        // This prevents transient GitHub API errors from exhausting the retry budget.
+        // This prevents transient GitHub API errors from exhausting the retry quota.
         if let Err(e) = task_manager
             .update_task_status(&crate::backends::ExternalId(ext_id), new_status)
             .await
@@ -1126,7 +1111,7 @@ pub(crate) async fn sync_tick(
     // subscriber (`src/engine/subscribers/review.rs`). Having the sync tick do the
     // same thing caused a race: both paths could fire simultaneously, each spawning
     // a review agent, each incrementing the failure counter on a single real failure —
-    // prematurely blocking tasks at half the expected retry budget (issue #857).
+    // prematurely blocking tasks at half the expected retry quota (issue #857).
     let enable_review = config::get("workflow.enable_review_agent")
         .map(|v| v != "false")
         .unwrap_or(true);
@@ -1197,7 +1182,7 @@ pub(crate) async fn sync_tick(
                 );
                 // Reset the failure counter: stale-session recovery is an infrastructure
                 // event (tmux crash, service restart) not a genuine agent parse failure.
-                // Keeping the counter would unfairly consume the budget for the next cycle.
+                // Keeping the counter would unfairly consume the quota for the next cycle.
                 if let Err(e) = store::store_set_result(
                     &Some(Arc::clone(store)),
                     repo,
@@ -1392,7 +1377,7 @@ pub(crate) async fn sync_tick(
 
             // If we've exceeded max attempts, escalate the task to Blocked with a clear reason.
             // Allow exactly MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS refires; only escalate when
-            // the new_refires value exceeds that budget (fix off-by-one where `>=` would
+            // the new_refires value exceeds that limit (fix off-by-one where `>=` would
             // escalate one attempt too early).
             if new_refires > MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS {
                 tracing::warn!(
@@ -1452,7 +1437,7 @@ pub(crate) async fn sync_tick(
             if !should_fire {
                 // Not firing yet — do NOT increment the refire counter on mere
                 // delay/backoff checks. The counter must reflect *actual* re-fire
-                // attempts so it can be used as an escalation budget. Incrementing
+                // attempts so it can be used as an escalation quota. Incrementing
                 // here inflated the counter when the subscriber was simply still
                 // within the backoff window and could wrongly cause escalation.
                 tracing::debug!(
@@ -3736,10 +3721,6 @@ mod tests {
         );
         assert_eq!(FailureCategory::ParseError.as_str(), "ParseError");
         assert_eq!(FailureCategory::FalseFailure.as_str(), "FalseFailure");
-        assert_eq!(
-            FailureCategory::TokenBudgetExceeded.as_str(),
-            "TokenBudgetExceeded"
-        );
         assert_eq!(FailureCategory::PushFailed.as_str(), "PushFailed");
         assert_eq!(FailureCategory::PrCreateFailed.as_str(), "PrCreateFailed");
     }
@@ -4645,8 +4626,6 @@ mod tests {
             total_cost_usd: 0.0,
             model_reroute_chain: String::new(),
             limit_reroute_chain: String::new(),
-            budget_warning: String::new(),
-            budget_exceeded: false,
             memory: vec![],
             delegations: vec![],
             auto_unblock_count: 0,

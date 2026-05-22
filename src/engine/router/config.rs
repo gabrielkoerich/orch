@@ -199,26 +199,6 @@ pub struct RouterConfig {
     pub ollama_model: String,
     /// Timeout for Ollama HTTP call in seconds (default: 30).
     pub ollama_timeout_seconds: u64,
-    /// Total time budget (seconds) for the entire LLM routing cascade (all pool
-    /// entries + fallback combined). When exceeded, routing immediately falls back
-    /// to round-robin without waiting for the remaining pool entries to time out
-    /// individually.
-    ///
-    /// `timeout_seconds` is a *per-entry* limit; `llm_budget_secs` caps the *total*
-    /// cascade. With a 3-entry pool each carrying a 45 s per-entry timeout, the
-    /// cascade could block for up to 135 s without this budget. Setting the budget
-    /// to 30 s ensures round-robin takes over quickly, preventing tick stalls from
-    /// exceeding the watchdog threshold (6 × tick_interval).
-    ///
-    /// Configurable via `router.llm_budget_secs` (default: `timeout_seconds`).
-    pub llm_budget_secs: u64,
-    /// Short-horizon LLM bypass: number of budget timeouts within `llm_bypass_window_secs`
-    /// required to trigger a temporary bypass of LLM routing.
-    pub llm_bypass_fail_threshold: u32,
-    /// Window in seconds for counting LLM budget timeouts for bypass triggering.
-    pub llm_bypass_window_secs: u64,
-    /// Duration in seconds to bypass LLM routing once the threshold is reached.
-    pub llm_bypass_duration_secs: u64,
 }
 
 /// Parse an `agent:model` pool entry string, splitting on the first colon.
@@ -279,10 +259,6 @@ impl Default for RouterConfig {
             ollama_url: "http://localhost:11434".to_string(),
             ollama_model: "qwen2.5-coder:3b-instruct".to_string(),
             ollama_timeout_seconds: 30,
-            llm_budget_secs: 30,
-            llm_bypass_fail_threshold: 3,
-            llm_bypass_window_secs: 10 * 60,
-            llm_bypass_duration_secs: 10 * 60,
         }
     }
 }
@@ -429,25 +405,6 @@ impl RouterConfig {
             }
         }
 
-        // Short-horizon LLM bypass configuration: trigger bypass after N
-        // `llm_budget` timeouts within a short window to avoid repeatedly
-        // invoking the routing LLM when it's clearly degraded.
-        if let Ok(val) = crate::config::get("router.llm_bypass_fail_threshold") {
-            if let Ok(n) = val.parse::<u32>() {
-                config.llm_bypass_fail_threshold = n.max(1);
-            }
-        }
-        if let Ok(val) = crate::config::get("router.llm_bypass_window_secs") {
-            if let Ok(n) = val.parse::<u64>() {
-                config.llm_bypass_window_secs = n.max(10);
-            }
-        }
-        if let Ok(val) = crate::config::get("router.llm_bypass_duration_secs") {
-            if let Ok(n) = val.parse::<u64>() {
-                config.llm_bypass_duration_secs = n.max(10);
-            }
-        }
-
         // Parse pool: list of "agent:model" entries.
         // `config::get_list()` returns Ok(vec![]) when the key is missing, so we
         // can't rely on `is_ok()` to indicate presence.
@@ -558,18 +515,6 @@ impl RouterConfig {
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .collect();
-                }
-            }
-        }
-
-        // Parse llm_budget_secs — total time cap for the entire pool cascade.
-        // Default to 30s so round-robin takes over before tick exceeds watchdog
-        // threshold (6 × tick_interval). User config overrides this.
-        config.llm_budget_secs = 30;
-        if let Ok(val) = crate::config::get("router.llm_budget_secs") {
-            if let Ok(secs) = val.parse::<u64>() {
-                if secs > 0 {
-                    config.llm_budget_secs = secs;
                 }
             }
         }
@@ -1117,19 +1062,6 @@ model_map:
             !model.ends_with('/'),
             "returned model should not have trailing slash, got: {}",
             model
-        );
-    }
-
-    #[test]
-    fn default_llm_budget_secs_is_30() {
-        // Bug #3048: llm_budget_secs must be low enough that a single slow pool
-        // entry times out before the tick watchdog fires (6 × tick_interval = 60s).
-        // With a 5-entry pool and 90s per-entry timeout, 30s budget ensures at most
-        // one entry can time out before round-robin fallback, preventing tick stalls.
-        let config = RouterConfig::default();
-        assert_eq!(
-            config.llm_budget_secs, 30,
-            "llm_budget_secs default should be 30s to prevent tick watchdog stalls"
         );
     }
 

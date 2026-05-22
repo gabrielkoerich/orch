@@ -365,7 +365,7 @@ pub async fn handle_error(
         agents::AgentError::ContextOverflow { message } => {
             // Context overflow is deterministic — the task's prompt/context is too large
             // for this model's context window. Cycling through other agents would hit the
-            // same limit and waste API budget. Skip failover entirely and escalate
+            // same limit and waste API calls. Skip failover entirely and escalate
             // immediately to needs_review so a human can intervene (e.g., split the task,
             // reduce context, or manually assign a model with a larger context window).
             let msg = format!("{agent_name} context overflow: {message}");
@@ -576,7 +576,7 @@ pub async fn handle_error(
     {
         let error_type_str = match retryable {
             response::RetryableError::UsageLimit => "rate",
-            response::RetryableError::AuthError => "budget",
+            response::RetryableError::AuthError => "auth",
             _ => "error",
         };
         if let Some(ref s) = store {

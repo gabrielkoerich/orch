@@ -2437,7 +2437,7 @@ mod tests {
     /// Regression: a transient `update_task_status` failure must NOT
     /// cause `handle_review_changes` to return `Err`.  Returning `Err` would
     /// propagate to the review subscriber which increments
-    /// `review_agent_failures` — incorrectly consuming the retry budget even
+    /// `review_agent_failures` — incorrectly consuming the retry quota even
     /// though the review decision itself was already persisted.
     ///
     /// We simulate the failure by giving the `TaskManager` a different repo

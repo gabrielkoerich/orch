@@ -437,7 +437,7 @@ src/
         ├── agent.rs     # Agent invocation + prompt building
         ├── agents/      # Per-agent runners (Claude, Codex, OpenCode)
         ├── response.rs  # Response parsing, weight signals
-        ├── response_handler.rs # Success path: commit, push, PR, budget
+        ├── response_handler.rs # Success path: commit, push, PR
         ├── fallback.rs  # Error classification and recovery strategies
         └── git_ops.rs   # Auto-commit, push, PR creation
 ```

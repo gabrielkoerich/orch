@@ -541,16 +541,46 @@ Orch is an internal tool running on a local machine with no external network acc
 
 External consumers (CLI, local debugging tools) connect via **localhost-only websocket** (`127.0.0.1`). Do not add externally-reachable servers, do not assume inbound connections from GitHub or other services will work, and do not design features that depend on webhook delivery.
 
-### Routing concurrency is controlled by `max_tasks_per_tick` + `llm_budget_secs` — no semaphore
+### Routing concurrency is controlled by `max_tasks_per_tick` — no semaphore, no wall-clock budget
 
-LLM routing concurrency is governed by exactly two knobs:
+LLM routing concurrency is governed by exactly one knob:
 
 - **`router.max_tasks_per_tick`** (default: 1) — caps how many tasks enter the routing loop per tick. With the default of 1, only one LLM classification call can ever be in flight at a time.
-- **`router.llm_budget_secs`** (default: 30s) — total wall-clock budget for the entire pool cascade before falling back to round-robin. Prevents tick stalls from exceeding the watchdog threshold (6 × tick_interval). The default of 30s ensures at most one slow pool entry can time out before round-robin fallback, preventing a single slow route call from blocking the tick loop.
 
-**Do not add a semaphore, worker pool, or `ORCH_ROUTER_MAX_PARALLEL_LLMS` env var.** Issue #2676 / PR #2677 introduced an `llm_semaphore` field on `Router` that was redundant with `max_tasks_per_tick=1` at its default value and added no protection that the budget timeout doesn't already provide. It was removed as dead complexity.
+Per-call timeouts are already enforced by `router.timeout_seconds`. If a route call hangs longer than that, it errors and the cascade moves on. There is no separate wall-clock "budget" wrapped around the cascade.
 
-If routing is too slow: tune `router.llm_budget_secs` (lower it to fall back to round-robin faster) or reduce `router.max_tasks_per_tick`. Do not add a third concurrency mechanism.
+**Do not add a semaphore, worker pool, `ORCH_ROUTER_MAX_PARALLEL_LLMS` env var, or `llm_budget_secs` field.** Issue #2676 / PR #2677 introduced an `llm_semaphore` field on `Router` that was redundant with `max_tasks_per_tick=1` and added no protection that the per-call timeout doesn't already provide. It was removed as dead complexity. A subsequent `llm_budget_secs` wall-clock wrapper was removed for the same reason (see "No 'budget' features" below).
+
+If routing is too slow: lower `router.timeout_seconds`, or reduce `router.max_tasks_per_tick`. Do not add a third concurrency mechanism.
+
+### No 'budget' features — agents run on subscription / fixed pricing
+
+There must be **zero "budget" tracking, accounting, or enforcement** anywhere in orch. No per-task token budgets, no per-PR budget warnings, no routing wall-clock budgets, no `llm_budget_secs` / `llm_bypass_*` knobs, no `budget_warning` / `budget_exceeded` columns, no `check_token_budget()` pre-run or post-run, no `TokenBudgetExceeded` failure category, no `BudgetCheckOutcome` enum, no "budget exhausted" cooldown reason.
+
+**Why**: all agents orch dispatches to (claude, codex, opencode, kimi, minimax, copilot, …) run on **subscription or fixed-price plans**. There is no per-token billing for orch to throttle against. Counting tokens to "save money" produces no real signal and just adds heavy bookkeeping (extra SQLite columns, extra runner branches, extra PR comments, extra failure categories) that breaks routinely and confuses every subsequent change to the runner / router / store.
+
+The correct mechanisms for limiting work already exist and must be used instead:
+
+- **Hung / silent agents** → silence detection + agent cooldown (`src/engine/cooldown.rs`)
+- **Slow router calls** → `router.timeout_seconds` (per-call timeout)
+- **Tick stalls** → watchdog (already wired)
+- **Runaway retries** → `max_route_attempts`, `max_review_cycles`, per-task attempt counters
+- **Rate limits / out of credits** → existing cooldown variants (`record_rate_limit`, `record_credit_exhaustion`, etc.)
+
+Do **not**:
+
+- Re-add `budget_warning` / `budget_exceeded` columns to `tasks` (migration `027_drop_budget_columns.sql` removed them — stay removed).
+- Re-add `check_token_budget()` to `src/engine/runner/task_init.rs` or `src/engine/runner/response_handler.rs`.
+- Re-add `TokenBudgetExceeded` to `FailureCategory` in `src/engine/sync.rs`.
+- Re-add `BudgetCheckOutcome` or any "pre-run budget guard" branch in the runner.
+- Re-add `llm_budget_secs`, `llm_bypass_fail_threshold`, `llm_bypass_window_secs`, `llm_bypass_duration_secs`, `llm_budget_fail_count`, `llm_budget_window_start`, `llm_bypass_until`, `record_llm_budget_timeout()`, `reset_llm_budget_counters()`, or `llm_bypass_active()` to the router.
+- Re-add a `tokio::time::timeout(budget, route_with_llm(...))` wall-clock wrapper around the cascade.
+- Re-add "budget warning" comments to PR bodies.
+- Add new variants of any of the above under a different name (`max_token_spend`, `cost_cap`, `route_deadline`, etc.). If you find yourself reaching for a knob that effectively counts tokens or wall-clock seconds against a quota, **stop**: the existing cooldown / timeout / watchdog mechanisms already cover the legitimate cases.
+
+**Do not file issues like "add cost tracking", "warn when task exceeds N tokens", "fall back to round-robin after Ns of LLM time", or "block tasks that would burn too many tokens".** They will be closed as invalid. This is not a per-call-priced system.
+
+If a comment in the codebase says "retry budget" / "escalation budget" / "consume the budget" / "exceeds that budget", it refers to a **count of attempts** (a retry quota), not money or tokens. Prefer the word "quota" or "limit" to avoid tempting future agents into re-introducing the feature.
 
 ### Security leak detection — ALL patterns block GitHub posting
 

@@ -321,40 +321,6 @@ async fn helper_get_token_usage_negative_tokens_clamp_to_zero() {
 }
 
 #[tokio::test]
-async fn helper_get_token_summary_negative_tokens_clamp_to_zero() {
-    let store = Arc::new(TaskStore::open_memory().await.unwrap());
-    let id = store
-        .create(&NewTask {
-            external_id: Some("702".to_string()),
-            repo: "owner/repo".to_string(),
-            origin: "github".to_string(),
-            title: "Negative summary token test".to_string(),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-    store
-        .set_fields(
-            id,
-            &[
-                ("input_tokens", serde_json::json!(-5)),
-                ("output_tokens", serde_json::json!(10)),
-                ("input_cost_usd", serde_json::json!(0.05)),
-                ("output_cost_usd", serde_json::json!(0.15)),
-                ("total_cost_usd", serde_json::json!(0.20)),
-            ],
-        )
-        .await
-        .unwrap();
-
-    let opt_store = Some(store);
-    let (total_tokens, cost) = get_token_summary(&opt_store, "owner/repo", "702").await;
-    assert_eq!(total_tokens, 10);
-    assert!((cost.total_cost_usd - 0.20).abs() < f64::EPSILON);
-}
-
-#[tokio::test]
 async fn helper_get_cost_estimate_from_store() {
     let store = Arc::new(TaskStore::open_memory().await.unwrap());
     let id = store
@@ -748,43 +714,6 @@ async fn helper_store_increment_by_id_returns_new_value() {
 
     let task = store.get(id).await.unwrap();
     assert_eq!(task.attempts, 2);
-}
-
-#[tokio::test]
-async fn helper_get_total_tokens_sums_input_and_output() {
-    let store = Arc::new(TaskStore::open_memory().await.unwrap());
-    store
-        .create(&NewTask {
-            external_id: Some("92".to_string()),
-            repo: "owner/repo".to_string(),
-            origin: "github".to_string(),
-            title: "Tokens test".to_string(),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-    store
-        .set_fields(
-            1,
-            &[
-                ("input_tokens", serde_json::json!(5000)),
-                ("output_tokens", serde_json::json!(3000)),
-            ],
-        )
-        .await
-        .unwrap();
-
-    let opt_store = Some(store);
-    let total = get_total_tokens(&opt_store, "owner/repo", "92").await;
-    assert_eq!(total, 8000);
-}
-
-#[tokio::test]
-async fn helper_get_total_tokens_returns_zero_without_store() {
-    let store: Option<Arc<TaskStore>> = None;
-    let total = get_total_tokens(&store, "owner/repo", "any").await;
-    assert_eq!(total, 0);
 }
 
 #[tokio::test]
@@ -2211,7 +2140,6 @@ async fn default_values_are_correct() {
     assert_eq!(task.output_tokens, 0);
     assert!((task.total_cost_usd - 0.0).abs() < f64::EPSILON);
     assert!(!task.worktree_cleaned);
-    assert!(!task.budget_exceeded);
     assert!(task.memory.is_empty());
     assert!(task.delegations.is_empty());
     assert!(task.pr_number.is_none());
@@ -3490,11 +3418,11 @@ async fn set_fields_with_numeric_bool_null_types() {
 
     // Set a boolean field
     store
-        .set_fields(id, &[("budget_exceeded", serde_json::json!(true))])
+        .set_fields(id, &[("worktree_cleaned", serde_json::json!(true))])
         .await
         .unwrap();
     let task = store.get(id).await.unwrap();
-    assert!(task.budget_exceeded);
+    assert!(task.worktree_cleaned);
 
     // Set a field to null (empty string)
     store
@@ -4352,7 +4280,7 @@ async fn rate_limits_counted_in_metrics_summary() {
         .await
         .unwrap();
     store
-        .record_rate_limit("codex", "budget", Some("5"))
+        .record_rate_limit("codex", "auth", Some("5"))
         .await
         .unwrap();
 
@@ -6491,7 +6419,7 @@ async fn task_row_deserialization_no_oob_panic() {
 }
 
 // Tests for the *_result variants — verify they propagate errors instead of
-// returning defaults, so callers like check_token_budget() can fail-safe.
+// returning defaults, so callers can fail-safe on store read errors.
 
 #[tokio::test]
 async fn helper_get_token_usage_result_without_store_returns_err() {
@@ -6508,41 +6436,10 @@ async fn helper_get_cost_estimate_result_without_store_returns_err() {
 }
 
 #[tokio::test]
-async fn helper_get_token_summary_result_without_store_returns_err() {
-    let store: Option<Arc<TaskStore>> = None;
-    let res = get_token_summary_result(&store, "owner/repo", "any").await;
-    assert!(res.is_err());
-}
-
-#[tokio::test]
 async fn helper_get_recent_memory_result_without_store_returns_err() {
     let store: Option<Arc<TaskStore>> = None;
     let res = get_recent_memory_result(&store, "owner/repo", "any", 10).await;
     assert!(res.is_err());
-}
-
-#[tokio::test]
-async fn helper_get_token_summary_result_not_found_returns_err() {
-    // Store is available but the task doesn't exist — result variant returns error
-    // (not Ok(None)), so callers can distinguish not-found from store-error.
-    let store = Arc::new(TaskStore::open_memory().await.unwrap());
-    store
-        .create(&NewTask {
-            external_id: Some("not-this-task".to_string()),
-            repo: "owner/repo".to_string(),
-            origin: "github".to_string(),
-            title: "Different task".to_string(),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-    let opt_store = Some(store);
-    let res = get_token_summary_result(&opt_store, "owner/repo", "nonexistent-task-12345").await;
-    assert!(
-        res.is_err(),
-        "get_token_summary_result should return error for missing task, not Ok(None)"
-    );
 }
 
 #[tokio::test]
@@ -6566,41 +6463,4 @@ async fn helper_get_recent_memory_result_not_found_returns_err() {
         res.is_err(),
         "get_recent_memory_result should return error for missing task, not Ok(None)"
     );
-}
-
-#[tokio::test]
-async fn helper_get_token_summary_result_happy_path() {
-    let store = Arc::new(TaskStore::open_memory().await.unwrap());
-    let id = store
-        .create(&NewTask {
-            external_id: Some("token-summary-test".to_string()),
-            repo: "owner/repo".to_string(),
-            origin: "github".to_string(),
-            title: "Token summary test".to_string(),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-    store
-        .set_fields(
-            id,
-            &[
-                ("input_tokens", serde_json::json!(100)),
-                ("output_tokens", serde_json::json!(200)),
-                ("input_cost_usd", serde_json::json!(0.01)),
-                ("output_cost_usd", serde_json::json!(0.02)),
-                ("total_cost_usd", serde_json::json!(0.03)),
-            ],
-        )
-        .await
-        .unwrap();
-
-    let opt_store = Some(store);
-    let res = get_token_summary_result(&opt_store, "owner/repo", "token-summary-test")
-        .await
-        .unwrap();
-    let (tokens, cost) = res.unwrap();
-    assert_eq!(tokens, 300);
-    assert!((cost.total_cost_usd - 0.03).abs() < f64::EPSILON);
 }
