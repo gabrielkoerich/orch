@@ -1495,6 +1495,7 @@ mod tests {
         record_model_failure, set_model_cooldown,
     };
     use crate::store::TaskStore;
+    use serial_test::serial;
     use std::time::{Duration, Instant};
 
     // Test-only delegates so tests can call router.parse_llm_response() and
@@ -1532,6 +1533,7 @@ mod tests {
         }
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn extract_agent_from_labels() {
         let mut config = RouterConfig::default();
@@ -1570,6 +1572,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn default_agents_constant() {
         assert_eq!(DEFAULT_AGENTS.len(), 6);
@@ -1579,6 +1582,7 @@ mod tests {
         assert!(DEFAULT_AGENTS.contains(&"glm"));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn extract_complexity_from_labels() {
         assert_eq!(
@@ -1599,6 +1603,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn route_result_serialization() {
         let result = RouteResult {
@@ -1626,6 +1631,7 @@ mod tests {
         assert_eq!(deserialized.model, Some("sonnet".to_string()));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn router_config_default() {
         let mut config = RouterConfig::default();
@@ -1655,6 +1661,7 @@ mod tests {
         assert!(config.agents.contains(&"glm".to_string()));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn model_map_lookup_returns_none_without_config() {
         // Default config has no hardcoded models — config.yml is the source of truth.
@@ -1673,6 +1680,7 @@ mod tests {
             .is_none());
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn model_map_lookup_returns_configured_value() {
         // When model_map is populated (from config), it is returned correctly.
@@ -1688,8 +1696,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn model_pool_selection_skips_cooled() {
+        crate::engine::cooldown::reset_global_state().await;
         use std::collections::HashMap;
 
         let mut config = RouterConfig::default();
@@ -1730,6 +1740,7 @@ mod tests {
         let _ = HashMap::<(), ()>::new(); // suppress unused import lint
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn model_pool_single_string_backward_compat() {
         // Single-item pools behave identically to the old string format.
@@ -1744,6 +1755,7 @@ mod tests {
         assert_eq!(m, Some("haiku".to_string()));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn parse_llm_response_direct_json() {
         let config = RouterConfig::default();
@@ -1769,6 +1781,7 @@ mod tests {
         assert_eq!(parsed.profile.role, "architect");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn parse_llm_response_markdown_fenced() {
         let config = RouterConfig::default();
@@ -1798,6 +1811,7 @@ Hope that helps!"#;
         assert_eq!(parsed.complexity, "medium");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn parse_llm_response_claude_envelope() {
         let config = RouterConfig::default();
@@ -1812,6 +1826,7 @@ Hope that helps!"#;
         assert_eq!(parsed.reason, "requires deep analysis");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn parse_llm_response_claude_envelope_with_code_block() {
         let config = RouterConfig::default();
@@ -1832,6 +1847,7 @@ Hope that helps!"#;
         assert_eq!(parsed.complexity, "simple");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn parse_llm_response_claude_envelope_error() {
         let config = RouterConfig::default();
@@ -1843,6 +1859,7 @@ Hope that helps!"#;
         assert!(err.to_string().contains("error"), "got: {err}");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn parse_llm_response_empty() {
         let config = RouterConfig::default();
@@ -1854,6 +1871,7 @@ Hope that helps!"#;
 
     /// Claude envelope where result is a JSON object, not a string.
     /// Some Claude versions may return the result as a nested object.
+    #[serial(cooldown_state)]
     #[test]
     fn parse_llm_response_claude_envelope_result_as_object() {
         let config = RouterConfig::default();
@@ -1871,6 +1889,7 @@ Hope that helps!"#;
     }
 
     /// LLM returns "agent" instead of "executor" — common hallucination.
+    #[serial(cooldown_state)]
     #[test]
     fn parse_llm_response_agent_instead_of_executor() {
         let config = RouterConfig::default();
@@ -1888,6 +1907,7 @@ Hope that helps!"#;
     }
 
     /// LLM returns minimal JSON without profile or reason.
+    #[serial(cooldown_state)]
     #[test]
     fn parse_llm_response_minimal_json() {
         let config = RouterConfig::default();
@@ -1907,6 +1927,7 @@ Hope that helps!"#;
     // ── Real fixture tests: route prompt → response → parsed result ──
 
     /// Real Claude envelope with result as escaped JSON string.
+    #[serial(cooldown_state)]
     #[test]
     fn fixture_route_response_string() {
         let config = RouterConfig::default();
@@ -1922,6 +1943,7 @@ Hope that helps!"#;
 
     /// Real Claude envelope with result as JSON object (not string).
     /// This was the root cause of all router failures on 2026-02-27.
+    #[serial(cooldown_state)]
     #[test]
     fn fixture_route_response_object() {
         let config = RouterConfig::default();
@@ -1934,6 +1956,7 @@ Hope that helps!"#;
     }
 
     /// Real Claude envelope with result as string containing markdown + JSON.
+    #[serial(cooldown_state)]
     #[test]
     fn fixture_route_response_markdown() {
         let config = RouterConfig::default();
@@ -1946,6 +1969,7 @@ Hope that helps!"#;
     }
 
     /// Claude envelope with escaped JSON string containing newlines and markdown.
+    #[serial(cooldown_state)]
     #[test]
     fn parse_llm_response_claude_envelope_with_prose() {
         let config = RouterConfig::default();
@@ -1969,8 +1993,10 @@ Hope that helps!"#;
         assert_eq!(parsed.unwrap().executor, "codex");
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn route_round_robin_basic() {
+        crate::engine::cooldown::reset_global_state().await;
         // Force at least one agent to be available for testing
         // In real usage, discover_agents finds installed CLIs
         let config = RouterConfig {
@@ -2005,8 +2031,10 @@ Hope that helps!"#;
         assert_eq!(result.reason, "round_robin (task 1 % 2 agents)");
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn route_uses_label_override() {
+        crate::engine::cooldown::reset_global_state().await;
         let mut config = RouterConfig::default();
         // Ensure a concrete model exists so the label override can be honored
         // in the test environment where no external config.yml is present.
@@ -2040,6 +2068,7 @@ Hope that helps!"#;
         assert!(result.reason.contains("label"));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn check_routing_sanity_warnings() {
         let config = RouterConfig::default();
@@ -2069,8 +2098,10 @@ Hope that helps!"#;
         assert!(warning.is_none());
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn router_reload_preserves_structure() {
+        crate::engine::cooldown::reset_global_state().await;
         let config = RouterConfig::default();
         let agents = vec!["claude".to_string()];
         let mut weights = AgentWeights::default();
@@ -2107,6 +2138,7 @@ Hope that helps!"#;
 
     // --- Weighted round-robin tests ---
 
+    #[serial(cooldown_state)]
     #[test]
     fn rate_limit_state_defaults_to_full_weight() {
         let state = RateLimitState::default();
@@ -2116,6 +2148,7 @@ Hope that helps!"#;
         assert!(!state.is_limited());
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn rate_limit_state_decays_on_hit() {
         let mut state = RateLimitState::default();
@@ -2131,6 +2164,7 @@ Hope that helps!"#;
         assert!((state.weight - expected).abs() < 1e-10);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn rate_limit_state_never_drops_below_min() {
         let mut state = RateLimitState::default();
@@ -2144,6 +2178,7 @@ Hope that helps!"#;
         assert_eq!(state.consecutive_hits, 100);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn rate_limit_state_recovers_on_success() {
         let mut state = RateLimitState::default();
@@ -2159,6 +2194,7 @@ Hope that helps!"#;
         assert_eq!(state.consecutive_hits, 0);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn rate_limit_state_success_caps_at_default() {
         let mut state = RateLimitState::default();
@@ -2168,6 +2204,7 @@ Hope that helps!"#;
         assert_eq!(state.weight, DEFAULT_WEIGHT);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn agent_weights_ensure_agents() {
         let mut weights = AgentWeights::default();
@@ -2179,6 +2216,7 @@ Hope that helps!"#;
         assert_eq!(weights.get_weight("codex"), DEFAULT_WEIGHT);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn agent_weights_ensure_agents_preserves_existing() {
         let mut weights = AgentWeights::default();
@@ -2202,6 +2240,7 @@ Hope that helps!"#;
         assert_eq!(weights.get_weight("opencode"), DEFAULT_WEIGHT);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn agent_weights_record_rate_limit() {
         let mut weights = AgentWeights::default();
@@ -2213,6 +2252,7 @@ Hope that helps!"#;
         assert_eq!(weights.get_weight("codex"), DEFAULT_WEIGHT);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn agent_weights_record_success() {
         let mut weights = AgentWeights::default();
@@ -2225,6 +2265,7 @@ Hope that helps!"#;
         assert!(weights.get_weight("claude") > after_limit);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn agent_weights_snapshot() {
         let mut weights = AgentWeights::default();
@@ -2244,6 +2285,7 @@ Hope that helps!"#;
         assert_eq!(snap[1].2, 0); // 0 hits
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn agent_weights_weighted_select_favors_higher_weight() {
         let mut weights = AgentWeights::default();
@@ -2274,12 +2316,14 @@ Hope that helps!"#;
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn agent_weights_weighted_select_empty_returns_none() {
         let weights = AgentWeights::default();
         assert!(weights.weighted_select(&[], "task-1").is_none());
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn agent_weights_batch_routing_produces_varied_selections() {
         // Regression test: when routing a batch of tasks in the same tick,
@@ -2305,6 +2349,7 @@ Hope that helps!"#;
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn agent_weights_weighted_select_single_agent() {
         let mut weights = AgentWeights::default();
@@ -2315,6 +2360,7 @@ Hope that helps!"#;
         assert_eq!(selected, Some("claude".to_string()));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn agent_weights_tick_recovery_restores_weight() {
         let mut weights = AgentWeights::default();
@@ -2333,6 +2379,7 @@ Hope that helps!"#;
         assert!(after > before, "weight should increase after recovery tick");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn agent_weights_tick_recovery_clears_on_full_restore() {
         let mut weights = AgentWeights::default();
@@ -2352,8 +2399,10 @@ Hope that helps!"#;
         assert_eq!(state.consecutive_hits, 0);
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn route_weighted_round_robin_basic() {
+        crate::engine::cooldown::reset_global_state().await;
         let mut config = RouterConfig {
             weighted_round_robin: true,
             ..Default::default()
@@ -2394,8 +2443,10 @@ Hope that helps!"#;
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn route_weighted_round_robin_respects_label_override() {
+        crate::engine::cooldown::reset_global_state().await;
         let mut config = RouterConfig {
             weighted_round_robin: true,
             ..Default::default()
@@ -2431,12 +2482,14 @@ Hope that helps!"#;
         assert!(result.reason.contains("label"));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn router_config_weighted_round_robin_default_false() {
         let config = RouterConfig::default();
         assert!(!config.weighted_round_robin);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn router_record_and_recover_weights() {
         let config = RouterConfig {
@@ -2459,6 +2512,7 @@ Hope that helps!"#;
         assert!(after_success > MIN_WEIGHT);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn review_rr_index_advances() {
         let mut config = RouterConfig::default();
@@ -2500,6 +2554,7 @@ Hope that helps!"#;
         assert_eq!(seen, vec!["test_a", "test_b", "test_c"]);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn review_rr_fallback_with_cooled_agent() {
         // Regression test for #2428: when one agent is in cooldown (candidates.len() <
@@ -2540,6 +2595,7 @@ Hope that helps!"#;
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn review_rr_index_uses_candidates_len_not_available_len() {
         // Regression test for #2449: review_rr_index must advance modulo candidates.len(),
@@ -2607,8 +2663,10 @@ Hope that helps!"#;
         assert_eq!(r1, r3, "third call should match first (clean cycle)");
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn last_agent_tracks_routing() {
+        crate::engine::cooldown::reset_global_state().await;
         let mut config = RouterConfig {
             mode: "round_robin".to_string(),
             ..Default::default()
@@ -2651,6 +2709,7 @@ Hope that helps!"#;
 
     // ── pool config ───────────────────────────────────────────────────────────
 
+    #[serial(cooldown_state)]
     #[test]
     fn parse_pool_entry_splits_on_first_colon() {
         let (agent, model) = super::parse_pool_entry("claude:haiku");
@@ -2658,6 +2717,7 @@ Hope that helps!"#;
         assert_eq!(model, "haiku");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn parse_pool_entry_model_with_slash() {
         // Models like "github-copilot/gpt-5-mini" must not be split on the slash
@@ -2666,6 +2726,7 @@ Hope that helps!"#;
         assert_eq!(model, "github-copilot/gpt-5-mini");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn parse_pool_entry_no_colon() {
         let (agent, model) = super::parse_pool_entry("claude");
@@ -2673,6 +2734,7 @@ Hope that helps!"#;
         assert_eq!(model, "");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn effective_pool_uses_configured_pool() {
         let config = RouterConfig {
@@ -2683,6 +2745,7 @@ Hope that helps!"#;
         assert_eq!(pool, vec!["kimi:k2p5", "claude:haiku"]);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn effective_pool_falls_back_to_router_agent_model() {
         let config = RouterConfig::default();
@@ -2693,6 +2756,7 @@ Hope that helps!"#;
         assert!(pool[0].contains(&config.router_model));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn effective_fallback_uses_configured_fallback() {
         let config = RouterConfig {
@@ -2702,6 +2766,7 @@ Hope that helps!"#;
         assert_eq!(config.effective_fallback(), "claude:haiku");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn effective_fallback_derives_from_router_agent_model() {
         let config = RouterConfig::default();
@@ -2712,6 +2777,7 @@ Hope that helps!"#;
 
     // ── pool expansion ────────────────────────────────────────────────────────
 
+    #[serial(cooldown_state)]
     #[test]
     fn expand_pool_basic_entries() {
         let config = RouterConfig {
@@ -2724,6 +2790,7 @@ Hope that helps!"#;
         assert_eq!(expanded[1], ("kimi".to_string(), "k2p5".to_string()));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn expand_pool_uses_effective_pool_when_pool_is_empty() {
         let config = RouterConfig {
@@ -2737,6 +2804,7 @@ Hope that helps!"#;
         assert_eq!(expanded[0], ("claude".to_string(), "haiku".to_string()));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn expand_pool_opencode_free_skipped_when_not_installed() {
         // `opencode` is unlikely to be in the test environment's PATH.
@@ -2758,6 +2826,7 @@ Hope that helps!"#;
         assert_eq!(expanded[0].1, "haiku");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn expand_pool_single_entry_from_default() {
         let config = RouterConfig::default();
@@ -2770,6 +2839,7 @@ Hope that helps!"#;
 
     // ── pool round-robin index ────────────────────────────────────────────────
 
+    #[serial(cooldown_state)]
     #[test]
     fn pool_index_initializes_to_zero() {
         let config = RouterConfig::default();
@@ -2777,6 +2847,7 @@ Hope that helps!"#;
         assert_eq!(router.pool_index, 0);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn router_pool_non_empty_after_construction() {
         let config = RouterConfig::default();
@@ -2784,8 +2855,10 @@ Hope that helps!"#;
         assert!(!router.router_pool.is_empty());
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn reload_resets_pool_index() {
+        crate::engine::cooldown::reset_global_state().await;
         let config = RouterConfig::default();
         let mut router = Router::new(config);
         router.pool_index = 5;
@@ -2793,6 +2866,7 @@ Hope that helps!"#;
         assert_eq!(router.pool_index, 0);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn pool_index_advances_after_failed_attempt() {
         let mut router = Router::new(RouterConfig::default());
@@ -2811,6 +2885,7 @@ Hope that helps!"#;
         assert_eq!(router.pool_index, 1);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn pool_index_wraps_after_last_attempt() {
         let mut router = Router::new(RouterConfig::default());
@@ -2829,14 +2904,17 @@ Hope that helps!"#;
         assert_eq!(router.pool_index, 0);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn earliest_pool_cooldown_returns_none_when_no_cooldowns() {
         let router = Router::new(RouterConfig::default());
         assert!(router.earliest_pool_cooldown().is_none());
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn earliest_pool_cooldown_returns_earliest_when_set() {
+        crate::engine::cooldown::reset_global_state().await;
         // Use explicit pool with predictable model names to avoid opencode discovery.
         let config = RouterConfig {
             pool: vec![
@@ -2857,8 +2935,10 @@ Hope that helps!"#;
         assert!((295..=300).contains(&remaining));
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn earliest_pool_cooldown_skips_non_pool_entries() {
+        crate::engine::cooldown::reset_global_state().await;
         // Use explicit pool so we can predict what entries exist.
         let config = RouterConfig {
             pool: vec![
@@ -2883,6 +2963,7 @@ Hope that helps!"#;
 
     // ---- Pre-emptive health check: degraded agent exclusion ----
 
+    #[serial(cooldown_state)]
     #[test]
     fn degraded_agent_excluded_from_routing() {
         let mut config = RouterConfig::default();
@@ -2920,6 +3001,7 @@ Hope that helps!"#;
         clear_agent_degraded("test_degraded_routing");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn healthy_agents_skips_degraded_but_keeps_healthy() {
         let mut config = RouterConfig::default();
@@ -2944,8 +3026,10 @@ Hope that helps!"#;
         clear_agent_degraded("agent_degraded");
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn refresh_health_marks_degraded_from_rate_limits() {
+        crate::engine::cooldown::reset_global_state().await;
         let store = test_store().await;
         let agent = "test_refresh_health_agent";
 

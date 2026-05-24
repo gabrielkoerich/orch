@@ -2446,6 +2446,7 @@ mod tests {
     use crate::engine::cooldown::set_agent_cooldown;
     use crate::store::{RunTokenUsage, TaskStore};
     use async_trait::async_trait;
+    use serial_test::serial;
     use std::sync::Arc;
 
     // ── ingest_external_tasks tests ─────────────────────────────────────────
@@ -2590,8 +2591,10 @@ mod tests {
         }
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn ingest_upserts_tasks_into_store() {
+        crate::engine::cooldown::reset_global_state().await;
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![
             (Status::New, make_ext_task("1", "First issue")),
             (Status::InProgress, make_ext_task("2", "Second issue")),
@@ -2623,8 +2626,10 @@ mod tests {
         assert_eq!(task2.status, crate::store::TaskStatus::InProgress);
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn ingest_updates_existing_tasks() {
+        crate::engine::cooldown::reset_global_state().await;
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![(
             Status::Routed,
             make_ext_task("42", "Updated title"),
@@ -2657,8 +2662,10 @@ mod tests {
         assert_eq!(task.status, crate::store::TaskStatus::Routed);
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn ingest_closes_duplicate_titles() {
+        crate::engine::cooldown::reset_global_state().await;
         use crate::store::{NewTask, TaskStore};
 
         let backend = IngestMockBackend::with_tasks_and_dedup(
@@ -2697,8 +2704,10 @@ mod tests {
         assert_eq!(status_updates[0].1, Status::Done);
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn ingest_handles_empty_backend() {
+        crate::engine::cooldown::reset_global_state().await;
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
@@ -2710,8 +2719,10 @@ mod tests {
         assert!(all.is_empty());
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn ingest_syncs_status_correctly_across_statuses() {
+        crate::engine::cooldown::reset_global_state().await;
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![
             (Status::New, make_ext_task("1", "New")),
             (Status::Routed, make_ext_task("2", "Routed")),
@@ -2735,8 +2746,10 @@ mod tests {
         assert_eq!(counts.get("blocked"), Some(&1));
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn ingest_does_not_overwrite_store_authoritative_status() {
+        crate::engine::cooldown::reset_global_state().await;
         // Backend reports task as New (GitHub labels haven't caught up yet)
         let backend: Arc<dyn ExternalBackend> =
             IngestMockBackend::with_tasks(vec![(Status::New, make_ext_task("99", "My task"))]);
@@ -2771,8 +2784,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn ingest_sync_to_project_called_only_for_new_tasks() {
+        crate::engine::cooldown::reset_global_state().await;
         use crate::store::{NewTask, TaskStore};
 
         // Two tasks: "10" is pre-existing, "11" is new.
@@ -2809,8 +2824,10 @@ mod tests {
         assert_eq!(syncs[0].0, "11", "sync_to_project must target the new task");
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn ingest_handles_mixed_labeled_and_unlabeled_open_issues() {
+        crate::engine::cooldown::reset_global_state().await;
         // Simulate a backend where some issues have no status label (routable/unlabeled)
         // and others carry active status labels.  Both kinds must be ingested and the
         // store status must reflect the label where present.
@@ -2916,8 +2933,10 @@ mod tests {
 
     // ── kv_get_prefer_store / kv_set_prefer_store ────────────────────
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn kv_get_prefer_store_reads_from_store() {
+        crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
         store.kv_set("k1", "store_val").await.unwrap();
@@ -2927,15 +2946,19 @@ mod tests {
         assert_eq!(val.as_deref(), Some("store_val"));
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn kv_get_prefer_store_returns_none_without_store() {
+        crate::engine::cooldown::reset_global_state().await;
         let opt: Option<&Arc<TaskStore>> = None;
         let val = kv_get_prefer_store(&opt, "k2").await;
         assert_eq!(val, None);
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn kv_set_prefer_store_writes_to_store() {
+        crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
         let opt = Some(&store);
@@ -2944,8 +2967,10 @@ mod tests {
         assert_eq!(store.kv_get("k3").await.unwrap().as_deref(), Some("val3"));
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn kv_set_prefer_store_noop_without_store() {
+        crate::engine::cooldown::reset_global_state().await;
         let opt: Option<&Arc<TaskStore>> = None;
         // Should not panic
         kv_set_prefer_store(&opt, "k4", "val4").await;
@@ -2953,8 +2978,10 @@ mod tests {
 
     // ── try_kv_get_prefer_store / try_kv_set_prefer_store ────────────────
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn try_kv_get_prefer_store_returns_value_from_store() {
+        crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         store.kv_set("try_k1", "try_val1").await.unwrap();
 
@@ -2963,8 +2990,10 @@ mod tests {
         assert_eq!(result.unwrap().as_deref(), Some("try_val1"));
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn try_kv_get_prefer_store_returns_none_for_missing_key() {
+        crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let opt = Some(&store);
 
@@ -2972,15 +3001,19 @@ mod tests {
         assert_eq!(result.unwrap(), None); // Key doesn't exist, but query succeeded
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn try_kv_get_prefer_store_returns_none_without_store() {
+        crate::engine::cooldown::reset_global_state().await;
         let opt: Option<&Arc<TaskStore>> = None;
         let result = try_kv_get_prefer_store(&opt, "try_k2").await;
         assert_eq!(result.unwrap(), None);
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn try_kv_set_prefer_store_writes_to_store() {
+        crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let opt = Some(&store);
 
@@ -2992,8 +3025,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn try_kv_set_prefer_store_ok_without_store() {
+        crate::engine::cooldown::reset_global_state().await;
         let opt: Option<&Arc<TaskStore>> = None;
         // Should not error - best effort when store unavailable
         let result = try_kv_set_prefer_store(&opt, "try_k4", "try_val4").await;
@@ -3002,6 +3037,7 @@ mod tests {
 
     // ── dispatching lock tests ──────────────────────────────────────────
 
+    #[serial(cooldown_state)]
     #[test]
     fn dispatching_set_blocks_duplicate_processing() {
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
@@ -3032,6 +3068,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn dispatching_set_does_not_block_other_tasks() {
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
@@ -3066,8 +3103,10 @@ mod tests {
     /// The fix: insert `dispatch_key` BEFORE `tokio::spawn`, remove it AFTER the future
     /// completes. This test verifies that invariant using tokio channels to synchronize
     /// with a simulated concurrent caller (review_open_prs).
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn dispatch_key_held_during_review_agent_execution() {
+        crate::engine::cooldown::reset_global_state().await;
         use tokio::sync::oneshot;
 
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
@@ -3127,8 +3166,10 @@ mod tests {
     ///
     /// The fix introduces `DispatchGuard`, a RAII wrapper whose `Drop` impl removes
     /// the key unconditionally, even when the task unwinds via panic.
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn dispatch_guard_releases_key_on_panic() {
+        crate::engine::cooldown::reset_global_state().await;
         use crate::engine::dispatch_guard::DispatchGuard;
 
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
@@ -3162,8 +3203,10 @@ mod tests {
 
     /// An InReview task with no tmux session should be reset to NeedsReview
     /// regardless of review_session_expected — the review agent is dead.
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn stale_in_review_recovery_resets_orphaned_task_without_session() {
+        crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
@@ -3223,8 +3266,10 @@ mod tests {
         assert_eq!(task.status, crate::store::TaskStatus::NeedsReview);
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn needs_review_refire_increments_and_fires_when_old_enough() {
+        crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
@@ -3286,8 +3331,10 @@ mod tests {
         assert_eq!(t2.status, crate::store::TaskStatus::NeedsReview);
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn needs_review_backoff_delays_fire_but_increments_counter() {
+        crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
@@ -3360,8 +3407,10 @@ mod tests {
         assert_eq!(after.status, crate::store::TaskStatus::NeedsReview);
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn needs_review_escalates_to_blocked_after_max_refires() {
+        crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
@@ -3428,8 +3477,10 @@ mod tests {
     /// Verify that exactly MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS refires are allowed
     /// before escalation. Task should still be NeedsReview at 5 refires,
     /// only block at the 6th attempt.
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn needs_review_allows_max_refires_before_escalation() {
+        crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
@@ -3496,8 +3547,10 @@ mod tests {
 
     /// A fresh InReview task (<1 min old) should NOT be reset — the review
     /// agent may still be starting up.
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn stale_in_review_recovery_skips_fresh_tasks() {
+        crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
@@ -3552,8 +3605,10 @@ mod tests {
         assert_eq!(task.status, crate::store::TaskStatus::InReview);
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn auto_unblock_routes_recoverable_failure() {
+        crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
@@ -3630,8 +3685,10 @@ mod tests {
         assert_eq!(task.auto_unblock_last_reason, "RateLimit");
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn auto_unblock_skips_manual_block() {
+        crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
@@ -3700,6 +3757,7 @@ mod tests {
 
     // ── FailureCategory::as_str ─────────────────────────────────────────
 
+    #[serial(cooldown_state)]
     #[test]
     fn failure_category_as_str() {
         // as_str() must return a stable, human-readable string used as the
@@ -3727,6 +3785,7 @@ mod tests {
 
     // ── classify_failure: ModelUnavailable ──────────────────────────────
 
+    #[serial(cooldown_state)]
     #[test]
     fn classify_failure_model_unavailable_phrase_is_recoverable() {
         let category = classify_failure("model unavailable (anthropic/claude-sonnet-4-6): Model not found: anthropic/claude-sonnet-4-6", "error");
@@ -3742,6 +3801,7 @@ mod tests {
     }
 
     // ── classify_failure: PrCreateFailed ──────────────────────────────
+    #[serial(cooldown_state)]
     #[test]
     fn classify_failure_pr_create_failed_specific_patterns() {
         // These should be classified as PrCreateFailed
@@ -3773,6 +3833,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn classify_failure_model_not_found_is_recoverable() {
         let category = classify_failure("Model not found: gpt-5-ultra", "error");
@@ -3784,6 +3845,7 @@ mod tests {
         assert!(category.is_recoverable());
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn classify_failure_model_does_not_exist_is_recoverable() {
         let category = classify_failure("The model `claude-opus-99` does not exist", "error");
@@ -3791,8 +3853,10 @@ mod tests {
         assert!(category.is_recoverable());
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn auto_unblock_routes_task_blocked_by_model_unavailable() {
+        crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
@@ -3862,8 +3926,10 @@ mod tests {
 
     // ── auto_unblock: reason-reset (regression for #1227) ─────────────────
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn auto_unblock_resets_count_when_reason_changes() {
+        crate::engine::cooldown::reset_global_state().await;
         // Regression test for #1227: when a task is blocked for a different failure
         // reason than the last auto-unblock, the counter should reset to 0 (immediate
         // retry) instead of accumulating across unrelated failures.
@@ -3953,8 +4019,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn auto_unblock_stores_reason_on_first_unblock() {
+        crate::engine::cooldown::reset_global_state().await;
         // When a task is auto-unblocked for the first time, the failure reason
         // should be stored so subsequent blocks can be compared.
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
@@ -4025,6 +4093,7 @@ mod tests {
 
     // ── classify_failure: sparse checkout (regression for substring false positive) ──
 
+    #[serial(cooldown_state)]
     #[test]
     fn classify_failure_sparse_checkout_not_parse_error() {
         // Regression test for #1204: "sparse" substring contains "parse",
@@ -4042,6 +4111,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn classify_failure_sparse_index_not_parse_error() {
         // Another sparse-checkout variant that contains "parse"
@@ -4050,6 +4120,7 @@ mod tests {
         assert_eq!(category, FailureCategory::Unknown);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn dispatching_key_includes_repo_for_cross_project_isolation() {
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
@@ -4067,8 +4138,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn emit_degraded_agents_writes_metric_when_three_or_more_agents_degraded() {
+        crate::engine::cooldown::reset_global_state().await;
         use crate::engine::router::{Router, RouterConfig};
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
@@ -4139,8 +4212,10 @@ mod tests {
         assert_eq!(alert_val.as_deref(), Some("1"));
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn emit_degraded_agents_clears_alert_when_below_threshold() {
+        crate::engine::cooldown::reset_global_state().await;
         use crate::engine::router::{Router, RouterConfig};
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
@@ -4193,8 +4268,10 @@ mod tests {
         assert_eq!(stale_pool_alert.as_deref(), Some("0"));
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn emit_degraded_agents_sets_stale_pool_alert_for_persistent_model_failures() {
+        crate::engine::cooldown::reset_global_state().await;
         use crate::engine::cooldown::record_persistent_model_failure;
         use crate::engine::router::{Router, RouterConfig};
 
@@ -4230,6 +4307,7 @@ mod tests {
     use super::{classify_comment, CommentAction, MentionCursor};
     use crate::engine::commands::OwnerCommand;
 
+    #[serial(cooldown_state)]
     #[test]
     fn classify_skip_already_processed() {
         let action = classify_comment(
@@ -4241,12 +4319,14 @@ mod tests {
         assert_eq!(action, CommentAction::Skip);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn classify_skip_irrelevant_comment() {
         let action = classify_comment("just a regular comment", None, "@bot", false);
         assert_eq!(action, CommentAction::Skip);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn classify_command_without_mention() {
         let action = classify_comment(
@@ -4264,6 +4344,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn classify_command_with_mention() {
         let action = classify_comment(
@@ -4281,6 +4362,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn classify_mention_without_command() {
         let action = classify_comment(
@@ -4297,18 +4379,21 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn classify_mention_without_issue_url() {
         let action = classify_comment("@orch help me", None, "@bot", false);
         assert_eq!(action, CommentAction::CreateMentionTask { issue_num: None });
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn classify_command_no_mention_no_url_skips() {
         let action = classify_comment("/retry", None, "@bot", false);
         assert_eq!(action, CommentAction::Skip);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn classify_mention_via_current_user() {
         let action = classify_comment(
@@ -4325,6 +4410,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn classify_command_with_mention_no_url_creates_task() {
         // @mention + command but no issue URL → can't run command, create mention task
@@ -4332,6 +4418,7 @@ mod tests {
         assert_eq!(action, CommentAction::CreateMentionTask { issue_num: None });
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn mention_cursor_stops_advancing_after_gap() {
         let mut cursor = MentionCursor::default();
@@ -4345,6 +4432,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn mention_cursor_tracks_max_timestamp_until_gap() {
         let mut cursor = MentionCursor::default();
@@ -4460,8 +4548,10 @@ mod tests {
 
     /// When acknowledge_mention fails for CreateMentionTask, the cursor must NOT
     /// advance and no mention task should be created. The next tick will retry.
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn create_mention_task_skips_on_ack_failure() {
+        crate::engine::cooldown::reset_global_state().await;
         let backend: Arc<AckTrackingBackend> = AckTrackingBackend::new(true);
         let store: Arc<TaskStore> = Arc::new(TaskStore::open_memory().await.unwrap());
 
@@ -4519,8 +4609,10 @@ mod tests {
 
     /// When acknowledge_mention fails for ExecuteCommandForMention, handle_slash_command
     /// must NOT be called and no mention task should be created.
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn execute_command_for_mention_skips_on_ack_failure() {
+        crate::engine::cooldown::reset_global_state().await;
         let backend: Arc<AckTrackingBackend> = AckTrackingBackend::new(true);
         let store: Arc<TaskStore> = Arc::new(TaskStore::open_memory().await.unwrap());
 
@@ -4639,6 +4731,7 @@ mod tests {
         }
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn is_ci_failure_block_matches_ci_failure_limit() {
         let task = make_task(Some(
@@ -4647,6 +4740,7 @@ mod tests {
         assert!(is_ci_failure_block(&task));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn is_ci_failure_block_matches_ci_checks_timeout() {
         let task = make_task(Some(
@@ -4655,12 +4749,14 @@ mod tests {
         assert!(is_ci_failure_block(&task));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn is_ci_failure_block_false_for_regular_block() {
         let task = make_task(Some("waiting on input".to_string()));
         assert!(!is_ci_failure_block(&task));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn is_ci_failure_block_false_for_none_reason() {
         let task = make_task(None);
@@ -4669,6 +4765,7 @@ mod tests {
 
     // ── ci_failure_unblock_cooldown_elapsed ────────────────────────────────
 
+    #[serial(cooldown_state)]
     #[test]
     fn ci_failure_cooldown_zero_count_immediate() {
         // count=0 means never attempted — always allow immediate attempt
@@ -4676,6 +4773,7 @@ mod tests {
         assert!(ci_failure_unblock_cooldown_elapsed(&task));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn ci_failure_cooldown_empty_last_at_immediate() {
         // count=1 but empty last_at means it was never recorded — allow immediate
@@ -4684,6 +4782,7 @@ mod tests {
         assert!(ci_failure_unblock_cooldown_elapsed(&task));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn ci_failure_cooldown_invalid_timestamp_immediate() {
         // invalid timestamp should not block
@@ -4693,6 +4792,7 @@ mod tests {
         assert!(ci_failure_unblock_cooldown_elapsed(&task));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn ci_failure_cooldown_high_count_still_eventually_elapses() {
         // count >= 3 must NOT be a permanent block — verify a sufficiently old
@@ -4709,6 +4809,7 @@ mod tests {
         }
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn ci_failure_cooldown_recent_timestamp_still_blocks() {
         // A recent timestamp should still gate the check at every count.

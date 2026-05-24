@@ -142,53 +142,163 @@ pub fn resolve_jobs_path() -> PathBuf {
     crate::home::config_path().unwrap_or_else(|_| PathBuf::from(".orch/config.yml"))
 }
 
-/// Load jobs from the orch config file.
+/// Load jobs from the orch config file plus any markdown prompt files
+/// discovered under `<base_dir>/prompts/jobs/*.md`.
 ///
-/// Reads the `jobs` key from `.orch.yml` (project) or
-/// `~/.orch/config.yml` (global).
+/// Inline `jobs:` in `.orch.yml` and discovered prompt files are merged;
+/// duplicate ids across the two sources are rejected.
 pub fn load_jobs(path: &PathBuf) -> anyhow::Result<Vec<Job>> {
-    if !path.exists() {
-        return Ok(vec![]);
+    let base_dir = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut jobs: Vec<Job> = if path.exists() {
+        let content =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let file: ConfigFile = serde_norway::from_str(&content)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        file.jobs
+    } else {
+        vec![]
+    };
+
+    let scanned = scan_prompt_jobs(&base_dir)?;
+    let mut seen: std::collections::HashSet<String> = jobs.iter().map(|j| j.id.clone()).collect();
+    for job in scanned {
+        if !seen.insert(job.id.clone()) {
+            anyhow::bail!(
+                "duplicate job id '{}' — defined in both '{}' and prompts/jobs/",
+                job.id,
+                path.display()
+            );
+        }
+        jobs.push(job);
     }
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let file: ConfigFile =
-        serde_norway::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
-    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    for job in &file.jobs {
-        let expanded = crate::cron::expand_alias(&job.schedule).with_context(|| {
-            format!("job '{}': invalid cron schedule '{}'", job.id, job.schedule)
-        })?;
-        let normalized = crate::cron::normalize_dow(&expanded);
-        let full_expr = format!("0 {normalized} *");
-        Schedule::from_str(&full_expr).with_context(|| {
-            format!("job '{}': invalid cron schedule '{}'", job.id, job.schedule)
-        })?;
-        if let Some(template) = job.task.as_ref() {
-            if template.prompt.is_some() && !template.body.is_empty() {
+
+    for job in &jobs {
+        validate_job(job, &base_dir)?;
+    }
+    Ok(jobs)
+}
+
+fn validate_job(job: &Job, base_dir: &Path) -> anyhow::Result<()> {
+    let expanded = crate::cron::expand_alias(&job.schedule)
+        .with_context(|| format!("job '{}': invalid cron schedule '{}'", job.id, job.schedule))?;
+    let normalized = crate::cron::normalize_dow(&expanded);
+    let full_expr = format!("0 {normalized} *");
+    Schedule::from_str(&full_expr)
+        .with_context(|| format!("job '{}': invalid cron schedule '{}'", job.id, job.schedule))?;
+    if let Some(template) = job.task.as_ref() {
+        if template.prompt.is_some() && !template.body.is_empty() {
+            anyhow::bail!(
+                "job '{}': set either 'task.body' or 'task.prompt', not both",
+                job.id
+            );
+        }
+        if let Some(rel) = template.prompt.as_deref() {
+            let candidate = Path::new(rel);
+            let full = if candidate.is_absolute() {
+                candidate.to_path_buf()
+            } else {
+                base_dir.join(candidate)
+            };
+            if !full.exists() {
                 anyhow::bail!(
-                    "job '{}': set either 'task.body' or 'task.prompt', not both",
-                    job.id
+                    "job '{}': prompt file not found: {}",
+                    job.id,
+                    full.display()
                 );
-            }
-            if let Some(rel) = template.prompt.as_deref() {
-                let candidate = Path::new(rel);
-                let full = if candidate.is_absolute() {
-                    candidate.to_path_buf()
-                } else {
-                    base_dir.join(candidate)
-                };
-                if !full.exists() {
-                    anyhow::bail!(
-                        "job '{}': prompt file not found: {}",
-                        job.id,
-                        full.display()
-                    );
-                }
             }
         }
     }
-    Ok(file.jobs)
+    Ok(())
+}
+
+/// Frontmatter schema for `prompts/jobs/*.md` files.
+#[derive(Debug, Deserialize)]
+struct JobFrontmatter {
+    id: String,
+    schedule: String,
+    title: String,
+    #[serde(default = "default_job_type")]
+    r#type: String,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    #[serde(default = "default_external")]
+    external: bool,
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    notify: bool,
+    #[serde(default)]
+    notify_target: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    dir: Option<String>,
+}
+
+/// Split a markdown file into (frontmatter, body). Returns `None` if the file
+/// does not start with a `---` fence.
+fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
+    let rest = content
+        .strip_prefix("---\n")
+        .or_else(|| content.strip_prefix("---\r\n"))?;
+    let end = rest.find("\n---\n").or_else(|| rest.find("\n---\r\n"))?;
+    let fm = &rest[..end];
+    let after = &rest[end..];
+    let body = after
+        .strip_prefix("\n---\n")
+        .or_else(|| after.strip_prefix("\n---\r\n"))
+        .unwrap_or(after);
+    Some((fm, body.trim_start_matches('\n')))
+}
+
+/// Scan `<base_dir>/prompts/jobs/*.md` for job-defining markdown files.
+pub fn scan_prompt_jobs(base_dir: &Path) -> anyhow::Result<Vec<Job>> {
+    let dir = base_dir.join("prompts").join("jobs");
+    if !dir.is_dir() {
+        return Ok(vec![]);
+    }
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("md"))
+        .collect();
+    entries.sort();
+
+    let mut jobs = Vec::with_capacity(entries.len());
+    for path in entries {
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let Some((fm, body)) = split_frontmatter(&content) else {
+            continue; // No frontmatter → treat as a plain prompt referenced from .orch.yml
+        };
+        let meta: JobFrontmatter = serde_norway::from_str(fm)
+            .with_context(|| format!("parsing frontmatter in {}", path.display()))?;
+        jobs.push(Job {
+            id: meta.id,
+            r#type: meta.r#type,
+            schedule: meta.schedule,
+            task: Some(TaskTemplate {
+                title: meta.title,
+                body: body.to_string(),
+                prompt: None,
+                labels: meta.labels,
+                agent: meta.agent,
+            }),
+            command: meta.command,
+            dir: meta.dir,
+            enabled: meta.enabled,
+            external: meta.external,
+            notify: meta.notify,
+            notify_target: meta.notify_target,
+        });
+    }
+    Ok(jobs)
 }
 
 /// Save jobs back to the config file, preserving all other keys.
@@ -717,5 +827,105 @@ jobs:
             resolve_template_body(&template, tmp.path()).unwrap(),
             "inline body"
         );
+    }
+
+    fn write_prompt_job(dir: &Path, name: &str, content: &str) {
+        let jobs_dir = dir.join("prompts").join("jobs");
+        fs::create_dir_all(&jobs_dir).unwrap();
+        fs::write(jobs_dir.join(name), content).unwrap();
+    }
+
+    #[test]
+    fn scan_prompt_jobs_picks_up_frontmatter_files() {
+        let tmp = tempdir().unwrap();
+        write_prompt_job(
+            tmp.path(),
+            "morning.md",
+            "---\nid: morning\nschedule: '0 9 * * *'\ntitle: Morning\nlabels: [daily]\nagent: claude\n---\n\nDo morning stuff.\n",
+        );
+        let jobs = scan_prompt_jobs(tmp.path()).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "morning");
+        assert_eq!(jobs[0].schedule, "0 9 * * *");
+        let task = jobs[0].task.as_ref().unwrap();
+        assert_eq!(task.title, "Morning");
+        assert_eq!(task.body, "Do morning stuff.\n");
+        assert_eq!(task.labels, vec!["daily".to_string()]);
+        assert_eq!(task.agent.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn load_jobs_merges_inline_and_scanned() {
+        let tmp = tempdir().unwrap();
+        write_prompt_job(
+            tmp.path(),
+            "scanned.md",
+            "---\nid: scanned\nschedule: '0 9 * * *'\ntitle: Scanned\n---\n\nbody\n",
+        );
+        let cfg = write_config(
+            tmp.path(),
+            r#"
+jobs:
+  - id: inline
+    schedule: "0 10 * * *"
+    task:
+      title: "Inline"
+      body: "x"
+"#,
+        );
+        let jobs = load_jobs(&cfg).unwrap();
+        let ids: Vec<&str> = jobs.iter().map(|j| j.id.as_str()).collect();
+        assert!(ids.contains(&"inline"));
+        assert!(ids.contains(&"scanned"));
+        assert_eq!(jobs.len(), 2);
+    }
+
+    #[test]
+    fn load_jobs_rejects_duplicate_id_across_sources() {
+        let tmp = tempdir().unwrap();
+        write_prompt_job(
+            tmp.path(),
+            "dup.md",
+            "---\nid: dup\nschedule: '0 9 * * *'\ntitle: Dup\n---\n\nbody\n",
+        );
+        let cfg = write_config(
+            tmp.path(),
+            r#"
+jobs:
+  - id: dup
+    schedule: "0 10 * * *"
+    task:
+      title: "Dup inline"
+      body: "x"
+"#,
+        );
+        let err = load_jobs(&cfg).unwrap_err().to_string();
+        assert!(err.contains("duplicate job id"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn scan_prompt_jobs_ignores_files_without_frontmatter() {
+        let tmp = tempdir().unwrap();
+        write_prompt_job(
+            tmp.path(),
+            "plain.md",
+            "just a prompt body, no frontmatter\n",
+        );
+        let jobs = scan_prompt_jobs(tmp.path()).unwrap();
+        assert_eq!(jobs.len(), 0);
+    }
+
+    #[test]
+    fn load_jobs_works_without_config_file_when_directory_present() {
+        let tmp = tempdir().unwrap();
+        write_prompt_job(
+            tmp.path(),
+            "solo.md",
+            "---\nid: solo\nschedule: '0 9 * * *'\ntitle: Solo\n---\n\nbody\n",
+        );
+        let missing_cfg = tmp.path().join(".orch.yml");
+        let jobs = load_jobs(&missing_cfg).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "solo");
     }
 }

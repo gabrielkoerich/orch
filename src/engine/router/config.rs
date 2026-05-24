@@ -716,6 +716,7 @@ impl RouterConfig {
 #[cfg(test)]
 mod tests {
     use super::{RouterConfig, MAX_ROUTER_TIMEOUT_SECS};
+    use serial_test::serial;
     use std::sync::{Mutex, OnceLock};
 
     struct CurrentDirGuard {
@@ -741,8 +742,10 @@ mod tests {
         CWD_MUTEX.get_or_init(|| Mutex::new(()))
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn model_for_complexity_returns_none_when_all_models_cooled() {
+        crate::engine::cooldown::reset_global_state().await;
         let mut config = RouterConfig::default();
         // Inject a two-model pool for a unique agent name to avoid cross-test pollution
         config
@@ -770,8 +773,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn model_for_complexity_returns_none_when_single_model_cooled() {
+        crate::engine::cooldown::reset_global_state().await;
         let mut config = RouterConfig::default();
         config
             .model_map
@@ -795,6 +800,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn model_for_complexity_returns_model_when_not_cooled() {
         let mut config = RouterConfig::default();
@@ -816,6 +822,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn has_available_model_returns_false_when_no_pool_configured() {
         let mut config = RouterConfig::default();
@@ -851,6 +858,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn default_self_routing_penalty_is_one() {
         let config = RouterConfig::default();
@@ -860,6 +868,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn from_config_reads_self_routing_penalty() {
         let _lock = cwd_mutex().lock().unwrap();
@@ -875,6 +884,7 @@ mod tests {
         assert_eq!(config.self_routing_penalty, 0.5);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn default_config_model_map_is_empty() {
         // model_map must be empty — config.yml is the sole source of truth for models.
@@ -888,6 +898,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn from_config_reads_router_pool_yaml_array() {
         let _lock = cwd_mutex().lock().unwrap();
@@ -912,6 +923,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn from_config_clamps_router_timeout_to_max() {
         let _lock = cwd_mutex().lock().unwrap();
@@ -927,6 +939,7 @@ mod tests {
         assert_eq!(config.timeout_seconds, MAX_ROUTER_TIMEOUT_SECS);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn normalize_model_identifier_strips_trailing_slash() {
         // Bug #1507: model assignment was producing "opus/" instead of "opus"
@@ -959,6 +972,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn is_valid_model_identifier_rejects_trailing_slash() {
         // Ensure validation correctly rejects models with trailing slashes
@@ -980,6 +994,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn from_config_loads_model_map_for_custom_agents() {
         let _lock = cwd_mutex().lock().unwrap();
@@ -1026,6 +1041,7 @@ model_map:
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn model_for_complexity_normalizes_trailing_slash_from_pool() {
         // Bug #1507: full path test - model identifiers with trailing slashes
@@ -1067,6 +1083,7 @@ model_map:
 
     // --- prune_unavailable_opencode_models regression tests (bug #3169) ---
 
+    #[serial(cooldown_state)]
     #[test]
     fn prune_unavailable_opencode_models_removes_missing_models() {
         use std::collections::{HashMap, HashSet};
@@ -1104,6 +1121,7 @@ model_map:
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn prune_unavailable_opencode_models_noop_when_all_available() {
         use std::collections::{HashMap, HashSet};
@@ -1129,6 +1147,7 @@ model_map:
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn prune_unavailable_opencode_models_preserves_non_opencode_agents() {
         use std::collections::{HashMap, HashSet};
@@ -1152,6 +1171,7 @@ model_map:
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn prune_unavailable_opencode_models_covers_all_complexity_tiers() {
         use std::collections::{HashMap, HashSet};

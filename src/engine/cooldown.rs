@@ -1198,8 +1198,19 @@ fn parse_retry_at(error_message: &str) -> Option<i64> {
 }
 
 #[cfg(test)]
+pub(crate) async fn reset_global_state() {
+    cooldowns().lock().unwrap().clear();
+    *cooldown_store().lock().await = None;
+    github_5xx_timestamps().lock().unwrap().clear();
+    *github_5xx_circuit_open().lock().unwrap() = None;
+    degraded_agents().lock().unwrap().clear();
+    crate::engine::runner::agents::opencode::reset_model_caches_for_test();
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     async fn test_store() -> Arc<crate::store::TaskStore> {
         Arc::new(
@@ -1209,8 +1220,10 @@ mod tests {
         )
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn init_loads_unexpired_cooldowns_from_kv() {
+        super::reset_global_state().await;
         let store = test_store().await;
         let cooldown_until = chrono::Utc::now().timestamp() + 3600; // 1 hour from now
 
@@ -1249,8 +1262,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn record_model_failure_writes_to_kv() {
+        super::reset_global_state().await;
         let store = test_store().await;
 
         *cooldown_store().lock().await = Some(store.clone());
@@ -1269,8 +1284,10 @@ mod tests {
         assert!(ts > now, "persisted timestamp should be in the future");
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn record_persistent_model_failure_escalates_and_increments_failure_count() {
+        super::reset_global_state().await;
         let store = test_store().await;
         *cooldown_store().lock().await = Some(store.clone());
 
@@ -1307,8 +1324,10 @@ mod tests {
         assert_eq!(stored_count, "2");
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn record_model_permanently_gone_applies_max_cooldown_immediately() {
+        super::reset_global_state().await;
         let store = test_store().await;
         *cooldown_store().lock().await = Some(store.clone());
 
@@ -1331,6 +1350,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn parse_retry_at_codex_format() {
         let msg = "You've hit your usage limit. Upgrade to Pro, visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Mar 26th, 2026 5:55 AM.";
@@ -1362,12 +1382,14 @@ mod tests {
         assert_eq!(dt.day(), 26);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn parse_retry_at_no_date() {
         assert!(parse_retry_at("generic rate limit error").is_none());
         assert!(parse_retry_at("").is_none());
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn parse_retry_at_glm_reset_format_with_seconds() {
         let msg = "Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-04-23 18:33:48";
@@ -1391,6 +1413,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn parse_retry_at_billing_cycle_without_date_returns_none() {
         // Without a specific "try again at" date, parse_retry_at should return
@@ -1402,16 +1425,20 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn agent_cooldown_persists_to_kv() {
+        super::reset_global_state().await;
         // Agent-level cooldowns persist to KV via set_cooldown_async
         let agent = "test_agent_persist_check";
         record_agent_failure_with_message(agent, "").await;
         assert!(is_agent_in_cooldown(agent));
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn cooldown_never_shortens() {
+        super::reset_global_state().await;
         let agent = "test_agent_no_shorten";
         set_agent_cooldown(agent, 24 * 60 * 60).await;
         let initial = {
@@ -1435,8 +1462,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn silence_agent_cooldown_is_short_lived() {
+        super::reset_global_state().await;
         let agent = "test_silence_agent_cd";
         assert!(!is_agent_in_cooldown(agent));
 
@@ -1455,8 +1484,10 @@ mod tests {
         assert!(remaining > 0, "cooldown should still be active");
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn record_silence_detection_applies_extended_cooldown() {
+        super::reset_global_state().await;
         let store = test_store().await;
         *cooldown_store().lock().await = Some(store.clone());
 
@@ -1486,6 +1517,7 @@ mod tests {
         assert_eq!(stored, "[]");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn detect_credit_exhaustion_out_of_credits() {
         let msg = "Error: API error - {\"error\":{\"message\":\"You exceeded your current quota\",\"type\":\"insufficient_quota\",\"param\":null,\"code\":\"insufficient_quota\"}}";
@@ -1495,6 +1527,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn detect_credit_exhaustion_out_of_credits_variations() {
         assert_eq!(
@@ -1515,6 +1548,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn detect_credit_exhaustion_org_level_disabled() {
         let msg = "Error: API error - {\"error\":{\"message\":\"Organization has been disabled\",\"type\":\"org_disabled\",\"code\":\"overageDisabledReason:org_level_disabled\"}}";
@@ -1524,6 +1558,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn detect_credit_exhaustion_org_level_disabled_variations() {
         assert_eq!(
@@ -1544,6 +1579,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn detect_credit_exhaustion_overage_disabled_reason_parsing() {
         let msg = "overageDisabledReason: out_of_credits";
@@ -1559,6 +1595,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn detect_credit_exhaustion_glm_insufficient_balance() {
         // GLM/ZhipuAI 429: "Insufficient balance or no resource package. Please recharge."
@@ -1582,6 +1619,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn detect_credit_exhaustion_none_for_regular_rate_limit() {
         assert!(detect_credit_exhaustion("rate limit exceeded").is_none());
@@ -1590,8 +1628,10 @@ mod tests {
         assert!(detect_credit_exhaustion("you've hit your usage limit").is_none());
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn record_credit_exhaustion_applies_agent_cooldown() {
+        super::reset_global_state().await;
         let agent = "test_credit_exhaust_agent";
         assert!(!is_agent_in_cooldown(agent));
 
@@ -1614,8 +1654,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn record_credit_exhaustion_org_level_applies_longer_cooldown() {
+        super::reset_global_state().await;
         let agent = "test_org_disabled_agent";
         assert!(!is_agent_in_cooldown(agent));
 
@@ -1638,8 +1680,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn record_credit_exhaustion_billing_cycle_applies_24h() {
+        super::reset_global_state().await;
         let store = test_store().await;
         *cooldown_store().lock().await = Some(store.clone());
 
@@ -1665,8 +1709,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn record_credit_exhaustion_billing_cycle_escalates() {
+        super::reset_global_state().await;
         let store = test_store().await;
         *cooldown_store().lock().await = Some(store.clone());
 
@@ -1727,6 +1773,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn credit_exhaustion_backoff_constants() {
         // OutOfCredits first failure: 1h base
@@ -1746,6 +1793,7 @@ mod tests {
 
     // ---- Degraded-agent tracking tests ----
 
+    #[serial(cooldown_state)]
     #[test]
     fn mark_and_check_agent_degraded() {
         let agent = "test_degraded_mark";
@@ -1756,8 +1804,10 @@ mod tests {
         assert!(!is_agent_degraded(agent));
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn refresh_degraded_agents_marks_cooled_agent() {
+        super::reset_global_state().await;
         let store = test_store().await;
         let agent = "test_refresh_cooled";
 
@@ -1778,8 +1828,10 @@ mod tests {
         clear_agent_degraded(agent);
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn refresh_degraded_agents_marks_no_models_agent() {
+        super::reset_global_state().await;
         let store = test_store().await;
         let agent = "test_refresh_no_models";
 
@@ -1796,8 +1848,10 @@ mod tests {
         clear_agent_degraded(agent);
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn refresh_degraded_agents_marks_rate_limited_agent() {
+        super::reset_global_state().await;
         let store = test_store().await;
         let agent = "test_refresh_rate_limited";
 
@@ -1822,8 +1876,10 @@ mod tests {
         clear_agent_degraded(agent);
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn refresh_degraded_agents_clears_healthy_agent() {
+        super::reset_global_state().await;
         let store = test_store().await;
         let agent = "test_refresh_healthy";
 
@@ -1841,8 +1897,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn refresh_degraded_agents_ignores_expired_cooldowns() {
+        super::reset_global_state().await;
         let store = test_store().await;
         let agent = "test_refresh_expired_cooldown";
 
@@ -1887,6 +1945,7 @@ mod tests {
         }
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn compute_backoff_grows_exponentially() {
         // count=0 or 1: base
@@ -1902,6 +1961,7 @@ mod tests {
         assert_eq!(compute_backoff(5, 300, 14400), 14400);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn compute_backoff_extended_tier_1_applies_24h() {
         // With base=300, max=14400:
@@ -1931,6 +1991,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn compute_backoff_extended_tier_2_applies_48h() {
         // With base=300, max=14400:
@@ -1957,6 +2018,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn compute_backoff_extended_tier_with_different_base_max() {
         // With base=60, max=3600:
@@ -1974,6 +2036,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn compute_backoff_extended_tier_persistent_fails_example() {
         // Real-world example from issue: glm:haiku with 21 failures
@@ -1993,6 +2056,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn compute_backoff_extended_tier_zero_base() {
         // Zero base should still work without panicking
@@ -2001,6 +2065,7 @@ mod tests {
         assert_eq!(compute_backoff(10, 0, 14400), 0);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn detect_credit_exhaustion_billing_cycle() {
         assert_eq!(
@@ -2029,6 +2094,7 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn detect_credit_exhaustion_overage_takes_priority_over_billing_cycle() {
         // A message containing both overage and billing cycle language should resolve
@@ -2040,8 +2106,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn refresh_degraded_agents_below_threshold_not_degraded() {
+        super::reset_global_state().await;
         let store = test_store().await;
         let agent = "test_refresh_below_threshold";
 
@@ -2065,8 +2133,10 @@ mod tests {
 
     // ---- Exponential backoff integration tests ----
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn repeated_agent_failures_escalate_backoff() {
+        super::reset_global_state().await;
         let store = test_store().await;
         *cooldown_store().lock().await = Some(store.clone());
 
@@ -2103,8 +2173,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn vendor_past_retry_falls_back_to_backoff() {
+        super::reset_global_state().await;
         // If a vendor-provided "try again at" date is in the past, the
         // code must NOT early-return and must instead apply the normal
         // exponential backoff (increment failure count and set a future cooldown).
@@ -2153,8 +2225,10 @@ mod tests {
         assert_eq!(stored, "1");
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn record_agent_success_resets_backoff() {
+        super::reset_global_state().await;
         let store = test_store().await;
         *cooldown_store().lock().await = Some(store.clone());
 
@@ -2203,8 +2277,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn clear_cooldown_resets_failure_counts() {
+        super::reset_global_state().await;
         let store = test_store().await;
         *cooldown_store().lock().await = Some(store.clone());
 
@@ -2251,8 +2327,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn clear_all_cooldowns_resets_all_failure_counts() {
+        super::reset_global_state().await;
         let store = test_store().await;
         *cooldown_store().lock().await = Some(store.clone());
 
@@ -2281,6 +2359,7 @@ mod tests {
         }
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn compute_backoff_saturates_on_large_counts() {
         // Very large count should not overflow — extended tier applies 48h
@@ -2292,6 +2371,7 @@ mod tests {
         assert_eq!(compute_backoff(u64::MAX, 300, 14400), 172800);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn compute_backoff_zero_base_returns_zero() {
         assert_eq!(compute_backoff(1, 0, 14400), 0);
@@ -2300,8 +2380,10 @@ mod tests {
 
     // ---- GitHub 5xx circuit breaker tests ----
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn github_circuit_stays_closed_below_threshold() {
+        super::reset_global_state().await;
         // Reset circuit breaker state
         {
             let mut open = github_5xx_circuit_open().lock().unwrap();
@@ -2327,8 +2409,10 @@ mod tests {
         assert_eq!(github_circuit_remaining_secs(), 0);
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn github_circuit_trips_at_threshold() {
+        super::reset_global_state().await;
         // Reset circuit breaker state
         {
             let mut open = github_5xx_circuit_open_lock();
@@ -2361,8 +2445,10 @@ mod tests {
         }
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn github_circuit_cannot_double_trip() {
+        super::reset_global_state().await;
         // Reset circuit breaker state
         {
             let mut open = github_5xx_circuit_open_lock();
@@ -2399,8 +2485,10 @@ mod tests {
         }
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn github_circuit_recovers_after_cooldown() {
+        super::reset_global_state().await;
         // Reset circuit breaker state
         {
             let mut open = github_5xx_circuit_open_lock();
@@ -2424,8 +2512,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn github_circuit_sliding_window_ages_out() {
+        super::reset_global_state().await;
         // Reset circuit breaker state
         {
             let mut open = github_5xx_circuit_open_lock();
