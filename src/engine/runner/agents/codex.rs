@@ -4,9 +4,9 @@
 //!
 //! ```bash
 //! cat "{msg_file}" | codex --model {model} \
-//!   --ask-for-approval never \
+//!   exec -c 'approval_policy="never"' \
 //!   --sandbox workspace-write \
-//!   exec --json -
+//!   --json -
 //! ```
 //!
 //! ## Output format (`exec --json`)
@@ -224,11 +224,13 @@ impl AgentRunner for CodexRunner {
             .map(|m| format!("--model {}", super::shell_single_quote(m)))
             .unwrap_or_default();
 
-        // Codex permission mode:
-        // - autonomous → --sandbox workspace-write --ask-for-approval never
-        // - supervised → --ask-for-approval suggest
+        // Codex permission mode (codex-cli 0.133.0+):
+        // - autonomous → --sandbox workspace-write -c 'approval_policy="never"'
+        // - supervised → -c 'approval_policy="on-request"' --sandbox {sandbox}
         // - full access → --dangerously-bypass-approvals-and-sandbox
         //
+        // Note: --ask-for-approval was removed in codex-cli 0.133.0.
+        // Use -c 'approval_policy="..."' instead.
         // Note: --full-auto is deprecated as of codex 0.128.0 and does not
         // reliably honour --add-dir entries under the new seatbelt policy.
         let permission_flags = if permissions.autonomous {
@@ -236,14 +238,14 @@ impl AgentRunner for CodexRunner {
                 SandboxLevel::FullAccess => {
                     "--dangerously-bypass-approvals-and-sandbox".to_string()
                 }
-                _ => "--sandbox workspace-write --ask-for-approval never".to_string(),
+                _ => r#"--sandbox workspace-write -c 'approval_policy="never"'"#.to_string(),
             }
         } else {
             let sandbox = match permissions.sandbox {
                 SandboxLevel::WorkspaceWrite | SandboxLevel::None => "workspace-write",
                 SandboxLevel::FullAccess => "danger-full-access",
             };
-            format!("--ask-for-approval suggest --sandbox {sandbox}")
+            format!(r#"-c 'approval_policy="on-request"' --sandbox {sandbox}"#)
         };
 
         // Extra writable dirs (e.g. the git common dir when running inside a
@@ -517,8 +519,12 @@ mod tests {
             "default autonomous codex should use --sandbox workspace-write, got: {cmd}"
         );
         assert!(
-            cmd.contains("--ask-for-approval never"),
-            "default autonomous codex should use --ask-for-approval never, got: {cmd}"
+            cmd.contains(r#"-c 'approval_policy="never"'"#),
+            "default autonomous codex should use -c approval_policy=never, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--ask-for-approval"),
+            "--ask-for-approval was removed in codex 0.133.0 and must not appear, got: {cmd}"
         );
         assert!(
             !cmd.contains("--full-auto"),
@@ -584,8 +590,12 @@ mod tests {
             "autonomous codex with extra dirs should use --sandbox workspace-write, got: {cmd}"
         );
         assert!(
-            cmd.contains("--ask-for-approval never"),
-            "autonomous codex with extra dirs should use --ask-for-approval never, got: {cmd}"
+            cmd.contains(r#"-c 'approval_policy="never"'"#),
+            "autonomous codex with extra dirs should use -c approval_policy=never, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--ask-for-approval"),
+            "--ask-for-approval was removed in codex 0.133.0 and must not appear, got: {cmd}"
         );
         assert!(
             !cmd.contains("--full-auto"),
