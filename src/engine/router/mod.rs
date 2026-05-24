@@ -1229,11 +1229,18 @@ impl Router {
                     let err_msg = e.to_string();
                     let is_timeout = err_msg.contains(TIMEOUT_PREFIX);
                     if is_timeout {
+                        // Advance pool index so the next tick starts at the next entry,
+                        // then return immediately. Continuing to try further pool entries
+                        // in the same tick would accumulate multiple timeout windows and
+                        // stall the tick loop for minutes (issue #3187).
+                        self.advance_pool_index_after_attempt(idx, n);
                         tracing::warn!(
                             agent,
                             model = model_str,
-                            "router LLM pool entry timed out — skipping cooldown, trying next entry"
+                            next_pool_idx = self.pool_index,
+                            "router LLM pool entry timed out — advancing pool index, will retry next tick"
                         );
+                        return Err(e);
                     } else {
                         tracing::warn!(
                             agent,
@@ -1316,8 +1323,9 @@ impl Router {
                         tracing::warn!(
                             agent = %fb_agent,
                             model = %fb_model_str,
-                            "fallback router LLM timed out — skipping cooldown"
+                            "fallback router LLM timed out — returning immediately to unblock tick loop"
                         );
+                        return Err(e);
                     } else {
                         tracing::warn!(
                             agent = %fb_agent,
