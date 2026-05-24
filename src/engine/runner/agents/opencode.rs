@@ -39,6 +39,22 @@ static FREE_MODELS_REFRESH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static ALL_MODELS_CACHE: OnceLock<Mutex<(i64, Vec<String>)>> = OnceLock::new();
 static ALL_MODELS_REFRESH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
+#[cfg(test)]
+pub(crate) fn reset_model_caches_for_test() {
+    if let Some(cache) = FREE_MODELS_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            *guard = (0, Vec::new());
+        }
+    }
+    if let Some(cache) = ALL_MODELS_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            *guard = (0, Vec::new());
+        }
+    }
+    FREE_MODELS_REFRESH_IN_PROGRESS.store(false, Ordering::Release);
+    ALL_MODELS_REFRESH_IN_PROGRESS.store(false, Ordering::Release);
+}
+
 /// Runner for OpenCode agent.
 pub struct OpenCodeRunner;
 

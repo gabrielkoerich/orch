@@ -657,6 +657,7 @@ mod tests {
     use super::*;
     use crate::engine::runner::agents::{AgentError, AgentRunner, ParsedResponse, PermissionRules};
     use crate::parser::AgentResponse;
+    use serial_test::serial;
 
     struct MockRunner {
         free: Vec<String>,
@@ -723,8 +724,10 @@ mod tests {
     ///
     /// This prevents concurrent dispatches from starting new runs against the same
     /// rate-limited agent while the first task is still in its error-handling path.
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn rate_limit_sets_agent_cooldown_immediately() {
+        crate::engine::cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "test-agent-1371-early-cooldown";
 
@@ -766,8 +769,10 @@ mod tests {
     /// is_model_in_cooldown(agent, model) which uses the agent:model key format.
     /// An agent-level cooldown alone does NOT prevent the same model from being
     /// re-selected, causing the rate-limited model to fail repeatedly (issue #2153).
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn rate_limit_sets_both_agent_and_model_cooldowns() {
+        crate::engine::cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "test-agent-2153-model-cooldown";
         let model = "opencode/github-copilot/qwen3.6-plus-free";
@@ -814,8 +819,10 @@ mod tests {
     }
 
     /// Verify that rate limit for a specific model does NOT cool other models of the same agent.
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn rate_limit_cooldown_is_model_specific() {
+        crate::engine::cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "test-agent-2153-model-specific";
         let cooled_model = "opencode/github-copilot/qwen3.6-plus-free";
@@ -851,8 +858,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn provider_returned_error_sets_extended_model_cooldown() {
+        crate::engine::cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "opencode";
         let model = "opencode/nemotron-3-super-free";
@@ -888,8 +897,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn silent_exit0_retries_free_model_for_simple_complexity() {
+        crate::engine::cooldown::reset_global_state().await;
         let runner = MockRunner {
             free: vec!["opencode/mimo-v2-omni-free".to_string()],
         };
@@ -919,8 +930,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn silent_exit0_retries_free_model_when_complexity_unknown() {
+        crate::engine::cooldown::reset_global_state().await;
         let runner = MockRunner {
             free: vec!["opencode/mimo-v2-omni-free".to_string()],
         };
@@ -950,8 +963,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn silent_exit0_retries_free_model_for_medium_complexity() {
+        crate::engine::cooldown::reset_global_state().await;
         let runner = MockRunner {
             free: vec!["opencode/mimo-v2-omni-free".to_string()],
         };
@@ -981,8 +996,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn silent_exit0_retries_free_model_for_complex_complexity() {
+        crate::engine::cooldown::reset_global_state().await;
         let runner = MockRunner {
             free: vec!["opencode/mimo-v2-omni-free".to_string()],
         };
@@ -1014,8 +1031,10 @@ mod tests {
 
     /// Context overflow is deterministic — the same context will overflow every agent.
     /// Verify that it escalates directly to needs_review without cycling through fallback agents.
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn context_overflow_escalates_to_needs_review_immediately() {
+        crate::engine::cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let err = AgentError::ContextOverflow {
             message: "prompt is too long: 250000 tokens, max 200000".to_string(),
@@ -1043,8 +1062,10 @@ mod tests {
 
     /// When store is None, store_set_result returns Ok(()) — reroute proceeds normally.
     /// This verifies the happy path is not broken by the error-propagation change.
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn free_model_reroute_succeeds_without_store() {
+        crate::engine::cooldown::reset_global_state().await;
         let runner = MockRunner {
             free: vec!["opencode/mimo-v2-omni-free".to_string()],
         };
@@ -1074,8 +1095,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn silent_exit0_falls_through_when_no_free_models() {
+        crate::engine::cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let err = AgentError::Unknown {
             exit_code: 0,
@@ -1107,8 +1130,10 @@ mod tests {
     /// This fixes issue #2750: InvalidResponse used to skip model-level cooldown,
     /// allowing models that produced unparseable responses to be immediately
     /// retried on the next task without any backoff.
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn invalid_response_sets_model_cooldown() {
+        crate::engine::cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "opencode";
         let model = "opencode/nemotron-3-super-free";
@@ -1144,8 +1169,10 @@ mod tests {
         );
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn summarize_rate_limit_error_extracts_api_retry_info() {
+        crate::engine::cooldown::reset_global_state().await;
         let raw_output = r#"some log lines
 {"type":"system","subtype":"api_retry","attempt":6,"max_retries":10,"retry_delay_ms":17266.789,"error_status":429,"error":"rate_limit","session_id":"331c099b-..."}
 {"type":"system","subtype":"api_retry","attempt":7,"max_retries":10,"retry_delay_ms":35162.66,"error_status":429,"error":"rate_limit","session_id":"331c099b-..."}
@@ -1155,16 +1182,20 @@ more logs"#;
         assert_eq!(summarized, "status=429 after 7 attempts (last delay 35s)");
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn summarize_rate_limit_error_returns_original_when_no_api_retry() {
+        crate::engine::cooldown::reset_global_state().await;
         let raw_output = "some regular error message without api_retry JSON";
 
         let summarized = super::summarize_rate_limit_error(raw_output);
         assert_eq!(summarized, raw_output);
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn summarize_rate_limit_error_handles_malformed_json_gracefully() {
+        crate::engine::cooldown::reset_global_state().await;
         let raw_output = r#"some logs
 {"type":"system","subtype":"api_retry","attempt":"not_a_number","retry_delay_ms":invalid,"error_status":429}
 more logs"#;
@@ -1177,8 +1208,10 @@ more logs"#;
         assert!(summarized.contains("(last delay"));
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn summarize_rate_limit_error_works_with_single_line() {
+        crate::engine::cooldown::reset_global_state().await;
         let raw_output = r#"{"type":"system","subtype":"api_retry","attempt":3,"max_retries":10,"retry_delay_ms":5000,"error_status":429,"error":"rate_limit"}"#;
 
         let summarized = super::summarize_rate_limit_error(raw_output);
@@ -1188,8 +1221,10 @@ more logs"#;
     /// Verify extract_json_field correctly handles quoted string values.
     /// Previously it stripped from the wrong end (strip_suffix), returning None for
     /// any field that isn't the last one in the JSON object (fixes issue #2817).
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn extract_json_field_handles_quoted_strings() {
+        crate::engine::cooldown::reset_global_state().await;
         let json = r#"{"error_status":429,"attempt":7,"retry_delay_ms":35162.66,"error":"rate_limit","session_id":"331c099b-..."}"#;
 
         assert_eq!(
@@ -1219,8 +1254,10 @@ more logs"#;
 
     /// Truncated fragment starting mid-object with ,"subtype":"api_retry"...
     /// Should NOT return raw JSON blob (regression test for issue #2839).
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn summarize_rate_limit_error_handles_truncated_fragment_with_subtype() {
+        crate::engine::cooldown::reset_global_state().await;
         // Real-world truncated fragment from GLM runs (no "type":"system" prefix)
         let raw_output = r#"some log context
 ,"subtype":"api_retry","attempt":5,"retry_delay_ms":20000,"error_status":429,"error":"rate_limit"
@@ -1245,8 +1282,10 @@ more context"#;
     }
 
     /// Fragment with attempt and delay fields extractable from mid-fragment.
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn summarize_rate_limit_error_handles_fragment_with_extractable_fields() {
+        crate::engine::cooldown::reset_global_state().await;
         let raw_output = r#"log output
 ,"subtype":"api_retry","attempt":5,"retry_delay_ms":20000,"error_status":429,"error":"rate_limit","session_id":"abc123","max_retries":10}
 rest of output"#;
@@ -1256,8 +1295,10 @@ rest of output"#;
     }
 
     /// Complete JSON (no truncation) still works after removing "type":"system" requirement.
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn summarize_rate_limit_error_complete_json_still_works() {
+        crate::engine::cooldown::reset_global_state().await;
         let raw_output = r#"some log lines
 {"type":"system","subtype":"api_retry","attempt":6,"max_retries":10,"retry_delay_ms":17266.789,"error_status":429,"error":"rate_limit","session_id":"331c099b-..."}
 {"type":"system","subtype":"api_retry","attempt":7,"max_retries":10,"retry_delay_ms":35162.66,"error_status":429,"error":"rate_limit","session_id":"331c099b-..."}
@@ -1268,8 +1309,10 @@ more logs"#;
     }
 
     /// When no api_retry JSON is found at all, should NOT return raw passthrough.
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn summarize_rate_limit_error_no_api_retry_no_raw_passthrough() {
+        crate::engine::cooldown::reset_global_state().await;
         let raw_output = "some regular error message without api_retry JSON that is quite long and should be truncated";
 
         let summarized = super::summarize_rate_limit_error(raw_output);
@@ -1281,8 +1324,10 @@ more logs"#;
     }
 
     /// Short error without api_retry: should return the line as-is (no truncation needed).
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn summarize_rate_limit_error_no_api_retry_short() {
+        crate::engine::cooldown::reset_global_state().await;
         let raw_output = "rate limit exceeded";
 
         let summarized = super::summarize_rate_limit_error(raw_output);
@@ -1294,8 +1339,10 @@ more logs"#;
     ///
     /// Regression test for issue #2941: dead models were retried every 4h indefinitely
     /// because "not found" was treated the same as a transient unavailability.
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn model_not_found_applies_persistent_cooldown() {
+        crate::engine::cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "opencode-2941-not-found";
         let model = "github-copilot/claude-opus-4.6";
@@ -1335,8 +1382,10 @@ more logs"#;
     }
 
     /// Transient model unavailability (not "not found") should use the standard short cooldown.
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn model_unavailable_transient_applies_short_cooldown() {
+        crate::engine::cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "opencode-2941-transient";
         let model = "github-copilot/gpt-4o";

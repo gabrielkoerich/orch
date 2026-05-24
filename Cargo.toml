@@ -97,6 +97,7 @@ tempfile = "3"
 tokio-test = "0.4"
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"
+serial_test = "3"
 
 [profile.release]
 opt-level = 3

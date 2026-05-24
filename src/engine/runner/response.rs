@@ -852,7 +852,9 @@ pub async fn store_failure_memory(
 mod tests {
     use super::*;
     use crate::engine::runner::agents::{find_agent_result, patterns, AgentError};
+    use serial_test::serial;
 
+    #[serial(cooldown_state)]
     #[test]
     fn calculate_backoff_delay_jitter_is_centered() {
         // Run many samples and verify the range is [0.7*capped, 1.3*capped].
@@ -876,6 +878,7 @@ mod tests {
         }
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn fallback_retry_count_uses_larger_network_retry_streak() {
         let task = crate::store::Task {
@@ -944,6 +947,7 @@ mod tests {
         assert_eq!(fallback_retry_count(Some(&task)), 3);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn retryable_type_str_returns_correct_labels() {
         assert_eq!(RetryableError::Timeout.type_str(), "timeout");
@@ -953,6 +957,7 @@ mod tests {
         assert_eq!(RetryableError::MissingTooling.type_str(), "failed");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn is_usage_limit_detects_rate_limit() {
         assert!(patterns::detect_rate_limit("Error: rate limit exceeded").is_some());
@@ -962,12 +967,14 @@ mod tests {
         assert!(patterns::detect_context_overflow("context_length_exceeded").is_some());
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn is_usage_limit_rejects_normal_text() {
         assert!(patterns::detect_rate_limit("task completed successfully").is_none());
         assert!(patterns::detect_rate_limit("").is_none());
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn is_auth_error_detects_common_patterns() {
         assert!(patterns::detect_auth_error("401 Unauthorized").is_some());
@@ -976,12 +983,14 @@ mod tests {
         assert!(patterns::detect_auth_error("Error: 403 Forbidden").is_some());
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn is_auth_error_rejects_normal_text() {
         assert!(patterns::detect_auth_error("task completed successfully").is_none());
         assert!(patterns::detect_auth_error("").is_none());
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn detect_missing_tooling_finds_known_tools() {
         let result = patterns::detect_missing_tool("bun: command not found");
@@ -1009,6 +1018,7 @@ mod tests {
         }
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn detect_missing_tooling_returns_none_for_normal() {
         assert!(patterns::detect_missing_tool("everything works fine").is_none());
@@ -1017,8 +1027,10 @@ mod tests {
 
     // ── Cooldown tests ────────────────────────────────────────────
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn record_and_check_agent_cooldown() {
+        crate::engine::cooldown::reset_global_state().await;
         // Use unique names to avoid interference from other tests
         let agent = "test_cooldown_agent_1";
         assert!(!is_agent_in_cooldown(agent));
@@ -1026,8 +1038,10 @@ mod tests {
         assert!(is_agent_in_cooldown(agent));
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn record_and_check_model_cooldown() {
+        crate::engine::cooldown::reset_global_state().await;
         let agent = "test_cooldown_agent_2";
         let model = "test_model_x";
         assert!(!is_model_in_cooldown(agent, model));
@@ -1037,8 +1051,10 @@ mod tests {
         assert!(!is_model_in_cooldown(agent, "other_model"));
     }
 
+    #[serial(cooldown_state)]
     #[tokio::test]
     async fn clear_expired_does_not_remove_fresh_entries() {
+        crate::engine::cooldown::reset_global_state().await;
         let agent = "test_cooldown_agent_3";
         record_agent_failure_with_message(agent, "").await;
         clear_expired_cooldowns();
@@ -1047,6 +1063,7 @@ mod tests {
     }
 
     // Use fake agent names so other tests don't interfere.
+    #[serial(cooldown_state)]
     #[test]
     fn pick_fallback_skips_current_agent() {
         let available = vec!["test_agent_a".to_string(), "test_agent_b".to_string()];
@@ -1054,6 +1071,7 @@ mod tests {
         assert_eq!(result, Some("test_agent_b".to_string()));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn pick_fallback_skips_chain_agents() {
         let available = vec![
@@ -1065,6 +1083,7 @@ mod tests {
         assert_eq!(result, Some("test_agent_c".to_string()));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn pick_fallback_returns_none_when_exhausted() {
         let available = vec!["test_agent_a".to_string(), "test_agent_b".to_string()];
@@ -1072,6 +1091,7 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn weight_signal_variants() {
         let success = WeightSignal::Success {
@@ -1088,6 +1108,7 @@ mod tests {
         assert!(format!("{none:?}").contains("None"));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn parse_review_response_direct_json() {
         let json = r#"{"decision":"approve","notes":"LGTM","test_results":"pass","issues":[]}"#;
@@ -1097,6 +1118,7 @@ mod tests {
         assert!(resp.issues.is_empty());
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn parse_review_response_from_markdown() {
         let md = r#"Here is my review:
@@ -1112,6 +1134,7 @@ That's all."#;
         assert_eq!(resp.issues[0].file, "src/main.rs");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn parse_review_response_embedded_json_object() {
         let text = "Review complete.\n\n{\"decision\":\"approve\",\"notes\":\"LGTM\",\"test_results\":\"pass\",\"issues\":[]}\nThanks!";
@@ -1120,12 +1143,14 @@ That's all."#;
         assert_eq!(resp.notes, "LGTM");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn parse_review_response_invalid() {
         let result = parse_review_response("not json at all");
         assert!(result.is_err());
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn extract_json_block_basic() {
         let md = "text\n```json\n{\"key\": \"value\"}\n```\nmore";
@@ -1134,6 +1159,7 @@ That's all."#;
         assert!(result.unwrap().contains("\"key\""));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn extract_json_block_skips_non_json_blocks() {
         let md = "```json\nnot-json-array\n```\n\n```json\n{\"real\": true}\n```";
@@ -1142,11 +1168,13 @@ That's all."#;
         assert!(result.unwrap().contains("\"real\""));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn extract_json_block_none_when_missing() {
         assert!(extract_json_block("no code blocks here").is_none());
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn extract_json_block_skips_malformed_intermediate_blocks() {
         let md = "prefix ```json{\"broken\": true}\n\n```json\n{\"real\": true}\n```";
@@ -1154,6 +1182,7 @@ That's all."#;
         assert_eq!(result.as_deref(), Some("{\"real\": true}"));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn extract_json_block_skips_multiple_malformed_intermediate_blocks() {
         let md = "prefix ```json{\"broken\": true}\nmid ```json[1, 2, 3]\n\n```json\n{\"real\": true}\n```";
@@ -1172,6 +1201,7 @@ That's all."#;
         })
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn parse_review_from_output_direct_json() {
         let json = r#"{"decision":"approve","notes":"LGTM","test_results":"pass","issues":[]}"#;
@@ -1179,6 +1209,7 @@ That's all."#;
         assert_eq!(resp.decision, "approve");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn parse_review_from_output_markdown() {
         let md = "Review complete.\n\n```json\n{\"decision\":\"request_changes\",\"notes\":\"Fix it\",\"issues\":[]}\n```\n";
@@ -1186,6 +1217,7 @@ That's all."#;
         assert_eq!(resp.decision, "request_changes");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn parse_review_from_output_plain_text_fallback() {
         let text = "The review is done — all tests passed and the PR was approved.";
@@ -1195,6 +1227,7 @@ That's all."#;
     }
 
     /// opencode NDJSON stream — text events use the `part.text` format.
+    #[serial(cooldown_state)]
     #[test]
     fn parse_review_from_output_ndjson_part_format() {
         let ndjson = concat!(
@@ -1210,6 +1243,7 @@ That's all."#;
     }
 
     /// opencode NDJSON stream — text events use the newer `text` directly-in-event format.
+    #[serial(cooldown_state)]
     #[test]
     fn parse_review_from_output_ndjson_direct_text_format() {
         let ndjson = concat!(
@@ -1225,6 +1259,7 @@ That's all."#;
     }
 
     /// opencode NDJSON with ReviewResponse JSON directly in a text event (no markdown wrapper).
+    #[serial(cooldown_state)]
     #[test]
     fn parse_review_from_output_ndjson_direct_json_in_text_event() {
         let ndjson = concat!(
@@ -1238,6 +1273,7 @@ That's all."#;
         assert_eq!(resp.decision, "approve");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn parse_review_from_output_ndjson_prefers_final_json_text_event() {
         let ndjson = concat!(
@@ -1251,6 +1287,7 @@ That's all."#;
     }
 
     /// Concatenated text events produce a valid ReviewResponse.
+    #[serial(cooldown_state)]
     #[test]
     fn parse_review_from_output_ndjson_concatenated_text() {
         let ndjson = concat!(
@@ -1266,6 +1303,7 @@ That's all."#;
     ///
     /// Real format from codex `exec --json` output (observed 2026-03-06):
     /// thread.started / turn.started / item.completed(reasoning) / item.completed(agent_message) / turn.completed
+    #[serial(cooldown_state)]
     #[test]
     fn parse_review_from_output_codex_agent_message() {
         let ndjson = concat!(
@@ -1287,6 +1325,7 @@ That's all."#;
     }
 
     /// codex NDJSON with ReviewResponse in a markdown code block inside agent_message.
+    #[serial(cooldown_state)]
     #[test]
     fn parse_review_from_output_codex_agent_message_markdown() {
         let ndjson = concat!(
@@ -1306,6 +1345,7 @@ That's all."#;
     }
 
     /// codex reasoning items must NOT be extracted as review text — only agent_message is used.
+    #[serial(cooldown_state)]
     #[test]
     fn codex_skips_reasoning_items() {
         let ndjson = concat!(
@@ -1319,6 +1359,7 @@ That's all."#;
     }
 
     /// Negation patterns must NOT trigger a false approval.
+    #[serial(cooldown_state)]
     #[test]
     fn infer_review_response_negation_not_approved() {
         assert!(
@@ -1327,6 +1368,7 @@ That's all."#;
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn infer_review_response_negation_unapproved() {
         assert!(
@@ -1335,6 +1377,7 @@ That's all."#;
         );
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn infer_review_response_negation_not_approving() {
         assert!(
@@ -1344,12 +1387,14 @@ That's all."#;
     }
 
     /// Positive plain-text approval signals must still work.
+    #[serial(cooldown_state)]
     #[test]
     fn infer_review_response_lgtm() {
         let resp = parse_review_plain("LGTM, everything looks fine.").unwrap();
         assert_eq!(resp.decision, "approve");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn infer_review_response_looks_good() {
         let resp = parse_review_plain("Looks good to me!").unwrap();
@@ -1357,6 +1402,7 @@ That's all."#;
     }
 
     /// "All checks passed" should infer approval (real failure observed in task 16393).
+    #[serial(cooldown_state)]
     #[test]
     fn infer_review_response_all_checks_passed() {
         let resp = parse_review_plain(
@@ -1366,12 +1412,14 @@ That's all."#;
         assert_eq!(resp.decision, "approve");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn infer_review_response_checks_passed() {
         let resp = parse_review_plain("All checks passed (fmt ✓, clippy ✓, tests ✓).").unwrap();
         assert_eq!(resp.decision, "approve");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn infer_review_response_all_tests_passed() {
         let resp =
@@ -1379,6 +1427,7 @@ That's all."#;
         assert_eq!(resp.decision, "approve");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn infer_review_response_no_issues_found() {
         let resp = parse_review_plain("Review complete. No issues found in the diff.").unwrap();
@@ -1386,6 +1435,7 @@ That's all."#;
     }
 
     /// Partial "tests passed" mid-sentence must NOT infer approval without "all" prefix.
+    #[serial(cooldown_state)]
     #[test]
     fn infer_review_response_partial_tests_passed_no_approve() {
         let text = "The existing tests passed before this change but the new payment logic has a null-pointer risk on line 42.";
@@ -1393,6 +1443,7 @@ That's all."#;
     }
 
     /// Partial "checks passed" mid-sentence must NOT infer approval without "all" prefix.
+    #[serial(cooldown_state)]
     #[test]
     fn infer_review_response_partial_checks_passed_no_approve() {
         let text = "CI checks passed for the base branch but this PR adds a broken path.";
@@ -1400,6 +1451,7 @@ That's all."#;
     }
 
     /// LLMs sometimes echo the JSON decision field value literally: "Decision is `approve`."
+    #[serial(cooldown_state)]
     #[test]
     fn infer_review_response_decision_is_approve_backtick() {
         let text = "Already retrieved the output and completed the review above. The CI test check passed (3m11s) and all other checks are green. Decision is `approve`.";
@@ -1408,6 +1460,7 @@ That's all."#;
     }
 
     /// "Decision: approve" without backticks should also match.
+    #[serial(cooldown_state)]
     #[test]
     fn infer_review_response_decision_colon_approve() {
         let text = "Reviewed the PR. No blocking issues found. Decision: approve";
@@ -1417,6 +1470,7 @@ That's all."#;
 
     /// Bare backtick `approve` in a negative context must NOT infer approval.
     /// e.g. "do not `approve`" previously matched the removed `lower.contains("`approve`")` check.
+    #[serial(cooldown_state)]
     #[test]
     fn infer_review_response_negation_do_not_approve_backtick() {
         let text = "There are unresolved issues — do not `approve` this PR until they are fixed.";
@@ -1443,6 +1497,7 @@ That's all."#;
             .ok_or_else(|| anyhow::anyhow!("failed to parse review response from {agent} output"))
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn agent_output_claude_ndjson_review() {
         let ndjson = concat!(
@@ -1456,6 +1511,7 @@ That's all."#;
         assert_eq!(resp.decision, "approve");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn agent_output_opencode_ndjson_review() {
         let ndjson = concat!(
@@ -1469,6 +1525,7 @@ That's all."#;
         assert_eq!(resp.decision, "request_changes");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn agent_output_codex_ndjson_review() {
         let ndjson = concat!(
@@ -1482,6 +1539,7 @@ That's all."#;
         assert_eq!(resp.decision, "approve");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn agent_output_plain_text_keyword_fallback() {
         let text = "All checks passed, LGTM.";
@@ -1489,6 +1547,7 @@ That's all."#;
         assert_eq!(resp.decision, "approve");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn agent_output_direct_json() {
         let json = r#"{"decision":"approve","notes":"LGTM","test_results":"pass","issues":[]}"#;
@@ -1499,6 +1558,7 @@ That's all."#;
     /// Regression: plain text containing JSON fragments should NOT trigger false
     /// positives. The per-agent extractor returns None for non-NDJSON text,
     /// so we fall through to keyword inference instead of generic NDJSON parsing.
+    #[serial(cooldown_state)]
     #[test]
     fn agent_output_text_with_json_fragment_no_false_positive() {
         let text = r#"I checked the file and found {"type":"text"} in the output. No issues."#;
@@ -1515,6 +1575,7 @@ That's all."#;
 
     /// Prose containing the word "decision" and a JSON-like fragment must not
     /// be misidentified as a review response by `extract_review_response_object`.
+    #[serial(cooldown_state)]
     #[test]
     fn parse_review_response_ignores_prose_with_decision_word() {
         let text = r#"The decision was made. Here is a debug trace: {"trace":123}"#;
@@ -1526,6 +1587,7 @@ That's all."#;
 
     /// Plain text with an embedded JSON object that has unrelated keys should
     /// not be extracted as a review response.
+    #[serial(cooldown_state)]
     #[test]
     fn parse_review_response_ignores_embedded_json_without_decision_key() {
         let text = r#"Analysis complete. Config: {"timeout":30,"retries":3}. Done."#;
@@ -1537,6 +1599,7 @@ That's all."#;
 
     // ── read_file_with_limit tests ───────────────────────────────────────────
 
+    #[serial(cooldown_state)]
     #[test]
     fn read_file_with_limit_reads_small_file_completely() {
         let temp_dir = std::env::temp_dir();
@@ -1551,6 +1614,7 @@ That's all."#;
         let _ = std::fs::remove_file(&file_path);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn read_file_with_limit_truncates_large_file() {
         let temp_dir = std::env::temp_dir();
@@ -1572,6 +1636,7 @@ That's all."#;
         let _ = std::fs::remove_file(&file_path);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn read_file_with_limit_handles_empty_file() {
         let temp_dir = std::env::temp_dir();
@@ -1585,6 +1650,7 @@ That's all."#;
         let _ = std::fs::remove_file(&file_path);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn read_file_with_limit_handles_nonexistent_file() {
         let temp_dir = std::env::temp_dir();
@@ -1594,6 +1660,7 @@ That's all."#;
         assert!(result.is_err());
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn read_file_with_limit_reads_exact_limit() {
         let temp_dir = std::env::temp_dir();
@@ -1611,6 +1678,7 @@ That's all."#;
         let _ = std::fs::remove_file(&file_path);
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn read_file_with_limit_handles_unicode_truncation() {
         let temp_dir = std::env::temp_dir();
@@ -1648,6 +1716,7 @@ That's all."#;
 
     // ── Claude review fixtures ─────────────────────────────────────────────────
 
+    #[serial(cooldown_state)]
     #[test]
     fn fixture_claude_review_approve() {
         let raw = include_str!("../../../tests/fixtures/review_claude_approve.jsonl");
@@ -1658,6 +1727,7 @@ That's all."#;
         assert!(resp.issues.is_empty());
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn fixture_claude_review_request_changes() {
         let raw = include_str!("../../../tests/fixtures/review_claude_request_changes.jsonl");
@@ -1671,6 +1741,7 @@ That's all."#;
         assert_eq!(resp.issues[0].severity, "error");
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn fixture_claude_review_rate_limit_returns_error() {
         // find_claude_result on an is_error=true result returns Some with is_error=true.
@@ -1688,6 +1759,7 @@ That's all."#;
 
     // ── OpenCode review fixtures ────────────────────────────────────────────────
 
+    #[serial(cooldown_state)]
     #[test]
     fn fixture_opencode_review_approve() {
         let raw = include_str!("../../../tests/fixtures/review_opencode_approve.jsonl");
@@ -1697,6 +1769,7 @@ That's all."#;
         assert!(resp.issues.is_empty());
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn fixture_opencode_review_request_changes() {
         let raw = include_str!("../../../tests/fixtures/review_opencode_request_changes.jsonl");
@@ -1709,6 +1782,7 @@ That's all."#;
         assert_eq!(resp.issues[0].line, Some(100));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn fixture_opencode_review_plain_text_approve() {
         // OpenCode with plain-text review (no JSON) — should infer approval via keywords.
@@ -1719,6 +1793,7 @@ That's all."#;
 
     // ── Codex review fixtures ────────────────────────────────────────────────────
 
+    #[serial(cooldown_state)]
     #[test]
     fn fixture_codex_review_approve() {
         let raw = include_str!("../../../tests/fixtures/review_codex_approve.jsonl");
@@ -1728,6 +1803,7 @@ That's all."#;
         assert!(resp.issues.is_empty());
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn fixture_codex_review_request_changes() {
         let raw = include_str!("../../../tests/fixtures/review_codex_request_changes.jsonl");
@@ -1739,6 +1815,7 @@ That's all."#;
         assert_eq!(resp.issues[0].line, Some(15));
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn fixture_codex_review_plain_text_approve() {
         // Codex with plain-text review — should infer approval via "LGTM" keyword.
@@ -1749,6 +1826,7 @@ That's all."#;
 
     // ── Kimi review fixtures ────────────────────────────────────────────────────
 
+    #[serial(cooldown_state)]
     #[test]
     fn fixture_kimi_review_approve() {
         let raw = include_str!("../../../tests/fixtures/review_kimi_approve.jsonl");
@@ -1761,6 +1839,7 @@ That's all."#;
 
     // ── MiniMax review fixtures ────────────────────────────────────────────────
 
+    #[serial(cooldown_state)]
     #[test]
     fn fixture_minimax_review_request_changes() {
         let raw = include_str!("../../../tests/fixtures/review_minimax_request_changes.jsonl");
@@ -1777,6 +1856,7 @@ That's all."#;
     // ── Cross-agent token/metadata extraction ───────────────────────────────────
 
     /// Verify that find_agent_result extracts token counts from each agent's format.
+    #[serial(cooldown_state)]
     #[test]
     fn find_agent_result_extracts_tokens_claude() {
         let raw = include_str!("../../../tests/fixtures/review_claude_approve.jsonl");
@@ -1786,6 +1866,7 @@ That's all."#;
         assert!(result.cost_usd.is_none()); // review fixtures don't include cost
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn find_agent_result_extracts_tokens_opencode() {
         let raw = include_str!("../../../tests/fixtures/review_opencode_approve.jsonl");
@@ -1796,6 +1877,7 @@ That's all."#;
     }
 
     /// Verify that find_agent_result returns None for empty/unparseable input.
+    #[serial(cooldown_state)]
     #[test]
     fn find_agent_result_returns_none_for_empty() {
         assert!(find_agent_result("claude", "").is_none());
@@ -1805,6 +1887,7 @@ That's all."#;
         assert!(find_agent_result("minimax", "").is_none());
     }
 
+    #[serial(cooldown_state)]
     #[test]
     fn find_agent_result_returns_none_for_plain_text() {
         assert!(find_agent_result("claude", "just some plain text").is_none());
@@ -1816,6 +1899,7 @@ That's all."#;
     // ── Error propagation via find_agent_result ─────────────────────────────────
 
     /// Verify that find_agent_result surfaces rate-limit errors from Claude.
+    #[serial(cooldown_state)]
     #[test]
     fn find_agent_result_propagates_claude_rate_limit() {
         let raw = include_str!("../../../tests/fixtures/review_claude_rate_limit.jsonl");
