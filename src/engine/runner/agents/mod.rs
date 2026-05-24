@@ -2459,7 +2459,7 @@ world"}"#;
             "claude default: expected rm disallowed, got: {cmd}"
         );
 
-        // Codex: autonomous + workspace-write → --sandbox workspace-write --ask-for-approval never
+        // Codex: autonomous + workspace-write → --sandbox workspace-write -c 'approval_policy="never"'
         let codex = get_runner("codex");
         let cmd = codex.build_command(None, "", sys, msg, &perms);
         assert!(
@@ -2467,8 +2467,12 @@ world"}"#;
             "codex default: expected --sandbox workspace-write, got: {cmd}"
         );
         assert!(
-            cmd.contains("--ask-for-approval never"),
-            "codex default: expected --ask-for-approval never, got: {cmd}"
+            cmd.contains(r#"-c 'approval_policy="never"'"#),
+            "codex default: expected -c approval_policy=never, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--ask-for-approval"),
+            "codex default: --ask-for-approval was removed in 0.133.0 and must not appear, got: {cmd}"
         );
         assert!(
             !cmd.contains("--full-auto"),
@@ -2511,12 +2515,16 @@ world"}"#;
             "claude supervised: expected acceptEdits, got: {cmd}"
         );
 
-        // Codex: supervised → suggest
+        // Codex: supervised → on-request
         let codex = get_runner("codex");
         let cmd = codex.build_command(None, "", sys, msg, &perms);
         assert!(
-            cmd.contains("--ask-for-approval suggest"),
-            "codex supervised: expected suggest, got: {cmd}"
+            cmd.contains(r#"-c 'approval_policy="on-request"'"#),
+            "codex supervised: expected -c approval_policy=on-request, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--ask-for-approval"),
+            "codex supervised: --ask-for-approval was removed in 0.133.0 and must not appear, got: {cmd}"
         );
     }
 
@@ -2571,8 +2579,12 @@ world"}"#;
             "codex sandbox::none + autonomous: should use --sandbox workspace-write, got: {cmd}"
         );
         assert!(
-            cmd.contains("--ask-for-approval never"),
-            "codex sandbox::none + autonomous: should use --ask-for-approval never, got: {cmd}"
+            cmd.contains(r#"-c 'approval_policy="never"'"#),
+            "codex sandbox::none + autonomous: should use -c approval_policy=never, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--ask-for-approval"),
+            "codex sandbox::none: --ask-for-approval was removed in 0.133.0, got: {cmd}"
         );
         assert!(
             !cmd.contains("--full-auto"),
@@ -2894,21 +2906,25 @@ world"}"#;
         let cmd = codex.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
 
         if perms.autonomous {
-            // autonomous codex uses --sandbox workspace-write --ask-for-approval never
+            // autonomous codex uses --sandbox workspace-write -c 'approval_policy="never"'
             assert!(
                 cmd.contains("--sandbox workspace-write"),
                 "autonomous config → --sandbox workspace-write, got: {cmd}"
             );
             assert!(
-                cmd.contains("--ask-for-approval never"),
-                "autonomous config → --ask-for-approval never, got: {cmd}"
+                cmd.contains(r#"-c 'approval_policy="never"'"#),
+                "autonomous config → -c approval_policy=never, got: {cmd}"
             );
         } else {
             assert!(
-                cmd.contains("--ask-for-approval suggest"),
-                "supervised config → --ask-for-approval suggest, got: {cmd}"
+                cmd.contains(r#"-c 'approval_policy="on-request"'"#),
+                "supervised config → -c approval_policy=on-request, got: {cmd}"
             );
         }
+        assert!(
+            !cmd.contains("--ask-for-approval"),
+            "--ask-for-approval was removed in codex 0.133.0 and must not appear, got: {cmd}"
+        );
     }
 
     // ── deny_read_only preset ───────────────────────────────────
