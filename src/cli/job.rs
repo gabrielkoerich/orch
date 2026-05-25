@@ -111,6 +111,7 @@ pub fn add(
         external: true,
         notify: false,
         notify_target: None,
+        prompt_file: None,
     };
 
     jobs.push(job);
@@ -149,15 +150,22 @@ pub fn disable(id: &str) -> anyhow::Result<()> {
 
 fn toggle_job(id: &str, enabled: bool) -> anyhow::Result<()> {
     let path = jobs::resolve_jobs_path();
-    let mut jobs = jobs::load_jobs(&path)?;
+    let mut all_jobs = jobs::load_jobs(&path)?;
 
-    let job = jobs
+    let job = all_jobs
         .iter_mut()
         .find(|j| j.id == id)
         .with_context(|| format!("job '{}' not found", id))?;
 
-    job.enabled = enabled;
-    jobs::save_jobs(&path, &jobs)?;
+    // If the job came from a prompt file, edit the frontmatter in-place rather
+    // than writing it into .orch.yml (which would create a duplicate on the
+    // next load and break the scheduler).
+    if let Some(ref prompt_path) = job.prompt_file.clone() {
+        jobs::set_frontmatter_enabled(prompt_path, enabled)?;
+    } else {
+        job.enabled = enabled;
+        jobs::save_jobs(&path, &all_jobs)?;
+    }
 
     println!(
         "Job '{}' {}",
