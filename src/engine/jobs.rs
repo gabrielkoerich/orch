@@ -54,6 +54,13 @@ pub struct Job {
     /// Only used when `notify: true`. Falls back to `channels.telegram.chat_id`.
     #[serde(default)]
     pub notify_target: Option<String>,
+    /// Path to the `prompts/jobs/*.md` file this job was loaded from, if any.
+    ///
+    /// `None` means the job was defined inline in `.orch.yml` / `config.yml`.
+    /// Set by `scan_prompt_jobs`; skipped during serialization so it never
+    /// leaks into config files.
+    #[serde(skip)]
+    pub prompt_file: Option<PathBuf>,
 }
 
 /// Template for creating a task from a job.
@@ -296,6 +303,7 @@ pub fn scan_prompt_jobs(base_dir: &Path) -> anyhow::Result<Vec<Job>> {
             external: meta.external,
             notify: meta.notify,
             notify_target: meta.notify_target,
+            prompt_file: Some(path.clone()),
         });
     }
     Ok(jobs)
@@ -315,10 +323,85 @@ pub fn save_jobs(path: &PathBuf, jobs: &[Job]) -> anyhow::Result<()> {
         }
     };
 
-    file.jobs = jobs.to_vec();
+    // Only persist inline jobs (those without a prompt_file source).
+    // Prompt-based jobs live in prompts/jobs/*.md and must not be duplicated
+    // into .orch.yml — doing so causes a "duplicate job id" error on the next
+    // load_jobs call.
+    file.jobs = jobs
+        .iter()
+        .filter(|j| j.prompt_file.is_none())
+        .cloned()
+        .collect();
     let content = serde_norway::to_string(&file)?;
     std::fs::write(path, content).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+/// Update the `enabled:` field in the YAML frontmatter of a prompt-based job
+/// file, preserving all other content unchanged.
+///
+/// The function rewrites only the `enabled:` line inside the opening `---`
+/// fence.  If the field is absent it is inserted before the closing `---`.
+pub fn set_frontmatter_enabled(path: &Path, enabled: bool) -> anyhow::Result<()> {
+    let original =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+
+    let value = if enabled { "true" } else { "false" };
+
+    // Replace an existing `enabled: <anything>` line inside the frontmatter.
+    // We only touch the first YAML block (between the opening and first closing
+    // `---` fences) to avoid accidentally rewriting the body.
+    let rewritten = rewrite_frontmatter_enabled(&original, value);
+    std::fs::write(path, rewritten).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Rewrite the `enabled:` key inside the first `---` fence block of `content`.
+///
+/// If the key is present, its value is replaced.  If absent, it is appended
+/// just before the closing `---` line.  The rest of the document is unchanged.
+fn rewrite_frontmatter_enabled(content: &str, value: &str) -> String {
+    // Locate the opening fence.
+    let Some(rest) = content
+        .strip_prefix("---\n")
+        .or_else(|| content.strip_prefix("---\r\n"))
+    else {
+        // No frontmatter: return unchanged.
+        return content.to_string();
+    };
+
+    // Find the closing fence.
+    let Some(close_pos) = rest.find("\n---\n").or_else(|| rest.find("\n---\r\n")) else {
+        return content.to_string();
+    };
+
+    let fm = &rest[..close_pos];
+    let after_close = &rest[close_pos..]; // starts with "\n---\n" or "\n---\r\n"
+
+    // Rebuild the frontmatter, replacing or inserting `enabled:`.
+    let new_line = format!("enabled: {value}");
+    let mut found = false;
+    let new_fm: String = fm
+        .lines()
+        .map(|line| {
+            if line == "enabled: true" || line == "enabled: false" || line.starts_with("enabled: ")
+            {
+                found = true;
+                new_line.clone()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let new_fm = if found {
+        new_fm
+    } else {
+        format!("{new_fm}\n{new_line}")
+    };
+
+    format!("---\n{new_fm}{after_close}")
 }
 
 /// Returns `true` if the error indicates a "not found" (404) response.
@@ -927,5 +1010,101 @@ jobs:
         let jobs = load_jobs(&missing_cfg).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].id, "solo");
+    }
+
+    // ──── Issue #3193: frontmatter `enabled: false` must be respected ────────
+
+    #[test]
+    fn scan_prompt_jobs_respects_enabled_false() {
+        let tmp = tempdir().unwrap();
+        write_prompt_job(
+            tmp.path(),
+            "disabled.md",
+            "---\nid: disabled\nschedule: '0 9 * * *'\ntitle: Disabled\nenabled: false\n---\n\nbody\n",
+        );
+        let jobs = scan_prompt_jobs(tmp.path()).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert!(!jobs[0].enabled, "job should be disabled via frontmatter");
+    }
+
+    #[test]
+    fn scan_prompt_jobs_sets_prompt_file() {
+        let tmp = tempdir().unwrap();
+        write_prompt_job(
+            tmp.path(),
+            "morning.md",
+            "---\nid: morning\nschedule: '0 9 * * *'\ntitle: Morning\n---\n\nbody\n",
+        );
+        let jobs = scan_prompt_jobs(tmp.path()).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert!(
+            jobs[0].prompt_file.is_some(),
+            "prompt_file should be set for frontmatter jobs"
+        );
+    }
+
+    #[test]
+    fn save_jobs_does_not_persist_prompt_based_jobs() {
+        let tmp = tempdir().unwrap();
+        // A prompt-based job
+        write_prompt_job(
+            tmp.path(),
+            "prompt.md",
+            "---\nid: from-prompt\nschedule: '0 9 * * *'\ntitle: Prompt Job\n---\n\nbody\n",
+        );
+        // An inline job in .orch.yml
+        let cfg = write_config(
+            tmp.path(),
+            "jobs:\n  - id: inline\n    schedule: \"0 10 * * *\"\n    task:\n      title: Inline\n      body: x\n",
+        );
+        let jobs = load_jobs(&cfg).unwrap();
+        assert_eq!(jobs.len(), 2);
+
+        // save_jobs should only write the inline job, not the prompt-based one
+        save_jobs(&cfg, &jobs).unwrap();
+
+        let saved = load_jobs(&cfg).unwrap();
+        assert_eq!(saved.len(), 2, "both jobs should still be loadable");
+        let ids: Vec<&str> = saved.iter().map(|j| j.id.as_str()).collect();
+        assert!(ids.contains(&"inline"));
+        assert!(ids.contains(&"from-prompt"));
+    }
+
+    #[test]
+    fn rewrite_frontmatter_enabled_replaces_existing_value() {
+        let input = "---\nid: foo\nschedule: daily\nenabled: true\ntitle: Foo\n---\n\nbody\n";
+        let out = rewrite_frontmatter_enabled(input, "false");
+        assert!(
+            out.contains("enabled: false"),
+            "should replace enabled: true"
+        );
+        assert!(!out.contains("enabled: true"), "old value must be gone");
+        assert!(out.contains("body"), "body must be preserved");
+    }
+
+    #[test]
+    fn rewrite_frontmatter_enabled_inserts_when_absent() {
+        let input = "---\nid: foo\nschedule: daily\ntitle: Foo\n---\n\nbody\n";
+        let out = rewrite_frontmatter_enabled(input, "false");
+        assert!(
+            out.contains("enabled: false"),
+            "should insert enabled: false"
+        );
+        assert!(out.contains("body"), "body must be preserved");
+    }
+
+    #[test]
+    fn set_frontmatter_enabled_writes_file() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("job.md");
+        fs::write(
+            &path,
+            "---\nid: foo\nschedule: daily\ntitle: Foo\nenabled: true\n---\n\nbody\n",
+        )
+        .unwrap();
+        set_frontmatter_enabled(&path, false).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("enabled: false"));
+        assert!(!content.contains("enabled: true"));
     }
 }
