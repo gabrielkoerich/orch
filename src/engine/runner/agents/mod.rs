@@ -418,6 +418,37 @@ fn extract_bullet_sections(text: &str) -> (Vec<String>, Vec<String>) {
     (accomplished, remaining)
 }
 
+/// Detect if text is a CLI/arg-parser diagnostic rather than an agent response.
+/// CLI diagnostics indicate process startup failure, not an agent answer.
+fn is_cli_parser_diagnostic(text: &str) -> bool {
+    let lower = text.to_lowercase();
+
+    // Clap-style error messages
+    if lower.contains("error: unexpected argument") {
+        return true;
+    }
+
+    // Usage/help text patterns
+    if text.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with("Usage:") || trimmed.starts_with("usage:")
+    }) {
+        return true;
+    }
+
+    // Clap help/info hints
+    if lower.contains("for more information, try '--help'") {
+        return true;
+    }
+
+    // Clap "tip" messages about passing values
+    if lower.contains("tip: to pass '") {
+        return true;
+    }
+
+    false
+}
+
 /// Build a synthetic agent response from plain text when structured parsing fails.
 ///
 /// Returns `None` for empty/whitespace-only text so callers can preserve the
@@ -425,6 +456,17 @@ fn extract_bullet_sections(text: &str) -> (Vec<String>, Vec<String>) {
 pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
+        return None;
+    }
+
+    // Detect CLI/arg-parser diagnostics and reject them. These indicate the agent
+    // process failed to start properly (e.g. invalid flag), not that the agent
+    // produced a free-form answer. Clap-based CLIs emit patterns like:
+    //   "error: unexpected argument '--flag' found"
+    //   "Usage: command [OPTIONS]"
+    //   "For more information, try '--help'"
+    //   "tip: to pass '...' as a value, use '-- ...'"
+    if is_cli_parser_diagnostic(trimmed) {
         return None;
     }
 
@@ -3128,5 +3170,74 @@ world"}"#;
                 );
             }
         }
+    }
+
+    // Regression: issue #3197 — CLI arg-parser diagnostics were being synthesized as
+    // agent responses. When a process (e.g. codex) fails with an invalid CLI flag, it
+    // exits non-zero with a clap/help diagnostic on stderr. This should be rejected
+    // (return None) rather than synthesized as a "needs_review" response.
+    #[test]
+    fn synthesize_rejects_cli_parser_diagnostics_unexpected_argument() {
+        // Real clap error from the bug report (codex exit 141)
+        let text = "error: unexpected argument '--ask-for-approval' found\n  \
+                    tip: to pass '--ask-for-approval' as a value, use '-- --ask-for-approval'\n\
+                    Usage: codex exec [OPTIONS] [PROMPT]";
+        assert!(
+            synthesize_response_from_text(text).is_none(),
+            "CLI parser diagnostic must not synthesize as agent response"
+        );
+    }
+
+    #[test]
+    fn synthesize_rejects_cli_parser_diagnostics_usage_line() {
+        let text = "Usage: mycommand [OPTIONS] <arg>";
+        assert!(
+            synthesize_response_from_text(text).is_none(),
+            "Usage line must not synthesize as agent response"
+        );
+    }
+
+    #[test]
+    fn synthesize_rejects_cli_parser_diagnostics_help_hint() {
+        let text = "Error: unknown flag --foo\nFor more information, try '--help'";
+        assert!(
+            synthesize_response_from_text(text).is_none(),
+            "Help hint must not synthesize as agent response"
+        );
+    }
+
+    #[test]
+    fn synthesize_rejects_cli_parser_diagnostics_tip() {
+        let text = "error: bad value\ntip: to pass '--flag' as a value, use '-- --flag'";
+        assert!(
+            synthesize_response_from_text(text).is_none(),
+            "Clap tip must not synthesize as agent response"
+        );
+    }
+
+    #[test]
+    fn synthesize_accepts_agent_error_messages_that_mention_error() {
+        // Agent returning plain text that happens to contain "error:" but is an actual
+        // agent message (e.g. summarizing what went wrong) should still synthesize.
+        let text = "I tried to run the command but got an error: permission denied on that file.";
+        let response =
+            synthesize_response_from_text(text).expect("agent error message should synthesize");
+        assert_eq!(response.status, "needs_review");
+        assert!(response.error.is_some());
+    }
+
+    // Regression: Issue #3197 — exact clap error from bug report.
+    // When codex fails with an invalid CLI flag (e.g., --ask-for-approval with old codex versions),
+    // it should return None, not synthesize as "needs_review". Without this fix, the run
+    // would be marked as success and advance to in_review, wasting resources.
+    #[test]
+    fn synthesize_rejects_exact_codex_cli_error() {
+        let stderr_from_codex = "error: unexpected argument '--ask-for-approval' found\n  \
+                                 tip: to pass '--ask-for-approval' as a value, use '-- --ask-for-approval'\n\
+                                 Usage: codex exec [OPTIONS] [PROMPT]";
+        assert!(
+            synthesize_response_from_text(stderr_from_codex).is_none(),
+            "exact codex CLI error from #3197 must not synthesize as agent response"
+        );
     }
 }
