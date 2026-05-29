@@ -3,11 +3,20 @@
 //! ## CLI invocation
 //!
 //! ```bash
-//! cat "{msg_file}" | codex --model {model} \
-//!   exec -c 'approval_policy="never"' \
+//! cat "{sys_file}" "{msg_file}" | codex --model {model} \
+//!   exec \
+//!   -c 'sandbox_workspace_write.network_access=true' \
+//!   -c 'shell_environment_policy.inherit=all' \
 //!   --sandbox workspace-write \
+//!   -c 'approval_policy="never"' \
 //!   --json -
 //! ```
+//!
+//! Note: all `-c` overrides must appear **after** the `exec` subcommand.
+//! Global `-c` flags before `exec` are parsed by the top-level codex CLI and do
+//! NOT propagate into the exec subcommand's sandbox — placing
+//! `sandbox_workspace_write.network_access=true` before `exec` silently fails,
+//! leaving the sandbox network-blocked.
 //!
 //! ## Output format (`exec --json`)
 //!
@@ -262,16 +271,18 @@ impl AgentRunner for CodexRunner {
             .collect::<Vec<_>>()
             .join(" ");
 
-        // Place permission flags (eg. --full-auto) and any --add-dir flags AFTER
-        // the `exec` subcommand. Recent codex CLI (0.128.0) treats flags placed
-        // before `exec` differently, causing autonomous dispatch to fail when
-        // `--full-auto` appears before `exec`. Moving these ensures compatibility
-        // with the newer CLI while keeping the rest of the invocation intact.
+        // All -c config overrides and permission flags must be placed AFTER the
+        // `exec` subcommand. Global -c flags before `exec` are parsed by the
+        // top-level CLI and do NOT propagate into the exec subcommand's sandbox
+        // initialisation — in particular, `sandbox_workspace_write.network_access=true`
+        // has no effect when placed before `exec`, causing outbound network to be
+        // blocked despite the documented contract. Place everything after `exec`.
         format!(
             r#"cat "{sys_file}" "{msg_file}" | {timeout_cmd} codex {model_flag} \
+  exec \
   -c 'sandbox_workspace_write.network_access=true' \
   -c 'shell_environment_policy.inherit=all' \
-  exec {permission_flags} {add_dir_flags} --json -"#,
+  {permission_flags} {add_dir_flags} --json -"#,
             sys_file = sys_file,
             msg_file = msg_file,
             timeout_cmd = timeout_cmd,
@@ -530,6 +541,22 @@ mod tests {
             !cmd.contains("--full-auto"),
             "--full-auto is deprecated and must not appear in the command, got: {cmd}"
         );
+        // Regression: network_access and shell_environment_policy overrides must appear
+        // AFTER `exec`, not before it.  Global -c flags placed before `exec` are parsed
+        // by the top-level codex CLI and do NOT propagate into the exec subcommand's
+        // sandbox initialisation — the network would be blocked silently if misplaced.
+        assert!(
+            cmd.contains("sandbox_workspace_write.network_access=true"),
+            "network_access override must be present, got: {cmd}"
+        );
+        let exec_pos = cmd.find("exec").expect("exec must appear in command");
+        let network_pos = cmd
+            .find("sandbox_workspace_write.network_access=true")
+            .expect("network_access override must appear in command");
+        assert!(
+            network_pos > exec_pos,
+            "sandbox_workspace_write.network_access=true must appear AFTER exec, got: {cmd}"
+        );
     }
 
     #[test]
@@ -604,6 +631,14 @@ mod tests {
         assert!(
             cmd.contains("exec") && cmd.contains("--json -"),
             "should include exec and --json -, got: {cmd}"
+        );
+        let exec_pos = cmd.find("exec").expect("exec must appear in command");
+        let network_pos = cmd
+            .find("sandbox_workspace_write.network_access=true")
+            .expect("network_access override must appear in command");
+        assert!(
+            network_pos > exec_pos,
+            "sandbox_workspace_write.network_access=true must appear AFTER exec, got: {cmd}"
         );
     }
 
