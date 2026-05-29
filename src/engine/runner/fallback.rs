@@ -498,6 +498,17 @@ pub async fn handle_error(
                 format!("{agent_name} stale session: {session_id}"),
             )
         }
+        agents::AgentError::ThinkingBlockConflict { message } => {
+            // Transient Anthropic API 400 — thinking blocks modified in multi-turn
+            // tool-use. Not a model capacity or rate-limit problem.
+            // Do NOT record failure counts or model/agent cooldowns.
+            // Pass ModelUnavailable so handle_failover skips agent failure recording
+            // while still updating the reroute chain to avoid re-selecting claude.
+            (
+                response::RetryableError::ModelUnavailable,
+                format!("{agent_name} thinking block conflict: {message}"),
+            )
+        }
         agents::AgentError::Unknown { exit_code, message } => {
             // Exit 0 with empty output is a silent failure (common with GitHub
             // Copilot models in opencode).  Record a model-specific cooldown so
@@ -1378,6 +1389,56 @@ more logs"#;
             remaining >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
             "expected ~4h (persistent) cooldown for 'Model not found', got {remaining}s — \
              may have applied transient 5min cooldown instead"
+        );
+    }
+
+    /// ThinkingBlockConflict must NOT set any agent or model cooldown.
+    ///
+    /// This error is a transient Claude CLI 400 (thinking blocks modified in multi-turn
+    /// tool-use) — not a model capacity problem. Penalising claude:opus with failure
+    /// counts would prematurely push it into extended-backoff for unrelated reasons.
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn thinking_block_conflict_does_not_set_cooldown() {
+        crate::engine::cooldown::reset_global_state().await;
+        let runner = MockRunner { free: vec![] };
+        let agent = "claude-3204-thinking-block";
+        let model = "opus";
+
+        assert!(
+            !crate::engine::cooldown::is_agent_in_cooldown(agent),
+            "agent must not be in cooldown before handle_error"
+        );
+        assert!(
+            !crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            "model must not be in cooldown before handle_error"
+        );
+
+        let err = AgentError::ThinkingBlockConflict {
+            message: "`thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified.".to_string(),
+        };
+
+        let _result = handle_error(
+            "test-3204-thinking",
+            &err,
+            agent,
+            &runner,
+            Some(model),
+            Some("complex"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !crate::engine::cooldown::is_agent_in_cooldown(agent),
+            "agent must NOT be in cooldown after ThinkingBlockConflict (fixes issue #3204)"
+        );
+        assert!(
+            !crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            "model must NOT be in cooldown after ThinkingBlockConflict (fixes issue #3204)"
         );
     }
 

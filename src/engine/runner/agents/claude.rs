@@ -106,6 +106,11 @@ impl ClaudeRunner {
             if let Some(e) = super::patterns::detect_stale_session(result_text) {
                 return Err(e);
             }
+            // Check thinking block conflict before auth — it's a specific 400
+            // that must not be counted as a model failure.
+            if let Some(e) = super::patterns::detect_thinking_block_conflict(result_text) {
+                return Err(e);
+            }
             // Check auth before rate_limit — billing errors (credit balance)
             // are auth issues, not transient rate limits.
             // Use result_text only (not combined with raw JSON) so the error
@@ -188,6 +193,9 @@ fn extract_error_from_envelope(
         // Use result_text only (not combined with raw JSON) so the error
         // message stays clean — the raw NDJSON stats blob must not leak
         // into the logged reason string.
+        if let Some(e) = super::patterns::detect_thinking_block_conflict(result_text) {
+            return Some(e);
+        }
         if let Some(e) = super::patterns::detect_auth_error(result_text) {
             return Some(e);
         }
@@ -1067,6 +1075,41 @@ mod tests {
         let raw = include_str!("../../../../tests/fixtures/claude_stream_rate_limit.jsonl");
         let err = runner().parse_response(raw).unwrap_err();
         assert!(matches!(err, AgentError::RateLimit { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn fixture_claude_stream_thinking_block_conflict() {
+        let raw =
+            include_str!("../../../../tests/fixtures/claude_stream_thinking_block_conflict.jsonl");
+        let err = runner().parse_response(raw).unwrap_err();
+        assert!(
+            matches!(err, AgentError::ThinkingBlockConflict { .. }),
+            "expected ThinkingBlockConflict, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_error_thinking_block_conflict_from_stderr() {
+        // The error can also surface through classify_error() when the claude
+        // process exits non-zero with the message in stdout/stderr.
+        let stderr = "claude failed: API Error: 400 messages.1.content.3: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response.";
+        let err = runner().classify_error(1, "", stderr);
+        assert!(
+            matches!(err, AgentError::ThinkingBlockConflict { .. }),
+            "expected ThinkingBlockConflict, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn thinking_block_conflict_does_not_match_unrelated_text() {
+        // Ensure the pattern is specific enough to not false-positive on
+        // work product that mentions "thinking" or "blocks".
+        let unrelated = "I was thinking about how to handle blocks of code in the response.";
+        let err = runner().classify_error(1, "", unrelated);
+        assert!(
+            !matches!(err, AgentError::ThinkingBlockConflict { .. }),
+            "should not classify unrelated text as ThinkingBlockConflict, got: {err:?}"
+        );
     }
 
     #[test]
