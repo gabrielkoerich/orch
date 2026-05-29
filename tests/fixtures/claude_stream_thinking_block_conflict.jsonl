@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","session_id":"abc123","model":"claude-opus-4-7","tools":[],"mcp_servers":[]}
+{"type":"assistant","message":{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-4-7","content":[{"type":"thinking","thinking":"Let me analyze this..."},{"type":"tool_use","id":"tool_01","name":"Bash","input":{"command":"ls"}}],"stop_reason":"tool_use","usage":{"input_tokens":500,"output_tokens":200}}}
+{"type":"tool_result","tool_use_id":"tool_01","content":"file1.rs\nfile2.rs"}
+{"type":"result","subtype":"error","is_error":true,"result":"API Error: 400 messages.1.content.3: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response.","usage":{"input_tokens":500,"output_tokens":200},"duration_ms":3210}

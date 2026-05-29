@@ -236,6 +236,13 @@ pub enum AgentError {
     AgentFailed { message: String },
     /// Transient network connectivity error — retry same agent, no failover.
     NetworkError { message: String },
+    /// Thinking blocks cannot be modified (Claude extended-thinking + tool-use 400).
+    ///
+    /// Transient API incompatibility inside the Claude CLI's multi-turn tool-use
+    /// loop — the Anthropic API rejects the request when thinking blocks are altered
+    /// between turns. Not a model capacity problem: does NOT increment failure counts
+    /// or apply cooldowns. The task is rerouted to a different agent.
+    ThinkingBlockConflict { message: String },
     /// Unclassified error.
     Unknown { exit_code: i32, message: String },
 }
@@ -262,6 +269,9 @@ impl std::fmt::Display for AgentError {
             }
             Self::AgentFailed { message } => write!(f, "agent failed: {message}"),
             Self::NetworkError { message } => write!(f, "network error: {message}"),
+            Self::ThinkingBlockConflict { message } => {
+                write!(f, "thinking block conflict: {message}")
+            }
             Self::Unknown { exit_code, message } => {
                 write!(f, "unknown error (exit {exit_code}): {message}")
             }
@@ -287,6 +297,7 @@ pub fn error_class_name(err: &AgentError) -> &'static str {
         AgentError::InvalidResponse { .. } => "InvalidResponse",
         AgentError::AgentFailed { .. } => "AgentFailed",
         AgentError::NetworkError { .. } => "NetworkError",
+        AgentError::ThinkingBlockConflict { .. } => "ThinkingBlockConflict",
         AgentError::Unknown { .. } => "Unknown",
     }
 }
@@ -1424,6 +1435,27 @@ pub(crate) mod patterns {
         None
     }
 
+    /// Check for the Claude 400 "thinking blocks cannot be modified" API error.
+    ///
+    /// Occurs when Claude CLI reconstructs a multi-turn tool-use request and the
+    /// Anthropic API rejects it because a thinking block was altered between turns.
+    /// Classified separately to avoid penalising the model with a failure count.
+    pub fn detect_thinking_block_conflict(text: &str) -> Option<AgentError> {
+        // Match the exact phrasing the Anthropic API emits (backtick-quoted names,
+        // case-sensitive — the API always uses this exact string).
+        if text.contains(
+            "thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified",
+        ) {
+            let message = text
+                .lines()
+                .find(|l| l.contains("cannot be modified"))
+                .map(|l| l.trim().to_string())
+                .unwrap_or_else(|| safe_tail(text, 300).to_string());
+            return Some(AgentError::ThinkingBlockConflict { message });
+        }
+        None
+    }
+
     /// Check for a stale/expired Claude session ID.
     ///
     /// Claude returns `"No conversation found with session ID: <uuid>"` when
@@ -1503,6 +1535,9 @@ pub(crate) mod patterns {
             return e;
         }
         if let Some(e) = detect_worktree_missing(text) {
+            return e;
+        }
+        if let Some(e) = detect_thinking_block_conflict(text) {
             return e;
         }
         // Only scan the tail of the combined output for CLI-style error
