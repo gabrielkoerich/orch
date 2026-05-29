@@ -38,9 +38,23 @@ pub fn version() {
         .ok()
         .and_then(|p| std::fs::read_to_string(p).ok())
     {
-        Some(svc) => {
-            let svc = svc.trim();
-            if svc == cli_version {
+        Some(raw) => {
+            let raw = raw.trim();
+            // Parse "{pid}\t{version}" written by engine ≥ fix for #3200.
+            // Fall back to treating the whole string as a plain version for older engines.
+            let (pid_opt, svc) = match raw.split_once('\t') {
+                Some((pid_str, ver)) => (pid_str.parse::<u32>().ok(), ver),
+                None => (None, raw),
+            };
+
+            let pid_alive = pid_opt.map(crate::home::pid_is_alive).unwrap_or(true); // legacy plain-version file: can't check, assume alive
+
+            if !pid_alive {
+                println!(
+                    "Service: stale (pid {} no longer running) — run: brew services restart orch",
+                    pid_opt.unwrap()
+                );
+            } else if svc == cli_version {
                 println!("Service: {svc}  ✓ in sync");
             } else {
                 println!("Service: {svc}  ✗ mismatch — run: brew upgrade orch && brew services restart orch");

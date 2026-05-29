@@ -117,9 +117,22 @@ pub async fn db_path() -> anyhow::Result<PathBuf> {
 /// Get the path to the service version file (~/.orch/state/service.version).
 ///
 /// Written by the engine at startup, deleted on graceful shutdown.
+/// Format: "{pid}\t{version}" — the PID lets readers verify the owning process is alive.
 /// Used by `orch version` to detect CLI/service drift.
 pub fn service_version_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(state_dir()?.join("service.version"))
+}
+
+/// Returns `true` if a process with the given PID is currently running.
+///
+/// Uses `kill -0` which sends no signal but checks process existence.
+/// Returns `false` on error (no such process, no permission, etc.).
+pub fn pid_is_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Get the path to the worktrees directory (~/.orch/worktrees/).

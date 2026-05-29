@@ -132,12 +132,27 @@ impl EventBus {
         }
         tokio::fs::write(&port_path, port.to_string()).await?;
 
-        // Write service version file so `orch version` can detect CLI/service drift
+        // Write service version file so `orch version` can detect CLI/service drift.
+        // Format: "{pid}\t{version}" so readers can verify the owning process is alive.
+        // Guard: skip writing if a live orch serve already owns the file, which prevents
+        // a transient/failed-restart binary from stamping over a surviving engine.
         if let Ok(path) = crate::home::service_version_path() {
             if let Some(parent) = path.parent() {
                 let _ = tokio::fs::create_dir_all(parent).await;
             }
-            let _ = tokio::fs::write(path, env!("ORCH_VERSION")).await;
+            let already_owned = tokio::fs::read_to_string(&path)
+                .await
+                .ok()
+                .and_then(|s| {
+                    let pid: u32 = s.split('\t').next()?.parse().ok()?;
+                    Some(crate::home::pid_is_alive(pid))
+                })
+                .unwrap_or(false);
+            if !already_owned {
+                let pid = std::process::id();
+                let content = format!("{}\t{}", pid, env!("ORCH_VERSION"));
+                let _ = tokio::fs::write(path, content).await;
+            }
         }
 
         let tx = self.tx.clone();
@@ -249,10 +264,20 @@ pub async fn cleanup_port_file() {
     }
 }
 
-/// Remove the service.version file on shutdown.
+/// Remove the service.version file on shutdown — only if this process owns it.
+///
+/// A transient binary that was unable to overwrite the file (due to the live-owner
+/// guard in `start_ws_server`) must not delete the surviving engine's file on exit.
 pub fn cleanup_version_file() {
     if let Ok(path) = crate::home::service_version_path() {
-        let _ = std::fs::remove_file(path);
+        let owned = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.split('\t').next()?.parse::<u32>().ok())
+            .map(|pid| pid == std::process::id())
+            .unwrap_or(true); // legacy plain-version files: assume ownership
+        if owned {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
