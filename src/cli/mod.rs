@@ -47,7 +47,10 @@ pub fn version() {
                 None => (None, raw),
             };
 
-            let pid_alive = pid_opt.map(crate::home::pid_is_alive).unwrap_or(true); // legacy plain-version file: can't check, assume alive
+            // Verify the recorded PID is alive AND is an `orch serve` process,
+            // guarding against PID reuse by an unrelated process after engine exit.
+            // Legacy plain-version files have no PID — assume alive (best-effort).
+            let pid_alive = pid_opt.map(crate::home::pid_is_orch_serve).unwrap_or(true);
 
             if !pid_alive {
                 println!(

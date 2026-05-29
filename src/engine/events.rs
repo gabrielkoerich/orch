@@ -140,12 +140,15 @@ impl EventBus {
             if let Some(parent) = path.parent() {
                 let _ = tokio::fs::create_dir_all(parent).await;
             }
+            // Only skip writing if the recorded PID is both alive AND is an
+            // `orch serve` process — prevents PID reuse by an unrelated process
+            // from blocking a new real engine from claiming the file.
             let already_owned = tokio::fs::read_to_string(&path)
                 .await
                 .ok()
                 .and_then(|s| {
                     let pid: u32 = s.split('\t').next()?.parse().ok()?;
-                    Some(crate::home::pid_is_alive(pid))
+                    Some(crate::home::pid_is_orch_serve(pid))
                 })
                 .unwrap_or(false);
             if !already_owned {

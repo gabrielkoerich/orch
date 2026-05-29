@@ -123,16 +123,25 @@ pub fn service_version_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(state_dir()?.join("service.version"))
 }
 
-/// Returns `true` if a process with the given PID is currently running.
+/// Returns `true` if the given PID is alive **and** is an `orch serve` process.
 ///
-/// Uses `kill -0` which sends no signal but checks process existence.
-/// Returns `false` on error (no such process, no permission, etc.).
-pub fn pid_is_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+/// Checks the process command line via `ps -p {pid} -o args=` to guard against
+/// PID reuse by an unrelated process after the real engine exits.
+pub fn pid_is_orch_serve(pid: u32) -> bool {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "args="])
+        .output()
+        .ok();
+    match output {
+        Some(o) if o.status.success() => {
+            let cmdline = String::from_utf8_lossy(&o.stdout);
+            let cmdline = cmdline.trim();
+            // The cmdline is the full argv, e.g. "/path/to/orch serve --flag".
+            // Verify both that the binary is "orch" and "serve" is the subcommand.
+            cmdline.contains("orch") && cmdline.split_whitespace().any(|w| w == "serve")
+        }
+        _ => false,
+    }
 }
 
 /// Get the path to the worktrees directory (~/.orch/worktrees/).
