@@ -713,6 +713,113 @@ pub(crate) async fn tick_recover_stuck_tasks(
         }
     }
 
+    // Global recovery for external tasks from repos that are not currently being ticked.
+    // These tasks would otherwise remain in_progress forever if their project was removed
+    // from active config and never enters this tick loop again.
+    let all_external_in_progress = match store
+        .list_all_by_status_global(crate::store::TaskStatus::InProgress)
+        .await
+    {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::warn!(
+                ?e,
+                "failed to list global in_progress tasks for cross-repo stuck recovery"
+            );
+            vec![]
+        }
+    };
+    for task in all_external_in_progress
+        .iter()
+        .filter(|t| t.origin != "internal" && t.repo != repo)
+    {
+        let external_id = task
+            .external_id
+            .clone()
+            .unwrap_or_else(|| task.id.to_string());
+        let Some(timing) = stuck_task_timing_from_map(
+            tmux,
+            &task.repo,
+            &external_id,
+            &task.updated_at,
+            config,
+            "cannot parse updated_at, skipping cross-repo stuck-task check",
+            session_map,
+        ) else {
+            continue;
+        };
+
+        if timing.has_session {
+            tracing::warn!(
+                task_id = task.id,
+                repo = %task.repo,
+                age_mins = timing.age.num_minutes(),
+                threshold_mins = timing.threshold / 60,
+                "recovering cross-repo stuck task: timed out with active session → new"
+            );
+        } else {
+            tracing::warn!(
+                task_id = task.id,
+                repo = %task.repo,
+                age_mins = timing.age.num_minutes(),
+                threshold_mins = timing.threshold / 60,
+                "recovering cross-repo stuck task: no session found — reclaiming early → new"
+            );
+        }
+
+        if let Err(e) = store_set_by_id(
+            &Some(store),
+            task.id,
+            &[
+                ("agent", serde_json::Value::Null),
+                ("model", serde_json::Value::Null),
+                ("route_attempts", serde_json::json!(0)),
+            ],
+        )
+        .await
+        {
+            tracing::warn!(
+                task_id = task.id,
+                repo = %task.repo,
+                ?e,
+                "failed to clear routing fields for cross-repo stuck task — will retry next tick"
+            );
+            continue;
+        }
+
+        if let Err(e) = store
+            .update_status(task.id, crate::store::TaskStatus::New)
+            .await
+        {
+            tracing::warn!(
+                task_id = task.id,
+                repo = %task.repo,
+                ?e,
+                "failed to reset cross-repo stuck task status"
+            );
+            continue;
+        }
+
+        let details = serde_json::json!({
+            "failure_reason": if timing.has_session { "stuck_with_session" } else { "stuck_no_session" },
+            "age_minutes": timing.age.num_minutes(),
+            "had_session": timing.has_session,
+            "scope": "cross_repo_global_sweep",
+        });
+        crate::store::store_log_activity(
+            &Some(Arc::clone(store)),
+            &task.repo,
+            &external_id,
+            "rerouted",
+            Some("in_progress"),
+            Some("new"),
+            None::<&str>,
+            None::<&str>,
+            Some(&details),
+        )
+        .await;
+    }
+
     // Recover internal (SQLite) tasks stuck in in_progress.
     // These have no GitHub labels or comments — just reset the DB status to New.
     use crate::store::TaskStatus as DbStatus;
@@ -2410,6 +2517,73 @@ mod tests {
             task.status,
             crate::store::TaskStatus::NeedsReview,
             "stuck internal InReview task should be reset to NeedsReview"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_stuck_tasks_resets_cross_repo_external_in_progress_to_new() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let mock = MockBackend::new();
+        let status_updates = mock.status_updates.clone();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(TmuxManager::new());
+        let config = EngineConfig {
+            no_session_stuck_timeout: 600,
+            stuck_timeout: 1800,
+            ..EngineConfig::default()
+        };
+
+        // Cross-repo task should still be recovered even when current tick repo is owner/repo.
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/other",
+                ext_id: "777",
+                title: "Cross-repo stuck task",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::InProgress)
+            .await
+            .unwrap();
+        set_task_updated_at_past(&store, id).await;
+
+        tick_recover_stuck_tasks(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &task_manager,
+            &config,
+            &store,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(
+            task.status,
+            crate::store::TaskStatus::New,
+            "cross-repo stale in_progress task should be reset to New"
+        );
+        assert_eq!(task.route_attempts, 0, "route attempts should be cleared");
+        assert!(task.agent.is_none(), "agent should be cleared");
+        assert!(task.model.is_none(), "model should be cleared");
+
+        // Cross-repo global sweep is store-only and must not call backend status updates.
+        assert!(
+            status_updates.lock().unwrap().is_empty(),
+            "cross-repo recovery should not call backend update_status"
         );
     }
 
