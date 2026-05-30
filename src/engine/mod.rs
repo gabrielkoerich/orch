@@ -728,7 +728,9 @@ async fn fetch_latest_release_version() -> Option<String> {
 /// restarts the service with the new binary. The signal is sent only after the
 /// brew command succeeds; on failure, nothing is restarted and the next check
 /// will try again.
-async fn perform_auto_upgrade(latest: &str) {
+///
+/// Returns `true` if brew succeeded and SIGTERM was sent, `false` on any failure.
+async fn perform_auto_upgrade(latest: &str) -> bool {
     tracing::info!(latest = %latest, "auto-upgrading orch via brew");
 
     let status = Command::new("brew")
@@ -743,12 +745,15 @@ async fn perform_auto_upgrade(latest: &str) {
             // with the newly installed binary.
             let pid = std::process::id().to_string();
             let _ = Command::new("kill").args(["-TERM", &pid]).status().await;
+            true
         }
         Ok(s) => {
             tracing::warn!(exit_code = ?s.code(), "brew upgrade orch failed — will retry at next check");
+            false
         }
         Err(e) => {
             tracing::warn!(error = %e, "failed to spawn brew upgrade orch");
+            false
         }
     }
 }
@@ -814,9 +819,14 @@ async fn check_and_notify_upgrade(
                 return;
             }
         }
-        // Mark before attempting so a crash during brew doesn't cause a rapid retry loop.
+        // Mark before attempting so a crash/restart mid-upgrade doesn't cause a rapid
+        // retry loop. On explicit failure the key is cleared below so the next hourly
+        // check can retry.
         let _ = store.kv_set(last_notified_key, &latest).await;
-        perform_auto_upgrade(&latest).await;
+        if !perform_auto_upgrade(&latest).await {
+            // Brew failed — clear the dedup key so the next check cycle will retry.
+            let _ = store.kv_delete(last_notified_key).await;
+        }
         return;
     }
 
