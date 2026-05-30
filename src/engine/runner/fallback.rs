@@ -291,12 +291,14 @@ pub async fn handle_error(
             format!("missing tool: {tool}"),
         ),
         agents::AgentError::ModelUnavailable { model, message } => {
-            // "Model not found" is deterministic — the model is decommissioned and
-            // will never return. Skip the escalating backoff and jump straight to the
-            // 7-day max to prevent 3-4 wasteful retries over the 4h→12h→36h ramp.
+            // "Model not found" and "not supported" are both deterministic — the model is
+            // decommissioned or incompatible with the account type and will never self-resolve.
+            // Skip the escalating backoff and jump straight to the 7-day max to prevent
+            // 3-4 wasteful retries over the 4h→12h→36h ramp.
             // All other model-unavailable signals use the standard escalating backoff.
             let lower = message.to_lowercase();
-            let is_permanently_gone = lower.contains("not found");
+            let is_permanently_gone =
+                lower.contains("not found") || lower.contains("not supported");
             if is_permanently_gone {
                 crate::engine::cooldown::record_model_permanently_gone(agent_name, model).await;
             } else {
@@ -1389,6 +1391,52 @@ more logs"#;
             remaining >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
             "expected ~4h (persistent) cooldown for 'Model not found', got {remaining}s — \
              may have applied transient 5min cooldown instead"
+        );
+    }
+
+    /// "Model not supported" is a permanent account-type mismatch — verify it applies the
+    /// persistent (4h base → 7d max) cooldown, same as "not found".
+    ///
+    /// Regression test for issue #3215: "not supported" was not matched by the
+    /// `is_permanently_gone` check, so it fell through to the 5min→4h transient backoff
+    /// and the model kept being retried every ~4h indefinitely.
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn model_not_supported_applies_persistent_cooldown() {
+        crate::engine::cooldown::reset_global_state().await;
+        let runner = MockRunner { free: vec![] };
+        let agent = "codex-3215-not-supported";
+        let model = "gpt-5.2-codex";
+        let key = format!("{agent}:{model}");
+
+        let err = AgentError::ModelUnavailable {
+            model: model.to_string(),
+            message: "The 'gpt-5.2-codex' model is not supported when using Codex with a ChatGPT account.".to_string(),
+        };
+
+        let _result = handle_error(
+            "test-3215-a",
+            &err,
+            agent,
+            &runner,
+            Some(model),
+            Some("medium"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let until = crate::engine::cooldown::cooldown_until(&key)
+            .expect("model not supported should set model cooldown");
+        let remaining = until.saturating_sub(now);
+
+        assert!(
+            remaining >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
+            "expected ~4h (persistent) cooldown for 'not supported', got {remaining}s — \
+             may have applied transient 5min cooldown instead (issue #3215)"
         );
     }
 
