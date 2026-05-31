@@ -738,6 +738,7 @@ async fn invoke_review_agent(
 async fn record_review_agent_failure(
     task_id: &str,
     review_agent: &str,
+    review_model: Option<&str>,
     err: &runner::agents::AgentError,
 ) {
     match err {
@@ -753,6 +754,11 @@ async fn record_review_agent_failure(
             } else {
                 runner::response::record_agent_failure_with_message(review_agent, &err.to_string())
                     .await;
+            }
+        }
+        runner::agents::AgentError::InvalidResponse { .. } => {
+            if let Some(model) = review_model {
+                crate::engine::cooldown::record_model_failure(review_agent, model).await;
             }
         }
         _ => {}
@@ -864,7 +870,13 @@ async fn parse_review_output(
         );
         let agent_runner = runner::agents::get_runner(&ctx.review_agent);
         let err = agent_runner.classify_error(exit_code, &raw_output, &stderr);
-        record_review_agent_failure(&task.id.0, &ctx.review_agent, &err).await;
+        record_review_agent_failure(
+            &task.id.0,
+            &ctx.review_agent,
+            ctx.review_model.as_deref(),
+            &err,
+        )
+        .await;
         tracing::error!(task_id = task.id.0, error = %err, "review agent failed");
         let stored_error = format_review_error(&ctx.review_agent, &err);
         complete_review_run(
@@ -1037,6 +1049,9 @@ async fn parse_review_output(
                     raw_output = %raw_output.chars().take(1000).collect::<String>(),
                     "failed to parse review response"
                 );
+                if let Some(model) = ctx.review_model.as_deref() {
+                    crate::engine::cooldown::record_model_failure(&ctx.review_agent, model).await;
+                }
                 complete_review_run(
                     store,
                     run.run_id,
