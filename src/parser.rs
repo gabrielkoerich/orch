@@ -152,7 +152,8 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
 /// Unknown statuses are kept as-is so that downstream code can distinguish
 /// them from canonical ones (e.g. for debugging/metrics).
 fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
-    resp.status = match resp.status.as_str() {
+    let normalized = resp.status.to_ascii_lowercase();
+    resp.status = match normalized.as_str() {
         // Canonical completion statuses.
         // Some agents return `complete` or `no_changes_needed` to indicate
         // a successful run with no further edits required — treat them as
@@ -171,7 +172,9 @@ fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
         | "acknowledged"
         | "flat"
         | "no_action"
-        | "no_action_needed" => "done".to_string(),
+        | "no_action_needed"
+        | "missed"
+        | "changes_addressed" => "done".to_string(),
         // Canonical progress statuses.
         // `partial` is used by some models to indicate partial progress —
         // treat it as in_progress so the task remains open for follow-up.
@@ -194,7 +197,7 @@ fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
         // Unknown non-canonical status — keep as-is so the audit trail records
         // exactly what the agent returned. This lets operators identify which
         // statuses need to be added to the normalization map.
-        other => other.to_string(),
+        _ => resp.status.clone(),
     };
     resp
 }
@@ -950,6 +953,20 @@ Some output here.
     #[test]
     fn parse_normalizes_completed_alias_to_done() {
         let input = r#"{"status":"completed","summary":"done","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
+    fn parse_normalizes_missed_alias_to_done_case_insensitive() {
+        let input = r#"{"status":"MISSED","summary":"no setups found","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
+    fn parse_normalizes_changes_addressed_alias_to_done() {
+        let input = r#"{"status":"changes_addressed","summary":"feedback addressed","accomplished":[],"remaining":[],"files":[]}"#;
         let resp = parse(input).unwrap();
         assert_eq!(resp.status, "done");
     }
