@@ -34,38 +34,67 @@ pub fn version() {
     let cli_version = env!("ORCH_VERSION");
     println!("CLI:     {cli_version}");
 
+    let all_pids = crate::home::find_orch_serve_pids(false);
+
     match crate::home::service_version_path()
         .ok()
         .and_then(|p| std::fs::read_to_string(p).ok())
     {
         Some(raw) => {
             let raw = raw.trim();
-            // Parse "{pid}\t{version}" written by engine ≥ fix for #3200.
-            // Fall back to treating the whole string as a plain version for older engines.
             let (pid_opt, svc) = match raw.split_once('\t') {
                 Some((pid_str, ver)) => (pid_str.parse::<u32>().ok(), ver),
                 None => (None, raw),
             };
 
-            // Verify the recorded PID is alive AND is an `orch serve` process,
-            // guarding against PID reuse by an unrelated process after engine exit.
-            // Legacy plain-version files have no PID — assume alive (best-effort).
-            let pid_alive = pid_opt.map(crate::home::pid_is_orch_serve).unwrap_or(true);
-
-            if !pid_alive {
-                println!(
-                    "Service: stale (pid {} no longer running) — run: brew services restart orch",
-                    pid_opt.unwrap()
-                );
+            if let Some(stale_pid) = pid_opt.filter(|pid| !crate::home::pid_is_orch_serve(*pid)) {
+                match all_pids.as_slice() {
+                    [] => println!(
+                        "Service: stale (pid {stale_pid} no longer running) — run: brew services restart orch"
+                    ),
+                    [ghost_pid] => {
+                        let ghost_version = orch_version_from_pid(*ghost_pid)
+                            .unwrap_or_else(|| "unknown".to_string());
+                        println!(
+                            "Service: {ghost_version}  ⚠ ghost process (pid {ghost_pid}) — run: brew services restart orch"
+                        );
+                    }
+                    _ => println!(
+                        "Service: unknown  ⚠ multiple ghost processes (pids: {}) — run: brew services restart orch",
+                        format_pids(&all_pids)
+                    ),
+                }
             } else if svc == cli_version {
-                println!("Service: {svc}  ✓ in sync");
+                if all_pids.len() > 1 {
+                    println!(
+                        "Service: {svc}  ⚠ multiple instances running (pids: {}) — run: brew services restart orch",
+                        format_pids(&all_pids)
+                    );
+                } else {
+                    println!("Service: {svc}  ✓ in sync");
+                }
+            } else if all_pids.len() > 1 {
+                println!(
+                    "Service: {svc}  ✗ mismatch; multiple instances running (pids: {}) — run: brew upgrade orch && brew services restart orch",
+                    format_pids(&all_pids)
+                );
             } else {
-                println!("Service: {svc}  ✗ mismatch — run: brew upgrade orch && brew services restart orch");
+                println!(
+                    "Service: {svc}  ✗ mismatch — run: brew upgrade orch && brew services restart orch"
+                );
             }
         }
-        None => {
-            println!("Service: not running (no service.version file)");
-        }
+        None => match all_pids.as_slice() {
+            [] => println!("Service: not running (no service.version file)"),
+            [pid] => {
+                let ver = orch_version_from_pid(*pid).unwrap_or_else(|| "unknown".to_string());
+                println!("Service: {ver}  ⚠ no service.version file (pid {pid})");
+            }
+            _ => println!(
+                "Service: unknown  ⚠ multiple instances (pids: {}) — no service.version file",
+                format_pids(&all_pids)
+            ),
+        },
     }
 
     if let Some(latest) = fetch_latest_release_version() {
@@ -75,6 +104,33 @@ pub fn version() {
             println!("Latest:  {latest}  ✓ up to date");
         }
     }
+}
+
+fn format_pids(pids: &[u32]) -> String {
+    pids.iter()
+        .map(|pid| pid.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn orch_version_from_pid(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("lsof")
+        .args(["-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().last())
+        .find_map(version_from_cellar_orch_path)
+        .map(str::to_string)
+}
+
+fn version_from_cellar_orch_path(path: &str) -> Option<&str> {
+    path.split("/Cellar/orch/").nth(1)?.split('/').next()
 }
 
 /// Fetch the latest orch release tag from GitHub via the `gh` CLI.

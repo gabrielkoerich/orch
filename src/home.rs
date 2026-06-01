@@ -123,25 +123,95 @@ pub fn service_version_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(state_dir()?.join("service.version"))
 }
 
-/// Returns `true` if the given PID is alive **and** is an `orch serve` process.
-///
-/// Checks the process command line via `ps -p {pid} -o args=` to guard against
-/// PID reuse by an unrelated process after the real engine exits.
+/// Returns `true` if the given PID is alive and is an `orch serve` process.
 pub fn pid_is_orch_serve(pid: u32) -> bool {
+    process_args(pid)
+        .as_deref()
+        .is_some_and(command_line_is_orch_serve)
+}
+
+/// Find all PIDs of running `orch serve` processes.
+pub fn find_orch_serve_pids(exclude_self: bool) -> Vec<u32> {
+    let output = std::process::Command::new("pgrep")
+        .args(["-x", "orch"])
+        .output()
+        .ok();
+
+    let self_pid = std::process::id();
+    match output {
+        Some(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .filter(|pid| !exclude_self || *pid != self_pid)
+            .filter(|pid| pid_is_orch_serve(*pid))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Send SIGTERM to other running `orch serve` processes, then SIGKILL stragglers.
+pub fn kill_other_orch_serve_processes(timeout: std::time::Duration) -> u32 {
+    let others = find_orch_serve_pids(true);
+    if others.is_empty() {
+        return 0;
+    }
+
+    for pid in &others {
+        tracing::info!(pid, "sending SIGTERM to stale orch serve process");
+        send_signal(*pid, "TERM");
+    }
+
+    let mut remaining = wait_for_orch_serve_exit(others.clone(), timeout);
+    for pid in &remaining {
+        tracing::warn!(pid, "stale orch serve ignored SIGTERM; sending SIGKILL");
+        send_signal(*pid, "KILL");
+    }
+
+    remaining = wait_for_orch_serve_exit(remaining, std::time::Duration::from_secs(1));
+    for pid in &remaining {
+        tracing::error!(pid, "stale orch serve survived SIGKILL");
+    }
+
+    (others.len() - remaining.len()) as u32
+}
+
+fn process_args(pid: u32) -> Option<String> {
     let output = std::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "args="])
         .output()
-        .ok();
-    match output {
-        Some(o) if o.status.success() => {
-            let cmdline = String::from_utf8_lossy(&o.stdout);
-            let cmdline = cmdline.trim();
-            // The cmdline is the full argv, e.g. "/path/to/orch serve --flag".
-            // Verify both that the binary is "orch" and "serve" is the subcommand.
-            cmdline.contains("orch") && cmdline.split_whitespace().any(|w| w == "serve")
-        }
-        _ => false,
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|args| !args.is_empty())
+}
+
+fn command_line_is_orch_serve(cmdline: &str) -> bool {
+    let mut args = cmdline.split_whitespace();
+    let Some(program) = args.next() else {
+        return false;
+    };
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "orch")
+        && args.any(|arg| arg == "serve")
+}
+
+fn send_signal(pid: u32, signal: &str) {
+    let _ = std::process::Command::new("kill")
+        .args([format!("-{signal}"), pid.to_string()])
+        .output();
+}
+
+fn wait_for_orch_serve_exit(mut pids: Vec<u32>, timeout: std::time::Duration) -> Vec<u32> {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout && !pids.is_empty() {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        pids.retain(|pid| pid_is_orch_serve(*pid));
     }
+    pids
 }
 
 /// Get the path to the worktrees directory (~/.orch/worktrees/).
@@ -321,5 +391,36 @@ mod tests {
         assert_ne!(dir_a, dir_b);
 
         restore_orch_home(prev);
+    }
+
+    #[test]
+    fn pid_is_orch_serve_returns_false_for_nonexistent_pid() {
+        assert!(!pid_is_orch_serve(99999));
+    }
+
+    #[test]
+    fn command_line_is_orch_serve_matches_real_invocations() {
+        assert!(command_line_is_orch_serve("/opt/homebrew/bin/orch serve"));
+        assert!(command_line_is_orch_serve(
+            "/opt/homebrew/Cellar/orch/0.73.18/bin/orch serve --foreground"
+        ));
+        assert!(!command_line_is_orch_serve(
+            "/opt/homebrew/bin/orch version"
+        ));
+        assert!(!command_line_is_orch_serve("/bin/sh -c orch serve"));
+        assert!(!command_line_is_orch_serve("/tmp/not-orch serve"));
+    }
+
+    #[test]
+    fn find_orch_serve_pids_does_not_panic() {
+        let pids = find_orch_serve_pids(false);
+        assert!(pids.iter().all(|pid| pid_is_orch_serve(*pid)));
+    }
+
+    #[test]
+    fn find_orch_serve_pids_excludes_self() {
+        let self_pid = std::process::id();
+        let pids = find_orch_serve_pids(true);
+        assert!(!pids.contains(&self_pid));
     }
 }

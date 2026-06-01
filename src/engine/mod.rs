@@ -898,6 +898,11 @@ async fn check_and_notify_upgrade(
 ///
 /// This is the main entry point — called by `orch serve`.
 pub async fn serve() -> anyhow::Result<()> {
+    let killed = crate::home::kill_other_orch_serve_processes(std::time::Duration::from_secs(30));
+    if killed > 0 {
+        tracing::info!(count = killed, "terminated stale orch serve processes");
+    }
+
     tracing::info!("orch engine starting");
 
     // Pre-create standard directories with async I/O so subsequent synchronous
