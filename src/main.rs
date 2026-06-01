@@ -271,6 +271,18 @@ enum Commands {
         /// Path to JSON file (or - for stdin)
         path: String,
     },
+    /// Create smart logical commits from current git changes
+    Commit {
+        /// Show proposed commit plan without creating commits
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+        /// Use this commit message as a single commit override
+        #[arg(long = "message", short = 'm')]
+        message: Option<String>,
+    },
     /// Check if a cron expression matches now
     Cron {
         /// Cron expression (5 fields)
@@ -805,6 +817,13 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Parse { path } => {
             parser::parse_and_print(&path)?;
+        }
+        Commands::Commit {
+            dry_run,
+            yes,
+            message,
+        } => {
+            cli::commit::run(dry_run, yes, message)?;
         }
         Commands::Cron { expression, since } => {
             let matches = cron::check(&expression, since.as_deref())?;

@@ -1,4 +1,5 @@
 pub mod chat;
+pub mod commit;
 pub mod cooldown;
 pub mod cost;
 pub mod dashboard;
