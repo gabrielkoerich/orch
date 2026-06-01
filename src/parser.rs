@@ -169,6 +169,7 @@ fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
         | "no_trades_no_positions"
         | "changes_made"
         | "change_made"
+        | "changes_pushed"
         | "acknowledged"
         | "flat"
         | "no_action"
@@ -972,6 +973,13 @@ Some output here.
     }
 
     #[test]
+    fn parse_normalizes_changes_pushed_alias_to_done() {
+        let input = r#"{"status":"changes_pushed","summary":"changes pushed to branch","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
     fn parse_normalizes_running_alias_to_in_progress() {
         let input = r#"{"status":"running","summary":"working","accomplished":[],"remaining":[],"files":[]}"#;
         let resp = parse(input).unwrap();
@@ -1111,6 +1119,9 @@ Some output here.
             ("skip", "done"),
             ("no_changes_needed", "done"),
             ("no_trades_no_positions", "done"),
+            ("changes_made", "done"),
+            ("changes_pushed", "done"),
+            ("changes_addressed", "done"),
             ("running", "in_progress"),
             ("partial", "in_progress"),
             ("reviewing", "in_review"),
