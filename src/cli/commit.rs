@@ -26,21 +26,14 @@ pub fn run(dry_run: bool, yes: bool, message_override: Option<String>) -> anyhow
         return Ok(());
     }
 
-    git_add_all()?;
-    let files = collect_changed_files()?;
+    // Collect files and diff WITHOUT touching the index, preserving the user's staging state.
+    let files = collect_all_changed_files()?;
     if files.is_empty() {
         println!("nothing to commit");
         return Ok(());
     }
 
-    let diff_text = git_output([
-        "diff",
-        "--cached",
-        "--no-color",
-        "--unified=0",
-        "--no-ext-diff",
-        "--find-renames",
-    ])?;
+    let diff_text = get_full_diff()?;
 
     let plans = if let Some(message) = message_override {
         vec![CommitPlan { message, files }]
@@ -51,14 +44,14 @@ pub fn run(dry_run: bool, yes: bool, message_override: Option<String>) -> anyhow
     print_plan_summary(&plans);
 
     if dry_run {
-        git_reset_unstage_all()?;
+        // Index was never mutated — nothing to undo.
         return Ok(());
     }
 
     if !yes {
         match prompt_confirmation()? {
             UserChoice::No => {
-                git_reset_unstage_all()?;
+                // Index was never mutated — nothing to undo.
                 println!("aborted");
                 return Ok(());
             }
@@ -365,19 +358,6 @@ fn has_changes() -> anyhow::Result<bool> {
     Ok(!unstaged.success() || !staged.success() || !untracked.trim().is_empty())
 }
 
-fn git_add_all() -> anyhow::Result<()> {
-    let out = std::process::Command::new("git")
-        .args(["add", "-A"])
-        .output_with_context()?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git add -A failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    Ok(())
-}
-
 fn git_reset_unstage_all() -> anyhow::Result<()> {
     let out = std::process::Command::new("git")
         .args(["reset"])
@@ -388,6 +368,85 @@ fn git_reset_unstage_all() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Collect all changed files (staged + unstaged + untracked) without touching the index.
+fn collect_all_changed_files() -> anyhow::Result<Vec<ChangedFile>> {
+    let mut seen = BTreeSet::new();
+    let mut files = Vec::new();
+
+    let staged = git_output(["diff", "--cached", "--name-status", "--find-renames"])?;
+    for line in staged.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if let Some(cf) = parse_name_status_line(line) {
+            if seen.insert(cf.path.clone()) {
+                files.push(cf);
+            }
+        }
+    }
+
+    let unstaged = git_output(["diff", "--name-status", "--find-renames"])?;
+    for line in unstaged.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if let Some(cf) = parse_name_status_line(line) {
+            if seen.insert(cf.path.clone()) {
+                files.push(cf);
+            }
+        }
+    }
+
+    let untracked = git_output(["ls-files", "--others", "--exclude-standard"])?;
+    for line in untracked.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if seen.insert(line.to_string()) {
+            files.push(ChangedFile {
+                path: line.to_string(),
+                old_path: None,
+            });
+        }
+    }
+
+    Ok(files)
+}
+
+fn parse_name_status_line(line: &str) -> Option<ChangedFile> {
+    let parts: Vec<&str> = line.split('\t').collect();
+    let status = parts.first()?;
+    if status.starts_with('R') || status.starts_with('C') {
+        if parts.len() >= 3 {
+            Some(ChangedFile {
+                path: parts[2].to_string(),
+                old_path: Some(parts[1].to_string()),
+            })
+        } else {
+            None
+        }
+    } else if parts.len() >= 2 {
+        Some(ChangedFile {
+            path: parts[1].to_string(),
+            old_path: None,
+        })
+    } else {
+        None
+    }
+}
+
+/// Returns combined staged + unstaged diff for analysis without mutating the index.
+fn get_full_diff() -> anyhow::Result<String> {
+    let staged = git_output([
+        "diff",
+        "--cached",
+        "--no-color",
+        "--unified=0",
+        "--no-ext-diff",
+        "--find-renames",
+    ])?;
+    let unstaged = git_output([
+        "diff",
+        "--no-color",
+        "--unified=0",
+        "--no-ext-diff",
+        "--find-renames",
+    ])?;
+    Ok(format!("{staged}{unstaged}"))
+}
+
+#[cfg(test)]
 fn collect_changed_files() -> anyhow::Result<Vec<ChangedFile>> {
     let name_status = git_output(["diff", "--cached", "--name-status", "--find-renames"])?;
     let mut files = Vec::new();
