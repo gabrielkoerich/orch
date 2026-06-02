@@ -295,6 +295,22 @@ impl OpenCodeRunner {
         Self
     }
 
+    /// Split an opencode model identifier into base model and optional variant.
+    ///
+    /// The identifier shape is: "provider/model[@variant]". Splitting is
+    /// performed on the LAST `@` so provider/model strings containing `@`
+    /// are handled correctly. Returns (base, Some(variant)) when a trailing
+    /// `@` is present (variant may be empty), or (s, None) when no `@` exists.
+    pub(crate) fn split_model_variant(s: &str) -> (&str, Option<&str>) {
+        if let Some(pos) = s.rfind('@') {
+            let base = &s[..pos];
+            let variant = &s[pos + 1..];
+            (base, Some(variant))
+        } else {
+            (s, None)
+        }
+    }
+
     /// Extract text from `text` events.
     ///
     /// Concatenates all text events, then tries to find the structured
@@ -418,9 +434,16 @@ impl AgentRunner for OpenCodeRunner {
         msg_file: &str,
         permissions: &PermissionRules,
     ) -> String {
-        let model_flag = model
-            .map(|m| format!("--model {}", super::shell_single_quote(m)))
-            .unwrap_or_default();
+        // Support optional variant suffix on opencode model identifiers:
+        // provider/model[@variant]
+        let (model_flag, variant_flag) = if let Some(m) = model {
+            let (base, variant) = Self::split_model_variant(m);
+            let mf = format!("--model {}", super::shell_single_quote(base));
+            let vf = variant.map(|v| format!("--variant {}", super::shell_single_quote(v)));
+            (mf, vf)
+        } else {
+            (String::new(), None)
+        };
 
         // OpenCode permission control via XDG_CONFIG_HOME override.
         //
@@ -450,8 +473,10 @@ printf '%s\n' {sq_permission_json} > .orch-opencode/opencode/opencode.json || {{
             ""
         };
 
+        // Append variant flag when present
+        let variant_part = variant_flag.unwrap_or_default();
         format!(
-            r#"{config_setup}cat "{sys_file}" "{msg_file}" | {xdg_prefix}{timeout_cmd} opencode run {model_flag} \
+            r#"{config_setup}cat "{sys_file}" "{msg_file}" | {xdg_prefix}{timeout_cmd} opencode run {model_flag} {variant_part} \
   --format json -"#,
             config_setup = config_setup,
             xdg_prefix = xdg_prefix,
@@ -459,6 +484,7 @@ printf '%s\n' {sq_permission_json} > .orch-opencode/opencode/opencode.json || {{
             msg_file = msg_file,
             timeout_cmd = timeout_cmd,
             model_flag = model_flag,
+            variant_part = variant_part,
         )
     }
 
@@ -568,7 +594,12 @@ printf '%s\n' {sq_permission_json} > .orch-opencode/opencode/opencode.json || {{
         let mut cmd = tokio::process::Command::new("opencode");
         cmd.arg("run").arg("--format").arg("json");
         if let Some(m) = model {
-            cmd.arg("--model").arg(m);
+            let (base, variant) = Self::split_model_variant(m);
+            cmd.arg("--model").arg(base);
+            if let Some(v) = variant {
+                // pass variant even if empty (last-token-wins semantics)
+                cmd.arg("--variant").arg(v);
+            }
         }
         cmd.arg(prompt);
         cmd.env("XDG_CONFIG_HOME", &config_dir);
@@ -1273,6 +1304,49 @@ mod tests {
             cmd.contains("GH_CONFIG_DIR=$HOME/.config/gh"),
             "expected GH_CONFIG_DIR to preserve gh auth, got: {cmd}"
         );
+    }
+
+    #[test]
+    fn split_model_variant_no_at() {
+        let (base, variant) = OpenCodeRunner::split_model_variant("openai/gpt-5.5");
+        assert_eq!(base, "openai/gpt-5.5");
+        assert!(variant.is_none());
+    }
+
+    #[test]
+    fn split_model_variant_with_variant() {
+        let (base, variant) = OpenCodeRunner::split_model_variant("openai/gpt-5.5@xhigh");
+        assert_eq!(base, "openai/gpt-5.5");
+        assert_eq!(variant, Some("xhigh"));
+    }
+
+    #[test]
+    fn split_model_variant_trailing_at_empty() {
+        let (base, variant) = OpenCodeRunner::split_model_variant("openai/gpt-5.5@");
+        assert_eq!(base, "openai/gpt-5.5");
+        assert_eq!(variant, Some(""));
+    }
+
+    #[test]
+    fn split_model_variant_multiple_ats_last_wins() {
+        let (base, variant) = OpenCodeRunner::split_model_variant("a@b@c@v");
+        assert_eq!(base, "a@b@c");
+        assert_eq!(variant, Some("v"));
+    }
+
+    #[test]
+    fn build_command_opencode_with_variant() {
+        let r = runner();
+        let perms = PermissionRules::default();
+        let cmd = r.build_command(
+            Some("openai/gpt-5.5@high"),
+            "timeout 1800",
+            "/tmp/sys.txt",
+            "/tmp/msg.txt",
+            &perms,
+        );
+        assert!(cmd.contains("--model 'openai/gpt-5.5'"));
+        assert!(cmd.contains("--variant 'high'"));
     }
 
     #[test]
