@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+use chrono::TimeZone;
 
 /// Default fallback cooldown for agents when no store is available: 30 minutes.
 ///
@@ -1118,7 +1119,16 @@ fn parse_retry_at(error_message: &str) -> Option<i64> {
     }
 
     let lower = error_message.to_lowercase();
-    for retry_marker in ["try again at ", "reset at "] {
+    // Accept a wider set of vendor-provided markers. Claude commonly uses
+    // variations like "resets 10:30am" (no explicit "at"), so include
+    // both "resets" and the older "reset at"/"try again at" markers.
+    for retry_marker in [
+        "try again at ",
+        "reset at ",
+        "resets at ",
+        "resets ",
+        "reset ",
+    ] {
         if let Some(idx) = lower.find(retry_marker) {
             let date_str = &lower[idx + retry_marker.len()..];
             // Take until period, newline, or end
@@ -1175,6 +1185,51 @@ fn parse_retry_at(error_message: &str) -> Option<i64> {
                 marker = retry_marker,
                 "could not parse retry-at date"
             );
+
+            // If the vendor provided only a time (e.g. "resets 10:30am"),
+            // attempt to parse a time-only and interpret it as the next
+            // occurrence of that time in the local timezone.
+            // Strip parenthesised timezone hints like "(America/Sao_Paulo)".
+            let time_only = date_str.split_once('(').map(|(t, _)| t).unwrap_or(date_str).trim();
+            for tf in &["%I:%M %p", "%I:%M%p", "%I %p", "%H:%M"] {
+                if let Ok(t) = chrono::NaiveTime::parse_from_str(time_only, tf) {
+                    // Build a NaiveDateTime for today at that time, then choose
+                    // today or tomorrow depending on whether the time has passed.
+                    let local_now = chrono::Local::now();
+                    let today = local_now.date_naive();
+                    let candidate = chrono::NaiveDateTime::new(today, t);
+                    // Use the TimeZone trait methods; annotate types so the
+                    // compiler can infer the concrete DateTime types.
+                    let candidate_local: chrono::DateTime<chrono::Local> = match chrono::Local.from_local_datetime(&candidate) {
+                        chrono::LocalResult::Single(dt) => dt,
+                        chrono::LocalResult::Ambiguous(earliest, _) => earliest,
+                        chrono::LocalResult::None => {
+                            // DST gap — fall back to UTC interpretation
+                            let utc_dt = candidate.and_utc();
+                            return Some(utc_dt.timestamp());
+                        }
+                    };
+                    let chosen = if candidate_local <= local_now {
+                        // Use tomorrow
+                        let tomorrow = today.succ_opt().unwrap_or(today);
+                        let ndt = chrono::NaiveDateTime::new(tomorrow, t);
+                        match chrono::Local.from_local_datetime(&ndt) {
+                            chrono::LocalResult::Single(dt) => dt.with_timezone(&chrono::Utc),
+                            chrono::LocalResult::Ambiguous(earliest, _) => earliest.with_timezone(&chrono::Utc),
+                            chrono::LocalResult::None => ndt.and_utc(),
+                        }
+                    } else {
+                        candidate_local.with_timezone(&chrono::Utc)
+                    };
+                    tracing::info!(
+                        retry_at = %chosen,
+                        raw = date_str,
+                        marker = retry_marker,
+                        "parsed rate limit retry-at time-only; interpreted as next occurrence"
+                    );
+                    return Some(chosen.timestamp());
+                }
+            }
         }
     }
 
