@@ -291,17 +291,20 @@ pub async fn handle_error(
             format!("missing tool: {tool}"),
         ),
         agents::AgentError::ModelUnavailable { model, message } => {
-            // "Model not found" and "not supported" are both deterministic — the model is
-            // decommissioned or incompatible with the account type and will never self-resolve.
-            // Skip the escalating backoff and jump straight to the 7-day max to prevent
-            // 3-4 wasteful retries over the 4h→12h→36h ramp.
-            // All other model-unavailable signals use the standard escalating backoff.
+            // "Model not found" and "not supported" indicate the model cannot be used
+            // for the current account or provider surface. Treat these as persistent
+            // model failures: apply the persistent-model backoff (4h base → 7d max)
+            // so the router avoids re-selecting the same model for a while without
+            // immediately jumping to the permanent 7-day cap. This reduces wasted
+            // dispatches while still allowing recovery if the model becomes available.
             let lower = message.to_lowercase();
             let is_permanently_gone =
                 lower.contains("not found") || lower.contains("not supported");
             if is_permanently_gone {
-                crate::engine::cooldown::record_model_permanently_gone(agent_name, model).await;
+                // Persistent model failure backoff (starts at 4h, escalates to 7d)
+                crate::engine::cooldown::record_persistent_model_failure(agent_name, model).await;
             } else {
+                // Generic model failure uses the standard model failure backoff (5m base → 4h max)
                 response::record_model_failure(agent_name, model).await;
             }
 
@@ -907,6 +910,47 @@ mod tests {
         assert!(
             remaining >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
             "expected ~4h model cooldown, got {remaining}s"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn model_unavailable_sets_persistent_model_cooldown_for_codex_style() {
+        crate::engine::cooldown::reset_global_state().await;
+        let runner = MockRunner { free: vec![] };
+        let agent = "codex";
+        let model = "gpt-5.3-codex";
+
+        // Simulate Codex provider JSON error: message contains "model is not supported"
+        let err = crate::engine::runner::agents::AgentError::ModelUnavailable {
+            model: model.to_string(),
+            message: "{\"detail\":\"The 'gpt-5.3-codex' model is not supported\"}".to_string(),
+        };
+
+        let _result = handle_error(
+            "test-codex-model-unsupported",
+            &err,
+            agent,
+            &runner,
+            Some(model),
+            Some("simple"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        // The persistent backoff base is ~4h; ensure cooldown exists and is at least that long minus a margin
+        let key = format!("{}:{}", agent, model);
+        let now = chrono::Utc::now().timestamp();
+        let until =
+            crate::engine::cooldown::cooldown_until(&key).expect("model cooldown should be set");
+        let remaining = until.saturating_sub(now);
+
+        assert!(
+            remaining >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
+            "expected persistent model cooldown (~4h) for codex model-unavailable, got {remaining}s"
         );
     }
 
