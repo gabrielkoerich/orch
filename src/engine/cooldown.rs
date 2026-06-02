@@ -510,19 +510,6 @@ pub async fn record_persistent_model_failure(agent_name: &str, model: &str) {
     set_cooldown_async(&key, cooldown_until, "persistent_model_error").await;
 }
 
-/// Apply an immediate maximum-duration cooldown when a model is known to be
-/// permanently unavailable ("Model not found").
-///
-/// Unlike `record_persistent_model_failure` (4h base → 7d max), "not found"
-/// errors are deterministic — the model was decommissioned and will not
-/// reappear. Jumping to the max (7 days) prevents 3-4 wasteful retries over
-/// the normal escalation window.
-pub async fn record_model_permanently_gone(agent_name: &str, model: &str) {
-    let key = format!("{agent_name}:{model}");
-    let cooldown_until = chrono::Utc::now().timestamp() + PERSISTENT_MODEL_BACKOFF_MAX_SECS;
-    set_cooldown_async(&key, cooldown_until, "model_not_found").await;
-}
-
 /// Set a model cooldown with a custom duration (in seconds).
 ///
 /// Used by silence detection to cooldown the specific model that failed to
@@ -1322,32 +1309,6 @@ mod tests {
             .expect("kv read should succeed")
             .expect("failure count should be written");
         assert_eq!(stored_count, "2");
-    }
-
-    #[serial(cooldown_state)]
-    #[tokio::test]
-    async fn record_model_permanently_gone_applies_max_cooldown_immediately() {
-        super::reset_global_state().await;
-        let store = test_store().await;
-        *cooldown_store().lock().await = Some(store.clone());
-
-        let agent = "testagent_gone";
-        let model = "testmodel_gone";
-        let key = format!("{agent}:{model}");
-
-        assert!(!is_model_in_cooldown(agent, model));
-        record_model_permanently_gone(agent, model).await;
-        assert!(is_model_in_cooldown(agent, model));
-
-        let remaining = cooldown_until(&key)
-            .map(|u| u - chrono::Utc::now().timestamp())
-            .expect("cooldown should exist");
-        // Should be ~7 days (max), not 4h (base)
-        let seven_days = PERSISTENT_MODEL_BACKOFF_MAX_SECS;
-        assert!(
-            remaining >= seven_days - 5,
-            "permanently-gone cooldown should be ~7d, got {remaining}s"
-        );
     }
 
     #[serial(cooldown_state)]
