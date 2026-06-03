@@ -8,17 +8,16 @@ description = "Daily evening retrospective: accomplishments, failures, routing a
 
 ## What Was Accomplished
 
-Five commits landed before the morning review, all delivering on yesterday's retro priorities:
+Four commits landed today, continuing progress on yesterday's retro priorities:
 
 | Commit | Description |
 |--------|-------------|
-| `992548e7` | fix(router): remove per-task route_defer — strands tasks after cooldowns expire (#3243) |
-| `f94b1da2` | Detect Claude 'session limit' as RateLimit and parse reset timestamp (#3242) |
-| `a89b64b8` | Investigate and fix Codex 'model unavailable' classification → persistent model cooldown (#3241) |
-| `e7b9e958` | feat(opencode): accept @variant suffix and forward via --variant (#3240) |
+| `a5c17466` | refactor(opencode): use --dangerously-skip-permissions instead of XDG config override (#3245) |
+| `c020f6b9` | docs(posts): evening retrospective for 2026-06-03 (#3246) |
+| `8499362c` | docs(posts): morning review for 2026-06-03 (#3244) |
 | `d106b02b` | cleanup jobs |
 
-Service upgraded **v0.74.1 → v0.75.3** automatically. All four retro-flagged priorities from June 2 were delivered.
+Service remained at **v0.75.3** (no new releases today).
 
 ### Tasks Completed Today (Last 12h)
 
@@ -31,7 +30,6 @@ Service upgraded **v0.74.1 → v0.75.3** automatically. All four retro-flagged p
 | internal:151536 | claude/sonnet | Gift radar: upcoming birthdays and holidays |
 | internal:151538 | opencode/mimo | Macro monitor: 0-100 weighted score |
 | internal:151556 | — | Daily morning review |
-| 3238 | — | Add 'changes_pushed' alias to parser.normalize_status |
 
 Self-improvement successfully closed all 4 child issues (#3236–#3239). Trading pipeline ran cleanly. Morning review dispatched and merged on time.
 
@@ -76,7 +74,7 @@ Root cause: the account-level restriction message may not match the cooldown cla
 **Action**: Verify whether `gpt-5.3-codex` is accumulating a failure count. If the error isn't triggering `ModelUnavailable`, it needs to be added to the classifier.
 
 ### 3. Multi-Agent Degradation: kimi + minimax + olm
-At 12:30 UTC, `sync.rs` logged: `multi-agent degradation detected — degraded_count=3 ["kimi", "minimax", "olm"]`. Active cooldowns at retrospective time:
+At approximately 12:30 UTC, `sync.rs` logged: `multi-agent degradation detected — degraded_count=3 ["kimi", "minimax", "olm"]`. Active cooldowns at retrospective time:
 
 | Agent | Remaining | Reason |
 |-------|-----------|--------|
@@ -169,5 +167,4 @@ Self-improvement parent task (internal:151442) remains blocked despite all 4 chi
 9. **Empty-branch tasks entering review loop** — internal:151553 is stuck because the agent produced no file changes. Review should detect zero commits and mark done, not loop indefinitely.
 
 ---
-
 Prepared by Orch automation (internal:151555)
