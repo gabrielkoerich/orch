@@ -222,7 +222,7 @@ pub fn parse_pool_entry(entry: &str) -> (String, String) {
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
-            mode: "llm".to_string(),
+            mode: "round_robin".to_string(),
             router_agent: "claude".to_string(),
             router_model: "claude-haiku-4-5-20251001".to_string(),
             timeout_seconds: 45,
@@ -434,37 +434,39 @@ impl RouterConfig {
             }
         }
 
+        // Load top-level model shorthand from config (models.{agent}).
+        //
+        // These candidates apply to every complexity tier by default. More
+        // specific model_map.{complexity}.{agent} entries below override the
+        // shorthand for that one tier.
+        let known_agents = crate::engine::configured_agents();
+        let known_complexities = ["simple", "medium", "complex", "review"];
+        for agent in &known_agents {
+            let key = format!("models.{agent}");
+            if let Some(models) = Self::read_model_pool_from_config(&key) {
+                for complexity in known_complexities {
+                    config
+                        .model_map
+                        .entry(complexity.to_string())
+                        .or_default()
+                        .insert(agent.to_string(), models.clone());
+                }
+            }
+        }
+
         // Load model_map overrides from config (model_map.{complexity}.{agent})
         // Value may be a single string ("model-name") or a JSON array (["m1","m2"]).
         // Iterate over all known complexity tiers regardless of what is in model_map —
         // the Default impl has no hardcoded entries, so iterating over keys() would be a no-op.
-        let known_agents = crate::engine::configured_agents();
-        let known_complexities = ["simple", "medium", "complex", "review"];
         for complexity in known_complexities {
             for agent in &known_agents {
                 let key = format!("model_map.{complexity}.{agent}");
-                // Try as list first (YAML arrays), fall back to single string
-                if let Ok(list) = crate::config::get_list(&key) {
-                    if !list.is_empty() {
-                        let normalized: Vec<String> = list
-                            .iter()
-                            .map(|m| RouterConfig::normalize_model_identifier(m))
-                            .collect();
-                        config
-                            .model_map
-                            .entry(complexity.to_string())
-                            .or_default()
-                            .insert(agent.to_string(), normalized);
-                    }
-                } else if let Ok(val) = crate::config::get(&key) {
-                    if !val.is_empty() {
-                        let normalized = RouterConfig::normalize_model_identifier(&val);
-                        config
-                            .model_map
-                            .entry(complexity.to_string())
-                            .or_default()
-                            .insert(agent.to_string(), vec![normalized]);
-                    }
+                if let Some(models) = Self::read_model_pool_from_config(&key) {
+                    config
+                        .model_map
+                        .entry(complexity.to_string())
+                        .or_default()
+                        .insert(agent.to_string(), models);
                 }
             }
         }
@@ -589,6 +591,24 @@ impl RouterConfig {
     /// a model string might have been incorrectly formatted.
     pub fn normalize_model_identifier(model: &str) -> String {
         model.trim_end_matches('/').to_string()
+    }
+
+    fn read_model_pool_from_config(key: &str) -> Option<Vec<String>> {
+        if let Ok(list) = crate::config::get_list(key) {
+            if !list.is_empty() {
+                return Some(
+                    list.iter()
+                        .map(|m| RouterConfig::normalize_model_identifier(m))
+                        .collect(),
+                );
+            }
+        } else if let Ok(val) = crate::config::get(key) {
+            if !val.is_empty() {
+                return Some(vec![RouterConfig::normalize_model_identifier(&val)]);
+            }
+        }
+
+        None
     }
 
     fn expanded_model_pool(&self, agent: &str, complexity: &str) -> Option<Vec<String>> {
@@ -1038,6 +1058,106 @@ model_map:
         assert_eq!(
             config.model_for_complexity("claude", "simple", "test-task"),
             Some("haiku".to_string()),
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn from_config_loads_models_shorthand_for_all_complexities() {
+        let _lock = cwd_mutex().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".orch.yml"),
+            r#"
+agents:
+  - shorthand
+models:
+  shorthand:
+    - gpt-5.2
+    - gpt-5.5
+"#,
+        )
+        .unwrap();
+        let _guard = CurrentDirGuard::set(dir.path());
+
+        let config = RouterConfig::from_config();
+
+        for complexity in ["simple", "medium", "complex", "review"] {
+            assert_eq!(
+                config.model_map[complexity]["shorthand"],
+                vec!["gpt-5.2".to_string(), "gpt-5.5".to_string()],
+                "models.shorthand should populate {complexity}"
+            );
+        }
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn from_config_loads_single_model_shorthand_for_all_complexities() {
+        let _lock = cwd_mutex().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".orch.yml"),
+            r#"
+agents:
+  - shorthand
+models:
+  shorthand: gpt-5.2
+"#,
+        )
+        .unwrap();
+        let _guard = CurrentDirGuard::set(dir.path());
+
+        let config = RouterConfig::from_config();
+
+        for complexity in ["simple", "medium", "complex", "review"] {
+            assert_eq!(
+                config.model_map[complexity]["shorthand"],
+                vec!["gpt-5.2".to_string()],
+                "models.shorthand should populate {complexity}"
+            );
+        }
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn from_config_model_map_overrides_models_shorthand_per_tier() {
+        let _lock = cwd_mutex().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".orch.yml"),
+            r#"
+agents:
+  - shorthand
+models:
+  shorthand:
+    - gpt-5.2
+    - gpt-5.5
+model_map:
+  review:
+    shorthand: gpt-5.6-review
+"#,
+        )
+        .unwrap();
+        let _guard = CurrentDirGuard::set(dir.path());
+
+        let config = RouterConfig::from_config();
+
+        assert_eq!(
+            config.model_map["simple"]["shorthand"],
+            vec!["gpt-5.2".to_string(), "gpt-5.5".to_string()]
+        );
+        assert_eq!(
+            config.model_map["medium"]["shorthand"],
+            vec!["gpt-5.2".to_string(), "gpt-5.5".to_string()]
+        );
+        assert_eq!(
+            config.model_map["complex"]["shorthand"],
+            vec!["gpt-5.2".to_string(), "gpt-5.5".to_string()]
+        );
+        assert_eq!(
+            config.model_map["review"]["shorthand"],
+            vec!["gpt-5.6-review".to_string()]
         );
     }
 
