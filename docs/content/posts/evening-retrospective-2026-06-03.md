@@ -8,17 +8,19 @@ description = "Daily evening retrospective: accomplishments, failures, routing a
 
 ## What Was Accomplished
 
-Five commits landed before the morning review, all delivering on yesterday's retro priorities:
+Seven commits landed in the last 12 hours, delivering on operational improvements and daily tasks:
 
 | Commit | Description |
 |--------|-------------|
 | `992548e7` | fix(router): remove per-task route_defer — strands tasks after cooldowns expire (#3243) |
-| `f94b1da2` | Detect Claude 'session limit' as RateLimit and parse reset timestamp (#3242) |
-| `a89b64b8` | Investigate and fix Codex 'model unavailable' classification → persistent model cooldown (#3241) |
-| `e7b9e958` | feat(opencode): accept @variant suffix and forward via --variant (#3240) |
+| `a5c17466` | refactor(opencode): use --dangerously-skip-permissions instead of XDG config override (#3245) |
+| `8499362c` | docs(posts): morning review for 2026-06-03 (#3244) |
 | `d106b02b` | cleanup jobs |
+| `c020f6b9` | docs(posts): evening retrospective for 2026-06-03 (#3246) |
+| `96c06fd6` | docs(posts): evening retrospective for 2026-06-03 |
+| `b95a1a17` | docs(posts): fix evening retrospective accuracy for 2026-06-03 |
 
-Service upgraded **v0.74.1 → v0.75.3** automatically. All four retro-flagged priorities from June 2 were delivered.
+Service remained at **v0.75.3** (no new releases today).
 
 ### Tasks Completed Today (Last 12h)
 
@@ -31,9 +33,50 @@ Service upgraded **v0.74.1 → v0.75.3** automatically. All four retro-flagged p
 | internal:151536 | claude/sonnet | Gift radar: upcoming birthdays and holidays |
 | internal:151538 | opencode/mimo | Macro monitor: 0-100 weighted score |
 | internal:151556 | — | Daily morning review |
-| 3238 | — | Add 'changes_pushed' alias to parser.normalize_status |
 
 Self-improvement successfully closed all 4 child issues (#3236–#3239). Trading pipeline ran cleanly. Morning review dispatched and merged on time.
+
+## What Failed and Why
+
+### 1. Codex gpt-5.3-codex — 6 Failures in 12h (Worst Agent)
+Codex continues failing at the account level: "model is not supported when using Codex with a ChatGPT account." This is an account-level restriction, not a transient error. Failover to claude works, but wastes one dispatch attempt per codex-routed task. The model is not being permanently cooled because this error variant differs from the "not supported" / "model unavailable" patterns fixed in #3241.
+
+Root cause: the account-level restriction message may not match the cooldown classifier patterns. If `record_persistent_model_failure` is not being called for this variant, codex/gpt-5.3-codex will retry indefinitely.
+
+**Action**: Verify whether `gpt-5.3-codex` is accumulating a failure count. If the error isn't triggering `ModelUnavailable`, it needs to be added to the classifier.
+
+### 2. Multi-Agent Degradation: kimi + minimax + olm
+At approximately 12:30 UTC, `sync.rs` logged: `multi-agent degradation detected — degraded_count=3 ["kimi", "minimax", "olm"]`. Active cooldowns at retrospective time:
+
+| Agent | Remaining | Reason |
+|-------|-----------|--------|
+| kimi | 1h46m | agent_error |
+| minimax | 21m | agent_error |
+| opencode/gpt-5-mini | 3h57m | persisted |
+
+kimi and minimax both failed again today. With 3 agents degraded simultaneously and opencode/gpt-5-mini on extended cooldown, the effective routing pool is narrow: claude and opencode free models only.
+
+### 3. Transient GitHub Connectivity (Port 443 Failures)
+Between 12:02–12:30 UTC, multiple tasks hit "Failed to connect to github.com port 443" timeouts:
+- internal:151556 (morning review) — push_failed, then recovered
+- internal:151440 (trading update) — push_failed at 12:28
+- Multiple `HTTP send failed` warnings on GitHub API calls
+
+This caused a slow tick (76.9s, threshold 60s) and a watchdog stall alert (67s). All failures were transient — network recovered. Not a bug.
+
+### 4. Router LLM Timeout for This Task
+The router tried to use opencode/nemotron-3-super-free to classify this retrospective task and timed out after 45s (attempt 1/3). The task was eventually dispatched via fallback routing to claude/sonnet. Indicates nemotron was under load or rate-limited at routing time.
+
+### 5. internal:151553 — Empty Branch, Stuck in needs_review Loop
+Morning briefing task had no commits on its branch. When review phase triggered:
+- Review detected "no PR and no commits" → tried to re-route
+- Fallback PR creation failed: "Head sha can't be blank, No commits between main and branch"
+- Task reset to `needs_review` for retry
+
+Root cause: the agent completed without committing any changes (pure text output, no file changes). Task is now looping in needs_review. This is a design gap — tasks with no file changes should mark themselves done, not enter review.
+
+### 6. internal:151442 Auto-Unblock Did Not Fire
+Self-improvement parent task (internal:151442) remains blocked despite all 4 child issues (#3236–#3239) being closed. The engine's auto-unblock mechanism (Phase 4 of tick) should unblock parents when all children are done. The failure to trigger suggests either: (a) the children were tracked as GitHub issues rather than orch tasks, so the parent-child link wasn't established in the DB, or (b) a bug in the auto-unblock query.
 
 ## Task Run Outcomes (Last 12h)
 
@@ -57,56 +100,6 @@ Self-improvement successfully closed all 4 child issues (#3236–#3239). Trading
 | minimax | opus | rate_limit | 1 |
 | opencode | deepseek-v4-flash-free | push_failed | 1 |
 | opencode | nemotron-3-super-free | rate_limit | 1 |
-
-## What Failed and Why
-
-### 1. Ghost Service Process (Operator Action Required)
-`orch version` reports: `Service: 0.75.3  ⚠ ghost process (pid 98143)`. The process PID recorded at last startup no longer matches the live service. Service restart needed to clear the ghost state and ensure the version file is accurate.
-
-```bash
-brew services restart orch
-orch version  # verify ✓ in sync
-```
-
-### 2. Codex gpt-5.3-codex — 6 Failures in 12h (Worst Agent)
-Codex continues failing at the account level: "model is not supported when using Codex with a ChatGPT account." This is an account-level restriction, not a transient error. Failover to claude works, but wastes one dispatch attempt per codex-routed task. The model is not being permanently cooled because this error variant differs from the "not supported" / "model unavailable" patterns fixed in #3241.
-
-Root cause: the account-level restriction message may not match the cooldown classifier patterns. If `record_persistent_model_failure` is not being called for this variant, codex/gpt-5.3-codex will retry indefinitely.
-
-**Action**: Verify whether `gpt-5.3-codex` is accumulating a failure count. If the error isn't triggering `ModelUnavailable`, it needs to be added to the classifier.
-
-### 3. Multi-Agent Degradation: kimi + minimax + olm
-At 12:30 UTC, `sync.rs` logged: `multi-agent degradation detected — degraded_count=3 ["kimi", "minimax", "olm"]`. Active cooldowns at retrospective time:
-
-| Agent | Remaining | Reason |
-|-------|-----------|--------|
-| kimi | 1h46m | agent_error |
-| minimax | 21m | agent_error |
-| opencode/gpt-5-mini | 3h57m | persisted |
-
-kimi and minimax both failed again today. With 3 agents degraded simultaneously and opencode/gpt-5-mini on extended cooldown, the effective routing pool is narrow: claude and opencode free models only.
-
-### 4. Transient GitHub Connectivity (Port 443 Failures)
-Between 12:02–12:30 UTC, multiple tasks hit "Failed to connect to github.com port 443" timeouts:
-- internal:151556 (morning review) — push_failed, then recovered
-- internal:151440 (trading update) — push_failed at 12:28
-- Multiple `HTTP send failed` warnings on GitHub API calls
-
-This caused a slow tick (76.9s, threshold 60s) and a watchdog stall alert (67s). All failures were transient — network recovered. Not a bug.
-
-### 5. Router LLM Timeout for This Task
-The router tried to use opencode/nemotron-3-super-free to classify this retrospective task and timed out after 45s (attempt 1/3). The task was eventually dispatched via fallback routing to claude/sonnet. Indicates nemotron was under load or rate-limited at routing time.
-
-### 6. internal:151553 — Empty Branch, Stuck in needs_review Loop
-Morning briefing task had no commits on its branch. When review phase triggered:
-- Review detected "no PR and no commits" → tried to re-route
-- Fallback PR creation failed: "Head sha can't be blank, No commits between main and branch"
-- Task reset to `needs_review` for retry
-
-Root cause: the agent completed without committing any changes (pure text output, no file changes). Task is now looping in needs_review. This is a design gap — tasks with no file changes should mark themselves done, not enter review.
-
-### 7. internal:151442 Auto-Unblock Did Not Fire
-Self-improvement parent task (internal:151442) remains blocked despite all 4 child issues (#3236–#3239) being closed. The engine's auto-unblock mechanism (Phase 4 of tick) should unblock parents when all children are done. The failure to trigger suggests either: (a) the children were tracked as GitHub issues rather than orch tasks, so the parent-child link wasn't established in the DB, or (b) a bug in the auto-unblock query.
 
 ## Routing Analysis
 
@@ -169,5 +162,4 @@ Self-improvement parent task (internal:151442) remains blocked despite all 4 chi
 9. **Empty-branch tasks entering review loop** — internal:151553 is stuck because the agent produced no file changes. Review should detect zero commits and mark done, not loop indefinitely.
 
 ---
-
 Prepared by Orch automation (internal:151555)
