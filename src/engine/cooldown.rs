@@ -13,9 +13,9 @@
 //! When a rate limit includes a "try again at {date}" message, the cooldown
 //! is set to that specific timestamp instead of the default duration.
 
+use chrono::TimeZone;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-use chrono::TimeZone;
 
 /// Default fallback cooldown for agents when no store is available: 30 minutes.
 ///
@@ -1190,7 +1190,11 @@ fn parse_retry_at(error_message: &str) -> Option<i64> {
             // attempt to parse a time-only and interpret it as the next
             // occurrence of that time in the local timezone.
             // Strip parenthesised timezone hints like "(America/Sao_Paulo)".
-            let time_only = date_str.split_once('(').map(|(t, _)| t).unwrap_or(date_str).trim();
+            let time_only = date_str
+                .split_once('(')
+                .map(|(t, _)| t)
+                .unwrap_or(date_str)
+                .trim();
             for tf in &["%I:%M %p", "%I:%M%p", "%I %p", "%H:%M"] {
                 if let Ok(t) = chrono::NaiveTime::parse_from_str(time_only, tf) {
                     // Build a NaiveDateTime for today at that time, then choose
@@ -1200,22 +1204,25 @@ fn parse_retry_at(error_message: &str) -> Option<i64> {
                     let candidate = chrono::NaiveDateTime::new(today, t);
                     // Use the TimeZone trait methods; annotate types so the
                     // compiler can infer the concrete DateTime types.
-                    let candidate_local: chrono::DateTime<chrono::Local> = match chrono::Local.from_local_datetime(&candidate) {
-                        chrono::LocalResult::Single(dt) => dt,
-                        chrono::LocalResult::Ambiguous(earliest, _) => earliest,
-                        chrono::LocalResult::None => {
-                            // DST gap — fall back to UTC interpretation
-                            let utc_dt = candidate.and_utc();
-                            return Some(utc_dt.timestamp());
-                        }
-                    };
+                    let candidate_local: chrono::DateTime<chrono::Local> =
+                        match chrono::Local.from_local_datetime(&candidate) {
+                            chrono::LocalResult::Single(dt) => dt,
+                            chrono::LocalResult::Ambiguous(earliest, _) => earliest,
+                            chrono::LocalResult::None => {
+                                // DST gap — fall back to UTC interpretation
+                                let utc_dt = candidate.and_utc();
+                                return Some(utc_dt.timestamp());
+                            }
+                        };
                     let chosen = if candidate_local <= local_now {
                         // Use tomorrow
                         let tomorrow = today.succ_opt().unwrap_or(today);
                         let ndt = chrono::NaiveDateTime::new(tomorrow, t);
                         match chrono::Local.from_local_datetime(&ndt) {
                             chrono::LocalResult::Single(dt) => dt.with_timezone(&chrono::Utc),
-                            chrono::LocalResult::Ambiguous(earliest, _) => earliest.with_timezone(&chrono::Utc),
+                            chrono::LocalResult::Ambiguous(earliest, _) => {
+                                earliest.with_timezone(&chrono::Utc)
+                            }
                             chrono::LocalResult::None => ndt.and_utc(),
                         }
                     } else {
