@@ -8,7 +8,7 @@ description = "Daily evening retrospective: accomplishments, failures, routing a
 
 ## What Was Accomplished
 
-Six commits landed in the last 12 hours, delivering on operational improvements and daily tasks:
+Seven commits landed in the last 12 hours, delivering on operational improvements and daily tasks:
 
 | Commit | Description |
 |--------|-------------|
@@ -18,6 +18,7 @@ Six commits landed in the last 12 hours, delivering on operational improvements 
 | `d106b02b` | cleanup jobs |
 | `c020f6b9` | docs(posts): evening retrospective for 2026-06-03 (#3246) |
 | `96c06fd6` | docs(posts): evening retrospective for 2026-06-03 |
+| `b95a1a17` | docs(posts): fix evening retrospective accuracy for 2026-06-03 |
 
 Service remained at **v0.75.3** (no new releases today).
 
