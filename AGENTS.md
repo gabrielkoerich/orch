@@ -553,6 +553,28 @@ Per-call timeouts are already enforced by `router.timeout_seconds`. If a route c
 
 If routing is too slow: lower `router.timeout_seconds`, or reduce `router.max_tasks_per_tick`. Do not add a third concurrency mechanism.
 
+### No per-task routing defer — `AllAgentsCooledError` must retry next tick, not write a timer
+
+There must be **zero per-task deferral state** anywhere in the routing path. No `route_defer_until:*` KV keys, no `route_defer_key()` / `compute_route_defer_secs()` / `route_defer_remaining_secs()` / `set_route_defer_until()` / `clear_route_defer()` helpers, no "back off this task for N seconds because all agents are cooled," no per-task timer of any other name (`route_backoff_until`, `next_route_attempt_at`, `cooled_skip_until`, etc.).
+
+When `router.route()` returns `AllAgentsCooledError`, the **only** correct response in `tick_route_tasks` is:
+
+1. `tracing::error!(...)` — loud, every tick, can't be hidden.
+2. `continue` — task stays in `new`.
+3. Next tick (~10s later), the routing loop tries again.
+
+The agent-level cooldown system in `src/engine/cooldown.rs` is already the single source of truth for "is this agent/model available right now." `available_agents_for_complexity()` filters cooled agents via `is_agent_in_cooldown` / `is_model_in_cooldown` / `is_agent_degraded` *before* any LLM call, so when everything is cooled, `router.route()` returns `AllAgentsCooledError` in microseconds — no tokens, no network, no LLM. There is nothing to "defer" away from.
+
+**Why a parallel timer is wrong**: the defer key was a wall-clock value (`now + remaining_secs / 2`) written into SQLite. It counted down independently of the real cooldowns. Long cooldowns (billing-cycle / out_of_credits at 24h → 7d) produced per-task defers of 12h → 3.5d. When agents became available again — minutes or hours before the defer expired — the task remained stranded in `new` because the unrelated future timestamp hadn't passed. There was no mechanism to recompute the defer when cooldowns shortened or cleared.
+
+Cautionary tale — exactly the mistake never to repeat:
+
+- **PR #3243** removed `route_defer_*` after a live incident in `gabrielkoerich/bean`: `orch cooldown list` reported `No active cooldowns.` while 9 `route_defer_until:*` KV keys held tasks in `new` for hours. Two `gabrielkoerich/orch` tasks (issue #3236 and an internal self-improvement task) hit the same pattern. The defer was guarding against a cost that doesn't exist — `AllAgentsCooledError` returns before any LLM call — and in exchange introduced a timer that drifted out of sync with reality.
+
+If you are tempted to add a "back off this task" timer because the ERROR log is noisy: **stop**. The log volume is the feature. It tells the operator that all agents are unavailable *right now*, every 10s, until the situation resolves. Suppressing it with a per-task timer is how the bug came back. If a specific operational need genuinely requires throttling routing retries: tune `engine.tick_interval`, lower `router.max_tasks_per_tick`, or fix the upstream cooldown duration — never write a parallel timer.
+
+**Do not file issues like "add backoff for AllAgentsCooled", "rate-limit the route_attempts log spam", "remember the last-cooled time per task", or "skip routing for N seconds after an all-cooled event."** They will be closed as invalid.
+
 ### No 'budget' features — agents run on subscription / fixed pricing
 
 There must be **zero "budget" tracking, accounting, or enforcement** anywhere in orch. No per-task token budgets, no per-PR budget warnings, no routing wall-clock budgets, no `llm_budget_secs` / `llm_bypass_*` knobs, no `budget_warning` / `budget_exceeded` columns, no `check_token_budget()` pre-run or post-run, no `TokenBudgetExceeded` failure category, no `BudgetCheckOutcome` enum, no "budget exhausted" cooldown reason.
