@@ -1297,11 +1297,7 @@ pub(crate) mod patterns {
     /// Check for missing worktree / working directory setup failures.
     pub fn detect_worktree_missing(text: &str) -> Option<AgentError> {
         let lower = text.to_lowercase();
-        let patterns = [
-            "worktree directory does not exist",
-            "failed to create opencode config directory",
-            "failed to write opencode config",
-        ];
+        let patterns = ["worktree directory does not exist"];
         if patterns.iter().any(|p| lower.contains(p)) {
             return Some(AgentError::AgentFailed {
                 message: safe_tail(text, 300).to_string(),
@@ -1886,10 +1882,6 @@ mod tests {
             patterns::detect_worktree_missing("worktree directory does not exist: /tmp/wt")
                 .is_some()
         );
-        assert!(patterns::detect_worktree_missing(
-            "failed to create opencode config directory: .orch-opencode/opencode"
-        )
-        .is_some());
         assert!(patterns::detect_worktree_missing("all good").is_none());
     }
 
@@ -2561,16 +2553,25 @@ world"}"#;
             "codex default: --full-auto is deprecated and must not appear, got: {cmd}"
         );
 
-        // OpenCode: should write permission config and override XDG_CONFIG_HOME
+        // OpenCode: autonomous dispatch passes --dangerously-skip-permissions
+        // and writes no config file (relies on opencode's built-in flag).
         let opencode = get_runner("opencode");
         let cmd = opencode.build_command(None, "", sys, msg, &perms);
         assert!(
-            cmd.contains("opencode.json"),
-            "opencode default: should write permission config, got: {cmd}"
+            cmd.contains("--dangerously-skip-permissions"),
+            "opencode default: should pass --dangerously-skip-permissions, got: {cmd}"
         );
         assert!(
-            cmd.contains("XDG_CONFIG_HOME=.orch-opencode"),
-            "opencode default: should set XDG_CONFIG_HOME, got: {cmd}"
+            !cmd.contains("opencode.json"),
+            "opencode default: should not write a config file, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("XDG_CONFIG_HOME"),
+            "opencode default: should not override XDG_CONFIG_HOME, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains(".orch-opencode"),
+            "opencode default: should not reference .orch-opencode, got: {cmd}"
         );
     }
 
