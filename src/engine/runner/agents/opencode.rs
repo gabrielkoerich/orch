@@ -445,30 +445,20 @@ impl AgentRunner for OpenCodeRunner {
             (String::new(), None)
         };
 
-        // OpenCode permission control via XDG_CONFIG_HOME override.
+        // OpenCode autonomous permission control.
         //
-        // We write our own opencode.json to .orch-opencode/opencode/opencode.json
-        // and set XDG_CONFIG_HOME=.orch-opencode so opencode reads ONLY our config,
-        // bypassing the user's global ~/.config/opencode/opencode.json (which has
-        // "edit":"ask" and "external_directory":"ask" that block agent file edits
-        // and git operations on the main repo's .git directory).
-        let config_setup = if permissions.autonomous {
-            let permission_json = translate_permissions_to_opencode(&permissions.allowed_tools);
-            let sq_permission_json = super::shell_single_quote(&permission_json);
-            format!(
-                r#"mkdir -p .orch-opencode/opencode || {{ printf '%s\n' 'failed to create opencode config directory: .orch-opencode/opencode' >&2; exit 1; }}
-printf '%s\n' {sq_permission_json} > .orch-opencode/opencode/opencode.json || {{ printf '%s\n' 'failed to write opencode config: .orch-opencode/opencode/opencode.json' >&2; exit 1; }}
-"#
-            )
-        } else {
-            String::new()
-        };
-
-        // When overriding XDG_CONFIG_HOME to isolate opencode's config, gh CLI
-        // would also look in the override directory and fail to authenticate.
-        // GH_CONFIG_DIR pins gh to its actual config regardless of XDG_CONFIG_HOME.
-        let xdg_prefix = if permissions.autonomous {
-            "XDG_CONFIG_HOME=.orch-opencode GH_CONFIG_DIR=$HOME/.config/gh "
+        // `--dangerously-skip-permissions` auto-approves any tool that isn't
+        // explicitly denied, which is what orch needs for unattended dispatch.
+        // It avoids the user's global ~/.config/opencode/opencode.json defaults
+        // (e.g. "edit":"ask", "external_directory":"ask") that would otherwise
+        // block agent file edits and git operations on the worktree.
+        //
+        // The previously-used .orch-opencode/opencode/opencode.json +
+        // XDG_CONFIG_HOME override is no longer needed: the only `deny` entries
+        // it set were for opencode's interactive-only features (todowrite,
+        // question, codesearch, list) which never fire under `opencode run`.
+        let skip_perms = if permissions.autonomous {
+            "--dangerously-skip-permissions "
         } else {
             ""
         };
@@ -476,15 +466,14 @@ printf '%s\n' {sq_permission_json} > .orch-opencode/opencode/opencode.json || {{
         // Append variant flag when present
         let variant_part = variant_flag.unwrap_or_default();
         format!(
-            r#"{config_setup}cat "{sys_file}" "{msg_file}" | {xdg_prefix}{timeout_cmd} opencode run {model_flag} {variant_part} \
+            r#"cat "{sys_file}" "{msg_file}" | {timeout_cmd} opencode run {model_flag} {variant_part} {skip_perms}\
   --format json -"#,
-            config_setup = config_setup,
-            xdg_prefix = xdg_prefix,
             sys_file = sys_file,
             msg_file = msg_file,
             timeout_cmd = timeout_cmd,
             model_flag = model_flag,
             variant_part = variant_part,
+            skip_perms = skip_perms,
         )
     }
 
@@ -573,26 +562,16 @@ printf '%s\n' {sq_permission_json} > .orch-opencode/opencode/opencode.json || {{
         prompt: &str,
         model: Option<&str>,
     ) -> anyhow::Result<tokio::process::Command> {
-        // Isolate opencode from the user's global config so that interactive
-        // permission defaults (e.g. "edit":"ask") don't trigger PermissionError
-        // events that the router misclassifies as model failures and applies
-        // unnecessary cooldowns to.  We write a deny-all permission config to a
-        // stable temp directory (reused across routing calls) and point
-        // XDG_CONFIG_HOME at it.
-        let config_dir = ensure_router_opencode_config()?;
-
-        // When XDG_CONFIG_HOME is overridden, gh CLI would also look for its
-        // config under the new home and fail to authenticate.  GH_CONFIG_DIR pins
-        // gh to its actual config regardless of XDG_CONFIG_HOME.
-        let gh_config_dir = std::env::var("GH_CONFIG_DIR")
-            .ok()
-            .or_else(|| {
-                dirs::home_dir().map(|h| h.join(".config").join("gh").display().to_string())
-            })
-            .unwrap_or_else(|| String::from("~/.config/gh"));
-
+        // Routing only needs text output — no tools fire.
+        // `--dangerously-skip-permissions` prevents the user's global
+        // ~/.config/opencode/opencode.json interactive defaults (e.g.
+        // "edit":"ask") from producing PermissionError events that the router
+        // would misclassify as model failures.
         let mut cmd = tokio::process::Command::new("opencode");
-        cmd.arg("run").arg("--format").arg("json");
+        cmd.arg("run")
+            .arg("--format")
+            .arg("json")
+            .arg("--dangerously-skip-permissions");
         if let Some(m) = model {
             let (base, variant) = Self::split_model_variant(m);
             cmd.arg("--model").arg(base);
@@ -602,144 +581,8 @@ printf '%s\n' {sq_permission_json} > .orch-opencode/opencode/opencode.json || {{
             }
         }
         cmd.arg(prompt);
-        cmd.env("XDG_CONFIG_HOME", &config_dir);
-        cmd.env("GH_CONFIG_DIR", &gh_config_dir);
         Ok(cmd)
     }
-}
-
-/// A deny-all opencode permission config used for routing invocations.
-///
-/// The router only needs text output — it should never exercise any tools.
-/// Denying all tools prevents interactive permission prompts (e.g. "edit":"ask"
-/// from the user's global config) from producing PermissionError events that
-/// the router misidentifies as model failures.
-///
-/// `external_directory` is kept "allow" for consistency with task-agent configs;
-/// the router doesn't use it, but leaving it "deny" would be harmless too.
-const ROUTER_DENY_ALL_CONFIG: &str = r#"{"permission":{"read":"deny","edit":"deny","glob":"deny","grep":"deny","bash":"deny","task":"deny","skill":"deny","webfetch":"deny","websearch":"deny","list":"deny","todowrite":"deny","todoread":"deny","question":"deny","codesearch":"deny","external_directory":"allow"}}"#;
-
-/// Return the path to the router opencode config directory, creating it and
-/// writing the deny-all config if needed.
-///
-/// Uses a stable path under the system temp directory so it persists across
-/// routing calls without needing a `TempDir` lifetime.  The directory and file
-/// are created idempotently — concurrent calls are safe because `write` is
-/// atomic on every supported platform for small files.
-fn ensure_router_opencode_config() -> anyhow::Result<std::path::PathBuf> {
-    let dir = std::env::temp_dir()
-        .join("orch-router-opencode")
-        .join("opencode");
-    std::fs::create_dir_all(&dir).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to create router opencode config dir {}: {e}",
-            dir.display()
-        )
-    })?;
-
-    let config_file = dir.join("opencode.json");
-    std::fs::write(&config_file, ROUTER_DENY_ALL_CONFIG).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to write router opencode config {}: {e}",
-            config_file.display()
-        )
-    })?;
-
-    // Return the parent of the "opencode" subdirectory — that is the value to
-    // set as XDG_CONFIG_HOME so opencode finds opencode/opencode.json inside it.
-    Ok(dir
-        .parent()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "router opencode config dir has no parent: {}",
-                dir.display()
-            )
-        })?
-        .to_path_buf())
-}
-
-/// Map from unified allowed_tools names to OpenCode permission keys.
-const TOOL_TO_OPENCODE: &[(&str, &str)] = &[
-    ("Edit", "edit"),
-    ("Write", "edit"),
-    ("Read", "read"),
-    ("Bash", "bash"),
-    ("Grep", "grep"),
-    ("Glob", "glob"),
-    ("WebFetch", "webfetch"),
-    ("WebSearch", "websearch"),
-    ("Task", "task"),
-    ("Skill", "skill"),
-];
-
-/// All OpenCode permission keys that can be controlled.
-const OPENCODE_PERMISSION_KEYS: &[&str] = &[
-    "read",
-    "edit",
-    "glob",
-    "grep",
-    "bash",
-    "task",
-    "skill",
-    "webfetch",
-    "websearch",
-    "list",
-    "todowrite",
-    "todoread",
-    "question",
-    "codesearch",
-    // Allow access to files outside the worktree (e.g. git's main repo .git dir
-    // which is referenced by the worktree's .git symlink for fetch/push operations).
-    "external_directory",
-];
-
-/// Translate allowed_tools into an OpenCode config JSON string.
-///
-/// Maps Claude tool names to OpenCode permission keys.
-/// Tools in the allowed list get "allow", others get "deny".
-/// CLI commands (git, npm, etc.) are covered by the "bash" permission.
-pub(crate) fn translate_permissions_to_opencode(allowed_tools: &[String]) -> String {
-    if allowed_tools.is_empty() {
-        // No restrictions: allow everything
-        return r#"{"permission":"allow"}"#.to_string();
-    }
-
-    // Collect which opencode keys should be "allow"
-    let mut allowed_keys: Vec<&str> = Vec::new();
-    for tool in allowed_tools {
-        for (from, to) in TOOL_TO_OPENCODE {
-            if tool == *from && !allowed_keys.contains(to) {
-                allowed_keys.push(to);
-            }
-        }
-        // CLI commands (lowercase) are all bash commands
-        if tool
-            .chars()
-            .next()
-            .map(|c| c.is_lowercase())
-            .unwrap_or(false)
-            && !allowed_keys.contains(&"bash")
-        {
-            allowed_keys.push("bash");
-        }
-    }
-
-    // Build permission object
-    let mut entries = Vec::new();
-    for key in OPENCODE_PERMISSION_KEYS {
-        let action = if *key == "external_directory" {
-            // Always allow external directory access — agents need this for git
-            // operations that touch the main repo's .git directory from a worktree.
-            "allow"
-        } else if allowed_keys.contains(key) {
-            "allow"
-        } else {
-            "deny"
-        };
-        entries.push(format!(r#""{key}":"{action}""#));
-    }
-
-    format!(r#"{{"permission":{{{}}}}}"#, entries.join(","))
 }
 
 /// Classify an OpenCode error message.
@@ -1291,18 +1134,43 @@ mod tests {
         assert!(cmd.contains("opencode run"));
         assert!(cmd.contains("--model 'anthropic/claude-sonnet-4-20250514'"));
         assert!(cmd.contains("--format json"));
-        // Autonomous mode should write permission config and set XDG_CONFIG_HOME
+        // Autonomous mode passes --dangerously-skip-permissions instead of
+        // writing a config file or overriding XDG_CONFIG_HOME.
         assert!(
-            cmd.contains("opencode.json"),
-            "expected permission config setup, got: {cmd}"
+            cmd.contains("--dangerously-skip-permissions"),
+            "expected --dangerously-skip-permissions, got: {cmd}"
         );
         assert!(
-            cmd.contains("XDG_CONFIG_HOME=.orch-opencode"),
-            "expected XDG_CONFIG_HOME override, got: {cmd}"
+            !cmd.contains("opencode.json"),
+            "should not write a config file, got: {cmd}"
         );
         assert!(
-            cmd.contains("GH_CONFIG_DIR=$HOME/.config/gh"),
-            "expected GH_CONFIG_DIR to preserve gh auth, got: {cmd}"
+            !cmd.contains("XDG_CONFIG_HOME"),
+            "should not override XDG_CONFIG_HOME, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains(".orch-opencode"),
+            "should not reference .orch-opencode, got: {cmd}"
+        );
+    }
+
+    #[test]
+    fn build_command_opencode_supervised_no_skip_flag() {
+        let r = runner();
+        let perms = PermissionRules {
+            autonomous: false,
+            ..PermissionRules::default()
+        };
+        let cmd = r.build_command(
+            Some("anthropic/claude-sonnet-4-20250514"),
+            "timeout 1800",
+            "/tmp/sys.txt",
+            "/tmp/msg.txt",
+            &perms,
+        );
+        assert!(
+            !cmd.contains("--dangerously-skip-permissions"),
+            "supervised mode must not pass --dangerously-skip-permissions, got: {cmd}"
         );
     }
 
@@ -1347,101 +1215,6 @@ mod tests {
         );
         assert!(cmd.contains("--model 'openai/gpt-5.5'"));
         assert!(cmd.contains("--variant 'high'"));
-    }
-
-    #[test]
-    fn translate_permissions_with_allowed_tools() {
-        let tools = vec![
-            "Edit".to_string(),
-            "Read".to_string(),
-            "Bash".to_string(),
-            "Grep".to_string(),
-            "git".to_string(), // CLI command → "bash" key
-        ];
-        let json = translate_permissions_to_opencode(&tools);
-        assert!(
-            json.contains(r#""edit":"allow""#),
-            "Edit should map to edit:allow"
-        );
-        assert!(
-            json.contains(r#""read":"allow""#),
-            "Read should map to read:allow"
-        );
-        assert!(
-            json.contains(r#""bash":"allow""#),
-            "Bash should map to bash:allow"
-        );
-        assert!(
-            json.contains(r#""grep":"allow""#),
-            "Grep should map to grep:allow"
-        );
-        // Tools not in allowed list should be denied
-        assert!(
-            json.contains(r#""webfetch":"deny""#),
-            "webfetch should be deny"
-        );
-        assert!(
-            json.contains(r#""websearch":"deny""#),
-            "websearch should be deny"
-        );
-    }
-
-    /// Test with the full real tool list from workflow.allowed_tools config.
-    #[test]
-    fn translate_permissions_full_config_list() {
-        let tools: Vec<String> = vec![
-            "Edit",
-            "Write",
-            "Read",
-            "Bash",
-            "Grep",
-            "Glob",
-            "WebFetch",
-            "WebSearch",
-            "Task",
-            "Skill",
-            "yq",
-            "jq",
-            "bash",
-            "just",
-            "git",
-            "rg",
-            "sed",
-            "awk",
-            "python3",
-            "node",
-            "npm",
-            "bun",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
-
-        let json = translate_permissions_to_opencode(&tools);
-
-        // All major permissions should be allowed
-        for key in &[
-            "edit",
-            "read",
-            "bash",
-            "grep",
-            "glob",
-            "webfetch",
-            "websearch",
-            "task",
-            "skill",
-        ] {
-            assert!(
-                json.contains(&format!(r#""{key}":"allow""#)),
-                "{key} should be allow, got: {json}"
-            );
-        }
-    }
-
-    #[test]
-    fn translate_permissions_empty_allows_all() {
-        let json = translate_permissions_to_opencode(&[]);
-        assert_eq!(json, r#"{"permission":"allow"}"#);
     }
 
     #[test]
