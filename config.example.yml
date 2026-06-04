@@ -94,8 +94,8 @@ router:
     - git-worktree
 
 # Simple model config. Each agent's candidates are used for simple, medium,
-# complex, and review tasks. When multiple candidates are listed, orch selects
-# uniformly across available non-cooled models.
+# complex, and review tasks. When multiple candidates are listed, orch picks
+# one based on the router mode and skips cooled / unavailable models.
 models:
   claude: haiku
   codex: gpt-5.2-codex
