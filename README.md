@@ -72,53 +72,26 @@ The service automatically:
 
 ## GitHub Authentication
 
-Orch requires GitHub authentication to sync with issues and create PRs. Three methods are supported:
+Orch needs a GitHub token to sync issues and open PRs. The simplest setup is `gh auth login` — no extra config needed.
 
-### Personal Access Token (Recommended for individuals)
+Tokens are resolved in this order (first match wins):
 
-```bash
-# Set as environment variable
-export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
+1. `GH_TOKEN` environment variable
+2. `GITHUB_TOKEN` environment variable
+3. `gh.auth.token` in `~/.orch/config.yml`
+4. `gh auth token` CLI (enabled by default via `gh.allow_gh_fallback: true`)
 
-# Or configure in ~/.orch/config.yml
-gh:
-  auth:
-    token: "ghp_xxxxxxxxxxxxxxxxxxxx"
-```
-
-### GitHub App (Recommended for organizations)
-
-Better audit trails and scoped permissions for team automation:
+For organizations, GitHub App auth is supported:
 
 ```yaml
+# ~/.orch/config.yml
 github:
   token_mode: github_app
   app_id: "123456"
   private_key_path: "/path/to/app-private-key.pem"
 ```
 
-Orch automatically generates JWTs and refreshes installation tokens before expiry.
-
-### gh CLI (Default fallback)
-
-The simplest setup — just authenticate once and everything works:
-
-```bash
-gh auth login
-```
-
-Orch calls `gh auth token` automatically when `GH_TOKEN`/`GITHUB_TOKEN` are not set.
-This fallback is enabled by default (`gh.allow_gh_fallback: true`).
-
-To disable it (enforce explicit token configuration):
-
-```yaml
-# ~/.orch/config.yml
-gh:
-  allow_gh_fallback: false
-```
-
-See [Configuration](#configuration) for details and run `orch auth check` to verify your setup.
+Orch generates JWTs from the private key (valid for 9 minutes) and caches the installation token until expiry.
 
 ### Security: Service Deployments (Homebrew / launchd)
 
@@ -181,10 +154,12 @@ orch task close <id> --note "msg"  # Mark done with a comment
 ### Project Management
 
 ```bash
-orch project list             # List all registered projects
-orch project add              # Register current directory as a project
-orch project add /path/to/dir # Register a specific project path
-orch project remove /path     # Unregister a project
+orch project list                        # List all registered projects
+orch project add .                       # Register current directory
+orch project add /path/to/repo           # Register a local path
+orch project add owner/repo              # Bare clone + import issues
+orch project add https://github.com/o/r  # Same, from a URL
+orch project remove /path                # Unregister a project
 ```
 
 ### GitHub Projects V2 Board
@@ -214,12 +189,23 @@ orch job tick                 # Run one scheduler tick (for testing)
 orch init                     # Initialize orch for current project
 orch init --repo owner/repo   # Initialize with specific repo
 orch agents                   # List installed agent CLIs
-orch metrics                  # Show task metrics summary (24h)
+orch dashboard                # Full dashboard view (tasks, sessions, activity)
+orch metrics                  # Show task metrics summary
+orch cost                     # Cost tracking and token usage
+orch stats                    # Throughput / per-project rollups
+orch events                   # Tail task events live
 orch stream                   # Stream ALL running agent sessions
 orch stream <task_id>         # Stream a single task
 orch log                      # Show last 50 log lines
 orch log 100                  # Show last N lines
 orch log watch                # Tail logs live
+orch doctor                   # Diagnose SQLite ↔ GitHub drift
+orch prune                    # Remove orphaned worktrees
+orch cooldown list            # Show active agent/model cooldowns
+orch cooldown clear <key>     # Clear a specific cooldown
+orch webhook status           # Show webhook server health
+orch session export <id>      # Export a task's session
+orch notify "message"         # Send a Telegram notification
 orch version                  # Show version
 orch config <key>             # Read config value (e.g., orch config gh.repo)
 orch completions <shell>      # Generate shell completions (bash, zsh, fish)
@@ -268,10 +254,13 @@ workflow:
   timeout_seconds: 1800
 
 router:
-  mode: "llm"              # "llm" (default) or "round_robin"
+  mode: "llm"              # "llm" | "round_robin" | "local" (Ollama)
   agent: "claude"          # which LLM performs routing
   model: "haiku"           # fast/cheap model for classification
   timeout_seconds: 60
+  max_route_attempts: 3    # LLM failures before falling back to round-robin
+  max_tasks_per_tick: 1    # max routing decisions per engine tick
+  weighted_round_robin: false
   fallback_executor: "codex"
 
 model_map:
@@ -288,12 +277,13 @@ model_map:
     claude: sonnet
     codex: gpt-5.2
 
+# Agent CLIs to discover in $PATH
 agents:
-  claude:
-    allowed_tools: [...]   # Claude Code tool allowlist
-  opencode:
-    permission: { ... }    # OpenCode permission config
-    models: [...]          # Available models
+  - claude
+  - codex
+  - opencode
+  - kimi
+  - minimax
 
 git:
   name: "orch[bot]"
@@ -378,7 +368,7 @@ src/
 ├── control.rs           # Control session (orch chat) — context assembly, agent invocation
 ├── config/
 │   └── mod.rs           # Config loading, hot-reload, multi-project
-├── store.rs             # Unified SQLite task store (tasks, metrics, KV, rate limits)
+├── store/               # Unified SQLite task store (tasks, metrics, KV, rate limits)
 ├── parser.rs            # Agent response normalization
 ├── cron.rs              # Cron expression matching
 ├── template.rs          # Template rendering
@@ -435,7 +425,7 @@ src/
         ├── context.rs   # Prompt context building
         ├── worktree.rs  # Git worktree management
         ├── agent.rs     # Agent invocation + prompt building
-        ├── agents/      # Per-agent runners (Claude, Codex, OpenCode)
+        ├── agents/      # Per-agent runners (Claude, Codex, OpenCode, Kimi, MiniMax)
         ├── response.rs  # Response parsing, weight signals
         ├── response_handler.rs # Success path: commit, push, PR
         ├── fallback.rs  # Error classification and recovery strategies
@@ -490,8 +480,9 @@ Install nextest: `cargo binstall cargo-nextest` (requires [cargo-binstall](https
 
 ## Documentation
 
-- [AGENTS.md](AGENTS.md) — Agent and developer notes
+- [AGENTS.md](AGENTS.md) — Agent and developer notes (also exposed as `CLAUDE.md` via symlink)
 - [docs/architecture.md](docs/architecture.md) — System architecture and diagrams
+- [docs/content/](docs/content/) — User-facing reference: getting started, CLI, configuration, routing, jobs, channels, agents, alerting, GitHub sync, workflow
 
 ## License
 

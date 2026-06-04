@@ -1,10 +1,10 @@
 +++
-title = "Channels — Telegram & Discord"
-description = "Set up and operate the Telegram and Discord integrations"
+title = "Channels — Telegram, Discord & Slack"
+description = "Set up and operate the Telegram, Discord, and Slack integrations"
 weight = 8
 +++
 
-Orch supports bidirectional communication via Telegram and Discord. Both channels receive incoming commands and stream task completion notifications back to you.
+Orch supports bidirectional communication via Telegram, Discord, and Slack. Each channel receives incoming commands and streams task completion notifications back to you.
 
 ## Overview
 
@@ -205,6 +205,42 @@ Fixed the OAuth flow.
 ```
 
 Discord uses standard Markdown bold (`**`) instead of Telegram-style `*`.
+
+---
+
+## Slack
+
+### 1. Create a Slack app
+
+1. Go to [api.slack.com/apps](https://api.slack.com/apps), click **Create New App** → *From scratch*
+2. Add the bot token scopes: `chat:write`, `channels:history`, `groups:history`, `im:history`, `app_mentions:read`
+3. Install the app to your workspace and copy the **Bot User OAuth Token** (`xoxb-...`)
+4. Invite the bot to the target channel(s)
+
+### 2. Configure orch
+
+```yaml
+channels:
+  slack:
+    bot_token: "${SLACK_BOT_TOKEN}"        # required (xoxb-...)
+    channel_id: "C0123456789"               # optional: restrict outgoing to one channel
+```
+
+Store the token in `~/.private`:
+
+```bash
+echo 'export SLACK_BOT_TOKEN="xoxb-..."' >> ~/.private
+chmod 600 ~/.private
+```
+
+### Config reference
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `channels.slack.bot_token` | Yes | Bot User OAuth token from the Slack app |
+| `channels.slack.channel_id` | No | Restrict outgoing messages to this channel ID. If omitted, posts go to the resolved project's mapped channel |
+
+The Slack channel uses Slack's Web API (`chat.postMessage`, `auth.test`) for outgoing messages. Inbound events route through the same `ChannelRouter` as Telegram and Discord, so per-project routing rules (`.orch.yml channels.slack.channel_id`) apply identically.
 
 ---
 

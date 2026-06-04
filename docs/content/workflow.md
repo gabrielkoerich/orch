@@ -105,7 +105,7 @@ The Rust runner spawns the agent inside a tmux session:
 ```bash
 claude -p \
   --model <model> \
-  --permission-mode acceptEdits \
+  --permission-mode bypassPermissions \   # autonomous (default); acceptEdits in supervised mode
   --allowedTools "Write" \
   --disallowedTools "Bash(rm *)" \
   --output-format json \

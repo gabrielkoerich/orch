@@ -45,31 +45,20 @@ new → routed → in_progress → needs_review → in_review → done (merged)
 - **blocked** — agent hit a blocker or crashed and requires human intervention (rare)
 - **needs_review** — agent needs human help, or review agent requested changes. After repeated failures the engine moves tasks to `needs_review` and removes any forced `agent:*` label so an owner can reassign.
 
-## Delegation & Decomposition
+## Delegation
 
-Complex tasks can be decomposed into subtasks:
+When the agent's response includes a `delegations` array, orch creates child tasks and blocks the parent until they finish.
 
-1. Router sets `decompose: true` for complex multi-system tasks
-2. Agent receives a planning prompt instead of an execution prompt
-3. Agent returns `delegations` — a list of child tasks
-4. Parent task is blocked until all children are `done`
-5. When children finish, parent is unblocked and re-run (rejoin)
+1. The agent emits `delegations: [{ title, body, labels }, ...]` in its JSON response (see `src/parser.rs::Delegation`)
+2. The runner (`src/engine/runner/mod.rs::process_delegations`) creates each as a child task with `parent_id` set
+3. Parent moves to `blocked` and waits
+4. When every child reaches `done`, the engine auto-unblocks the parent (Phase 4 of the engine tick) and re-dispatches it so it can integrate the results
 
-Force decomposition manually:
-```bash
-orch task plan "Complex feature" "Detailed description"
-# or add the "plan" label
-orch task add "title" "body" "plan"
-```
-
-Orch will:
-- Create child tasks with `parent_id` set
-- Block the parent until children are done
-- Re-run the parent via `poll` or `rejoin`
+There is no `decompose:true` router flag, no `plan` label, and no `orch task plan` subcommand — delegation is purely agent-driven via the response payload.
 
 ## Concurrency
 
-- The engine dispatches tasks concurrently using a `tokio::sync::Semaphore` (configurable concurrency limit)
+- The engine dispatches tasks concurrently up to `engine.max_parallel` (semaphore-guarded)
 - SQLite WAL mode allows concurrent reads; writes are serialized by SQLite
 - The `needs_review` to `in_review` status transition serves as an atomic guard against duplicate review agent spawns
 - Worktree cleanup runs in a background task so it does not block routing or dispatch

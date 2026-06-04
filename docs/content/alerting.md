@@ -72,7 +72,7 @@ Example log line (JSON mode):
 | `silence_detected` | Model silently exited (model-level) | 30 min–4 h |
 | `credit_exhaustion_out_of_credits` | Per-model credit exhaustion | 1 h → 3 h → 8 h (cap) |
 | `credit_exhaustion_org_level_disabled` | Org billing disabled | 2 h → 6 h → 8 h (cap) |
-| `billing_cycle_exhausted` | Monthly billing cycle quota | 24 h (flat, no backoff) |
+| `billing_cycle_exhausted` | Monthly billing cycle quota | 24 h → 3 d → 7 d (cap) |
 | `persisted` | Cooldown loaded from previous run | Remaining original duration |
 
 ### Pagerduty / Alertmanager example

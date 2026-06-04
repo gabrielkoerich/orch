@@ -15,34 +15,45 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `engine` | `tick_interval` | Main engine tick interval in seconds | `10` |
 | `engine` | `sync_interval` | Sync tick interval in seconds (GitHub ingest, cleanup) | `45` |
 | `engine` | `max_parallel` | Max tasks dispatched concurrently | `4` |
+| `engine` | `stuck_timeout` | Timeout (seconds) for detecting stuck `in_progress` tasks | `1800` |
+| `engine` | `no_session_stuck_timeout` | Timeout (seconds) for `in_progress` tasks with no tmux session | `600` |
+| `engine` | `webhook_health_check_interval` | Health check frequency for the local webhook server | `60` |
+| `engine` | `silence_grace_period` | Seconds of agent silence before warning | (see config.example.yml) |
+| `engine` | `silence_cooldown` | Seconds of agent silence before marking model unavailable | (see config.example.yml) |
 | `engine` | `graceful_shutdown_timeout` | Seconds to wait for in-flight tasks on SIGTERM | `600` |
+| `engine` | `auto_upgrade` | Automatically run `brew upgrade orch` on a schedule | `false` |
+| `engine` | `upgrade_check_interval` | How often to check for new orch versions (seconds) | `3600` |
 | `workflow` | `auto_close` | Auto-close GitHub issues when tasks are `done` | `true` |
-| `workflow` | `review_owner` | GitHub handle to tag when review is needed | `@owner` |
 | `workflow` | `enable_review_agent` | Run a [review agent](@/review-agent.md) after task completion | `false` |
-| `workflow` | `review_agent` | Fallback reviewer when opposite agent unavailable | `claude` |
 | `workflow` | `max_attempts` | Max attempts before marking task as blocked | `10` |
-| `workflow` | `stuck_timeout` | Timeout (seconds) for detecting stuck in_progress tasks | `1800` |
+| `workflow` | `max_review_cycles` | Max PR review cycles before escalating to human | `2` |
+| `workflow` | `max_reroute_attempts` | Max times a task may be re-routed automatically | `3` |
 | `workflow` | `timeout_seconds` | Task execution timeout (0 disables timeout) | `1800` |
-| `workflow` | `timeout_by_complexity` | Per-complexity task timeouts (takes precedence) | `{}` |
-| `workflow` | `required_skills` | Skills always injected into agent prompts (marked `[REQUIRED]`) | `[]` |
+| `workflow` | `timeout_by_complexity` | Per-complexity overrides (e.g. `complex: 7200`) | `{}` |
+| `workflow` | `required_skills` | Skills always injected into agent prompts | `[]` |
+| `workflow` | `allowed_tools` | Tool patterns the agent may use (allowlist) | `[]` |
 | `workflow` | `disallowed_tools` | Tool patterns blocked via `--disallowedTools` | `["Bash(rm *)","Bash(rm -*)"]` |
+| `workflow` | `permissions.mode` | Agent permission mode (`autonomous` / `supervised`) | `autonomous` |
+| `workflow` | `permissions.sandbox` | Sandbox level for Codex (`workspace-write` / `full-access`) | `workspace-write` |
+| `workflow` | `worktree_janitor_ttl_hours` | Janitor TTL before pruning orphaned worktrees | (see config.example.yml) |
+| `workflow` | `auto_create_followup_on_changes` | Auto-create follow-up task when review requests changes | `false` |
+| `router` | `mode` | `llm`, `round_robin`, or `local` (Ollama) | `llm` |
 | `router` | `agent` | Default router executor | `claude` |
 | `router` | `model` | Router model name | `haiku` |
 | `router` | `timeout_seconds` | Router timeout (0 disables timeout) | `60` |
-| `router` | `disabled_agents` | Agents to exclude from routing (e.g. `[opencode]`) | `[]` |
+| `router` | `max_route_attempts` | LLM failures before falling back to round-robin | `3` |
+| `router` | `max_tasks_per_tick` | Max routing decisions per engine tick (concurrency cap) | `1` |
 | `router` | `fallback_executor` | Fallback executor when router fails | `codex` |
 | `router` | `allowed_tools` | Default tool allowlist used in routing prompts | `[yq, jq, bash, ...]` |
-| `router` | `default_skills` | Skills always included in routing | `[gh, git-worktree]` |
-| `llm` | `input_format` | CLI input format override | `""` |
-| `llm` | `output_format` | CLI output format override | `"json"` |
-| `gh` | `enabled` | Enable GitHub sync | `true` |
+| `router` | `weighted_round_robin` | Use degraded-weight-aware round robin | `false` |
+| `router` | `pool` | Agents and models the router may pick from | (see config.example.yml) |
+| `webhook` | `enabled` | Start the local webhook receiver (HTTP) | `false` |
+| `webhook` | `port` | Webhook listener port | `8080` |
+| `webhook` | `secret` | HMAC secret for verifying GitHub webhook payloads | `""` |
 | `gh` | `repo` | Default repo (`owner/repo`) | `"owner/repo"` |
-| `gh` | `sync_label` | Only sync tasks/issues with this label (empty = all) | `"sync"` |
 | `gh` | `project_id` | GitHub Project v2 ID | `""` |
 | `gh` | `project_status_field_id` | Status field ID in Project v2 | `""` |
-| `gh` | `project_status_names` | Mapping for `backlog/in_progress/review/done` status option names (used to resolve option IDs) | `{}` |
 | `gh` | `project_status_map` | Mapping for `backlog/in_progress/review/done` option IDs | `{}` |
-| `gh.backoff` | `mode` | Rate-limit behavior: `wait` or `skip` | `"wait"` |
 | `gh.backoff` | `base_seconds` | Initial backoff duration in seconds | `30` |
 | `gh.backoff` | `max_seconds` | Max backoff duration in seconds | `900` |
 | `gh` | `allow_gh_fallback` | Allow `gh auth token` CLI fallback when no token is set | `true` |
@@ -50,51 +61,13 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `github` | `token_mode` | Token resolution mode: `env` or `github_app` | `"env"` |
 | `github` | `app_id` | GitHub App ID (for `token_mode: github_app`) | `""` |
 | `github` | `private_key_path` | Path to GitHub App private key (.pem) | `""` |
-| `model_map` | `simple/medium/complex` | Agent-specific model names per complexity level | `{}` |
+| `channels.discord` | `bot_token` | Discord bot token | `""` |
+| `channels.telegram` | `bot_token` / `chat_id` | Telegram bot credentials | `""` |
+| `notifications` | `level` | Minimum notification level (`info` / `warn` / `error`) | `info` |
+| `agents` | (list of strings) | Agent CLIs to discover in `$PATH` (e.g. `[claude, codex, opencode]`) | `[]` |
+| `model_map` | `simple/medium/complex/review` | Per-complexity model name per agent | `{}` |
 
-## Authentication
-
-Orch supports three authentication methods for GitHub API access:
-
-### Personal Access Token (PAT)
-
-```yaml
-gh:
-  auth:
-    mode: token
-    token: "ghp_xxxxxxxxxxxxxxxxxxxx"  # Or use GH_TOKEN/GITHUB_TOKEN env var
-```
-
-Create tokens at [GitHub Settings → Developer settings → Personal access tokens](https://github.com/settings/tokens).
-
-### GitHub App
-
-Recommended for organization automation with better audit trails:
-
-```yaml
-gh:
-  auth:
-    mode: github_app
-    app_id: "123456"
-    private_key: "/path/to/app-private-key.pem"
-    # Optional: specific installation ID (auto-detected if not set)
-    # installation_id: "78901234"
-```
-
-Orch automatically:
-- Generates JWTs from your App credentials
-- Exchanges JWTs for installation access tokens
-- Refreshes tokens before they expire (valid for 1 hour)
-
-### gh CLI (Legacy)
-
-```yaml
-gh:
-  auth:
-    mode: gh_cli
-```
-
-Requires `gh auth login` to be run interactively. Not recommended for service environments — prefer `GH_TOKEN`/`GITHUB_TOKEN` or GitHub App credentials and run `orch auth check`.
+> Authoritative reference: `config.example.yml` in the orch repo. Run `orch config <key>` to read the live value for any dotted key (e.g. `orch config engine.tick_interval`).
 
 ## Per-Project Config
 
@@ -115,26 +88,24 @@ router:
 
 - Project config is deep-merged with global config (project wins)
 - The server restarts automatically when `.orch.yml` changes
-- `gh_project_apply.sh` / `orch project info --fix` writes project IDs into the global config overlay when run from the server context
+- Use `orch board sync` to (re-)discover project / status / estimate field IDs and persist them into the project's `.orch.yml`
 
 ## Skills
 
-Skills extend agent capabilities with specialized knowledge:
+Skills extend agent capabilities with specialized knowledge. Skill repositories are cloned into `~/.orch/skills/` by the engine on its sync tick — there is no dedicated `orch skills` subcommand.
 
 ```yaml
 # ~/.orch/skills.yml
 repositories:
-  - url: "https://github.com/user/skills-repo"
-    commit: "abc123"
-catalog:
-  - id: "solana-best-practices"
-    name: "Solana Best Practices"
-    description: "Reviews Solana/Anchor programs for development best practices"
-```
-
-```bash
-orch skills sync    # clone/update skill repositories
-orch skills list    # show available skills
+  - name: gabrielkoerich
+    url: https://github.com/gabrielkoerich/skills
+    description: Personal skill catalog
+    pin: f9a2062d2a184f9625746262a6b7656d3b630973  # Optional: pin to a specific commit
+  - name: anthropics
+    url: https://github.com/anthropics/skills
+    description: Anthropic official skills
+    pin: 1ed29a03dc852d30fa6ef2ca53a67dc2c2c2c563
+skills: []   # Reserved for inline skill definitions (rarely used)
 ```
 
 Skills listed in `workflow.required_skills` are always injected into agent prompts. Other skills are selected per-task by the router.

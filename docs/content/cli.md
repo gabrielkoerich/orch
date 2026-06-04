@@ -7,39 +7,51 @@ weight = 6
 ## Namespaces
 
 ```bash
-orch task list|add|get|status|route|run|retry|unblock|attach|live|kill|publish|cost|tree
-orch service start|stop|restart|status
-orch job add|list|remove|enable|disable|tick
-orch project add|remove|list
-orch stream <task_id>
-orch dashboard
-orch metrics
-orch cost
+orch task     list|add|get|status|route|run|retry|reroute|unblock|attach|live|kill
+              publish|cost|tree|logs|log|history|runs|close|watch|reopen|inspect
+orch service  start|stop|restart|status
+orch job      list|add|remove|enable|disable|tick|run
+orch project  list|add|remove
+orch board    list|link|sync|info
+orch cooldown list|clear
+orch session  export
+orch webhook  status
+orch chat     [message…] | history | stats
 ```
 
-Top-level shortcuts: `serve`, `init`, `log`, `chat`, `agents`, `version`, `completions`.
+Top-level commands: `serve`, `init`, `log`, `agents`, `version`, `completions`, `parse`, `commit`, `cron`, `config`, `template`, `stream`, `metrics`, `dashboard`, `cost`, `stats`, `events`, `doctor`, `prune`, `notify`.
 
 ## Task Commands
 
 ```bash
-orch task add "title" --body "body" --labels "comma,separated"  # create a task
-orch task add "title" -p owner/repo   # create a task for a managed project
-orch task list                          # list tasks for current project
-orch task tree                          # show parent-child tree
-orch task get <id>                      # get task details
-orch task status                        # show task status summary
-orch task route <id>                    # route a task to an agent
-orch task run <id>                      # run a specific task
-orch task retry <id>                    # reset task to new
-orch task unblock <id>                  # reset a needs_review/stalled task to new
-orch task unblock all                   # reset all needs_review/blocked tasks
-orch task attach <id>                   # attach to a running agent's tmux session
-orch task live                          # list active agent tmux sessions
-orch task kill <id>                     # kill a running agent tmux session
-orch task publish <id>                  # publish internal task to GitHub
-orch task cost <id>                     # show token cost breakdown for a task
-orch stream <id>                        # stream live output from a running task
+orch task add "title" -b "body" -l label1 -l label2   # create a task
+orch task list                                         # list tasks for current project
+orch task list -g                                      # list across all projects
+orch task tree [id]                                    # show parent-child tree
+orch task get <id>                                     # task details
+orch task status                                       # status summary for current project
+orch task route <id>                                   # (re-)route a task
+orch task run [id]                                     # run a specific task (or next routed)
+orch task retry <id> [--agent X --model Y]             # reset to new, optionally forcing routing
+orch task reroute <id> --agent X --model Y             # force a new agent/model
+orch task unblock <id> | all                           # reset blocked tasks to new
+orch task attach <id>                                  # attach to the agent's tmux session
+orch task live                                         # list active agent tmux sessions
+orch task kill <id>                                    # kill a running agent tmux session
+orch task publish <id> [-l label1]                     # promote internal task to GitHub
+orch task cost <id>                                    # token cost breakdown
+orch task logs <id>                                    # post-mortem / saved logs for a task
+orch task log <id> [--limit N] [--json]                # activity timeline
+orch task history <id>                                 # routing history / attempts
+orch task runs <id> [--verbose]                        # full run audit (stdout/stderr/response)
+orch task close <id> [-n "note"]                       # mark done without running an agent
+orch task watch <id>                                   # follow status changes live
+orch task reopen <id>                                  # reopen a done/blocked task
+orch task inspect <id>                                 # unified diagnostic view
+orch stream [id]                                       # stream live output (all sessions if no id)
 ```
+
+Note: `orch task add` does not take a `-p`/project flag — task creation always targets the current project (resolved from CWD or the `.orch.yml` config). To create tasks for another project, `cd` into it first, or use `orch task publish` to promote an internal task to GitHub.
 
 ## Background Service
 
@@ -68,10 +80,22 @@ The service ticks every `engine.tick_interval` seconds (default 10s):
 
 ```bash
 orch dashboard              # full dashboard view (tasks, sessions, activity)
+orch dashboard -g           # aggregate across all configured projects
 orch task status            # show task counts for current project
-orch metrics                # show task metrics summary
-orch cost                   # show cost tracking and token usage
-orch log                    # tail server logs
+orch metrics [--details]    # task metrics summary (slow tasks, error dist.)
+orch cost [--summary]       # cost tracking and token usage
+orch stats [--all]          # task throughput / per-project rollups
+orch events [--repo X]      # tail task events live
+orch log [N]                # tail server logs (last N lines or "watch")
+orch doctor [--fix]         # diagnose SQLite ↔ GitHub drift
+orch prune [--dry-run]      # remove orphaned worktrees
+orch cooldown list          # show active agent/model cooldowns
+orch cooldown clear <key>   # clear a specific cooldown (e.g. claude, claude:sonnet)
+orch cooldown clear --all   # clear every active cooldown
+orch webhook status         # show webhook server health
+orch session export <id>    # export a task's session in markdown/json/raw
+orch notify "message"       # send a Telegram notification (uses config target by default)
+orch config <key>           # read a live config value (dot-separated path)
 ```
 
 ## Channels
@@ -81,22 +105,28 @@ Channels are first-class: use chat platforms to interact with running tasks. Inc
 ## Project Commands
 
 ```bash
-orch project add owner/repo   # bare clone + import issues
-orch project add /path/to/repo # register a local project
-orch project list              # list registered projects
-orch project remove owner/repo # remove a project from registry
+orch project add .                         # register the current directory
+orch project add owner/repo                # bare clone + import issues
+orch project add https://github.com/o/r    # same, from a URL
+orch project add /path/to/repo             # register a local path
+orch project list                          # list registered projects
+orch project remove /path/to/repo          # remove a project from registry
 ```
 
 ## Job Commands
 
 ```bash
-orch job list                             # list scheduled jobs
-orch job add "title" --cron "0 9 * * *"  # add a cron job
-orch job remove <id>                      # remove a job
-orch job enable <id>                      # enable a job
-orch job disable <id>                     # disable a job
-orch job tick                             # run one job scheduler tick manually
+orch job list                                              # list scheduled jobs
+orch job add "0 9 * * *" "Daily report" -b "body"          # cron + title (positional)
+orch job add "0 9 * * *" "Backup" -t bash -c "./backup.sh" # bash job
+orch job remove <id>                                       # remove a job
+orch job enable <id>                                       # enable a job
+orch job disable <id>                                      # disable a job
+orch job tick                                              # run one scheduler tick manually
+orch job run <id>                                          # run a job immediately, ignoring schedule
 ```
+
+Jobs can also be defined declaratively as markdown files under `prompts/jobs/*.md` (frontmatter: `id`, `schedule`, `title`, `type`, `enabled`, `external`, `agent`, `command`, `dir`). See [Jobs](@/jobs.md).
 
 ## Version
 
