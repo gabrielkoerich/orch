@@ -563,6 +563,7 @@ mod tests {
             summary: "Recap delivered".to_string(),
             repo: Some("owner/repo".to_string()),
             notify_target: None,
+            pr_number: None,
         };
         let msg = n.format_telegram();
         let title_pos = msg.find("Morning briefing").expect("title present");
@@ -584,6 +585,7 @@ mod tests {
             summary: "ok".to_string(),
             repo: Some("acme/svc".to_string()),
             notify_target: None,
+            pr_number: None,
         };
         let msg = n.format_discord();
         let title_pos = msg.find("Deploy svc").expect("title present");

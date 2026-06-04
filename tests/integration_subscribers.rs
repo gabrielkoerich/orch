@@ -159,7 +159,31 @@ async fn notify_done_event_pushes_notification() {
 }
 
 #[tokio::test]
-async fn notify_needs_review_event_pushes_notification() {
+async fn notify_in_review_event_pushes_notification() {
+    let (tx, rx) = broadcast::channel::<TaskEvent>(16);
+    let transport = Arc::new(Transport::new());
+    let mut notify_rx = transport.subscribe_notifications();
+
+    notify::spawn(rx, transport.clone());
+
+    tx.send(make_event("7", "owner/repo", "in_review")).unwrap();
+
+    let notification =
+        tokio::time::timeout(std::time::Duration::from_millis(300), notify_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("closed");
+
+    assert_eq!(notification.task_id, "7");
+    assert_eq!(notification.status, "in_review");
+    drop(tx);
+}
+
+/// `needs_review` is intentionally suppressed under default `All` — it
+/// always pairs with a follow-up `in_review`/`blocked`/`failed` event
+/// within seconds, so notifying on it produces a redundant ping.
+#[tokio::test]
+async fn notify_needs_review_event_suppressed() {
     let (tx, rx) = broadcast::channel::<TaskEvent>(16);
     let transport = Arc::new(Transport::new());
     let mut notify_rx = transport.subscribe_notifications();
@@ -169,14 +193,12 @@ async fn notify_needs_review_event_pushes_notification() {
     tx.send(make_event("7", "owner/repo", "needs_review"))
         .unwrap();
 
-    let notification =
-        tokio::time::timeout(std::time::Duration::from_millis(300), notify_rx.recv())
-            .await
-            .expect("timeout")
-            .expect("closed");
-
-    assert_eq!(notification.task_id, "7");
-    assert_eq!(notification.status, "needs_review");
+    let result =
+        tokio::time::timeout(std::time::Duration::from_millis(150), notify_rx.recv()).await;
+    assert!(
+        result.is_err(),
+        "needs_review should not produce a notification under default level"
+    );
     drop(tx);
 }
 
@@ -221,7 +243,7 @@ async fn notify_failed_event_pushes_notification() {
 }
 
 /// The default notification level is `All`, which suppresses intermediate
-/// transitions: new, routed, in_progress, in_review.
+/// transitions: new, routed, in_progress, needs_review.
 #[tokio::test]
 async fn notify_intermediate_statuses_not_forwarded() {
     let (tx, rx) = broadcast::channel::<TaskEvent>(16);
@@ -230,7 +252,7 @@ async fn notify_intermediate_statuses_not_forwarded() {
 
     notify::spawn(rx, transport.clone());
 
-    for status in &["new", "routed", "in_progress", "in_review"] {
+    for status in &["new", "routed", "in_progress", "needs_review"] {
         tx.send(make_event("1", "owner/repo", status)).unwrap();
     }
 
@@ -255,7 +277,7 @@ async fn notify_multiple_terminal_events_all_forwarded() {
 
     tx.send(make_event("1", "repo/a", "done")).unwrap();
     tx.send(make_event("2", "repo/b", "blocked")).unwrap();
-    tx.send(make_event("3", "repo/c", "needs_review")).unwrap();
+    tx.send(make_event("3", "repo/c", "in_review")).unwrap();
 
     let mut received_ids: Vec<String> = Vec::new();
     for _ in 0..3 {
