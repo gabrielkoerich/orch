@@ -512,15 +512,27 @@ impl AgentRunner for OpenCodeRunner {
             return Err(err);
         }
 
-        // Extract text
-        let text =
-            self.extract_text_from_events(&events)
-                .ok_or_else(|| AgentError::InvalidResponse {
-                    raw: trimmed.to_string(),
-                })?;
-
-        // Extract tokens
+        // Extract tokens (needed for both the text path and the tool-only fallback)
         let (input_tokens, output_tokens) = self.extract_tokens(&events);
+
+        // Extract text — when opencode emits only tool_use/step events with no
+        // text content, synthesize a human-readable summary from the event
+        // stream instead of falling through to InvalidResponse. Otherwise the
+        // upstream `synthesize_response_from_text` heuristic gets handed the
+        // entire raw NDJSON, matches a "completed" substring inside tool state
+        // JSON, and emits 500 bytes of raw NDJSON as the task summary.
+        let text = match self.extract_text_from_events(&events) {
+            Some(t) => t,
+            None => {
+                let response = synthesize_response_from_events(&events);
+                return Ok(ParsedResponse {
+                    response,
+                    input_tokens,
+                    output_tokens,
+                    duration_ms: None,
+                });
+            }
+        };
 
         // Parse the text through standard parser
         let response =
@@ -885,6 +897,102 @@ async fn run_opencode_models_discovery_async() -> Vec<String> {
     }
 }
 
+/// Build a synthetic `AgentResponse` summarizing an opencode NDJSON event
+/// stream when no `text` events are present.
+///
+/// Opencode runs that produced tool calls but never emitted a text event
+/// (model exited mid-tool, stop_reason without a final reply, etc.) would
+/// otherwise be passed to `synthesize_response_from_text` as raw NDJSON.
+/// That heuristic matches "completed" substrings inside tool state JSON and
+/// emits the first 500 bytes of NDJSON as the notification summary — what
+/// the user sees as garbage in Telegram/Discord/Slack.
+///
+/// Status is `needs_review` because there is no text confirming completion;
+/// the agent did work but never reported on it.
+fn synthesize_response_from_events(events: &[serde_json::Value]) -> crate::parser::AgentResponse {
+    use std::collections::BTreeMap;
+
+    let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+    let mut tool_names: Vec<String> = Vec::new();
+    let mut step_finish_reason: Option<String> = None;
+
+    for event in events {
+        let event_type = event
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        *counts.entry(event_type.to_string()).or_insert(0) += 1;
+
+        if event_type == "step_finish" {
+            if let Some(reason) = event
+                .get("part")
+                .and_then(|p| p.get("reason"))
+                .and_then(|r| r.as_str())
+            {
+                step_finish_reason = Some(reason.to_string());
+            }
+        }
+
+        // Capture tool names from common opencode/claude-style shapes.
+        if event_type == "tool_use" {
+            if let Some(name) = event
+                .get("name")
+                .and_then(|v| v.as_str())
+                .or_else(|| event.get("tool").and_then(|v| v.as_str()))
+                .or_else(|| {
+                    event
+                        .get("part")
+                        .and_then(|p| p.get("name"))
+                        .and_then(|v| v.as_str())
+                })
+                .or_else(|| {
+                    event
+                        .get("tool")
+                        .and_then(|t| t.get("name"))
+                        .and_then(|v| v.as_str())
+                })
+            {
+                tool_names.push(name.to_string());
+            }
+        }
+    }
+
+    let total_events = events.len();
+    let reason = step_finish_reason.as_deref().unwrap_or("unknown");
+
+    let tool_summary = if tool_names.is_empty() {
+        String::new()
+    } else {
+        let mut tool_counts: BTreeMap<String, u32> = BTreeMap::new();
+        for n in &tool_names {
+            *tool_counts.entry(n.clone()).or_insert(0) += 1;
+        }
+        let parts: Vec<String> = tool_counts
+            .iter()
+            .map(|(k, v)| {
+                if *v > 1 {
+                    format!("{k}×{v}")
+                } else {
+                    k.clone()
+                }
+            })
+            .collect();
+        format!(" (tools: {})", parts.join(", "))
+    };
+
+    let summary = format!(
+        "opencode emitted {total_events} event(s) with no text output{tool_summary}; \
+         step_finish reason: {reason}"
+    );
+
+    crate::parser::AgentResponse {
+        status: "needs_review".to_string(),
+        summary,
+        error: Some("agent emitted no text response — only tool/step events".to_string()),
+        ..Default::default()
+    }
+}
+
 /// Extract a structured `AgentResult` from OpenCode NDJSON output.
 ///
 /// Concatenates text from `type:text` events (both `part.text` and direct
@@ -1032,6 +1140,43 @@ mod tests {
 
         let err = runner().parse_response(raw).unwrap_err();
         assert!(matches!(err, AgentError::RateLimit { .. }));
+    }
+
+    /// Regression: opencode runs that emit only tool_use / step_start / step_finish
+    /// events (no `text` events) must synthesize a clean needs_review response from
+    /// the event stream instead of returning InvalidResponse with the raw NDJSON
+    /// blob, which would otherwise be passed to synthesize_response_from_text and
+    /// leak as 500 bytes of raw JSON into the notification summary.
+    #[test]
+    fn parse_opencode_tool_only_stream_synthesizes_needs_review() {
+        let raw = r#"{"type":"step_start","timestamp":1,"part":{"type":"step-start"}}
+{"type":"tool_use","timestamp":2,"name":"bash","input":{"cmd":"ls"}}
+{"type":"tool_use","timestamp":3,"name":"read","input":{"path":"src/main.rs"}}
+{"type":"tool_use","timestamp":4,"name":"bash","input":{"cmd":"cargo check"}}
+{"type":"step_finish","timestamp":5,"part":{"type":"step-finish","reason":"stop","tokens":{"input":500,"output":0}}}"#;
+
+        let parsed = runner()
+            .parse_response(raw)
+            .expect("tool-only NDJSON must synthesize a response, not error");
+        assert_eq!(parsed.response.status, "needs_review");
+        assert!(
+            !parsed.response.summary.contains("\"type\":\"step_start\""),
+            "summary must not contain raw NDJSON; got: {}",
+            parsed.response.summary
+        );
+        assert!(
+            parsed.response.summary.contains("bash") && parsed.response.summary.contains("read"),
+            "summary should mention tools used; got: {}",
+            parsed.response.summary
+        );
+        assert!(
+            parsed.response.summary.contains("stop"),
+            "summary should mention step_finish reason; got: {}",
+            parsed.response.summary
+        );
+        // Tokens from step_finish must still be propagated.
+        assert_eq!(parsed.input_tokens, Some(500));
+        assert_eq!(parsed.output_tokens, Some(0));
     }
 
     #[test]

@@ -1,8 +1,11 @@
 //! Reacts to status transitions — pushes notifications to channels for meaningful states.
 //!
-//! Only terminal/meaningful transitions are forwarded by default (`level: all`):
-//! `done`, `needs_review`, `blocked`, `failed`. Intermediate transitions
-//! (`new`, `routed`, `in_progress`, `in_review`) are suppressed unless
+//! Only review-active and terminal transitions are forwarded by default
+//! (`level: all`): `done`, `in_review`, `blocked`, `failed`. `needs_review`
+//! is intentionally suppressed: it's the agent-handoff signal that always
+//! pairs with a follow-up `in_review`/`blocked`/`failed` event within
+//! seconds — notifying on it produces a redundant ping. Other intermediate
+//! transitions (`new`, `routed`, `in_progress`) are suppressed unless
 //! `notifications.level: verbose` is set in config.
 
 use crate::channels::notification::{NotificationLevel, TaskNotification};

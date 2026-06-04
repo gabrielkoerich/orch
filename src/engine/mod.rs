@@ -1267,6 +1267,14 @@ pub async fn serve() -> anyhow::Result<()> {
                         if routed {
                             // notify_target handled — skip further routing
                         } else if let Some(repo) = notification.repo.as_deref() {
+                            // Track destinations already sent to in this iteration so
+                            // the dedicated (path 1) and subscribed (path 2) loops
+                            // don't double-fire the same Telegram/Discord destination
+                            // when a repo's configured topic and a `channel_subscriptions`
+                            // row resolve to the same `(channel, topic_id)`.
+                            let mut sent: std::collections::HashSet<(String, Option<String>)> =
+                                std::collections::HashSet::new();
+
                             // 1. Dedicated channel targets for this repo.
                             for channel in channels.iter() {
                                 let ch_name = channel.name();
@@ -1284,12 +1292,13 @@ pub async fn serve() -> anyhow::Result<()> {
                                     } else {
                                         serde_json::json!({})
                                     };
+                                    let resolved_topic = Some(topic_id.to_string());
                                     let msg = OutgoingMessage {
                                         thread_id: notification.task_id.clone(),
                                         body,
                                         reply_to: None,
                                         metadata,
-                                        topic_id: Some(topic_id.to_string()),
+                                        topic_id: resolved_topic.clone(),
                                     };
                                     if let Err(e) = channel.send(&msg).await {
                                         tracing::warn!(
@@ -1299,6 +1308,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                             "failed to send to dedicated channel"
                                         );
                                     } else {
+                                        sent.insert((ch_name.to_string(), resolved_topic));
                                         routed = true;
                                     }
                                 }
@@ -1314,23 +1324,37 @@ pub async fn serve() -> anyhow::Result<()> {
                                             let Some(channel) = channel else {
                                                 continue;
                                             };
+                                            let resolved_topic = if topic_id.is_empty() {
+                                                None
+                                            } else {
+                                                Some(topic_id.clone())
+                                            };
+                                            // Skip if a dedicated send to the same
+                                            // (channel, topic_id) already happened.
+                                            if sent.contains(&(
+                                                ch_name.clone(),
+                                                resolved_topic.clone(),
+                                            )) {
+                                                tracing::debug!(
+                                                    channel = %ch_name,
+                                                    task_id = %notification.task_id,
+                                                    topic_id = ?resolved_topic,
+                                                    "skipping duplicate subscriber dispatch — destination already received from dedicated path"
+                                                );
+                                                continue;
+                                            }
                                             let body = notification.format_with_project(&ch_name);
                                             let metadata = if ch_name == "telegram" {
                                                 serde_json::json!({"preformatted_html": true})
                                             } else {
                                                 serde_json::json!({})
                                             };
-                                            let resolved_topic = if topic_id.is_empty() {
-                                                None
-                                            } else {
-                                                Some(topic_id.clone())
-                                            };
                                             let msg = OutgoingMessage {
                                                 thread_id: thread_id.clone(),
                                                 body,
                                                 reply_to: None,
                                                 metadata,
-                                                topic_id: resolved_topic,
+                                                topic_id: resolved_topic.clone(),
                                             };
                                             if let Err(e) = channel.send(&msg).await {
                                                 tracing::warn!(
@@ -1340,6 +1364,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                                     "failed to send to subscribed channel"
                                                 );
                                             } else {
+                                                sent.insert((ch_name.clone(), resolved_topic));
                                                 routed = true;
                                             }
                                         }

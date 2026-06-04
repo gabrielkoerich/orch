@@ -13,13 +13,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationLevel {
-    /// Broadcast terminal/meaningful completions only: done, needs_review, blocked, failed.
-    /// Intermediate transitions (new, routed, in_progress, in_review) are suppressed.
-    /// This restores pre-event-bus behavior.
+    /// Broadcast review-active and terminal completions only: `done`,
+    /// `in_review`, `blocked`, `failed`. Intermediate transitions (`new`,
+    /// `routed`, `in_progress`, `needs_review`) are suppressed.
     All,
     /// Broadcast every status transition, including intermediate states.
     Verbose,
-    /// Only broadcast errors (needs_review, blocked, failed).
+    /// Only broadcast errors (`blocked`, `failed`).
     ErrorsOnly,
     /// Disable notifications entirely.
     None,
@@ -41,13 +41,17 @@ impl NotificationLevel {
     }
 
     /// Whether a notification with this status should be sent.
+    ///
+    /// `needs_review` is intentionally excluded from `All` and `ErrorsOnly`:
+    /// it's the agent-handoff signal that always pairs with a follow-up
+    /// `in_review` (or `blocked`/`failed`) within seconds, so notifying on it
+    /// produces a redundant ping. The review-active states (`in_review`,
+    /// `blocked`, `failed`) are the ones humans actually act on.
     pub fn should_notify(&self, status: &str) -> bool {
         match self {
-            Self::All => matches!(status, "done" | "needs_review" | "blocked" | "failed"),
+            Self::All => matches!(status, "done" | "in_review" | "blocked" | "failed"),
             Self::Verbose => true,
-            Self::ErrorsOnly => {
-                matches!(status, "needs_review" | "blocked" | "failed")
-            }
+            Self::ErrorsOnly => matches!(status, "blocked" | "failed"),
             Self::None => false,
         }
     }
@@ -107,17 +111,16 @@ impl TaskNotification {
         };
 
         format!(
-            "{emoji} <b>Task #{task_id}</b>: {status}\n\
-             <b>{title}</b>\n\
-             Agent: <code>{agent}</code> | Duration: {duration}\n\
+            "{emoji} <b>{title}</b>\n\
+             {status} · <code>{agent}</code> · {duration} · #{task_id}\n\
              \n\
              {summary}{link_suffix}",
             emoji = emoji,
-            task_id = html_escape(&self.task_id),
-            status = html_escape(&self.status),
             title = html_escape(&self.title),
+            status = html_escape(&self.status),
             agent = html_escape(&self.agent),
             duration = duration,
+            task_id = html_escape(&self.task_id),
             summary = html_escape(&self.summary),
             link_suffix = link_suffix,
         )
@@ -139,17 +142,16 @@ impl TaskNotification {
         };
 
         format!(
-            "{emoji} *Task #{task_id}*: {status}\n\
-             *{title}*\n\
-             Agent: `{agent}` | Duration: {duration}\n\
+            "{emoji} *{title}*\n\
+             {status} · `{agent}` · {duration} · #{task_id}\n\
              \n\
              {summary}{link_suffix}",
             emoji = emoji,
-            task_id = self.task_id,
-            status = self.status,
             title = self.title,
+            status = self.status,
             agent = self.agent,
             duration = duration,
+            task_id = self.task_id,
             summary = self.summary,
             link_suffix = link_suffix,
         )
@@ -169,17 +171,16 @@ impl TaskNotification {
         };
 
         format!(
-            "{emoji} **Task #{task_id}**: {status}\n\
-             **{title}**\n\
-             Agent: `{agent}` | Duration: {duration}\n\
+            "{emoji} **{title}**\n\
+             {status} · `{agent}` · {duration} · #{task_id}\n\
              \n\
              {summary}{link_suffix}",
             emoji = emoji,
-            task_id = self.task_id,
-            status = self.status,
             title = self.title,
+            status = self.status,
             agent = self.agent,
             duration = duration,
+            task_id = self.task_id,
             summary = self.summary,
             link_suffix = link_suffix,
         )
@@ -250,18 +251,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn notification_level_should_notify_all_terminal_only() {
+    fn notification_level_should_notify_all_active_review_only() {
         let level = NotificationLevel::All;
-        // Terminal/meaningful states — should notify
+        // Active states that warrant a ping — should notify
         assert!(level.should_notify("done"));
-        assert!(level.should_notify("needs_review"));
+        assert!(level.should_notify("in_review"));
         assert!(level.should_notify("blocked"));
         assert!(level.should_notify("failed"));
-        // Intermediate states — should NOT notify
+        // needs_review is suppressed: it's a redundant handoff signal that
+        // always pairs with a follow-up in_review/blocked/failed event.
+        assert!(!level.should_notify("needs_review"));
+        // Other intermediate states — should NOT notify
         assert!(!level.should_notify("new"));
         assert!(!level.should_notify("routed"));
         assert!(!level.should_notify("in_progress"));
-        assert!(!level.should_notify("in_review"));
     }
 
     #[test]
@@ -283,7 +286,7 @@ mod tests {
         assert!(!level.should_notify("done"));
         assert!(!level.should_notify("in_progress"));
         assert!(!level.should_notify("in_review"));
-        assert!(level.should_notify("needs_review"));
+        assert!(!level.should_notify("needs_review"));
         assert!(level.should_notify("blocked"));
         assert!(level.should_notify("failed"));
     }
@@ -293,6 +296,7 @@ mod tests {
         let level = NotificationLevel::None;
         assert!(!level.should_notify("done"));
         assert!(!level.should_notify("needs_review"));
+        assert!(!level.should_notify("in_review"));
         assert!(!level.should_notify("blocked"));
     }
 
@@ -338,9 +342,13 @@ mod tests {
         };
         let msg = n.format_telegram();
         assert!(msg.contains("✅"));
-        assert!(msg.contains("Task #42"));
+        // Title-first layout: title is the headline, metadata line carries the id.
+        assert!(
+            msg.contains("<b>Fix auth bug</b>"),
+            "title should be the headline: {msg}"
+        );
+        assert!(msg.contains("#42"));
         assert!(msg.contains("done"));
-        assert!(msg.contains("Fix auth bug"));
         assert!(msg.contains("claude"));
         assert!(msg.contains("2m 0s"));
         assert!(msg.contains("Fixed the OAuth flow"));
@@ -420,9 +428,12 @@ mod tests {
         };
         let msg = n.format_slack();
         assert!(msg.contains("✅"));
-        assert!(msg.contains("*Task #7*"));
+        assert!(
+            msg.contains("*Refactor engine*"),
+            "title should be the headline: {msg}"
+        );
+        assert!(msg.contains("#7"));
         assert!(msg.contains("done"));
-        assert!(msg.contains("Refactor engine"));
         assert!(msg.contains("`claude`"));
         assert!(msg.contains("1m 0s"));
         assert!(msg.contains("Decomposed mod.rs"));
@@ -443,7 +454,11 @@ mod tests {
         };
         let msg = n.format_discord();
         assert!(msg.contains("⚠️"));
-        assert!(msg.contains("**Task #99**"));
+        assert!(
+            msg.contains("**Deploy service**"),
+            "title should be the headline: {msg}"
+        );
+        assert!(msg.contains("#99"));
         assert!(msg.contains("needs_review"));
         assert!(msg.contains("codex"));
         assert!(msg.contains("30m 0s"));
@@ -464,7 +479,8 @@ mod tests {
         };
         let msg = n.format_with_project("telegram");
         assert!(msg.starts_with("[widgets] "));
-        assert!(msg.contains("Task #10"));
+        assert!(msg.contains("#10"));
+        assert!(msg.contains("<b>Add feature</b>"));
     }
 
     #[test]
@@ -537,6 +553,47 @@ mod tests {
     }
 
     #[test]
+    fn title_appears_before_metadata_in_telegram() {
+        let n = TaskNotification {
+            task_id: "internal:151694".to_string(),
+            title: "Morning briefing: daily focus plan".to_string(),
+            status: "done".to_string(),
+            agent: "opencode".to_string(),
+            duration_seconds: 1821.0,
+            summary: "Recap delivered".to_string(),
+            repo: Some("owner/repo".to_string()),
+            notify_target: None,
+            pr_number: None,
+        };
+        let msg = n.format_telegram();
+        let title_pos = msg.find("Morning briefing").expect("title present");
+        let id_pos = msg.find("#internal:151694").expect("id present");
+        assert!(
+            title_pos < id_pos,
+            "title must appear before task id: {msg}"
+        );
+    }
+
+    #[test]
+    fn title_appears_before_metadata_in_discord() {
+        let n = TaskNotification {
+            task_id: "internal:5".to_string(),
+            title: "Deploy svc".to_string(),
+            status: "done".to_string(),
+            agent: "codex".to_string(),
+            duration_seconds: 60.0,
+            summary: "ok".to_string(),
+            repo: Some("acme/svc".to_string()),
+            notify_target: None,
+            pr_number: None,
+        };
+        let msg = n.format_discord();
+        let title_pos = msg.find("Deploy svc").expect("title present");
+        let id_pos = msg.find("#internal:5").expect("id present");
+        assert!(title_pos < id_pos, "title before id: {msg}");
+    }
+
+    #[test]
     fn format_with_project_uses_channel_format() {
         let n = TaskNotification {
             task_id: "5".into(),
@@ -554,9 +611,12 @@ mod tests {
         // Both start with project prefix
         assert!(tg.starts_with("[svc]"));
         assert!(dc.starts_with("[svc]"));
-        // Discord uses ** for bold, telegram uses HTML <b> tags
-        assert!(dc.contains("**Task #5**"));
-        assert!(tg.contains("<b>Task #5</b>"));
+        // Discord uses ** for bold, telegram uses HTML <b> tags — title is the headline now.
+        assert!(dc.contains("**Deploy**"));
+        assert!(tg.contains("<b>Deploy</b>"));
+        // Task id appears on the metadata line.
+        assert!(tg.contains("#5"));
+        assert!(dc.contains("#5"));
     }
 
     #[test]
