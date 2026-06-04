@@ -55,7 +55,7 @@ engine:
   # silence_cooldown: 3600
 
 router:
-  mode: "llm"              # "llm" (default), "local", or "round_robin"
+  mode: "round_robin"      # "round_robin" (default), "llm", or "local"
   agent: "claude"          # Which agent performs routing
   model: "haiku"           # Model for routing (fast/cheap)
   timeout_seconds: 60
@@ -72,7 +72,7 @@ router:
   #   claude: 0.25
   #   codex: 0.1
   #   opencode: 0.25
-  # Routing pool for LLM router (agent:model pairs)
+  # Routing pool for LLM router (agent:model pairs; only used when mode: "llm")
   # pool:
   #   - claude:haiku
   #   - opencode:free
@@ -93,44 +93,31 @@ router:
     - gh
     - git-worktree
 
-model_map:
-  simple:
-    claude: haiku
-    codex: gpt-5.2-codex
-    opencode:
-      - opencode:free
-      - github-copilot/gpt-5-mini
-    kimi: sonnet
-    minimax: sonnet
-    # olm: qwen3.5
-  medium:
-    claude: sonnet
-    codex: gpt-5.3-codex
-    opencode:
-      - opencode:free
-      - github-copilot/claude-sonnet-4.6
-      - github-copilot/gpt-5.4
-    kimi: opus
-    minimax: opus
-    # olm: gemma4
-  complex:
-    claude: opus
-    codex: gpt-5.4
-    opencode:
-      - github-copilot/claude-opus-4.6
-      - github-copilot/gpt-5.4
-    kimi: opus
-    minimax: opus
-    # olm: gemma4
-  review:
-    claude: sonnet
-    codex: gpt-5.3-codex
-    opencode:
-      - opencode:free
-      - github-copilot/gpt-5-mini
-    kimi: opus
-    minimax: opus
-    # olm: qwen3.5
+# Simple model config. Each agent's candidates are used for simple, medium,
+# complex, and review tasks. When multiple candidates are listed, orch picks
+# one based on the router mode and skips cooled / unavailable models.
+models:
+  claude: haiku
+  codex: gpt-5.2-codex
+  opencode:
+    - opencode:free
+    - github-copilot/gpt-5-mini
+  kimi: sonnet
+  minimax: sonnet
+  # olm: qwen3.5
+
+# Advanced model config. Use this only when an agent needs different model
+# candidates for different complexity tiers. Entries here override `models:`
+# for the specified tier and agent.
+# model_map:
+#   simple:
+#     codex: gpt-5.2-codex
+#   medium:
+#     codex: gpt-5.3-codex
+#   complex:
+#     codex: gpt-5.4
+#   review:
+#     codex: gpt-5.3-codex
 
 gh:
   repo: "owner/repo"

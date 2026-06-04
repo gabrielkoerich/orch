@@ -137,7 +137,7 @@ fn router_config_parses() {
     // In test context there's no config file, so it uses defaults.
     let config = orch::engine::router::config::RouterConfig::from_config();
     assert!(!config.agents.is_empty(), "should have default agents");
-    assert_eq!(config.mode, "llm");
+    assert_eq!(config.mode, "round_robin");
 }
 
 /// Verify that the mock backend passes the health check.
