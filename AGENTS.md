@@ -121,20 +121,7 @@ workflow:
 
 ## Complexity-based model routing
 
-The router assigns `complexity: simple|medium|complex` instead of specific model names. The actual model is resolved per agent from `config.yml`.
-
-Two config forms are supported. The simple form sets one candidate (or list) per agent, used for all four tiers (`simple`, `medium`, `complex`, `review`):
-
-```yaml
-models:
-  claude: haiku
-  codex: gpt-5.2-codex
-  opencode:
-    - opencode:free
-    - github-copilot/gpt-5-mini
-```
-
-The advanced form maps each complexity tier explicitly. Entries here override `models:` for the specified tier and agent:
+The router assigns `complexity: simple|medium|complex` instead of specific model names. The actual model is resolved per agent from `config.yml`:
 
 ```yaml
 model_map:
@@ -152,7 +139,7 @@ model_map:
     codex: gpt-5.2
 ```
 
-Complexity is set by the router LLM under `mode: "llm"`, or by `complexity:*` labels (defaulting to `medium`) under `round_robin` / `weighted_round_robin`. See `model_for_complexity()` in the router module.
+See `model_for_complexity()` in the router module.
 
 ## Router Module (Rust)
 
