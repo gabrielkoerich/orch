@@ -460,6 +460,43 @@ fn is_cli_parser_diagnostic(text: &str) -> bool {
     false
 }
 
+/// Detect whether `text` looks like an NDJSON event stream emitted by an
+/// agent CLI (opencode/claude/codex). Returns true when the first non-empty
+/// line parses as a JSON object containing a `type` field with one of the
+/// known event-type strings.
+///
+/// This guard prevents raw NDJSON from being interpreted as agent prose and
+/// leaking into notification summaries.
+fn looks_like_ndjson_event_stream(text: &str) -> bool {
+    let Some(first_line) = text.lines().map(str::trim).find(|l| !l.is_empty()) else {
+        return false;
+    };
+
+    if !first_line.starts_with('{') {
+        return false;
+    }
+
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(first_line) else {
+        return false;
+    };
+
+    let Some(event_type) = value.get("type").and_then(|v| v.as_str()) else {
+        return false;
+    };
+
+    matches!(
+        event_type,
+        "step_start"
+            | "step_finish"
+            | "tool_use"
+            | "tool_result"
+            | "assistant"
+            | "system"
+            | "message"
+            | "text"
+    )
+}
+
 /// Build a synthetic agent response from plain text when structured parsing fails.
 ///
 /// Returns `None` for empty/whitespace-only text so callers can preserve the
@@ -478,6 +515,15 @@ pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
     //   "For more information, try '--help'"
     //   "tip: to pass '...' as a value, use '-- ...'"
     if is_cli_parser_diagnostic(trimmed) {
+        return None;
+    }
+
+    // Detect NDJSON event streams (opencode/claude/codex stdout) and reject
+    // them. Raw NDJSON masquerading as prose would otherwise leak into
+    // notification summaries — the "completed" substring inside tool state
+    // JSON triggers a false "done" classification and the first 500 bytes of
+    // NDJSON become the user-visible summary.
+    if looks_like_ndjson_event_stream(trimmed) {
         return None;
     }
 
@@ -2255,6 +2301,38 @@ mod tests {
     #[test]
     fn synthesize_response_rejects_empty_text() {
         assert!(synthesize_response_from_text("   \n\t  ").is_none());
+    }
+
+    /// Regression: raw NDJSON event streams (opencode/claude/codex stdout)
+    /// must be rejected by the synthesizer. Without the guard, the
+    /// "completed" substring inside tool state JSON triggers a false "done"
+    /// classification and 500 bytes of raw NDJSON leak into the
+    /// notification summary.
+    #[test]
+    fn synthesize_response_rejects_ndjson_event_stream() {
+        let ndjson = r#"{"type":"step_start","timestamp":1,"part":{"type":"step-start"}}
+{"type":"tool_use","timestamp":2,"name":"bash","input":{"cmd":"echo completed"}}
+{"type":"step_finish","timestamp":3,"part":{"type":"step-finish","reason":"stop"}}"#;
+        assert!(
+            synthesize_response_from_text(ndjson).is_none(),
+            "raw NDJSON must not be interpreted as agent prose"
+        );
+
+        let single = r#"{"type":"step_finish","reason":"stop","completed":true}"#;
+        assert!(
+            synthesize_response_from_text(single).is_none(),
+            "single-line NDJSON event must also be rejected"
+        );
+    }
+
+    #[test]
+    fn synthesize_response_accepts_json_without_event_type() {
+        // A JSON-like blob that does NOT match a known NDJSON event type
+        // should still be allowed through to the regular synthesis path
+        // (so the guard does not over-reach).
+        let text = "The task is complete. Filed issue #1234 successfully.";
+        let response = synthesize_response_from_text(text).expect("plain prose should synthesize");
+        assert_eq!(response.status, "done");
     }
 
     // Regression: opencode/nemotron-3-super-free and similar models sometimes exit
