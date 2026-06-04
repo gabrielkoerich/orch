@@ -65,97 +65,33 @@ rm -rf ~/.orch/worktrees/orch/gh-issue-NNNN-*
 
 ## Live Session Streaming
 
-Orch can stream live output from running agent sessions. This allows you to watch agent work in real-time from the terminal.
-
-### Streaming via CLI
-
 ```bash
 orch stream              # stream ALL running sessions (auto-discovers new ones)
 orch stream <task_id>    # stream a single task
 ```
 
-Without arguments, `orch stream` discovers all `orch-*` tmux sessions and merges their output with `[repo-taskid]` prefixes. New sessions that start while streaming are picked up automatically (re-discovery every 3 seconds).
-
-Single-task mode connects to one task's tmux session and prints output as it arrives. The stream updates every 2 seconds with new content from the agent's pane.
-
-### How It Works
-
-1. **Capture Service** (`src/channels/capture.rs`): Runs a background loop every 2 seconds that captures tmux pane output
-2. **Diffing**: Compares new output against previous capture to find only new content
-3. **Transport Layer**: Broadcasts output chunks to all subscribers (CLI, Telegram, Discord, etc.)
-4. **Output Chunks**: Each chunk contains:
-   - `task_id`: The task identifier
-   - `content`: New output text
-   - `timestamp`: When captured
-   - `is_final`: Whether this is the final output
-
-### No Duplicate Output
-
-The capture loop diffs against the previous capture, so multiple clients streaming the same session each receive only new content — no duplicates.
+Implementation: `src/channels/capture.rs` — diffs tmux pane output every 2 s and broadcasts chunks to subscribers (CLI, Telegram, Discord). Diffing prevents duplicates across multiple clients on the same session.
 
 ## Discord Gateway (Websocket)
 
-The Discord channel uses Discord's Gateway websocket API (`wss://gateway.discord.gg`) instead of HTTP polling. This delivers MESSAGE_CREATE events in real-time with sub-second latency and avoids repeated API requests.
+The Discord channel uses the Discord Gateway websocket (`wss://gateway.discord.gg`) for real-time `MESSAGE_CREATE` events. Implementation: `src/channels/discord/`.
 
-### How It Works
-
-1. **Connect** — Opens a persistent websocket connection to the Gateway URL
-2. **Hello** — Server sends `heartbeat_interval` (typically 41.25 s)
-3. **Identify** — Client sends bot token, intents, and shard info
-4. **Ready** — Server responds with `session_id` and `resume_gateway_url`
-5. **Events** — `MESSAGE_CREATE` dispatches arrive in real-time
-6. **Heartbeat** — Client sends `op=1` every `heartbeat_interval` ms; server ACKs with `op=11`
-7. **Reconnect** — On disconnect or server-requested reconnect, the client resumes with `session_id + seq`; falls back to re-identify on invalid session
-
-### Required Bot Token Scopes
-
-The bot token must have these **Gateway Intents** enabled in the [Discord Developer Portal](https://discord.com/developers/applications):
-
-| Intent | Bit | Required for |
-|--------|-----|-------------|
-| `GUILDS` | `1 << 0` | Receiving guild context |
-| `GUILD_MESSAGES` | `1 << 9` | MESSAGE_CREATE events in guilds |
-| `MESSAGE_CONTENT` | `1 << 15` | Reading message text (privileged) |
-
-> **Note:** `MESSAGE_CONTENT` is a privileged intent. Enable it in the bot's settings under *Privileged Gateway Intents* in the Discord Developer Portal.
-
-### Configuration
+Bot token must have `GUILDS`, `GUILD_MESSAGES`, and the privileged `MESSAGE_CONTENT` intent (enable under *Privileged Gateway Intents* in the Discord Developer Portal).
 
 ```yaml
 channels:
   discord:
-    bot_token: "${DISCORD_BOT_TOKEN}"   # Required: bot token from Discord Developer Portal
-    channel_id: "1234567890123456789"   # Optional: restrict to a single channel ID
-    shard_id: 0                          # Optional: shard index (default: 0)
-    shard_count: 1                       # Optional: total shards (default: 1)
+    bot_token: "${DISCORD_BOT_TOKEN}"
+    channel_id: "..."          # optional: restrict to a single channel
+    shard_id: 0                # only needed for bots in 2 500+ guilds
+    shard_count: 1
 ```
 
-Sharding is only needed for bots in 2 500+ guilds. For most deployments, the defaults (`shard_id: 0, shard_count: 1`) are correct.
-
-### Reconnect & Backoff
-
-- On disconnect, the gateway reconnects using the `resume_gateway_url` from READY + `session_id` + last sequence number
-- If the session is invalid (op=9 with `resumable=false`), the client re-identifies after a 5 s delay
-- Backoff starts at 1 s and doubles on each failed connect attempt, capping at 60 s
+Reconnect uses `resume_gateway_url` + `session_id` + last seq; falls back to re-identify on invalid session. Backoff: 1 s → 60 s.
 
 ## Webhooks & Polling Fallback
 
-Orch has two modes for receiving GitHub events:
-
-1. **Webhook mode** (instant) — via `webhook.enabled: true` in config
-2. **Polling mode** — via periodic `sync_tick()` (every 45s by default)
-
-### Polling Fallback
-
-When webhooks are enabled but the local server becomes unavailable (e.g. port conflict, crash), orch automatically switches to polling fallback mode. When webhooks are disabled entirely, polling mode is used from the start.
-
-- **Health check**: Pings the local webhook server's `/health` endpoint every 60 seconds (configurable). This verifies the local HTTP listener is running — it does not verify GitHub-side reachability or webhook secret validity.
-- **Faster polling**: When in fallback mode, sync operations run every 30 seconds (configurable) instead of 45s
-- **Logging**: Clear log messages when entering/exiting fallback mode:
-  - `entering polling fallback mode` — webhook health check failed
-  - `exiting polling fallback mode` — webhook health restored
-
-### Configuration
+Two modes for receiving GitHub events: webhook (instant) and polling (`sync_tick()` every 45 s). If the local webhook server's `/health` fails, orch auto-switches to faster polling (30 s) and logs `entering polling fallback mode`; recovery logs `exiting polling fallback mode`.
 
 ```yaml
 webhook:
@@ -164,51 +100,24 @@ webhook:
   secret: "${WEBHOOK_SECRET}"
 
 engine:
-  tick_interval: 10          # Main tick interval (seconds)
-  sync_interval: 45         # Normal sync interval (seconds)
-  fallback_sync_interval: 30 # Faster sync when webhooks fail
-  webhook_health_check_interval: 60 # Health check frequency
+  tick_interval: 10
+  sync_interval: 45
+  fallback_sync_interval: 30
+  webhook_health_check_interval: 60
 ```
 
-### Features Affected
-
-| Feature | Webhook | Polling Fallback |
-|---------|---------|------------------|
-| Issue creation | Instant | Next sync |
-| @mention detection | Instant | Next sync |
-| PR review comments | Instant | Next sync |
-| Issue close/reopen | Instant | Next sync |
-| PR merge events | Instant | Next sync |
+See also `## DO NOT TOUCH → No external endpoints`. In practice polling is the default — webhooks rarely work without a public endpoint.
 
 ## PR Review Integration
 
-Orch re-routes tasks when PR reviews request changes, closing the feedback loop between code review and agent execution.
+When a PR review on an `in_review` task returns `CHANGES_REQUESTED`, the engine stores feedback in `pr_review_context`, increments `review_cycles`, re-routes the task back to `Routed` (reuses existing agent/model/worktree/branch — skips LLM re-classification), and the agent commits fixes to the same PR.
 
-### How It Works
-
-1. The engine periodically checks tasks in `in_review` status (every sync interval)
-2. For each task with an open PR, it fetches PR reviews from GitHub
-3. When a review requests changes (`CHANGES_REQUESTED`), it:
-   - Stores the review feedback in `pr_review_context` field
-   - Increments the `review_cycles` counter
-   - Posts a review comment on the PR with the feedback
-   - Re-routes the task back to `Routed` status for re-dispatch (skips LLM re-classification, reuses existing agent/model)
-   - The agent reuses the existing worktree/branch and commits fixes (engine pushes to the same PR)
-4. If `review_cycles >= max_review_cycles`, the task is blocked for human review
-
-### Configuration
+Task becomes `blocked` when `review_cycles >= max_review_cycles`, and `done` only when the PR is actually merged.
 
 ```yaml
 workflow:
-  # Max review cycles before escalating to human (default: 2)
   max_review_cycles: 2
 ```
-
-### Status Updates
-
-- Task is re-routed (`Routed`) when review requests changes — same branch/PR is reused
-- Task is blocked when max review cycles exceeded — requires human intervention
-- Task is marked `done` only when the PR is actually merged (detected by `review_poll`)
 
 ## Complexity-based model routing
 
@@ -234,106 +143,20 @@ See `model_for_complexity()` in the router module.
 
 ## Router Module (Rust)
 
-The agent router is implemented in `src/engine/router.rs`. It selects the best agent (claude/codex/opencode) and model for each task based on task content, labels, and configured routing rules.
+Implementation: `src/engine/router/` (selects agent + model per task). Prompt: `prompts/route.md`. Structs: `RouteResult`, `AgentProfile` in source.
 
-### Router Configuration
-
-```yaml
-router:
-  mode: "llm"              # "llm" (default) or "round_robin"
-  agent: "claude"          # which LLM performs routing
-  model: "haiku"           # fast/cheap model for classification
-  timeout_seconds: 60     # routing timeout
-  fallback_executor: "codex"  # fallback if routing fails
-  max_route_attempts: 3    # after N LLM failures, fall back to round-robin
-  agents:                  # agents to discover in PATH
-    - claude
-    - codex
-    - opencode
-    - kimi
-    - minimax
-  allowed_tools:           # default tools for agent profiles
-    - yq
-    - jq
-    - bash
-    - just
-    - git
-    - rg
-    - sed
-    - awk
-    - python3
-    - node
-    - npm
-    - bun
-  default_skills:          # skills always included
-    - gh
-    - git-worktree
-```
-
-### Routing Logic
-
-The router follows this priority order:
-
-1. **Label-based override**: If task has `agent:*` label (e.g., `agent:claude`), use that agent directly
-2. **Round-robin mode**: If `router.mode` is `round_robin`, cycle through available agents by task ID
-3. **LLM classification**: Call the configured router LLM with the routing prompt
-4. **Parse response**: Extract executor, complexity, profile, and selected skills from JSON
-5. **Fallback**: If LLM fails, use `router.fallback_executor`
+Priority order: label override → round-robin mode → LLM classification → `router.fallback_executor`. Configured under the `router:` key in `~/.orch/config.yml`.
 
 ### Label-Based Routing
 
-Override the router by adding labels to tasks:
-
 | Label | Effect |
 |-------|--------|
-| `agent:claude` | Force Claude executor |
-| `agent:codex` | Force Codex executor |
-| `agent:opencode` | Force OpenCode executor |
-| `complexity:simple` | Use simple model tier |
-| `complexity:medium` | Use medium model tier |
-| `complexity:complex` | Use complex model tier |
-
-### RouteResult Struct
-
-Routing results are stored in the unified SQLite task store (`~/.orch/orch.db`):
-
-```rust
-pub struct RouteResult {
-    pub agent: String,           // "claude", "codex", or "opencode"
-    pub model: Option<String>,   // e.g., "sonnet", "opus"
-    pub complexity: String,      // "simple", "medium", "complex"
-    pub reason: String,          // why this agent was selected
-    pub profile: AgentProfile,   // role, skills, tools, constraints
-    pub selected_skills: Vec<String>,
-    pub warning: Option<String>, // routing sanity check warnings
-}
-```
-
-### AgentProfile Struct
-
-```rust
-pub struct AgentProfile {
-    pub role: String,           // e.g., "backend specialist"
-    pub skills: Vec<String>,    // focus skills for this task
-    pub tools: Vec<String>,     // tools allowed
-    pub constraints: Vec<String>, // constraints for this task
-}
-```
+| `agent:claude` \| `agent:codex` \| `agent:opencode` | Force that executor |
+| `complexity:simple` \| `medium` \| `complex` | Use that model tier |
 
 ### Environment Variables
 
-The runner passes routing results to the agent invocation via:
-
-- `ORCH_AGENT` — the selected agent (claude/codex/opencode)
-- `ORCH_MODEL` — the specific model to use
-
-### Routing Prompt
-
-The routing prompt template is at `prompts/route.md`. It includes:
-- Available executors
-- Skills catalog
-- Task details (ID, title, labels, body)
-- Expected JSON output format
+The runner passes routing results to the agent via `ORCH_AGENT` (selected agent) and `ORCH_MODEL` (specific model).
 
 ## Directory layout
 
@@ -628,105 +451,26 @@ Agents run in worktrees, NOT the main project directory. Orch enforces this:
 
 ## Codex sandbox config
 
-Codex runs with `--full-auto` + network access enabled by default. Configurable:
+Codex runs under `exec` with `--sandbox workspace-write -c 'approval_policy="never"'` and network access enabled by default. `--full-auto` is deprecated (Codex 0.128+) and must not be reintroduced.
 
-```yaml
-# In config.yml or .orch.yml
-agents:
-  codex:
-    sandbox: full-auto  # full-auto | workspace-write | danger-full-access | none
-```
+The sandbox level comes from `workflow.permissions.sandbox` (`workspace-write` | `full-access`) and the approval mode from `workflow.permissions.mode` (`autonomous` | `supervised`). See `src/engine/runner/agents/codex.rs` for the exact flag combinations.
 
-Or per-run: `CODEX_SANDBOX=danger-full-access orch task run 5`
-
-Modes:
-- `full-auto` (default) — filesystem sandboxed, network enabled
-- `workspace-write` — same sandbox, explicit mode
-- `danger-full-access` — no sandbox (for tasks needing bun, solana-test-validator, etc.)
-- `none` — bypasses all Codex sandboxing (orch is the sandbox)
+Network access is enabled via `-c 'sandbox_workspace_write.network_access=true'` and the shell environment is inherited via `-c 'shell_environment_policy.inherit=all'`. Both flags must precede `exec` — placing them after silently fails.
 
 ## Control Session (`orch chat`)
 
-An interactive conversational control plane. Talk to orch in natural language — ask about running tasks, create new ones, check status, unblock things.
-
-### How It Works
-
-Uses one-shot agent invocations with SQLite-backed continuity:
-
-```
-1. Each named session stores conversation history, summaries, memories, and a session UUID in SQLite
-2. Every message assembles fresh context from that stored state
-3. The agent runs one-shot via `bash -c` with a timeout, not inside tmux
-4. Claude-compatible agents receive the stored session UUID for conversation continuity
-5. Changing `/model` or `/agent` resets the stored session UUID so the next message starts fresh with the new selection
-
-Storage: context assembled from SQLite (live state + memories)
-```
-
-All data persisted to `control_messages` table (history + summary + tokens + cost).
-
-### CLI Usage
+Interactive conversational control plane — natural-language interface to orch state. Implementation: `src/control.rs`, `src/cli/chat.rs`, prompt at `prompts/control_system.md`. Persistence in `orch.db` (`control_messages` table + `kv` keys `control:model`, `control:agent`, `control:memory:{session}:*`).
 
 ```bash
 orch chat                           # interactive REPL
 orch chat "what's running?"         # single message
-orch chat --session ops             # use a named session profile
-orch chat history                   # show recent messages
-orch chat history --search "bean"   # search past conversations
+orch chat --session ops             # named session (isolated history + memories)
+orch chat history [--search QUERY]  # show / search past messages
 ```
 
-### Model Selection
+Inside the REPL: `/model <name>` or `/model <agent>:<model>`, `/agent <name>`. Changing model/agent resets the stored session UUID so the next message starts fresh. Selection is validated by a test invocation before being saved (catches rate limits, missing API keys, expired credits). Sessions isolate history + memories; model/agent selection is global.
 
-```bash
-/model sonnet                       # infer agent (claude)
-/model minimax:sonnet               # explicit agent:model
-/model opencode:minimax-m2.5-free   # opencode with specific model
-/agent codex                        # switch agent and its default model
-/agent                              # show current agent:model
-/model                              # show current agent:model
-```
-
-Model selection validates before saving:
-1. Agent must be in `DEFAULT_AGENTS` (from `router/config.rs`)
-2. Agent binary must exist in PATH (via `cmd_cache::command_exists`)
-3. For opencode: pre-checks against `opencode models` list
-4. **Always**: test invocation to verify model actually works (catches rate limits, missing API keys, expired credits)
-
-### Multi-Session Support
-
-Sessions isolate conversation history and memories. Default session is `"default"`.
-
-```bash
-orch chat --session ops             # ops profile
-orch chat --session dev             # dev profile
-```
-
-Each session has its own:
-- Message history in `control_messages` table (filtered by `session_id`)
-- Memories in KV store (keys: `control:memory:{session_id}:*`)
-- Model/agent selection is global (shared across sessions)
-
-### Storage
-
-All in `~/.orch/orch.db`:
-
-- `control_messages` table — full conversation history with session_id, role, content, summary, model, agent, tokens, cost
-- `kv` table — model state (`control:model`, `control:agent`) and memories (`control:memory:{session}:*`)
-
-### Architecture
-
-- `src/control.rs` — context assembly, agent invocation, response parsing
-- `src/cli/chat.rs` — CLI handlers (REPL, single-message, history)
-- `prompts/control_system.md` — system prompt template with `{current_state}`, `{memories}`, `{recent_summaries}` placeholders
-- Reuses runner infrastructure: `get_runner()`, `build_command()`, `parse_response()`, `classify_error()` from `src/engine/runner/agents/`
-- Agent invocations run via `bash -c` with timeout (45s), not tmux
-
-### Configuration
-
-```yaml
-# No config needed — works with defaults (claude:sonnet)
-# Model/agent stored in KV, changed via /model or /agent commands
-```
+Agent invocations run one-shot via `bash -c` with a 45 s timeout, not in tmux.
 
 ## Landing the Plane (Session Completion)
 
