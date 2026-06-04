@@ -32,7 +32,10 @@ gh:
 
 3. Optionally set up a GitHub Project v2:
 ```bash
-orch project info --fix     # auto-fills project field/option IDs into config
+orch board list             # list accessible Project v2 boards
+orch board link PVT_xxx     # link this repo to a board
+orch board sync             # (re-)discover field/option IDs and persist to .orch.yml
+orch board info             # show current board config
 ```
 
 ## How It Works
@@ -47,7 +50,7 @@ orch project info --fix     # auto-fills project field/option IDs into config
 | body | Issue body |
 | status | Label `status:new`, `status:routed`, etc. |
 | agent | Label `agent:claude`, `agent:codex`, etc. |
-| complexity | Label `complexity:low/med/high` |
+| complexity | Label `complexity:simple/medium/complex` |
 | labels | Issue labels (non-prefixed) |
 | parent_id | Sub-issue relationship |
 | summary, response | Structured comment with `<!-- orch:agent-response -->` marker |
@@ -78,12 +81,11 @@ Machine-specific fields (branch, worktree path, attempt count, agent, model, pr_
 
 ## Backoff
 
-When GitHub rate limits or abuse detection triggers, orch sleeps and retries:
+When GitHub rate limits or abuse detection triggers, orch sleeps and retries with exponential backoff:
 
 ```yaml
 gh:
   backoff:
-    mode: "wait"         # "wait" (default) or "skip"
     base_seconds: 30     # initial backoff duration
     max_seconds: 900     # maximum backoff duration
 ```
@@ -96,13 +98,6 @@ Link tasks to a GitHub Project v2 board:
 gh:
   project_id: "PVT_..."
   project_status_field_id: "PVTSSF_..."
-  # Optional: set these if your Project "Status" options aren't
-  # exactly: Backlog, In Progress, Review, Done
-  project_status_names:
-    backlog: "Todo"
-    in_progress: "Doing"
-    review: ["In Review", "Needs Review"]
-    done: "Done"
   project_status_map:
     backlog: "option-id-1"
     in_progress: "option-id-2"
@@ -112,8 +107,8 @@ gh:
 
 Discover IDs automatically:
 ```bash
-orch project info        # show current project field/option IDs
-orch project info --fix  # auto-fill into config
+orch board info          # show current project field/option IDs
+orch board sync          # (re-)discover and persist to .orch.yml
 ```
 
 ## Owner Feedback
@@ -126,17 +121,18 @@ When the repo owner comments on a GitHub issue linked to a completed task, orch 
 
 ### Slash Commands
 
-Owner comments can also start with a slash command on the **first line** (case-insensitive):
+Owner comments can also start with a slash command on the **first line** (case-insensitive). Parsed by `src/engine/commands.rs`.
 
 | Command | Action |
 |---|---|
 | `/retry` | Reset task to `status:new` (clears agent + attempts) |
-| `/assign <agent>` | Set agent (`claude`, `codex`, `opencode`) and move to `status:routed` |
-| `/unblock` | Clear `blocked`/error state and reset to `status:new` |
+| `/reroute [agent]` | Re-route the task (optionally forcing a specific agent) |
+| `/unblock` | Clear `blocked` state and reset to `status:new` |
+| `/block [reason]` | Mark the task blocked with an optional reason |
 | `/close` | Mark `status:done` and close the issue |
-| `/context <text>` | Append text to task context and move to `status:routed` |
-| `/priority <low|medium|high>` | Set complexity (`simple|medium|complex`) and move to `status:routed` |
-| `/help` | Show supported commands |
+| `/review` | Trigger / re-trigger the review agent on the linked PR |
+
+To change agent or complexity without using a slash command, add the corresponding label directly on the issue (`agent:claude`, `complexity:medium`, etc.) — the engine picks up label changes on the next sync.
 
 ## Notes
 

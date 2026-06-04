@@ -40,65 +40,35 @@ orch service start      # start background service
 
 ```bash
 orch project add owner/repo          # bare clone + import issues
-orch task add "title" -p owner/repo  # add a task to that project
+cd ~/.orch/projects/owner/repo.git   # or any local checkout of that repo
+orch task add "title"                # add a task to the current project
 orch service start                   # service picks it up automatically
 ```
 
-Bare clones live at `~/.orch/projects/<owner>/<repo>.git`. Agents always work in worktrees — never in the main clone. Worktrees are under `~/.orch/worktrees/<project>/<branch>/`.
+`orch task add` always targets the current project (resolved from CWD). To create tasks for another project, `cd` into it first. Bare clones live at `~/.orch/projects/<owner>/<repo>.git`. Agents always work in worktrees — never in the main clone. Worktrees are under `~/.orch/worktrees/<project>/<branch>/`.
 
 ## GitHub Authentication
 
-Orch requires GitHub authentication to create issues, post comments, and manage PRs. Three auth methods are supported:
+The simplest setup is `gh auth login` — orch picks up the token automatically. No extra config needed.
 
-### Option 1: Personal Access Token (Recommended for individuals)
+Tokens are resolved in this order (first match wins):
 
-Create a token at [GitHub Settings → Developer settings → Personal access tokens](https://github.com/settings/tokens).
+1. `GH_TOKEN` environment variable
+2. `GITHUB_TOKEN` environment variable
+3. `gh.auth.token` in `~/.orch/config.yml`
+4. `gh auth token` CLI (enabled by default via `gh.allow_gh_fallback: true`)
 
-```bash
-# Set as environment variable (add to ~/.zshrc or ~/.bashrc)
-export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
-
-# Or configure in ~/.orch/config.yml
-gh:
-  auth:
-    token: "ghp_xxxxxxxxxxxxxxxxxxxx"
-```
-
-### Option 2: GitHub App (Recommended for organizations)
-
-GitHub Apps provide better audit trails and scoped permissions for automation:
-
-1. Create a GitHub App in your organization settings
-2. Generate a private key and download the `.pem` file
-3. Install the app on your repositories
-4. Configure in `~/.orch/config.yml`:
+For organizations, GitHub App auth is supported:
 
 ```yaml
+# ~/.orch/config.yml
 github:
   token_mode: github_app
   app_id: "123456"
   private_key_path: "/path/to/app-private-key.pem"
 ```
 
-Orch automatically exchanges the App credentials for installation tokens and refreshes them before expiry.
-
-### Option 3: gh CLI (Default fallback)
-
-The simplest setup — orch calls `gh auth token` automatically when no env var or config token is set:
-
-```bash
-gh auth login
-```
-
-That's it. No extra config needed. To disable this fallback:
-
-```yaml
-# ~/.orch/config.yml
-gh:
-  allow_gh_fallback: false
-```
-
-**Note:** The `gh` CLI fallback is not recommended for service environments (launchd/systemd) as it requires an interactive login session. Use `GH_TOKEN` via `~/.private` or a GitHub App instead.
+Orch generates JWTs from the private key (valid for 9 minutes) and caches the installation token until expiry.
 
 ### Security: Service Deployments (Homebrew / launchd)
 
@@ -141,7 +111,7 @@ All runtime state lives in `~/.orch/` (`ORCH_HOME`):
 | `config.yml` | Global runtime configuration |
 | `orch.db` | SQLite task database (internal tasks, metrics, KV store) |
 | `skills.yml` | Approved skill repositories and catalog |
-| `skills/` | Cloned skill repositories (via `orch skills sync`) |
+| `skills/` | Cloned skill repositories (refreshed automatically on the engine's sync tick) |
 | `projects/` | Bare clones added via `orch project add` |
 | `worktrees/` | Agent worktrees (`<project>/<branch>/`) |
 | `state/` | Runtime state (logs, prompts, per-task artifacts) |

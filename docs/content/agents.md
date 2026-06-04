@@ -6,9 +6,10 @@ weight = 5
 
 Once routed, agents run in full agentic mode with tool access:
 
-- **Claude**: `-p` flag (non-interactive agentic mode), `--permission-mode acceptEdits`, `--output-format json`, system prompt via `--append-system-prompt`
-- **Codex**: `-q` flag (quiet non-interactive mode), `--json`, system+agent prompt combined
-- **OpenCode**: `opencode run --format json` with combined prompt
+- **Claude**: `-p` (non-interactive), `--permission-mode bypassPermissions` (autonomous) or `acceptEdits` (supervised), `--output-format json`, system prompt via `--append-system-prompt`
+- **Codex**: `exec` subcommand with `--sandbox workspace-write -c 'approval_policy="never"'` (autonomous) or `--dangerously-bypass-approvals-and-sandbox` (full access); `-c 'sandbox_workspace_write.network_access=true'`; system+agent prompt combined
+- **OpenCode**: `opencode run` with `--dangerously-skip-permissions` and combined prompt
+- **Kimi / MiniMax**: spawned via their CLIs with the prompt as stdin; combined system+task prompt
 
 Agents execute inside an isolated git worktree created for the task (not your main repo), so they can read project files, edit code, and run commands.
 
@@ -47,7 +48,6 @@ Create a `~/.path` file that exports your development tool paths:
 export PATH="/opt/homebrew/bin:$PATH"
 export PATH="$HOME/.bun/bin:$PATH"
 export PATH="$HOME/.cargo/bin:$PATH"
-export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
@@ -55,14 +55,14 @@ Orch sources this file before launching agents, so any tool on your PATH will be
 
 **Option 2: Default fallback**
 
-If `~/.path` doesn't exist, orch automatically adds common paths:
+If `~/.path` doesn't exist, orch automatically prepends these well-known directories (only when they exist on disk):
 
-- `$HOME/.bun/bin`
-- `$HOME/.cargo/bin`
-- `$HOME/.local/share/solana/install/active_release/bin`
-- `$HOME/.local/bin`
 - `/opt/homebrew/bin`
+- `/opt/homebrew/sbin`
 - `/usr/local/bin`
+- `$HOME/.cargo/bin`
+- `$HOME/.local/bin`
+- `$HOME/.bun/bin`
 
 ## Safety Rules
 
@@ -128,9 +128,17 @@ orch task unblock all      # reset all needs_review/blocked tasks
 
 ## Codex Sandbox Notes
 
-Codex supports multiple sandbox configurations. When a workspace-write sandbox is required the runner enables networking and inherits the shell environment to allow tools like `bun` and language runtimes to work. Recommended settings when enabling workspace-write sandboxing:
+Codex runs under the `exec` subcommand. The sandbox flag depends on `workflow.permissions.mode` and `workflow.permissions.sandbox`:
 
-- `sandbox_workspace_write.network_access=true`
-- `shell_environment_policy.inherit=all`
+| Mode | Sandbox | Flags |
+|------|---------|-------|
+| `autonomous` | (any) | `--sandbox workspace-write -c 'approval_policy="never"'` |
+| `supervised` | `workspace-write` | `-c 'approval_policy="on-request"' --sandbox workspace-write` |
+| `autonomous` | `full-access` | `--dangerously-bypass-approvals-and-sandbox` |
 
-These are configured by orch when spawning the Codex runner — do not rely on agents to set these themselves.
+The runner also sets:
+
+- `-c 'sandbox_workspace_write.network_access=true'` (must precede `exec` — placing it after silently leaves the sandbox network-blocked)
+- `-c 'shell_environment_policy.inherit=all'` (so `bun`, `cargo`, etc. work)
+
+`--full-auto` is **not** used — it was deprecated in Codex 0.128.0. Do not reintroduce it.

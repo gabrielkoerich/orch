@@ -44,6 +44,7 @@ graph TB
         CO["codex"]
         OC["opencode"]
         KI["kimi"]
+        MM["minimax"]
     end
 
     subgraph "tmux Sessions"
@@ -233,7 +234,7 @@ new → routed → in_progress → needs_review → in_review → done
 │  3. Resolve model/agent from KV                │
 │  4. Invoke agent one-shot:                     │
 │     - get_runner(agent).build_command()         │
-│     - bash -c (120s timeout)                   │
+│     - bash -c (45s timeout)                    │
 │     - get_runner(agent).parse_response()        │
 │     - get_runner(agent).classify_error()        │
 │  5. Extract text + tokens from response        │
@@ -307,7 +308,8 @@ graph LR
 │  Channels:                                       │
 │    - Telegram (forum topics, inline keyboards)   │
 │    - Discord (multi-channel, button interactions)│
-│    - GitHub webhooks (instant events)            │
+│    - Slack (channels, threads)                   │
+│    - GitHub (webhooks when reachable, else poll) │
 │    - Tmux capture (output streaming)             │
 │                                                  │
 │  Shutdown:                                       │
@@ -333,10 +335,16 @@ graph LR
 
 ## Settled Decisions (DO NOT TOUCH)
 
+These are short pointers — the authoritative descriptions and rationales live in [`AGENTS.md`](../AGENTS.md) under "DO NOT TOUCH". Read those before changing any of the areas below.
+
 - **`src/github/token.rs`** — Token resolution uses `std::process::Command` (blocking, cached 1h). Intentional.
 - **`src/engine/runner/`** — Tmux IS the PTY. No external PTY runners.
-- **`src/github/auth.rs`** — Deleted (dead code). Do not recreate.
-- **No external endpoints** — Orch is an internal tool with no external network access. No public HTTP/webhook endpoints. The webhook receiver exists but only works when the machine is reachable (rarely). External consumers (CLI, local tools) connect via localhost-only websocket. Do not add externally-reachable servers or rely on inbound connections from GitHub/other services.
-- **Migrations are immutable** — Never modify existing migration files in `migrations/`. SQLx locks checksums on first run. Always create a new numbered migration file instead. Modifying an existing one breaks `TaskStore::open()` on all existing databases.
+- **No external endpoints** — Orch is an internal tool. The webhook receiver exists but only works when the host is reachable; the default mode is GitHub polling. External consumers connect via localhost-only websocket.
+- **Migrations are immutable** — Never modify existing files in `migrations/`. SQLx locks checksums on first run; create a new numbered file instead.
 - **Config files are off-limits** — Agents must never modify `~/.orch/config.yml`, `config.example.yml`, or `.orch.yml` project configs.
-- **Cooldown system is generic with exponential backoff** — All failures (agent, model, credit exhaustion, billing cycle) are handled by a single generic mechanism. Backoff formula: `min(base * 3^(attempt-1), max)`. Failure counts persist in KV (`failure_count:{key}`). Vendor "try again at" dates are always authoritative. Do not add special-case handling for specific agents/models. Incremental tuning is welcome, but the exponential backoff mechanism must not be reverted to flat cooldowns.
+- **Cooldown system is generic with exponential backoff** — All failures share one mechanism: `min(base * 3^(attempt-1), max)`, failure counts in `failure_count:{key}` KV, vendor "try again at" dates always authoritative. No per-agent or per-model special-casing.
+- **No hardcoded model names in router/runner/cooldown code** — Model failures go through `record_persistent_model_failure(agent, model)`; never add `match` arms or allow/deny lists keyed on specific model identifiers.
+- **No per-task routing defer** — When `AllAgentsCooledError` fires, log + `continue`. Never write a `route_defer_until:*` KV key or any other parallel timer that races the real cooldowns.
+- **No 'budget' features** — Agents run on subscription / fixed pricing. No per-task token budgets, no LLM wall-clock budgets, no "budget_exceeded" columns or failure categories. Use existing cooldown/timeout/watchdog mechanisms.
+- **Routing concurrency = `router.max_tasks_per_tick`** — One knob, plus per-call `router.timeout_seconds`. No semaphores, worker pools, or wall-clock budget wrappers.
+- **Security leak detection blocks ALL patterns** — `has_leaks()` ignores the `high_confidence` flag; any match prevents GitHub posting. The flag is for display severity only.

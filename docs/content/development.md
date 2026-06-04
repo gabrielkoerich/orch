@@ -59,7 +59,7 @@ If all commits since the last tag are `chore:`/`docs:` only, the release job is 
 ```
 src/
   main.rs           — CLI entrypoint (clap)
-  store.rs          — Unified SQLite task store (tasks, metrics, KV, rate limits)
+  store/            — Unified SQLite task store (tasks, metrics, KV, rate limits)
   config/           — Config loading, hot-reload, multi-project
   engine/           — Core orchestration (tick, sync, review, cleanup, router, runner)
   github/           — GitHub API (HTTP client, token resolution, types, Projects V2)

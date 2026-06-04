@@ -31,12 +31,14 @@ Orch uses an LLM-as-classifier to route each task to the best agent. This is a n
 
 ```yaml
 router:
+  mode: "llm"               # "llm" | "round_robin" | "local"
   agent: "claude"           # which LLM does the routing
   model: "haiku"            # fast/cheap model for classification
   timeout_seconds: 60
-  fallback_executor: "codex"  # safety net if routing fails
-  disabled_agents:          # exclude agents from routing
-    - opencode
+  max_route_attempts: 3     # LLM failures before falling back to round-robin
+  max_tasks_per_tick: 1     # routing concurrency cap
+  weighted_round_robin: false
+  fallback_executor: "codex"
   allowed_tools:            # default tool allowlist
     - yq
     - jq
@@ -45,6 +47,8 @@ router:
     - gh
     - git-worktree
 ```
+
+To exclude an agent from routing entirely, remove it from the `agents:` discovery list (the router only considers installed, listed agents) — there is no separate `disabled_agents` knob.
 
 ## Available Executors
 
@@ -66,13 +70,16 @@ The router assigns a `complexity` level (`simple`, `medium`, `complex`) which ma
 model_map:
   simple:
     claude: "haiku"
-    codex: "gpt-4.1-mini"
+    codex: "gpt-5.1-codex-mini"
   medium:
     claude: "sonnet"
-    codex: "gpt-4.1"
+    codex: "gpt-5.2"
   complex:
     claude: "opus"
-    codex: "o3"
+    codex: "gpt-5.3-codex"
+  review:
+    claude: "sonnet"
+    codex: "gpt-5.2"
 ```
 
 The routing prompt is in `prompts/route.md`. The router only classifies — it never touches code or files.

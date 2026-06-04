@@ -9,13 +9,14 @@ Define recurring work with cron expressions. Jobs create tasks on schedule (or r
 ## Commands
 
 ```bash
-orch job add "0 9 * * *" "Daily report" "body" "labels"
-orch job add --type bash --command "echo hello" "@hourly" "Ping"
-orch job list
+orch job list                                                # list scheduled jobs
+orch job add "0 9 * * *" "Daily report" -b "what to do"      # task job (positional: schedule, title)
+orch job add "@hourly" "Ping" -t bash -c "./scripts/ping.sh" # bash job
 orch job enable <id>
 orch job disable <id>
 orch job remove <id>
-orch job tick          # manually check and fire due jobs
+orch job tick                                                # run one scheduler tick
+orch job run <id> [-p repo-slug]                             # run a job immediately, ignoring schedule
 ```
 
 ## Job Types
@@ -27,7 +28,9 @@ orch job tick          # manually check and fire due jobs
 
 ## How It Works
 
-1. Jobs are defined per-project in the project's `.orch.yml` under the `jobs:` key.
+1. Jobs are loaded from **two sources**:
+   - Per-project `.orch.yml` under the `jobs:` key
+   - Per-project `prompts/jobs/*.md` files with frontmatter (`id`, `schedule`, `title`, `type`, `enabled`, `external`, `agent`, `command`, `dir`)
 2. The engine's scheduler checks cron schedules on each tick (tick interval configurable via `engine.tick_interval`).
 3. When a schedule matches, a task is created (or command is run)
 4. Jobs skip if a previous task from the same job is still in-flight (`active_task_id`)
@@ -52,11 +55,11 @@ Aliases: `@hourly`, `@daily`, `@weekly`, `@monthly`, `@yearly`
 ## Example
 
 ```bash
-# Run code quality check every morning
-orch job add "0 9 * * 1-5" "Code quality review" "Run lints, check for TODO items, update docs"
+# Run code quality check every weekday morning
+orch job add "0 9 * * 1-5" "Code quality review" -b "Run lints, check for TODO items, update docs"
 
 # Database backup every night (bash, no agent)
-orch job add --type bash --command "pg_dump mydb > /backups/nightly.sql" "0 2 * * *" "DB backup"
+orch job add "0 2 * * *" "DB backup" -t bash -c "pg_dump mydb > /backups/nightly.sql"
 ```
 
 Jobs integrate with GitHub sync — job-created tasks get synced to GitHub issues like any other task.
