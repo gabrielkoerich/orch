@@ -808,6 +808,7 @@ pub async fn execute_job(
                 summary,
                 repo: Some(repo.to_string()),
                 notify_target: target,
+                pr_number: None,
             };
             t.push_notification(notification);
         }

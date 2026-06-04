@@ -69,6 +69,23 @@ pub struct TaskNotification {
     /// the channel routing logic.
     #[serde(default)]
     pub notify_target: Option<String>,
+    /// PR number if a pull request is associated with the task.
+    #[serde(default)]
+    pub pr_number: Option<String>,
+}
+
+/// Build the GitHub URL associated with this task, preferring the PR link
+/// when available and falling back to the issue link for external tasks.
+fn github_link(repo: Option<&str>, task_id: &str, pr_number: Option<&str>) -> Option<String> {
+    let repo = repo?;
+    if let Some(pr) = pr_number {
+        return Some(format!("https://github.com/{repo}/pull/{pr}"));
+    }
+    // External task IDs are bare issue numbers; internal IDs start with "internal:".
+    if !task_id.starts_with("internal:") && task_id.chars().all(|c| c.is_ascii_digit()) {
+        return Some(format!("https://github.com/{repo}/issues/{task_id}"));
+    }
+    None
 }
 
 impl TaskNotification {
@@ -80,13 +97,21 @@ impl TaskNotification {
     pub fn format_telegram(&self) -> String {
         let emoji = status_emoji(&self.status);
         let duration = format_duration(self.duration_seconds);
+        let link_suffix = match github_link(
+            self.repo.as_deref(),
+            &self.task_id,
+            self.pr_number.as_deref(),
+        ) {
+            Some(url) => format!("\n\n<a href=\"{}\">View on GitHub</a>", html_escape(&url)),
+            None => String::new(),
+        };
 
         format!(
             "{emoji} <b>Task #{task_id}</b>: {status}\n\
              <b>{title}</b>\n\
              Agent: <code>{agent}</code> | Duration: {duration}\n\
              \n\
-             {summary}",
+             {summary}{link_suffix}",
             emoji = emoji,
             task_id = html_escape(&self.task_id),
             status = html_escape(&self.status),
@@ -94,6 +119,7 @@ impl TaskNotification {
             agent = html_escape(&self.agent),
             duration = duration,
             summary = html_escape(&self.summary),
+            link_suffix = link_suffix,
         )
     }
 
@@ -103,13 +129,21 @@ impl TaskNotification {
     pub fn format_slack(&self) -> String {
         let emoji = status_emoji(&self.status);
         let duration = format_duration(self.duration_seconds);
+        let link_suffix = match github_link(
+            self.repo.as_deref(),
+            &self.task_id,
+            self.pr_number.as_deref(),
+        ) {
+            Some(url) => format!("\n\n<{url}|View on GitHub>"),
+            None => String::new(),
+        };
 
         format!(
             "{emoji} *Task #{task_id}*: {status}\n\
              *{title}*\n\
              Agent: `{agent}` | Duration: {duration}\n\
              \n\
-             {summary}",
+             {summary}{link_suffix}",
             emoji = emoji,
             task_id = self.task_id,
             status = self.status,
@@ -117,6 +151,7 @@ impl TaskNotification {
             agent = self.agent,
             duration = duration,
             summary = self.summary,
+            link_suffix = link_suffix,
         )
     }
 
@@ -124,13 +159,21 @@ impl TaskNotification {
     pub fn format_discord(&self) -> String {
         let emoji = status_emoji(&self.status);
         let duration = format_duration(self.duration_seconds);
+        let link_suffix = match github_link(
+            self.repo.as_deref(),
+            &self.task_id,
+            self.pr_number.as_deref(),
+        ) {
+            Some(url) => format!("\n\n[View on GitHub]({url})"),
+            None => String::new(),
+        };
 
         format!(
             "{emoji} **Task #{task_id}**: {status}\n\
              **{title}**\n\
              Agent: `{agent}` | Duration: {duration}\n\
              \n\
-             {summary}",
+             {summary}{link_suffix}",
             emoji = emoji,
             task_id = self.task_id,
             status = self.status,
@@ -138,6 +181,7 @@ impl TaskNotification {
             agent = self.agent,
             duration = duration,
             summary = self.summary,
+            link_suffix = link_suffix,
         )
     }
 
@@ -290,6 +334,7 @@ mod tests {
             summary: "Fixed the OAuth flow".to_string(),
             repo: Some("owner/my-project".to_string()),
             notify_target: None,
+            pr_number: None,
         };
         let msg = n.format_telegram();
         assert!(msg.contains("✅"));
@@ -312,6 +357,7 @@ mod tests {
             summary: "Done".to_string(),
             repo: None,
             notify_target: None,
+            pr_number: None,
         };
         let msg = n.format_telegram();
         // HTML mode: underscores and asterisks are literal characters; ensure
@@ -332,6 +378,7 @@ mod tests {
             summary: "Ready for review".to_string(),
             repo: None,
             notify_target: None,
+            pr_number: None,
         };
         let msg = n.format_telegram();
         // In HTML mode underscores are literal; ensure status is present and
@@ -350,6 +397,7 @@ mod tests {
             summary: "Done".to_string(),
             repo: None,
             notify_target: None,
+            pr_number: None,
         };
         let msg = n.format_telegram();
         // HTML mode: underscores are literal in text and agent is enclosed in
@@ -368,6 +416,7 @@ mod tests {
             summary: "Decomposed mod.rs".to_string(),
             repo: Some("org/refactor-repo".to_string()),
             notify_target: None,
+            pr_number: None,
         };
         let msg = n.format_slack();
         assert!(msg.contains("✅"));
@@ -390,6 +439,7 @@ mod tests {
             summary: "Timed out waiting for tests".to_string(),
             repo: Some("acme/deploy-svc".to_string()),
             notify_target: None,
+            pr_number: None,
         };
         let msg = n.format_discord();
         assert!(msg.contains("⚠️"));
@@ -410,6 +460,7 @@ mod tests {
             summary: "Feature added".to_string(),
             repo: Some("acme/widgets".to_string()),
             notify_target: None,
+            pr_number: None,
         };
         let msg = n.format_with_project("telegram");
         assert!(msg.starts_with("[widgets] "));
@@ -427,6 +478,7 @@ mod tests {
             summary: "Done".to_string(),
             repo: None,
             notify_target: None,
+            pr_number: None,
         };
         let msg = n.format_with_project("discord");
         assert!(msg.starts_with("[unknown] "));
@@ -454,6 +506,7 @@ mod tests {
             summary: "Fixed it".into(),
             repo: Some("owner/myproject".into()),
             notify_target: None,
+            pr_number: None,
         };
         let formatted = n.format_with_project("telegram");
         assert!(
@@ -474,6 +527,7 @@ mod tests {
             summary: "Fixed it".into(),
             repo: None,
             notify_target: None,
+            pr_number: None,
         };
         let formatted = n.format_with_project("telegram");
         assert!(
@@ -493,6 +547,7 @@ mod tests {
             summary: "Deployed".into(),
             repo: Some("acme/svc".into()),
             notify_target: None,
+            pr_number: None,
         };
         let tg = n.format_with_project("telegram");
         let dc = n.format_with_project("discord");
@@ -502,5 +557,97 @@ mod tests {
         // Discord uses ** for bold, telegram uses HTML <b> tags
         assert!(dc.contains("**Task #5**"));
         assert!(tg.contains("<b>Task #5</b>"));
+    }
+
+    #[test]
+    fn telegram_appends_pr_link_when_pr_number_present() {
+        let n = TaskNotification {
+            task_id: "internal:151696".to_string(),
+            title: "Market intelligence".to_string(),
+            status: "done".to_string(),
+            agent: "claude".to_string(),
+            duration_seconds: 39.0,
+            summary: "Trending topics".to_string(),
+            repo: Some("owner/repo".to_string()),
+            notify_target: None,
+            pr_number: Some("4242".to_string()),
+        };
+        let msg = n.format_telegram();
+        assert!(
+            msg.contains("https://github.com/owner/repo/pull/4242"),
+            "expected PR link in {msg}"
+        );
+        assert!(msg.contains("View on GitHub"));
+    }
+
+    #[test]
+    fn telegram_falls_back_to_issue_link_for_external_task_without_pr() {
+        let n = TaskNotification {
+            task_id: "1234".to_string(),
+            title: "An issue".to_string(),
+            status: "needs_review".to_string(),
+            agent: "claude".to_string(),
+            duration_seconds: 10.0,
+            summary: "Awaiting review".to_string(),
+            repo: Some("owner/repo".to_string()),
+            notify_target: None,
+            pr_number: None,
+        };
+        let msg = n.format_telegram();
+        assert!(
+            msg.contains("https://github.com/owner/repo/issues/1234"),
+            "expected issue link in {msg}"
+        );
+    }
+
+    #[test]
+    fn no_link_for_internal_task_without_pr() {
+        let n = TaskNotification {
+            task_id: "internal:99".to_string(),
+            title: "Internal task".to_string(),
+            status: "done".to_string(),
+            agent: "claude".to_string(),
+            duration_seconds: 5.0,
+            summary: "Done".to_string(),
+            repo: Some("owner/repo".to_string()),
+            notify_target: None,
+            pr_number: None,
+        };
+        let msg = n.format_telegram();
+        assert!(!msg.contains("github.com"), "should not link: {msg}");
+    }
+
+    #[test]
+    fn discord_appends_pr_link() {
+        let n = TaskNotification {
+            task_id: "internal:7".to_string(),
+            title: "T".to_string(),
+            status: "done".to_string(),
+            agent: "claude".to_string(),
+            duration_seconds: 1.0,
+            summary: "S".to_string(),
+            repo: Some("owner/repo".to_string()),
+            notify_target: None,
+            pr_number: Some("9".to_string()),
+        };
+        let msg = n.format_discord();
+        assert!(msg.contains("[View on GitHub](https://github.com/owner/repo/pull/9)"));
+    }
+
+    #[test]
+    fn slack_appends_pr_link() {
+        let n = TaskNotification {
+            task_id: "internal:7".to_string(),
+            title: "T".to_string(),
+            status: "done".to_string(),
+            agent: "claude".to_string(),
+            duration_seconds: 1.0,
+            summary: "S".to_string(),
+            repo: Some("owner/repo".to_string()),
+            notify_target: None,
+            pr_number: Some("9".to_string()),
+        };
+        let msg = n.format_slack();
+        assert!(msg.contains("<https://github.com/owner/repo/pull/9|View on GitHub>"));
     }
 }

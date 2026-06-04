@@ -343,6 +343,7 @@ mod tests {
             summary: "Completed successfully".to_string(),
             repo: None,
             notify_target: None,
+            pr_number: None,
         };
 
         transport.push_notification(notification.clone());
@@ -369,6 +370,7 @@ mod tests {
             summary: "Done".to_string(),
             repo: None,
             notify_target: None,
+            pr_number: None,
         });
 
         let n1 = rx1.recv().await.unwrap();
@@ -413,6 +415,7 @@ mod tests {
             summary: "Done".to_string(),
             repo: None,
             notify_target: None,
+            pr_number: None,
         });
     }
 
