@@ -175,7 +175,9 @@ fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
         | "no_action"
         | "no_action_needed"
         | "missed"
-        | "changes_addressed" => "done".to_string(),
+        | "changes_addressed"
+        | "review_addressed"
+        | "already_finalized_in_attempt_1" => "done".to_string(),
         // Canonical progress statuses.
         // `partial` is used by some models to indicate partial progress —
         // treat it as in_progress so the task remains open for follow-up.
@@ -968,6 +970,20 @@ Some output here.
     #[test]
     fn parse_normalizes_changes_addressed_alias_to_done() {
         let input = r#"{"status":"changes_addressed","summary":"feedback addressed","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
+    fn parse_normalizes_review_addressed_alias_to_done() {
+        let input = r#"{"status":"review_addressed","summary":"review feedback addressed","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
+    fn parse_normalizes_already_finalized_in_attempt_1_alias_to_done() {
+        let input = r#"{"status":"already_finalized_in_attempt_1","summary":"work already done in attempt 1","accomplished":[],"remaining":[],"files":[]}"#;
         let resp = parse(input).unwrap();
         assert_eq!(resp.status, "done");
     }
