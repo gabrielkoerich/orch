@@ -179,7 +179,8 @@ pub struct EngineConfig {
     /// Set to 0 to disable. Default: 3600 (1 hour).
     pub upgrade_check_interval: u64,
     /// Automatically run `brew upgrade orch` and restart the service when a newer
-    /// release is detected. Default: true. Set `engine.auto_upgrade: false` to disable.
+    /// release is detected. Default: false (notify only). Set `engine.auto_upgrade: true`
+    /// to opt in to automatic upgrades.
     pub auto_upgrade: bool,
 }
 
@@ -198,7 +199,7 @@ impl Default for EngineConfig {
             silence_grace_period: 300,
             silence_cooldown: 3600,
             upgrade_check_interval: 3600,
-            auto_upgrade: true,
+            auto_upgrade: false,
         }
     }
 }
@@ -306,7 +307,7 @@ impl EngineConfig {
         }
 
         if let Ok(val) = crate::config::get("engine.auto_upgrade") {
-            config.auto_upgrade = !val.eq_ignore_ascii_case("false");
+            config.auto_upgrade = val.eq_ignore_ascii_case("true");
         }
 
         config
@@ -2440,7 +2441,7 @@ mod tests {
             std::time::Duration::from_secs(600)
         );
         assert_eq!(config.upgrade_check_interval, 3600);
-        assert!(config.auto_upgrade, "auto_upgrade default must be true");
+        assert!(!config.auto_upgrade, "auto_upgrade default must be false");
     }
 
     #[test]
@@ -2457,8 +2458,8 @@ mod tests {
             std::time::Duration::from_secs(600)
         );
         assert_eq!(config.upgrade_check_interval, 3600);
-        // auto_upgrade may be overridden by user config; default is true
-        // (user config may disable it, so only check default struct)
+        // auto_upgrade may be overridden by user config; default is false
+        // (user config may enable it, so only check default struct)
     }
 
     #[test]
