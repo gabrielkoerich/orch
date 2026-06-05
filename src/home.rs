@@ -118,7 +118,7 @@ pub async fn db_path() -> anyhow::Result<PathBuf> {
 ///
 /// Written by the engine at startup, deleted on graceful shutdown.
 /// Format: "{pid}\t{version}" — the PID lets readers verify the owning process is alive.
-/// Used by `orch version` to detect CLI/service drift.
+/// Used by service status and diagnostics to detect CLI/service drift.
 pub fn service_version_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(state_dir()?.join("service.version"))
 }
@@ -404,9 +404,7 @@ mod tests {
         assert!(command_line_is_orch_serve(
             "/opt/homebrew/Cellar/orch/0.73.18/bin/orch serve --foreground"
         ));
-        assert!(!command_line_is_orch_serve(
-            "/opt/homebrew/bin/orch version"
-        ));
+        assert!(!command_line_is_orch_serve("/opt/homebrew/bin/orch -V"));
         assert!(!command_line_is_orch_serve("/bin/sh -c orch serve"));
         assert!(!command_line_is_orch_serve("/tmp/not-orch serve"));
     }

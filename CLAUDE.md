@@ -1,1 +1,1 @@
-/Users/gb/Projects/orch/AGENTS.md
+AGENTS.md

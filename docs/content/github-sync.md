@@ -32,10 +32,10 @@ gh:
 
 3. Optionally set up a GitHub Project v2:
 ```bash
-orch board list             # list accessible Project v2 boards
-orch board link PVT_xxx     # link this repo to a board
-orch board sync             # (re-)discover field/option IDs and persist to .orch.yml
-orch board info             # show current board config
+orch project board list             # list accessible Project v2 boards
+orch project board link PVT_xxx     # link this repo to a board
+orch project board sync             # (re-)discover field/option IDs and persist to .orch.yml
+orch project board info             # show current board config
 ```
 
 ## How It Works
@@ -107,8 +107,8 @@ gh:
 
 Discover IDs automatically:
 ```bash
-orch board info          # show current project field/option IDs
-orch board sync          # (re-)discover and persist to .orch.yml
+orch project board info          # show current project field/option IDs
+orch project board sync          # (re-)discover and persist to .orch.yml
 ```
 
 ## Owner Feedback

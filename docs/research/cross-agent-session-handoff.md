@@ -104,5 +104,5 @@ Rather than building a universal session interchange format (high effort, fragil
 
 1. **Use git + file system as the handoff medium** — agents already share worktrees
 2. **Use prompt injection for context transfer** — summarize previous agent's work into the next agent's system prompt (already done for review cycles)
-3. **Build an `orch session export` command** that reads any agent's native format and produces a human-readable summary with key decisions, changes made, and outstanding items
+3. **Build an `orch task session export` command** that reads any agent's native format and produces a human-readable summary with key decisions, changes made, and outstanding items
 4. **Only build native import for OpenCode** (it already supports it) — for Claude and Codex, prompt-based context injection is more robust than trying to reconstruct their internal session format

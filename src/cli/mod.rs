@@ -26,140 +26,6 @@ use anyhow::Context;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
-/// Print version information.
-///
-/// Shows CLI version and, if the service is running, the service version.
-/// Warns when they differ so operators can detect CLI/service drift.
-/// Also fetches the latest GitHub release and warns when the local build is behind.
-pub fn version() {
-    let cli_version = env!("ORCH_VERSION");
-    println!("CLI:     {cli_version}");
-
-    let all_pids = crate::home::find_orch_serve_pids(false);
-
-    match crate::home::service_version_path()
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-    {
-        Some(raw) => {
-            let raw = raw.trim();
-            let (pid_opt, svc) = match raw.split_once('\t') {
-                Some((pid_str, ver)) => (pid_str.parse::<u32>().ok(), ver),
-                None => (None, raw),
-            };
-
-            if let Some(stale_pid) = pid_opt.filter(|pid| !crate::home::pid_is_orch_serve(*pid)) {
-                match all_pids.as_slice() {
-                    [] => println!(
-                        "Service: stale (pid {stale_pid} no longer running) — run: brew services restart orch"
-                    ),
-                    [ghost_pid] => {
-                        let ghost_version = orch_version_from_pid(*ghost_pid)
-                            .unwrap_or_else(|| "unknown".to_string());
-                        println!(
-                            "Service: {ghost_version}  ⚠ ghost process (pid {ghost_pid}) — run: brew services restart orch"
-                        );
-                    }
-                    _ => println!(
-                        "Service: unknown  ⚠ multiple ghost processes (pids: {}) — run: brew services restart orch",
-                        format_pids(&all_pids)
-                    ),
-                }
-            } else if svc == cli_version {
-                if all_pids.len() > 1 {
-                    println!(
-                        "Service: {svc}  ⚠ multiple instances running (pids: {}) — run: brew services restart orch",
-                        format_pids(&all_pids)
-                    );
-                } else {
-                    println!("Service: {svc}  ✓ in sync");
-                }
-            } else if all_pids.len() > 1 {
-                println!(
-                    "Service: {svc}  ✗ mismatch; multiple instances running (pids: {}) — run: brew upgrade orch && brew services restart orch",
-                    format_pids(&all_pids)
-                );
-            } else {
-                println!(
-                    "Service: {svc}  ✗ mismatch — run: brew upgrade orch && brew services restart orch"
-                );
-            }
-        }
-        None => match all_pids.as_slice() {
-            [] => println!("Service: not running (no service.version file)"),
-            [pid] => {
-                let ver = orch_version_from_pid(*pid).unwrap_or_else(|| "unknown".to_string());
-                println!("Service: {ver}  ⚠ no service.version file (pid {pid})");
-            }
-            _ => println!(
-                "Service: unknown  ⚠ multiple instances (pids: {}) — no service.version file",
-                format_pids(&all_pids)
-            ),
-        },
-    }
-
-    if let Some(latest) = fetch_latest_release_version() {
-        if latest != cli_version {
-            println!("Latest:  {latest}  ⚠  upgrade available — run: brew update && brew upgrade orch && brew services restart orch");
-        } else {
-            println!("Latest:  {latest}  ✓ up to date");
-        }
-    }
-}
-
-fn format_pids(pids: &[u32]) -> String {
-    pids.iter()
-        .map(|pid| pid.to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn orch_version_from_pid(pid: u32) -> Option<String> {
-    let output = std::process::Command::new("lsof")
-        .args(["-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.split_whitespace().last())
-        .find_map(version_from_cellar_orch_path)
-        .map(str::to_string)
-}
-
-fn version_from_cellar_orch_path(path: &str) -> Option<&str> {
-    path.split("/Cellar/orch/").nth(1)?.split('/').next()
-}
-
-/// Fetch the latest orch release tag from GitHub via the `gh` CLI.
-///
-/// Returns the version string (without the leading "v"), or `None` if the
-/// check fails (no network, unauthenticated, `gh` not installed, etc.).
-fn fetch_latest_release_version() -> Option<String> {
-    let output = std::process::Command::new("gh")
-        .args([
-            "api",
-            "repos/gabrielkoerich/orch/releases/latest",
-            "--jq",
-            ".tag_name",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let tag = String::from_utf8(output.stdout).ok()?;
-    let version = tag.trim().trim_start_matches('v').to_string();
-    if version.is_empty() {
-        None
-    } else {
-        Some(version)
-    }
-}
-
 /// Initialize orch for a project.
 pub fn init(repo: Option<String>) -> anyhow::Result<()> {
     let orch_home = crate::home::orch_home()?;
@@ -179,7 +45,7 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
         None => {
             // Try to detect from git remote (origin) by reading the remote URL
             let git_remote = std::process::Command::new("git")
-                .args(["config", "--get", "remote.origin.url"])
+                .args(["remote", "get-url", "origin"])
                 .output_with_context();
 
             match git_remote {
@@ -238,8 +104,8 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
     // Guidance for board setup
     println!();
     println!("Next steps:");
-    println!("  orch board list     — find GitHub Projects V2 boards");
-    println!("  orch board link <id> — link a board for status tracking");
+    println!("  orch project board list      — find GitHub Projects V2 boards");
+    println!("  orch project board link <id> — link a board for status tracking");
 
     Ok(())
 }
@@ -856,11 +722,12 @@ pub async fn board_link(project_id: &str) -> anyhow::Result<()> {
 pub async fn board_sync() -> anyhow::Result<()> {
     use crate::github::projects::{write_project_config, ProjectSync};
 
-    let project_id = config::get("gh.project_id")
-        .map_err(|_| anyhow::anyhow!("no board configured — run `orch board link <id>` first"))?;
+    let project_id = config::get("gh.project_id").map_err(|_| {
+        anyhow::anyhow!("no board configured — run `orch project board link <id>` first")
+    })?;
 
     if project_id.is_empty() {
-        anyhow::bail!("no board configured — run `orch board link <id>` first");
+        anyhow::bail!("no board configured — run `orch project board link <id>` first");
     }
 
     println!("Syncing board fields for {}...", project_id);
@@ -883,8 +750,8 @@ pub fn board_info() -> anyhow::Result<()> {
 
     if project_id.is_empty() {
         println!("No board configured");
-        println!("  Run `orch board list` to see available boards");
-        println!("  Run `orch board link <id>` to link one");
+        println!("  Run `orch project board list` to see available boards");
+        println!("  Run `orch project board link <id>` to link one");
         return Ok(());
     }
 

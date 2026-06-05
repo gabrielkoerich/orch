@@ -88,7 +88,7 @@ router:
 
 - Project config is deep-merged with global config (project wins)
 - The server restarts automatically when `.orch.yml` changes
-- Use `orch board sync` to (re-)discover project / status / estimate field IDs and persist them into the project's `.orch.yml`
+- Use `orch project board sync` to (re-)discover project / status / estimate field IDs and persist them into the project's `.orch.yml`
 
 ## Skills
 

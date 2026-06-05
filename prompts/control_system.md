@@ -12,9 +12,9 @@ You can run CLI commands to manage tasks, check status, and take actions. Use ba
 - `orch task retry <id>` — retry a failed task
 - `orch task get <id>` — get task details
 - `orch stats` — show task metrics and statistics
-- `orch cost` — show cost tracking and token usage
+- `orch stats cost` — show cost tracking and token usage
 - `orch stream <task_id>` — stream live output from a running task
-- `orch dashboard` — combined dashboard: tasks, sessions, recent activity
+- `orch stats dashboard` — combined dashboard: tasks, sessions, recent activity
 - `orch job list` — list scheduled jobs
 - `orch service status` — check service status
 - `orch service restart` — restart the service

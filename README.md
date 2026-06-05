@@ -165,10 +165,10 @@ orch project remove /path                # Unregister a project
 ### GitHub Projects V2 Board
 
 ```bash
-orch board list               # List accessible GitHub Projects V2 boards
-orch board link <id>          # Link current repo to a board by ID
-orch board sync               # Re-discover field IDs and update config
-orch board info               # Show current board config
+orch project board list               # List accessible GitHub Projects V2 boards
+orch project board link <id>          # Link current repo to a board by ID
+orch project board sync               # Re-discover field IDs and update config
+orch project board info               # Show current board config
 ```
 
 ### Job Management (Scheduled Tasks)
@@ -188,25 +188,27 @@ orch job tick                 # Run one scheduler tick (for testing)
 ```bash
 orch init                     # Initialize orch for current project
 orch init --repo owner/repo   # Initialize with specific repo
-orch agents                   # List installed agent CLIs
-orch dashboard                # Full dashboard view (tasks, sessions, activity)
-orch metrics                  # Show task metrics summary
-orch cost                     # Cost tracking and token usage
+orch config agents            # List installed agent CLIs
+orch stats dashboard          # Full dashboard view (tasks, sessions, activity)
+orch stats metrics            # Show task metrics summary
+orch stats cost               # Cost tracking and token usage
 orch stats                    # Throughput / per-project rollups
-orch events                   # Tail task events live
+orch stats overview           # Explicit stats overview subcommand
+orch task events              # Tail task events live
 orch stream                   # Stream ALL running agent sessions
 orch stream <task_id>         # Stream a single task
 orch log                      # Show last 50 log lines
 orch log 100                  # Show last N lines
-orch log watch                # Tail logs live
-orch doctor                   # Diagnose SQLite ↔ GitHub drift
-orch prune                    # Remove orphaned worktrees
+orch log -f                   # Tail service logs live
+orch log -f --task <task_id>  # Stream a single task
+orch service doctor           # Diagnose SQLite ↔ GitHub drift
+orch service prune            # Remove orphaned worktrees
 orch cooldown list            # Show active agent/model cooldowns
 orch cooldown clear <key>     # Clear a specific cooldown
-orch webhook status           # Show webhook server health
-orch session export <id>      # Export a task's session
+orch webhook status           # Show webhook server health (hidden, rare public-host use)
+orch task session export <id> # Export a task's session
 orch notify "message"         # Send a Telegram notification
-orch version                  # Show version
+orch -V                       # Show CLI version
 orch config <key>             # Read config value (e.g., orch config gh.repo)
 orch completions <shell>      # Generate shell completions (bash, zsh, fish)
 ```
