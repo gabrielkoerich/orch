@@ -211,6 +211,30 @@ orch config <key>             # Read config value (e.g., orch config gh.repo)
 orch completions <shell>      # Generate shell completions (bash, zsh, fish)
 ```
 
+### Smart Commits
+
+```bash
+orch commit                         # Group changes and draft messages with the LLM
+orch commit --dry-run               # Show the plan without committing
+orch commit --yes                   # Accept the drafted messages without prompting
+orch commit -m "fix: ..."           # Force a single commit with this exact message (skips LLM)
+orch commit --no-llm                # Use the path/hunk heuristic instead of an LLM call
+```
+
+`orch commit` groups the working tree's staged + unstaged + untracked changes
+into one or more logical commits by path, then asks the current chat agent
+(`orch chat`'s sticky `/agent` + `/model`) to draft a Conventional Commits
+message for each group from the file list and unified diff. The diff is capped
+at `commit.max_diff_bytes` bytes per group (default 32 KB) so the call stays
+cheap and predictable. Edit, accept, or reject the drafts interactively; pass
+`--yes` to skip the prompt or `-m` to override entirely.
+
+Fallback behaviour: if no agent is available (all cooled, no API key, offline)
+the heuristic message survives, a one-line warning is logged, and you still get
+the editor unless `--yes` was passed. Use `--no-llm` to force the heuristic
+path (handy for scripts and tests). The agent prompt lives at
+[`prompts/commit_message.md`](prompts/commit_message.md).
+
 ### Control Session (Chat)
 
 ```bash

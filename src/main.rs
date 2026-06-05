@@ -283,6 +283,9 @@ enum Commands {
         /// Use this commit message as a single commit override
         #[arg(long = "message", short = 'm')]
         message: Option<String>,
+        /// Skip the LLM and use the path-based heuristic for commit messages
+        #[arg(long = "no-llm")]
+        no_llm: bool,
     },
     /// Deprecated: use `orch job cron`
     #[command(hide = true)]
@@ -848,8 +851,9 @@ async fn main() -> anyhow::Result<()> {
             dry_run,
             yes,
             message,
+            no_llm,
         } => {
-            cli::commit::run(dry_run, yes, message)?;
+            cli::commit::run(dry_run, yes, message, no_llm).await?;
         }
         Commands::Cron { expression, since } => {
             eprintln!("warning: `orch cron` is deprecated; use `orch job cron` instead");
