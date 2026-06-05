@@ -165,6 +165,8 @@ fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
         | "skip"
         | "ok"
         | "success"
+        | "noop"
+        | "green"
         | "no_changes_needed"
         | "no_trades_no_positions"
         | "changes_made"
@@ -178,11 +180,12 @@ fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
         | "changes_addressed"
         | "review_addressed"
         | "already_finalized_in_attempt_1"
-        | "alert" => "done".to_string(),
+        | "alert"
+        | "alerts_sent" => "done".to_string(),
         // Canonical progress statuses.
         // `partial` is used by some models to indicate partial progress —
         // treat it as in_progress so the task remains open for follow-up.
-        "in_progress" | "running" | "partial" => "in_progress".to_string(),
+        "in_progress" | "running" | "partial" | "waiting" => "in_progress".to_string(),
         "in_review" | "reviewing" => "in_review".to_string(),
         "needs_review" | "pending_review" | "ready_for_review" => "needs_review".to_string(),
         // Canonical error statuses.

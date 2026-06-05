@@ -1111,6 +1111,25 @@ pub(crate) mod patterns {
                     .next()
                     .is_some_and(|c| c.is_ascii_digit())
             }));
+
+        // Guard against false positives: if "rate_limit" appears near the start of the
+        // text without an error-context indicator nearby, it may be from test output
+        // (e.g. nextest progress lines) or a stored-error prefix rather than a real
+        // rate limit error. Require an error indicator (429/http/error/failed) nearby.
+        if let Some(pos) = match_pos {
+            if pos < 100 {
+                let window_start = pos.saturating_sub(50);
+                let window_end = (pos + 100).min(lower.len());
+                let context = &lower[window_start..window_end];
+                let has_error_context =
+                    context.contains("429") || context.contains("http")
+                    || context.contains("error") || context.contains("failed");
+                if !has_error_context {
+                    return None;
+                }
+            }
+        }
+
         if match_pos.is_some() || has_429 || has_529 {
             let message = if let Some(pos) = match_pos {
                 extract_context_around(text, pos, 300)
