@@ -192,6 +192,91 @@ pub async fn init_cooldown_store(store: Arc<crate::store::TaskStore>) {
     *cooldown_store().lock().await = Some(store);
 }
 
+/// Reconcile the in-memory cooldown map with the persisted KV state.
+///
+/// KV is the source of truth. This is called once per tick by
+/// `router.refresh_health` so the running service notices state mutated by a
+/// separate process (e.g. `orch cooldown clear`). Without this sync, the CLI
+/// clears KV but the engine's in-memory map keeps the stale entries until they
+/// expire on their own, producing the "all agents cooled" + "No active
+/// cooldowns" inconsistency.
+///
+/// Reconciliation rules (KV authoritative for every key it has):
+/// - KV row missing for an in-memory key: leave memory alone — likely a
+///   `set_cooldown_async` race where memory was written but the KV row isn't
+///   yet visible. The next tick will catch up.
+/// - KV row present with `cooldown_until <= now` (including the "0" tombstone
+///   written by `clear_cooldown`): drop from memory.
+/// - KV row present with `cooldown_until > now`: insert/update memory to match.
+pub async fn sync_from_kv(store: &Arc<crate::store::TaskStore>) {
+    let rows = match store.kv_list_prefix(KV_PREFIX).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(err = %e, "cooldown sync_from_kv: KV list failed");
+            return;
+        }
+    };
+    let now = chrono::Utc::now().timestamp();
+
+    // explicit_kv[key] = Some(ts > now) for active cooldowns, Some(None) for
+    // cleared/expired ("0" or past-timestamp) rows. Keys not present in
+    // explicit_kv mean KV has no row at all — those are left alone.
+    let mut explicit_kv: HashMap<String, Option<i64>> = HashMap::with_capacity(rows.len());
+    for (kv_key, value) in &rows {
+        let cooldown_key = kv_key.trim_start_matches(KV_PREFIX);
+        if let Ok(ts) = value.parse::<i64>() {
+            let normalized = if ts > now { Some(ts) } else { None };
+            explicit_kv.insert(cooldown_key.to_string(), normalized);
+        }
+    }
+
+    let mut map = cooldown_lock();
+    let mut dropped = 0usize;
+    let mut updated = 0usize;
+
+    // Drop in-memory entries that KV explicitly marks cleared/expired.
+    map.retain(|key, _| {
+        if matches!(explicit_kv.get(key), Some(None)) {
+            dropped += 1;
+            false
+        } else {
+            true
+        }
+    });
+
+    // Adopt KV's authoritative timestamp for active cooldowns.
+    for (key, normalized) in explicit_kv {
+        if let Some(ts) = normalized {
+            match map.get_mut(&key) {
+                Some(entry) => {
+                    if entry.cooldown_until != ts {
+                        entry.cooldown_until = ts;
+                        updated += 1;
+                    }
+                }
+                None => {
+                    map.insert(
+                        key,
+                        CooldownEntry {
+                            cooldown_until: ts,
+                            reason: "synced_from_kv".to_string(),
+                        },
+                    );
+                    updated += 1;
+                }
+            }
+        }
+    }
+
+    if dropped > 0 || updated > 0 {
+        tracing::info!(
+            dropped,
+            updated,
+            "cooldown sync_from_kv: reconciled in-memory map with KV"
+        );
+    }
+}
+
 /// Failure count threshold (times at max backoff) for first extended tier (24h).
 ///
 /// After a model has been at the max cap this many times, apply a 6x multiplier.
@@ -1825,6 +1910,90 @@ mod tests {
         assert!(is_agent_degraded(agent));
         clear_agent_degraded(agent);
         assert!(!is_agent_degraded(agent));
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn sync_from_kv_drops_in_memory_entry_cleared_externally() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        let agent = "test_sync_external_clear";
+        let future = chrono::Utc::now().timestamp() + 600;
+
+        // Register the store and put a cooldown in both memory and KV.
+        init_cooldown_store(store.clone()).await;
+        set_cooldown_async(agent, future, "test").await;
+        assert!(is_agent_in_cooldown(agent));
+
+        // Simulate `orch cooldown clear --all` from a separate CLI process: it
+        // can only write KV (to "0"); the running engine's in-memory map is
+        // untouched.
+        store
+            .kv_set(&format!("{KV_PREFIX}{agent}"), "0")
+            .await
+            .expect("kv_set tombstone");
+        assert!(
+            is_agent_in_cooldown(agent),
+            "in-memory cooldown should still be present before sync"
+        );
+
+        sync_from_kv(&store).await;
+
+        assert!(
+            !is_agent_in_cooldown(agent),
+            "sync_from_kv must drop in-memory entries the KV tombstoned"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn sync_from_kv_keeps_in_memory_entry_when_kv_row_missing() {
+        // Race window: set_cooldown_async writes memory first, then KV. If a
+        // sync runs between those two writes, the KV row is missing — we must
+        // leave the in-memory entry alone, not drop it.
+        super::reset_global_state().await;
+        let store = test_store().await;
+        let agent = "test_sync_race_window";
+        let future = chrono::Utc::now().timestamp() + 600;
+
+        // Simulate the race: memory has the entry, KV does not.
+        set_cooldown_in_memory(agent, future, "raced");
+        assert!(is_agent_in_cooldown(agent));
+
+        sync_from_kv(&store).await;
+
+        assert!(
+            is_agent_in_cooldown(agent),
+            "sync_from_kv must NOT drop entries whose KV row is missing — that is the set_cooldown_async race window"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn sync_from_kv_adopts_kv_timestamp() {
+        // KV is the source of truth: if KV has a different active timestamp,
+        // memory adopts it (covers external manual KV edits).
+        super::reset_global_state().await;
+        let store = test_store().await;
+        let agent = "test_sync_adopt_kv";
+        let original = chrono::Utc::now().timestamp() + 600;
+        let updated = chrono::Utc::now().timestamp() + 1200;
+
+        init_cooldown_store(store.clone()).await;
+        set_cooldown_async(agent, original, "initial").await;
+
+        store
+            .kv_set(&format!("{KV_PREFIX}{agent}"), &updated.to_string())
+            .await
+            .expect("kv_set updated");
+
+        sync_from_kv(&store).await;
+
+        let until = cooldown_until(agent).expect("cooldown still active");
+        assert_eq!(
+            until, updated,
+            "sync_from_kv must adopt KV's authoritative timestamp"
+        );
     }
 
     #[serial(cooldown_state)]

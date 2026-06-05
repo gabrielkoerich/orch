@@ -75,7 +75,7 @@ pub enum RouteResultError {
 use crate::backends::ExternalTask;
 use crate::engine::cooldown::{
     cooldown_until, is_agent_degraded, is_agent_in_cooldown, is_model_in_cooldown,
-    refresh_degraded_agents,
+    refresh_degraded_agents, sync_from_kv,
 };
 use crate::store::{get_task_field_direct, store_log_activity, TaskStore};
 use serde::{Deserialize, Serialize};
@@ -392,6 +392,14 @@ impl Router {
     /// Queries the `rate_limits` table for recent events and combines with
     /// cooldown state to mark agents as degraded before routing attempts them.
     pub async fn refresh_health(&self, store: &std::sync::Arc<TaskStore>) {
+        // KV is the source of truth for cooldowns. Reconcile the in-memory map
+        // from KV every tick so external mutations (e.g. `orch cooldown clear`
+        // from a separate CLI process) actually take effect on the running
+        // service. Without this, the engine keeps stale entries until they
+        // expire on their own, producing the "all agents cooled" log with
+        // `orch cooldown list` simultaneously reporting "No active cooldowns".
+        sync_from_kv(store).await;
+
         let config_ref = &self.config;
         let agents = self.available_agents.clone();
         let model_checker = |agent: &str| -> bool {
