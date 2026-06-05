@@ -134,10 +134,16 @@ async fn store_tasks_table_exists() {
 #[test]
 fn router_config_parses() {
     // This exercises RouterConfig::from_config() which reads config.yml.
-    // In test context there's no config file, so it uses defaults.
+    // The repository's project config may be visible in test context, so assert
+    // that parsing succeeds and yields a supported mode rather than assuming
+    // hardcoded defaults.
     let config = orch::engine::router::config::RouterConfig::from_config();
     assert!(!config.agents.is_empty(), "should have default agents");
-    assert_eq!(config.mode, "round_robin");
+    assert!(
+        matches!(config.mode.as_str(), "llm" | "local" | "round_robin"),
+        "unsupported router mode: {}",
+        config.mode
+    );
 }
 
 /// Verify that the mock backend passes the health check.

@@ -305,7 +305,7 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     //
     // We scan all worktree directories in this repo's worktrees subdirectory and
     // remove any that are not referenced by an existing task. This catches the
-    // "done but worktree not cleaned" case that `orch doctor` reports.
+    // "done but worktree not cleaned" case that `orch service doctor` reports.
     let worktrees_base = match crate::home::worktrees_dir() {
         Ok(base) => Some(base),
         Err(e) => {
@@ -1028,7 +1028,7 @@ async fn worktree_age_hours(worktree: &std::path::Path) -> Option<u64> {
 
 /// Resolve the repo root for an orphaned worktree and remove it.
 ///
-/// Used by `orch doctor --fix` and `orch prune` to clean up worktrees that are
+/// Used by `orch service doctor --fix` and `orch service prune` to clean up worktrees that are
 /// no longer owned by any task. Returns `true` if the worktree directory is gone
 /// after the call.
 pub(crate) async fn cleanup_orphaned_worktree(task_id: &str, wt: &std::path::Path) -> bool {

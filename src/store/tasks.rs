@@ -1051,7 +1051,7 @@ impl TaskStore {
             .collect())
     }
 
-    /// List tasks for `orch doctor`: active tasks + done tasks updated since `cutoff_str`.
+    /// List tasks for `orch service doctor`: active tasks + done tasks updated since `cutoff_str`.
     /// Much cheaper than `list_all` on repos with many historical done tasks.
     pub async fn list_for_doctor(&self, repo: &str, cutoff_str: &str) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(

@@ -132,7 +132,7 @@ impl EventBus {
         }
         tokio::fs::write(&port_path, port.to_string()).await?;
 
-        // Write service version file so `orch version` can detect CLI/service drift.
+        // Write service version file so service status can detect CLI/service drift.
         // Format: "{pid}\t{version}" so readers can verify the owning process is alive.
         if let Ok(path) = crate::home::service_version_path() {
             if let Some(parent) = path.parent() {

@@ -5,7 +5,7 @@ use std::sync::Arc;
 /// Remove orphaned worktrees — directories under `~/.orch/worktrees/` that are
 /// not referenced by any task in the store.
 ///
-/// Unlike `orch doctor --fix`, this command does not require `--fix` to be
+/// Unlike `orch service doctor --fix`, this command does not require `--fix` to be
 /// specified and does not prompt for confirmation. Orphaned worktrees are
 /// unreferenced by definition and safe to remove automatically.
 pub async fn run(dry_run: bool) -> anyhow::Result<()> {

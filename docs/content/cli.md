@@ -9,17 +9,15 @@ weight = 6
 ```bash
 orch task     list|add|get|status|route|run|retry|reroute|unblock|attach|live|kill
               publish|cost|tree|logs|log|history|runs|close|watch|reopen|inspect
-orch service  start|stop|restart|status
+orch service  start|stop|restart|status|doctor|prune
 orch job      list|add|remove|enable|disable|tick|run
-orch project  list|add|remove
-orch board    list|link|sync|info
+orch project  list|add|remove|board
+orch stats    overview|metrics|cost|dashboard
 orch cooldown list|clear
-orch session  export
-orch webhook  status
 orch chat     [message…] | history | stats
 ```
 
-Top-level commands: `serve`, `init`, `log`, `agents`, `version`, `completions`, `parse`, `commit`, `cron`, `config`, `template`, `stream`, `metrics`, `dashboard`, `cost`, `stats`, `events`, `doctor`, `prune`, `notify`.
+Visible top-level commands: `log`, `commit`, `stream`, `notify`, `chat`, `task`, `job`, `service`, `project`, `stats`, `cooldown`, `config`.
 
 ## Task Commands
 
@@ -49,6 +47,7 @@ orch task watch <id>                                   # follow status changes l
 orch task reopen <id>                                  # reopen a done/blocked task
 orch task inspect <id>                                 # unified diagnostic view
 orch stream [id]                                       # stream live output (all sessions if no id)
+orch log -f --task <id>                                # stream one task through log
 ```
 
 Note: `orch task add` does not take a `-p`/project flag — task creation always targets the current project (resolved from CWD or the `.orch.yml` config). To create tasks for another project, `cd` into it first, or use `orch task publish` to promote an internal task to GitHub.
@@ -76,26 +75,28 @@ The service ticks every `engine.tick_interval` seconds (default 10s):
 - Runs due scheduled jobs (per-project)
 - Recovers stuck tasks (no tmux session, age >10 min → reset to `new`)
 
-## Dashboard & Status
+## Stats & Status
 
 ```bash
-orch dashboard              # full dashboard view (tasks, sessions, activity)
-orch dashboard -g           # aggregate across all configured projects
+orch stats dashboard        # full dashboard view (tasks, sessions, activity)
+orch stats dashboard -g     # aggregate across all configured projects
 orch task status            # show task counts for current project
-orch metrics [--details]    # task metrics summary (slow tasks, error dist.)
-orch cost [--summary]       # cost tracking and token usage
+orch stats metrics [--details] # task metrics summary (slow tasks, error dist.)
+orch stats cost [--summary] # cost tracking and token usage
 orch stats [--all]          # task throughput / per-project rollups
-orch events [--repo X]      # tail task events live
-orch log [N]                # tail server logs (last N lines or "watch")
-orch doctor [--fix]         # diagnose SQLite ↔ GitHub drift
-orch prune [--dry-run]      # remove orphaned worktrees
+orch stats overview [--all] # explicit overview subcommand
+orch task events [--repo X] # tail task events live
+orch log [N]                # tail server logs (last N lines)
+orch log -f                 # follow service logs
+orch service doctor [--fix] # diagnose SQLite ↔ GitHub drift
+orch service prune [--dry-run] # remove orphaned worktrees
 orch cooldown list          # show active agent/model cooldowns
 orch cooldown clear <key>   # clear a specific cooldown (e.g. claude, claude:sonnet)
 orch cooldown clear --all   # clear every active cooldown
-orch webhook status         # show webhook server health
-orch session export <id>    # export a task's session in markdown/json/raw
+orch task session export <id> # export a task's session in markdown/json/raw
 orch notify "message"       # send a Telegram notification (uses config target by default)
 orch config <key>           # read a live config value (dot-separated path)
+orch config agents          # list installed agent CLIs
 ```
 
 ## Channels
@@ -111,6 +112,10 @@ orch project add https://github.com/o/r    # same, from a URL
 orch project add /path/to/repo             # register a local path
 orch project list                          # list registered projects
 orch project remove /path/to/repo          # remove a project from registry
+orch project board list                    # list GitHub Projects V2 boards
+orch project board link <id>               # link a board
+orch project board sync                    # discover field IDs
+orch project board info                    # show board config
 ```
 
 ## Job Commands
@@ -131,17 +136,10 @@ Jobs can also be defined declaratively as markdown files under `prompts/jobs/*.m
 ## Version
 
 ```bash
-orch version    # show CLI version and service version (warns on mismatch)
+orch -V    # show CLI version
 ```
 
-Shows the CLI version and, if the service is running, the version the service was built from. Warns when they differ so you can detect CLI/service drift:
-
-```
-CLI:     0.12.3
-Service: 0.12.3  ✓ in sync
-```
-
-When out of sync, run `brew upgrade orch && brew services restart orch`.
+Service status lives under `orch service status`. When upgrading, run `brew upgrade orch && brew services restart orch`.
 
 ## Chat
 
@@ -158,7 +156,7 @@ Conversational control plane — talk to orch in natural language. Each message 
 ## Agent Management
 
 ```bash
-orch agents                 # list available agents and their status
+orch config agents          # list available agents and their status
 ```
 
 ## Logging

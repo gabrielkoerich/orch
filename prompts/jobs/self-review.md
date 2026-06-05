@@ -12,7 +12,7 @@ Analyze orch metrics from the last 7 days and file issues for patterns that need
 3. Slow complex tasks (>10 min for complex tasks)
 4. Persistent review loops (3+ tasks with 2+ review cycles)
 
-Use `orch task list`, `orch metrics`, `orch doctor`, and SQLite queries to gather data.
+Use `orch task list`, `orch stats metrics`, `orch service doctor`, and SQLite queries to gather data.
 
 File detailed issues (DO NOT fix code directly)
 

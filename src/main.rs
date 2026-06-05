@@ -162,7 +162,7 @@ fn rotated_log_path(path: &std::path::Path, suffix: usize) -> std::path::PathBuf
 #[cfg(test)]
 mod tests {
     use super::{rotate_log_if_needed, rotated_log_path, Cli, Commands, MAX_SERVICE_LOG_BYTES};
-    use clap::Parser;
+    use clap::{error::ErrorKind, CommandFactory, Parser};
 
     #[test]
     fn rotated_log_path_appends_suffix() {
@@ -237,10 +237,83 @@ mod tests {
             _ => panic!("expected stream command"),
         }
     }
+
+    #[test]
+    fn help_lists_trimmed_top_level_commands() {
+        let mut cmd = Cli::command();
+        let mut output = Vec::new();
+        cmd.write_long_help(&mut output).unwrap();
+        let help = String::from_utf8(output).unwrap();
+
+        for command in [
+            "log", "commit", "stream", "notify", "chat", "task", "job", "service", "project",
+            "stats", "cooldown", "config",
+        ] {
+            assert!(help.contains(&format!("  {command}")), "{command} missing");
+        }
+
+        for hidden in [
+            "init",
+            "agents",
+            "metrics",
+            "cost",
+            "dashboard",
+            "doctor",
+            "prune",
+            "board",
+            "version",
+            "help",
+            "parse",
+            "template",
+            "completions",
+            "webhook",
+        ] {
+            assert!(!help.contains(&format!("  {hidden}")), "{hidden} visible");
+        }
+    }
+
+    #[test]
+    fn version_and_help_subcommands_are_removed() {
+        fn parse_error_kind(args: &[&str]) -> ErrorKind {
+            match Cli::try_parse_from(args) {
+                Ok(_) => panic!("expected clap display/error for {args:?}"),
+                Err(err) => err.kind(),
+            }
+        }
+
+        assert!(Cli::try_parse_from(["orch", "version"]).is_err());
+        assert!(Cli::try_parse_from(["orch", "help"]).is_err());
+        assert_eq!(
+            parse_error_kind(&["orch", "--version"]),
+            ErrorKind::DisplayVersion
+        );
+        assert_eq!(
+            parse_error_kind(&["orch", "--help"]),
+            ErrorKind::DisplayHelp
+        );
+    }
+
+    #[test]
+    fn nested_cli_surface_parses() {
+        assert!(Cli::try_parse_from(["orch", "stats", "metrics"]).is_ok());
+        assert!(Cli::try_parse_from(["orch", "stats", "cost"]).is_ok());
+        assert!(Cli::try_parse_from(["orch", "stats", "overview"]).is_ok());
+        assert!(Cli::try_parse_from(["orch", "stats", "dashboard"]).is_ok());
+        assert!(Cli::try_parse_from(["orch", "service", "doctor"]).is_ok());
+        assert!(Cli::try_parse_from(["orch", "service", "prune"]).is_ok());
+        assert!(Cli::try_parse_from(["orch", "project", "board", "info"]).is_ok());
+        assert!(Cli::try_parse_from(["orch", "config", "agents"]).is_ok());
+        assert!(Cli::try_parse_from(["orch", "log", "-f", "--task", "123"]).is_ok());
+    }
 }
 
 #[derive(Parser)]
-#[command(name = "orch", version = env!("ORCH_VERSION"), about = "Orch — The Agent Orchestration Engine")]
+#[command(
+    name = "orch",
+    version = env!("ORCH_VERSION"),
+    about = "Orch — The Agent Orchestration Engine",
+    disable_help_subcommand = true,
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -251,23 +324,27 @@ enum Commands {
     /// Start the orch service
     #[command(hide = true)]
     Serve,
-    /// Show version information
-    Version,
     /// Initialize orch for a project
+    #[command(hide = true)]
     Init {
         /// Repository in OWNER/REPO format
         #[arg(long)]
         repo: Option<String>,
     },
-    /// Tail orch logs
+    /// Tail orch logs (or stream a single task with --task)
     Log {
-        /// Number of lines to show, or "watch" for live follow
+        /// Number of lines to show (ignored with --follow or --task)
         #[arg(default_value = "50")]
         lines: String,
+        /// Follow log output in real time
+        #[arg(long, short = 'f')]
+        follow: bool,
+        /// Scope to a single task ID (streams live task output)
+        #[arg(long)]
+        task: Option<String>,
     },
-    /// List installed agent CLIs
-    Agents,
     /// Parse and normalize agent JSON response
+    #[command(hide = true)]
     Parse {
         /// Path to JSON file (or - for stdin)
         path: String,
@@ -296,10 +373,16 @@ enum Commands {
         #[arg(long)]
         since: Option<String>,
     },
-    /// Read config values
+    /// Read config values and inspect installed agents
+    #[command(
+        subcommand_precedence_over_arg = true,
+        args_conflicts_with_subcommands = true
+    )]
     Config {
         /// Config key (dot-separated path)
-        key: String,
+        key: Option<String>,
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
     },
     /// Stream live output from running tasks (all if no ID given)
     Stream {
@@ -332,6 +415,7 @@ enum Commands {
         action: Option<ChatAction>,
     },
     /// Render a template file with environment variables
+    #[command(hide = true)]
     Template {
         /// Path to template file
         path: String,
@@ -348,12 +432,13 @@ enum Commands {
         #[command(subcommand)]
         action: JobAction,
     },
-    /// Service management (start/stop/restart)
+    /// Service management
     Service {
         #[command(subcommand)]
         action: ServiceAction,
     },
-    /// Show task metrics summary
+    /// Deprecated: use `orch stats metrics`
+    #[command(hide = true)]
     Metrics {
         /// Show slow tasks and error distribution
         #[arg(long)]
@@ -362,7 +447,8 @@ enum Commands {
         #[arg(long, default_value = "24h")]
         since: String,
     },
-    /// Combined dashboard: tasks, sessions, recent activity
+    /// Deprecated: use `orch stats dashboard`
+    #[command(hide = true)]
     Dashboard {
         /// Show tasks across all projects (default when outside a project directory)
         #[arg(long, short = 'g')]
@@ -371,12 +457,13 @@ enum Commands {
         #[arg(long)]
         project: Option<String>,
     },
-    /// GitHub Projects V2 board management
+    /// Deprecated: use `orch project board`
+    #[command(hide = true)]
     Board {
         #[command(subcommand)]
         action: BoardAction,
     },
-    /// Multi-project management
+    /// Project management
     Project {
         #[command(subcommand)]
         action: ProjectAction,
@@ -386,7 +473,8 @@ enum Commands {
         #[command(subcommand)]
         action: CooldownAction,
     },
-    /// Show cost tracking and token usage
+    /// Deprecated: use `orch stats cost`
+    #[command(hide = true)]
     Cost {
         /// Task ID to show cost for
         task_id: Option<String>,
@@ -400,7 +488,11 @@ enum Commands {
         #[arg(long)]
         model: bool,
     },
-    /// Show task metrics and statistics
+    /// Task metrics and statistics
+    #[command(
+        subcommand_precedence_over_arg = true,
+        args_conflicts_with_subcommands = true
+    )]
     Stats {
         /// Aggregate all projects into one table
         #[arg(long)]
@@ -408,8 +500,11 @@ enum Commands {
         /// Time window to report on (e.g. "24h", "7d", "30d"; default: "24h")
         #[arg(long, default_value = "24h")]
         since: String,
+        #[command(subcommand)]
+        action: Option<StatsAction>,
     },
     /// Generate shell completions
+    #[command(hide = true)]
     Completions {
         /// Shell type
         shell: Shell,
@@ -425,11 +520,13 @@ enum Commands {
         task: Option<String>,
     },
     /// Webhook server management
+    #[command(hide = true)]
     Webhook {
         #[command(subcommand)]
         action: WebhookAction,
     },
-    /// Diagnose state inconsistencies between SQLite and GitHub
+    /// Deprecated: use `orch service doctor`
+    #[command(hide = true)]
     Doctor {
         /// Run a full (expensive) audit including historical done tasks
         #[arg(long)]
@@ -441,12 +538,16 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Remove orphaned worktrees not owned by any task
+    /// Deprecated: use `orch service prune`
+    #[command(hide = true)]
     Prune {
         /// Show what would be removed without making changes
         #[arg(long)]
         dry_run: bool,
     },
+    /// Deprecated: use `orch config agents`
+    #[command(hide = true)]
+    Agents,
     /// Deprecated: use `orch task session`
     #[command(hide = true)]
     Session {
@@ -788,6 +889,11 @@ enum ProjectAction {
     },
     /// List all registered projects
     List,
+    /// GitHub Projects V2 board management
+    Board {
+        #[command(subcommand)]
+        action: BoardAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -800,6 +906,113 @@ enum ServiceAction {
     Restart,
     /// Show service status
     Status,
+    /// Diagnose state inconsistencies between SQLite and GitHub
+    Doctor {
+        /// Run a full (expensive) audit including historical done tasks
+        #[arg(long)]
+        full: bool,
+        /// Attempt automatic repairs for fixable issues
+        #[arg(long)]
+        fix: bool,
+        /// Show what --fix would do without applying changes
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove orphaned worktrees not owned by any task
+    Prune {
+        /// Show what would be removed without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum StatsAction {
+    /// Show task metrics summary (default)
+    Overview {
+        /// Aggregate all projects into one table
+        #[arg(long)]
+        all: bool,
+        /// Time window to report on (e.g. "24h", "7d", "30d"; default: "24h")
+        #[arg(long, default_value = "24h")]
+        since: String,
+    },
+    /// Show detailed task metrics
+    Metrics {
+        /// Show slow tasks and error distribution
+        #[arg(long)]
+        details: bool,
+        /// Time window to report on (e.g. "24h", "7d", "30d"; default: "24h")
+        #[arg(long, default_value = "24h")]
+        since: String,
+    },
+    /// Show cost tracking and token usage
+    Cost {
+        /// Task ID to show cost for
+        task_id: Option<String>,
+        /// Show aggregate cost summary (24h, 7d, 30d)
+        #[arg(long)]
+        summary: bool,
+        /// Show costs grouped by agent
+        #[arg(long)]
+        agent: bool,
+        /// Show costs grouped by model
+        #[arg(long)]
+        model: bool,
+    },
+    /// Combined dashboard: tasks, sessions, recent activity
+    Dashboard {
+        /// Show tasks across all projects (default when outside a project directory)
+        #[arg(long, short = 'g')]
+        global: bool,
+        /// Filter to a specific project (e.g. owner/repo or just repo name)
+        #[arg(long)]
+        project: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// List installed agent CLIs
+    Agents,
+    /// Get a config value
+    Get {
+        /// Config key (dot-separated path)
+        key: String,
+    },
+}
+
+async fn run_board_action(action: BoardAction) -> anyhow::Result<()> {
+    match action {
+        BoardAction::List => cli::board_list().await,
+        BoardAction::Link { id } => cli::board_link(&id).await,
+        BoardAction::Sync => cli::board_sync().await,
+        BoardAction::Info => cli::board_info(),
+    }
+}
+
+async fn run_cost(
+    task_id: Option<String>,
+    _summary: bool,
+    agent: bool,
+    model: bool,
+) -> anyhow::Result<()> {
+    if let Some(id) = task_id {
+        cli::cost::show_task(&id).await
+    } else if agent {
+        cli::cost::show_by_agent().await
+    } else if model {
+        cli::cost::show_by_model().await
+    } else {
+        cli::cost::show_summary().await
+    }
+}
+
+fn parse_since_or_default(since: &str) -> u32 {
+    cli::parse_since(since).unwrap_or_else(|| {
+        eprintln!("Warning: unrecognised --since value {since:?}, defaulting to 24h");
+        24
+    })
 }
 
 #[tokio::main]
@@ -832,16 +1045,24 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("starting orch serve");
             engine::serve().await?;
         }
-        Commands::Version => {
-            cli::version();
-        }
         Commands::Init { repo } => {
             cli::init(repo)?;
         }
-        Commands::Log { lines } => {
-            cli::log(&lines)?;
+        Commands::Log {
+            lines,
+            follow,
+            task,
+        } => {
+            if let Some(id) = task {
+                cli::stream_task(&id, true).await?;
+            } else if follow {
+                cli::log("watch")?;
+            } else {
+                cli::log(&lines)?;
+            }
         }
         Commands::Agents => {
+            eprintln!("warning: `orch agents` is deprecated; use `orch config agents` instead");
             cli::agents();
         }
         Commands::Parse { path } => {
@@ -860,10 +1081,22 @@ async fn main() -> anyhow::Result<()> {
             let matches = cron::check(&expression, since.as_deref())?;
             std::process::exit(if matches { 0 } else { 1 });
         }
-        Commands::Config { key } => {
-            let val = config::get(&key)?;
-            println!("{val}");
-        }
+        Commands::Config { key, action } => match (action, key) {
+            (Some(ConfigAction::Agents), _) => cli::agents(),
+            (Some(ConfigAction::Get { key }), _) => {
+                let val = config::get(&key)?;
+                println!("{val}");
+            }
+            (None, Some(k)) => {
+                let val = config::get(&k)?;
+                println!("{val}");
+            }
+            (None, None) => {
+                eprintln!("Usage: orch config <key>");
+                eprintln!("       orch config agents");
+                std::process::exit(2);
+            }
+        },
         Commands::Stream {
             task_id,
             formatted,
@@ -1056,8 +1289,15 @@ async fn main() -> anyhow::Result<()> {
             ServiceAction::Status => {
                 cli::service::status()?;
             }
+            ServiceAction::Doctor { full, fix, dry_run } => {
+                cli::doctor::run(full, fix, dry_run).await?;
+            }
+            ServiceAction::Prune { dry_run } => {
+                cli::prune::run(dry_run).await?;
+            }
         },
         Commands::Metrics { details, since } => {
+            eprintln!("warning: `orch metrics` is deprecated; use `orch stats metrics` instead");
             let hours = cli::parse_since(&since).unwrap_or_else(|| {
                 eprintln!(
                     "Warning: unrecognised --since value {:?}, defaulting to 24h",
@@ -1069,22 +1309,15 @@ async fn main() -> anyhow::Result<()> {
         }
         // Combined dashboard view: tasks, sessions, recent activity
         Commands::Dashboard { global, project } => {
+            eprintln!(
+                "warning: `orch dashboard` is deprecated; use `orch stats dashboard` instead"
+            );
             cli::dashboard::dashboard(global, project).await?;
         }
-        Commands::Board { action } => match action {
-            BoardAction::List => {
-                cli::board_list().await?;
-            }
-            BoardAction::Link { id } => {
-                cli::board_link(&id).await?;
-            }
-            BoardAction::Sync => {
-                cli::board_sync().await?;
-            }
-            BoardAction::Info => {
-                cli::board_info()?;
-            }
-        },
+        Commands::Board { action } => {
+            eprintln!("warning: `orch board` is deprecated; use `orch project board` instead");
+            run_board_action(action).await?;
+        }
         Commands::Project { action } => match action {
             ProjectAction::Add { path } => {
                 cli::project_add(&path)?;
@@ -1094,6 +1327,9 @@ async fn main() -> anyhow::Result<()> {
             }
             ProjectAction::List => {
                 cli::project_list()?;
+            }
+            ProjectAction::Board { action } => {
+                run_board_action(action).await?;
             }
         },
         Commands::Cooldown { action } => match action {
@@ -1110,29 +1346,34 @@ async fn main() -> anyhow::Result<()> {
             agent,
             model,
         } => {
-            if let Some(id) = task_id {
-                cli::cost::show_task(&id).await?;
-            } else if agent {
-                cli::cost::show_by_agent().await?;
-            } else if model {
-                cli::cost::show_by_model().await?;
-            } else if summary {
-                cli::cost::show_summary().await?;
-            } else {
-                // Default: show summary
-                cli::cost::show_summary().await?;
+            eprintln!("warning: `orch cost` is deprecated; use `orch stats cost` instead");
+            run_cost(task_id, summary, agent, model).await?;
+        }
+        Commands::Stats { all, since, action } => match action {
+            Some(StatsAction::Overview { all, since }) => {
+                let hours = parse_since_or_default(&since);
+                cli::stats::stats(all, hours).await?;
             }
-        }
-        Commands::Stats { all, since } => {
-            let hours = cli::parse_since(&since).unwrap_or_else(|| {
-                eprintln!(
-                    "Warning: unrecognised --since value {:?}, defaulting to 24h",
-                    since
-                );
-                24
-            });
-            cli::stats::stats(all, hours).await?;
-        }
+            Some(StatsAction::Metrics { details, since }) => {
+                let hours = parse_since_or_default(&since);
+                cli::metrics(details, hours).await?;
+            }
+            Some(StatsAction::Cost {
+                task_id,
+                summary,
+                agent,
+                model,
+            }) => {
+                run_cost(task_id, summary, agent, model).await?;
+            }
+            Some(StatsAction::Dashboard { global, project }) => {
+                cli::dashboard::dashboard(global, project).await?;
+            }
+            None => {
+                let hours = parse_since_or_default(&since);
+                cli::stats::stats(all, hours).await?;
+            }
+        },
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "orch", &mut std::io::stdout());
@@ -1147,9 +1388,11 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Commands::Doctor { full, fix, dry_run } => {
+            eprintln!("warning: `orch doctor` is deprecated; use `orch service doctor` instead");
             cli::doctor::run(full, fix, dry_run).await?;
         }
         Commands::Prune { dry_run } => {
+            eprintln!("warning: `orch prune` is deprecated; use `orch service prune` instead");
             cli::prune::run(dry_run).await?;
         }
         Commands::Session { action } => {

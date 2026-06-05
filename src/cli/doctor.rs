@@ -45,7 +45,7 @@ enum FixAction {
     None,
 }
 
-/// A single diagnostic finding from `orch doctor`.
+/// A single diagnostic finding from `orch service doctor`.
 struct Finding {
     severity: Severity,
     task_id: String,
@@ -97,7 +97,10 @@ pub async fn run(full: bool, fix: bool, dry_run: bool) -> anyhow::Result<()> {
         let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let mut i = 0usize;
         while spinner_flag.load(Ordering::Relaxed) {
-            eprint!("\r{} Running orch doctor…", frames[i % frames.len()]);
+            eprint!(
+                "\r{} Running orch service doctor…",
+                frames[i % frames.len()]
+            );
             let _ = std::io::stderr().flush();
             tokio::time::sleep(std::time::Duration::from_millis(80)).await;
             i += 1;
@@ -422,8 +425,8 @@ async fn run_checks(
         );
 
         if errors > 0 {
-            println!("\nRun `orch doctor --fix` to attempt automatic repairs.");
-            println!("Run `orch doctor --dry-run` to preview what --fix would do.");
+            println!("\nRun `orch service doctor --fix` to attempt automatic repairs.");
+            println!("Run `orch service doctor --dry-run` to preview what --fix would do.");
         }
     }
 
@@ -1681,7 +1684,7 @@ async fn reopen_and_set_needs_review(
 async fn create_pr_for_task(gh: &GhHttp, repo: &str, task: &Task) -> anyhow::Result<u64> {
     let title = format!("fix: recover work for #{}", task_label(task));
     let body = format!(
-        "Recovered by `orch doctor --fix`.\n\nOriginal task: #{}",
+        "Recovered by `orch service doctor --fix`.\n\nOriginal task: #{}",
         task_label(task)
     );
     let pr_url = gh

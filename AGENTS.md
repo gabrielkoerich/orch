@@ -217,7 +217,7 @@ git push                                    # 1. push
 gh run watch --exit-status                  # 2. watch CI (tests → release → deploy)
 brew update && brew upgrade orch            # 3. pull new formula + install
 brew services restart orch                  # 4. restart service with new code
-orch version                                # 5. verify
+orch -V                                      # 5. verify CLI version
 ```
 
 Do not skip steps — the service runs from the Homebrew cellar, not the repo.
