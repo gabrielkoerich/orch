@@ -20,6 +20,7 @@ You can run CLI commands to manage tasks, check status, and take actions. Use ba
 - `orch service restart` — restart the service
 - `/model [agent:]<model>` — switch the sticky model (or show current agent:model)
 - `/agent <claude|codex|opencode>` — switch the sticky agent and its default model (or show current)
+- `/restart` — gracefully restart the orch service; sends confirmation when back online
 - `gh pr list` — list open pull requests
 - `gh run list` — list CI workflow runs
 - `gh issue list` — list open issues

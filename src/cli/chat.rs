@@ -41,7 +41,7 @@ pub async fn interactive(session_id: &str) -> anyhow::Result<()> {
             break;
         }
 
-        match control::maybe_handle_control_command(&store, session_id, message).await? {
+        match control::maybe_handle_control_command(&store, session_id, None, message).await? {
             Some(response) => {
                 println!("{response}");
                 println!();
@@ -65,7 +65,7 @@ pub async fn interactive(session_id: &str) -> anyhow::Result<()> {
 pub async fn single_message(session_id: &str, message: &str) -> anyhow::Result<()> {
     let store = crate::cli::init_store().await?;
     if let Some(response) =
-        control::maybe_handle_control_command(&store, session_id, message).await?
+        control::maybe_handle_control_command(&store, session_id, None, message).await?
     {
         println!("{response}");
         return Ok(());
