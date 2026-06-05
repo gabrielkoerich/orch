@@ -177,7 +177,8 @@ fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
         | "missed"
         | "changes_addressed"
         | "review_addressed"
-        | "already_finalized_in_attempt_1" => "done".to_string(),
+        | "already_finalized_in_attempt_1"
+        | "alert" => "done".to_string(),
         // Canonical progress statuses.
         // `partial` is used by some models to indicate partial progress —
         // treat it as in_progress so the task remains open for follow-up.
