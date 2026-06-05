@@ -1194,6 +1194,53 @@ pub async fn serve() -> anyhow::Result<()> {
         });
     }
 
+    // Post-restart confirmation: if the service was restarted via the /restart control command,
+    // a KV marker was stored before shutdown. Send a confirmation to the originating channel now
+    // that we're back online. Use a short delay to let the channel connections re-establish.
+    {
+        let restart_channels = channel_registry.clone();
+        let restart_store = project_engines.first().map(|e| e.store.clone());
+        if let Some(store) = restart_store {
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                match store.kv_get("control:restart_pending").await {
+                    Ok(Some(conv_key)) => {
+                        if let Some((ch_name, thread_id, topic_id)) =
+                            crate::channels::transport::parse_conversation_key(&conv_key)
+                        {
+                            for ch in restart_channels.iter() {
+                                if ch.name() == ch_name {
+                                    let msg = OutgoingMessage {
+                                        thread_id: thread_id.to_string(),
+                                        body: "orch restarted successfully.".to_string(),
+                                        reply_to: None,
+                                        metadata: serde_json::json!({}),
+                                        topic_id: topic_id.map(|t| t.to_string()),
+                                    };
+                                    if let Err(e) = ch.send(&msg).await {
+                                        tracing::warn!(
+                                            channel = ch_name,
+                                            error = %e,
+                                            "failed to send restart confirmation"
+                                        );
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        if let Err(e) = store.kv_delete("control:restart_pending").await {
+                            tracing::warn!(error = %e, "failed to clear control:restart_pending");
+                        }
+                    }
+                    Ok(None) => {} // no pending restart, nothing to do
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to read control:restart_pending");
+                    }
+                }
+            });
+        }
+    }
+
     // Spawn notification dispatcher — reads task completion notifications
     // from transport and broadcasts to configured channels.
     //

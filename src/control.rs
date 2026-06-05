@@ -64,6 +64,7 @@ pub struct ModelSpec {
 pub enum ControlCommand {
     Model(Option<String>),
     Agent(Option<String>),
+    Restart,
 }
 
 fn default_model_for_agent(agent: &str) -> &'static str {
@@ -89,6 +90,7 @@ pub fn parse_control_command(message: &str) -> Option<ControlCommand> {
         "agent" => Some(ControlCommand::Agent(
             (!args.is_empty()).then(|| args.to_string()),
         )),
+        "restart" => Some(ControlCommand::Restart),
         _ => None,
     }
 }
@@ -393,6 +395,7 @@ fn format_switched_spec(spec: &ModelSpec) -> String {
 async fn handle_control_command(
     store: &TaskStore,
     session_id: &str,
+    channel_thread: Option<&str>,
     command: ControlCommand,
 ) -> Result<String> {
     match command {
@@ -413,6 +416,22 @@ async fn handle_control_command(
             reset_session_uuid(store, session_id).await?;
             Ok(format_switched_spec(&spec))
         }
+        ControlCommand::Restart => {
+            // Store the conversation key so the post-restart startup check can send a confirmation.
+            if let Some(ct) = channel_thread {
+                store.kv_set("control:restart_pending", ct).await.ok();
+            }
+            // Delay the SIGTERM slightly so the acknowledgment reply is delivered first.
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let pid = std::process::id().to_string();
+                let _ = tokio::process::Command::new("kill")
+                    .args(["-TERM", &pid])
+                    .status()
+                    .await;
+            });
+            Ok("Restarting orch service\u{2026} I'll confirm here when back online.".to_string())
+        }
     }
 }
 
@@ -420,10 +439,13 @@ async fn handle_control_command(
 pub async fn maybe_handle_control_command(
     store: &TaskStore,
     session_id: &str,
+    channel_thread: Option<&str>,
     message: &str,
 ) -> Result<Option<String>> {
     Ok(match parse_control_command(message) {
-        Some(command) => Some(handle_control_command(store, session_id, command).await?),
+        Some(command) => {
+            Some(handle_control_command(store, session_id, channel_thread, command).await?)
+        }
         None => None,
     })
 }
@@ -659,7 +681,9 @@ pub async fn send_message(
     message: &str,
 ) -> Result<String> {
     // Handle control commands — don't store as messages.
-    if let Some(response) = maybe_handle_control_command(store, session_id, message).await? {
+    if let Some(response) =
+        maybe_handle_control_command(store, session_id, channel_thread, message).await?
+    {
         return Ok(response);
     }
 
@@ -1047,6 +1071,10 @@ mod tests {
                 "opencode:deepseek-r1".to_string()
             )))
         );
+        assert_eq!(
+            parse_control_command("/restart"),
+            Some(ControlCommand::Restart)
+        );
         assert_eq!(parse_control_command("/kill"), None);
         assert_eq!(parse_control_command("/session"), None);
     }
@@ -1059,7 +1087,7 @@ mod tests {
             .map(|caps| caps[1].to_string())
             .collect::<std::collections::BTreeSet<_>>();
 
-        let expected = ["agent", "model"]
+        let expected = ["agent", "model", "restart"]
             .into_iter()
             .map(str::to_string)
             .collect::<std::collections::BTreeSet<_>>();
@@ -1124,7 +1152,8 @@ mod tests {
         set_agent(&store, "claude").await.unwrap();
 
         // Try switching to an unknown agent — should fail
-        let result = maybe_handle_control_command(&store, "default", "/agent bogusagent").await;
+        let result =
+            maybe_handle_control_command(&store, "default", None, "/agent bogusagent").await;
         assert!(result.is_err(), "should reject unknown agent");
         assert!(result.unwrap_err().to_string().contains("unknown agent"));
 
