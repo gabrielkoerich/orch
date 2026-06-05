@@ -5,6 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::Path;
 
+/// Default cap on diff bytes sent to the LLM per commit group.
+const DEFAULT_MAX_DIFF_BYTES: usize = 32 * 1024;
+
 #[derive(Debug, Clone)]
 struct ChangedFile {
     path: String,
@@ -17,7 +20,12 @@ struct CommitPlan {
     files: Vec<ChangedFile>,
 }
 
-pub fn run(dry_run: bool, yes: bool, message_override: Option<String>) -> anyhow::Result<()> {
+pub async fn run(
+    dry_run: bool,
+    yes: bool,
+    message_override: Option<String>,
+    no_llm: bool,
+) -> anyhow::Result<()> {
     ensure_git_repo()?;
     ensure_no_merge_conflicts()?;
 
@@ -35,10 +43,14 @@ pub fn run(dry_run: bool, yes: bool, message_override: Option<String>) -> anyhow
 
     let diff_text = get_full_diff()?;
 
-    let plans = if let Some(message) = message_override {
+    let mut plans = if let Some(message) = message_override {
         vec![CommitPlan { message, files }]
     } else {
-        build_plans(files, &diff_text)
+        let mut p = build_plans(files, &diff_text);
+        if !no_llm {
+            enrich_with_llm(&mut p).await;
+        }
+        p
     };
 
     print_plan_summary(&plans);
@@ -56,9 +68,8 @@ pub fn run(dry_run: bool, yes: bool, message_override: Option<String>) -> anyhow
                 return Ok(());
             }
             UserChoice::Edit => {
-                let mut edited = plans.clone();
-                edit_messages(&mut edited)?;
-                execute_plans(&edited)?;
+                edit_messages(&mut plans)?;
+                execute_plans(&plans)?;
                 return Ok(());
             }
             UserChoice::Yes => {}
@@ -66,6 +77,233 @@ pub fn run(dry_run: bool, yes: bool, message_override: Option<String>) -> anyhow
     }
 
     execute_plans(&plans)
+}
+
+/// Replace each plan's heuristic message with an LLM-drafted one.
+///
+/// On any error (no store, no agent, cooldowns, timeout) the heuristic
+/// message survives and a one-line warning is logged.
+async fn enrich_with_llm(plans: &mut [CommitPlan]) {
+    let store = match crate::cli::init_store().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "orch commit: could not open store for LLM message; using heuristic messages"
+            );
+            return;
+        }
+    };
+
+    let agent = match crate::control::get_agent(&store).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(error = %e, "orch commit: could not resolve agent; using heuristic messages");
+            return;
+        }
+    };
+    let model = match crate::control::get_model(&store).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "orch commit: could not resolve model; using heuristic messages");
+            return;
+        }
+    };
+
+    let max_bytes = resolve_max_diff_bytes();
+
+    for plan in plans.iter_mut() {
+        match draft_message_for_plan(&agent, &model, plan, max_bytes).await {
+            Ok(message) => plan.message = message,
+            Err(e) => tracing::warn!(
+                agent = %agent,
+                model = %model,
+                error = %e,
+                "orch commit: LLM draft failed, keeping heuristic message"
+            ),
+        }
+    }
+}
+
+fn resolve_max_diff_bytes() -> usize {
+    crate::config::get("commit.max_diff_bytes")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_DIFF_BYTES)
+}
+
+/// Call the agent once for this plan and return a cleaned commit message.
+async fn draft_message_for_plan(
+    agent: &str,
+    model: &str,
+    plan: &CommitPlan,
+    max_bytes: usize,
+) -> anyhow::Result<String> {
+    let paths: Vec<String> = plan
+        .files
+        .iter()
+        .flat_map(|f| std::iter::once(f.path.clone()).chain(f.old_path.clone()))
+        .collect();
+
+    let diff_text = diff_for_paths(&paths)?;
+    let (diff_for_prompt, truncated) = truncate_diff(&diff_text, max_bytes);
+
+    let file_list = plan
+        .files
+        .iter()
+        .map(|f| match &f.old_path {
+            Some(old) => format!("- {} -> {}", old, f.path),
+            None => format!("- {}", f.path),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let truncated_note = if truncated {
+        format!(
+            "Note: the diff was truncated to ~{} KB to fit the budget. Base the message on the visible portion.",
+            max_bytes / 1024
+        )
+    } else {
+        String::new()
+    };
+
+    let prompt = include_str!("../../prompts/commit_message.md")
+        .replace("{{FILES}}", &file_list)
+        .replace("{{DIFF}}", &diff_for_prompt)
+        .replace("{{TRUNCATED_NOTE}}", &truncated_note);
+
+    let result = crate::control::invoke_agent(agent, model, "", &prompt).await?;
+    let cleaned = clean_llm_message(&result.text);
+    if cleaned.is_empty() {
+        anyhow::bail!("LLM returned an empty commit message");
+    }
+    Ok(cleaned)
+}
+
+/// Strip fences, leading/trailing whitespace, and obvious chatter from an LLM response.
+fn clean_llm_message(raw: &str) -> String {
+    let trimmed = raw.trim();
+
+    // Remove a leading triple-backtick fence if present (with or without a language tag).
+    let without_open_fence = if let Some(rest) = trimmed.strip_prefix("```") {
+        // Drop the rest of the opening line (language tag) up to the first newline.
+        match rest.find('\n') {
+            Some(i) => &rest[i + 1..],
+            None => rest,
+        }
+    } else {
+        trimmed
+    };
+
+    // Remove a trailing triple-backtick fence.
+    let without_close_fence = without_open_fence
+        .trim_end()
+        .strip_suffix("```")
+        .unwrap_or(without_open_fence);
+
+    without_close_fence.trim().to_string()
+}
+
+/// Truncate the diff at `max_bytes`, snapping to a UTF-8 character boundary.
+fn truncate_diff(diff: &str, max_bytes: usize) -> (String, bool) {
+    if diff.len() <= max_bytes {
+        return (diff.to_string(), false);
+    }
+    let mut cutoff = max_bytes;
+    while cutoff > 0 && !diff.is_char_boundary(cutoff) {
+        cutoff -= 1;
+    }
+    (diff[..cutoff].to_string(), true)
+}
+
+/// Get the combined staged + unstaged + untracked diff scoped to the given paths.
+///
+/// `git diff --cached` and `git diff` never include untracked files, so for any
+/// path returned by `git ls-files --others --exclude-standard` we synthesize a
+/// `new file` diff via `git diff --no-index /dev/null <path>`. Without this the
+/// LLM would see only the filename for brand-new files and fall back to
+/// path-only guessing — defeating the point of the LLM draft.
+///
+/// Uses default unified context (3 lines) so the LLM can see what changed
+/// in surrounding code, unlike `get_full_diff()` which uses --unified=0
+/// because it only feeds the hunk-counting heuristic.
+fn diff_for_paths(paths: &[String]) -> anyhow::Result<String> {
+    let unique: BTreeSet<String> = paths.iter().cloned().collect();
+
+    let untracked_list = git_output(["ls-files", "--others", "--exclude-standard"])?;
+    let untracked: BTreeSet<String> = untracked_list
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    let mut staged_args: Vec<String> = vec![
+        "diff".into(),
+        "--cached".into(),
+        "--no-color".into(),
+        "--no-ext-diff".into(),
+        "--find-renames".into(),
+        "--".into(),
+    ];
+    staged_args.extend(unique.iter().cloned());
+
+    let mut unstaged_args: Vec<String> = vec![
+        "diff".into(),
+        "--no-color".into(),
+        "--no-ext-diff".into(),
+        "--find-renames".into(),
+        "--".into(),
+    ];
+    unstaged_args.extend(unique.iter().cloned());
+
+    let staged = run_git(&staged_args)?;
+    let unstaged = run_git(&unstaged_args)?;
+
+    let mut combined = format!("{staged}{unstaged}");
+    for path in unique.iter().filter(|p| untracked.contains(*p)) {
+        combined.push_str(&diff_for_untracked(path)?);
+    }
+    Ok(combined)
+}
+
+/// Produce a unified diff for an untracked file by diffing it against /dev/null.
+///
+/// `git diff --no-index` exits 1 when the files differ — that is the expected
+/// path here, since we are always comparing to an empty file. Treat exit 0 and
+/// 1 as success and surface anything else as an error.
+fn diff_for_untracked(path: &str) -> anyhow::Result<String> {
+    let out = std::process::Command::new("git")
+        .args([
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-index",
+            "--",
+            "/dev/null",
+            path,
+        ])
+        .output_with_context()?;
+    let code = out.status.code();
+    if !matches!(code, Some(0) | Some(1)) {
+        anyhow::bail!(
+            "git diff --no-index -- /dev/null {path} failed (exit {:?}): {}",
+            code,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn run_git(args: &[String]) -> anyhow::Result<String> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .output_with_context()?;
+    if !out.status.success() {
+        anyhow::bail!("git {} failed", args.join(" "));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
 fn execute_plans(plans: &[CommitPlan]) -> anyhow::Result<()> {
@@ -539,27 +777,27 @@ mod tests {
         assert_eq!(plans.len(), 2);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn dry_run_works_in_temp_repo() {
+    async fn dry_run_works_in_temp_repo() {
         let dir = init_temp_repo();
         std::env::set_current_dir(dir.path()).unwrap();
         std::fs::write(dir.path().join("src.rs"), "fn main() {}\n").unwrap();
 
-        run(true, true, None).unwrap();
+        run(true, true, None, true).await.unwrap();
 
         let log = git_output(["log", "--oneline", "-1"]).unwrap();
         assert!(log.contains("init"));
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn commits_in_temp_repo_with_yes() {
+    async fn commits_in_temp_repo_with_yes() {
         let dir = init_temp_repo();
         std::env::set_current_dir(dir.path()).unwrap();
         std::fs::write(dir.path().join("notes.md"), "updated\n").unwrap();
 
-        run(false, true, None).unwrap();
+        run(false, true, None, true).await.unwrap();
 
         let count = Command::new("git")
             .args(["rev-list", "--count", "HEAD"])
@@ -571,6 +809,31 @@ mod tests {
             .parse::<u32>()
             .unwrap();
         assert!(count >= 2);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn message_override_skips_llm_and_commits_once() {
+        let dir = init_temp_repo();
+        std::env::set_current_dir(dir.path()).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        std::fs::write(dir.path().join("b.md"), "b\n").unwrap();
+
+        // no_llm=false on purpose — the override must take priority over the LLM path.
+        run(
+            false,
+            true,
+            Some("chore: forced override".to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let log = git_output(["log", "--oneline", "-1"]).unwrap();
+        assert!(
+            log.contains("chore: forced override"),
+            "expected override message in HEAD, got: {log}"
+        );
     }
 
     #[test]
@@ -586,5 +849,67 @@ mod tests {
             .unwrap();
         let files = collect_changed_files().unwrap();
         assert!(files.iter().any(|f| f.path == "x.txt"));
+    }
+
+    #[test]
+    fn clean_llm_message_strips_fences_and_whitespace() {
+        let raw = "```\nfeat(cli): add --no-llm flag\n\nLet users opt out of LLM-drafted messages.\n```\n";
+        let cleaned = super::clean_llm_message(raw);
+        assert_eq!(
+            cleaned,
+            "feat(cli): add --no-llm flag\n\nLet users opt out of LLM-drafted messages."
+        );
+    }
+
+    #[test]
+    fn clean_llm_message_strips_language_tagged_fence() {
+        let raw = "```text\nfix(router): handle empty pool\n```";
+        let cleaned = super::clean_llm_message(raw);
+        assert_eq!(cleaned, "fix(router): handle empty pool");
+    }
+
+    #[test]
+    fn clean_llm_message_passes_plain_text_through() {
+        let cleaned = super::clean_llm_message("  docs: clarify usage  \n\n");
+        assert_eq!(cleaned, "docs: clarify usage");
+    }
+
+    #[test]
+    fn truncate_diff_no_op_when_under_budget() {
+        let diff = "diff --git a/x b/x\n+hello\n";
+        let (out, truncated) = super::truncate_diff(diff, 1024);
+        assert!(!truncated);
+        assert_eq!(out, diff);
+    }
+
+    #[test]
+    fn truncate_diff_snaps_to_char_boundary() {
+        let diff = "héllo wörld"; // multi-byte chars in the middle
+        let (out, truncated) = super::truncate_diff(diff, 5);
+        assert!(truncated);
+        // out must be valid UTF-8 and never split a multi-byte char.
+        assert!(out.chars().count() > 0);
+        assert!(diff.starts_with(&out));
+    }
+
+    #[test]
+    #[serial]
+    fn diff_for_paths_includes_untracked_file_contents() {
+        let dir = init_temp_repo();
+        std::env::set_current_dir(dir.path()).unwrap();
+        // Brand-new file: never staged, never tracked. The LLM path must still
+        // see its contents — otherwise the message would be drafted from the
+        // filename alone, which is exactly the regression this guards against.
+        std::fs::write(dir.path().join("brand_new.txt"), "alpha\nbeta\ngamma\n").unwrap();
+
+        let diff = super::diff_for_paths(&["brand_new.txt".to_string()]).unwrap();
+        assert!(
+            diff.contains("brand_new.txt"),
+            "diff should reference the new file path, got: {diff}"
+        );
+        assert!(
+            diff.contains("+alpha") && diff.contains("+beta") && diff.contains("+gamma"),
+            "diff should include the new file's added lines, got: {diff}"
+        );
     }
 }
