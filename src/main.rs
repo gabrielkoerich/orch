@@ -249,6 +249,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start the orch service
+    #[command(hide = true)]
     Serve,
     /// Show version information
     Version,
@@ -283,7 +284,8 @@ enum Commands {
         #[arg(long = "message", short = 'm')]
         message: Option<String>,
     },
-    /// Check if a cron expression matches now
+    /// Deprecated: use `orch job cron`
+    #[command(hide = true)]
     Cron {
         /// Cron expression (5 fields)
         expression: String,
@@ -409,7 +411,8 @@ enum Commands {
         /// Shell type
         shell: Shell,
     },
-    /// Stream task events in real-time
+    /// Deprecated: use `orch task events`
+    #[command(hide = true)]
     Events {
         /// Filter by repo (substring match)
         #[arg(long)]
@@ -441,7 +444,8 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Export task session output in human-readable format
+    /// Deprecated: use `orch task session`
+    #[command(hide = true)]
     Session {
         #[command(subcommand)]
         action: SessionAction,
@@ -680,6 +684,20 @@ enum TaskAction {
         /// Task ID (e.g. "internal:8" or issue number)
         id: String,
     },
+    /// Stream task state-transition events in real-time
+    Events {
+        /// Filter by repo (substring match)
+        #[arg(long)]
+        repo: Option<String>,
+        /// Filter by task ID
+        #[arg(long)]
+        task: Option<String>,
+    },
+    /// Export task session output in human-readable format
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -726,6 +744,14 @@ enum JobAction {
         /// Project filter (repo slug substring) to disambiguate jobs with the same ID
         #[arg(short, long)]
         project: Option<String>,
+    },
+    /// Check if a cron expression matches now
+    Cron {
+        /// Cron expression (5 fields)
+        expression: String,
+        /// Check if schedule fired since this timestamp
+        #[arg(long)]
+        since: Option<String>,
     },
 }
 
@@ -826,6 +852,7 @@ async fn main() -> anyhow::Result<()> {
             cli::commit::run(dry_run, yes, message)?;
         }
         Commands::Cron { expression, since } => {
+            eprintln!("warning: `orch cron` is deprecated; use `orch job cron` instead");
             let matches = cron::check(&expression, since.as_deref())?;
             std::process::exit(if matches { 0 } else { 1 });
         }
@@ -956,6 +983,22 @@ async fn main() -> anyhow::Result<()> {
             TaskAction::Inspect { id } => {
                 cli::task::inspect(&id).await?;
             }
+            TaskAction::Events { repo, task } => {
+                cli::events::stream(repo.as_deref(), task.as_deref()).await?;
+            }
+            TaskAction::Session { action } => match action {
+                SessionAction::Export {
+                    task_id,
+                    attempt,
+                    format,
+                } => {
+                    use crate::cli::session::ExportFormat;
+                    let fmt = format
+                        .parse::<ExportFormat>()
+                        .unwrap_or(ExportFormat::Markdown);
+                    cli::session::export(&task_id, attempt, fmt).await?;
+                }
+            },
         },
         Commands::Job { action } => match action {
             JobAction::List => {
@@ -990,6 +1033,10 @@ async fn main() -> anyhow::Result<()> {
             }
             JobAction::Run { id, project } => {
                 cli::job::run(&id, project.as_deref()).await?;
+            }
+            JobAction::Cron { expression, since } => {
+                let matches = cron::check(&expression, since.as_deref())?;
+                std::process::exit(if matches { 0 } else { 1 });
             }
         },
         Commands::Service { action } => match action {
@@ -1087,6 +1134,7 @@ async fn main() -> anyhow::Result<()> {
             generate(shell, &mut cmd, "orch", &mut std::io::stdout());
         }
         Commands::Events { repo, task } => {
+            eprintln!("warning: `orch events` is deprecated; use `orch task events` instead");
             cli::events::stream(repo.as_deref(), task.as_deref()).await?;
         }
         Commands::Webhook { action } => match action {
@@ -1100,19 +1148,22 @@ async fn main() -> anyhow::Result<()> {
         Commands::Prune { dry_run } => {
             cli::prune::run(dry_run).await?;
         }
-        Commands::Session { action } => match action {
-            SessionAction::Export {
-                task_id,
-                attempt,
-                format,
-            } => {
-                use crate::cli::session::ExportFormat;
-                let fmt = format
-                    .parse::<ExportFormat>()
-                    .unwrap_or(ExportFormat::Markdown);
-                cli::session::export(&task_id, attempt, fmt).await?;
+        Commands::Session { action } => {
+            eprintln!("warning: `orch session` is deprecated; use `orch task session` instead");
+            match action {
+                SessionAction::Export {
+                    task_id,
+                    attempt,
+                    format,
+                } => {
+                    use crate::cli::session::ExportFormat;
+                    let fmt = format
+                        .parse::<ExportFormat>()
+                        .unwrap_or(ExportFormat::Markdown);
+                    cli::session::export(&task_id, attempt, fmt).await?;
+                }
             }
-        },
+        }
         Commands::Notify { message, target } => {
             cli::notify::send(&message, target.as_deref()).await?;
         }
