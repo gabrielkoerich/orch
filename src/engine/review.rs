@@ -2260,6 +2260,25 @@ async fn ensure_pr_exists(
                     {
                         tracing::error!(task_id = task.id.0, err = %e, "update_task_status_and_result(Blocked) failed — skipping block to avoid silent auto-unblock loop");
                     }
+                    Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Blocked(msg)))
+                } else if task.id.0.starts_with("internal:") {
+                    // Internal tasks with no PR or code changes are read-only/analysis
+                    // tasks (e.g. morning briefing, evening retrospective) that
+                    // legitimately produce no git-visible changes. Mark them done
+                    // instead of re-routing, which would create a loop: needs_review
+                    // → review agent → no PR/no commits → reroute to New → agent
+                    // runs → needs_review → ...
+                    tracing::info!(
+                        task_id = task.id.0,
+                        "no PR and no commits for internal task — marking done"
+                    );
+                    if let Err(e) = task_manager
+                        .update_task_status(&task.id, Status::Done)
+                        .await
+                    {
+                        tracing::error!(task_id = task.id.0, err = %e, "update_task_status(Done) failed — task may be stuck in InReview");
+                    }
+                    Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Skipped))
                 } else {
                     // Clear agent/model so router picks a different one and note the
                     // fact that this attempt produced no PR or code changes.
@@ -2287,8 +2306,8 @@ async fn ensure_pr_exists(
                     {
                         tracing::error!(task_id = task.id.0, err = %e, "update_task_status(New) failed — task may be stuck in InReview");
                     }
+                    Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Rerouted))
                 }
-                Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Rerouted))
             }
         }
         Err(e) => {
