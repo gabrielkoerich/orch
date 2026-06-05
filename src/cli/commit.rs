@@ -143,7 +143,7 @@ async fn draft_message_for_plan(
     let paths: Vec<String> = plan
         .files
         .iter()
-        .flat_map(|f| std::iter::once(f.path.clone()).chain(f.old_path.clone().into_iter()))
+        .flat_map(|f| std::iter::once(f.path.clone()).chain(f.old_path.clone()))
         .collect();
 
     let diff_text = diff_for_paths(&paths)?;
@@ -217,13 +217,27 @@ fn truncate_diff(diff: &str, max_bytes: usize) -> (String, bool) {
     (diff[..cutoff].to_string(), true)
 }
 
-/// Get the combined staged + unstaged unified diff scoped to the given paths.
+/// Get the combined staged + unstaged + untracked diff scoped to the given paths.
+///
+/// `git diff --cached` and `git diff` never include untracked files, so for any
+/// path returned by `git ls-files --others --exclude-standard` we synthesize a
+/// `new file` diff via `git diff --no-index /dev/null <path>`. Without this the
+/// LLM would see only the filename for brand-new files and fall back to
+/// path-only guessing — defeating the point of the LLM draft.
 ///
 /// Uses default unified context (3 lines) so the LLM can see what changed
 /// in surrounding code, unlike `get_full_diff()` which uses --unified=0
 /// because it only feeds the hunk-counting heuristic.
 fn diff_for_paths(paths: &[String]) -> anyhow::Result<String> {
     let unique: BTreeSet<String> = paths.iter().cloned().collect();
+
+    let untracked_list = git_output(["ls-files", "--others", "--exclude-standard"])?;
+    let untracked: BTreeSet<String> = untracked_list
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
 
     let mut staged_args: Vec<String> = vec![
         "diff".into(),
@@ -246,7 +260,40 @@ fn diff_for_paths(paths: &[String]) -> anyhow::Result<String> {
 
     let staged = run_git(&staged_args)?;
     let unstaged = run_git(&unstaged_args)?;
-    Ok(format!("{staged}{unstaged}"))
+
+    let mut combined = format!("{staged}{unstaged}");
+    for path in unique.iter().filter(|p| untracked.contains(*p)) {
+        combined.push_str(&diff_for_untracked(path)?);
+    }
+    Ok(combined)
+}
+
+/// Produce a unified diff for an untracked file by diffing it against /dev/null.
+///
+/// `git diff --no-index` exits 1 when the files differ — that is the expected
+/// path here, since we are always comparing to an empty file. Treat exit 0 and
+/// 1 as success and surface anything else as an error.
+fn diff_for_untracked(path: &str) -> anyhow::Result<String> {
+    let out = std::process::Command::new("git")
+        .args([
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-index",
+            "--",
+            "/dev/null",
+            path,
+        ])
+        .output_with_context()?;
+    let code = out.status.code();
+    if !matches!(code, Some(0) | Some(1)) {
+        anyhow::bail!(
+            "git diff --no-index -- /dev/null {path} failed (exit {:?}): {}",
+            code,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
 fn run_git(args: &[String]) -> anyhow::Result<String> {
@@ -843,5 +890,26 @@ mod tests {
         // out must be valid UTF-8 and never split a multi-byte char.
         assert!(out.chars().count() > 0);
         assert!(diff.starts_with(&out));
+    }
+
+    #[test]
+    #[serial]
+    fn diff_for_paths_includes_untracked_file_contents() {
+        let dir = init_temp_repo();
+        std::env::set_current_dir(dir.path()).unwrap();
+        // Brand-new file: never staged, never tracked. The LLM path must still
+        // see its contents — otherwise the message would be drafted from the
+        // filename alone, which is exactly the regression this guards against.
+        std::fs::write(dir.path().join("brand_new.txt"), "alpha\nbeta\ngamma\n").unwrap();
+
+        let diff = super::diff_for_paths(&["brand_new.txt".to_string()]).unwrap();
+        assert!(
+            diff.contains("brand_new.txt"),
+            "diff should reference the new file path, got: {diff}"
+        );
+        assert!(
+            diff.contains("+alpha") && diff.contains("+beta") && diff.contains("+gamma"),
+            "diff should include the new file's added lines, got: {diff}"
+        );
     }
 }
