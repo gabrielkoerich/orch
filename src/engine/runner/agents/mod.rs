@@ -1554,6 +1554,15 @@ pub(crate) mod patterns {
     /// to exclude most long-form agent outputs.
     const RATE_LIMIT_SCAN_TAIL_BYTES: usize = 3000;
 
+    /// How many bytes from the start of combined stdout+stderr we scan for
+    /// rate limit patterns that appear as early system events.
+    ///
+    /// Some rate limit errors (e.g., Claude session limit) appear as
+    /// `type:system` NDJSON events early in the stream, not in the tail.
+    /// Scanning the head catches these before they get pushed out of the
+    /// tail window by subsequent agent output.
+    const RATE_LIMIT_SCAN_HEAD_BYTES: usize = 3000;
+
     /// Run all pattern detectors against combined stdout+stderr.
     /// Returns the first matching AgentError, or a generic Unknown.
     pub fn classify_from_text(exit_code: i32, text: &str) -> AgentError {
@@ -1581,6 +1590,15 @@ pub(crate) mod patterns {
             return e;
         }
         if let Some(e) = detect_thinking_block_conflict(text) {
+            return e;
+        }
+        // Also scan the head of the combined output for rate limit patterns.
+        // Some rate limit errors (e.g., Claude session limit) appear as
+        // `type:system` NDJSON events early in the stream, not in the tail.
+        // Scanning the head catches these before they get pushed out of the
+        // tail window by subsequent agent output.
+        let scan_head = safe_head(text, RATE_LIMIT_SCAN_HEAD_BYTES);
+        if let Some(e) = detect_rate_limit(scan_head) {
             return e;
         }
         // Only scan the tail of the combined output for CLI-style error
@@ -1630,6 +1648,19 @@ pub(crate) mod patterns {
             idx += 1;
         }
         &text[idx..]
+    }
+
+    /// Safely extract the first `max_bytes` of a string, respecting UTF-8 boundaries.
+    pub fn safe_head(text: &str, max_bytes: usize) -> &str {
+        if text.len() <= max_bytes {
+            return text;
+        }
+        let mut idx = max_bytes;
+        // Walk backward to find a char boundary
+        while idx > 0 && !text.is_char_boundary(idx) {
+            idx -= 1;
+        }
+        &text[..idx]
     }
 
     /// Scan NDJSON events for errors using agent-specific extraction and classification.
@@ -2049,6 +2080,37 @@ mod tests {
         assert!(
             matches!(err, AgentError::RateLimit { .. }),
             "real rate limit at tail must be detected, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_detects_session_limit_as_early_system_event() {
+        // Regression test for issue #3272: Claude session limit errors appear as
+        // `type:system` NDJSON events early in the stream, not as `type:result`
+        // lines. When the agent produces significant output after the error, the
+        // system event is pushed out of the tail window and missed by tail-only
+        // scanning. The head scan must catch it.
+        let system_event = r#"{"type":"system","subtype":"error","error":{"type":"session_limit","message":"You've hit your session limit · resets 4:10am (America/Sao_Paulo)"}}"#;
+        // Generate enough work product (>3000 bytes) to push the system event
+        // out of the tail window.
+        let work_product = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Working on the task...\"}]}}\n"
+            .repeat(200);
+        let text = format!("{system_event}\n{work_product}");
+        // Verify the output is large enough that the event is not in the tail.
+        assert!(
+            text.len() > 3000,
+            "test output must exceed tail window to be meaningful"
+        );
+        let err = patterns::classify_from_text(1, &text);
+        assert!(
+            matches!(err, AgentError::RateLimit { .. }),
+            "session limit as early system event must be detected via head scan, got: {err:?}"
+        );
+        // The message should contain the actual error, not unrelated tail content.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("session limit"),
+            "error message should contain the rate limit reason, got: {msg}"
         );
     }
 
