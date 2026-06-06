@@ -993,6 +993,36 @@ Some output here.
     }
 
     #[test]
+    fn parse_normalizes_noop_alias_to_done() {
+        // noop / green / alerts_sent → done, matching #3273 alias map.
+        let input = r#"{"status":"noop","summary":"nothing to do","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
+    fn parse_normalizes_green_alias_to_done() {
+        let input = r#"{"status":"green","summary":"all passing","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
+    fn parse_normalizes_alerts_sent_alias_to_done() {
+        let input = r#"{"status":"alerts_sent","summary":"notifications dispatched","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
+    fn parse_normalizes_waiting_alias_to_in_progress() {
+        // waiting → in_progress (distinct from running/partial in the alias map).
+        let input = r#"{"status":"waiting","summary":"blocked on upstream","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "in_progress");
+    }
+
+    #[test]
     fn parse_normalizes_changes_pushed_alias_to_done() {
         let input = r#"{"status":"changes_pushed","summary":"changes pushed to branch","accomplished":[],"remaining":[],"files":[]}"#;
         let resp = parse(input).unwrap();

@@ -1065,6 +1065,24 @@ pub(crate) mod patterns {
     use super::AgentError;
     use std::time::Duration;
 
+    /// Returns true if the pattern found at `lower_pos` (byte offset in lowercase text)
+    /// is at a word boundary in the original `text` — i.e., surrounded by non-identifier
+    /// chars. Used to suppress false positives from identifiers like `record_rate_limit_returns_id`.
+    fn is_word_boundary(text: &str, lower_pos: usize, pattern: &str) -> bool {
+        let after_match = lower_pos + pattern.len();
+        let prev_is_boundary = lower_pos == 0
+            || !text[..lower_pos]
+                .chars()
+                .last()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        let next_is_boundary = after_match >= text.len()
+            || !text[after_match..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        prev_is_boundary && next_is_boundary
+    }
+
     /// Check for rate limit / usage limit patterns in text.
     pub fn detect_rate_limit(text: &str) -> Option<AgentError> {
         let lower = text.to_lowercase();
@@ -1112,20 +1130,15 @@ pub(crate) mod patterns {
                     .is_some_and(|c| c.is_ascii_digit())
             }));
 
-        // Guard against false positives: if "rate_limit" appears near the start of the
-        // text without an error-context indicator nearby, it may be from test output
-        // (e.g. nextest progress lines) or a stored-error prefix rather than a real
-        // rate limit error. Require an error indicator (429/http/error/failed) nearby.
-        if let Some(pos) = match_pos {
-            if pos < 100 {
-                let window_start = pos.saturating_sub(50);
-                let window_end = (pos + 100).min(lower.len());
-                let context = &lower[window_start..window_end];
-                let has_error_context =
-                    context.contains("429") || context.contains("http")
-                    || context.contains("error") || context.contains("failed");
-                if !has_error_context {
-                    return None;
+        // Guard: skip "rate_limit"/"ratelimit" unless at a word boundary — prevents
+        // false positives from test identifiers like `record_rate_limit_returns_id`.
+        // Other patterns (natural-language phrases) are low risk.
+        if let Some(lower_pos) = match_pos {
+            for pat in ["rate_limit", "ratelimit"] {
+                if let Some(pat_pos) = lower.find(pat) {
+                    if pat_pos == lower_pos && !is_word_boundary(text, lower_pos, pat) {
+                        return None;
+                    }
                 }
             }
         }
