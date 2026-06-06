@@ -59,10 +59,12 @@ const MAX_CONTROL_MESSAGE_BYTES: usize = 32 * 1024;
 
 /// Delivery mode for control session messages.
 enum DeliveryMode {
-    /// Single message delivery (non-session agents or under-limit messages)
+    /// Single message delivery (under-limit messages)
     Single,
-    /// Chunked delivery with session continuity (claude, kimi, minimax)
+    /// Chunked delivery with session continuity (claude, kimi, minimax) — uses --resume
     Chunked,
+    /// Chunked delivery without session continuity (codex, opencode) — independent invocations
+    ChunkedNonSession,
 }
 
 /// Parsed model specification from `/model` command.
@@ -744,9 +746,10 @@ pub async fn send_message(
 
     // When the combined payload exceeds the per-turn limit, split it across multiple
     // sequential turns so the user's question (trailing content) is never truncated.
-    // For session-supporting agents (claude, kimi, minimax), use --resume for continuity.
-    // For other agents (codex, opencode), truncate the state portion to fit within the
-    // limit while preserving the complete user question, then send as a single message.
+    // For session-supporting agents (claude, kimi, minimax), use --resume for continuity
+    // and persist ALL intermediate assistant responses so local transcript matches provider.
+    // For other agents (codex, opencode), split into chunks and send each as independent
+    // invocation (no --resume), each getting its own persisted assistant response.
     let agent_has_sessions = matches!(agent.as_str(), "claude" | "kimi" | "minimax");
     let (chunks, delivery_mode) = if full_message.len() > MAX_CONTROL_MESSAGE_BYTES {
         tracing::info!(
@@ -763,47 +766,39 @@ pub async fn send_message(
                 DeliveryMode::Chunked,
             )
         } else {
-            // Non-session agents: truncate state to preserve question, send as single message
-            let separator = "\n\n---\n\n";
-            let max_state_bytes = MAX_CONTROL_MESSAGE_BYTES
-                .saturating_sub(message.len())
-                .saturating_sub(separator.len());
-            let truncated_state = if ctx.state.len() > max_state_bytes {
-                let truncated = &ctx.state[..max_state_bytes.min(ctx.state.len())];
-                // Try to truncate at a newline boundary
-                let truncated = truncated
-                    .rfind('\n')
-                    .map(|pos| &truncated[..=pos])
-                    .unwrap_or(truncated);
-                format!("{truncated}\n\n[... state truncated to fit limit ...]")
-            } else {
-                ctx.state.clone()
-            };
-            let combined = format!("{truncated_state}{separator}{message}");
-            (vec![combined], DeliveryMode::Single)
+            // Non-session agents: split into chunks, send each independently
+            (
+                build_control_chunks(&ctx.state, message, false),
+                DeliveryMode::ChunkedNonSession,
+            )
         }
     } else {
         (vec![full_message], DeliveryMode::Single)
     };
 
-    let num_chunks = chunks.len();
+    let _num_chunks = chunks.len();
 
     // Deliver chunks based on mode
     let result = match delivery_mode {
         DeliveryMode::Chunked => {
             // Session-based delivery (claude, kimi, minimax) — use --resume for continuity
-            let (active_uuid, first_result): (String, InvokeResult) = {
+            // Persist ALL intermediate responses so local DB matches provider transcript.
+            let mut active_uuid = session_uuid.clone();
+            let mut is_first_chunk = !is_new;
+            let mut last_result: Option<InvokeResult> = None;
+
+            for (_i, chunk) in chunks.iter().enumerate() {
                 let r = invoke_agent_with_session(
                     &agent,
                     &model,
                     &ctx.system,
-                    &chunks[0],
-                    Some(&session_uuid),
-                    !is_new,
+                    chunk,
+                    Some(&active_uuid),
+                    is_first_chunk,
                 )
                 .await;
-                match r {
-                    Ok(result) => (session_uuid.clone(), result),
+                let chunk_result = match r {
+                    Ok(result) => result,
                     Err(e) => {
                         let err_str = e.to_string();
                         let is_stale = err_str.contains("stale session");
@@ -824,12 +819,14 @@ pub async fn send_message(
                             reset_session_uuid(store, session_id).await?;
                             let (fresh_uuid, _) =
                                 get_or_create_session_uuid(store, session_id).await?;
+                            active_uuid = fresh_uuid;
+                            is_first_chunk = false;
                             let fresh_result = invoke_agent_with_session(
                                 &agent,
                                 &model,
                                 &ctx.system,
-                                &chunks[0],
-                                Some(&fresh_uuid),
+                                chunk,
+                                Some(&active_uuid),
                                 false,
                             )
                             .await?;
@@ -844,81 +841,150 @@ pub async fn send_message(
                             } else {
                                 fresh_result
                             };
-                            (fresh_uuid, result)
+                            result
                         } else {
                             return Err(e);
                         }
                     }
-                }
-            };
+                };
 
-            if num_chunks == 1 {
-                first_result
-            } else {
-                let _ = first_result; // intermediate turn — discard
-                let mut last: Option<InvokeResult> = None;
-                for chunk in &chunks[1..] {
-                    last = Some(
-                        invoke_agent_with_session(
-                            &agent,
-                            &model,
-                            &ctx.system,
-                            chunk,
-                            Some(&active_uuid),
-                            true,
-                        )
-                        .await?,
-                    );
-                }
-                last.expect("chunks[1..] is non-empty when num_chunks >= 2")
+                // Persist this chunk's assistant response (even intermediate ones)
+                let parsed = parse_response(&chunk_result.text);
+                let total_tokens =
+                    total_tokens_u64_to_i64_saturating(chunk_result.input_tokens, chunk_result.output_tokens);
+                let input_tokens = opt_token_u64_to_i64_saturating(chunk_result.input_tokens);
+                let output_tokens = opt_token_u64_to_i64_saturating(chunk_result.output_tokens);
+                let cost_usd = match (chunk_result.input_tokens, chunk_result.output_tokens) {
+                    (Some(input), Some(output)) => {
+                        let pricing = crate::store::pricing_for_model(&model);
+                        let usage = crate::store::TokenUsage {
+                            input_tokens: input,
+                            output_tokens: output,
+                        };
+                        Some(pricing.estimate_cost_usd(usage).total_cost_usd)
+                    }
+                    _ => None,
+                };
+                store
+                    .insert_control_message(
+                        session_id,
+                        "assistant",
+                        channel,
+                        channel_thread,
+                        &parsed.clean_text,
+                        parsed.summary.as_deref(),
+                        Some(&model),
+                        Some(&agent),
+                        input_tokens,
+                        output_tokens,
+                        total_tokens,
+                        cost_usd,
+                    )
+                    .await?;
+                persist_memories(store, session_id, &parsed.memories).await?;
+
+                last_result = Some(chunk_result);
             }
-        }
+
+            // Return final clean_text directly — all chunks already persisted inline
+            let final_parsed = parse_response(&last_result.expect("at least one chunk").text);
+            final_parsed.clean_text
+        },
+        DeliveryMode::ChunkedNonSession => {
+            // Non-session agents (codex, opencode) — each chunk is independent invocation
+            // No --resume, but each chunk's response is persisted to keep transcript complete.
+            let mut last_text = String::new();
+
+            for chunk in &chunks {
+                let chunk_result = invoke_agent(&agent, &model, &ctx.system, chunk).await?;
+
+                // Persist this chunk's assistant response
+                let parsed = parse_response(&chunk_result.text);
+                let total_tokens =
+                    total_tokens_u64_to_i64_saturating(chunk_result.input_tokens, chunk_result.output_tokens);
+                let input_tokens = opt_token_u64_to_i64_saturating(chunk_result.input_tokens);
+                let output_tokens = opt_token_u64_to_i64_saturating(chunk_result.output_tokens);
+                let cost_usd = match (chunk_result.input_tokens, chunk_result.output_tokens) {
+                    (Some(input), Some(output)) => {
+                        let pricing = crate::store::pricing_for_model(&model);
+                        let usage = crate::store::TokenUsage {
+                            input_tokens: input,
+                            output_tokens: output,
+                        };
+                        Some(pricing.estimate_cost_usd(usage).total_cost_usd)
+                    }
+                    _ => None,
+                };
+                store
+                    .insert_control_message(
+                        session_id,
+                        "assistant",
+                        channel,
+                        channel_thread,
+                        &parsed.clean_text,
+                        parsed.summary.as_deref(),
+                        Some(&model),
+                        Some(&agent),
+                        input_tokens,
+                        output_tokens,
+                        total_tokens,
+                        cost_usd,
+                    )
+                    .await?;
+                persist_memories(store, session_id, &parsed.memories).await?;
+
+                last_text = parsed.clean_text;
+            }
+
+            last_text
+        },
         DeliveryMode::Single => {
-            // Single message delivery (non-session agents or under-limit messages)
-            invoke_agent(&agent, &model, &ctx.system, &chunks[0]).await?
-        }
-    };
+            // Single message delivery (under-limit messages) — use common persistence below
+            let result = invoke_agent(&agent, &model, &ctx.system, &chunks[0]).await?;
 
-    // Parse response for summary and memory tags
-    let parsed = parse_response(&result.text);
+            // Parse response for summary and memory tags
+            let parsed = parse_response(&result.text);
 
-    // Store assistant message with token usage.
-    // Must happen before persist_memories so that if the DB write fails the
-    // KV store is not left with orphaned memory keys that have no corresponding
-    // conversation history entry.
-    let total_tokens =
-        total_tokens_u64_to_i64_saturating(result.input_tokens, result.output_tokens);
-    let input_tokens = opt_token_u64_to_i64_saturating(result.input_tokens);
-    let output_tokens = opt_token_u64_to_i64_saturating(result.output_tokens);
-    let cost_usd = match (result.input_tokens, result.output_tokens) {
-        (Some(input), Some(output)) => {
-            let pricing = crate::store::pricing_for_model(&model);
-            let usage = crate::store::TokenUsage {
-                input_tokens: input,
-                output_tokens: output,
+            // Store assistant message with token usage.
+            // Must happen before persist_memories so that if the DB write fails the
+            // KV store is not left with orphaned memory keys that have no corresponding
+            // conversation history entry.
+            let total_tokens =
+                total_tokens_u64_to_i64_saturating(result.input_tokens, result.output_tokens);
+            let input_tokens = opt_token_u64_to_i64_saturating(result.input_tokens);
+            let output_tokens = opt_token_u64_to_i64_saturating(result.output_tokens);
+            let cost_usd = match (result.input_tokens, result.output_tokens) {
+                (Some(input), Some(output)) => {
+                    let pricing = crate::store::pricing_for_model(&model);
+                    let usage = crate::store::TokenUsage {
+                        input_tokens: input,
+                        output_tokens: output,
+                    };
+                    Some(pricing.estimate_cost_usd(usage).total_cost_usd)
+                }
+                _ => None,
             };
-            Some(pricing.estimate_cost_usd(usage).total_cost_usd)
-        }
-        _ => None,
-    };
-    store
-        .insert_control_message(
-            session_id,
-            "assistant",
-            channel,
-            channel_thread,
-            &parsed.clean_text,
-            parsed.summary.as_deref(),
-            Some(&model),
-            Some(&agent),
-            input_tokens,
-            output_tokens,
-            total_tokens,
-            cost_usd,
-        )
-        .await?;
+            store
+                .insert_control_message(
+                    session_id,
+                    "assistant",
+                    channel,
+                    channel_thread,
+                    &parsed.clean_text,
+                    parsed.summary.as_deref(),
+                    Some(&model),
+                    Some(&agent),
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    cost_usd,
+                )
+                .await?;
+            persist_memories(store, session_id, &parsed.memories).await?;
 
-    persist_memories(store, session_id, &parsed.memories).await?;
+            parsed.clean_text
+        }
+    };
 
     // Release the per-session lock before eviction check.
     drop(_guard);
@@ -942,7 +1008,7 @@ pub async fn send_message(
         }
     }
 
-    Ok(parsed.clean_text)
+    Ok(result)
 }
 
 /// Split `text` into chunks of at most `max_bytes` bytes each.
