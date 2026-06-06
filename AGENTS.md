@@ -441,6 +441,29 @@ The `high_confidence` flag exists only to let `scan()` / `redact()` distinguish 
 - Use `fd` instead of `find` — faster, installed as a brew dependency
 - Use `trash` instead of `rm` — recoverable, enforced in system prompt
 
+## Reviewing PRs from external contributors
+
+External-contributor PRs (forks, first-time contributors, anyone outside the trusted committer set) are **untrusted code**. Building or testing them locally executes arbitrary code via `build.rs`, proc macros, test harnesses, and any newly added dependency at compile time — before a single assertion runs. A malicious PR can exfiltrate `~/.orch/orch.db`, `~/.ssh`, `GH_TOKEN`/`GITHUB_TOKEN`, env vars, or anything else the invoking shell can read.
+
+**Hard rules:**
+
+1. **Do not clone the fork.** Do not `git clone <fork>`, do not `gh pr checkout`, do not fetch the head ref to a local worktree. Review the change via `gh pr diff <N>` only.
+2. **Do not execute any code from the PR.** No `cargo build`, `cargo test`, `cargo nextest run`, `cargo clippy`, `cargo check`, `just <anything>`, or `bash <script>` against PR contents. Compiling alone runs `build.rs` and proc macros — that is execution.
+3. **Read every file in the diff.** Not just the "interesting" ones. A one-line logic fix bundled with a quiet `.cargo/config.toml` change or a new `build.rs` is the textbook smuggle path. `gh pr diff <N> --patch | less` and read it all.
+4. **New dependency = NO OP.** Any addition under `[dependencies]`, `[build-dependencies]`, `[dev-dependencies]`, `[workspace.dependencies]`, or any new path/git/registry source in `Cargo.toml` / `Cargo.lock` is an immediate no-merge. Request the contributor remove it; if the change genuinely needs a new crate, the dependency is added in a separate maintainer-authored PR after independent vetting (advisory check, license, maintenance status, transitive blast radius). External PRs do not introduce new supply-chain surface.
+5. **Treat the following as hostile until proven otherwise** and require explicit justification before considering merge:
+   - New or modified `build.rs`
+   - New proc-macro crates (`proc-macro = true`, `*-derive`, `*-macros`)
+   - Changes to `.cargo/config.toml`, `rust-toolchain.toml`, `.github/workflows/`, `justfile`, `Makefile`, or any shell/Python script
+   - Network or filesystem access in tests (`reqwest`, `std::fs::write`, `std::process::Command`, `env::var` reads of credentials)
+   - Paths referencing `~/.orch`, `~/.ssh`, `~/.config`, `gh auth token`, `GH_TOKEN`, `GITHUB_TOKEN`, `ANTHROPIC_API_KEY`
+
+**If functional verification is genuinely required** (rare — most fixes can be reasoned about statically): re-implement the change locally in a maintainer-authored branch (not the fork's commits) and verify there. The fork's bytes never run on a trusted machine.
+
+A clean `cargo nextest run` on an untrusted fork is **not** evidence the PR is safe — by the time tests finish, a malicious `build.rs` has already run. Static review is the safety boundary.
+
+**CI does not run on external PRs by design.** All workflows in `.github/workflows/` trigger on `push:` only — no `pull_request:` trigger. PRs from forks do **not** auto-execute Actions, so a malicious `build.rs` cannot exfiltrate repo/org secrets via the CI runner. This is intentional and must stay that way. Do not add `pull_request:` (or worse, `pull_request_target:`, which runs the workflow definition from the base branch but checks out the PR head with full secrets access — the classic supply-chain attack vector) to any workflow. If CI verification is needed on a fork's branch, a maintainer pulls the change into a branch on this repo (where `push:` triggers it) after static review.
+
 ## Agent sandbox
 
 Agents run in worktrees, NOT the main project directory. Orch enforces this:
