@@ -458,7 +458,18 @@ External-contributor PRs (forks, first-time contributors, anyone outside the tru
    - Network or filesystem access in tests (`reqwest`, `std::fs::write`, `std::process::Command`, `env::var` reads of credentials)
    - Paths referencing `~/.orch`, `~/.ssh`, `~/.config`, `gh auth token`, `GH_TOKEN`, `GITHUB_TOKEN`, `ANTHROPIC_API_KEY`
 
-**If functional verification is genuinely required** (rare — most fixes can be reasoned about statically), there are two acceptable paths:
+**Use the `just review-pr <N>` recipe** for the standard workflow. It:
+
+1. Runs `scripts/review/hooks-check.sh` against the PR diff and refuses to proceed if any tripwire fires (Cargo manifest, build.rs, agent/IDE hooks, CI workflows, shell scripts — full list in the script).
+2. Resolves the fork URL + head ref via `gh pr view`.
+3. Spins up two short-lived Docker containers from `scripts/review/Dockerfile.fetch` and `scripts/review/Dockerfile.run`:
+   - **Stage A (fetch)** — network ON, no compilation. `git clone --depth=50 --branch <ref> <fork>` into a volume, then `cargo fetch --locked`. No `build.rs` runs at this point.
+   - **Stage B (run)** — `--network=none`. `cargo nextest run --offline`. Untrusted code first executes here, with no network egress, no host bind mounts, no host credentials.
+4. Cleans up the source + git-deps volumes on exit. The crates.io registry cache and `target/` dir persist across reviews for speed (wipe with `just review-pr-clean`).
+
+`just hermetic-tests` runs the current worktree through the same network-off stage-B container — use this to catch tests that silently depend on network, a `tmux` binary on PATH, non-root file-mode semantics, etc.
+
+**If `just review-pr` is not an option** (rare — most fixes can be reasoned about statically), there are two acceptable manual paths:
 
 1. **Re-implement in a maintainer-authored branch.** Don't run the fork's commits — recreate the diff yourself, push to a branch on this repo, let CI run there. The fork's bytes never touch a trusted machine.
 2. **Clone and execute inside Docker.** The clone itself happens inside the container — the fork's bytes never land on the host filesystem.

@@ -1,0 +1,23 @@
+# Stage A: clone the PR fork + download crates from the registry.
+# Network IS required here (git clone, cargo fetch). Untrusted code has NOT
+# executed yet — `cargo fetch` only downloads sources, it does not run any
+# build.rs or proc-macros. Output: source tree at /src/repo and the crate
+# cache at /cargo-home, persisted via named volumes for stage B.
+FROM rust:slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CARGO_HOME=/cargo-home
+RUN mkdir -p /src /cargo-home
+
+WORKDIR /src
+
+# Args supplied at `docker run`:
+#   FORK_URL  – https URL of the contributor's fork
+#   HEAD_REF  – branch / ref name on that fork
+ENTRYPOINT ["/bin/bash", "-euxc"]
+CMD ["git clone --depth=50 --branch \"$HEAD_REF\" \"$FORK_URL\" /src/repo \
+      && cd /src/repo \
+      && cargo fetch --locked"]

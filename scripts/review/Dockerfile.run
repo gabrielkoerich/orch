@@ -1,0 +1,34 @@
+# Stage B: build and run tests with NO network. This is where untrusted code
+# (build.rs, proc-macros, test bodies) first executes — and it executes inside
+# a container that has no host bind mounts, no host credentials in env, and
+# `--network=none` so anything trying to dial out fails closed.
+#
+# Built-in tools (nextest, git) are installed at image build time from the
+# trusted base, never at run time. Image build runs once and is cached.
+FROM rust:slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         git ca-certificates curl \
+         pkg-config libssl-dev \
+         build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Prebuilt nextest binary — avoids `cargo install` (which would compile a
+# proc-macro toolchain into this image and slow rebuilds).
+RUN arch=$(dpkg --print-architecture) && \
+    case "$arch" in \
+        amd64) url=https://get.nexte.st/latest/linux ;; \
+        arm64) url=https://get.nexte.st/latest/linux-arm ;; \
+        *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL "$url" | tar -xz -C /usr/local/bin cargo-nextest
+
+ENV CARGO_HOME=/cargo-home
+WORKDIR /src/repo
+
+# At runtime the orchestrator passes one of:
+#   cargo nextest run --offline --no-fail-fast
+#   cargo nextest run --offline --no-fail-fast <FILTER>  # for hermetic-test detector
+ENTRYPOINT ["/bin/bash", "-euxc"]
+CMD ["cargo nextest run --offline --no-fail-fast"]
