@@ -408,9 +408,41 @@ impl AgentRunner for ClaudeRunner {
             let result_str = obj.get("result")?.as_str()?;
             Some(result_str.to_string())
         })();
-        let combined = match error_result {
-            Some(ref r) => format!("{r}\n{stdout}\n{stderr}"),
-            None => format!("{stdout}\n{stderr}"),
+
+        // Also check for system-level error events (e.g., session limit mid-stream).
+        // These appear as `type:system` NDJSON events with an error object, not as
+        // `type:result` lines with `is_error:true`. This catches errors like session
+        // limits, credential issues, and API errors that interrupt the agent mid-run.
+        //
+        // Example:
+        //   {"type":"system","subtype":"error","error":{"type":"session_limit","message":"..."}}
+        let system_error: Option<String> = (|| {
+            let trimmed = stdout.trim();
+            for line in trimmed.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(obj) = val.as_object() {
+                        if obj.get("type").and_then(|t| t.as_str()) == Some("system") {
+                            if let Some(error) = obj.get("error") {
+                                if let Some(msg) = error.get("message").and_then(|m| m.as_str()) {
+                                    return Some(msg.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        })();
+
+        let combined = match (&error_result, &system_error) {
+            (Some(r), Some(s)) => format!("{s}\n{r}\n{stdout}\n{stderr}"),
+            (Some(r), None) => format!("{r}\n{stdout}\n{stderr}"),
+            (None, Some(s)) => format!("{s}\n{stdout}\n{stderr}"),
+            (None, None) => format!("{stdout}\n{stderr}"),
         };
         super::patterns::classify_from_text(exit_code, &combined)
     }
@@ -916,6 +948,39 @@ mod tests {
     fn classify_error_rate_limit() {
         let err = runner().classify_error(1, "", "429 Too Many Requests");
         assert!(matches!(err, AgentError::RateLimit { .. }));
+    }
+
+    #[test]
+    fn classify_error_detects_session_limit_from_mid_stream_system_event() {
+        // Regression test for issue #3272: Claude session limit errors appear as
+        // `type:system` NDJSON events mid-stream, not as `type:result` lines with
+        // `is_error:true`. When significant work product exists before and after
+        // the system event, it is outside both head and tail scan windows in
+        // `classify_from_text`. The `classify_error` function must extract the
+        // error message from the system event and prepend it to the combined text.
+        let header_events = "{\"type\":\"conversation\",\"subtype\":\"init\"}\n\
+             {\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"I'll work on this task.\"}]}}\n"
+            .repeat(80);
+        let system_event = r#"{"type":"system","subtype":"error","error":{"type":"session_limit","message":"You've hit your session limit · resets 4:10am (America/Sao_Paulo)"}}"#;
+        let work_product = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Here is the implementation...\"}]}}\n"
+            .repeat(80);
+        let stdout = format!("{header_events}{system_event}\n{work_product}");
+        // Verify the system event is deep enough to miss head and tail scans.
+        assert!(
+            stdout.len() > 6000,
+            "test stdout must exceed combined head+tail windows, got {} bytes",
+            stdout.len()
+        );
+        let err = runner().classify_error(1, &stdout, "");
+        assert!(
+            matches!(err, AgentError::RateLimit { .. }),
+            "session limit system event mid-stream must be detected, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("session limit"),
+            "error message should contain the rate limit reason, got: {msg}"
+        );
     }
 
     #[test]
