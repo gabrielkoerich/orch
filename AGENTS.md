@@ -458,7 +458,34 @@ External-contributor PRs (forks, first-time contributors, anyone outside the tru
    - Network or filesystem access in tests (`reqwest`, `std::fs::write`, `std::process::Command`, `env::var` reads of credentials)
    - Paths referencing `~/.orch`, `~/.ssh`, `~/.config`, `gh auth token`, `GH_TOKEN`, `GITHUB_TOKEN`, `ANTHROPIC_API_KEY`
 
-**If functional verification is genuinely required** (rare — most fixes can be reasoned about statically): re-implement the change locally in a maintainer-authored branch (not the fork's commits) and verify there. The fork's bytes never run on a trusted machine.
+**If functional verification is genuinely required** (rare — most fixes can be reasoned about statically), there are two acceptable paths:
+
+1. **Re-implement in a maintainer-authored branch.** Don't run the fork's commits — recreate the diff yourself, push to a branch on this repo, let CI run there. The fork's bytes never touch a trusted machine.
+2. **Clone and execute inside Docker.** The clone itself happens inside the container — the fork's bytes never land on the host filesystem.
+   - Start a fresh container from a clean base image (e.g. `rust:slim`).
+   - **No bind mounts of host paths.** No `-v ~:/host`, no `-v $(pwd):/work`, no `-v ~/.ssh:...`, no `-v ~/.orch:...`. The container is empty when it starts.
+   - **No host credentials.** No `-e GH_TOKEN`, no `-e GITHUB_TOKEN`, no `-e ANTHROPIC_API_KEY`, no `--env-file ~/.env`. If `gh pr diff` is needed inside, use a scoped throwaway token with read-only access to public repos, not the maintainer's real token.
+   - **Network gated.** `--network=none` if possible. If the build genuinely needs network (Cargo registry fetch), use a fresh network namespace, and never the host network.
+   - Clone the fork **inside** the container (`git clone <fork> /work && cd /work`), then `cargo build` / `cargo nextest run` there.
+   - When done, `docker rm -f` the container. It is disposable — never reuse.
+
+   Skeleton:
+   ```bash
+   docker run --rm -it \
+     --network=none \
+     --read-only --tmpfs /tmp --tmpfs /work \
+     rust:slim bash
+   # inside container:
+   apk add --no-cache git || apt-get update && apt-get install -y git
+   git clone https://github.com/<fork-owner>/<repo>.git /work && cd /work
+   git checkout <pr-branch>
+   cargo nextest run
+   ```
+   (Network must be re-enabled briefly for the `git clone` and Cargo fetch; the right pattern is to enable network for fetch, then drop it before `cargo build`. Or pre-vendor deps in a trusted base image and run the actual build offline.)
+   - A fresh ephemeral cloud VM / Codespace works the same way: clone inside, run inside, destroy after. Do not reuse for credentialed work.
+   - The container is the trust boundary. If the build/test exfiltrates from inside it, there is nothing to exfiltrate. If you find yourself thinking "I just need to mount `~/.orch` so the test can find the DB," you don't have a sandbox — you have a slower host shell.
+
+Sandboxing is **not** a substitute for static review — read every file in the diff first, regardless of where you intend to run it. The sandbox limits blast radius; static review is what actually catches the bad change.
 
 A clean `cargo nextest run` on an untrusted fork is **not** evidence the PR is safe — by the time tests finish, a malicious `build.rs` has already run. Static review is the safety boundary.
 
