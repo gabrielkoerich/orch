@@ -12,6 +12,7 @@ RUN apt-get update \
          git ca-certificates curl \
          pkg-config libssl-dev \
          build-essential \
+         tmux \
     && rm -rf /var/lib/apt/lists/*
 
 # Prebuilt nextest binary — avoids `cargo install` (which would compile a

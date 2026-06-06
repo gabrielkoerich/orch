@@ -74,11 +74,20 @@ TRIPWIRES=(
   '^yarn\.lock$'
 )
 
-files=$(gh pr diff "$pr_number" -R "$repo" --name-only)
+# Distinguish three outcomes:
+#   exit 0  – diff fetched, no tripwires fired
+#   exit 1  – diff fetched, tripwires fired (legitimately refuse)
+#   exit 2  – couldn't fetch diff (host network / gh auth / unknown PR) — caller
+#             should retry, not treat as a refusal
+if ! files=$(gh pr diff "$pr_number" -R "$repo" --name-only 2>/tmp/hooks-check-gh.err); then
+  echo "hooks-check: gh pr diff failed (host network or gh auth)" >&2
+  cat /tmp/hooks-check-gh.err >&2 || true
+  exit 2
+fi
 
 if [[ -z "$files" ]]; then
-  echo "PR #$pr_number: empty diff?" >&2
-  exit 1
+  echo "PR #$pr_number: empty diff" >&2
+  exit 2
 fi
 
 hits=()

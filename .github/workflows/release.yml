@@ -2,13 +2,14 @@ name: CI
 
 on:
   push:
+  pull_request:
   workflow_dispatch: {}
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:

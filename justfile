@@ -49,12 +49,24 @@ review-pr pr repo=default_repo: review-images
     repo="{{repo}}"
 
     echo ">>> [1/4] Static-review pre-flight (hooks check)"
-    if ! bash scripts/review/hooks-check.sh "$pr" "$repo"; then
-      echo
-      echo "Refusing to proceed. Read every flagged file in 'gh pr diff $pr -R $repo'."
-      echo "Re-run with: just review-pr-force $pr $repo  (acknowledges the risk)"
-      exit 1
-    fi
+    set +e
+    bash scripts/review/hooks-check.sh "$pr" "$repo"
+    rc=$?
+    set -e
+    case $rc in
+      0) ;;  # clean, proceed
+      1)
+        echo
+        echo "Refusing to proceed. Read every flagged file in 'gh pr diff $pr -R $repo'."
+        echo "Re-run with: just review-pr-force $pr $repo  (acknowledges the risk)"
+        exit 1
+        ;;
+      *)
+        echo
+        echo "Could not fetch PR diff (host network or gh auth issue). Retry shortly."
+        exit 2
+        ;;
+    esac
 
     echo ">>> [2/4] Resolving fork URL and head ref for PR #$pr"
     fork_owner=$(gh pr view "$pr" -R "$repo" --json headRepositoryOwner --jq '.headRepositoryOwner.login')
@@ -142,6 +154,17 @@ review-pr-clean:
     docker volume rm -f orch-review-src orch-review-git orch-review-registry orch-review-target
     @echo "Review caches removed."
 
+# Dispatch a workflow on this repo against a fork PR's head ref via
+# `gh workflow run`. Requires the target workflow to declare
+# `workflow_dispatch:` — otherwise GitHub rejects the call.
+#
+#   just review-pr-ci 3279                       # dispatches release.yml
+#   just review-pr-ci 3279 integration-tests.yml # dispatches a specific one
+#
+# Static review still has to happen first — this just hands you the button.
+review-pr-ci pr workflow="release.yml" repo=default_repo:
+    gh workflow run {{workflow}} -R {{repo}} --ref refs/pull/{{pr}}/head
+
 # Hermetic-test detector. Runs the FULL test suite of the current branch
 # (NOT a PR — for catching drift on our own tree) inside the same
 # --network=none stage-B container. Any test that fails here is a test that
@@ -168,9 +191,12 @@ hermetic-tests: review-images
           -euxc 'mkdir -p /src/repo && tar -xf - -C /src/repo && cd /src/repo && cargo fetch --locked'
 
     # Stage B — run tests offline. Failures here = non-hermetic tests.
+    # CARGO_BUILD_JOBS=2 fits Docker Desktop's default memory ceiling; without it
+    # the linker is parallelized into SIGKILL.
     docker run --rm \
         --network=none \
         -v orch-hermetic-src:/src \
         -v orch-hermetic-cargo:/cargo-home \
+        -e CARGO_BUILD_JOBS=2 \
         orch-review-run \
         'cargo nextest run --offline --no-fail-fast'
