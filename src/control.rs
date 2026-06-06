@@ -52,6 +52,11 @@ const SYSTEM_TEMPLATE: &str = include_str!("../prompts/control_system.md");
 /// Timeout for agent invocations (2 minutes).
 const AGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Maximum bytes for a single control-session turn payload.
+/// When the combined state + user message exceeds this limit, the payload is split
+/// across multiple sequential turns so the user's question is never truncated.
+const MAX_CONTROL_MESSAGE_BYTES: usize = 32 * 1024;
+
 /// Parsed model specification from `/model` command.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelSpec {
@@ -729,67 +734,122 @@ pub async fn send_message(
     // Get or create a session UUID for conversation continuity
     let (session_uuid, is_new) = get_or_create_session_uuid(store, session_id).await?;
 
-    // Invoke agent one-shot with --session-id (new) or --resume (existing) for conversation continuity
-    let result = match invoke_agent_with_session(
-        &agent,
-        &model,
-        &ctx.system,
-        &full_message,
-        Some(&session_uuid),
-        !is_new,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            // If the session UUID has expired server-side, reset it and retry
-            // with a fresh session. This handles the "No conversation found with
-            // session ID: <uuid>" error that Claude returns when a session expires.
-            // The AgentError is converted to a string by anyhow::bail! in direct.rs,
-            // so we match on the Display representation of StaleSession.
-            let err_str = e.to_string();
-            let is_stale = err_str.contains("stale session");
-            // A timeout (exit code 124 from the `timeout` CLI tool) also means
-            // the session can no longer be resumed — reset and start fresh rather
-            // than surfacing "Control session error: timeout after 1800s" to the user.
-            let is_timeout =
-                err_str.contains("timeout after") || err_str.contains("timed out after");
-            if is_stale || is_timeout {
-                if is_stale {
-                    tracing::info!(
-                        session_id,
-                        "chat session UUID expired; resetting and retrying with fresh session"
-                    );
-                } else {
-                    tracing::info!(
-                        session_id,
-                        "chat session timed out; resetting and retrying with fresh session"
-                    );
-                }
-                reset_session_uuid(store, session_id).await?;
-                // Fresh invocation — no resume, generates a new UUID
-                let (fresh_uuid, _) = get_or_create_session_uuid(store, session_id).await?;
-                let fresh_result = invoke_agent_with_session(
-                    &agent,
-                    &model,
-                    &ctx.system,
-                    &full_message,
-                    Some(&fresh_uuid),
-                    false, // not resuming — new session
-                )
-                .await?;
-                if is_timeout {
-                    InvokeResult {
-                        text: format!("_(New session started.)_\n\n{}", fresh_result.text),
-                        ..fresh_result
+    // When the combined payload exceeds the per-turn limit, split it across multiple
+    // sequential turns so the user's question (trailing content) is never truncated.
+    // For session-supporting agents (claude, kimi, minimax), use --resume for continuity.
+    // For other agents (codex, opencode), send chunks as independent invocations.
+    let agent_has_sessions = matches!(agent.as_str(), "claude" | "kimi" | "minimax");
+    let chunks: Vec<String> = if full_message.len() > MAX_CONTROL_MESSAGE_BYTES {
+        tracing::info!(
+            bytes = full_message.len(),
+            limit = MAX_CONTROL_MESSAGE_BYTES,
+            agent = %agent,
+            agent_has_sessions,
+            "control session payload exceeds limit; splitting across multiple turns"
+        );
+        build_control_chunks(&ctx.state, message, agent_has_sessions)
+    } else {
+        vec![full_message]
+    };
+
+    let num_chunks = chunks.len();
+
+    // Deliver chunks. For session-supporting agents, use --resume for continuity.
+    // For other agents, each chunk is an independent invocation.
+    let result = if agent_has_sessions {
+        // Session-based delivery (claude, kimi, minimax)
+        let (active_uuid, first_result): (String, InvokeResult) = {
+            let r = invoke_agent_with_session(
+                &agent,
+                &model,
+                &ctx.system,
+                &chunks[0],
+                Some(&session_uuid),
+                !is_new,
+            )
+            .await;
+            match r {
+                Ok(result) => (session_uuid.clone(), result),
+                Err(e) => {
+                    let err_str = e.to_string();
+                    let is_stale = err_str.contains("stale session");
+                    let is_timeout =
+                        err_str.contains("timeout after") || err_str.contains("timed out after");
+                    if is_stale || is_timeout {
+                        if is_stale {
+                            tracing::info!(
+                                session_id,
+                                "chat session UUID expired; resetting and retrying with fresh session"
+                            );
+                        } else {
+                            tracing::info!(
+                                session_id,
+                                "chat session timed out; resetting and retrying with fresh session"
+                            );
+                        }
+                        reset_session_uuid(store, session_id).await?;
+                        let (fresh_uuid, _) = get_or_create_session_uuid(store, session_id).await?;
+                        let fresh_result = invoke_agent_with_session(
+                            &agent,
+                            &model,
+                            &ctx.system,
+                            &chunks[0],
+                            Some(&fresh_uuid),
+                            false,
+                        )
+                        .await?;
+                        let result = if is_timeout {
+                            InvokeResult {
+                                text: format!("_(New session started.)_\n\n{}", fresh_result.text),
+                                ..fresh_result
+                            }
+                        } else {
+                            fresh_result
+                        };
+                        (fresh_uuid, result)
+                    } else {
+                        return Err(e);
                     }
-                } else {
-                    fresh_result
                 }
-            } else {
-                return Err(e);
+            }
+        };
+
+        if num_chunks == 1 {
+            first_result
+        } else {
+            let _ = first_result; // intermediate turn — discard
+            let mut last: Option<InvokeResult> = None;
+            for chunk in &chunks[1..] {
+                last = Some(
+                    invoke_agent_with_session(
+                        &agent,
+                        &model,
+                        &ctx.system,
+                        chunk,
+                        Some(&active_uuid),
+                        true,
+                    )
+                    .await?,
+                );
+            }
+            last.expect("chunks[1..] is non-empty when num_chunks >= 2")
+        }
+    } else {
+        // Non-session delivery (codex, opencode) — each chunk is independent
+        let mut last: Option<InvokeResult> = None;
+        for (i, chunk) in chunks.iter().enumerate() {
+            last = Some(invoke_agent(&agent, &model, &ctx.system, chunk).await?);
+            // For intermediate chunks, we could log progress but don't store responses
+            if i < num_chunks - 1 {
+                tracing::debug!(
+                    session_id,
+                    chunk = i + 1,
+                    total = num_chunks,
+                    "delivered intermediate chunk for non-session agent"
+                );
             }
         }
+        last.expect("chunks is non-empty")
     };
 
     // Parse response for summary and memory tags
@@ -856,6 +916,90 @@ pub async fn send_message(
     }
 
     Ok(parsed.clean_text)
+}
+
+/// Split `text` into chunks of at most `max_bytes` bytes each.
+/// Prefers splitting at newline boundaries to preserve readability.
+fn chunk_text(text: &str, max_bytes: usize) -> Vec<String> {
+    if text.len() <= max_bytes {
+        return vec![text.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let total = text.len();
+
+    while start < total {
+        let mut end = (start + max_bytes).min(total);
+        // Respect UTF-8 char boundaries
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            // Single char exceeds limit — advance past it
+            if let Some(ch) = text[start..].chars().next() {
+                end = start + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        // Prefer splitting at a newline within the chunk
+        if end < total {
+            if let Some(nl_offset) = text[start..end].rfind('\n') {
+                end = start + nl_offset + 1;
+            }
+        }
+        chunks.push(text[start..end].to_string());
+        start = end;
+    }
+    chunks
+}
+
+/// Build control session message chunks for agents with or without session support.
+///
+/// For session-supporting agents (claude, kimi, minimax), chunks are raw text pieces
+/// that will be sent sequentially with `--resume` for conversation continuity.
+///
+/// For non-session agents (codex, opencode), each chunk is prefixed with a header
+/// indicating its position in the sequence, since each invocation is independent.
+fn build_control_chunks(state: &str, message: &str, agent_has_sessions: bool) -> Vec<String> {
+    let header_reserve = if agent_has_sessions { 0 } else { 200 };
+    let effective_limit = MAX_CONTROL_MESSAGE_BYTES.saturating_sub(header_reserve);
+    let mut parts = Vec::new();
+
+    // Split state into chunks
+    let state_chunks = chunk_text(state, effective_limit);
+    for (i, chunk) in state_chunks.iter().enumerate() {
+        let prefixed = if agent_has_sessions {
+            chunk.clone()
+        } else {
+            format!(
+                "[Context chunk {}/{}]\n{}",
+                i + 1,
+                state_chunks.len(),
+                chunk
+            )
+        };
+        parts.push(prefixed);
+    }
+
+    // Split user message if needed, then add as final chunk(s)
+    let msg_chunks = chunk_text(message, effective_limit);
+    for (i, chunk) in msg_chunks.iter().enumerate() {
+        let prefixed = if agent_has_sessions {
+            chunk.clone()
+        } else if msg_chunks.len() == 1 {
+            format!("[Context complete. User question:]\n{}", chunk)
+        } else {
+            format!(
+                "[User question chunk {}/{}]\n{}",
+                i + 1,
+                msg_chunks.len(),
+                chunk
+            )
+        };
+        parts.push(prefixed);
+    }
+    parts
 }
 
 #[cfg(test)]
@@ -1300,6 +1444,144 @@ mod tests {
                 !is_timeout,
                 "pattern must not be detected as timeout: {msg:?}"
             );
+        }
+    }
+
+    // ── chunk_text ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn chunk_text_under_limit_returns_single_chunk() {
+        let text = "hello world";
+        let chunks = chunk_text(text, 100);
+        assert_eq!(chunks, vec!["hello world".to_string()]);
+    }
+
+    #[test]
+    fn chunk_text_exact_limit_returns_single_chunk() {
+        let text = "abcde";
+        let chunks = chunk_text(text, 5);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], "abcde");
+    }
+
+    #[test]
+    fn chunk_text_splits_and_reassembles() {
+        let text = "line1\nline2\nline3\nline4\nline5";
+        let chunks = chunk_text(text, 12);
+        let reassembled: String = chunks.join("");
+        assert_eq!(reassembled, text);
+    }
+
+    #[test]
+    fn chunk_text_respects_utf8_boundaries() {
+        // 4-byte emoji placed at the split boundary
+        let content = "x".repeat(97) + "😀"; // 101 bytes; limit=100 cuts inside emoji
+        let chunks = chunk_text(&content, 100);
+        let reassembled: String = chunks.join("");
+        assert_eq!(reassembled, content);
+        for c in &chunks {
+            assert!(
+                std::str::from_utf8(c.as_bytes()).is_ok(),
+                "chunk is not valid UTF-8"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_text_prefers_newline_boundary() {
+        // "aaaa\nbbbb" with limit=6 — should split after the '\n', not mid-word
+        let text = "aaaa\nbbbb";
+        let chunks = chunk_text(text, 6);
+        // First chunk should end with '\n' (split at newline, not byte 6 into "aaaa\nb")
+        assert!(
+            chunks[0].ends_with('\n'),
+            "expected split at newline, got: {:?}",
+            chunks[0]
+        );
+        let reassembled: String = chunks.join("");
+        assert_eq!(reassembled, text);
+    }
+
+    #[test]
+    fn chunk_text_empty_string() {
+        let chunks = chunk_text("", 32);
+        assert!(chunks.is_empty() || chunks == vec!["".to_string()]);
+    }
+
+    // ── build_control_chunks ────────────────────────────────────────────────
+
+    #[test]
+    fn build_control_chunks_session_agent_splits_state_and_message() {
+        // build_control_chunks always splits state and message into separate chunks
+        // (it's only called when full_message exceeds the limit)
+        let state = "state content";
+        let message = "user question";
+        let chunks = build_control_chunks(state, message, true);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], "state content");
+        assert_eq!(chunks[1], "user question");
+    }
+
+    #[test]
+    fn build_control_chunks_session_agent_long_state_splits() {
+        // Long state gets split into multiple chunks
+        let state = "line\n".repeat(10000); // ~60KB
+        let message = "question";
+        let chunks = build_control_chunks(state, message, true);
+        // Should have multiple state chunks + 1 message chunk
+        assert!(chunks.len() >= 3);
+        // All but last are state chunks
+        for chunk in &chunks[..chunks.len()-1] {
+            assert!(chunk.contains("line"));
+        }
+        // Last is message
+        assert_eq!(chunks.last().unwrap(), "question");
+    }
+
+    #[test]
+    fn build_control_chunks_non_session_agent_adds_headers() {
+        let state = "state content";
+        let message = "user question";
+        let chunks = build_control_chunks(state, message, false);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].starts_with("[Context chunk 1/1]"));
+        assert!(chunks[0].contains("state content"));
+        assert!(chunks[1].starts_with("[Context complete. User question:]"));
+        assert!(chunks[1].contains("user question"));
+    }
+
+    #[test]
+    fn build_control_chunks_non_session_agent_splits_long_message() {
+        let state = "state";
+        let message = "x".repeat(50000); // Exceeds 32KB limit
+        let chunks = build_control_chunks(state, &message, false);
+        // Should have 1 state chunk + multiple message chunks
+        assert!(chunks.len() >= 2);
+        assert!(chunks[0].starts_with("[Context chunk 1/1]"));
+        // Message chunks should have question headers
+        for chunk in &chunks[1..] {
+            assert!(chunk.starts_with("[User question chunk"));
+        }
+        // Verify reassembly (without headers)
+        let reassembled_state = chunks[0].split_once('\n').map(|(_, r)| r).unwrap_or("");
+        assert_eq!(reassembled_state, "state");
+    }
+
+    #[test]
+    fn build_control_chunks_non_session_agent_long_state_splits() {
+        let state = "line\n".repeat(10000); // ~60KB
+        let message = "question";
+        let chunks = build_control_chunks(state, message, false);
+        // Multiple state chunks + 1 message chunk
+        assert!(chunks.len() >= 3);
+        for (i, chunk) in chunks.iter().enumerate() {
+            if i < chunks.len() - 1 {
+                assert!(chunk.starts_with(&format!("[Context chunk {}/", i + 1)));
+                assert!(chunk.contains("line"));
+            } else {
+                assert!(chunk.starts_with("[Context complete. User question:]"));
+                assert_eq!(chunk.split_once('\n').map(|(_, r)| r).unwrap_or(""), "question");
+            }
         }
     }
 }
