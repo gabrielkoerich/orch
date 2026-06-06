@@ -165,6 +165,8 @@ fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
         | "skip"
         | "ok"
         | "success"
+        | "noop"
+        | "green"
         | "no_changes_needed"
         | "no_trades_no_positions"
         | "changes_made"
@@ -178,11 +180,12 @@ fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
         | "changes_addressed"
         | "review_addressed"
         | "already_finalized_in_attempt_1"
-        | "alert" => "done".to_string(),
+        | "alert"
+        | "alerts_sent" => "done".to_string(),
         // Canonical progress statuses.
         // `partial` is used by some models to indicate partial progress —
         // treat it as in_progress so the task remains open for follow-up.
-        "in_progress" | "running" | "partial" => "in_progress".to_string(),
+        "in_progress" | "running" | "partial" | "waiting" => "in_progress".to_string(),
         "in_review" | "reviewing" => "in_review".to_string(),
         "needs_review" | "pending_review" | "ready_for_review" => "needs_review".to_string(),
         // Canonical error statuses.
@@ -987,6 +990,36 @@ Some output here.
         let input = r#"{"status":"already_finalized_in_attempt_1","summary":"work already done in attempt 1","accomplished":[],"remaining":[],"files":[]}"#;
         let resp = parse(input).unwrap();
         assert_eq!(resp.status, "done");
+    }
+
+    #[test]
+    fn parse_normalizes_noop_alias_to_done() {
+        // noop / green / alerts_sent → done, matching #3273 alias map.
+        let input = r#"{"status":"noop","summary":"nothing to do","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
+    fn parse_normalizes_green_alias_to_done() {
+        let input = r#"{"status":"green","summary":"all passing","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
+    fn parse_normalizes_alerts_sent_alias_to_done() {
+        let input = r#"{"status":"alerts_sent","summary":"notifications dispatched","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
+    fn parse_normalizes_waiting_alias_to_in_progress() {
+        // waiting → in_progress (distinct from running/partial in the alias map).
+        let input = r#"{"status":"waiting","summary":"blocked on upstream","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "in_progress");
     }
 
     #[test]

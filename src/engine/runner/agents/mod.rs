@@ -1065,6 +1065,24 @@ pub(crate) mod patterns {
     use super::AgentError;
     use std::time::Duration;
 
+    /// Returns true if the pattern found at `lower_pos` (byte offset in lowercase text)
+    /// is at a word boundary in the original `text` — i.e., surrounded by non-identifier
+    /// chars. Used to suppress false positives from identifiers like `record_rate_limit_returns_id`.
+    fn is_word_boundary(text: &str, lower_pos: usize, pattern: &str) -> bool {
+        let after_match = lower_pos + pattern.len();
+        let prev_is_boundary = lower_pos == 0
+            || !text[..lower_pos]
+                .chars()
+                .last()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        let next_is_boundary = after_match >= text.len()
+            || !text[after_match..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        prev_is_boundary && next_is_boundary
+    }
+
     /// Check for rate limit / usage limit patterns in text.
     pub fn detect_rate_limit(text: &str) -> Option<AgentError> {
         let lower = text.to_lowercase();
@@ -1111,6 +1129,20 @@ pub(crate) mod patterns {
                     .next()
                     .is_some_and(|c| c.is_ascii_digit())
             }));
+
+        // Guard: skip "rate_limit"/"ratelimit" unless at a word boundary — prevents
+        // false positives from test identifiers like `record_rate_limit_returns_id`.
+        // Other patterns (natural-language phrases) are low risk.
+        if let Some(lower_pos) = match_pos {
+            for pat in ["rate_limit", "ratelimit"] {
+                if let Some(pat_pos) = lower.find(pat) {
+                    if pat_pos == lower_pos && !is_word_boundary(text, lower_pos, pat) {
+                        return None;
+                    }
+                }
+            }
+        }
+
         if match_pos.is_some() || has_429 || has_529 {
             let message = if let Some(pos) = match_pos {
                 extract_context_around(text, pos, 300)
