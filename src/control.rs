@@ -850,8 +850,10 @@ pub async fn send_message(
 
                 // Persist this chunk's assistant response (even intermediate ones)
                 let parsed = parse_response(&chunk_result.text);
-                let total_tokens =
-                    total_tokens_u64_to_i64_saturating(chunk_result.input_tokens, chunk_result.output_tokens);
+                let total_tokens = total_tokens_u64_to_i64_saturating(
+                    chunk_result.input_tokens,
+                    chunk_result.output_tokens,
+                );
                 let input_tokens = opt_token_u64_to_i64_saturating(chunk_result.input_tokens);
                 let output_tokens = opt_token_u64_to_i64_saturating(chunk_result.output_tokens);
                 let cost_usd = match (chunk_result.input_tokens, chunk_result.output_tokens) {
@@ -889,7 +891,7 @@ pub async fn send_message(
             // Return final clean_text directly — all chunks already persisted inline
             let final_parsed = parse_response(&last_result.expect("at least one chunk").text);
             final_parsed.clean_text
-        },
+        }
         DeliveryMode::ChunkedNonSession => {
             // Non-session agents (codex, opencode) — each chunk is independent invocation
             // No --resume, but each chunk's response is persisted to keep transcript complete.
@@ -900,8 +902,10 @@ pub async fn send_message(
 
                 // Persist this chunk's assistant response
                 let parsed = parse_response(&chunk_result.text);
-                let total_tokens =
-                    total_tokens_u64_to_i64_saturating(chunk_result.input_tokens, chunk_result.output_tokens);
+                let total_tokens = total_tokens_u64_to_i64_saturating(
+                    chunk_result.input_tokens,
+                    chunk_result.output_tokens,
+                );
                 let input_tokens = opt_token_u64_to_i64_saturating(chunk_result.input_tokens);
                 let output_tokens = opt_token_u64_to_i64_saturating(chunk_result.output_tokens);
                 let cost_usd = match (chunk_result.input_tokens, chunk_result.output_tokens) {
@@ -937,7 +941,7 @@ pub async fn send_message(
             }
 
             last_text
-        },
+        }
         DeliveryMode::Single => {
             // Single message delivery (under-limit messages) — use common persistence below
             let result = invoke_agent(&agent, &model, &ctx.system, &chunks[0]).await?;
