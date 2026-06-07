@@ -943,21 +943,66 @@ pub async fn send_message(
             last_text
         }
         DeliveryMode::Single => {
-            // Single message delivery (under-limit messages) — use common persistence below
-            let result = invoke_agent(&agent, &model, &ctx.system, &chunks[0]).await?;
+            // Single message delivery (under-limit messages) — use invoke_agent_with_session
+            // for conversation continuity with --session-id / --resume
+            let mut active_uuid = session_uuid.clone();
+            let mut is_first_chunk = !is_new;
+            let chunk_result = loop {
+                let r = invoke_agent_with_session(
+                    &agent,
+                    &model,
+                    &ctx.system,
+                    &chunks[0],
+                    Some(&active_uuid),
+                    is_first_chunk,
+                )
+                .await;
+                match r {
+                    Ok(result) => break result,
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        let is_stale = err_str.contains("stale session");
+                        let is_timeout = err_str.contains("timeout after")
+                            || err_str.contains("timed out after");
+                        if is_stale || is_timeout {
+                            if is_stale {
+                                tracing::info!(
+                                    session_id,
+                                    "chat session UUID expired; resetting and retrying with fresh session"
+                                );
+                            } else {
+                                tracing::info!(
+                                    session_id,
+                                    "chat session timed out; resetting and retrying with fresh session"
+                                );
+                            }
+                            reset_session_uuid(store, session_id).await?;
+                            let (fresh_uuid, _) =
+                                get_or_create_session_uuid(store, session_id).await?;
+                            active_uuid = fresh_uuid;
+                            is_first_chunk = false;
+                            continue;
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
+            };
 
             // Parse response for summary and memory tags
-            let parsed = parse_response(&result.text);
+            let parsed = parse_response(&chunk_result.text);
 
             // Store assistant message with token usage.
             // Must happen before persist_memories so that if the DB write fails the
             // KV store is not left with orphaned memory keys that have no corresponding
             // conversation history entry.
-            let total_tokens =
-                total_tokens_u64_to_i64_saturating(result.input_tokens, result.output_tokens);
-            let input_tokens = opt_token_u64_to_i64_saturating(result.input_tokens);
-            let output_tokens = opt_token_u64_to_i64_saturating(result.output_tokens);
-            let cost_usd = match (result.input_tokens, result.output_tokens) {
+            let total_tokens = total_tokens_u64_to_i64_saturating(
+                chunk_result.input_tokens,
+                chunk_result.output_tokens,
+            );
+            let input_tokens = opt_token_u64_to_i64_saturating(chunk_result.input_tokens);
+            let output_tokens = opt_token_u64_to_i64_saturating(chunk_result.output_tokens);
+            let cost_usd = match (chunk_result.input_tokens, chunk_result.output_tokens) {
                 (Some(input), Some(output)) => {
                     let pricing = crate::store::pricing_for_model(&model);
                     let usage = crate::store::TokenUsage {
