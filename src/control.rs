@@ -787,7 +787,7 @@ pub async fn send_message(
             let mut is_first_chunk = !is_new;
             let mut last_result: Option<InvokeResult> = None;
 
-            for (_i, chunk) in chunks.iter().enumerate() {
+            for chunk in chunks.iter() {
                 let r = invoke_agent_with_session(
                     &agent,
                     &model,
