@@ -88,15 +88,91 @@ description = "End-of-day operational review: commits, issues, task health, and 
 - **GitHub GraphQL** operations appear healthy (no EOF errors observed today).
 - **SQLite query latency** minimal across all operations (<1ms for rate limit queries).
 
+## Evening Update
+
+### What Shipped (Afternoon)
+
+6 additional commits landed since the morning review, plus **orch upgraded to v0.80.2**:
+
+| Commit | Description |
+|--------|-------------|
+| `1834788a` | fix(parser): normalize_status aliases + detect_rate_limit word-boundary guard (#3279) |
+| `4cb7b176` | ci+review: trigger CI on pull_request, fix sandbox image, add review-pr-ci recipe |
+| `6a748d09` | chore(review): sandboxed external-PR review workflow |
+| `5f9f459d` | docs(agents): require clone+execute inside Docker for external PRs |
+| `831a2289` | docs(agents): policy for reviewing external-contributor PRs |
+| `b5afd534` | bug(runner): claude 'session limit' still classified as failed → #3278 |
+
+**Issues closed this afternoon:** #3272 (claude session limit misclassification), #3273 (normalize_status missing aliases).
+
+**PRs merged:** #3278 (maintainer fix for claude session limit), #3279 (contributor @Jah-yee parser fixes — merged after review split).
+
+### External PR Review Security Workflow
+
+A full secure review workflow was added for external-contributor PRs:
+- `CLAUDE.md`: hard policy — no fork clones, no code execution outside Docker, new deps = immediate no-merge
+- `scripts/review/Dockerfile.fetch` + `Dockerfile.run` — two-stage sandboxed execution (network-gated fetch → offline run)
+- `just review-pr <N>` recipe — automated hooks-check + Docker spin-up + cleanup
+- `scripts/review/hooks-check.sh` — tripwire for `.cargo/config.toml`, `build.rs`, CI workflows, shell scripts
+- CI now triggers on `pull_request` for test validation (but not `pull_request_target` — fork secrets remain safe)
+
+### Operational Issues Filed (Evening)
+
+| Issue | Title | Severity |
+|-------|-------|----------|
+| [#3283](https://github.com/gabrielkoerich/orch/issues/3283) | bug(runner): claude "weekly limit" misclassified as failed — reset timestamp not parsed | high |
+
+**#3283 root cause:** `detect_rate_limit()` in `src/engine/runner/agents/mod.rs` lacks `"weekly limit"` in its pattern list. Claude messages like `"You've hit your weekly limit · resets Jun 9 at 1am (America/Sao_Paulo)"` fall through to a generic `Failed` classification — no cooldown is set, the 3-day reset timestamp is discarded, and orch retries immediately instead of waiting. Fix: add `"weekly limit"` alongside the existing `"session limit"` entry (same `parse_retry_at` logic applies). Tasks affected: 152324, 152327, 152331.
+
+### Current Cooldown State (Evening)
+
+| Key | Remaining | Reason |
+|-----|-----------|--------|
+| `codex:gpt-5.3` | 17h | persisted |
+| `kimi` | 22h13m | persisted (billing) |
+| `minimax` | 1d21h | persisted |
+| `minimax:opus` | 1d21h | persisted |
+| `opencode/deepseek-v4-flash-free` | 1d3h | persisted |
+| `opencode/mimo-v2.5-free` | 4h26m | persisted |
+| `opencode/minimax-m3-free` | 4h58m | persisted |
+| `opencode/nemotron-3-ultra-free` | 8h11m | persisted |
+
+**ALL opencode models are cooled at time of this review** — all agents in the routing pool hit cooldowns simultaneously. Effective pool for next ~4h: claude sonnet/opus + codex (gpt-5.4/gpt-5.5 only).
+
+### Remaining Stuck Tasks
+
+| Task | Status | Age | Issue |
+|------|--------|-----|-------|
+| #3281 | blocked | 4h, 5 attempts | control: split oversized messages — opencode failing on all attempts |
+| #3274 | blocked | 1d, 3 attempts | opencode false-positive rate_limit (#3279 partially addressed word-boundary fix) |
+| internal:151442 | blocked | 4d | Self-improvement — children done but auto-unblock still stale |
+
+### Task Run Summary (Full Day)
+
+| Agent | Model | Success | Failed | Other |
+|-------|-------|---------|--------|-------|
+| claude | sonnet | 74 | 4 | — |
+| opencode | nemotron-3-ultra-free | 43 | 4 | 1 parse_error, 1 timeout |
+| codex | gpt-5.5 | 25 | 2 | 1 blocked |
+| codex | gpt-5.4 | 18 | — | 1 rate_limit |
+| claude | opus | 17 | 5 | 3 blocked |
+| opencode | deepseek-v4-flash-free | 10 | 3 | — |
+| opencode | mimo-v2.5-free | 10 | 3 | 2 aborted, 2 timeout |
+| opencode | minimax-m3-free | 8 | 2 | 3 timeout |
+| minimax | opus | 0 | 6 | — (all failed) |
+| codex | gpt-5.3 | 0 | 4 | — (model restricted) |
+
+**Activity totals (24h):** 315 dispatches · 222 pushes · 103 review starts · 89 review decisions · 86 PR creates · 40 errors · 9 timeouts · 3 auto-unblocks.
+
 ## Tomorrow's Priorities
 
-1. **Unblock #3272-#3274** — remove `agent:kimi` labels or apply fix from #3275/#3276 manually. kimi won't be back for 1d21h.
-2. **Review and merge #3275 or #3276** — contributor PR has been waiting ~24h. Either merge after splitting, or take over the fix.
-3. **Investigate #3272 (session limit)** — opencode can handle this fix once kimi is unblocked as the agent.
-4. **Shrink model config** — kimi and minimax are both on multi-day cooldowns. Simplify the pool to claude + opencode + codex only.
-5. **Monitor cooldown clears** — codex (39m) will clear soon, restoring some capacity.
-6. **Fix router LLM pool skipping** — the router wasted 45s on minimax/haiku (cooled). Consider adding cooldown filtering to the LLM pool index.
+1. **Fix #3283 (claude weekly limit misclassification)** — add `"weekly limit"` to `detect_rate_limit()` patterns alongside `"session limit"`. The `parse_retry_at` logic already handles the reset timestamp format; the fix is a one-line addition + regression test. Without it, 3-day cooldowns are discarded and orch retries immediately on weekly limit exhaustion.
+2. **Fix #3274 (opencode rate_limit false-positive)** — the word-boundary guard in #3279 may not be sufficient; the root cause is nextest output containing test function names with `rate_limit`. Needs a smarter check (e.g., JSON output gate or test-output exclusion pattern).
+3. **Fix #3281 (control oversized messages)** — 5 attempts, still blocked. Assign to claude when opencode remains cooled. Message chunking is a straightforward string-split task.
+4. **Unblock internal:151442** — 4-day-old self-improvement task, children done, auto-unblock stale. Check `orch task unblock all`.
+5. **Monitor kimi/minimax cooldown recovery** — kimi clears in ~22h, minimax in ~1d21h. When they recover, re-route any remaining backlog.
+6. **Verify #3279 parser fix** — `detect_rate_limit` now uses word-boundary guard. Watch for any residual false-positives on `rate_limit` in test output over the next cycle.
 
 ---
 
-*Prepared by Orch automation (internal:152037, attempt 4)*
+*Morning section prepared by internal:152037 (attempt 4). Evening update by internal:152385 (attempt 3).*
