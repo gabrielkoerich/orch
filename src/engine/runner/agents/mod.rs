@@ -1094,6 +1094,7 @@ pub(crate) mod patterns {
             "too many requests",
             "usage limit",
             "session limit", // catches "You've hit your session limit · resets …"
+            "weekly limit",  // catches "You've hit your weekly limit · resets …"
             "quota exceeded",
             "overloaded",
             "capacity",
@@ -1828,6 +1829,31 @@ mod tests {
              To ensure system stability, please adjust your client logic to scale requests more smoothly over time."
         ).is_some());
         assert!(patterns::detect_rate_limit("all good").is_none());
+    }
+
+    #[test]
+    fn classify_from_text_detects_weekly_limit_as_rate_limit() {
+        // Regression test for issue #3283: Claude "weekly limit" errors were
+        // classified as `failed` instead of `rate_limit` because "weekly limit"
+        // was not in the detect_rate_limit pattern list.
+        let system_event = r#"{"type":"system","subtype":"error","error":{"type":"weekly_limit","message":"You've hit your weekly limit · resets Jun 9 at 1am (America/Sao_Paulo)"}}"#;
+        let work_product = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Working on the task...\"}]}}\n"
+            .repeat(200);
+        let text = format!("{system_event}\n{work_product}");
+        assert!(
+            text.len() > 3000,
+            "test output must exceed tail window to be meaningful"
+        );
+        let err = patterns::classify_from_text(1, &text);
+        assert!(
+            matches!(err, AgentError::RateLimit { .. }),
+            "weekly limit as early system event must be detected via head scan, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("weekly limit"),
+            "error message should reference weekly limit, got: {msg}"
+        );
     }
 
     #[test]
