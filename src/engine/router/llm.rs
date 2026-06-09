@@ -828,7 +828,12 @@ impl LlmRouter {
     ) -> anyhow::Result<String> {
         use crate::engine::runner::direct::{run_direct_command_raw, DirectCommandError};
 
-        // Skip immediately if this specific agent+model is on cooldown
+        // Skip immediately if the agent itself is on cooldown (agent-level)
+        if crate::engine::cooldown::is_agent_in_cooldown(agent) {
+            anyhow::bail!("router LLM {agent} (agent) is on cooldown");
+        }
+
+        // Skip immediately if this specific agent+model is on cooldown (model-level)
         let model_str = model.unwrap_or("");
         if crate::engine::runner::response::is_model_in_cooldown(agent, model_str) {
             anyhow::bail!("router LLM {agent}:{model_str} is on cooldown");
