@@ -341,7 +341,11 @@ impl RetryableError {
 }
 
 /// Handle failover for any retryable error type.
-/// Returns the resulting status string: "routed" if rerouted, "needs_review" otherwise.
+/// Returns the resulting status string:
+/// - "new" if rerouted to a fallback agent, or if all agents exhausted with a retryable error
+///   (rate limit / auth / model unavailable) so the task waits for cooldowns to expire.
+/// - "blocked" if all agents exhausted with a hard (non-retryable) failure.
+/// - "needs_review" if no fallback agents are available (but not all configured agents exhausted).
 ///
 /// Note: DB recording of rate limit events is handled by the caller (mod.rs)
 /// which has async context. This function only handles store state + cooldowns.
@@ -372,22 +376,50 @@ pub async fn handle_failover(
     let is_exhausted = available.iter().all(|a| chain_set.contains(a.as_str()));
 
     if is_exhausted {
+        // Retryable failures (rate limits, quota, model unavailable) will resolve once
+        // cooldowns expire — reset to "new" so the router picks it up again then.
+        // Hard failures (generic agent crash, missing tooling) won't improve on retry;
+        // block immediately with a clear reason rather than wasting 63 minutes in the
+        // review-refire loop before getting a misleading "review agent rebroadcast" message.
+        let is_retryable = matches!(
+            error_type,
+            RetryableError::UsageLimit
+                | RetryableError::AuthError
+                | RetryableError::ModelUnavailable
+        );
+        let next_status = if is_retryable { "new" } else { "blocked" };
+
         tracing::warn!(
             task_id,
             agent = agent_name,
-            "all agents exhausted, marking needs_review"
+            error_type = ?error_type,
+            next_status,
+            "all agents exhausted"
         );
-        let msg = format!("{error_message} (all agents exhausted)");
-        if let Err(e) = store::store_set_result(
-            store,
-            repo,
-            task_id,
-            &[("last_error", serde_json::json!(msg))],
-        )
-        .await
-        {
-            tracing::warn!(task_id, err = %e, "failed to write agents_exhausted last_error to store");
+
+        let mut store_fields: Vec<(&str, serde_json::Value)> = Vec::new();
+
+        if is_retryable {
+            // Clear reroute chain so the next dispatch builds a fresh one rather than
+            // immediately seeing "all agents in chain" and exhausting again.
+            let msg = format!("{error_message} (all agents exhausted, will retry when available)");
+            store_fields.push(("last_error", serde_json::json!(msg)));
+            store_fields.push(("limit_reroute_chain", serde_json::json!("")));
+        } else {
+            let msg = format!("{error_message} (all agents exhausted)");
+            let block_reason = format!(
+                "all agents exhausted: {} — {}",
+                error_type.type_str(),
+                error_message
+            );
+            store_fields.push(("last_error", serde_json::json!(msg)));
+            store_fields.push(("block_reason", serde_json::json!(block_reason)));
         }
+
+        if let Err(e) = store::store_set_result(store, repo, task_id, &store_fields).await {
+            tracing::warn!(task_id, err = %e, "failed to write agents_exhausted fields to store");
+        }
+
         // If this was a timeout, ensure the agent is placed into cooldown
         // so the router's round-robin avoids it for a while.
         if matches!(error_type, RetryableError::Timeout) {
@@ -400,6 +432,7 @@ pub async fn handle_failover(
             "error_message": error_message,
             "chain": chain,
             "agents_exhausted": true,
+            "is_retryable": is_retryable,
         });
         crate::store::store_log_activity(
             store,
@@ -407,14 +440,14 @@ pub async fn handle_failover(
             task_id,
             "rerouted",
             Some("in_progress"),
-            Some("needs_review"),
+            Some(next_status),
             None::<&str>,
             None::<&str>,
             Some(&details),
         )
         .await;
 
-        return "needs_review".to_string();
+        return next_status.to_string();
     }
 
     // Pick a fallback agent

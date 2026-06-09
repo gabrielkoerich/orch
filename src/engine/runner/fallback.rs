@@ -646,8 +646,10 @@ pub async fn handle_error(
 
     let status =
         response::handle_failover(task_id, agent_name, retryable, &error_msg, store, repo).await;
-    if status == "needs_review" {
-        tracing::warn!(task_id, "failover exhausted, task marked needs_review");
+    match status.as_str() {
+        "new" => tracing::warn!(task_id, "failover exhausted (retryable), task reset to new"),
+        "blocked" => tracing::warn!(task_id, "failover exhausted (hard failure), task blocked"),
+        _ => {}
     }
 
     // Store failure memory for retry learning
