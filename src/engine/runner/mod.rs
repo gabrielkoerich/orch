@@ -237,6 +237,18 @@ fn parse_success_output(
     if let Some(agent_result) = agents::find_agent_result(agent_name, raw_stdout) {
         // Treat is_error as authoritative for the success path
         if agent_result.is_error {
+            // Classify the error from the agent's result text rather than
+            // blindly returning AgentFailed — this preserves rate-limit, auth,
+            // and other actionable error types for proper cooldown/reroute.
+            // Without this, e.g. a claude session-limit error with is_error=true
+            // would be downgraded to AgentFailed, losing the RateLimit signal
+            // that the fallback chain needs for UsageLimit recovery (issue #3292).
+            if let Some(e) = agents::patterns::detect_rate_limit(&agent_result.result_text) {
+                return Err(e);
+            }
+            if let Some(e) = agents::patterns::detect_auth_error(&agent_result.result_text) {
+                return Err(e);
+            }
             return Err(agents::AgentError::AgentFailed {
                 message: agent_result.result_text,
             });
@@ -387,10 +399,14 @@ pub fn parse_session_output(
         match parse_success_output(task_id, agent_name, agent_runner, &combined_output) {
             Ok(parsed) => return Ok(parsed),
             Err(err) => {
-                // If parse_success_output already returned AgentFailed (e.g. is_error=true
-                // in NDJSON envelope), propagate it directly — the session had an explicit
-                // error and we should not try to re-classify it or intercept it.
-                if matches!(err, agents::AgentError::AgentFailed { .. }) {
+                // If parse_success_output already returned a classified error
+                // (RateLimit, AgentFailed, Timeout, Auth, etc.), propagate it
+                // directly — only InvalidResponse (unparseable output) should
+                // be intercepted by the terminal_reason:completed / cost-telemetry
+                // guard below. Without this, e.g. a claude session-limit error
+                // with terminal_reason=completed would be downgraded from RateLimit
+                // to InvalidResponse → Failed, losing the correct cooldown/reroute.
+                if !matches!(err, agents::AgentError::InvalidResponse { .. }) {
                     return Err(err);
                 }
                 if session_output.exit_code != 0 {
@@ -2961,6 +2977,31 @@ mod tests {
         assert!(
             matches!(err, agents::AgentError::AgentFailed { .. }),
             "is_error=true should return AgentFailed, got {err:?}"
+        );
+    }
+
+    /// RateLimit with terminal_reason=completed must be propagated as RateLimit,
+    /// not downgraded to InvalidResponse. This covers claude session-limit errors
+    /// that include "terminal_reason":"completed" in their NDJSON envelope — the
+    /// terminal_reason guard was designed for kimi/minimax/glm false-positive
+    /// exit codes but was intercepting classified errors like RateLimit.
+    #[test]
+    fn parse_session_output_exit1_with_rate_limit_and_terminal_reason_completed() {
+        let ndjson = r#"{"type":"result","is_error":true,"terminal_reason":"completed","result":"You've hit your session limit · resets 2:20pm (America/Sao_Paulo)","usage":{"input_tokens":0,"output_tokens":0}}"#;
+        let session = session::SessionOutput {
+            exit_code: 1,
+            raw_stdout: ndjson.to_string(),
+            raw_stderr: String::new(),
+            elapsed_secs: Some(120),
+        };
+
+        let runner = agents::get_runner("claude");
+        let result = parse_session_output("152895", "claude", &*runner, &session);
+
+        let err = result.expect_err("rate-limit should be an error");
+        assert!(
+            matches!(err, agents::AgentError::RateLimit { .. }),
+            "session limit should return RateLimit, not downgraded, got {err:?}"
         );
     }
 }
