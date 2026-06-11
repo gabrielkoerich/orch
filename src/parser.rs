@@ -185,7 +185,9 @@ fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
         | "alerts"
         | "alerts_sent"
         | "not_configured"
-        | "healthy" => "done".to_string(),
+        | "healthy"
+        | "alerts_fired"
+        | "verified" => "done".to_string(),
         // Canonical progress statuses.
         // `partial` is used by some models to indicate partial progress —
         // treat it as in_progress so the task remains open for follow-up.
@@ -1014,6 +1016,20 @@ Some output here.
     #[test]
     fn parse_normalizes_alerts_sent_alias_to_done() {
         let input = r#"{"status":"alerts_sent","summary":"notifications dispatched","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
+    fn parse_normalizes_verified_alias_to_done() {
+        let input = r#"{"status":"verified","summary":"result verified correct","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
+    fn parse_normalizes_alerts_fired_alias_to_done() {
+        let input = r#"{"status":"alerts_fired","summary":"alerts dispatched","accomplished":[],"remaining":[],"files":[]}"#;
         let resp = parse(input).unwrap();
         assert_eq!(resp.status, "done");
     }
