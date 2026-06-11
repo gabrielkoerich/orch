@@ -1096,6 +1096,7 @@ pub(crate) mod patterns {
             "session limit", // catches "You've hit your session limit · resets …"
             "weekly limit",  // catches "You've hit your weekly limit · resets …"
             "quota exceeded",
+            "monthly quota", // GitHub Copilot: "You have exceeded your monthly quota"
             "overloaded",
             "capacity",
             "throttled",
@@ -1853,6 +1854,18 @@ mod tests {
         assert!(
             msg.contains("weekly limit"),
             "error message should reference weekly limit, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn detect_rate_limit_github_copilot_monthly_quota() {
+        // Regression test for issue #3302: "You have exceeded your monthly quota"
+        // was not matched because detect_rate_limit only checked "quota exceeded"
+        // (reversed word order), causing 4 immediate retries with no cooldown.
+        let err = patterns::detect_rate_limit("You have exceeded your monthly quota");
+        assert!(
+            matches!(err, Some(AgentError::RateLimit { .. })),
+            "monthly quota exhaustion must be detected as rate limit, got: {err:?}"
         );
     }
 
