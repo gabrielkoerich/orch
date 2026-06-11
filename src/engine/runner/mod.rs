@@ -115,7 +115,7 @@ fn classify_run_error_type(last_error: &str) -> &'static str {
         "success"
     } else if last_error.contains("timeout") {
         "timeout"
-    } else if last_error.contains("billing cycle") {
+    } else if last_error.contains("billing cycle") || last_error.contains("monthly quota") {
         "billing_cycle_exhausted"
     } else if last_error.contains("rate limit") || last_error.contains("usage limit") {
         "rate_limit"
@@ -1938,6 +1938,22 @@ mod tests {
         assert_eq!(
             classify_run_error_type("billing account suspended"),
             "failed"
+        );
+    }
+
+    #[test]
+    fn classify_run_error_type_monthly_quota_is_billing_cycle() {
+        // Regression test for issue #3302: GitHub Copilot "You have exceeded your
+        // monthly quota" must map to billing_cycle_exhausted, not "failed".
+        assert_eq!(
+            classify_run_error_type(
+                "opencode failed: agent failed: You have exceeded your monthly quota"
+            ),
+            "billing_cycle_exhausted"
+        );
+        assert_eq!(
+            classify_run_error_type("You have exceeded your monthly quota"),
+            "billing_cycle_exhausted"
         );
     }
 
