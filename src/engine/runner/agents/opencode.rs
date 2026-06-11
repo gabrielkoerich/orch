@@ -691,6 +691,11 @@ fn classify_opencode_message(message: &str) -> AgentError {
         };
     }
 
+    // Transient network/transport errors (e.g. "Upstream idle timeout exceeded")
+    if let Some(e) = super::patterns::detect_network_error(message) {
+        return e;
+    }
+
     AgentError::AgentFailed {
         message: message.to_string(),
     }
@@ -1386,6 +1391,17 @@ mod tests {
         assert!(
             matches!(err_with_detail, AgentError::RateLimit { .. }),
             "expected RateLimit, got: {err_with_detail:?}"
+        );
+    }
+
+    #[test]
+    fn classify_opencode_upstream_idle_timeout() {
+        // Issue #3301: "Upstream idle timeout exceeded" must produce NetworkError so
+        // fallback.rs applies a model-level cooldown instead of retrying immediately.
+        let err = classify_opencode_message("Upstream idle timeout exceeded");
+        assert!(
+            matches!(err, AgentError::NetworkError { .. }),
+            "expected NetworkError, got: {err:?}"
         );
     }
 
