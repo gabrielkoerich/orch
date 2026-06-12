@@ -1281,18 +1281,14 @@ pub(crate) mod patterns {
         } else {
             None
         };
-        let http_pos = [
-            http_401_match_pos,
-            http_403_match_pos,
-            http_407_match_pos,
-        ]
-        .into_iter()
-        .flatten()
-        .min()
-        .and_then(|rel| {
-            let char_idx = lower[..rel].chars().count();
-            text.char_indices().nth(char_idx).map(|(i, _)| i)
-        });
+        let http_pos = [http_401_match_pos, http_403_match_pos, http_407_match_pos]
+            .into_iter()
+            .flatten()
+            .min()
+            .and_then(|rel| {
+                let char_idx = lower[..rel].chars().count();
+                text.char_indices().nth(char_idx).map(|(i, _)| i)
+            });
         let match_pos = [first_match_pos, http_pos].into_iter().flatten().min();
         let message = if let Some(pos) = match_pos {
             find_line_containing(text, pos)
