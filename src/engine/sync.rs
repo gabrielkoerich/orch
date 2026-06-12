@@ -1349,7 +1349,26 @@ pub(crate) async fn sync_tick(
                 "sync catch-up: checking stale NeedsReview tasks"
             );
         }
+        // If every review agent is currently cooled, skip the per-task catch-up
+        // pass this tick. Re-firing now would waste the refire counter (and
+        // risk escalating tasks to Blocked) while the subscriber would only
+        // bail again. The next tick re-checks and resumes re-firing as soon as
+        // any review agent recovers.
+        let all_review_agents_cooled = {
+            let r = router.read().await;
+            !r.available_agents.is_empty() && r.healthy_agent_count("review") == 0
+        };
+        let skip_refires = all_review_agents_cooled && needs_review_count > 0;
+        if skip_refires {
+            tracing::info!(
+                count = needs_review_count,
+                "sync catch-up: all review agents currently cooled — skipping re-fire this tick (counter not incremented)"
+            );
+        }
         for task in &needs_review_tasks {
+            if skip_refires {
+                break;
+            }
             // Only retry tasks that have been in NeedsReview long enough that the
             // subscriber should have handled them by now. Fresh tasks (just transitioned)
             // are likely still in flight via the event bus. Unparseable timestamps are

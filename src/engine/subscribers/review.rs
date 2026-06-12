@@ -208,27 +208,22 @@ pub fn spawn(
                     }
 
                     // If no agents are currently routable (all cooled, degraded, or without
-                    // an available review model), wait until the earliest cooldown expires.
-                    // Using router.healthy_agent_count covers agent cooldowns, degradation,
-                    // weight thresholds, and model availability in one call — keeping this
-                    // check in sync with the main router's agent_is_routable() logic.
+                    // an available review model), skip this event and let sync re-fire when
+                    // an agent is available again. Sleeping inline here would block every
+                    // subsequent NeedsReview event for this repo for the duration of the
+                    // cooldown (potentially hours/days), causing sync's rebroadcast loop to
+                    // escalate piled-up tasks to Blocked.
                     {
                         let router_guard = router.read().await;
                         let no_routable = !router_guard.available_agents.is_empty()
                             && router_guard.healthy_agent_count("review") == 0;
+                        drop(router_guard);
                         if no_routable {
-                            let now = chrono::Utc::now().timestamp();
-                            let wait_secs = router_guard
-                                .earliest_cooldown_until(Some("review"))
-                                .map(|until| ((until - now).max(1)) as u64)
-                                .unwrap_or(AGENT_COOLDOWN_SECS as u64);
-                            drop(router_guard);
                             tracing::info!(
                                 task_id,
-                                wait_secs,
-                                "no routable review agents — delaying review until cooldown expires"
+                                "no routable review agents — leaving task in needs_review for sync to re-fire"
                             );
-                            tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                            continue;
                         }
                     }
 
@@ -275,10 +270,8 @@ pub fn spawn(
                         if pre_check_all_cooled {
                             tracing::info!(
                                 task_id = tid,
-                                "all agents cooled at review spawn time — deferring without running agent"
+                                "all agents cooled at review spawn time — resetting to needs_review for sync to re-fire"
                             );
-                            // Fall through to RateLimited outcome handling below, which
-                            // waits for the cooldown to expire and resets to NeedsReview.
                             crate::store::set_review_session_expected(
                                 &store_c,
                                 &repo_s,
@@ -286,19 +279,6 @@ pub fn spawn(
                                 false,
                             )
                             .await;
-                            let wait_secs = {
-                                let r = router_c.read().await;
-                                let now = chrono::Utc::now().timestamp();
-                                r.earliest_cooldown_until(Some("review"))
-                                    .map(|until| ((until - now).max(1)) as u64)
-                                    .unwrap_or(AGENT_COOLDOWN_SECS as u64)
-                            };
-                            tracing::info!(
-                                task_id = tid,
-                                wait_secs,
-                                "pre-check: deferring review retry due to agent rate limit cooldown"
-                            );
-                            tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
                             if let Err(e) = task_manager_c
                                 .update_task_status(
                                     &ExternalId(tid.clone()),
