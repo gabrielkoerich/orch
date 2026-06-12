@@ -1266,12 +1266,30 @@ pub(crate) mod patterns {
                 });
         // Also check HTTP status codes for standalone matches (not caught by
         // pattern strings like "401" is too short to add as a pattern).
-        let http_match_pos = if http_401 {
+        let http_401_match_pos = if http_401 {
             lower.find("401 ").or_else(|| lower.find(": 401"))
         } else {
             None
         };
-        let http_pos = http_match_pos.and_then(|rel| {
+        let http_403_match_pos = if http_403 {
+            lower.find("403 ").or_else(|| lower.find(": 403"))
+        } else {
+            None
+        };
+        let http_407_match_pos = if http_407 {
+            lower.find("407 ").or_else(|| lower.find(": 407"))
+        } else {
+            None
+        };
+        let http_pos = [
+            http_401_match_pos,
+            http_403_match_pos,
+            http_407_match_pos,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .and_then(|rel| {
             let char_idx = lower[..rel].chars().count();
             text.char_indices().nth(char_idx).map(|(i, _)| i)
         });
@@ -1302,8 +1320,9 @@ pub(crate) mod patterns {
     fn find_auth_line_scan(text: &str) -> Option<String> {
         for line in text.lines().rev().take(50) {
             let line_lower = line.to_lowercase();
-            if line_lower.contains("401")
-                || line_lower.contains("403")
+            if contains_http_status(&line_lower, "401")
+                || contains_http_status(&line_lower, "403")
+                || contains_http_status(&line_lower, "407")
                 || line_lower.contains("unauthorized")
                 || line_lower.contains("authentication required")
                 || line_lower.contains("invalid api")
