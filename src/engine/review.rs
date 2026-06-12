@@ -718,6 +718,9 @@ async fn invoke_review_agent(
         Err(_) => {
             tracing::error!(task_id = task.id.0, "review agent timed out");
             let _ = tmux.kill_session(&session).await;
+            if let Some(model) = ctx.review_model.as_deref() {
+                crate::engine::cooldown::record_model_failure(&ctx.review_agent, model).await;
+            }
             complete_review_run(
                 store,
                 run_id,
