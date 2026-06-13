@@ -744,6 +744,119 @@ async fn try_unblock_ci_failure_task(
     Ok(false)
 }
 
+/// Auto-recover tasks blocked due to refire-counter exhaustion during agent cooldowns.
+///
+/// When all review agents are cooled simultaneously the NeedsReview refire counter can
+/// exhaust (>5 attempts) before any agent becomes available, escalating the task to
+/// `Blocked` with `block_reason = "review agent rebroadcast escalated after repeated
+/// retries"`.  These tasks were never actually reviewed — `review_cycles == 0` is the
+/// distinguishing signal.  Once any review agent is routable again, reset them to
+/// `NeedsReview` and clear the refire counter so the subscriber can pick them up.
+///
+/// A minimum block age of `MIN_BLOCK_AGE_MINUTES` is enforced so that tasks escalated
+/// in the current tick are not immediately un-blocked by the same tick's recovery pass.
+async fn auto_recover_rebroadcast_blocked_tasks(
+    repo: &str,
+    router: &Arc<RwLock<Router>>,
+    task_manager: &Arc<TaskManager>,
+    store: &Arc<TaskStore>,
+) -> anyhow::Result<()> {
+    const REBROADCAST_BLOCK_REASON: &str =
+        "review agent rebroadcast escalated after repeated retries";
+    // Must have been blocked for at least this long before we consider recovering it.
+    // Prevents the recovery pass from immediately undoing an escalation that happened
+    // earlier in the same sync_tick call.
+    const MIN_BLOCK_AGE_MINUTES: i64 = 5;
+
+    // Bail early if no review agents are routable — re-firing while all agents are
+    // cooled would immediately re-exhaust the counter.
+    let any_routable = {
+        let r = router.read().await;
+        !r.available_agents.is_empty() && r.healthy_agent_count("review") > 0
+    };
+    if !any_routable {
+        return Ok(());
+    }
+
+    let blocked = match store.list_by_status(repo, TaskStatus::Blocked).await {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::warn!(err = %e, "failed to list blocked tasks — skipping rebroadcast recovery this tick");
+            return Ok(());
+        }
+    };
+
+    let now = chrono::Utc::now();
+    let candidates: Vec<_> = blocked
+        .into_iter()
+        .filter(|t| {
+            if t.block_reason.as_deref() != Some(REBROADCAST_BLOCK_REASON) || t.review_cycles != 0 {
+                return false;
+            }
+            // Only recover tasks that have been blocked long enough to rule out
+            // same-tick escalations (i.e. tasks blocked by a previous sync cycle).
+            if let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&t.updated_at) {
+                let age = now - updated_at.with_timezone(&chrono::Utc);
+                age.num_minutes() >= MIN_BLOCK_AGE_MINUTES
+            } else {
+                // Unparseable timestamp → treat as old enough.
+                true
+            }
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!(
+        count = candidates.len(),
+        "sync: auto-recovering rebroadcast-blocked tasks — review agents now available"
+    );
+
+    for task in candidates {
+        let ext_id = task
+            .external_id
+            .clone()
+            .unwrap_or_else(|| format!("internal:{}", task.id));
+
+        if let Err(e) = task_manager
+            .update_task_status(
+                &crate::backends::ExternalId(ext_id.clone()),
+                Status::NeedsReview,
+            )
+            .await
+        {
+            tracing::warn!(
+                task_id = task.id,
+                err = %e,
+                "rebroadcast-recovery: failed to reset task to needs_review — skipping"
+            );
+            continue;
+        }
+
+        let fields: &[(&str, serde_json::Value)] = &[
+            ("block_reason", serde_json::Value::Null),
+            ("needs_review_refires", serde_json::json!(0)),
+        ];
+        if let Err(e) = store.set_fields(task.id, fields).await {
+            tracing::warn!(
+                task_id = task.id,
+                err = %e,
+                "rebroadcast-recovery: failed to clear block_reason/needs_review_refires after status reset"
+            );
+        }
+
+        tracing::info!(
+            task_id = task.id,
+            ext_id = %ext_id,
+            "auto-recovering rebroadcast-blocked task — review agents now available"
+        );
+    }
+
+    Ok(())
+}
+
 async fn auto_unblock_blocked_tasks(
     repo: &str,
     task_manager: &Arc<TaskManager>,
@@ -1517,6 +1630,15 @@ pub(crate) async fn sync_tick(
     // 5c. Auto-unblock tasks with recoverable failures.
     if let Err(e) = auto_unblock_blocked_tasks(repo, task_manager, store, dispatching).await {
         tracing::warn!(err = %e, "auto-unblock failed");
+    }
+
+    // 5d. Auto-recover tasks blocked by rebroadcast-escalation once review agents return.
+    if enable_review {
+        if let Err(e) =
+            auto_recover_rebroadcast_blocked_tasks(repo, router, task_manager, store).await
+        {
+            tracing::warn!(err = %e, "rebroadcast-recovery failed");
+        }
     }
 
     // 6. Sync skill repositories
