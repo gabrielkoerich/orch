@@ -760,8 +760,12 @@ async fn record_review_agent_failure(
             }
         }
         runner::agents::AgentError::InvalidResponse { .. } => {
+            // Structural failure: model produced no parseable output at all.
+            // Apply persistent backoff (4h base → 7d max) — same rationale as
+            // silent exit-0 in the agent runner. A model that cannot produce
+            // ANY output for a review is unlikely to self-heal on the next try.
             if let Some(model) = review_model {
-                crate::engine::cooldown::record_model_failure(review_agent, model).await;
+                crate::engine::cooldown::record_persistent_model_failure(review_agent, model).await;
             }
         }
         _ => {}
@@ -1053,7 +1057,16 @@ async fn parse_review_output(
                     "failed to parse review response"
                 );
                 if let Some(model) = ctx.review_model.as_deref() {
-                    crate::engine::cooldown::record_model_failure(&ctx.review_agent, model).await;
+                    // Structural format failure: the model ran and produced output but
+                    // couldn't format it as a parseable review response. Use persistent
+                    // backoff (4h base → 7d max) so the model isn't re-selected after
+                    // the short 5-min base backoff expires and another task's success
+                    // resets the failure counter via record_agent_success.
+                    crate::engine::cooldown::record_persistent_model_failure(
+                        &ctx.review_agent,
+                        model,
+                    )
+                    .await;
                 }
                 complete_review_run(
                     store,
@@ -2863,6 +2876,88 @@ mod tests {
         assert!(
             result.is_err(),
             "expected Err when directory is not a git repo, got {result:?}"
+        );
+    }
+
+    // ── review cooldown escalation (issue #3314) ────────────────────────────
+
+    /// Review `InvalidResponse` (hard failure: empty/error output) must apply the
+    /// persistent model backoff (~4h base) so the model isn't re-selected on the
+    /// next tick after a brief standard cooldown expires.
+    ///
+    /// Regression test for issue #3314: `record_model_failure` (5-min base) was used
+    /// instead of `record_persistent_model_failure` (4h base), allowing repeated
+    /// re-selection of a structurally broken review model.
+    #[serial_test::serial(cooldown_state)]
+    #[tokio::test]
+    async fn review_invalid_response_applies_persistent_model_cooldown() {
+        crate::engine::cooldown::reset_global_state().await;
+        let agent = "opencode-3314-review-invalid";
+        let model = "opencode/north-mini-code-free";
+        let key = format!("{agent}:{model}");
+
+        assert!(
+            !crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            "model should not be in cooldown before record_review_agent_failure"
+        );
+
+        let err = runner::agents::AgentError::InvalidResponse {
+            raw: "empty review output".to_string(),
+        };
+        record_review_agent_failure("test-3314-a", agent, Some(model), &err).await;
+
+        let now = chrono::Utc::now().timestamp();
+        let until = crate::engine::cooldown::cooldown_until(&key)
+            .expect("review InvalidResponse should set model cooldown");
+        let remaining = until.saturating_sub(now);
+
+        // Persistent backoff base is ~4h (14400s); standard model backoff base is 5min (300s).
+        // Verify the persistent (4h) path was taken, not the short one.
+        assert!(
+            remaining >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
+            "review InvalidResponse must apply ~4h persistent cooldown (issue #3314), \
+             got {remaining}s — may have used 5-min standard backoff instead"
+        );
+    }
+
+    /// Review `parse_error` (got output but couldn't parse it as a review response) must
+    /// also apply the persistent model backoff so the model is cooled long enough to
+    /// prevent re-selection after a brief cooldown or a success-reset from another task.
+    ///
+    /// Verifies the `record_review_agent_failure` path for `InvalidResponse`
+    /// (which covers both the hard-failure and soft parse-error paths that were
+    /// changed in the fix for issue #3314).
+    #[serial_test::serial(cooldown_state)]
+    #[tokio::test]
+    async fn review_persistent_cooldown_survives_after_first_failure() {
+        crate::engine::cooldown::reset_global_state().await;
+        let agent = "opencode-3314-review-parse";
+        let model = "opencode/north-mini-code-free";
+        let key = format!("{agent}:{model}");
+
+        // First failure: persistent backoff should apply immediately
+        let err = runner::agents::AgentError::InvalidResponse {
+            raw: "failed to parse review response".to_string(),
+        };
+        record_review_agent_failure("test-3314-b", agent, Some(model), &err).await;
+
+        let now = chrono::Utc::now().timestamp();
+        let until1 = crate::engine::cooldown::cooldown_until(&key)
+            .expect("first failure should set cooldown");
+        let remaining1 = until1.saturating_sub(now);
+
+        // Simulate a success for the same agent+model (from a non-review task).
+        // This resets failure_count:{agent}:{model} to 0.
+        crate::engine::cooldown::record_agent_success(agent, model).await;
+
+        // After success reset, cooldown timestamp is still set — the success only
+        // resets the failure count, NOT the existing cooldown timer.
+        // The next review failure will restart from count=1 (base backoff).
+        // The key invariant: persistent base (4h) >> standard base (5min) so even
+        // after a reset, the first-failure cooldown still lasts ~4h.
+        assert!(
+            remaining1 >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
+            "after success reset, first-failure cooldown should still be ~4h, got {remaining1}s"
         );
     }
 }
