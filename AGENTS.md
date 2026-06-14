@@ -285,7 +285,7 @@ All cooldowns are **persisted to SQLite KV** (`cooldown:{key}`) so they survive 
 - Silence detection → model cooldown + short 120s agent cooldown → re-route
 - Credit exhaustion (`out_of_credits`) → exponential from 1h, capping at 8h
 - Org-level disabling (`org_level_disabled`) → exponential from 2h, capping at 8h
-- Billing cycle exhaustion → escalating from 24h, capping at 7 days (monthly event; flat 24h caused daily retry-fail cycles)
+- Billing cycle exhaustion → when the failing model is known: persistent model-level cooldown (4h base → 7d cap); when no model is identified: escalating agent-wide cooldown from 24h, capping at 7 days. Model-scoped exhaustion (e.g. a provider sub-model like `github-copilot/gpt-5-mini`) must not block unrelated models on the same agent.
 - On successful completion → failure counts reset via `record_agent_success()` so next failure starts from base again
 
 **Exception for pre-emptive routability checks**: The router performs proactive checks to skip agents/models that are likely to fail based on routing weight decay and cooldown states. This is not considered special-casing because it uses the same generic cooldown system and weight decay mechanisms that feed into the routing decision process.
