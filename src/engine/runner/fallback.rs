@@ -239,7 +239,22 @@ pub async fn handle_error(
             // is set. Without the model-level cooldown, the model continues to be
             // picked and fails repeatedly (issue #2153).
             if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
-                crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await;
+                // For billing cycle exhaustion where we know the specific model, apply
+                // model-level persistent cooldown only. The quota is scoped to that
+                // provider sub-model (e.g. github-copilot/gpt-5-mini), not the entire
+                // agent account, so an agent-wide cooldown would incorrectly block
+                // unrelated models on the same agent.
+                if reason == crate::engine::cooldown::CreditExhaustionReason::BillingCycleExhausted
+                {
+                    if let Some(model) = model_name {
+                        crate::engine::cooldown::record_persistent_model_failure(agent_name, model)
+                            .await;
+                    } else {
+                        crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await;
+                    }
+                } else {
+                    crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await;
+                }
             } else {
                 crate::engine::cooldown::record_agent_failure_with_message(agent_name, message)
                     .await;
@@ -269,7 +284,19 @@ pub async fn handle_error(
             // agent-level and model-level cooldowns so the router can observe them before
             // concurrent tasks start another run against the same unavailable model.
             if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
-                crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await;
+                // Billing cycle exhaustion scoped to a known model gets model-level
+                // persistent cooldown only — agent-wide cooldown would block unrelated models.
+                if reason == crate::engine::cooldown::CreditExhaustionReason::BillingCycleExhausted
+                {
+                    if let Some(model) = model_name {
+                        crate::engine::cooldown::record_persistent_model_failure(agent_name, model)
+                            .await;
+                    } else {
+                        crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await;
+                    }
+                } else {
+                    crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await;
+                }
             } else {
                 crate::engine::cooldown::record_agent_failure_with_message(agent_name, message)
                     .await;
