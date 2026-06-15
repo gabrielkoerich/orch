@@ -174,6 +174,7 @@ impl CodexRunner {
         // into the dedicated network-retry loop with backoff and escalation.
         if lower.contains("reconnecting")
             || lower.contains("stream disconnected")
+            || lower.contains("event stream lagged")
             || lower.contains("connection closed")
             || lower.contains("websocket")
             || lower.contains("econnreset")
@@ -686,6 +687,16 @@ mod tests {
     #[test]
     fn classify_codex_websocket_error() {
         let err = runner().classify_message("WebSocket connection closed unexpectedly");
+        assert!(
+            matches!(err, AgentError::NetworkError { .. }),
+            "expected NetworkError so fallback retries, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_codex_event_stream_lagged() {
+        let err = runner()
+            .classify_message("in-process app-server event stream lagged; dropped 1 events");
         assert!(
             matches!(err, AgentError::NetworkError { .. }),
             "expected NetworkError so fallback retries, got: {err:?}"
