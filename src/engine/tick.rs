@@ -3034,4 +3034,80 @@ mod tests {
 
         let _ = tmux.kill_session(&session_name).await;
     }
+
+    // ── tick_job_scheduler: resilience to bad project configs ────────────────
+
+    /// A project with a duplicate job id (same id in .orch.yml AND prompts/jobs/)
+    /// must not cause tick_job_scheduler to return Err — it should log an error
+    /// and return Ok(()) so other projects are unaffected.
+    #[tokio::test]
+    async fn job_scheduler_returns_ok_on_duplicate_job_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join(".orch.yml");
+        std::fs::write(
+            &cfg,
+            "jobs:\n  - id: trading-scan\n    schedule: \"0 9 * * *\"\n    task:\n      title: Scan\n      body: do it\n",
+        )
+        .unwrap();
+        let jobs_dir = tmp.path().join("prompts").join("jobs");
+        std::fs::create_dir_all(&jobs_dir).unwrap();
+        std::fs::write(
+            jobs_dir.join("trading-scan.md"),
+            "---\nid: trading-scan\nschedule: '0 9 * * *'\ntitle: Trading Scan\n---\n\nDo trading scan.\n",
+        )
+        .unwrap();
+
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let result = tick_job_scheduler(&cfg, &backend, None, "test/repo", None).await;
+        assert!(
+            result.is_ok(),
+            "duplicate job id must not propagate as Err: {result:?}"
+        );
+    }
+
+    /// When one project has a duplicate job id (bad config) and a second project
+    /// has a valid config, the scheduler tick for the second project must still
+    /// succeed — simulating the per-project loop in the engine.
+    #[tokio::test]
+    async fn job_scheduler_processes_valid_project_when_other_has_duplicate() {
+        // Bad project: duplicate id across .orch.yml and prompts/jobs/
+        let bad_tmp = tempfile::tempdir().unwrap();
+        let bad_cfg = bad_tmp.path().join(".orch.yml");
+        std::fs::write(
+            &bad_cfg,
+            "jobs:\n  - id: dup\n    schedule: \"0 9 * * *\"\n    task:\n      title: Dup\n      body: x\n",
+        )
+        .unwrap();
+        let bad_jobs_dir = bad_tmp.path().join("prompts").join("jobs");
+        std::fs::create_dir_all(&bad_jobs_dir).unwrap();
+        std::fs::write(
+            bad_jobs_dir.join("dup.md"),
+            "---\nid: dup\nschedule: '0 9 * * *'\ntitle: Dup\n---\n\nbody\n",
+        )
+        .unwrap();
+
+        // Good project: valid config, no duplicate
+        let good_tmp = tempfile::tempdir().unwrap();
+        let good_cfg = good_tmp.path().join(".orch.yml");
+        std::fs::write(
+            &good_cfg,
+            "jobs:\n  - id: valid-job\n    schedule: \"0 9 * * *\"\n    task:\n      title: Valid\n      body: ok\n",
+        )
+        .unwrap();
+
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+
+        let bad_result = tick_job_scheduler(&bad_cfg, &backend, None, "test/bad-repo", None).await;
+        assert!(
+            bad_result.is_ok(),
+            "bad project must not abort scheduler: {bad_result:?}"
+        );
+
+        let good_result =
+            tick_job_scheduler(&good_cfg, &backend, None, "test/good-repo", None).await;
+        assert!(
+            good_result.is_ok(),
+            "valid project must still run after bad project: {good_result:?}"
+        );
+    }
 }
