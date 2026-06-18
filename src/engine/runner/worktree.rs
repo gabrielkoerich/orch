@@ -941,6 +941,102 @@ mod tests {
         );
     }
 
+    /// Capture stdout of a git command in `dir`.
+    fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|e| panic!("git {:?} failed to start: {e}", args));
+        if !out.status.success() {
+            panic!(
+                "git {:?} failed:\nstdout: {}\nstderr: {}",
+                args,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// End-to-end guard for the operator-main-leak fix: when the operator's
+    /// local `main` has commits that are not yet pushed, `setup_worktree`
+    /// must branch from `origin/main` and produce a worktree whose HEAD is
+    /// the pushed tip — never the local-only tip.
+    #[tokio::test]
+    #[serial_test::serial(orch_home)]
+    async fn setup_worktree_anchors_on_origin_not_local_main() {
+        // Isolate ORCH_HOME so the worktree lands in a temp dir.
+        let orch_home_dir = tempfile::tempdir().unwrap();
+        let prev_orch_home = std::env::var("ORCH_HOME").ok();
+        std::env::set_var("ORCH_HOME", orch_home_dir.path());
+
+        // Bare "remote".
+        let remote = tempfile::tempdir().unwrap();
+        git(remote.path(), &["init", "--bare"]);
+
+        // Operator's project clone.
+        let project = tempfile::tempdir().unwrap();
+        git(
+            project.path(),
+            &["clone", remote.path().to_str().unwrap(), "."],
+        );
+        git(project.path(), &["config", "user.email", "t@t.com"]);
+        git(project.path(), &["config", "user.name", "T"]);
+
+        // Pushed baseline on main.
+        std::fs::write(project.path().join("README.md"), "pushed\n").unwrap();
+        git(project.path(), &["add", "."]);
+        git(project.path(), &["commit", "-m", "pushed baseline"]);
+        git(project.path(), &["push", "origin", "HEAD:main"]);
+        let pushed_sha = git_stdout(project.path(), &["rev-parse", "HEAD"]);
+
+        // Ensure origin/HEAD is set so detect_default_branch resolves "main".
+        git(project.path(), &["remote", "set-head", "origin", "main"]);
+
+        // Operator's WIP: an unpushed local commit on top of main.
+        std::fs::write(project.path().join("LOCAL_ONLY.md"), "unpushed\n").unwrap();
+        git(project.path(), &["add", "."]);
+        git(project.path(), &["commit", "-m", "local unpushed commit"]);
+        let local_sha = git_stdout(project.path(), &["rev-parse", "HEAD"]);
+        assert_ne!(
+            pushed_sha, local_sha,
+            "precondition: local main must be ahead of origin/main"
+        );
+
+        // Run setup_worktree for a fresh internal task (skips GitHub linking).
+        let setup = setup_worktree(
+            "internal:1",
+            "leak guard",
+            project.path(),
+            &None,
+            "test/repo",
+        )
+        .await
+        .expect("setup_worktree should succeed");
+
+        // Worktree must sit on the pushed tip, not the local-only tip.
+        let wt_sha = git_stdout(&setup.work_dir, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            wt_sha, pushed_sha,
+            "worktree HEAD must equal origin/main, not local main"
+        );
+        assert_ne!(
+            wt_sha, local_sha,
+            "worktree must NOT include the operator's unpushed commit"
+        );
+        assert!(
+            !setup.work_dir.join("LOCAL_ONLY.md").exists(),
+            "unpushed-only file must not appear in the worktree"
+        );
+
+        // Restore ORCH_HOME.
+        match prev_orch_home {
+            Some(v) => std::env::set_var("ORCH_HOME", v),
+            None => std::env::remove_var("ORCH_HOME"),
+        }
+    }
+
     /// When neither `origin/<branch>` nor `origin/<default_branch>` exist,
     /// fall back to the local default branch name as a last resort.
     #[tokio::test]
