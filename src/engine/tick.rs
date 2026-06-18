@@ -13,9 +13,9 @@ use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::channels::capture::CaptureService;
 use crate::config;
 use crate::engine::cooldown::{
-    github_circuit_remaining_secs, is_github_circuit_open, record_agent_failure_with_message,
-    record_silence_detection, set_agent_cooldown, set_model_cooldown, SILENCE_AGENT_COOLDOWN_SECS,
-    SILENCE_EXTENDED_COOLDOWN_SECS,
+    github_circuit_remaining_secs, is_github_circuit_open, is_repo_billing_blocked,
+    record_agent_failure_with_message, record_silence_detection, set_agent_cooldown,
+    set_model_cooldown, SILENCE_AGENT_COOLDOWN_SECS, SILENCE_EXTENDED_COOLDOWN_SECS,
 };
 use crate::engine::dispatch_guard::DispatchGuard;
 use crate::engine::jobs;
@@ -1195,6 +1195,32 @@ pub(crate) async fn tick_route_tasks(
     let max_per_tick = crate::engine::router::config::max_tasks_per_routing_tick();
     for task in routable.into_iter().take(max_per_tick) {
         let _task_span = tracing::info_span!("engine.route", task_id = %task.id.0).entered();
+
+        // Check for active repo billing failure before routing.
+        // If this repo's CI is blocked by GitHub Actions billing, skip
+        // the LLM routing call and block the task immediately to avoid
+        // wasting agent compute on work that can never land.
+        if is_repo_billing_blocked(store, repo).await {
+            tracing::error!(
+                task_id = %task.id.0,
+                repo,
+                "repo billing failure active — blocking task without dispatching agent"
+            );
+            let fields = [(
+                "block_reason",
+                serde_json::json!(
+                    "GitHub Actions billing failure — check Billing & plans settings \
+                     (jobs are not starting due to payment failure or spending limit)"
+                ),
+            )];
+            if let Err(e) = task_manager
+                .update_task_status_and_result(&task.id, Status::Blocked, &fields)
+                .await
+            {
+                tracing::error!(task_id = %task.id.0, err = %e, "failed to block task for repo billing failure");
+            }
+            continue;
+        }
 
         let task_start = Instant::now();
         match router.route(task, store, repo).await {
