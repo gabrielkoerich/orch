@@ -428,9 +428,22 @@ pub async fn tick(
     transport: Option<&Arc<Transport>>,
 ) -> anyhow::Result<()> {
     let jobs_path_clone = jobs_path.to_path_buf();
-    let jobs = tokio::task::spawn_blocking(move || load_jobs(&jobs_path_clone))
+    let jobs = match tokio::task::spawn_blocking(move || load_jobs(&jobs_path_clone))
         .await
-        .map_err(|e| anyhow::anyhow!("load_jobs panicked: {e}"))??;
+        .map_err(|e| anyhow::anyhow!("load_jobs panicked: {e}"))
+        .and_then(|r| r)
+    {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::error!(
+                path = %jobs_path.display(),
+                repo = %repo,
+                ?e,
+                "job config invalid — skipping scheduler tick for this project"
+            );
+            return Ok(());
+        }
+    };
     let now = chrono::Utc::now();
 
     for job in &jobs {
