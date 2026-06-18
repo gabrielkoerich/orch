@@ -224,7 +224,7 @@ impl Default for RouterConfig {
         Self {
             mode: "round_robin".to_string(),
             router_agent: "claude".to_string(),
-            router_model: "claude-haiku-4-5-20251001".to_string(),
+            router_model: "haiku".to_string(),
             timeout_seconds: 45,
             fallback_executor: "codex".to_string(),
             agents: DEFAULT_AGENTS.iter().map(|s| s.to_string()).collect(),
