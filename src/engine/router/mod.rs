@@ -1661,7 +1661,7 @@ mod tests {
 
         assert_eq!(config.mode, "round_robin");
         assert_eq!(config.router_agent, "claude");
-        assert_eq!(config.router_model, "claude-haiku-4-5-20251001");
+        assert_eq!(config.router_model, "haiku");
         assert_eq!(config.fallback_executor, "codex");
         assert_eq!(config.max_route_attempts, 3);
         assert!(!config.allowed_tools.is_empty());
