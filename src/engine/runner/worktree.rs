@@ -293,23 +293,34 @@ pub async fn resolve_main_repo(project_dir: &Path) -> PathBuf {
 
 /// Resolve the starting point for creating a new local branch.
 ///
-/// If `origin/<branch>` exists in the repository (e.g. cleanup kept the
-/// remote branch after deleting the local one), use it so the new worktree
-/// starts from the agent's committed work rather than the default branch tip.
-/// Falls back to `default_branch` when no remote tracking ref is found.
+/// Preference order:
+/// 1. `origin/<branch>` if it exists — cleanup kept the remote branch after
+///    deleting the local one, so resume from the agent's committed work.
+/// 2. `origin/<default_branch>` if it exists — anchors on the pushed tip of
+///    the default branch so unpushed local commits in the operator's main
+///    checkout don't leak into the worktree.
+/// 3. `default_branch` as a last resort (no origin remote / never fetched).
 async fn resolve_branch_start_point(repo_root: &str, branch: &str, default_branch: &str) -> String {
-    let origin_ref = format!("origin/{branch}");
-    let has_remote = Command::new("git")
-        .args(["-C", repo_root, "rev-parse", "--verify", &origin_ref])
-        .output_with_context()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if has_remote {
-        origin_ref
-    } else {
-        default_branch.to_string()
+    let verify = |reference: String| async move {
+        Command::new("git")
+            .args(["-C", repo_root, "rev-parse", "--verify", &reference])
+            .output_with_context()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+
+    let origin_branch_ref = format!("origin/{branch}");
+    if verify(origin_branch_ref.clone()).await {
+        return origin_branch_ref;
     }
+
+    let origin_default_ref = format!("origin/{default_branch}");
+    if verify(origin_default_ref.clone()).await {
+        return origin_default_ref;
+    }
+
+    default_branch.to_string()
 }
 
 /// Validate that a worktree directory has a working gitdir link.
@@ -350,21 +361,6 @@ pub async fn validate_worktree_gitdir(worktree_dir: &Path) -> bool {
             .unwrap_or(false);
     }
     false
-}
-
-/// Check if a directory is a bare git repository.
-async fn is_bare_repo(dir: &Path) -> bool {
-    let output = Command::new("git")
-        .args([
-            "-C",
-            &dir.to_string_lossy(),
-            "rev-parse",
-            "--is-bare-repository",
-        ])
-        .output_with_context()
-        .await;
-
-    matches!(output, Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
 }
 
 /// Resolve the branch and worktree directory from a parent task, if available.
@@ -561,24 +557,21 @@ pub async fn setup_worktree(
     if tokio::fs::metadata(&worktree_dir).await.is_err() {
         tracing::info!(task_id, worktree = %worktree_dir.display(), "creating worktree");
 
-        // Pull/fetch latest so the new branch starts from up-to-date main.
-        if is_bare_repo(&main_dir).await {
-            let _ = Command::new("git")
-                .args([
-                    "-C",
-                    &main_dir.to_string_lossy(),
-                    "fetch",
-                    "--all",
-                    "--prune",
-                ])
-                .output_with_context()
-                .await;
-        } else {
-            let _ = Command::new("git")
-                .args(["-C", &main_dir.to_string_lossy(), "pull", "--ff-only"])
-                .output_with_context()
-                .await;
-        }
+        // Fetch latest so `origin/<default_branch>` (and any pre-existing
+        // remote task branch) is fresh. We deliberately do NOT `git pull` on
+        // the operator's checkout: branching from `origin/<default_branch>`
+        // means unpushed local commits or in-progress work on `main` never
+        // leak into the new worktree.
+        let _ = Command::new("git")
+            .args([
+                "-C",
+                &main_dir.to_string_lossy(),
+                "fetch",
+                "--prune",
+                "origin",
+            ])
+            .output_with_context()
+            .await;
 
         // Create local branch. Prefer `origin/<branch>` when it already exists
         // (recovery case: cleanup deleted local branch but kept the remote),
@@ -915,10 +908,11 @@ mod tests {
         );
     }
 
-    /// When `origin/<branch>` does NOT exist, `resolve_branch_start_point`
-    /// should fall back to the default branch.
+    /// When `origin/<branch>` does NOT exist but `origin/<default_branch>` does,
+    /// `resolve_branch_start_point` should anchor on the remote default branch
+    /// so unpushed local commits on `main` don't leak into the worktree.
     #[tokio::test]
-    async fn resolve_branch_start_point_falls_back_to_default() {
+    async fn resolve_branch_start_point_prefers_origin_default_over_local() {
         let remote = tempfile::tempdir().unwrap();
         git(remote.path(), &["init", "--bare"]);
 
@@ -939,11 +933,34 @@ mod tests {
 
         let repo_root = local.path().to_str().unwrap();
 
-        // Branch "no-such-branch" has never been pushed → should fall back.
+        // Branch "no-such-branch" has never been pushed, but origin/main exists.
+        let start = resolve_branch_start_point(repo_root, "no-such-branch", "main").await;
+        assert_eq!(
+            start, "origin/main",
+            "should anchor on origin/<default_branch> instead of local default"
+        );
+    }
+
+    /// When neither `origin/<branch>` nor `origin/<default_branch>` exist,
+    /// fall back to the local default branch name as a last resort.
+    #[tokio::test]
+    async fn resolve_branch_start_point_falls_back_to_local_default() {
+        let local = tempfile::tempdir().unwrap();
+        git(local.path(), &["init"]);
+        git(local.path(), &["config", "user.email", "t@t.com"]);
+        git(local.path(), &["config", "user.name", "T"]);
+        git(local.path(), &["checkout", "-b", "main"]);
+        std::fs::write(local.path().join("README.md"), "main").unwrap();
+        git(local.path(), &["add", "."]);
+        git(local.path(), &["commit", "-m", "init"]);
+
+        let repo_root = local.path().to_str().unwrap();
+
+        // No remote at all → fall back to "main".
         let start = resolve_branch_start_point(repo_root, "no-such-branch", "main").await;
         assert_eq!(
             start, "main",
-            "should fall back to default_branch when remote does not exist"
+            "should fall back to local default_branch when no remote refs exist"
         );
     }
 

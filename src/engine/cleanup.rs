@@ -411,26 +411,30 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
                 }
             }
 
-            let pull_result = timeout(
+            // Fetch instead of pull: refresh `origin/*` refs without touching
+            // the operator's checked-out branch or working tree. `pull` would
+            // operate on whatever HEAD happens to be (often a feature branch,
+            // not main) and would silently no-op on divergence.
+            let fetch_result = timeout(
                 GIT_TIMEOUT,
                 Command::new("git")
-                    .args(["-C", &repo_root, "pull", "--ff-only"])
+                    .args(["-C", &repo_root, "fetch", "--prune", "origin"])
                     .output_with_context(),
             )
             .await;
-            match pull_result {
+            match fetch_result {
                 Ok(Ok(output)) if output.status.success() => {
-                    tracing::info!(%repo, "pulled main after worktree cleanup");
+                    tracing::info!(%repo, "fetched origin after worktree cleanup");
                 }
                 Ok(Ok(output)) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    tracing::debug!(%repo, err = %stderr, "git pull skipped after cleanup");
+                    tracing::debug!(%repo, err = %stderr, "git fetch skipped after cleanup");
                 }
                 Ok(Err(e)) => {
-                    tracing::debug!(%repo, err = %e, "git pull failed after cleanup");
+                    tracing::debug!(%repo, err = %e, "git fetch failed after cleanup");
                 }
                 Err(_) => {
-                    tracing::debug!(%repo, "git pull timed out after 60s");
+                    tracing::debug!(%repo, "git fetch timed out after 60s");
                 }
             }
         }
@@ -442,7 +446,7 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
 /// Cleanup a single task's worktree and branches.
 ///
 /// Removes the git worktree, deletes local + remote branches,
-/// pulls main to stay up-to-date, and marks the task as cleaned.
+/// fetches origin to refresh remote tracking refs, and marks the task as cleaned.
 ///
 /// This function is used for inline post-merge cleanup (called from
 /// auto-merge flows) and must attempt immediate removal — it constructs
@@ -459,31 +463,33 @@ pub(crate) async fn cleanup_task_worktree(
     };
     let cleaned = cleanup_task_worktree_with_opts(task_id, repo, store, &opts).await?;
 
-    // Pull main once after inline cleanup (post-merge single-task path).
-    // Only pull if cleanup actually happened (not skipped due to active session).
+    // Fetch origin once after inline cleanup (post-merge single-task path).
+    // Only fetch if cleanup actually happened (not skipped due to active session).
+    // Fetch (not pull) so the operator's checked-out branch and working tree
+    // are never touched — see the matching comment in cleanup_orphaned_worktrees.
     if cleaned {
         if let Ok(repo_root) = resolve_repo_root(repo).await {
             const GIT_TIMEOUT: Duration = Duration::from_secs(60);
-            let pull_result = timeout(
+            let fetch_result = timeout(
                 GIT_TIMEOUT,
                 Command::new("git")
-                    .args(["-C", &repo_root, "pull", "--ff-only"])
+                    .args(["-C", &repo_root, "fetch", "--prune", "origin"])
                     .output_with_context(),
             )
             .await;
-            match pull_result {
+            match fetch_result {
                 Ok(Ok(output)) if output.status.success() => {
-                    tracing::debug!(%repo, "pulled main after task cleanup");
+                    tracing::debug!(%repo, "fetched origin after task cleanup");
                 }
                 Ok(Ok(output)) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    tracing::debug!(%repo, err = %stderr, "git pull skipped after task cleanup");
+                    tracing::debug!(%repo, err = %stderr, "git fetch skipped after task cleanup");
                 }
                 Ok(Err(e)) => {
-                    tracing::debug!(%repo, err = %e, "git pull failed after task cleanup");
+                    tracing::debug!(%repo, err = %e, "git fetch failed after task cleanup");
                 }
                 Err(_) => {
-                    tracing::debug!(%repo, "git pull timed out after 60s");
+                    tracing::debug!(%repo, "git fetch timed out after 60s");
                 }
             }
         }
