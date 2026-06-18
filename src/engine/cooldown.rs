@@ -399,13 +399,15 @@ pub async fn record_agent_success(agent_name: &str, model: &str) {
     let store_opt = cooldown_store().lock().await.clone();
     if let Some(store) = store_opt {
         let agent_key = format!("{FAILURE_COUNT_PREFIX}{agent_name}");
-        let model_key = format!("{FAILURE_COUNT_PREFIX}{agent_name}:{model}");
         let credit_key = format!("{CREDIT_FAILURE_COUNT_PREFIX}{agent_name}");
         if let Err(e) = store.kv_set(&agent_key, "0").await {
             tracing::warn!(key = agent_key, err = %e, "failed to reset failure count");
         }
-        if let Err(e) = store.kv_set(&model_key, "0").await {
-            tracing::warn!(key = model_key, err = %e, "failed to reset failure count");
+        if !model.is_empty() {
+            let model_key = format!("{FAILURE_COUNT_PREFIX}{agent_name}:{model}");
+            if let Err(e) = store.kv_set(&model_key, "0").await {
+                tracing::warn!(key = model_key, err = %e, "failed to reset failure count");
+            }
         }
         if let Err(e) = store.kv_set(&credit_key, "0").await {
             tracing::warn!(key = credit_key, err = %e, "failed to reset failure count");
@@ -2466,6 +2468,33 @@ mod tests {
         assert_eq!(
             model_count, 0,
             "success should reset model failure count to 0"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn record_agent_success_without_model_skips_empty_model_key() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        *cooldown_store().lock().await = Some(store.clone());
+
+        let agent = "test_success_without_model";
+
+        record_agent_success(agent, "").await;
+
+        let agent_kv_key = format!("{FAILURE_COUNT_PREFIX}{agent}");
+        let agent_count = store
+            .kv_get(&agent_kv_key)
+            .await
+            .unwrap()
+            .expect("agent failure count should be stored");
+        assert_eq!(agent_count, "0");
+
+        let empty_model_kv_key = format!("{FAILURE_COUNT_PREFIX}{agent}:");
+        let empty_model_count = store.kv_get(&empty_model_kv_key).await.unwrap();
+        assert!(
+            empty_model_count.is_none(),
+            "success without model should not create an empty model failure count key"
         );
     }
 
