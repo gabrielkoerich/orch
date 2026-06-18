@@ -1268,6 +1268,10 @@ pub(crate) async fn auto_merge_pr(
                         pr_number,
                         "GitHub Actions billing failure detected — blocking for human intervention"
                     );
+                    // Persist a repo-level billing failure marker so the router
+                    // can skip dispatching new agents for this repo until billing
+                    // is resolved (24h TTL, auto-clears).
+                    crate::engine::cooldown::set_repo_billing_failure(repo, store).await;
                     let fields = [(
                         "block_reason",
                         serde_json::json!(

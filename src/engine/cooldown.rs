@@ -783,6 +783,21 @@ pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
                 }
             }
         }
+        // Also clear any repo billing failure markers so tasks can be
+        // re-dispatched after a billing issue is resolved.
+        if let Ok(bf_entries) = store.kv_list_prefix(REPO_BILLING_FAILURE_PREFIX).await {
+            for (bf_key, _) in &bf_entries {
+                if let Err(e) = store.kv_delete(bf_key).await {
+                    tracing::warn!(key = bf_key, err = %e, "failed to clear repo billing failure marker");
+                }
+            }
+            if !bf_entries.is_empty() {
+                tracing::info!(
+                    count = bf_entries.len(),
+                    "cleared repo billing failure markers"
+                );
+            }
+        }
         tracing::info!(
             count = keys.len(),
             "cleared all cooldowns and failure counts"
@@ -807,6 +822,86 @@ pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
             tracing::warn!(key = credit_fc_key, err = %e, "failed to reset credit failure count");
         }
         tracing::info!(key, "cleared cooldown and failure count");
+    }
+}
+
+/// KV prefix for per-repo billing failure markers.
+const REPO_BILLING_FAILURE_PREFIX: &str = "repo_billing_failure:";
+
+/// TTL for repo billing failure markers: 24 hours.
+const REPO_BILLING_FAILURE_TTL_SECS: i64 = 24 * 60 * 60;
+
+/// Persist a repo-level billing failure marker so the router skips this repo
+/// and avoids wasting agent compute on tasks whose CI will never succeed.
+pub async fn set_repo_billing_failure(repo: &str, store: &Arc<crate::store::TaskStore>) {
+    let now = chrono::Utc::now().timestamp();
+    let kv_key = format!("{REPO_BILLING_FAILURE_PREFIX}{repo}");
+    if let Err(e) = store.kv_set(&kv_key, &now.to_string()).await {
+        tracing::warn!(repo, err = %e, "failed to persist repo billing failure marker");
+    } else {
+        tracing::info!(
+            repo,
+            ttl_hours = REPO_BILLING_FAILURE_TTL_SECS / 3600,
+            "persisted repo billing failure marker"
+        );
+    }
+}
+
+/// Check if a repo has an active billing failure marker from a recent CI failure.
+///
+/// Returns `true` when an agent should not be dispatched for this repo — any CI
+/// runs triggered by the agent's PR will fail before a runner can start. The
+/// marker has a 24-hour TTL so the system self-recovers once billing is resolved.
+pub async fn is_repo_billing_blocked(store: &Arc<crate::store::TaskStore>, repo: &str) -> bool {
+    let kv_key = format!("{REPO_BILLING_FAILURE_PREFIX}{repo}");
+    match store.kv_get(&kv_key).await {
+        Ok(Some(raw)) => match raw.parse::<i64>() {
+            Ok(ts) => {
+                let now = chrono::Utc::now().timestamp();
+                let age_secs = now - ts;
+                if age_secs < REPO_BILLING_FAILURE_TTL_SECS {
+                    let remaining_hours = (REPO_BILLING_FAILURE_TTL_SECS - age_secs) / 3600;
+                    tracing::debug!(
+                        repo,
+                        remaining_hours,
+                        "repo billing failure marker still active — skipping agent dispatch"
+                    );
+                    true
+                } else {
+                    if let Err(e) = store.kv_delete(&kv_key).await {
+                        tracing::debug!(
+                            repo,
+                            err = %e,
+                            "failed to delete expired repo billing failure marker"
+                        );
+                    }
+                    false
+                }
+            }
+            Err(e) => {
+                tracing::warn!(repo, err = %e, "failed to parse repo billing failure timestamp");
+                false
+            }
+        },
+        Ok(None) => false,
+        Err(e) => {
+            tracing::debug!(
+                repo,
+                err = %e,
+                "failed to check repo billing failure — allowing dispatch"
+            );
+            false
+        }
+    }
+}
+
+/// Clear a repo billing failure marker. Called when a human unblocks tasks,
+/// allowing the next dispatch to attempt again.
+pub async fn clear_repo_billing_failure(repo: &str, store: &Arc<crate::store::TaskStore>) {
+    let kv_key = format!("{REPO_BILLING_FAILURE_PREFIX}{repo}");
+    match store.kv_delete(&kv_key).await {
+        Ok(_) => tracing::info!(repo, "cleared repo billing failure marker"),
+        Err(e) => tracing::warn!(repo, err = %e, "failed to clear repo billing failure marker"),
     }
 }
 
