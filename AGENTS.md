@@ -398,6 +398,30 @@ If you are tempted to add a "back off this task" timer because the ERROR log is 
 
 **Do not file issues like "add backoff for AllAgentsCooled", "rate-limit the route_attempts log spam", "remember the last-cooled time per task", or "skip routing for N seconds after an all-cooled event."** They will be closed as invalid.
 
+### GitHub Actions billing failures block the single task, never a whole repo
+
+When a PR's CI cannot run because of a GitHub Actions billing problem (payment failure, spending limit hit, plan downgrade), the **only** correct response is to block the *current task at merge time* with `block_reason = "GitHub Actions billing failure …"`. The agent must still route, dispatch, do the work, open the PR, and the review agent must still review. Merging is what's blocked, not the work itself.
+
+There must be **zero "skip the whole repo" mechanism**: no `repo_billing_failure:*` KV markers, no `set_repo_billing_failure()` / `is_repo_billing_blocked()` / `clear_repo_billing_failure()` helpers, no preemptive check in `tick_route_tasks` that transitions tasks to `Blocked` before the router runs, no `clear_repo_billing_failure` calls in `orch task unblock`, no TTL on a repo-wide flag, no per-repo allow/deny list of any other name (`repo_ci_blocked`, `actions_disabled_until`, etc.).
+
+**Why**: blocking pre-dispatch confuses three different things:
+
+1. **Discovering the billing failure is cheap** — orch already detects it via `is_billing_failure()` (`src/engine/auto_merge.rs`) when it tries to merge an open PR. There is no per-PR cost to *finding out* CI is broken.
+2. **Doing the work is still valuable** — the PR exists once merging unblocks. The diff, the review, the agent's reasoning, and the human-readable summary are all artifacts the operator wants regardless of whether CI is currently paid up. A repo with a 6-hour billing outage shouldn't lose 6 hours of agent throughput.
+3. **A repo-wide marker has no way to know when CI is fixed** — orch can't poll GitHub billing status. A 24h TTL is arbitrary; clearing on `orch task unblock` couples two unrelated concerns. The marker either over-blocks (CI was restored 5 min after the failure, but the marker still gates everything for 23h55m) or under-blocks (operator runs `unblock` without fixing billing, and the next task immediately re-blocks the same way). The natural signal is the merge attempt itself — let it fire per-task, block per-task.
+
+The correct path on a billing failure:
+
+- `is_billing_failure()` returns true during `auto_merge_pr` → mark **that one task** `Blocked` with the billing `block_reason` and `return Ok(())`. That's it.
+- Other tasks for the same repo keep routing, dispatching, opening PRs, getting reviewed. When each one reaches the merge attempt, it either succeeds (CI restored in the meantime) or hits the same per-task block.
+- Operator pays the bill → runs `orch task unblock all` → blocked tasks return to `new` → next merge attempt succeeds. No repo-wide flag to keep in sync.
+
+Cautionary tale — exactly the mistake never to repeat:
+
+- **PR #3334** (`fix(router): skip agent dispatch for repos with active GitHub Actions billing failures`) introduced `repo_billing_failure:{repo}` markers with a 24h TTL and a `tick_route_tasks` pre-check that transitioned every new task for that repo straight to `Blocked` without running the router. It also coupled `orch task unblock` to clearing the marker. The agent never got to write code, the review agent never got to review, and the human lost a full day of throughput per repo per billing hiccup — for a class of failure that's already caught one layer down at exactly the right granularity. Reverted.
+
+**Do not file issues like "skip dispatch when CI is broken", "save agent compute when GitHub billing fails", "add a 24h TTL marker for repos with billing problems", or "preemptively block tasks for repos whose last merge failed on infra".** They will be closed as invalid. The per-task block at merge time is the boundary; do not move it earlier.
+
 ### No 'budget' features — agents run on subscription / fixed pricing
 
 There must be **zero "budget" tracking, accounting, or enforcement** anywhere in orch. No per-task token budgets, no per-PR budget warnings, no routing wall-clock budgets, no `llm_budget_secs` / `llm_bypass_*` knobs, no `budget_warning` / `budget_exceeded` columns, no `check_token_budget()` pre-run or post-run, no `TokenBudgetExceeded` failure category, no `BudgetCheckOutcome` enum, no "budget exhausted" cooldown reason.

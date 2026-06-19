@@ -955,12 +955,6 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
             }
         }
 
-        // Clear the repo billing failure marker so the next dispatch
-        // attempt is not blocked by the stale marker.
-        if let Some(ref s) = store {
-            crate::engine::cooldown::clear_repo_billing_failure(&repo, s).await;
-        }
-
         let total = external_count + internal_count;
         println!(
             "Unblocked {} tasks ({} external, {} internal) (attempts reset)",
@@ -982,7 +976,6 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
                     "Unblocked internal task #{} (attempts reset, will be re-routed)",
                     parsed
                 );
-                crate::engine::cooldown::clear_repo_billing_failure(&repo, s).await;
                 return Ok(());
             }
         }
@@ -996,7 +989,6 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
                         "Unblocked internal task #{} (attempts reset, will be re-routed)",
                         parsed
                     );
-                    crate::engine::cooldown::clear_repo_billing_failure(&repo, s).await;
                     return Ok(());
                 }
             }
@@ -1007,9 +999,6 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
     store::store_reset_counters(&store, &repo, &ext_id.0).await;
     update_status_store_first(&store, &backend, &repo, &ext_id, Status::New).await?;
     println!("Unblocked task #{} (attempts reset)", id);
-    if let Some(ref s) = store {
-        crate::engine::cooldown::clear_repo_billing_failure(&repo, s).await;
-    }
 
     Ok(())
 }
