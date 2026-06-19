@@ -95,7 +95,10 @@ fn status_is_known(status: &str) -> bool {
 pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
     let mut last_err: Option<anyhow::Error> = None;
     let mut saw_jsonish_candidate = false;
-    let mut best_candidate: Option<AgentResponse> = None;
+    // Pair: (parsed response, raw candidate string) so we can check the raw object
+    // for substantive fields that map_generic_response handles but that direct
+    // deserialization into AgentResponse ignores (e.g. "output", "message").
+    let mut best_candidate: Option<(AgentResponse, String)> = None;
 
     for candidate in json_candidates(raw) {
         match parse_candidate(&candidate) {
@@ -107,7 +110,7 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
                 }
                 // Non-canonical status - remember it but keep looking for better.
                 if best_candidate.is_none() {
-                    best_candidate = Some(resp);
+                    best_candidate = Some((resp, candidate));
                 }
             }
             Err(err) => {
@@ -126,8 +129,8 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
     // be deserialized into AgentResponse, but they carry no orch fields like
     // `summary`, `accomplished`, `files`, etc. Returning them would silently
     // promote a domain value (e.g. "inbound-not-submitted") as the task status.
-    if let Some(resp) = best_candidate {
-        if has_substantive_fields(&resp) {
+    if let Some((resp, raw_candidate)) = best_candidate {
+        if has_substantive_fields(&raw_candidate) {
             return Ok(resp);
         }
     }
@@ -288,20 +291,22 @@ fn find_closing_fence_at_line_boundary(content: &str) -> Option<usize> {
     None
 }
 
-/// Returns true if the response has at least one substantive orch control field beyond `status`.
+/// Returns true if the raw JSON candidate has at least one substantive orch control field.
 ///
-/// Domain JSON records (career pipeline entries, trading alerts, etc.) parse successfully
-/// as `AgentResponse` because all fields except `status` are `#[serde(default)]`, but they
-/// carry none of these control fields. Checking this prevents a domain `status` value
-/// (e.g. "inbound-not-submitted") from being promoted as the orch task status.
-fn has_substantive_fields(resp: &AgentResponse) -> bool {
-    !resp.summary.is_empty()
-        || !resp.accomplished.is_empty()
-        || !resp.remaining.is_empty()
-        || !resp.files.is_empty()
-        || !resp.learnings.is_empty()
-        || !resp.delegations.is_empty()
-        || resp.error.is_some()
+/// Operates on the raw string (not the deserialized `AgentResponse`) so that fields like
+/// `output` and `message` — which `map_generic_response` maps to `summary` but which are
+/// not struct fields on `AgentResponse` and are silently ignored by direct deserialization —
+/// are correctly treated as substantive. This prevents domain JSON records (career pipeline
+/// entries, trading alerts, etc.) whose only orch-like field is `status` from being promoted
+/// as the task status.
+fn has_substantive_fields(raw: &str) -> bool {
+    if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(raw) {
+        return SUBSTANTIVE_RESPONSE_FIELDS
+            .iter()
+            .any(|key| obj.contains_key(*key))
+            || obj.contains_key("error");
+    }
+    false
 }
 
 /// Fields that indicate a JSON blob is an AgentResponse (higher score = better match).
@@ -1403,5 +1408,25 @@ The fix from attempt #8 was already committed. All quality gates pass.
             "Career radar written to md/career/2026-06-15-radar.md"
         );
         assert_eq!(resp.files, vec!["md/career/2026-06-15-radar.md"]);
+    }
+
+    #[test]
+    fn parse_regression_3336_noncanonical_with_output_accepted() {
+        // A non-canonical status with `output` (handled by map_generic_response but not a
+        // struct field on AgentResponse) must still be accepted — not rejected with a parse
+        // error. Previously `has_substantive_fields` checked the deserialized struct and
+        // missed `output`, causing this to fail with "JSON object lacks substantive".
+        let input = r#"{"status":"mystery_status","output":"All tests passed"}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "mystery_status");
+    }
+
+    #[test]
+    fn parse_regression_3336_noncanonical_with_message_accepted() {
+        // Same as above for `message` — also substantive but absent from the AgentResponse
+        // struct, so direct deserialization leaves summary empty.
+        let input = r#"{"status":"mystery_status","message":"All tests passed"}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "mystery_status");
     }
 }
