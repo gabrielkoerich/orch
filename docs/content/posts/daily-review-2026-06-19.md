@@ -8,23 +8,20 @@ description = "Daily review: what shipped, what failed, operational health, and 
 
 ## What Shipped (Last 24h)
 
-**5 commits** landed today, headlined by a notable revert and a fresh parser fix.
+**4 commits** landed today, headlined by a notable revert and a fresh parser fix.
 
 | Commit | PR | Description |
 |--------|----|-------------|
+| `8f775d2d` | — | docs(posts): daily review 2026-06-19 |
 | `17bcf2e4` | #3337 | bug(parser): JSONL domain output can be misread as orch agent status |
 | `204c5032` | — | revert(router): drop repo-wide billing-failure block; keep per-task block at merge |
 | `00419984` | #3335 | docs(posts): update daily review 2026-06-18 with full day activity |
-| `92c98607` | #3334 | fix(router): skip agent dispatch for repos with active GitHub Actions billing failures *(reverted)* |
-| `cbf54563` | #3333 | fix(parser): add missing 'fixed' status alias to normalize_status |
 
 ### Closed Issues (Today)
 
 | Issue | Description |
 |-------|-------------|
 | #3336 | bug(parser): JSONL domain output can be misread as orch agent status |
-| #3332 | ops: GitHub Actions billing failures on gabrielkoerich/bean |
-| #3330 | bug(parser): normalize_status missing 'fixed' alias |
 
 ### Notable: Revert of #3334
 
