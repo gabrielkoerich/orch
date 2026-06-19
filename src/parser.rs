@@ -120,9 +120,16 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
     }
 
     // If we found a candidate with non-canonical status but no known-status
-    // candidate was found, use the best one we have.
+    // candidate was found, use the best one we have — but only if it has at
+    // least one substantive orch control field. Domain JSON records (career
+    // pipeline entries, trading alerts, etc.) have a `status` field that can
+    // be deserialized into AgentResponse, but they carry no orch fields like
+    // `summary`, `accomplished`, `files`, etc. Returning them would silently
+    // promote a domain value (e.g. "inbound-not-submitted") as the task status.
     if let Some(resp) = best_candidate {
-        return Ok(resp);
+        if has_substantive_fields(&resp) {
+            return Ok(resp);
+        }
     }
 
     if saw_jsonish_candidate {
@@ -279,6 +286,22 @@ fn find_closing_fence_at_line_boundary(content: &str) -> Option<usize> {
         search_from = after_nl;
     }
     None
+}
+
+/// Returns true if the response has at least one substantive orch control field beyond `status`.
+///
+/// Domain JSON records (career pipeline entries, trading alerts, etc.) parse successfully
+/// as `AgentResponse` because all fields except `status` are `#[serde(default)]`, but they
+/// carry none of these control fields. Checking this prevents a domain `status` value
+/// (e.g. "inbound-not-submitted") from being promoted as the orch task status.
+fn has_substantive_fields(resp: &AgentResponse) -> bool {
+    !resp.summary.is_empty()
+        || !resp.accomplished.is_empty()
+        || !resp.remaining.is_empty()
+        || !resp.files.is_empty()
+        || !resp.learnings.is_empty()
+        || !resp.delegations.is_empty()
+        || resp.error.is_some()
 }
 
 /// Fields that indicate a JSON blob is an AgentResponse (higher score = better match).
@@ -1323,5 +1346,62 @@ The fix from attempt #8 was already committed. All quality gates pass.
         let input = r#"{"status": "done", "summary": "done", "files_modified": ["src/foo.rs", "src/bar.rs"]}"#;
         let resp = parse(input).unwrap();
         assert_eq!(resp.files, vec!["src/foo.rs", "src/bar.rs"]);
+    }
+
+    // ── Regression tests for gh-issue-3336 ───────────────────────────────
+
+    #[test]
+    fn parse_regression_3336_jsonl_domain_status_field_rejected() {
+        // Career pipeline JSONL output. Neither record has an orch canonical status
+        // and neither has any substantive orch fields — must be rejected, not returned
+        // with domain status "inbound-not-submitted" as the task status.
+        let input = r#"{"date":"2026-06-15","role":"Senior Solana Engineer","company":"M0","status":"inbound-not-submitted","source":"referral"}
+{"date":"2026-06-15","role":"Rust Engineer (Solana)","company":"Exo Tech","status":"applied-follow-up-overdue","source":"linkedin"}"#;
+        let err = parse(input).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("agent output is not valid JSON or a supported JSON wrapper")
+                || msg.contains("JSON object lacks substantive"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_regression_3336_single_domain_record_rejected() {
+        // A single domain JSON record with a non-canonical status and no orch fields.
+        let input = r#"{"status":"inbound-not-submitted","date":"2026-06-15","role":"Engineer","company":"Acme"}"#;
+        let err = parse(input).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("agent output is not valid JSON or a supported JSON wrapper")
+                || msg.contains("JSON object lacks substantive"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_regression_3336_noncanonical_status_with_summary_still_accepted() {
+        // A non-canonical orch status WITH a summary is a real agent response and must
+        // still be accepted (not broken by the substantive-field guard).
+        let input = r#"{"status":"fix_deployed","summary":"deployed to staging","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "fix_deployed");
+        assert_eq!(resp.summary, "deployed to staging");
+    }
+
+    #[test]
+    fn parse_regression_3336_jsonl_domain_plus_orch_response_prefers_orch() {
+        // JSONL output where domain records precede an actual orch response with a
+        // canonical status. The parser must pick the orch response.
+        let input = r#"{"date":"2026-06-15","role":"Senior Solana Engineer","company":"M0","status":"inbound-not-submitted","source":"referral"}
+{"date":"2026-06-15","role":"Rust Engineer (Solana)","company":"Exo Tech","status":"applied-follow-up-overdue","source":"linkedin"}
+{"status":"done","summary":"Career radar written to md/career/2026-06-15-radar.md","accomplished":["Wrote career radar"],"remaining":[],"files":["md/career/2026-06-15-radar.md"]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+        assert_eq!(
+            resp.summary,
+            "Career radar written to md/career/2026-06-15-radar.md"
+        );
+        assert_eq!(resp.files, vec!["md/career/2026-06-15-radar.md"]);
     }
 }
