@@ -418,11 +418,10 @@ impl ExternalBackend for GitHubBackend {
 
     async fn list_reconciliation_candidates(&self) -> anyhow::Result<Vec<ExternalTask>> {
         let since = (Utc::now() - Duration::days(30)).to_rfc3339();
-        let open = self.gh.list_all_open_issues(&self.repo, None).await?;
         let closed = self.gh.list_closed_issues_since(&self.repo, &since).await?;
-        let issues = open.into_iter().chain(closed);
 
-        Ok(issues
+        Ok(closed
+            .into_iter()
             .filter(|issue| issue.pull_request.is_none()) // Exclude PRs
             .filter(is_trusted_author) // Only trusted authors
             .map(|issue| ExternalTask {

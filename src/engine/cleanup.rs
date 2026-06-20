@@ -11,11 +11,11 @@ use crate::store;
 use crate::store::store_log_activity;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
-use dashmap::DashSet;
+use dashmap::{DashMap, DashSet};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::time::sleep;
 use tokio::time::timeout;
@@ -27,10 +27,15 @@ use super::sync::ReviewTaskSnapshot;
 /// 30 s gives enough headroom for paginated list_all_tasks calls while still bounding the
 /// overall background-task duration.
 const RECONCILIATION_LIST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Closed-issue reconciliation is a best-effort cleanup fallback, not a per-sync requirement.
+/// Run it on a slower cadence so repeated GitHub slowness does not consume 30 s every sync.
+const RECONCILIATION_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// Per-repo in-flight guard for closed-issue reconciliation/cleanup.
 /// Prevents overlapping cleanup runs from piling up across sync cycles.
 static CLEANUP_IN_FLIGHT: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+/// Per-repo reconciliation cadence tracker.
+static RECONCILIATION_LAST_RUN: LazyLock<DashMap<String, Instant>> = LazyLock::new(DashMap::new);
 
 struct CleanupInFlightGuard {
     repo: String,
@@ -51,6 +56,20 @@ impl CleanupInFlightGuard {
 impl Drop for CleanupInFlightGuard {
     fn drop(&mut self) {
         CLEANUP_IN_FLIGHT.remove(&self.repo);
+    }
+}
+
+fn should_run_reconciliation(repo: &str) -> bool {
+    let now = Instant::now();
+    if let Some(mut last_run) = RECONCILIATION_LAST_RUN.get_mut(repo) {
+        if last_run.elapsed() < RECONCILIATION_INTERVAL {
+            return false;
+        }
+        *last_run = now;
+        true
+    } else {
+        RECONCILIATION_LAST_RUN.insert(repo.to_string(), now);
+        true
     }
 }
 
@@ -220,35 +239,43 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     // Note: This still queries the backend because GitHub `state` (open/closed)
     // is backend-specific and not tracked in the store.
     //
-    // Use list_reconciliation_candidates() (open + 30-day closed window) directly.
+    // Use list_reconciliation_candidates() (closed issues only, bounded recent window) directly.
     // list_all_tasks() fetches every issue ever created (state=all, all pages) and
     // consistently times out on repos with many issues — it is not appropriate for
-    // a per-tick reconciliation path.
-    match timeout(
-        RECONCILIATION_LIST_TIMEOUT,
-        backend.list_reconciliation_candidates(),
-    )
-    .await
-    {
-        Ok(Ok(candidates)) if !candidates.is_empty() => {
-            tracing::debug!(
-                count = candidates.len(),
-                "reconciling closed issues from candidates"
-            );
-            reconcile_closed_tasks(&mut task_ids, &candidates, task_manager).await;
+    // a cleanup fallback path.
+    if should_run_reconciliation(repo) {
+        match timeout(
+            RECONCILIATION_LIST_TIMEOUT,
+            backend.list_reconciliation_candidates(),
+        )
+        .await
+        {
+            Ok(Ok(candidates)) if !candidates.is_empty() => {
+                tracing::debug!(
+                    count = candidates.len(),
+                    "reconciling closed issues from candidates"
+                );
+                reconcile_closed_tasks(&mut task_ids, &candidates, task_manager).await;
+            }
+            Ok(Ok(_)) => {
+                tracing::debug!("no reconciliation candidates found");
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(err = %e, "failed to list reconciliation candidates");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = RECONCILIATION_LIST_TIMEOUT.as_secs(),
+                    retry_after_secs = RECONCILIATION_INTERVAL.as_secs(),
+                    "timed out listing reconciliation candidates"
+                );
+            }
         }
-        Ok(Ok(_)) => {
-            tracing::debug!("no reconciliation candidates found");
-        }
-        Ok(Err(e)) => {
-            tracing::warn!(err = %e, "failed to list reconciliation candidates");
-        }
-        Err(_) => {
-            tracing::warn!(
-                timeout_secs = RECONCILIATION_LIST_TIMEOUT.as_secs(),
-                "timed out listing reconciliation candidates"
-            );
-        }
+    } else {
+        tracing::debug!(
+            retry_after_secs = RECONCILIATION_INTERVAL.as_secs(),
+            "skipping closed-issue reconciliation until interval elapses"
+        );
     }
 
     // Also include internal done tasks.
@@ -1396,6 +1423,7 @@ mod tests {
     use crate::store::{NewTask, TaskStore};
     use async_trait::async_trait;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     // worktree_age_hours
@@ -2041,5 +2069,108 @@ mod tests {
         assert_eq!(comments.len(), 1);
         assert_eq!(comments[0].0, "101");
         assert!(comments[0].1.contains("PR merged, marking task complete"));
+    }
+
+    struct ReconciliationMockBackend {
+        reconciliation_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ExternalBackend for ReconciliationMockBackend {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn create_task(
+            &self,
+            _title: &str,
+            _body: &str,
+            _labels: &[String],
+        ) -> anyhow::Result<ExternalId> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn get_task(&self, _id: &ExternalId) -> anyhow::Result<ExternalTask> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn list_by_status(&self, _status: Status) -> anyhow::Result<Vec<ExternalTask>> {
+            Ok(vec![])
+        }
+
+        async fn list_reconciliation_candidates(&self) -> anyhow::Result<Vec<ExternalTask>> {
+            self.reconciliation_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![])
+        }
+
+        async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
+            Ok(vec![])
+        }
+
+        async fn post_comment(&self, _id: &ExternalId, _body: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn set_labels(&self, _id: &ExternalId, _labels: &[String]) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn remove_label(&self, _id: &ExternalId, _label: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn get_sub_issues(&self, _id: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
+            Ok(vec![])
+        }
+
+        async fn create_sub_task(
+            &self,
+            _parent: &ExternalId,
+            _title: &str,
+            _body: &str,
+            _labels: &[String],
+        ) -> anyhow::Result<ExternalId> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn health_check(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_reconciliation_is_rate_limited_per_repo() {
+        let repo = "owner/repo-cleanup-rate-limit";
+        RECONCILIATION_LAST_RUN.remove(repo);
+
+        let backend = Arc::new(ReconciliationMockBackend {
+            reconciliation_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let backend_dyn: Arc<dyn ExternalBackend> = backend.clone();
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend_dyn.clone(),
+            store.clone(),
+            repo.to_string(),
+        ));
+        let opts = JanitorOptions {
+            ttl_hours: 0,
+            dry_run: true,
+        };
+
+        cleanup_done_worktrees_with_opts(&backend_dyn, repo, &task_manager, &store, &opts)
+            .await
+            .unwrap();
+        cleanup_done_worktrees_with_opts(&backend_dyn, repo, &task_manager, &store, &opts)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            backend.reconciliation_calls.load(Ordering::SeqCst),
+            1,
+            "cleanup should not re-list reconciliation candidates on every sync pass"
+        );
+
+        RECONCILIATION_LAST_RUN.remove(repo);
     }
 }
