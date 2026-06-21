@@ -28,6 +28,26 @@ orch cooldown clear --all           # clear all active cooldowns
 orch task unblock all               # unblock blocked tasks
 ```
 
+## Filing issues — NEVER mention a project orch works on internally
+
+When filing a new issue in this repo (`gabrielkoerich/orch`), describe orch's behavior in **generic, repo-agnostic terms**. **Never name any of the downstream projects orch dispatches to** — not in the title, body, suggested fix, evidence section, SQL output, log snippets, or anywhere else.
+
+This applies to:
+
+- Owner/repo slugs of downstream projects (`owner/project-name`, …)
+- Bare project names of downstream projects (`project-name`, …)
+- **Any absolute path** — never paste raw paths into an issue. Home-directory paths (`/Users/<name>/...`, `/home/<name>/...`) leak the operator's username, and even non-home paths often embed a downstream project name or other operational detail. Use a tilde-rooted placeholder form (`~/.orch/worktrees/<project>/<branch>/`) or describe the location in words ("the agent's worktree", "the orch state dir").
+- Evidence tables / SQL output that leak a `repo` column (or any column that names a project / embeds a path) — redact before pasting (use `<repo>`, `<path>`, or drop the column)
+- Log lines that name a downstream project or contain absolute paths — paraphrase before quoting
+
+If you need to describe a reproduction, abstract it: "a downstream project", "the repo that owns the failing task", "the affected repo".
+
+Filing an issue triggered by something you observed in a downstream project is **fine** — the rule is about the *name*, not the *source*. Strip the identifying name, keep the behavior. "Tasks for a downstream repo block at merge time when GitHub Actions billing fails — is the per-task block working as intended?" is a fine issue. "Tasks for `owner/project` block at merge time…" is not.
+
+**Why**: orch is a generic orchestrator. Issues are the long-term spec of how it should behave. Naming a specific downstream project couples the bug report to that project's transient state, leaks the operator's internal project list into a shared tracker, and produces issues that future agents misinterpret as "this bug only happens for project X" when the underlying behavior is generic.
+
+Cautionary tale — issue #3339 named a specific downstream project throughout the body and SQL output while describing behavior that was actually working as intended per the settled architecture (per-task block at merge time on GitHub Actions billing failure). It was deleted.
+
 ## Manual issue closure cleanup
 
 **IMPORTANT:** When you manually close a GitHub issue, agents may still be working on it — tmux sessions and worktrees must be cleaned up or they'll interfere with future work.
@@ -300,57 +320,39 @@ If you believe the generic system has a bug (e.g., cooldowns not being applied, 
 
 #### NEVER hardcode model names or aliases in router code
 
-There must be **zero literal model-identifier strings** in the routing/dispatch code paths (e.g. `"github-copilot/gpt-5.3"`, `"gpt-5.3-codex"`, `"opencode/..."`). No `match` arms keyed on specific models, no "known unavailable" allow/deny lists, no canonicalization tables that rewrite alias A → alias B, no per-model `if agent == "opencode" && model == "X"` branches anywhere in `src/engine/router/`, `src/engine/runner/`, or `src/engine/cooldown.rs`.
+There must be **zero literal model-identifier strings** in the routing/dispatch code paths (`"github-copilot/gpt-5.3"`, `"gpt-5.3-codex"`, `"opencode/..."`, etc.). No `match` arms keyed on specific models, no "known unavailable" allow/deny lists, no canonicalization tables that rewrite alias A → alias B, no per-model `if agent == "X" && model == "Y"` branches anywhere in `src/engine/router/`, `src/engine/runner/`, or `src/engine/cooldown.rs`.
 
 When a model fails (including `Model not found` / `ProviderModelNotFoundError` / "model unavailable"), the **only** correct response is:
 
-1. The runner classifies the error as `AgentError::ModelUnavailable`.
-2. `cooldown::record_persistent_model_failure(agent, model)` puts that **specific model** into a long cooldown (4h base → 7d max).
-3. The router's next selection skips that model via `is_model_in_cooldown()` and picks the next entry in the pool — or fails over to a different agent if none remain.
+1. Runner classifies the error as `AgentError::ModelUnavailable`.
+2. `cooldown::record_persistent_model_failure(agent, model)` puts that specific model into a long cooldown (4h base → 7d max).
+3. The router's next selection skips that model via `is_model_in_cooldown()` and picks the next entry — or fails over to a different agent if none remain.
 4. The agent itself is not penalized — its other models still route normally.
 
-That's it. There is no list to update, no alias to add, no `is_known_unavailable_model()` to extend. If the cooldown is being cleared too early, fix the cooldown duration. If the wrong error variant is returned, fix the parser in the agent runner. If the model keeps coming back from config, that's a **config** problem (`~/.orch/config.yml` is human-managed — see "Config files are off-limits").
+There is no list to update, no alias to add, no `is_known_unavailable_model()` to extend. If the cooldown clears too early, fix the duration. If the wrong error variant comes back, fix the parser. If the model keeps coming back from config, that's a **config** problem (see "Config files are off-limits").
 
-Cautionary tales — these are exactly the mistake to never repeat:
+Cautionary tales — **PRs #3020 and #3040** added `canonicalize_model_alias()` / `is_known_unavailable_model()` with hardcoded `"github-copilot/gpt-5.3"` → `"gpt-5.3-codex"` rewrites. Both reverted. **Issue #3051** proposed adding yet another model name to the same hardcoded list — closed as invalid.
 
-- **PR #3020** (`fix(router): canonicalize dead opencode copilot model alias`) added `canonicalize_model_alias()` and `is_known_unavailable_model()` with hardcoded `"github-copilot/gpt-5.3"` → `"gpt-5.3-codex"` rewrites in `src/engine/router/config.rs`. Wrong on two counts: (a) the rewrite produced an identifier the target CLI also rejected, and (b) there should never have been a hardcoded model string in code in the first place.
-- **PR #3040** (`fix(router): filter dead github-copilot/gpt-5.3 alias …`) tried to "fix" #3020 by reordering the same hardcoded match arms. It compounded the mistake instead of removing it.
-- **Issue #3051** (`gpt-5.3-codex not filtered for opencode agent — is_known_unavailable_model only covers …`) proposed adding **another** model name to the same hardcoded list. Closed as invalid for the same reason.
-
-Both PRs were reverted. If you are tempted to add a model name to a `match` or a `Vec<&str>` of "bad models", **stop**: the generic per-model cooldown already handles it the moment the dispatch fails, and any list you write rots the next time a model is renamed/added/removed. Do not file issues like #3051; do not write code like #3020.
-
-If `record_persistent_model_failure` is somehow not firing for your scenario, file an issue about the **classifier** (why didn't `AgentError::ModelUnavailable` come back?) or about the **cooldown duration** (why is the model being retried too soon?) — never about adding a specific model name to a filter.
+If you are tempted to add a model name to a `match` or `Vec<&str>` of "bad models", **stop**: the generic per-model cooldown handles it the moment dispatch fails, and any list rots the next time a model is renamed. If `record_persistent_model_failure` isn't firing for your scenario, file an issue about the **classifier** or the **cooldown duration** — never about adding a specific model name to a filter.
 
 #### Pre-emptive Routability and Circuit-Breaker Behavior
 
-The router now implements two key optimizations to prevent unnecessary agent invocations:
+The router implements two optimizations to prevent unnecessary agent invocations:
 
-1. **Pre-emptive routability check**: Before attempting to route a task, the router evaluates each agent/model combination's routing weight. If the weight has decayed below a configurable threshold (indicating poor recent performance), that combination is skipped entirely.
+1. **Pre-emptive routability check** — before routing, evaluate each agent/model's routing weight; skip combinations whose weight has decayed below a configurable threshold.
+2. **Circuit-breaker behavior** — `out_of_credits` and `org_level_disabled` trigger extended cooldowns (typically 2-4x standard durations) to prevent repeated futile attempts.
 
-2. **Circuit-breaker behavior**: When specific failure events occur (`out_of_credits` or `org_level_disabled`), the router applies extended cooldown periods (typically 2-4x longer than standard cooldowns) to prevent repeated futile attempts.
+Both reuse the generic cooldown system as the single source of truth.
 
-These mechanisms integrate with the generic cooldown system as follows:
-- Routing weight decay is tracked in the same system that handles failure recovery
-- Extended cooldowns for special events are still managed by `src/engine/cooldown.rs`
-- The router queries the cooldown system to determine if an agent/model is available
-- All cooldown state remains the single source of truth in the SQLite store
+**Integration points** (`src/engine/router/mod.rs`):
 
-**Monitoring and alerting guidance**:
-- Monitor the percentage of agent/model combinations that are skipped due to low routing weight
-- Set up alerts when 3+ agents show degraded routing weight (weight < threshold) simultaneously
-- Track the frequency and duration of extended cooldowns for `out_of_credits` and `org_level_disabled` events
-- Review router logs for messages indicating skipped agents due to weight decay or circuit-breaker activation
+- `router.refresh_health(&store)` — each tick; delegates to `cooldown::refresh_degraded_agents()` (queries `rate_limits`, updates degraded set).
+- `router.agent_is_routable(agent, complexity)` — guards routing; false when `is_agent_in_cooldown` / `is_agent_degraded`; with `weighted_round_robin`, also skips agents whose `AgentWeights::get_weight` is below `router.skip_limited_threshold` (default `0.3`).
+- `router.available_agents_for_complexity(complexity)` — filters through `agent_is_routable`; used by round-robin, weighted, and LLM paths.
+- `cooldown::record_credit_exhaustion(agent, reason)` — exponential agent-wide cooldown (1h→8h for `out_of_credits`, 2h→8h for `org_level_disabled`, 24h→7d for `billing_cycle_exhausted`).
+- `cooldown::record_agent_success(agent, model)` — runner calls on success; resets `failure_count:*` so next failure restarts from base.
 
-**Actual integration points** (in `src/engine/router/mod.rs`):
-- `router.refresh_health(&store)` — called each tick; delegates to `cooldown::refresh_degraded_agents()` which queries the `rate_limits` table and updates the in-memory degraded set
-- `router.agent_is_routable(agent, complexity)` — guards all routing paths; returns `false` when `cooldown::is_agent_in_cooldown(agent)` or `cooldown::is_agent_degraded(agent)` is true; additionally skips agents whose `AgentWeights::get_weight` has fallen below `router.skip_limited_threshold` when `weighted_round_robin` is enabled
-- `router.available_agents_for_complexity(complexity)` — filters `available_agents` through `agent_is_routable`; used by round-robin, weighted, and LLM routing paths
-- `cooldown::record_credit_exhaustion(agent, reason)` — applies exponential agent-wide cooldown (1h→8h for `out_of_credits`, 2h→8h for `org_level_disabled`, 24h→7d for `billing_cycle_exhausted`)
-- `cooldown::record_agent_success(agent, model)` — called by the runner on success; resets `failure_count:*` KV keys so the next failure restarts backoff from the base duration
-- `weights.get_weight(agent)` (in `AgentWeights`) — used by weighted-round-robin; decays on each `record_rate_limit` call and recovers toward 1.0 over time
-- `router.skip_limited_threshold` (`RouterConfig`) — weight threshold below which an agent is considered too degraded for proactive routing; default `0.3`; only evaluated when `weighted_round_robin` is enabled
-
-These checks happen before LLM-based routing, preventing unnecessary invocation attempts when success is unlikely.
+These checks happen before LLM-based routing.
 
 ### Migrations are immutable — NEVER modify existing migration files
 
@@ -378,78 +380,59 @@ If routing is too slow: lower `router.timeout_seconds`, or reduce `router.max_ta
 
 ### No per-task routing defer — `AllAgentsCooledError` must retry next tick, not write a timer
 
-There must be **zero per-task deferral state** anywhere in the routing path. No `route_defer_until:*` KV keys, no `route_defer_key()` / `compute_route_defer_secs()` / `route_defer_remaining_secs()` / `set_route_defer_until()` / `clear_route_defer()` helpers, no "back off this task for N seconds because all agents are cooled," no per-task timer of any other name (`route_backoff_until`, `next_route_attempt_at`, `cooled_skip_until`, etc.).
+There must be **zero per-task deferral state** in the routing path. No `route_defer_until:*` KV keys, no `route_defer_*` helpers, no per-task timer under any other name (`route_backoff_until`, `next_route_attempt_at`, `cooled_skip_until`, etc.).
 
 When `router.route()` returns `AllAgentsCooledError`, the **only** correct response in `tick_route_tasks` is:
 
-1. `tracing::error!(...)` — loud, every tick, can't be hidden.
+1. `tracing::error!(...)` — loud, every tick.
 2. `continue` — task stays in `new`.
-3. Next tick (~10s later), the routing loop tries again.
+3. Next tick (~10s later), routing tries again.
 
-The agent-level cooldown system in `src/engine/cooldown.rs` is already the single source of truth for "is this agent/model available right now." `available_agents_for_complexity()` filters cooled agents via `is_agent_in_cooldown` / `is_model_in_cooldown` / `is_agent_degraded` *before* any LLM call, so when everything is cooled, `router.route()` returns `AllAgentsCooledError` in microseconds — no tokens, no network, no LLM. There is nothing to "defer" away from.
+`src/engine/cooldown.rs` is the single source of truth for "is this agent/model available right now." `available_agents_for_complexity()` filters cooled agents *before* any LLM call, so when everything is cooled, `router.route()` returns `AllAgentsCooledError` in microseconds — no tokens, no network. There is nothing to "defer" away from.
 
-**Why a parallel timer is wrong**: the defer key was a wall-clock value (`now + remaining_secs / 2`) written into SQLite. It counted down independently of the real cooldowns. Long cooldowns (billing-cycle / out_of_credits at 24h → 7d) produced per-task defers of 12h → 3.5d. When agents became available again — minutes or hours before the defer expired — the task remained stranded in `new` because the unrelated future timestamp hadn't passed. There was no mechanism to recompute the defer when cooldowns shortened or cleared.
+**Why a parallel timer is wrong**: the defer key was a wall-clock value (`now + remaining_secs / 2`) written into SQLite. It counted down independently of the real cooldowns. Long cooldowns (billing-cycle / out_of_credits at 24h → 7d) produced per-task defers of 12h → 3.5d. When agents became available again, tasks stayed stranded in `new` because the unrelated future timestamp hadn't passed. **PR #3243** removed it after a live incident — `orch cooldown list` reported `No active cooldowns.` while 9 `route_defer_until:*` KV keys held tasks for hours.
 
-Cautionary tale — exactly the mistake never to repeat:
+If the ERROR log is noisy: the volume **is the feature**. It tells the operator that all agents are unavailable *right now*, every 10s, until the situation resolves. Suppressing it with a per-task timer is how the bug came back. If you genuinely need to throttle: tune `engine.tick_interval`, lower `router.max_tasks_per_tick`, or fix the upstream cooldown duration — never write a parallel timer.
 
-- **PR #3243** removed `route_defer_*` after a live incident in `gabrielkoerich/bean`: `orch cooldown list` reported `No active cooldowns.` while 9 `route_defer_until:*` KV keys held tasks in `new` for hours. Two `gabrielkoerich/orch` tasks (issue #3236 and an internal self-improvement task) hit the same pattern. The defer was guarding against a cost that doesn't exist — `AllAgentsCooledError` returns before any LLM call — and in exchange introduced a timer that drifted out of sync with reality.
-
-If you are tempted to add a "back off this task" timer because the ERROR log is noisy: **stop**. The log volume is the feature. It tells the operator that all agents are unavailable *right now*, every 10s, until the situation resolves. Suppressing it with a per-task timer is how the bug came back. If a specific operational need genuinely requires throttling routing retries: tune `engine.tick_interval`, lower `router.max_tasks_per_tick`, or fix the upstream cooldown duration — never write a parallel timer.
-
-**Do not file issues like "add backoff for AllAgentsCooled", "rate-limit the route_attempts log spam", "remember the last-cooled time per task", or "skip routing for N seconds after an all-cooled event."** They will be closed as invalid.
+**Do not file issues like "add backoff for AllAgentsCooled", "rate-limit the route_attempts log spam", "remember the last-cooled time per task", or "skip routing for N seconds after an all-cooled event."** Closed as invalid.
 
 ### GitHub Actions billing failures block the single task, never a whole repo
 
-When a PR's CI cannot run because of a GitHub Actions billing problem (payment failure, spending limit hit, plan downgrade), the **only** correct response is to block the *current task at merge time* with `block_reason = "GitHub Actions billing failure …"`. The agent must still route, dispatch, do the work, open the PR, and the review agent must still review. Merging is what's blocked, not the work itself.
+When a PR's CI cannot run because of a GitHub Actions billing problem (payment failure, spending limit, plan downgrade), the **only** correct response is to block the *current task at merge time* with `block_reason = "GitHub Actions billing failure …"`. The agent still routes, dispatches, does the work, opens the PR; the review agent still reviews. Merging is what's blocked, not the work.
 
-There must be **zero "skip the whole repo" mechanism**: no `repo_billing_failure:*` KV markers, no `set_repo_billing_failure()` / `is_repo_billing_blocked()` / `clear_repo_billing_failure()` helpers, no preemptive check in `tick_route_tasks` that transitions tasks to `Blocked` before the router runs, no `clear_repo_billing_failure` calls in `orch task unblock`, no TTL on a repo-wide flag, no per-repo allow/deny list of any other name (`repo_ci_blocked`, `actions_disabled_until`, etc.).
+There must be **zero "skip the whole repo" mechanism**: no `repo_billing_failure:*` KV markers, no `set_repo_billing_failure()` / `is_repo_billing_blocked()` helpers, no pre-dispatch check in `tick_route_tasks`, no TTL on a repo-wide flag, no per-repo allow/deny list under any name (`repo_ci_blocked`, `actions_disabled_until`, etc.).
 
-**Why**: blocking pre-dispatch confuses three different things:
+**Why**: blocking pre-dispatch confuses three things:
 
-1. **Discovering the billing failure is cheap** — orch already detects it via `is_billing_failure()` (`src/engine/auto_merge.rs`) when it tries to merge an open PR. There is no per-PR cost to *finding out* CI is broken.
-2. **Doing the work is still valuable** — the PR exists once merging unblocks. The diff, the review, the agent's reasoning, and the human-readable summary are all artifacts the operator wants regardless of whether CI is currently paid up. A repo with a 6-hour billing outage shouldn't lose 6 hours of agent throughput.
-3. **A repo-wide marker has no way to know when CI is fixed** — orch can't poll GitHub billing status. A 24h TTL is arbitrary; clearing on `orch task unblock` couples two unrelated concerns. The marker either over-blocks (CI was restored 5 min after the failure, but the marker still gates everything for 23h55m) or under-blocks (operator runs `unblock` without fixing billing, and the next task immediately re-blocks the same way). The natural signal is the merge attempt itself — let it fire per-task, block per-task.
+1. **Discovering the billing failure is cheap** — `is_billing_failure()` (`src/engine/auto_merge.rs`) already catches it at merge time.
+2. **Doing the work is still valuable** — the diff, the review, the agent's reasoning are artifacts the operator wants regardless of whether CI is currently paid up.
+3. **A repo-wide marker has no way to know when CI is fixed** — orch can't poll GitHub billing. A TTL is arbitrary; clearing on `orch task unblock` couples unrelated concerns. The marker either over-blocks or under-blocks. The natural signal is the merge attempt — let it fire per-task, block per-task.
 
-The correct path on a billing failure:
+**Correct path**: `is_billing_failure()` returns true during `auto_merge_pr` → mark **that one task** `Blocked` with the billing `block_reason` and `return Ok(())`. Other tasks for the same repo keep routing/dispatching/opening PRs/getting reviewed. Operator pays the bill → `orch task unblock all` → blocked tasks return to `new` → next merge attempt succeeds.
 
-- `is_billing_failure()` returns true during `auto_merge_pr` → mark **that one task** `Blocked` with the billing `block_reason` and `return Ok(())`. That's it.
-- Other tasks for the same repo keep routing, dispatching, opening PRs, getting reviewed. When each one reaches the merge attempt, it either succeeds (CI restored in the meantime) or hits the same per-task block.
-- Operator pays the bill → runs `orch task unblock all` → blocked tasks return to `new` → next merge attempt succeeds. No repo-wide flag to keep in sync.
+Cautionary tale — **PR #3334** introduced `repo_billing_failure:{repo}` markers with a 24h TTL and a `tick_route_tasks` pre-check that transitioned new tasks straight to `Blocked` without running the router. The agent never wrote code, the review agent never reviewed, and the operator lost a full day of throughput per billing hiccup — for a class of failure already caught one layer down at the right granularity. Reverted.
 
-Cautionary tale — exactly the mistake never to repeat:
-
-- **PR #3334** (`fix(router): skip agent dispatch for repos with active GitHub Actions billing failures`) introduced `repo_billing_failure:{repo}` markers with a 24h TTL and a `tick_route_tasks` pre-check that transitioned every new task for that repo straight to `Blocked` without running the router. It also coupled `orch task unblock` to clearing the marker. The agent never got to write code, the review agent never got to review, and the human lost a full day of throughput per repo per billing hiccup — for a class of failure that's already caught one layer down at exactly the right granularity. Reverted.
-
-**Do not file issues like "skip dispatch when CI is broken", "save agent compute when GitHub billing fails", "add a 24h TTL marker for repos with billing problems", or "preemptively block tasks for repos whose last merge failed on infra".** They will be closed as invalid. The per-task block at merge time is the boundary; do not move it earlier.
+**Do not file issues like "skip dispatch when CI is broken", "save agent compute when GitHub billing fails", "add a 24h TTL marker", or "preemptively block tasks for repos whose last merge failed on infra".** Closed as invalid. The per-task block at merge time is the boundary; do not move it earlier.
 
 ### No 'budget' features — agents run on subscription / fixed pricing
 
-There must be **zero "budget" tracking, accounting, or enforcement** anywhere in orch. No per-task token budgets, no per-PR budget warnings, no routing wall-clock budgets, no `llm_budget_secs` / `llm_bypass_*` knobs, no `budget_warning` / `budget_exceeded` columns, no `check_token_budget()` pre-run or post-run, no `TokenBudgetExceeded` failure category, no `BudgetCheckOutcome` enum, no "budget exhausted" cooldown reason.
+There must be **zero "budget" tracking, accounting, or enforcement** anywhere in orch. No per-task token budgets, no per-PR budget warnings, no routing wall-clock budgets, no `budget_warning` / `budget_exceeded` columns, no `check_token_budget()`, no `TokenBudgetExceeded` failure category, no `BudgetCheckOutcome` enum, no "budget exhausted" cooldown reason, no `llm_budget_secs` / `llm_bypass_*` knobs.
 
-**Why**: all agents orch dispatches to (claude, codex, opencode, kimi, minimax, copilot, …) run on **subscription or fixed-price plans**. There is no per-token billing for orch to throttle against. Counting tokens to "save money" produces no real signal and just adds heavy bookkeeping (extra SQLite columns, extra runner branches, extra PR comments, extra failure categories) that breaks routinely and confuses every subsequent change to the runner / router / store.
+**Why**: all agents orch dispatches to (claude, codex, opencode, kimi, minimax, copilot, …) run on **subscription or fixed-price plans**. There is no per-token billing to throttle against. Counting tokens to "save money" produces no real signal and just adds heavy bookkeeping (extra SQLite columns, extra runner branches, extra PR comments) that breaks routinely.
 
-The correct mechanisms for limiting work already exist and must be used instead:
+The correct mechanisms already exist:
 
-- **Hung / silent agents** → silence detection + agent cooldown (`src/engine/cooldown.rs`)
+- **Hung / silent agents** → silence detection + agent cooldown
 - **Slow router calls** → `router.timeout_seconds` (per-call timeout)
-- **Tick stalls** → watchdog (already wired)
+- **Tick stalls** → watchdog
 - **Runaway retries** → `max_route_attempts`, `max_review_cycles`, per-task attempt counters
 - **Rate limits / out of credits** → existing cooldown variants (`record_rate_limit`, `record_credit_exhaustion`, etc.)
 
-Do **not**:
+Migration `027_drop_budget_columns.sql` removed the budget columns. They stay removed. Do not re-add any of the above under a new name (`max_token_spend`, `cost_cap`, `route_deadline`, etc.) — if you're reaching for a knob that counts tokens or wall-clock seconds against a quota, **stop**: the existing cooldown / timeout / watchdog mechanisms already cover the legitimate cases.
 
-- Re-add `budget_warning` / `budget_exceeded` columns to `tasks` (migration `027_drop_budget_columns.sql` removed them — stay removed).
-- Re-add `check_token_budget()` to `src/engine/runner/task_init.rs` or `src/engine/runner/response_handler.rs`.
-- Re-add `TokenBudgetExceeded` to `FailureCategory` in `src/engine/sync.rs`.
-- Re-add `BudgetCheckOutcome` or any "pre-run budget guard" branch in the runner.
-- Re-add `llm_budget_secs`, `llm_bypass_fail_threshold`, `llm_bypass_window_secs`, `llm_bypass_duration_secs`, `llm_budget_fail_count`, `llm_budget_window_start`, `llm_bypass_until`, `record_llm_budget_timeout()`, `reset_llm_budget_counters()`, or `llm_bypass_active()` to the router.
-- Re-add a `tokio::time::timeout(budget, route_with_llm(...))` wall-clock wrapper around the cascade.
-- Re-add "budget warning" comments to PR bodies.
-- Add new variants of any of the above under a different name (`max_token_spend`, `cost_cap`, `route_deadline`, etc.). If you find yourself reaching for a knob that effectively counts tokens or wall-clock seconds against a quota, **stop**: the existing cooldown / timeout / watchdog mechanisms already cover the legitimate cases.
+**Do not file issues like "add cost tracking", "warn when task exceeds N tokens", "fall back to round-robin after Ns of LLM time", or "block tasks that would burn too many tokens".** Closed as invalid. This is not a per-call-priced system.
 
-**Do not file issues like "add cost tracking", "warn when task exceeds N tokens", "fall back to round-robin after Ns of LLM time", or "block tasks that would burn too many tokens".** They will be closed as invalid. This is not a per-call-priced system.
-
-If a comment in the codebase says "retry budget" / "escalation budget" / "consume the budget" / "exceeds that budget", it refers to a **count of attempts** (a retry quota), not money or tokens. Prefer the word "quota" or "limit" to avoid tempting future agents into re-introducing the feature.
+If a comment says "retry budget" / "escalation budget", it refers to a **count of attempts** (a retry quota), not money or tokens. Prefer "quota" or "limit" to avoid tempting future agents into re-introducing the feature.
 
 ### Security leak detection — ALL patterns block GitHub posting
 
@@ -471,60 +454,34 @@ External-contributor PRs (forks, first-time contributors, anyone outside the tru
 
 **Hard rules:**
 
-1. **Do not clone the fork.** Do not `git clone <fork>`, do not `gh pr checkout`, do not fetch the head ref to a local worktree. Review the change via `gh pr diff <N>` only.
-2. **Do not execute any code from the PR.** No `cargo build`, `cargo test`, `cargo nextest run`, `cargo clippy`, `cargo check`, `just <anything>`, or `bash <script>` against PR contents. Compiling alone runs `build.rs` and proc macros — that is execution.
-3. **Read every file in the diff.** Not just the "interesting" ones. A one-line logic fix bundled with a quiet `.cargo/config.toml` change or a new `build.rs` is the textbook smuggle path. `gh pr diff <N> --patch | less` and read it all.
-4. **New dependency = NO OP.** Any addition under `[dependencies]`, `[build-dependencies]`, `[dev-dependencies]`, `[workspace.dependencies]`, or any new path/git/registry source in `Cargo.toml` / `Cargo.lock` is an immediate no-merge. Request the contributor remove it; if the change genuinely needs a new crate, the dependency is added in a separate maintainer-authored PR after independent vetting (advisory check, license, maintenance status, transitive blast radius). External PRs do not introduce new supply-chain surface.
-5. **Treat the following as hostile until proven otherwise** and require explicit justification before considering merge:
-   - New or modified `build.rs`
-   - New proc-macro crates (`proc-macro = true`, `*-derive`, `*-macros`)
-   - Changes to `.cargo/config.toml`, `rust-toolchain.toml`, `.github/workflows/`, `justfile`, `Makefile`, or any shell/Python script
-   - Network or filesystem access in tests (`reqwest`, `std::fs::write`, `std::process::Command`, `env::var` reads of credentials)
-   - Paths referencing `~/.orch`, `~/.ssh`, `~/.config`, `gh auth token`, `GH_TOKEN`, `GITHUB_TOKEN`, `ANTHROPIC_API_KEY`
+1. **Do not clone the fork** — no `gh pr checkout`, no fetch to a local worktree. Review via `gh pr diff <N>` only.
+2. **Do not execute any code from the PR** — `cargo build`/`test`/`clippy`/`check` all run `build.rs` and proc macros at compile time. That is execution.
+3. **Read every file in the diff** — not just the "interesting" ones. A one-line fix bundled with a quiet `.cargo/config.toml` or new `build.rs` is the textbook smuggle path.
+4. **New dependency = NO OP.** Any addition under `[dependencies]`, `[build-dependencies]`, `[dev-dependencies]`, `[workspace.dependencies]`, or any new path/git/registry source in `Cargo.toml` / `Cargo.lock` is an immediate no-merge. New crates are added in separate maintainer-authored PRs after vetting (advisory check, license, maintenance, transitive blast radius).
+5. **Treat as hostile until proven otherwise**: new/modified `build.rs`; proc-macro crates (`*-derive`, `*-macros`); changes to `.cargo/config.toml` / `rust-toolchain.toml` / `.github/workflows/` / `justfile` / `Makefile` / shell scripts; network or filesystem access in tests (`reqwest`, `std::fs::write`, `std::process::Command`, credential reads); paths referencing `~/.orch` / `~/.ssh` / `gh auth token` / `GH_TOKEN` / `ANTHROPIC_API_KEY`.
 
-**Use the `just review-pr <N>` recipe** for the standard workflow. It:
+**Use `just review-pr <N>`** for the standard workflow. It runs `scripts/review/hooks-check.sh` against the diff (refuses if any tripwire fires — Cargo manifest, build.rs, hooks, CI workflows, shell scripts), then spins up two short-lived Docker containers:
 
-1. Runs `scripts/review/hooks-check.sh` against the PR diff and refuses to proceed if any tripwire fires (Cargo manifest, build.rs, agent/IDE hooks, CI workflows, shell scripts — full list in the script).
-2. Resolves the fork URL + head ref via `gh pr view`.
-3. Spins up two short-lived Docker containers from `scripts/review/Dockerfile.fetch` and `scripts/review/Dockerfile.run`:
-   - **Stage A (fetch)** — network ON, no compilation. `git clone --depth=50 --branch <ref> <fork>` into a volume, then `cargo fetch --locked`. No `build.rs` runs at this point.
-   - **Stage B (run)** — `--network=none`. `cargo nextest run --offline`. Untrusted code first executes here, with no network egress, no host bind mounts, no host credentials.
-4. Cleans up the source + git-deps volumes on exit. The crates.io registry cache and `target/` dir persist across reviews for speed (wipe with `just review-pr-clean`).
+- **Stage A (fetch)** — network ON, no compilation. `git clone --depth=50 --branch <ref>` into a volume, `cargo fetch --locked`. `build.rs` does not run.
+- **Stage B (run)** — `--network=none`, no host bind mounts, no host credentials. `cargo nextest run --offline`. Untrusted code first executes here.
 
-`just hermetic-tests` runs the current worktree through the same network-off stage-B container — use this to catch tests that silently depend on network, a `tmux` binary on PATH, non-root file-mode semantics, etc.
+`just hermetic-tests` runs the current worktree through the same stage-B container — catches tests that silently depend on network, `tmux` on PATH, non-root file-mode semantics.
 
-**If `just review-pr` is not an option** (rare — most fixes can be reasoned about statically), there are two acceptable manual paths:
+**Fallback paths** when `just review-pr` is not an option:
 
-1. **Re-implement in a maintainer-authored branch.** Don't run the fork's commits — recreate the diff yourself, push to a branch on this repo, let CI run there. The fork's bytes never touch a trusted machine.
-2. **Clone and execute inside Docker.** The clone itself happens inside the container — the fork's bytes never land on the host filesystem.
-   - Start a fresh container from a clean base image (e.g. `rust:slim`).
-   - **No bind mounts of host paths.** No `-v ~:/host`, no `-v $(pwd):/work`, no `-v ~/.ssh:...`, no `-v ~/.orch:...`. The container is empty when it starts.
-   - **No host credentials.** No `-e GH_TOKEN`, no `-e GITHUB_TOKEN`, no `-e ANTHROPIC_API_KEY`, no `--env-file ~/.env`. If `gh pr diff` is needed inside, use a scoped throwaway token with read-only access to public repos, not the maintainer's real token.
-   - **Network gated.** `--network=none` if possible. If the build genuinely needs network (Cargo registry fetch), use a fresh network namespace, and never the host network.
-   - Clone the fork **inside** the container (`git clone <fork> /work && cd /work`), then `cargo build` / `cargo nextest run` there.
-   - When done, `docker rm -f` the container. It is disposable — never reuse.
+1. **Re-implement in a maintainer-authored branch.** Recreate the diff yourself, push to this repo, let CI run there. The fork's bytes never touch a trusted machine.
+2. **Clone and execute inside Docker.** Fresh container from a clean base (e.g. `rust:slim`). No bind mounts of host paths. No host credentials in env (no `-e GH_TOKEN`, no `--env-file`). `--network=none` once Cargo fetch is done. Clone the fork *inside* the container, then `cargo nextest run`. `docker rm -f` after. Skeleton:
 
-   Skeleton:
    ```bash
-   docker run --rm -it \
-     --network=none \
-     --read-only --tmpfs /tmp --tmpfs /work \
-     rust:slim bash
-   # inside container:
-   apk add --no-cache git || apt-get update && apt-get install -y git
-   git clone https://github.com/<fork-owner>/<repo>.git /work && cd /work
-   git checkout <pr-branch>
-   cargo nextest run
+   docker run --rm -it --network=none --read-only --tmpfs /tmp --tmpfs /work rust:slim bash
+   # inside: install git, clone fork, checkout PR branch, cargo nextest run
    ```
-   (Network must be re-enabled briefly for the `git clone` and Cargo fetch; the right pattern is to enable network for fetch, then drop it before `cargo build`. Or pre-vendor deps in a trusted base image and run the actual build offline.)
-   - A fresh ephemeral cloud VM / Codespace works the same way: clone inside, run inside, destroy after. Do not reuse for credentialed work.
-   - The container is the trust boundary. If the build/test exfiltrates from inside it, there is nothing to exfiltrate. If you find yourself thinking "I just need to mount `~/.orch` so the test can find the DB," you don't have a sandbox — you have a slower host shell.
 
-Sandboxing is **not** a substitute for static review — read every file in the diff first, regardless of where you intend to run it. The sandbox limits blast radius; static review is what actually catches the bad change.
+   Network must be on briefly for the clone + Cargo fetch, then drop it before build. The container is the trust boundary — if you mount `~/.orch` so a test can find the DB, you don't have a sandbox.
 
-A clean `cargo nextest run` on an untrusted fork is **not** evidence the PR is safe — by the time tests finish, a malicious `build.rs` has already run. Static review is the safety boundary.
+**Sandboxing is not a substitute for static review.** A clean `cargo nextest run` proves nothing — by then `build.rs` has already run. Read every file in the diff first.
 
-**CI does not run on external PRs by design.** All workflows in `.github/workflows/` trigger on `push:` only — no `pull_request:` trigger. PRs from forks do **not** auto-execute Actions, so a malicious `build.rs` cannot exfiltrate repo/org secrets via the CI runner. This is intentional and must stay that way. Do not add `pull_request:` (or worse, `pull_request_target:`, which runs the workflow definition from the base branch but checks out the PR head with full secrets access — the classic supply-chain attack vector) to any workflow. If CI verification is needed on a fork's branch, a maintainer pulls the change into a branch on this repo (where `push:` triggers it) after static review.
+**CI does not run on external PRs by design.** All workflows in `.github/workflows/` trigger on `push:` only — no `pull_request:` (and never `pull_request_target:`, which runs the workflow definition from the base branch but checks out the PR head with full secrets access — the classic supply-chain attack vector). PRs from forks do not auto-execute Actions. If CI verification on a fork is needed, a maintainer pulls the change into a branch on this repo after static review.
 
 ## Agent sandbox
 
