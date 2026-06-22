@@ -144,7 +144,10 @@ pub enum WeightSignal {
     RateLimited { agent: String },
     /// Task is blocked on child tasks (delegations). Do not trigger review agent.
     Blocked,
-    /// No weight-relevant signal (timeout, auth error, etc.)
+    /// Task was rerouted (silence detection, timeout, parse error) — reset to new for re-routing.
+    /// Distinct from None so the engine never converts a silent-reset task into needs_review.
+    Rerouted,
+    /// No weight-relevant signal (guard skipped task, unrecognised status, etc.)
     None,
 }
 

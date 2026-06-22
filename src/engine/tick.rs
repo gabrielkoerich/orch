@@ -1630,9 +1630,14 @@ pub(crate) async fn tick_dispatch_tasks(
                         WeightSignal::Success { .. } => "done",
                         WeightSignal::RateLimited { .. } => "new",
                         WeightSignal::Blocked => "blocked",
-                        // None means the runner guard skipped the task or the task
-                        // completed with an unrecognised status string. Only route to
-                        // needs_review when the review agent is actually enabled;
+                        // Rerouted: silence detection or other non-rate-limit reset already
+                        // moved the task to "new". Stay in "new" — never convert to
+                        // needs_review, which would trigger the no-code shortcut and falsely
+                        // close the task as done without a successful agent run.
+                        WeightSignal::Rerouted => "new",
+                        // None means the runner guard skipped the task (e.g. tmux session
+                        // already exists) or the task completed with an unrecognised status.
+                        // Route to needs_review only when the review agent is enabled;
                         // otherwise mark done so the task is not permanently stuck.
                         WeightSignal::None if enable_review => "needs_review",
                         WeightSignal::None => "done",

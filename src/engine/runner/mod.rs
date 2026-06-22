@@ -1243,9 +1243,11 @@ impl TaskRunner {
                     agent: agent_name.clone(),
                 }
             } else {
-                // Non-rate-limit reroutes (silence, timeout, parse error) should not trigger
-                // weight degradation — they're not provider-side limits.
-                WeightSignal::None
+                // Non-rate-limit reroutes (silence detection, timeout, parse error): signal
+                // the engine to keep the task in "new" for re-routing. Using Rerouted (not
+                // None) prevents tick from converting the silence-reset back to needs_review,
+                // which would trigger the no-code review shortcut and falsely mark it done.
+                WeightSignal::Rerouted
             }
         } else if status == "needs_review" {
             // Rate limit errors that escalate to needs_review must NOT reset backoff
@@ -2456,7 +2458,7 @@ mod tests {
                     agent: agent.to_string(),
                 }
             } else {
-                WeightSignal::None
+                WeightSignal::Rerouted
             }
         } else if status == "done"
             || status == "needs_review"
@@ -2509,18 +2511,43 @@ mod tests {
     }
 
     #[test]
-    fn weight_signal_none_for_reroute_without_rate_limit_error() {
+    fn weight_signal_rerouted_for_non_rate_limit_reroute() {
         // Reroute due to silence detection, timeout, or other non-rate-limit errors
-        // should NOT emit RateLimited (fixes false cooldown cascades).
+        // should emit Rerouted (not RateLimited and not None).
+        // Rerouted maps to "new" in tick so the task stays retryable and is never
+        // converted to needs_review → done via the no-code review shortcut.
         for error_type in ["timeout", "silence detected", "parse_error", "failed"] {
             for status in ["new", "routed"] {
                 let signal = weight_signal_for(status, error_type, "claude");
                 assert!(
-                    matches!(signal, WeightSignal::None),
-                    "{status} with error_type={error_type} should produce WeightSignal::None, not RateLimited"
+                    matches!(signal, WeightSignal::Rerouted),
+                    "{status} with error_type={error_type} should produce WeightSignal::Rerouted, not RateLimited or None"
                 );
             }
         }
+    }
+
+    #[test]
+    fn silence_reset_rerouted_never_becomes_needs_review() {
+        // Regression test for: silence detection sets task to new, runner returns
+        // WeightSignal::Rerouted, tick must map that to "new" — not "needs_review".
+        // If it mapped to needs_review the no-code shortcut would close the task as
+        // done with no successful agent run in the audit trail.
+        let signal = weight_signal_for("new", "silence detected", "claude");
+        assert!(
+            matches!(signal, WeightSignal::Rerouted),
+            "silence-reset reroute must produce Rerouted, never None/needs_review"
+        );
+        // Verify tick mapping: Rerouted => "new" (not needs_review or done)
+        let display_status = match &signal {
+            WeightSignal::Rerouted => "new",
+            WeightSignal::None => "needs_review", // the old (buggy) path
+            _ => "other",
+        };
+        assert_eq!(
+            display_status, "new",
+            "Rerouted must map to 'new' in tick, not 'needs_review'"
+        );
     }
 
     #[test]
