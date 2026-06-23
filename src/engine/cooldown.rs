@@ -493,6 +493,9 @@ pub fn detect_credit_exhaustion(error_message: &str) -> Option<CreditExhaustionR
         "refreshed in the next cycle",
         "weekly/monthly limit exhausted",
         "limit will reset at",
+        "upgrade your token plan", // minimax: Token Plan usage limit reached
+        "token plan usage limit",  // minimax: Token Plan usage limit reached
+        "purchase credits for more", // minimax: ...purchase Credits for more usage
     ];
 
     if billing_cycle_patterns.iter().any(|p| lower.contains(p)) {
@@ -2284,6 +2287,29 @@ mod tests {
             detect_credit_exhaustion(
                 "Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-04-23 18:33:48"
             ),
+            Some(CreditExhaustionReason::BillingCycleExhausted)
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn detect_credit_exhaustion_billing_cycle_minimax() {
+        assert_eq!(
+            detect_credit_exhaustion(
+                "minimax rate limit: API Error: Request rejected (429) · Token Plan usage limit reached: Upgrade your Token Plan or purchase Credits for more usage."
+            ),
+            Some(CreditExhaustionReason::BillingCycleExhausted)
+        );
+        assert_eq!(
+            detect_credit_exhaustion("Upgrade your Token Plan"),
+            Some(CreditExhaustionReason::BillingCycleExhausted)
+        );
+        assert_eq!(
+            detect_credit_exhaustion("Token Plan usage limit reached"),
+            Some(CreditExhaustionReason::BillingCycleExhausted)
+        );
+        assert_eq!(
+            detect_credit_exhaustion("purchase Credits for more usage"),
             Some(CreditExhaustionReason::BillingCycleExhausted)
         );
     }
