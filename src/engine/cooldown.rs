@@ -311,7 +311,7 @@ const EXTENDED_TIER_2_MULTIPLIER: i64 = 12;
 ///
 /// The extended tier applies when the model has hit the max cap multiple times,
 /// indicating a persistently broken model that won't self-resolve quickly.
-pub fn compute_backoff(count: u64, base: i64, max: i64) -> i64 {
+pub fn compute_backoff(count: u64, base: i64, max: i64, allow_extended: bool) -> i64 {
     if count <= 1 {
         return base;
     }
@@ -342,6 +342,10 @@ pub fn compute_backoff(count: u64, base: i64, max: i64) -> i64 {
 
     // Times we've been at the max cap (excluding the first time we hit it)
     let times_at_max = count.saturating_sub(first_max);
+
+    if !allow_extended {
+        return standard;
+    }
 
     if standard == max && times_at_max >= EXTENDED_TIER_2_THRESHOLD {
         max.saturating_mul(EXTENDED_TIER_2_MULTIPLIER)
@@ -442,7 +446,7 @@ pub async fn record_agent_failure_with_message(agent_name: &str, error_message: 
     let count = read_and_increment_failure_count(&store_opt, agent_name).await;
     let base = crate::engine::router::config::get_agent_backoff_base(agent_name);
     let cooldown_until =
-        chrono::Utc::now().timestamp() + compute_backoff(count, base, BACKOFF_MAX_SECS);
+        chrono::Utc::now().timestamp() + compute_backoff(count, base, BACKOFF_MAX_SECS, true);
     set_cooldown_async(agent_name, cooldown_until, "agent_error").await;
 }
 
@@ -558,7 +562,12 @@ pub async fn record_credit_exhaustion(agent_name: &str, reason: CreditExhaustion
             (BILLING_CYCLE_COOLDOWN_SECS, BILLING_CYCLE_MAX_SECS)
         }
     };
-    let cooldown_secs = compute_backoff(count, base, max);
+    let cooldown_secs = compute_backoff(
+        count,
+        base,
+        max,
+        !matches!(reason, CreditExhaustionReason::BillingCycleExhausted),
+    );
     let cooldown_until = chrono::Utc::now().timestamp() + cooldown_secs;
     set_cooldown_async(agent_name, cooldown_until, reason_str).await;
     tracing::warn!(
@@ -579,7 +588,7 @@ pub async fn record_model_failure(agent_name: &str, model: &str) {
     let count = read_and_increment_failure_count(&store_opt, &key).await;
     let base = crate::engine::router::config::get_agent_backoff_base(agent_name);
     let cooldown_until =
-        chrono::Utc::now().timestamp() + compute_backoff(count, base, BACKOFF_MAX_SECS);
+        chrono::Utc::now().timestamp() + compute_backoff(count, base, BACKOFF_MAX_SECS, true);
     set_cooldown_async(&key, cooldown_until, "model_error").await;
 }
 
@@ -596,6 +605,7 @@ pub async fn record_persistent_model_failure(agent_name: &str, model: &str) {
         count,
         PERSISTENT_MODEL_BACKOFF_BASE_SECS,
         PERSISTENT_MODEL_BACKOFF_MAX_SECS,
+        false,
     );
     let cooldown_until = chrono::Utc::now().timestamp() + cooldown_secs;
     set_cooldown_async(&key, cooldown_until, "persistent_model_error").await;
@@ -1464,6 +1474,34 @@ mod tests {
     }
 
     #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn record_persistent_model_failure_stays_capped_at_7_days() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        *cooldown_store().lock().await = Some(store.clone());
+
+        let agent = "testagent_persistent_capped";
+        let model = "testmodel_persistent_capped";
+        let key = format!("{agent}:{model}");
+
+        for _ in 0..9 {
+            record_persistent_model_failure(agent, model).await;
+        }
+
+        let remaining = cooldown_until(&key)
+            .expect("cooldown should exist")
+            .saturating_sub(chrono::Utc::now().timestamp());
+        assert!(
+            remaining >= PERSISTENT_MODEL_BACKOFF_MAX_SECS - 5,
+            "persistent model cooldown should stay capped at 7 days, got {remaining}s"
+        );
+        assert!(
+            remaining <= PERSISTENT_MODEL_BACKOFF_MAX_SECS + 5,
+            "persistent model cooldown should not exceed 7 days, got {remaining}s"
+        );
+    }
+
+    #[serial(cooldown_state)]
     #[test]
     fn parse_retry_at_codex_format() {
         let msg = "You've hit your usage limit. Upgrade to Pro, visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Mar 26th, 2026 5:55 AM.";
@@ -1887,21 +1925,74 @@ mod tests {
     }
 
     #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn record_credit_exhaustion_billing_cycle_stays_capped_after_repeats() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        *cooldown_store().lock().await = Some(store.clone());
+
+        let agent = "test_billing_cycle_agent_capped";
+
+        for _ in 0..5 {
+            record_credit_exhaustion(agent, CreditExhaustionReason::BillingCycleExhausted).await;
+        }
+
+        let remaining = {
+            let map = cooldowns().lock().unwrap();
+            let entry = map.get(agent).expect("cooldown entry should exist");
+            entry.cooldown_until - chrono::Utc::now().timestamp()
+        };
+        assert!(
+            remaining >= BILLING_CYCLE_MAX_SECS - 5,
+            "billing cycle cooldown should stay capped at 7 days, got {remaining}s"
+        );
+        assert!(
+            remaining <= BILLING_CYCLE_MAX_SECS + 5,
+            "billing cycle cooldown should not exceed 7 days, got {remaining}s"
+        );
+    }
+
+    #[serial(cooldown_state)]
     #[test]
     fn credit_exhaustion_backoff_constants() {
         // OutOfCredits first failure: 1h base
         assert_eq!(
-            compute_backoff(1, CREDIT_BACKOFF_BASE_SECS, CREDIT_BACKOFF_MAX_SECS),
+            compute_backoff(1, CREDIT_BACKOFF_BASE_SECS, CREDIT_BACKOFF_MAX_SECS, true),
             CREDIT_BACKOFF_BASE_SECS
         );
         // OrgLevelDisabled first failure: 2h base
         assert_eq!(
-            compute_backoff(1, ORG_BACKOFF_BASE_SECS, CREDIT_BACKOFF_MAX_SECS),
+            compute_backoff(1, ORG_BACKOFF_BASE_SECS, CREDIT_BACKOFF_MAX_SECS, true),
             ORG_BACKOFF_BASE_SECS
         );
         // BillingCycleExhausted: 24h base, 7d cap
         assert_eq!(BILLING_CYCLE_COOLDOWN_SECS, 24 * 60 * 60);
         assert_eq!(BILLING_CYCLE_MAX_SECS, 7 * 24 * 60 * 60);
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn compute_backoff_long_cap_without_extended_stays_capped() {
+        assert_eq!(
+            compute_backoff(
+                3,
+                BILLING_CYCLE_COOLDOWN_SECS,
+                BILLING_CYCLE_MAX_SECS,
+                false
+            ),
+            BILLING_CYCLE_MAX_SECS,
+            "7-day capped paths should stop at the documented max"
+        );
+        assert_eq!(
+            compute_backoff(
+                9,
+                PERSISTENT_MODEL_BACKOFF_BASE_SECS,
+                PERSISTENT_MODEL_BACKOFF_MAX_SECS,
+                false,
+            ),
+            PERSISTENT_MODEL_BACKOFF_MAX_SECS,
+            "persistent model failures should not extend past 7 days"
+        );
     }
 
     // ---- Degraded-agent tracking tests ----
@@ -2146,16 +2237,16 @@ mod tests {
     #[test]
     fn compute_backoff_grows_exponentially() {
         // count=0 or 1: base
-        assert_eq!(compute_backoff(0, 300, 14400), 300);
-        assert_eq!(compute_backoff(1, 300, 14400), 300);
+        assert_eq!(compute_backoff(0, 300, 14400, true), 300);
+        assert_eq!(compute_backoff(1, 300, 14400, true), 300);
         // count=2: base * 3
-        assert_eq!(compute_backoff(2, 300, 14400), 900);
+        assert_eq!(compute_backoff(2, 300, 14400, true), 900);
         // count=3: base * 9
-        assert_eq!(compute_backoff(3, 300, 14400), 2700);
+        assert_eq!(compute_backoff(3, 300, 14400, true), 2700);
         // count=4: base * 27 = 8100 < 14400
-        assert_eq!(compute_backoff(4, 300, 14400), 8100);
+        assert_eq!(compute_backoff(4, 300, 14400, true), 8100);
         // count=5: base * 81 = 24300 → capped at 14400
-        assert_eq!(compute_backoff(5, 300, 14400), 14400);
+        assert_eq!(compute_backoff(5, 300, 14400, true), 14400);
     }
 
     #[serial(cooldown_state)]
@@ -2167,22 +2258,22 @@ mod tests {
         // count=6: 14400s (times_at_max=1, no extension yet, need >=2)
         // count=7: 86400s (times_at_max=2, extended tier 1: 6x = 24h)
         assert_eq!(
-            compute_backoff(5, 300, 14400),
+            compute_backoff(5, 300, 14400, true),
             14400,
             "first at max, not extended"
         );
         assert_eq!(
-            compute_backoff(6, 300, 14400),
+            compute_backoff(6, 300, 14400, true),
             14400,
             "times_at_max=1, not extended"
         );
         assert_eq!(
-            compute_backoff(7, 300, 14400),
+            compute_backoff(7, 300, 14400, true),
             86400,
             "times_at_max=2, extended 6x"
         );
         assert_eq!(
-            compute_backoff(8, 300, 14400),
+            compute_backoff(8, 300, 14400, true),
             86400,
             "times_at_max=3, still extended 6x"
         );
@@ -2194,22 +2285,22 @@ mod tests {
         // With base=300, max=14400:
         // count=10: times_at_max=5 (first_max=5, count=10), extended tier 2: 12x = 48h
         assert_eq!(
-            compute_backoff(9, 300, 14400),
+            compute_backoff(9, 300, 14400, true),
             86400,
             "times_at_max=4, still tier 1"
         );
         assert_eq!(
-            compute_backoff(10, 300, 14400),
+            compute_backoff(10, 300, 14400, true),
             172800,
             "times_at_max=5, extended 12x"
         );
         assert_eq!(
-            compute_backoff(15, 300, 14400),
+            compute_backoff(15, 300, 14400, true),
             172800,
             "times_at_max=10, still tier 2"
         );
         assert_eq!(
-            compute_backoff(20, 300, 14400),
+            compute_backoff(20, 300, 14400, true),
             172800,
             "times_at_max=15, still tier 2"
         );
@@ -2224,10 +2315,10 @@ mod tests {
         // count=5: 60*81=4860 → capped at 3600
         // count=6: times_at_max=1, still 3600
         // count=7: times_at_max=2, extended 6x = 21600 (6h)
-        assert_eq!(compute_backoff(5, 60, 3600), 3600, "first at max");
-        assert_eq!(compute_backoff(6, 60, 3600), 3600, "times_at_max=1");
+        assert_eq!(compute_backoff(5, 60, 3600, true), 3600, "first at max");
+        assert_eq!(compute_backoff(6, 60, 3600, true), 3600, "times_at_max=1");
         assert_eq!(
-            compute_backoff(7, 60, 3600),
+            compute_backoff(7, 60, 3600, true),
             21600,
             "times_at_max=2, extended 6x"
         );
@@ -2240,14 +2331,14 @@ mod tests {
         // With base=300, max=14400:
         // count=21 → times_at_max=16 (first_max=5), extended tier 2: 12x = 48h
         assert_eq!(
-            compute_backoff(21, 300, 14400),
+            compute_backoff(21, 300, 14400, true),
             172800,
             "21 failures should get 48h extended cooldown"
         );
 
         // kimi:haiku with 36 failures
         assert_eq!(
-            compute_backoff(36, 300, 14400),
+            compute_backoff(36, 300, 14400, true),
             172800,
             "36 failures should also get 48h extended cooldown"
         );
@@ -2257,9 +2348,9 @@ mod tests {
     #[test]
     fn compute_backoff_extended_tier_zero_base() {
         // Zero base should still work without panicking
-        assert_eq!(compute_backoff(1, 0, 14400), 0);
-        assert_eq!(compute_backoff(5, 0, 14400), 0);
-        assert_eq!(compute_backoff(10, 0, 14400), 0);
+        assert_eq!(compute_backoff(1, 0, 14400, true), 0);
+        assert_eq!(compute_backoff(5, 0, 14400, true), 0);
+        assert_eq!(compute_backoff(10, 0, 14400, true), 0);
     }
 
     #[serial(cooldown_state)]
@@ -2611,18 +2702,18 @@ mod tests {
     fn compute_backoff_saturates_on_large_counts() {
         // Very large count should not overflow — extended tier applies 48h
         assert_eq!(
-            compute_backoff(100, BACKOFF_BASE_SECS, BACKOFF_MAX_SECS),
+            compute_backoff(100, BACKOFF_BASE_SECS, BACKOFF_MAX_SECS, true),
             BACKOFF_MAX_SECS * 12
         );
-        assert_eq!(compute_backoff(u32::MAX as u64, 300, 14400), 172800);
-        assert_eq!(compute_backoff(u64::MAX, 300, 14400), 172800);
+        assert_eq!(compute_backoff(u32::MAX as u64, 300, 14400, true), 172800);
+        assert_eq!(compute_backoff(u64::MAX, 300, 14400, true), 172800);
     }
 
     #[serial(cooldown_state)]
     #[test]
     fn compute_backoff_zero_base_returns_zero() {
-        assert_eq!(compute_backoff(1, 0, 14400), 0);
-        assert_eq!(compute_backoff(5, 0, 14400), 0);
+        assert_eq!(compute_backoff(1, 0, 14400, true), 0);
+        assert_eq!(compute_backoff(5, 0, 14400, true), 0);
     }
 
     // ---- GitHub 5xx circuit breaker tests ----
