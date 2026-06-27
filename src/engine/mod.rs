@@ -179,8 +179,8 @@ pub struct EngineConfig {
     /// Set to 0 to disable. Default: 3600 (1 hour).
     pub upgrade_check_interval: u64,
     /// Automatically run `brew upgrade orch` and restart the service when a newer
-    /// release is detected. Default: false (notify only). Set `engine.auto_upgrade: true`
-    /// to opt in to automatic upgrades.
+    /// release is detected. Default: true. Set `engine.auto_upgrade: false`
+    /// to opt out of automatic upgrades.
     pub auto_upgrade: bool,
 }
 
@@ -199,7 +199,7 @@ impl Default for EngineConfig {
             silence_grace_period: 300,
             silence_cooldown: 3600,
             upgrade_check_interval: 3600,
-            auto_upgrade: false,
+            auto_upgrade: true,
         }
     }
 }
@@ -969,19 +969,28 @@ pub async fn serve() -> anyhow::Result<()> {
         );
     }
 
-    // Check for a newer orch release in the background and warn if the service is behind.
-    // Channels are not yet registered at this point, so this only logs. Channel notifications
-    // are sent by the periodic check in the main loop once channels are up.
+    // Check for a newer orch release in the background and log if the service is behind.
+    // The periodic checker runs immediately once the main loop starts, so any auto-upgrade
+    // or channel notification happens there after channels are initialized.
     {
         let current = env!("ORCH_VERSION").to_string();
+        let auto_upgrade = config.auto_upgrade;
         tokio::spawn(async move {
             if let Some(latest) = fetch_latest_release_version().await {
                 if latest != current {
-                    tracing::warn!(
-                        current_version = %current,
-                        latest_version = %latest,
-                        "orch service is behind the latest release — run: brew update && brew upgrade orch && brew services restart orch"
-                    );
+                    if auto_upgrade {
+                        tracing::warn!(
+                            current_version = %current,
+                            latest_version = %latest,
+                            "orch service is behind the latest release — automatic upgrade will run on the next upgrade check"
+                        );
+                    } else {
+                        tracing::warn!(
+                            current_version = %current,
+                            latest_version = %latest,
+                            "orch service is behind the latest release — run: brew update && brew upgrade orch && brew services restart orch"
+                        );
+                    }
                 }
             }
         });
@@ -1687,7 +1696,11 @@ pub async fn serve() -> anyhow::Result<()> {
     let mut last_sync = std::time::Instant::now();
 
     // Track upgrade check interval
-    let mut last_upgrade_check = std::time::Instant::now();
+    let mut last_upgrade_check = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(
+            config.upgrade_check_interval,
+        ))
+        .unwrap_or_else(std::time::Instant::now);
 
     // Channel for weight signals from task runners back to the router
     let (weight_tx, mut weight_rx) = mpsc::channel::<WeightSignal>(64);
@@ -2488,7 +2501,7 @@ mod tests {
             std::time::Duration::from_secs(600)
         );
         assert_eq!(config.upgrade_check_interval, 3600);
-        assert!(!config.auto_upgrade, "auto_upgrade default must be false");
+        assert!(config.auto_upgrade, "auto_upgrade default must be true");
     }
 
     #[test]
@@ -2505,8 +2518,8 @@ mod tests {
             std::time::Duration::from_secs(600)
         );
         assert_eq!(config.upgrade_check_interval, 3600);
-        // auto_upgrade may be overridden by user config; default is false
-        // (user config may enable it, so only check default struct)
+        // auto_upgrade may be overridden by user config; default is true
+        // (user config may disable it, so only check default struct)
     }
 
     #[test]
