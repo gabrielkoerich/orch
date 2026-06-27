@@ -314,6 +314,19 @@ impl EngineConfig {
     }
 }
 
+fn should_run_upgrade_check(
+    last_upgrade_check: Option<std::time::Instant>,
+    upgrade_check_interval: u64,
+) -> bool {
+    if upgrade_check_interval == 0 {
+        return false;
+    }
+
+    last_upgrade_check
+        .map(|last| last.elapsed() >= std::time::Duration::from_secs(upgrade_check_interval))
+        .unwrap_or(true)
+}
+
 /// Initialize all project engines from config.
 ///
 /// Returns a vector of ProjectEngine, one for each configured project.
@@ -1696,11 +1709,7 @@ pub async fn serve() -> anyhow::Result<()> {
     let mut last_sync = std::time::Instant::now();
 
     // Track upgrade check interval
-    let mut last_upgrade_check = std::time::Instant::now()
-        .checked_sub(std::time::Duration::from_secs(
-            config.upgrade_check_interval,
-        ))
-        .unwrap_or_else(std::time::Instant::now);
+    let mut last_upgrade_check: Option<std::time::Instant> = None;
 
     // Channel for weight signals from task runners back to the router
     let (weight_tx, mut weight_rx) = mpsc::channel::<WeightSignal>(64);
@@ -2079,10 +2088,7 @@ pub async fn serve() -> anyhow::Result<()> {
                 }
 
                 // Periodic upgrade check — notify channels when a newer release is available.
-                if config.upgrade_check_interval > 0
-                    && last_upgrade_check.elapsed()
-                        >= std::time::Duration::from_secs(config.upgrade_check_interval)
-                {
+                if should_run_upgrade_check(last_upgrade_check, config.upgrade_check_interval) {
                     if let Some(store) = project_engines.first().map(|e| e.store.clone()) {
                         let channels = channel_registry.clone();
                         let current = env!("ORCH_VERSION").to_string();
@@ -2100,7 +2106,7 @@ pub async fn serve() -> anyhow::Result<()> {
                             .await;
                         });
                     }
-                    last_upgrade_check = std::time::Instant::now();
+                    last_upgrade_check = Some(std::time::Instant::now());
                 }
 
                 // Update watchdog timestamp + log tick duration.
@@ -2530,6 +2536,24 @@ mod tests {
             "no_session_stuck_timeout ({}) exceeds 15 minutes",
             config.no_session_stuck_timeout
         );
+    }
+
+    #[test]
+    fn upgrade_check_runs_immediately_when_never_checked() {
+        assert!(should_run_upgrade_check(None, 3600));
+    }
+
+    #[test]
+    fn upgrade_check_waits_for_interval_after_first_run() {
+        assert!(!should_run_upgrade_check(
+            Some(std::time::Instant::now()),
+            3600
+        ));
+    }
+
+    #[test]
+    fn upgrade_check_can_be_disabled() {
+        assert!(!should_run_upgrade_check(None, 0));
     }
 
     #[test]

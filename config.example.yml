@@ -50,11 +50,6 @@ engine:
   max_parallel: 4
   stuck_timeout: 1800
   graceful_shutdown_timeout: 600
-  # Automatically install newer orch releases and restart the service.
-  auto_upgrade: true
-  # How often to check for a newer release (seconds). The first check runs
-  # immediately after startup.
-  upgrade_check_interval: 3600
   # Silence detection: grace period before flagging (seconds)
   # silence_grace_period: 120
   # silence_cooldown: 3600
