@@ -2238,11 +2238,24 @@ pub(crate) async fn emit_degraded_agents_if_needed(
         })
         .collect();
 
+    // Edge-triggered: only log when the affected-agents set changes, so a
+    // persistent condition doesn't flood the log every sync tick.
+    const STALE_AGENTS_KV: &str = "metrics:orch.model_pool_stale_persistent.agents";
+    let current_dim = heavily_cooled_agents.join(",");
+    let prev_dim = kv_get_prefer_store(&store, STALE_AGENTS_KV)
+        .await
+        .unwrap_or_default();
+
     if !heavily_cooled_agents.is_empty() {
-        tracing::warn!(
-            affected_agents = ?heavily_cooled_agents,
-            "agent model pool appears stale: persistent model failures in heavily cooled pool"
-        );
+        if current_dim != prev_dim {
+            tracing::warn!(
+                affected_agents = ?heavily_cooled_agents,
+                "agent model pool appears stale: persistent model failures in heavily cooled pool"
+            );
+        }
+        if let Err(e) = try_kv_set_prefer_store(&store, STALE_AGENTS_KV, &current_dim).await {
+            tracing::warn!(err = %e, "failed to persist stale model pool agents state");
+        }
         if let Err(e) = try_kv_set_prefer_store(
             &store,
             "metrics:orch.model_pool_stale_persistent.alert",
@@ -2252,14 +2265,22 @@ pub(crate) async fn emit_degraded_agents_if_needed(
         {
             tracing::warn!(err = %e, "failed to persist stale model pool alert metric");
         }
-    } else if let Err(e) = try_kv_set_prefer_store(
-        &store,
-        "metrics:orch.model_pool_stale_persistent.alert",
-        "0",
-    )
-    .await
-    {
-        tracing::warn!(err = %e, "failed to clear stale model pool alert metric");
+    } else {
+        if !prev_dim.is_empty() {
+            tracing::info!("agent model pool stale condition cleared");
+        }
+        if let Err(e) = try_kv_set_prefer_store(&store, STALE_AGENTS_KV, "").await {
+            tracing::warn!(err = %e, "failed to clear stale model pool agents state");
+        }
+        if let Err(e) = try_kv_set_prefer_store(
+            &store,
+            "metrics:orch.model_pool_stale_persistent.alert",
+            "0",
+        )
+        .await
+        {
+            tracing::warn!(err = %e, "failed to clear stale model pool alert metric");
+        }
     }
 }
 
