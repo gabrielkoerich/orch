@@ -79,7 +79,7 @@ Claude/sonnet dominated success volume (39), followed by Codex/gpt-5.4 (10) and 
 
 #### 1. Service is still running v0.80.31
 
-The CLI and service both report `orch 0.80.31`. The latest published release is `v0.80.32` (which includes `fix(sync): edge-trigger stale model-pool alert log`). The stale-alert warning is therefore still visible in every sync tick:
+The CLI and service both report `orch 0.80.31`. The latest published release is `v0.80.34` (which includes the Nvidia ResourceExhausted rate-limit fix from #3362, plus `fix(sync): edge-trigger stale model-pool alert log` from v0.80.32). The stale-alert warning is therefore still visible in every sync tick:
 
 ```text
 agent model pool appears stale: persistent model failures in heavily cooled pool
@@ -100,7 +100,7 @@ minimax:opus    3d10h remaining    (persisted)
 
 Failure counts: `minimax=5`, `minimax:haiku=5`, `minimax:opus=4`, `minimax:sonnet=1`.
 
-The pool continues to be effectively dead. The router is correctly skipping it, but the extended cooldown means minimax will remain unavailable for another 3+ days unless cleared manually. This is not new — it has persisted across multiple review windows. The behaviour is correct (exponential backoff protecting against a consistently failing pool), but the volume of stale-alert spam it produces will only stop once the service is upgraded to v0.80.32.
+The pool continues to be effectively dead. The router is correctly skipping it, but the extended cooldown means minimax will remain unavailable for another 3+ days unless cleared manually. This is not new — it has persisted across multiple review windows. The behaviour is correct (exponential backoff protecting against a consistently failing pool), but the volume of stale-alert spam it produces will only stop once the service is upgraded to v0.80.34.
 
 #### 3. Two `claude:sonnet` failures
 
@@ -131,14 +131,14 @@ No new stuck-task pattern inside `gabrielkoerich/orch` itself.
 
 **Open issues in `gabrielkoerich/orch` at review time: 0.**
 
-No new issues warranted from this review. The `minimax` cooldown spam is already addressed by v0.80.32 (deployment lag only). The two transient claude failures require no action. The Nvidia ResourceExhausted fix landed correctly.
+No new issues warranted from this review. The `minimax` cooldown spam is already addressed by v0.80.32; the Nvidia fix is in v0.80.34 — both are deployment lag only. The two transient claude failures require no action.
 
 ---
 
 ## Priorities for Tomorrow
 
-1. **Upgrade the running service to v0.80.32.** The single most impactful action available — stops the repeated stale-pool WARN spam and confirms the edge-trigger fix is live.
-2. **Confirm warning volume drops post-upgrade.** If the minimax stale-pool warning persists after upgrading, that is a new regression and should be investigated. If it disappears, the noise was deployment lag only.
+1. **Upgrade the running service to v0.80.34.** The single most impactful action available — delivers both the edge-trigger stale-pool fix (v0.80.32) and the Nvidia ResourceExhausted rate-limit classification (v0.80.34) in one step.
+2. **Confirm warning volume drops post-upgrade.** If the minimax stale-pool warning persists after upgrading to v0.80.34, that is a new regression and should be investigated. If it disappears, the noise was deployment lag only.
 3. **Watch `minimax` cooldown expiry.** The active `minimax:opus` cooldown clears in ~3.5 days. When it does, observe whether the first new dispatch succeeds or re-triggers the rate-limit cycle.
 4. **Continue monitoring `codex:gpt-5.5`.** It had one success and one failure in this window. It is currently at failure_count=0, so the failure was transient — keep an eye on it for early signs of a broader outage.
 
