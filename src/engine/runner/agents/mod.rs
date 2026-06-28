@@ -1103,6 +1103,8 @@ pub(crate) mod patterns {
             "insufficient_quota",
             "tokens_exceeded",
             "you've hit your usage limit",
+            "resourceexhausted", // Nvidia / gRPC provider capacity
+            "worker local total request limit reached", // Nvidia nemotron via OpenCode
         ];
         // Find the earliest match position so we can extract context around the
         // actual error message rather than the tail (which may be unrelated JSON).
@@ -1883,6 +1885,37 @@ mod tests {
         assert!(
             matches!(err, Some(AgentError::RateLimit { .. })),
             "monthly quota exhaustion must be detected as rate limit, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn detect_rate_limit_nvidia_resourceexhausted() {
+        // Regression test for issue #3361: Nvidia "ResourceExhausted: Worker local total
+        // request limit reached" was classified as generic `failed` instead of `rate_limit`,
+        // bypassing the cooldown path and weakening routing health signals.
+        let opencode_error = r#"opencode agent error: agent failed: "Upstream error from Nvidia: ResourceExhausted: Worker local total request limit reached (42/32)""#;
+        let err = patterns::detect_rate_limit(opencode_error);
+        assert!(
+            matches!(err, Some(AgentError::RateLimit { .. })),
+            "Nvidia ResourceExhausted must be detected as rate limit, got: {err:?}"
+        );
+
+        // Both sub-patterns must match independently.
+        assert!(
+            patterns::detect_rate_limit("ResourceExhausted: some capacity error").is_some(),
+            "bare ResourceExhausted must match"
+        );
+        assert!(
+            patterns::detect_rate_limit("Worker local total request limit reached (10/8)")
+                .is_some(),
+            "worker local total request limit reached must match"
+        );
+
+        // classify_from_text must also route this to RateLimit (exercises the tail-scan path).
+        let err = patterns::classify_from_text(1, opencode_error);
+        assert!(
+            matches!(err, AgentError::RateLimit { .. }),
+            "classify_from_text must produce RateLimit for Nvidia ResourceExhausted, got: {err:?}"
         );
     }
 
