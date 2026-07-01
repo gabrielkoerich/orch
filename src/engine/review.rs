@@ -768,7 +768,22 @@ async fn record_review_agent_failure(
                 crate::engine::cooldown::record_persistent_model_failure(review_agent, model).await;
             }
         }
-        _ => {}
+        runner::agents::AgentError::ModelUnavailable { .. } => {
+            // Model not available (provider error, model not found, etc.)
+            // Apply persistent model cooldown (4h base → 7d max) per settled
+            // architecture (AGENTS.md:325-328). The agent itself is not
+            // penalized — its other models still route normally.
+            if let Some(model) = review_model {
+                crate::engine::cooldown::record_persistent_model_failure(review_agent, model).await;
+            }
+        }
+        _ => {
+            // Generic failure (AgentFailed, NetworkError, etc.)
+            // Apply standard model backoff (5min→4h max) to prevent immediate re-selection.
+            if let Some(model) = review_model {
+                crate::engine::cooldown::record_model_failure(review_agent, model).await;
+            }
+        }
     }
 }
 
