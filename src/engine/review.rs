@@ -768,7 +768,13 @@ async fn record_review_agent_failure(
                 crate::engine::cooldown::record_persistent_model_failure(review_agent, model).await;
             }
         }
-        _ => {}
+        _ => {
+            // Generic failure (AgentFailed, NetworkError, ModelUnavailable, etc.)
+            // Apply standard model backoff (5min→4h max) to prevent immediate re-selection.
+            if let Some(model) = review_model {
+                crate::engine::cooldown::record_model_failure(review_agent, model).await;
+            }
+        }
     }
 }
 
