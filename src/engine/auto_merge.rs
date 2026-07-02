@@ -110,6 +110,36 @@ fn is_pr_behind(pr: &GitHubPullRequest) -> bool {
         .is_some_and(|state| state.eq_ignore_ascii_case("behind"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeFailureClass {
+    RecoverableConflict,
+    Transient,
+    Blocking,
+}
+
+fn classify_merge_failure(error: &str) -> MergeFailureClass {
+    let err_msg = error.to_ascii_lowercase();
+    let is_conflict = err_msg.contains("405")
+        || err_msg.contains("not mergeable")
+        || err_msg.contains("merge conflict")
+        || (err_msg.contains("409") && err_msg.contains("head branch is out of date"))
+        || err_msg.contains("review and try the merge again");
+    let is_transient = err_msg.contains("502")
+        || err_msg.contains("503")
+        || err_msg.contains("504")
+        || err_msg.contains("server error")
+        || err_msg.contains("bad gateway")
+        || err_msg.contains("service unavailable");
+
+    if is_transient {
+        MergeFailureClass::Transient
+    } else if is_conflict {
+        MergeFailureClass::RecoverableConflict
+    } else {
+        MergeFailureClass::Blocking
+    }
+}
+
 async fn attempt_worktree_rebase_and_force_push(
     task_id: &str,
     worktree_path: Option<String>,
@@ -1432,43 +1462,35 @@ pub(crate) async fn auto_merge_pr(
 
     // 6. Merge via gh CLI
     if let Err(e) = gh.merge_pr(repo, pr_number, true).await {
-        let err_msg = e.to_string().to_lowercase();
-        let is_conflict = err_msg.contains("405")
-            || err_msg.contains("not mergeable")
-            || err_msg.contains("merge conflict");
-        let is_transient = err_msg.contains("502")
-            || err_msg.contains("503")
-            || err_msg.contains("504")
-            || err_msg.contains("server error")
-            || err_msg.contains("bad gateway")
-            || err_msg.contains("service unavailable");
-
-        if is_transient {
-            tracing::warn!(
-                task_id = task.id.0,
-                pr_number,
-                error = %e,
-                "transient GitHub error on merge — will retry next sync"
-            );
-            // Don't change status — task stays in InReview, sync tick retries
-            return Ok(());
-        }
-
-        if is_conflict {
-            // Delegate to the shared helper — same logic as the poll_mergeable_until path.
-            handle_pr_rebase_recovery(
-                task,
-                repo,
-                pr_number,
-                &gh,
-                task_manager,
-                store,
-                review_agent,
-                review_model,
-                Some(e.to_string().as_str()),
-            )
-            .await?;
-            return Ok(());
+        let merge_error = e.to_string();
+        match classify_merge_failure(&merge_error) {
+            MergeFailureClass::Transient => {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    pr_number,
+                    error = %e,
+                    "transient GitHub error on merge — will retry next sync"
+                );
+                // Don't change status — task stays in InReview, sync tick retries
+                return Ok(());
+            }
+            MergeFailureClass::RecoverableConflict => {
+                // Delegate to the shared helper — same logic as the poll_mergeable_until path.
+                handle_pr_rebase_recovery(
+                    task,
+                    repo,
+                    pr_number,
+                    &gh,
+                    task_manager,
+                    store,
+                    review_agent,
+                    review_model,
+                    Some(&merge_error),
+                )
+                .await?;
+                return Ok(());
+            }
+            MergeFailureClass::Blocking => {}
         }
 
         // Non-conflict merge failure (permissions, branch protection, etc.)
@@ -2595,6 +2617,29 @@ mod tests {
 
         pr.mergeable_state = None;
         assert!(!is_pr_behind(&pr));
+    }
+
+    #[test]
+    fn classify_merge_failure_treats_out_of_date_head_as_recoverable() {
+        let error = r#"GitHub PR merge failed (409 Conflict): {"message":"Head branch is out of date. Review and try the merge again."}"#;
+        assert_eq!(
+            classify_merge_failure(error),
+            MergeFailureClass::RecoverableConflict
+        );
+    }
+
+    #[test]
+    fn classify_merge_failure_treats_gateway_errors_as_transient() {
+        assert_eq!(
+            classify_merge_failure("GitHub PR merge failed (502 Bad Gateway)"),
+            MergeFailureClass::Transient
+        );
+    }
+
+    #[test]
+    fn classify_merge_failure_keeps_branch_protection_errors_blocking() {
+        let error = "GitHub PR merge failed (403 Forbidden): branch protection prevented merge";
+        assert_eq!(classify_merge_failure(error), MergeFailureClass::Blocking);
     }
 
     /// When the GitHub API is unavailable (no real token in unit tests),
