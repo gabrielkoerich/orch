@@ -1150,6 +1150,16 @@ pub(crate) async fn tick_recover_stuck_tasks(
         }
     }
 
+    // Global sweep for CI-failure blocked tasks from inactive or removed projects.
+    // auto_unblock_blocked_tasks runs inside sync_tick and is scoped to the active repo.
+    // Tasks blocked for projects no longer in orch config are never processed there.
+    // This sweep covers all repos so stale CI-failure blocks are eventually resolved.
+    if let Err(e) =
+        crate::engine::sync::auto_unblock_ci_failure_blocked_tasks_global(task_manager, store).await
+    {
+        tracing::warn!(err = %e, "global CI-failure blocked sweep failed");
+    }
+
     Ok(())
 }
 

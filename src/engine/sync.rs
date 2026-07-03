@@ -1065,6 +1065,63 @@ async fn auto_unblock_blocked_tasks(
     Ok(())
 }
 
+/// Global sweep for CI-failure blocked tasks from inactive or removed projects.
+///
+/// `auto_unblock_blocked_tasks` is called from `sync_tick` and only runs for the
+/// currently-active repo. Tasks that were blocked for a project that is later removed
+/// from orch config never get processed and accumulate in the DB indefinitely.
+///
+/// This function queries all blocked tasks across all repos and handles the CI-failure
+/// cases (block_reason LIKE '%CI failure%' or '%CI checks timed out%') so they are
+/// eventually cleaned up regardless of project activity. Called once per main tick from
+/// `tick_recover_stuck_tasks`.
+pub(crate) async fn auto_unblock_ci_failure_blocked_tasks_global(
+    task_manager: &Arc<crate::engine::tasks::TaskManager>,
+    store: &Arc<TaskStore>,
+) -> anyhow::Result<()> {
+    let all_blocked = match store.list_all_by_status_global(TaskStatus::Blocked).await {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::warn!(err = %e, "global CI-failure blocked sweep: failed to list blocked tasks");
+            return Ok(());
+        }
+    };
+
+    let ci_failure_tasks: Vec<_> = all_blocked
+        .into_iter()
+        .filter(is_ci_failure_block)
+        .collect();
+    if ci_failure_tasks.is_empty() {
+        return Ok(());
+    }
+
+    let gh = match crate::github::http::GhHttp::new() {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(err = %e, "global CI-failure blocked sweep: failed to create GhHttp");
+            return Ok(());
+        }
+    };
+
+    for task in ci_failure_tasks {
+        if !ci_failure_unblock_cooldown_elapsed(&task) {
+            continue;
+        }
+        if let Err(e) =
+            try_unblock_ci_failure_task(&gh, &task.repo, task_manager, store, &task).await
+        {
+            tracing::warn!(
+                task_id = task.id,
+                repo = %task.repo,
+                err = %e,
+                "global CI-failure blocked sweep: unblock check failed"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Sync tick — runs every 45s.
 ///
 /// Handles less-frequent operations:
@@ -4985,5 +5042,131 @@ mod tests {
                 "count={count} should still be cooling down"
             );
         }
+    }
+
+    // ── auto_unblock_ci_failure_blocked_tasks_global ───────────────────────
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn global_ci_failure_sweep_returns_ok_with_no_blocked_tasks() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        auto_unblock_ci_failure_blocked_tasks_global(&task_manager, &store)
+            .await
+            .unwrap();
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn global_ci_failure_sweep_skips_tasks_in_cooldown() {
+        // Tasks with a fresh auto_unblock_last_at are skipped before reaching GhHttp,
+        // so this test works without a real GitHub token.
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            store.clone(),
+            "active/repo".to_string(),
+        ));
+
+        // Insert a CI-failure task from an inactive repo with a very recent last_at.
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "inactive/repo",
+                ext_id: "10",
+                title: "Old blocked task",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::Blocked)
+            .await
+            .unwrap();
+        let just_now = chrono::Utc::now().to_rfc3339();
+        store
+            .set_fields(
+                id,
+                &[
+                    (
+                        "block_reason",
+                        serde_json::json!("CI failure limit reached during auto-merge"),
+                    ),
+                    ("pr_number", serde_json::json!(99)),
+                    ("auto_unblock_count", serde_json::json!(1)),
+                    ("auto_unblock_last_at", serde_json::json!(just_now)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        auto_unblock_ci_failure_blocked_tasks_global(&task_manager, &store)
+            .await
+            .unwrap();
+
+        // Cooldown not elapsed — task must remain untouched.
+        let task = store.get(id).await.unwrap();
+        assert_eq!(
+            task.auto_unblock_count, 1,
+            "task in cooldown must not be processed"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn global_ci_failure_sweep_ignores_non_ci_failure_blocks() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            store.clone(),
+            "active/repo".to_string(),
+        ));
+
+        // Insert a non-CI-failure blocked task — should be ignored entirely.
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "inactive/repo",
+                ext_id: "20",
+                title: "Manual block",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::Blocked)
+            .await
+            .unwrap();
+        store
+            .set_fields(
+                id,
+                &[("block_reason", serde_json::json!("waiting for human input"))],
+            )
+            .await
+            .unwrap();
+
+        auto_unblock_ci_failure_blocked_tasks_global(&task_manager, &store)
+            .await
+            .unwrap();
+
+        // Non-CI-failure tasks must remain blocked.
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.status, crate::store::TaskStatus::Blocked);
     }
 }
