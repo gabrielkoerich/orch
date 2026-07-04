@@ -1,10 +1,10 @@
 +++
-title = "Daily Review — 2026-07-03"
-date = 2026-07-03
+title = "Daily Review — 2026-07-04"
+date = 2026-07-04
 description = "Daily review: what shipped, what failed, operational health, and priorities for tomorrow."
 +++
 
-# Daily Review — 2026-07-03
+# Daily Review — 2026-07-04
 
 ## What Shipped (Last 24h)
 
@@ -130,4 +130,4 @@ No new issues filed during this review — none of today's observed failures (Gi
 
 ---
 
-*Prepared by Orch automation (internal:154627) at 2026-07-03T23:00:00Z.*
+*Prepared by Orch automation (internal:154627) at 2026-07-04T01:23:23Z.*
