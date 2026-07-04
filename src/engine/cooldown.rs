@@ -497,8 +497,9 @@ pub fn detect_credit_exhaustion(error_message: &str) -> Option<CreditExhaustionR
         "refreshed in the next cycle",
         "weekly/monthly limit exhausted",
         "limit will reset at",
+        "upgrade to pro", // codex/chatgpt plan usage cap: requires billing upgrade
         "upgrade your token plan", // minimax: Token Plan usage limit reached
-        "token plan usage limit",  // minimax: Token Plan usage limit reached
+        "token plan usage limit", // minimax: Token Plan usage limit reached
         "purchase credits for more", // minimax: ...purchase Credits for more usage
     ];
 
@@ -1777,6 +1778,10 @@ mod tests {
         assert!(detect_credit_exhaustion("too many requests").is_none());
         assert!(detect_credit_exhaustion("429 Too Many Requests").is_none());
         assert!(detect_credit_exhaustion("you've hit your usage limit").is_none());
+        assert!(detect_credit_exhaustion(
+            "You've hit your usage limit, try again in a few minutes."
+        )
+        .is_none());
     }
 
     #[serial(cooldown_state)]
@@ -2401,6 +2406,12 @@ mod tests {
         );
         assert_eq!(
             detect_credit_exhaustion("purchase Credits for more usage"),
+            Some(CreditExhaustionReason::BillingCycleExhausted)
+        );
+        assert_eq!(
+            detect_credit_exhaustion(
+                "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits"
+            ),
             Some(CreditExhaustionReason::BillingCycleExhausted)
         );
     }
