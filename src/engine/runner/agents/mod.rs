@@ -1372,6 +1372,8 @@ pub(crate) mod patterns {
             "fetch failed",
             // Upstream HTTP-layer timeouts from model provider APIs (e.g. opencode/nemotron)
             "upstream idle timeout",
+            "streaming response failed",
+            "upstream request failed",
         ];
         // Map the byte offset from `lower` back to `text` via char-count (same
         // rationale as detect_rate_limit: Unicode case-folding can change byte lengths).
@@ -2044,6 +2046,8 @@ mod tests {
         assert!(patterns::detect_network_error("network unreachable").is_some());
         assert!(patterns::detect_network_error("Upstream idle timeout exceeded").is_some());
         assert!(patterns::detect_network_error("upstream idle timeout").is_some());
+        assert!(patterns::detect_network_error("Streaming response failed").is_some());
+        assert!(patterns::detect_network_error("Upstream request failed").is_some());
         assert!(patterns::detect_network_error("all systems operational").is_none());
     }
 
