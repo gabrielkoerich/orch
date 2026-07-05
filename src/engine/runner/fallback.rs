@@ -238,6 +238,12 @@ pub async fn handle_error(
             // the same model from being re-selected even when the agent-level cooldown
             // is set. Without the model-level cooldown, the model continues to be
             // picked and fails repeatedly (issue #2153).
+            // Track whether the quota is model-scoped (BillingCycleExhausted + known model).
+            // When true we return ModelUnavailable so handle_failover skips the
+            // agent-level failure counter — the agent itself is healthy, only the
+            // specific model's plan quota was exhausted (issue #3382).
+            let mut billing_cycle_model_scoped = false;
+
             if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
                 // For billing cycle exhaustion where we know the specific model, apply
                 // model-level persistent cooldown only. The quota is scoped to that
@@ -249,6 +255,7 @@ pub async fn handle_error(
                     if let Some(model) = model_name {
                         crate::engine::cooldown::record_persistent_model_failure(agent_name, model)
                             .await;
+                        billing_cycle_model_scoped = true;
                     } else {
                         crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await;
                     }
@@ -270,8 +277,16 @@ pub async fn handle_error(
                     }
                 }
             }
+            // Use ModelUnavailable when billing cycle is exhausted for a known model so
+            // handle_failover does not call record_agent_failure_with_message (which would
+            // set an unwanted agent-level cooldown). The agent's other models remain available.
+            let retryable = if billing_cycle_model_scoped {
+                response::RetryableError::ModelUnavailable
+            } else {
+                response::RetryableError::UsageLimit
+            };
             (
-                response::RetryableError::UsageLimit,
+                retryable,
                 format!(
                     "{agent_name} rate limit: {}",
                     summarize_rate_limit_error(message)
@@ -283,6 +298,8 @@ pub async fn handle_error(
             // For plain auth failures (expired key, wrong token, etc.) record both the
             // agent-level and model-level cooldowns so the router can observe them before
             // concurrent tasks start another run against the same unavailable model.
+            let mut billing_cycle_model_scoped = false;
+
             if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
                 // Billing cycle exhaustion scoped to a known model gets model-level
                 // persistent cooldown only — agent-wide cooldown would block unrelated models.
@@ -291,6 +308,7 @@ pub async fn handle_error(
                     if let Some(model) = model_name {
                         crate::engine::cooldown::record_persistent_model_failure(agent_name, model)
                             .await;
+                        billing_cycle_model_scoped = true;
                     } else {
                         crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await;
                     }
@@ -304,10 +322,14 @@ pub async fn handle_error(
                     response::record_model_failure(agent_name, model).await;
                 }
             }
-            (
-                response::RetryableError::AuthError,
-                format!("{agent_name} auth error: {message}"),
-            )
+            // Use ModelUnavailable for model-scoped billing exhaustion so handle_failover
+            // does not set an agent-level failure cooldown (issue #3382).
+            let retryable = if billing_cycle_model_scoped {
+                response::RetryableError::ModelUnavailable
+            } else {
+                response::RetryableError::AuthError
+            };
+            (retryable, format!("{agent_name} auth error: {message}"))
         }
         agents::AgentError::Timeout { elapsed } => (
             response::RetryableError::Timeout,
@@ -1252,6 +1274,55 @@ mod tests {
         assert!(
             crate::engine::cooldown::is_model_in_cooldown(agent, model),
             "model should be in cooldown after InvalidResponse (fixes issue #2750)"
+        );
+    }
+
+    /// BillingCycleExhausted with a known model must set ONLY the model-level cooldown.
+    ///
+    /// Regression test for issue #3382: "upgrade to pro" messages (added to
+    /// billing_cycle_patterns in #3380) were triggering an agent-wide 24h cooldown
+    /// when model_name was None, blocking all codex models even though only the
+    /// specific model's plan quota was exhausted.
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn billing_cycle_exhausted_with_known_model_sets_only_model_cooldown() {
+        crate::engine::cooldown::reset_global_state().await;
+        let runner = MockRunner { free: vec![] };
+        let agent = "codex-3382-billing-cycle";
+        let model = "gpt-5.5";
+
+        let err = AgentError::RateLimit {
+            message: "rate limit: You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro).".to_string(),
+        };
+
+        let _result = handle_error(
+            "test-3382-a",
+            &err,
+            agent,
+            &runner,
+            Some(model),
+            Some("medium"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        // Agent-level credit cooldown must NOT be set — the quota is model-scoped.
+        assert!(
+            !crate::engine::cooldown::is_agent_in_cooldown(agent),
+            "agent must NOT be in agent-level cooldown when BillingCycleExhausted has a known model (issue #3382)"
+        );
+        // Model-level cooldown MUST be set.
+        assert!(
+            crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            "model must be in cooldown after BillingCycleExhausted (issue #3382)"
+        );
+        // Other models on the same agent must NOT be cooled.
+        assert!(
+            !crate::engine::cooldown::is_model_in_cooldown(agent, "gpt-5.4"),
+            "other models on the same agent must not be cooled by a single model's billing exhaustion"
         );
     }
 
