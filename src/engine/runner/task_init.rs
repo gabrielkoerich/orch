@@ -122,11 +122,19 @@ pub async fn prepare_task(
     attempts: u32,
     store: &Option<Arc<TaskStore>>,
 ) -> anyhow::Result<TaskInitResult> {
-    // Load title from store for branch naming (set by run_with_context before run())
-    let title_for_branch = store::opt_store_get_task(store, repo, task_id)
-        .await
-        .map(|t| t.title)
+    // Load title (and model fallback) from store.
+    // `model` param and `route_result.model` can both be None when a prior
+    // ModelUnavailable failover wrote the new model to tasks.model but did not
+    // update task_routes.model.  Reading tasks.model here ensures model_name is
+    // never None when the task already has a model assigned — which matters for
+    // BillingCycleExhausted handling in fallback.rs (model-known → model-level
+    // cooldown only; model-unknown → agent-wide 24 h cooldown).
+    let initial_task = store::opt_store_get_task(store, repo, task_id).await;
+    let title_for_branch = initial_task
+        .as_ref()
+        .map(|t| t.title.clone())
         .unwrap_or_default();
+    let stored_model = initial_task.and_then(|t| t.model);
 
     // Set up worktree
     let wt = worktree::setup_worktree(task_id, &title_for_branch, project_dir, store, repo).await?;
@@ -180,7 +188,8 @@ pub async fn prepare_task(
 
     let model_name = model
         .map(String::from)
-        .or_else(|| route_result.as_ref().and_then(|r| r.model.clone()));
+        .or_else(|| route_result.as_ref().and_then(|r| r.model.clone()))
+        .or(stored_model);
 
     let complexity = route_result.as_ref().map(|r| r.complexity.clone());
 
