@@ -679,7 +679,10 @@ async fn helper_store_reset_failure_counters_preserves_review_cycles_and_merge_c
 
     let task = store.get(id).await.unwrap();
     assert_eq!(task.review_cycles, 1);
-    assert_eq!(task.review_invocations, 0);
+    assert_eq!(
+        task.review_invocations, 1,
+        "review_invocations must be preserved (monotonic — same reason as attempts)"
+    );
     assert_eq!(task.attempts, 1, "attempts must be preserved (monotonic)");
     assert_eq!(
         task.merge_conflict_retries, 1,
@@ -1758,12 +1761,15 @@ async fn reset_failure_counters_preserves_review_cycles_and_merge_conflict_retri
     store.increment(id, "ci_merge_failures").await.unwrap();
     store.increment(id, "ci_merge_failures").await.unwrap();
     store.increment(id, "attempts").await.unwrap();
+    store.increment(id, "review_invocations").await.unwrap();
     store.increment(id, "review_agent_failures").await.unwrap();
     store.increment(id, "merge_conflict_retries").await.unwrap();
     store.increment(id, "network_retries").await.unwrap();
 
     // reset_failure_counters must zero transient counters but preserve
-    // review_cycles, ci_merge_failures, merge_conflict_retries, and attempts.
+    // review_cycles, ci_merge_failures, merge_conflict_retries, attempts, and
+    // review_invocations. Both attempts and review_invocations must be monotonic
+    // so that (task_id, attempt, run_type) keys in task_runs remain unique.
     store.reset_failure_counters(id).await.unwrap();
 
     let task = store.get(id).await.unwrap();
@@ -1777,6 +1783,10 @@ async fn reset_failure_counters_preserves_review_cycles_and_merge_conflict_retri
         "merge_conflict_retries must be preserved"
     );
     assert_eq!(task.attempts, 1, "attempts must be preserved (monotonic)");
+    assert_eq!(
+        task.review_invocations, 1,
+        "review_invocations must be preserved (monotonic — same reason as attempts)"
+    );
     assert_eq!(task.review_agent_failures, 0);
     assert_eq!(task.network_retries, 0);
 }
@@ -4806,6 +4816,151 @@ async fn get_last_run_filters_by_type() {
     // No route run exists
     let no_route = store.get_last_run(task_id, "route").await.unwrap();
     assert!(no_route.is_none());
+}
+
+/// Regression test for issue #3386.
+///
+/// `reset_failure_counters` used to reset `review_invocations` to 0.  When a
+/// new review cycle started after that reset the first dispatch received
+/// `attempt=1` again, and `start_run()`'s `ON CONFLICT DO UPDATE` overwrote the
+/// previous `attempt=1` record — erasing the audit trail for the earlier review.
+///
+/// The production path is: `review_invocations` is incremented each time
+/// `build_review_context()` runs and the resulting value is used directly as the
+/// `attempt` key in `start_run()`.  When `reset_failure_counters` zeroed
+/// `review_invocations`, the next invocation produced `attempt=1` again, causing
+/// the ON CONFLICT clause to silently overwrite the previous record.
+#[tokio::test]
+async fn review_invocations_preserved_across_reset_prevents_task_run_overwrite() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let task_id = store
+        .create_internal("owner/repo", "task", "body", "manual", "", None)
+        .await
+        .unwrap();
+
+    // ── Cycle A: a previous successful review reset the counter. ─────────────
+    // Simulate: one review dispatch completed (attempt=1), then
+    // reset_failure_counters was called (e.g. on Approve).
+    store.increment(task_id, "review_invocations").await.unwrap(); // → 1
+    let prev_run_id = store
+        .start_run(&StartRun {
+            task_id,
+            attempt: 1,
+            run_type: "review",
+            agent: "prev-agent",
+            model: "prev-model",
+            command: "",
+            prompt: "",
+        })
+        .await
+        .unwrap();
+    store
+        .complete_run(&CompleteRun {
+            run_id: prev_run_id,
+            exit_code: Some(0),
+            stdout: "",
+            stderr: "",
+            parsed: "",
+            outcome: "success",
+            error: "",
+            tokens: RunTokenUsage::default(),
+        })
+        .await
+        .unwrap();
+    // End of cycle A: reset_failure_counters is called (Approve path).
+    // With the OLD code this zeroed review_invocations back to 0.
+    // With the fix it stays at 1.
+    store.reset_failure_counters(task_id).await.unwrap();
+
+    let after_reset = store.get(task_id).await.unwrap();
+    assert_eq!(
+        after_reset.review_invocations, 1,
+        "review_invocations must survive reset_failure_counters (issue #3386)"
+    );
+
+    // ── Cycle B: codex billing-limit fast-fail, then kimi succeeds. ──────────
+    // Increment → attempt=2 for codex (not 1, because review_invocations is 1).
+    let codex_attempt = store.increment(task_id, "review_invocations").await.unwrap() as i32; // → 2
+    let codex_run_id = store
+        .start_run(&StartRun {
+            task_id,
+            attempt: codex_attempt,
+            run_type: "review",
+            agent: "codex",
+            model: "gpt-5.4",
+            command: "",
+            prompt: "",
+        })
+        .await
+        .unwrap();
+    store
+        .complete_run(&CompleteRun {
+            run_id: codex_run_id,
+            exit_code: Some(1),
+            stdout: "",
+            stderr: "billing limit",
+            parsed: "",
+            outcome: "rate_limit",
+            error: "codex rate limit: billing cycle exhausted",
+            tokens: RunTokenUsage::default(),
+        })
+        .await
+        .unwrap();
+
+    // Kimi is dispatched as the retry (attempt=3).
+    let kimi_attempt = store.increment(task_id, "review_invocations").await.unwrap() as i32; // → 3
+    let kimi_run_id = store
+        .start_run(&StartRun {
+            task_id,
+            attempt: kimi_attempt,
+            run_type: "review",
+            agent: "kimi",
+            model: "kimi-model",
+            command: "",
+            prompt: "",
+        })
+        .await
+        .unwrap();
+    store
+        .complete_run(&CompleteRun {
+            run_id: kimi_run_id,
+            exit_code: Some(0),
+            stdout: "",
+            stderr: "",
+            parsed: r#"{"decision":"approve"}"#,
+            outcome: "success",
+            error: "",
+            tokens: RunTokenUsage::default(),
+        })
+        .await
+        .unwrap();
+
+    // All three records must be visible — codex's audit trail was NOT
+    // overwritten because review_invocations was NOT zeroed by the earlier reset.
+    let all_runs = store.get_runs(task_id).await.unwrap();
+    let review_runs: Vec<_> = all_runs.iter().filter(|r| r.run_type == "review").collect();
+    assert_eq!(
+        review_runs.len(),
+        3,
+        "all three review runs must be in the audit trail"
+    );
+
+    let prev_run = review_runs.iter().find(|r| r.agent == "prev-agent");
+    assert!(prev_run.is_some(), "cycle-A run must still be present");
+    assert_eq!(prev_run.unwrap().attempt, 1);
+
+    let codex_run = review_runs.iter().find(|r| r.agent == "codex");
+    assert!(
+        codex_run.is_some(),
+        "codex billing-limit run must be present (was erased by the bug)"
+    );
+    assert_eq!(codex_run.unwrap().outcome, "rate_limit");
+    assert_eq!(codex_run.unwrap().attempt, 2);
+
+    let kimi_run = review_runs.iter().find(|r| r.agent == "kimi");
+    assert!(kimi_run.is_some(), "kimi success run must be present");
+    assert_eq!(kimi_run.unwrap().outcome, "success");
+    assert_eq!(kimi_run.unwrap().attempt, 3);
 }
 
 // ── prune_old_runs ──────────────────────────────────────────────
