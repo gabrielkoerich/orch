@@ -4841,7 +4841,10 @@ async fn review_invocations_preserved_across_reset_prevents_task_run_overwrite()
     // ── Cycle A: a previous successful review reset the counter. ─────────────
     // Simulate: one review dispatch completed (attempt=1), then
     // reset_failure_counters was called (e.g. on Approve).
-    store.increment(task_id, "review_invocations").await.unwrap(); // → 1
+    store
+        .increment(task_id, "review_invocations")
+        .await
+        .unwrap(); // → 1
     let prev_run_id = store
         .start_run(&StartRun {
             task_id,
@@ -4880,7 +4883,10 @@ async fn review_invocations_preserved_across_reset_prevents_task_run_overwrite()
 
     // ── Cycle B: codex billing-limit fast-fail, then kimi succeeds. ──────────
     // Increment → attempt=2 for codex (not 1, because review_invocations is 1).
-    let codex_attempt = store.increment(task_id, "review_invocations").await.unwrap() as i32; // → 2
+    let codex_attempt = store
+        .increment(task_id, "review_invocations")
+        .await
+        .unwrap() as i32; // → 2
     let codex_run_id = store
         .start_run(&StartRun {
             task_id,
@@ -4908,7 +4914,10 @@ async fn review_invocations_preserved_across_reset_prevents_task_run_overwrite()
         .unwrap();
 
     // Kimi is dispatched as the retry (attempt=3).
-    let kimi_attempt = store.increment(task_id, "review_invocations").await.unwrap() as i32; // → 3
+    let kimi_attempt = store
+        .increment(task_id, "review_invocations")
+        .await
+        .unwrap() as i32; // → 3
     let kimi_run_id = store
         .start_run(&StartRun {
             task_id,
