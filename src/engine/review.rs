@@ -765,7 +765,22 @@ async fn record_review_agent_failure(
                 "review agent hit error — adding to cooldown"
             );
             if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
-                crate::engine::cooldown::record_credit_exhaustion(review_agent, reason).await;
+                if reason == crate::engine::cooldown::CreditExhaustionReason::BillingCycleExhausted
+                {
+                    if let Some(model) = review_model {
+                        // Quota is model-scoped: don't penalize the whole agent.
+                        crate::engine::cooldown::record_persistent_model_failure(
+                            review_agent,
+                            model,
+                        )
+                        .await;
+                    } else {
+                        crate::engine::cooldown::record_credit_exhaustion(review_agent, reason)
+                            .await;
+                    }
+                } else {
+                    crate::engine::cooldown::record_credit_exhaustion(review_agent, reason).await;
+                }
             } else {
                 runner::response::record_agent_failure_with_message(review_agent, &err.to_string())
                     .await;
