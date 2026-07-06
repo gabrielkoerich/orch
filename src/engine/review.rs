@@ -614,6 +614,18 @@ async fn invoke_review_agent(
         Ok(session) => session,
         Err(e) => {
             tracing::error!(task_id = task.id.0, error = %e, "failed to spawn review agent");
+            complete_review_run(
+                store,
+                run_id,
+                None,
+                "",
+                &e.to_string(),
+                "",
+                "failed",
+                &format!("spawn failed: {e}"),
+                RunTokenUsage::default(),
+            )
+            .await;
             return ReviewPhase::EarlyReturn(ReviewDecision::Failed(format!("spawn failed: {e}")));
         }
     };

@@ -1232,16 +1232,16 @@ impl TaskStore {
     /// they must accumulate across attempts to enforce their circuit breakers,
     /// just like `review_cycles`.
     ///
-    /// NOTE: `attempts` is intentionally NOT reset here. It must increase monotonically
-    /// across the task's lifetime so that `(task_id, attempt, run_type)` keys in
-    /// `task_runs` remain unique. Resetting it caused subsequent retries to overwrite
-    /// earlier audit trail records via the ON CONFLICT UPSERT in `start_run()`.
+    /// NOTE: `attempts` and `review_invocations` are intentionally NOT reset here.
+    /// Both must increase monotonically across the task's lifetime so that
+    /// `(task_id, attempt, run_type)` keys in `task_runs` remain unique. Resetting
+    /// either causes subsequent retries to overwrite earlier audit trail records via
+    /// the ON CONFLICT UPSERT in `start_run()`.
     pub async fn reset_failure_counters(&self, id: i64) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE tasks SET
             route_attempts = 0,
             review_agent_failures = 0,
-            review_invocations = 0,
             pr_create_failures = 0,
             push_failures = 0,
             network_retries = 0,
