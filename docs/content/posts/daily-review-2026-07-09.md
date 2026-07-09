@@ -83,7 +83,7 @@ Blocked count unchanged at 50. GitHub Actions billing failures grew from ~2 to 5
 
 ### 1. kimi/opus: 2 failures (second consecutive day)
 
-Kimi/opus produced 2 failures again today despite 10 successes. Yesterday also saw 0 failures so this is a new pattern forming. The generic failure counter will accumulate; if a third day sees 2+ failures, the exponential backoff will trigger a cooldown. No action needed yet — monitoring.
+Kimi/opus produced 2 failures again today despite 10 successes. Yesterday also saw 2 failures so this is a new pattern forming. The generic failure counter will accumulate; if a third day sees 2+ failures, the exponential backoff will trigger a cooldown. No action needed yet — monitoring.
 
 ### 2. claude/sonnet: 1 failure + 1 null outcome
 
