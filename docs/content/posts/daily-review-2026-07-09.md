@@ -53,7 +53,7 @@ Volume continues a gentle decline (~5% on dispatches, ~22% on review starts). Er
 - `north-mini-code-free` fully recovered: 3 successes, 0 timeouts (vs 2/2 yesterday). Not in cooldown.
 - `nemotron-3-ultra-free` absent — still in cooldown from yesterday's ~9h backoff.
 - `codex/gpt-5.4` returned with 1 success — the ~17h codex cooldown from yesterday expired cleanly.
-- `kimi/opus` had 2 failures (new concern — second consecutive day with failures, but success count still high at 10).
+- `kimi/opus` had 2 failures today; yesterday (07-08) was clean (0 failures), so this is the first failure day after a two-day clean streak. Success count still high at 10.
 - `minimax/opus` hit a rate_limit event, but the active cooldown is already 6d11h (billing-cycle level — this was pre-existing).
 
 ### Active Cooldowns
@@ -81,9 +81,9 @@ Blocked count unchanged at 50. GitHub Actions billing failures grew from ~2 to 5
 
 ## What Failed
 
-### 1. kimi/opus: 2 failures (second consecutive day)
+### 1. kimi/opus: 2 failures (first failure day after clean streak)
 
-Kimi/opus produced 2 failures again today despite 10 successes. Yesterday also saw 2 failures so this is a new pattern forming. The generic failure counter will accumulate; if a third day sees 2+ failures, the exponential backoff will trigger a cooldown. No action needed yet — monitoring.
+Kimi/opus produced 2 failures today despite 10 successes. Yesterday (07-08) had 0 failures — the second consecutive clean day — so this is the first failure day after a clean run, not a recurring pattern yet. The generic failure counter will accumulate; if failures persist across multiple days, the exponential backoff will trigger a cooldown. No action needed yet — monitoring.
 
 ### 2. claude/sonnet: 1 failure + 1 null outcome
 
@@ -111,13 +111,13 @@ Sync ticks are clean: 1.5–4s elapsed, no HTTP errors or lock contention. One t
 
 `gh issue list --state open` returned **no open issues** in this repository.
 
-No new issues filed. Kimi/opus failure pattern (2/day for two days) is below the threshold that warrants a bug report — the existing backoff system will activate if it persists. The GitHub Actions billing failure count growth (2 → 5 blocked tasks) is a downstream project concern, not an orch engine defect.
+No new issues filed. Kimi/opus had 2 failures today (first after two clean days) — isolated incident, below the threshold that warrants a bug report. The existing backoff system will activate if failures recur. The GitHub Actions billing failure count growth (2 → 5 blocked tasks) is a downstream project concern, not an orch engine defect.
 
 ---
 
 ## Priorities for Tomorrow
 
-1. **kimi/opus failure pattern** — watch for a third consecutive day of 2 failures. If it continues, exponential backoff will kick in; monitor whether the root cause is transient or structural.
+1. **kimi/opus failure watch** — today was the first failure day after two clean days. Watch for a second consecutive day of failures; if it recurs, exponential backoff will kick in. Monitor whether today's failures were transient or structural.
 2. **nemotron-3-ultra-free cooldown expires** — should route again soon. Watch for a third failure cycle; if so, backoff extends to ~27h.
 3. **GitHub Actions billing blocks (5 tasks)** — count grew from 2 to 5. These require manual intervention in downstream projects' billing settings, then `orch task unblock all`.
 4. **CI-failure backlog at ~50 tasks** — run `orch task unblock all` to drain stale entries; inspect re-blockers.
