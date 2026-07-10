@@ -1176,6 +1176,54 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Like `set_fields` but does NOT touch `updated_at`.
+    ///
+    /// Use this for internal bookkeeping writes (probe timestamps, counters) that
+    /// must not make a stale task appear recently-modified to triage queries.
+    pub async fn set_fields_silent(
+        &self,
+        id: i64,
+        updates: &[(&str, serde_json::Value)],
+    ) -> anyhow::Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        for (col, _) in updates {
+            anyhow::ensure!(
+                ALLOWED_FIELDS.contains(col),
+                "column {col} is not in the update allowlist"
+            );
+        }
+
+        let mut set_parts = Vec::new();
+        let mut values: Vec<Option<String>> = Vec::new();
+
+        for (col, val) in updates {
+            set_parts.push(format!("{col} = ?"));
+            match val {
+                serde_json::Value::String(s) => values.push(Some(s.clone())),
+                serde_json::Value::Number(n) => values.push(Some(n.to_string())),
+                serde_json::Value::Bool(b) => {
+                    values.push(Some(if *b { "1" } else { "0" }.to_string()));
+                }
+                serde_json::Value::Null => values.push(None),
+                other => values.push(Some(serde_json::to_string(other)?)),
+            }
+        }
+
+        let sql = format!("UPDATE tasks SET {} WHERE id = ?", set_parts.join(", "));
+
+        let mut query = sqlx::query(&sql);
+        for v in &values {
+            query = query.bind(v.as_deref());
+        }
+        query = query.bind(id);
+        query.execute(&self.pool).await?;
+
+        Ok(())
+    }
+
     /// Increment an integer field by 1, returning the new value.
     pub async fn increment(&self, id: i64, field: &str) -> anyhow::Result<i32> {
         anyhow::ensure!(

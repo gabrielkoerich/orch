@@ -739,7 +739,10 @@ async fn try_unblock_ci_failure_task(
         ("auto_unblock_count", serde_json::json!(new_count)),
         ("auto_unblock_last_at", serde_json::json!(&now)),
     ];
-    store.set_fields(task.id, &fields).await?;
+    // Use set_fields_silent so the probe write does not bump updated_at on stale
+    // blocked tasks — triage queries keyed off updated_at must only see real
+    // status/result changes, not periodic re-checks of an open PR.
+    store.set_fields_silent(task.id, &fields).await?;
 
     Ok(false)
 }
