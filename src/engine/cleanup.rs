@@ -625,9 +625,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
     // resolve the repo root. Resolving the repo root can fail for
     // projects not registered in config and that should not make
     // cleanup a hard error when there is nothing to do.
-    let branch_nonempty = branch
-        .as_ref()
-        .and_then(|b| if b.is_empty() { None } else { Some(b) });
+    let branch_nonempty = branch.as_ref().filter(|b| !b.is_empty());
     if worktree_to_remove.is_none() && branch_nonempty.is_none() {
         // If the stored worktree path is non-empty but doesn't exist on disk,
         // the worktree is already gone — mark it cleaned so we stop retrying.
