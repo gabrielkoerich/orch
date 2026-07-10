@@ -3727,6 +3727,46 @@ async fn set_fields_multiple_fields_at_once() {
 }
 
 #[tokio::test]
+async fn set_fields_silent_does_not_bump_updated_at() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let id = store
+        .create(&NewTask {
+            external_id: Some("1".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Silent update".to_string(),
+            body: "".to_string(),
+            source: "".to_string(),
+            source_id: "".to_string(),
+            author: "".to_string(),
+            url: "".to_string(),
+            labels: vec![],
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+
+    // Backdate updated_at to a known stale timestamp.
+    sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+        .bind(id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+    store
+        .set_fields_silent(id, &[("agent", serde_json::json!("claude"))])
+        .await
+        .unwrap();
+
+    let task = store.get(id).await.unwrap();
+    assert_eq!(task.agent, Some("claude".to_string()));
+    assert_eq!(
+        task.updated_at, "2020-01-01T00:00:00Z",
+        "set_fields_silent must not touch updated_at"
+    );
+}
+
+#[tokio::test]
 async fn store_tokens_overwrites_previous_values() {
     let store = TaskStore::open_memory().await.unwrap();
     let id = store
