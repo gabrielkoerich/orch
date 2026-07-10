@@ -1610,13 +1610,29 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolve a task ID, falling back to a global (cross-repo) lookup if the
+/// current-repo-scoped lookup finds nothing.  Emits a note on stderr when the
+/// task is found in a different repo so the operator can tell at a glance.
+async fn resolve_id(store: &TaskStore, id: &str) -> anyhow::Result<i64> {
+    let repo = config::get_current_repo().unwrap_or_default();
+    if let Some(task_id) = store.resolve_task_id(&repo, id).await? {
+        return Ok(task_id);
+    }
+    match store.resolve_task_id_globally(id).await? {
+        Some((task_id, found_repo)) => {
+            if found_repo != repo {
+                eprintln!("note: task {id} belongs to repo {found_repo:?}");
+            }
+            Ok(task_id)
+        }
+        None => anyhow::bail!("task not found: {id}"),
+    }
+}
+
 /// Show run history for a task.
 pub async fn runs(id: &str, verbose: bool) -> anyhow::Result<()> {
     let store = crate::cli::init_store().await?;
-    let repo = config::get_current_repo().unwrap_or_default();
-    let Some(task_id) = store.resolve_task_id(&repo, id).await? else {
-        anyhow::bail!("task not found: {id}");
-    };
+    let task_id = resolve_id(&store, id).await?;
 
     let runs = store.get_runs(task_id).await?;
     if runs.is_empty() {
@@ -1668,10 +1684,7 @@ pub async fn runs(id: &str, verbose: bool) -> anyhow::Result<()> {
 /// Show lifecycle activity timeline for a task.
 pub async fn activity_log(id: &str, limit: Option<usize>, json: bool) -> anyhow::Result<()> {
     let store = crate::cli::init_store().await?;
-    let repo = config::get_current_repo().unwrap_or_default();
-    let Some(task_id) = store.resolve_task_id(&repo, id).await? else {
-        anyhow::bail!("task not found: {id}");
-    };
+    let task_id = resolve_id(&store, id).await?;
 
     let events = store.get_activity(task_id, limit).await?;
     if events.is_empty() {
@@ -1713,10 +1726,7 @@ pub async fn activity_log(id: &str, limit: Option<usize>, json: bool) -> anyhow:
 /// Show task routing history with attempt timeline.
 pub async fn history(id: &str) -> anyhow::Result<()> {
     let store = crate::cli::init_store().await?;
-    let repo = config::get_current_repo().unwrap_or_default();
-    let Some(task_id) = store.resolve_task_id(&repo, id).await? else {
-        anyhow::bail!("task not found: {id}");
-    };
+    let task_id = resolve_id(&store, id).await?;
 
     let task = store.get(task_id).await?;
     let events = store.get_activity(task_id, None).await?;
@@ -1819,10 +1829,7 @@ pub async fn history(id: &str) -> anyhow::Result<()> {
 /// Unified diagnostic view for a task: status, agent, attempts, last error, PR, block reason.
 pub async fn inspect(id: &str) -> anyhow::Result<()> {
     let store = crate::cli::init_store().await?;
-    let repo = config::get_current_repo().unwrap_or_default();
-    let Some(task_id) = store.resolve_task_id(&repo, id).await? else {
-        anyhow::bail!("task not found: {id}");
-    };
+    let task_id = resolve_id(&store, id).await?;
 
     let task = store.get(task_id).await?;
 
@@ -1926,7 +1933,7 @@ pub async fn inspect(id: &str) -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| format!("internal:{}", task.id));
     let tmux = TmuxManager::new();
-    let session = tmux.session_name(&repo, &task_key);
+    let session = tmux.session_name(&task.repo, &task_key);
     if tmux.session_exists(&session).await {
         println!();
         println!(
