@@ -3953,6 +3953,89 @@ async fn create_internal_resolvable_by_task_id() {
     assert_eq!(resolved, Some(id));
 }
 
+// ── resolve_task_id_globally ────────────────────────────────────────────
+
+#[tokio::test]
+async fn resolve_task_id_globally_finds_internal_across_repos() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let id = store
+        .create_internal("other/repo", "Cross-repo task", "body", "cron", "j:1", None)
+        .await
+        .unwrap();
+
+    // Current-repo scoped lookup misses it.
+    let scoped = store
+        .resolve_task_id("my/repo", &format!("internal:{id}"))
+        .await
+        .unwrap();
+    assert_eq!(scoped, None);
+
+    // Global lookup finds it.
+    let global = store
+        .resolve_task_id_globally(&format!("internal:{id}"))
+        .await
+        .unwrap();
+    assert_eq!(global, Some((id, "other/repo".to_string())));
+}
+
+#[tokio::test]
+async fn resolve_task_id_globally_returns_none_for_unknown() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let result = store
+        .resolve_task_id_globally("internal:999")
+        .await
+        .unwrap();
+    assert_eq!(result, None);
+}
+
+#[tokio::test]
+async fn resolve_task_id_globally_unique_external_resolves() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let id = store
+        .create(&NewTask {
+            external_id: Some("77".to_string()),
+            repo: "owner/repo-a".to_string(),
+            origin: "github".to_string(),
+            title: "Issue 77".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let global = store.resolve_task_id_globally("77").await.unwrap();
+    assert_eq!(global, Some((id, "owner/repo-a".to_string())));
+}
+
+#[tokio::test]
+async fn resolve_task_id_globally_ambiguous_external_errors() {
+    let store = TaskStore::open_memory().await.unwrap();
+    store
+        .create(&NewTask {
+            external_id: Some("42".to_string()),
+            repo: "owner/repo-a".to_string(),
+            origin: "github".to_string(),
+            title: "Issue 42 in A".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    store
+        .create(&NewTask {
+            external_id: Some("42".to_string()),
+            repo: "owner/repo-b".to_string(),
+            origin: "github".to_string(),
+            title: "Issue 42 in B".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let result = store.resolve_task_id_globally("42").await;
+    assert!(result.is_err(), "ambiguous ID should return an error");
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("ambiguous"), "error should mention ambiguity");
+}
+
 #[tokio::test]
 async fn list_internal_by_status_filters_origin() {
     let store = TaskStore::open_memory().await.unwrap();

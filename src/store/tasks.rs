@@ -2269,6 +2269,57 @@ impl TaskStore {
         self.resolve_id_by_external(repo, task_id).await
     }
 
+    /// Resolve a task_id globally (across all repos) when a repo-scoped lookup fails.
+    ///
+    /// Returns `(internal_id, repo)` if found unambiguously, `None` if not found,
+    /// or an error if the external_id matches tasks in multiple repos (GitHub issue
+    /// numbers are not globally unique).
+    pub async fn resolve_task_id_globally(
+        &self,
+        task_id: &str,
+    ) -> anyhow::Result<Option<(i64, String)>> {
+        if let Some(suffix) = task_id.strip_prefix("internal:") {
+            // internal:N — external_id is globally unique; primary key is also unique.
+            let row = sqlx::query("SELECT id, repo FROM tasks WHERE external_id = ?")
+                .bind(task_id)
+                .fetch_optional(&self.pool)
+                .await?;
+            if let Some(r) = row {
+                return Ok(Some((r.try_get("id")?, r.try_get("repo")?)));
+            }
+            if let Ok(id) = suffix.parse::<i64>() {
+                let row = sqlx::query("SELECT id, repo FROM tasks WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+                if let Some(r) = row {
+                    return Ok(Some((r.try_get("id")?, r.try_get("repo")?)));
+                }
+            }
+            return Ok(None);
+        }
+        // External IDs (e.g. GitHub issue numbers) may collide across repos.
+        let rows = sqlx::query("SELECT id, repo FROM tasks WHERE external_id = ?")
+            .bind(task_id)
+            .fetch_all(&self.pool)
+            .await?;
+        match rows.len() {
+            0 => Ok(None),
+            1 => Ok(Some((rows[0].try_get("id")?, rows[0].try_get("repo")?))),
+            _ => {
+                let repos: Vec<String> = rows
+                    .iter()
+                    .filter_map(|r| r.try_get::<String, _>("repo").ok())
+                    .collect();
+                anyhow::bail!(
+                    "task ID {task_id:?} is ambiguous — found in multiple repos: {}. \
+                     Run from the repo worktree so the current-repo lookup resolves it.",
+                    repos.join(", ")
+                )
+            }
+        }
+    }
+
     fn row_to_run(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskRun> {
         Ok(TaskRun {
             id: row
