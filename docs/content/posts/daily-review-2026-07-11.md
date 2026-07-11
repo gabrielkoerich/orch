@@ -8,109 +8,117 @@ description = "Daily review: what shipped, what failed, operational health, and 
 
 ## What Shipped (Last 24h)
 
-**2 commits** landed today — both bug fixes:
+**1 commit** landed on `main` in the last 24 hours:
 
 | Commit | PR | Summary |
 |--------|----|---------|
-| `1c15e367` | #3395 | `bug(sync)`: CI-failure unblock sweep rewrites `updated_at` on stale blocked tasks, polluting recent-failure triage |
-| `534b7a0e` | #3396 | `bug(cli)`: `orch task runs` only resolves the current repo, breaking cross-project failure triage |
+| `80e1d311` | #3397 | Daily review post (2026-07-11, earlier draft) |
 
-**2 issues closed:** #3393 (sync bug) and #3394 (CLI bug). Both were root-cause fixes identified during triage tooling improvements.
+Two bug-fix commits (`1c15e367` / #3395, `534b7a0e` / #3396) merged on 2026-07-10 — outside the 24h window. **2 issues closed on 07-10:** #3393 (sync bug) and #3394 (CLI bug).
+
+Service upgraded to **v0.80.46** (from v0.80.45 at this morning's review — 1 release deployed today).
 
 ---
 
 ## Operational Health
 
-### Throughput
+### Throughput (full day vs morning snapshot)
 
-`task_activity` comparison vs last review (07-08):
+| Event | End-of-day | Morning snapshot | Change |
+|-------|------------|-----------------|--------|
+| `status_change` | 307 | 129 | +138% |
+| `push` | 101 | 45 | +124% |
+| `dispatch` | 91 | 39 | +133% |
+| `branch_delete` | 62 | 26 | +138% |
+| `review_start` | 51 | 22 | +132% |
+| `review_decision` | 49 | 22 | +123% |
+| `pr_create` | 48 | 22 | +118% |
+| `routed` | 34 | 14 | +143% |
+| `error` | 6 | 1 | +5 |
 
-| Event | Today | Last review (07-08) |
-|-------|-------|---------------------|
-| `status_change` | 129 | 186 |
-| `push` | 45 | 56 |
-| `dispatch` | 39 | 59 |
-| `branch_delete` | 26 | 44 |
-| `review_start` | 22 | 31 |
-| `review_decision` | 22 | 27 |
-| `pr_create` | 22 | 27 |
-| `routed` | 14 | 26 |
-| `error` | 1 | 4 |
+Strong throughput day — 91 dispatches and 48 PRs created. Error count rose from 1 to 6 (still low), and dispatch volume is well above the 07-08 comparison (59 dispatches).
 
-Dispatch volume is down ~34% vs the last review (three days prior), but **quality is at a new high**: only 1 error event and no timeouts recorded. Error count dropped from 4 → 1, a 75% improvement.
-
-### Agent / Model Outcomes (last 24h)
+### Agent / Model Outcomes (full day)
 
 | Agent | Model | Outcome | Count |
 |-------|-------|---------|-------|
-| claude | sonnet | success | 22 |
-| **codex** | **gpt-5.4** | **success** | **9** |
-| kimi | opus | success | 8 |
-| opencode | north-mini-code-free | success | 4 |
-| opencode | deepseek-v4-flash-free | success | 1 |
+| claude | sonnet | success | 50 |
+| **codex** | **gpt-5.4** | **success** | **20** |
+| kimi | opus | success | 17 |
+| opencode | north-mini-code-free | success | 6 |
+| opencode | deepseek-v4-flash-free | success | 4 |
+| opencode | mimo-v2.5-free | success | 2 |
 | opencode | hy3-free | success | 1 |
 | opencode | nemotron-3-ultra-free | success | 1 |
 | claude | sonnet | failed | 1 |
+| claude | sonnet | push_failed | 1 |
 | claude | sonnet | — | 1 |
+| codex | gpt-5.4 | failed | 1 |
+| opencode | deepseek-v4-flash-free | failed | 1 |
+| opencode | nemotron-3-ultra-free | failed | 1 |
+| opencode | north-mini-code-free | parse_error | 1 |
 
-**Headline: codex is back.** After an extended cooldown period, codex/gpt-5.4 delivered 9 successes with zero failures today — the best codex performance in several days. The agent-level cooldown cleared and gpt-5.4 is routing cleanly.
+**Headline: codex/gpt-5.4 delivered 20 successes** — the strongest codex day after its extended cooldown cleared. Claude/sonnet leads with 50 successes. Kimi/opus holds at 17 (excellent third consecutive clean day).
 
-Claude/sonnet leads with 22 successes. Kimi/opus holds at 8 (third clean day). `nemotron-3-ultra-free` finally posted a success after two consecutive failure days — the exponential backoff appears to have let the model recover.
+Notable: a `push_failed` outcome appeared in claude/sonnet — distinct from a task failure (agent succeeded, push step failed). This is a new failure category observed; one instance, no cooldown triggered.
 
-### Active Cooldowns
+### Active Cooldowns (end of day)
 
-Only one cooldown is active as of review time:
+| Key | Remaining | Notes |
+|-----|-----------|-------|
+| minimax:opus | ~4d11h | Extended — LLM router keeps selecting, immediate fallback to claude |
+| opencode:opencode/nemotron-3-ultra-free | ~1d16h | New today — failure after morning success |
+| opencode:opencode/north-mini-code-free | ~3h18m | New today — parse_error |
 
-| Key | Expires | Notes |
-|-----|---------|-------|
-| minimax:opus | ~2026-07-16 (~4.8 days) | Extended cooldown |
-
-All other cooldowns have expired (codex, kimi, opencode model-level, claude agent-level). The LLM router continues to select minimax for complex internal tasks, which are immediately re-routed to claude — this is the expected fallback behavior and will continue until the minimax:opus cooldown clears.
-
-The `github:5xx` cooldown expired within seconds of review time (no operational impact observed).
+Two new model-level cooldowns emerged during the afternoon. north-mini-code-free clears tonight (~3h18m remaining); nemotron-3-ultra-free clears around July 13 (~1d16h remaining). Fallback routing is handling both cleanly. No agent-level cooldowns.
 
 ### Blocked Inventory
 
-| Reason | Count |
-|--------|-------|
-| CI failure limit reached | ~43 |
-| No block reason recorded | 4 |
-| GitHub Actions billing failure | 5 |
-| Review rebroadcast escalation | 1 |
-| Max review cycles exceeded | 1 |
-| **Total blocked** | **51** |
+Blocked count is roughly stable (~51). The CI-failure-limit set represents PRs from a downstream project with stale CI. The GitHub Actions billing failures are correctly scoped per-task.
 
-Blocked count is roughly stable (51 vs ~50 at the last review). The CI-failure-limit set represents PRs from a downstream project with stale CI. The GitHub Actions billing failures are correctly scoped per-task. **`orch task unblock all` is the recommended drain** — tasks that re-block immediately should be inspected.
-
-Note: `internal:154863` (previous daily review task) remains blocked at PR #3392 due to CI failure limit.
+Note: `internal:154863` (previous daily review task) remains blocked at PR #3392 due to CI failure limit — the earlier daily review post is stale.
 
 ---
 
 ## What Failed
 
-### 1. claude/sonnet: 1 failure
+### 1. opencode/nemotron-3-ultra-free: failed after morning success
 
-One claude/sonnet failure with no accompanying model cooldown (no repeated failures). Likely a transient error; the agent recovered normally on subsequent dispatches.
+Had 1 success and 1 failure today. The failure triggered a ~40h cooldown (1d16h remaining). This was the nemotron recovery signal from this morning; it did not hold through the full day.
 
-### 2. LLM router still selecting cooled minimax
+### 2. opencode/north-mini-code-free: parse_error
 
-Both `internal:154906` (this task) and `internal:154907` were routed to minimax by the LLM router and immediately re-routed to claude. The routing sanity warning fires on every complex internal task while minimax:opus remains cooled (~4.8 days remaining). No task impact — the fallback works correctly.
+1 parse_error and 6 successes. The parse error triggered a short ~3h18m cooldown. Model is functioning normally for the majority of tasks; this appears to be a one-off parse failure.
 
-### 3. One slow tick (53,975ms)
+### 3. codex/gpt-5.4: 1 failure
 
-A single slow tick was logged when two tasks were dispatched in the same cycle (worktree creation + tmux session start). This is expected behavior under simultaneous dispatch; no tasks were delayed or dropped.
+One failure amid 20 successes (95% success rate). No cooldown triggered — the generic failure threshold wasn't met. Likely a transient error; codex is routing cleanly.
+
+### 4. claude/sonnet: push_failed (1 instance)
+
+Agent completed successfully; the push step failed. This is a distinct failure mode from task failure. One instance — no cooldown, no repeated occurrence. Monitor for recurrence.
+
+### 5. Watchdog stall + slow tick at dispatch
+
+A 70s watchdog warning fired at 23:01:17Z when two internal tasks were dispatched simultaneously (two worktrees created + two tmux sessions started in the same tick). The tick completed at 63,379ms. No tasks were dropped or delayed. This is expected behavior under simultaneous multi-task dispatch; the watchdog threshold (60s) is conservative relative to actual dispatch time.
+
+### 6. LLM router still selecting minimax (cooled)
+
+Both this task and another internal task were routed to minimax by the LLM router and immediately re-routed to claude. The routing sanity warning fires on every internal task while minimax:opus remains cooled (~4.5 days remaining). Fallback is immediate and correct.
 
 ---
 
 ## Routing Accuracy
 
-No wrong complexity tier observed. Codex routing via gpt-5.4 is correct — the model handle matches what's in config. The minimax LLM-router preference for complex tasks is inaccurate (the model has a 4.8-day cooldown), but the fallback to claude is immediate. The 1 re-route event is entirely explained by this minimax pattern. No silent failures detected.
+No wrong complexity tier observed. Codex routing via gpt-5.4 is correct. The minimax LLM-router preference for complex tasks is inaccurate (model cooled), but the fallback to claude is immediate. No silent failures detected. The 2 routing sanity warnings are fully explained by the persistent minimax:opus cooldown.
 
 ---
 
 ## Log Health
 
-Service running **v0.80.45** (up from v0.80.43 mentioned in the 07-08 review — 2 releases deployed). The brew error log is 0 bytes. Service logs show clean sync ticks, event-driven dispatch working correctly, and cooldown KV sync completing in <1ms. No HTTP errors, no lock contention.
+Service running **v0.80.46**. Brew error log is 0 bytes. Sync ticks completing in 1.5–2.5s. Cooldown KV sync in <1ms. Event-driven dispatch working correctly. No HTTP errors, no lock contention.
+
+One watchdog warning (WATCHDOG: tick loop stall at 70s) — expected under simultaneous dual-dispatch, not a service health concern.
 
 ---
 
@@ -118,18 +126,20 @@ Service running **v0.80.45** (up from v0.80.43 mentioned in the 07-08 review —
 
 `gh issue list --state open` returned **no open issues** in `gabrielkoerich/orch`.
 
-No new issues filed today. The codex recovery and error-count improvement are positive signals; the minimax routing warning is a known transient. The CI-failure blocklist is large but stable and drainable via `orch task unblock all`.
+No new issues filed today. The nemotron/north-mini-code-free model-level cooldowns are handled by the generic system. The push_failed outcome on claude/sonnet warrants monitoring but is a single instance.
 
 ---
 
 ## Priorities for Tomorrow
 
-1. **Codex/gpt-5.4 is healthy — monitor for continuation.** 9 successes today after extended cooldown; watch for any new failures that would trigger another backoff cycle.
-2. **minimax:opus cooldown runs ~4.8 more days** (~expires 2026-07-16). Routing sanity warnings on complex internal tasks will continue daily. No action needed unless the LLM router starts selecting other cooled models.
-3. **CI-failure blocklist at 51** — run `orch task unblock all` to drain; inspect any that immediately re-block for root causes.
-4. **internal:154863 blocked at PR #3392** — the daily review post from a prior run. Resolve or close the PR manually if CI is not going to pass.
-5. **nemotron-3-ultra-free recovery** — watch whether today's single success holds or if failures resume.
+1. **Codex/gpt-5.4 on a 20-success day** — watch for continuation; next failure from this model restarts backoff from base.
+2. **north-mini-code-free cooldown clears in ~3h** — should be back in rotation before midnight tonight; monitor parse_error recurrence.
+3. **nemotron-3-ultra-free cooldown clears ~July 13** — not a concern for tomorrow; the model is unreliable (1 success, 1 failure today).
+4. **minimax:opus cooldown runs ~4.5 more days** (~expires 2026-07-16). Routing sanity warnings on complex internal tasks will continue. No action needed.
+5. **CI-failure blocklist (~51)** — run `orch task unblock all` to drain; inspect any that immediately re-block.
+6. **internal:154863 blocked at PR #3392** — stale daily review PR. Close or merge manually; CI may never pass.
+7. **push_failed category** — watch for recurrence on claude/sonnet. If it appears again, investigate whether it's a git push timeout or a branch conflict.
 
 ---
 
-*Prepared by Orch automation (internal:154906) at 2026-07-11 UTC.*
+*Prepared by Orch automation (internal:154941) at 2026-07-11 UTC (end of day update).*
