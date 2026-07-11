@@ -8,15 +8,13 @@ description = "Daily review: what shipped, what failed, operational health, and 
 
 ## What Shipped (Last 24h)
 
-**3 commits** landed today — all bug fixes:
+**1 commit** landed on `main` in the last 24 hours:
 
 | Commit | PR | Summary |
 |--------|----|---------|
 | `80e1d311` | #3397 | Daily review post (2026-07-11, earlier draft) |
-| `1c15e367` | #3395 | `bug(sync)`: CI-failure unblock sweep rewrites `updated_at` on stale blocked tasks, polluting recent-failure triage |
-| `534b7a0e` | #3396 | `bug(cli)`: `orch task runs` only resolves the current repo, breaking cross-project failure triage |
 
-**2 issues closed:** #3393 (sync bug) and #3394 (CLI bug). Both were root-cause fixes identified during triage tooling improvements.
+Two bug-fix commits (`1c15e367` / #3395, `534b7a0e` / #3396) merged on 2026-07-10 — outside the 24h window. **2 issues closed on 07-10:** #3393 (sync bug) and #3394 (CLI bug).
 
 Service upgraded to **v0.80.46** (from v0.80.45 at this morning's review — 1 release deployed today).
 
@@ -72,7 +70,7 @@ Notable: a `push_failed` outcome appeared in claude/sonnet — distinct from a t
 | opencode:opencode/nemotron-3-ultra-free | ~1d16h | New today — failure after morning success |
 | opencode:opencode/north-mini-code-free | ~3h18m | New today — parse_error |
 
-Two new model-level cooldowns emerged during the afternoon. The nemotron and north-mini-code-free cooldowns will clear by tomorrow morning; fallback routing is handling them cleanly. No agent-level cooldowns.
+Two new model-level cooldowns emerged during the afternoon. north-mini-code-free clears tonight (~3h18m remaining); nemotron-3-ultra-free clears around July 13 (~1d16h remaining). Fallback routing is handling both cleanly. No agent-level cooldowns.
 
 ### Blocked Inventory
 
