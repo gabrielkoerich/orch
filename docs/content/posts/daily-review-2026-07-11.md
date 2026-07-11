@@ -23,22 +23,21 @@ description = "Daily review: what shipped, what failed, operational health, and 
 
 ### Throughput
 
-`task_activity` comparison vs yesterday (07-08):
+`task_activity` comparison vs last review (07-08):
 
-| Event | Today | Yesterday (07-08) |
-|-------|-------|------------------|
-| `status_change` | 135 | 186 |
+| Event | Today | Last review (07-08) |
+|-------|-------|---------------------|
+| `status_change` | 129 | 186 |
 | `push` | 45 | 56 |
-| `dispatch` | 43 | 59 |
+| `dispatch` | 39 | 59 |
 | `branch_delete` | 26 | 44 |
 | `review_start` | 22 | 31 |
 | `review_decision` | 22 | 27 |
 | `pr_create` | 22 | 27 |
-| `routed` | 16 | 26 |
+| `routed` | 14 | 26 |
 | `error` | 1 | 4 |
-| `timeout` | 0 | — |
 
-Dispatch volume is down ~27%, but **quality is at a new high**: only 1 error event and 0 timeouts in 24h. Error count dropped from 4 → 1, a 75% improvement.
+Dispatch volume is down ~34% vs the last review (three days prior), but **quality is at a new high**: only 1 error event and no timeouts recorded. Error count dropped from 4 → 1, a 75% improvement.
 
 ### Agent / Model Outcomes (last 24h)
 
@@ -81,7 +80,7 @@ The `github:5xx` cooldown expired within seconds of review time (no operational 
 | Max review cycles exceeded | 1 |
 | **Total blocked** | **51** |
 
-Blocked count is roughly stable (51 vs ~50 yesterday). The CI-failure-limit set represents PRs from a downstream project with stale CI. The GitHub Actions billing failures are correctly scoped per-task. **`orch task unblock all` is the recommended drain** — tasks that re-block immediately should be inspected.
+Blocked count is roughly stable (51 vs ~50 at the last review). The CI-failure-limit set represents PRs from a downstream project with stale CI. The GitHub Actions billing failures are correctly scoped per-task. **`orch task unblock all` is the recommended drain** — tasks that re-block immediately should be inspected.
 
 Note: `internal:154863` (previous daily review task) remains blocked at PR #3392 due to CI failure limit.
 
