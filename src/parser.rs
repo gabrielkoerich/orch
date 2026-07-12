@@ -206,7 +206,7 @@ fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
         "in_review" | "reviewing" => "in_review".to_string(),
         "needs_review" | "pending_review" | "ready_for_review" => "needs_review".to_string(),
         // Canonical error statuses.
-        "blocked" | "error" | "failed" => "blocked".to_string(),
+        "blocked" | "error" | "failed" | "failure" => "blocked".to_string(),
         // Passthrough: known canonical statuses (already canonical, keep as-is).
         s if s == "new"
             || s == "routed"
@@ -1110,6 +1110,13 @@ Some output here.
     fn parse_normalizes_error_alias_to_blocked() {
         let input =
             r#"{"status":"error","summary":"failed","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "blocked");
+    }
+
+    #[test]
+    fn parse_normalizes_failure_alias_to_blocked() {
+        let input = r#"{"status":"failure","summary":"could not complete","accomplished":[],"remaining":[],"files":[]}"#;
         let resp = parse(input).unwrap();
         assert_eq!(resp.status, "blocked");
     }
