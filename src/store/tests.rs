@@ -889,6 +889,75 @@ async fn complete_run_stores_null_error_for_empty_string() {
 }
 
 #[tokio::test]
+async fn complete_run_redacts_sensitive_git_error_fields() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let task_id = store
+        .create(&NewTask {
+            repo: "owner/repo".to_string(),
+            origin: "internal".to_string(),
+            title: "Test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let run_id = store
+        .start_run(&StartRun {
+            task_id,
+            attempt: 1,
+            run_type: "agent",
+            agent: "codex",
+            model: "gpt-5.2",
+            command: "git push",
+            prompt: "push branch",
+        })
+        .await
+        .unwrap();
+
+    let leaked =
+        "https://x-access-token:ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij@github.com/owner/repo.git";
+    let stderr = format!("remote rejected {leaked}");
+    let error = format!("push failed: {stderr}");
+
+    store
+        .complete_run(&CompleteRun {
+            run_id,
+            exit_code: Some(1),
+            stdout: "",
+            stderr: &stderr,
+            parsed: "{}",
+            outcome: "failed",
+            error: &error,
+            tokens: RunTokenUsage::default(),
+        })
+        .await
+        .unwrap();
+
+    let row = sqlx::query("SELECT stderr, error FROM task_runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    let stored_stderr: String = row.try_get("stderr").unwrap();
+    let stored_error: String = row.try_get("error").unwrap();
+    assert!(!stored_stderr.contains("ghp_"));
+    assert!(!stored_error.contains("ghp_"));
+    assert!(stored_stderr.contains("[REDACTED:github_token]"));
+    assert!(stored_error.contains("[REDACTED:github_token]"));
+
+    let activity = sqlx::query_scalar::<_, String>(
+        "SELECT details FROM task_activity WHERE task_id = ? AND event_type = 'error' ORDER BY id DESC LIMIT 1",
+    )
+    .bind(task_id)
+    .fetch_one(&store.pool)
+    .await
+    .unwrap();
+    assert!(!activity.contains("ghp_"));
+    assert!(activity.contains("[REDACTED:github_token]"));
+}
+
+#[tokio::test]
 async fn finalize_incomplete_runs_marks_open_runs_aborted() {
     let store = TaskStore::open_memory().await.unwrap();
 
@@ -1025,6 +1094,66 @@ async fn set_fields_updates_task() {
     assert_eq!(task.agent, Some("claude".to_string()));
     assert_eq!(task.branch, "fix-bug-42");
     assert_eq!(task.pr_number, Some(123));
+}
+
+#[tokio::test]
+async fn set_fields_redacts_last_error() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let id = store
+        .create(&NewTask {
+            external_id: None,
+            repo: "owner/repo".to_string(),
+            origin: "internal".to_string(),
+            title: "Test".to_string(),
+            body: "".to_string(),
+            source: "manual".to_string(),
+            source_id: "".to_string(),
+            author: "".to_string(),
+            url: "".to_string(),
+            labels: vec![],
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+
+    store
+        .set_fields(
+            id,
+            &[(
+                "last_error",
+                serde_json::json!(
+                    "push failed: https://x-access-token:ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij@github.com/owner/repo.git"
+                ),
+            )],
+        )
+        .await
+        .unwrap();
+
+    let task = store.get(id).await.unwrap();
+    assert!(!task.last_error.contains("ghp_"));
+    assert!(task.last_error.contains("[REDACTED:github_token]"));
+}
+
+#[tokio::test]
+async fn set_block_reason_redacts_sensitive_git_error() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let id = make_task(&store).await;
+
+    store
+        .set_block_reason(
+            id,
+            Some(
+                "push failed: https://x-access-token:ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij@github.com/owner/repo.git",
+            ),
+        )
+        .await
+        .unwrap();
+
+    let task = store.get(id).await.unwrap();
+    let block_reason = task.block_reason.expect("block_reason should be set");
+    assert!(!block_reason.contains("ghp_"));
+    assert!(block_reason.contains("[REDACTED:github_token]"));
 }
 
 #[tokio::test]
@@ -6516,6 +6645,24 @@ async fn batch_set_fields_updates_multiple_tasks() {
     let t2 = store.get(id2).await.unwrap();
     assert_eq!(t1.summary, "first");
     assert_eq!(t2.summary, "second");
+}
+
+#[tokio::test]
+async fn batch_set_fields_redacts_last_error() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let id = make_task(&store).await;
+    let updates: &[(&str, serde_json::Value)] = &[(
+        "last_error",
+        serde_json::json!(
+            "push failed: https://x-access-token:ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij@github.com/owner/repo.git"
+        ),
+    )];
+
+    store.batch_set_fields(&[(id, updates)]).await.unwrap();
+
+    let task = store.get(id).await.unwrap();
+    assert!(!task.last_error.contains("ghp_"));
+    assert!(task.last_error.contains("[REDACTED:github_token]"));
 }
 
 #[tokio::test]
