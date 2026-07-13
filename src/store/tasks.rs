@@ -1,4 +1,5 @@
 use super::*;
+use crate::security;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
@@ -104,6 +105,47 @@ const INCREMENTABLE_FIELDS: &[&str] = &[
     "no_code_reroutes",
     "network_retries",
 ];
+
+fn sanitize_activity_details(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => serde_json::Value::String(security::redact(text)),
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(sanitize_activity_details)
+                .collect::<Vec<_>>(),
+        ),
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), sanitize_activity_details(value)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn sanitize_task_field_value(col: &str, value: &serde_json::Value) -> serde_json::Value {
+    match (col, value) {
+        ("last_error" | "block_reason", serde_json::Value::String(text)) => {
+            serde_json::Value::String(security::redact(text))
+        }
+        _ => value.clone(),
+    }
+}
+
+fn sql_value_for_task_field(
+    col: &str,
+    value: &serde_json::Value,
+) -> anyhow::Result<Option<String>> {
+    let sanitized = sanitize_task_field_value(col, value);
+    match sanitized {
+        serde_json::Value::String(text) => Ok(Some(text)),
+        serde_json::Value::Number(number) => Ok(Some(number.to_string())),
+        serde_json::Value::Bool(boolean) => Ok(Some(if boolean { "1" } else { "0" }.to_string())),
+        serde_json::Value::Null => Ok(None),
+        other => Ok(Some(serde_json::to_string(&other)?)),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -365,7 +407,7 @@ impl TaskStore {
         details: Option<&serde_json::Value>,
     ) -> anyhow::Result<()> {
         let details_json = match details {
-            Some(v) => serde_json::to_string(v)?,
+            Some(v) => serde_json::to_string(&sanitize_activity_details(v))?,
             None => "{}".to_string(),
         };
         sqlx::query(
@@ -399,7 +441,7 @@ impl TaskStore {
         details: Option<&serde_json::Value>,
     ) -> anyhow::Result<()> {
         let details_json = match details {
-            Some(v) => serde_json::to_string(v)?,
+            Some(v) => serde_json::to_string(&sanitize_activity_details(v))?,
             None => "{}".to_string(),
         };
         sqlx::query(
@@ -1152,15 +1194,7 @@ impl TaskStore {
 
         for (col, val) in updates {
             set_parts.push(format!("{col} = ?"));
-            match val {
-                serde_json::Value::String(s) => values.push(Some(s.clone())),
-                serde_json::Value::Number(n) => values.push(Some(n.to_string())),
-                serde_json::Value::Bool(b) => {
-                    values.push(Some(if *b { "1" } else { "0" }.to_string()));
-                }
-                serde_json::Value::Null => values.push(None),
-                other => values.push(Some(serde_json::to_string(other)?)),
-            }
+            values.push(sql_value_for_task_field(col, val)?);
         }
 
         set_parts.push("updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')".to_string());
@@ -1201,15 +1235,7 @@ impl TaskStore {
 
         for (col, val) in updates {
             set_parts.push(format!("{col} = ?"));
-            match val {
-                serde_json::Value::String(s) => values.push(Some(s.clone())),
-                serde_json::Value::Number(n) => values.push(Some(n.to_string())),
-                serde_json::Value::Bool(b) => {
-                    values.push(Some(if *b { "1" } else { "0" }.to_string()));
-                }
-                serde_json::Value::Null => values.push(None),
-                other => values.push(Some(serde_json::to_string(other)?)),
-            }
+            values.push(sql_value_for_task_field(col, val)?);
         }
 
         let sql = format!("UPDATE tasks SET {} WHERE id = ?", set_parts.join(", "));
@@ -1570,15 +1596,7 @@ impl TaskStore {
             let mut values: Vec<Option<String>> = Vec::new();
             for (col, val) in *entry_updates {
                 set_parts.push(format!("{col} = ?"));
-                match val {
-                    serde_json::Value::String(s) => values.push(Some(s.clone())),
-                    serde_json::Value::Number(n) => values.push(Some(n.to_string())),
-                    serde_json::Value::Bool(b) => {
-                        values.push(Some(if *b { "1" } else { "0" }.to_string()));
-                    }
-                    serde_json::Value::Null => values.push(None),
-                    other => values.push(Some(serde_json::to_string(other)?)),
-                }
+                values.push(sql_value_for_task_field(col, val)?);
             }
             set_parts.push("updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')".to_string());
             let sql = format!("UPDATE tasks SET {} WHERE id = ?", set_parts.join(", "));
@@ -1827,10 +1845,10 @@ impl TaskStore {
         )
         .bind(run.exit_code)
         .bind(run.stdout)
-        .bind(run.stderr)
+        .bind(security::redact(run.stderr))
         .bind(run.parsed)
         .bind(run.outcome)
-        .bind(run.error)
+        .bind(security::redact(run.error))
         .bind(i64::try_from(run.tokens.input_tokens).unwrap_or_else(|_| {
             tracing::warn!(
                 run.tokens.input_tokens,
