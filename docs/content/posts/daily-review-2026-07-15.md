@@ -26,35 +26,36 @@ No feature or bug-fix commits today — the service continues running **v0.80.49
 
 | Event | Count |
 |------|------:|
-| `status_change` | 183 |
-| `push` | 60 |
-| `dispatch` | 58 |
+| `status_change` | 192 |
+| `push` | 63 |
+| `dispatch` | 61 |
 | `branch_delete` | 46 |
-| `review_start` | 31 |
-| `review_decision` | 29 |
-| `pr_create` | 29 |
-| `routed` | 24 |
+| `review_start` | 33 |
+| `review_decision` | 30 |
+| `pr_create` | 31 |
+| `routed` | 25 |
 | `error` | 4 |
 | `rerouted` | 1 |
 
-Throughput is up from yesterday (58 dispatches vs 52). Review pipeline kept pace: 29 decisions against 29 PRs created.
+Throughput is up from yesterday (61 dispatches vs 52). Review pipeline kept pace: 30 decisions against 31 PRs created.
 
 ### Task Run Outcomes
 
-`task_runs` shows **65 runs** over the last 24 hours:
+`task_runs` shows **69 runs** over the last 24 hours:
 
 | Agent | Model | Outcome | Count |
 |------|-------|---------|------:|
-| claude | sonnet | success | 29 |
-| codex | gpt-5.4 | success | 13 |
+| claude | sonnet | success | 30 |
+| codex | gpt-5.4 | success | 14 |
 | opencode | various free models | success | 13 |
-| kimi | opus | success | 5 |
+| kimi | opus | success | 6 |
 | kimi | opus | rate_limit | 2 |
 | claude | sonnet | failed | 1 |
 | opencode | nemotron-3-ultra-free | failed | 1 |
 | claude | sonnet | (in progress) | 1 |
+| codex | gpt-5.4 | (in progress) | 1 |
 
-**60 of 64 completed runs succeeded (~94%).** Four non-success events requiring attention below.
+**63 of 67 completed runs succeeded (~94%).** Four non-success events requiring attention below.
 
 ### Failures Today
 
@@ -71,7 +72,7 @@ Throughput is up from yesterday (58 dispatches vs 52). Review pipeline kept pace
 **3. kimi/opus — billing cycle exhausted (tasks 155056, 155060)**
 - Two rate limits today: `403 You've reached your usage limit for this billing cycle`
 - Cooldown applied to `kimi:haiku` (~8h59m remaining)
-- kimi:opus continues routing successfully (5 successes today post-rate-limit on other tasks) — billing limit may be per-subaccount or already reset
+- kimi:opus continues routing successfully (6 successes today post-rate-limit on other tasks) — billing limit may be per-subaccount or already reset
 
 ### Active Cooldowns
 
@@ -90,8 +91,9 @@ LLM router selected `minimax/medium` for this task (internal:155086) again — s
 ### Logs and Service Health
 
 - `orch.error.log` is **0 bytes** — no service-level errors
-- Sync ticks steady at **1.4s–2.6s**
-- No watchdog triggers, no stuck ticks
+- Sync ticks normal range: **1.4s–3.1s** throughout the review window
+- **1 watchdog alert at 23:01:16 UTC**: tick loop stalled for 70s (threshold 60s), followed by a slow tick of **72024ms** at 23:01:28 UTC
+- Root cause: simultaneous LLM router calls for two tasks at ~23:00 UTC; minimax router call for one task timed out after 45s, blocking the tick loop until timeout resolved — automatic reroute to claude/sonnet succeeded
 - 4 `error` events in `task_activity` correspond to the 4 failure outcomes above
 
 ---
@@ -114,10 +116,10 @@ All handled generically by the cooldown and silence-detection systems. No manual
 |-------|------:|
 | `done` | 5042 |
 | `blocked` | 50 |
-| `new` | 3 |
+| `new` | 2 |
 | `in_progress` | 1 |
 
-`new` count rose from 2 to 3 — likely includes the re-queued silence-detection task plus two pre-existing tasks. The 50 blocked tasks are downstream CI-related merge failures (per settled architecture). No new blocked tasks appeared today.
+`new` count at 2 — likely the re-queued silence-detection task plus one pre-existing task. The 50 blocked tasks are downstream CI-related merge failures (per settled architecture). No new blocked tasks appeared today.
 
 ---
 
