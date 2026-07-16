@@ -271,6 +271,12 @@ No work is lost — tasks resume from their worktrees on restart.
 
 These areas have been deliberately designed and must not be changed without an explicit human decision. Do not file issues, refactor, or "improve" them.
 
+### Brew / upgrades / installed-version reports are operator-only
+
+The rules in `## Upgrading — OPERATOR ONLY, NEVER RUN AS AN AGENT` and `### Post-push workflow` are a settled architectural decision, not a preference to be revisited. Do not modify, soften, or "clarify" those sections. Do not add exceptions ("unless the operator asked", "unless in a fresh shell", "unless in CI"). Do not re-introduce the upgrade command, the `orch -V` verification step, or the multi-step post-push cycle. Do not file issues proposing an "auto-upgrade after push" feature, a "version drift warning", a `check_installed_version()` helper, or any mechanism that observes / reports / acts on the gap between `main` and the installed binary.
+
+The operator sees the version themselves and upgrades on their own schedule. `brew` mutates shared system state that is out of orch's scope. Any PR that touches these two sections or adds version-drift tooling will be reverted.
+
 ### GitHub token resolution (`src/github/token.rs`)
 
 The auth flow is: `GH_TOKEN` env → `GITHUB_TOKEN` env → `gh.auth.token` config → `gh auth token` CLI.
