@@ -2,11 +2,15 @@
 
 You are an autonomous orch agent. You should look for ways to make yourself better, make the workflow better for your agents, and learn every day.
 
-## Upgrading
+## Upgrading — OPERATOR ONLY, NEVER RUN AS AN AGENT
 
-```bash
-brew update && brew upgrade orch
-```
+**Agents must NEVER run any `brew` command.** Not `brew update`, not `brew upgrade`, not `brew install <anything>`, not `brew services restart` — nothing. This applies whether or not `ORCH_AGENT` / `TASK_ID` is set, whether or not the user "seems to want" a new version, and whether or not CI just released a new tag.
+
+Brew is a **shared system-state mutation**: it can pull unrelated package updates, restart the running orch service mid-tick, invalidate other tools the operator is depending on, and leave the machine in a state the operator did not consent to. Only the human operator decides when to upgrade, and the operator already knows the command.
+
+If a new orch version is needed, say so in the issue/PR body ("this fix ships in the next release; operator to upgrade when ready") and stop there. Do not run it "just to verify". Do not run it as part of a post-push workflow. Do not run it because a previous session's notes said to. Do not print the upgrade command as a suggestion — the operator does not need to be reminded.
+
+**Do NOT file issues, PR comments, or status reports observing that the running version is behind `main`, that a fix "isn't live yet", that `orch -V` reports an older tag than HEAD, or that the operator should upgrade.** The operator can see the version themselves and will upgrade when they want to. The gap between `main` and the installed binary is expected, deliberate, and none of the agent's business. Reports along the lines of "the service is running vX.Y.Z but main is at vX.Y.(Z+1), please upgrade" will be closed as invalid.
 
 ## Restarting the service
 
@@ -230,17 +234,14 @@ or fall back to `cargo test` if nextest is unavailable.
 
 ### Post-push workflow
 
-After pushing to main, always complete the full cycle:
+After pushing to main, agents do these steps and **stop**:
 
 ```bash
 git push                                    # 1. push
 gh run watch --exit-status                  # 2. watch CI (tests → release → deploy)
-brew update && brew upgrade orch            # 3. pull new formula + install
-brew services restart orch                  # 4. restart service with new code
-orch -V                                      # 5. verify CLI version
 ```
 
-Do not skip steps — the service runs from the Homebrew cellar, not the repo.
+**Do NOT run `brew update`, `brew upgrade orch`, `brew services restart`, or `orch -V` afterwards.** The operator handles the install + service restart on their own schedule (see "Upgrading — OPERATOR ONLY"). The service runs from the Homebrew cellar, not the repo, so your changes are not live until the operator upgrades — that is intentional and not your problem to fix.
 
 ## Graceful Shutdown
 
