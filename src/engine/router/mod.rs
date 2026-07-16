@@ -245,6 +245,30 @@ impl Router {
         Self::new(RouterConfig::from_config())
     }
 
+    /// Create a router with a forced agent list, bypassing CLI discovery.
+    /// Only for use in unit tests.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(config: RouterConfig, available_agents: Vec<String>) -> Self {
+        let mut weights = AgentWeights {
+            base_weights: config.weights.clone(),
+            ..Default::default()
+        };
+        weights.ensure_agents(&available_agents);
+        let router_pool = Self::expand_pool(&config);
+        Self {
+            config,
+            available_agents,
+            weights,
+            llm_router: std::sync::Arc::new(LlmRouter::new()),
+            ollama_router: None,
+            rr_index: 0,
+            last_agent: None,
+            review_rr_index: 0,
+            router_pool,
+            pool_index: 0,
+        }
+    }
+
     /// Return a cloned handle to the LLM router subsystem.
     ///
     /// Callers that need to invoke async methods on the underlying `LlmRouter`
