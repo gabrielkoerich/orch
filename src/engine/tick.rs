@@ -1386,6 +1386,118 @@ pub(crate) async fn tick_route_tasks(
     Ok(())
 }
 
+/// Global routing sweep: route status:new tasks from inactive or removed repos.
+///
+/// `tick_route_tasks` is scoped to the active repo per-tick and never processes
+/// tasks whose `repo` field differs from the current project. When a project is
+/// removed from the orch config, its tasks accumulate in `new` indefinitely
+/// because no tick ever runs for that repo. This sweep covers all repos so
+/// orphaned new tasks are eventually routed.
+pub(crate) async fn route_new_tasks_global(
+    router: &mut Router,
+    store: &Arc<TaskStore>,
+    current_repo: &str,
+) -> anyhow::Result<()> {
+    use crate::store::{StoreRoute, TaskStatus};
+
+    let all_new = store.list_all_by_status_global(TaskStatus::New).await?;
+    let orphaned: Vec<&crate::store::Task> = all_new
+        .iter()
+        .filter(|t| t.repo != current_repo)
+        .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
+        .collect();
+
+    if orphaned.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!(
+        count = orphaned.len(),
+        "global routing sweep: found new tasks from inactive repos"
+    );
+
+    router.refresh_health(store).await;
+
+    let max_per_tick = crate::engine::router::config::max_tasks_per_routing_tick();
+    for task in orphaned.into_iter().take(max_per_tick) {
+        let ext_task = crate::engine::tasks::store_task_to_external(task);
+        let task_start = Instant::now();
+        match router.route(&ext_task, store, &task.repo).await {
+            Ok(result) => {
+                tracing::debug!(
+                    task_id = %ext_task.id.0,
+                    repo = %task.repo,
+                    duration_ms = task_start.elapsed().as_millis(),
+                    "global sweep: route completed"
+                );
+                let profile_json = serde_json::to_string(&result.profile).unwrap_or_default();
+                let skills_json =
+                    serde_json::to_string(&result.selected_skills).unwrap_or_default();
+                if let Err(e) = store
+                    .store_route(&StoreRoute {
+                        id: task.id,
+                        agent: &result.agent,
+                        model: result.model.as_deref(),
+                        complexity: &result.complexity,
+                        estimate: result.estimate,
+                        reason: &result.reason,
+                        profile: &profile_json,
+                        skills: &skills_json,
+                    })
+                    .await
+                {
+                    tracing::warn!(
+                        task_id = %ext_task.id.0,
+                        repo = %task.repo,
+                        err = %e,
+                        "global sweep: failed to store route result; skipping status update"
+                    );
+                    continue;
+                }
+                if let Err(e) = store.update_status(task.id, TaskStatus::Routed).await {
+                    tracing::warn!(
+                        task_id = %ext_task.id.0,
+                        repo = %task.repo,
+                        err = %e,
+                        "global sweep: failed to set status:routed"
+                    );
+                } else {
+                    tracing::info!(
+                        task_id = %ext_task.id.0,
+                        repo = %task.repo,
+                        agent = %result.agent,
+                        complexity = %result.complexity,
+                        "global sweep: task routed"
+                    );
+                }
+                if let Some(ref warning) = result.warning {
+                    tracing::warn!(task_id = %ext_task.id.0, warning, "global sweep: routing sanity warning");
+                }
+            }
+            Err(e) => {
+                if let Some(cooled) = e.downcast_ref::<AllAgentsCooledError>() {
+                    tracing::error!(
+                        task_id = %ext_task.id.0,
+                        repo = %task.repo,
+                        scope = %cooled.scope(),
+                        remaining_secs = ?cooled.remaining_secs(),
+                        "global sweep: ALL AGENTS COOLED — task stays in 'new'"
+                    );
+                    continue;
+                }
+                tracing::error!(
+                    task_id = %ext_task.id.0,
+                    repo = %task.repo,
+                    err = ?e,
+                    "global sweep: routing failed, skipping task"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Phase 3b of tick: spawn agents for all status:routed tasks up to the parallel limit.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DispatchMode {
@@ -1948,6 +2060,12 @@ pub(crate) async fn tick(
     )
     .await?;
     tick_route_tasks(backend, task_manager, router, store, repo).await?;
+    // Global routing sweep for tasks from inactive or removed repos.
+    // tick_route_tasks is scoped to the active repo; tasks from projects no longer
+    // in config are never returned by list_routable and would stay in 'new' indefinitely.
+    if let Err(e) = route_new_tasks_global(router, store, repo).await {
+        tracing::warn!(err = %e, "global new-task routing sweep failed");
+    }
     let dispatch_mode = dispatch_mode_from_router(router);
     tick_dispatch_tasks(
         backend,
@@ -3123,6 +3241,149 @@ mod tests {
         assert!(
             good_result.is_ok(),
             "valid project must still run after bad project: {good_result:?}"
+        );
+    }
+
+    // ── route_new_tasks_global ───────────────────────────────────────────────
+
+    /// Regression test for #3407: tasks from inactive/removed repos were stuck
+    /// in `new` indefinitely because `tick_route_tasks` is repo-scoped.
+    ///
+    /// `route_new_tasks_global` must route tasks whose repo != current_repo
+    /// and leave current-repo tasks untouched.
+    #[serial_test::serial(cooldown_state)]
+    #[tokio::test]
+    async fn global_sweep_routes_inactive_repo_tasks() {
+        use crate::engine::router::{Router, RouterConfig};
+        use crate::store::{TaskStatus, UpsertExternal};
+
+        crate::engine::cooldown::reset_global_state().await;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        // Active repo task — must NOT be touched by the global sweep.
+        let active_id = store
+            .upsert_external(&UpsertExternal {
+                repo: "active/repo",
+                ext_id: "1",
+                title: "Active task",
+                body: "",
+                author: "user",
+                url: "https://github.com/active/repo/issues/1",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+
+        // Inactive repo task — must be routed by the global sweep.
+        let inactive_id = store
+            .upsert_external(&UpsertExternal {
+                repo: "inactive/repo",
+                ext_id: "42",
+                title: "Orphaned task",
+                body: "",
+                author: "user",
+                url: "https://github.com/inactive/repo/issues/42",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(store.get(active_id).await.unwrap().status, TaskStatus::New);
+        assert_eq!(
+            store.get(inactive_id).await.unwrap().status,
+            TaskStatus::New
+        );
+
+        let mut model_map: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, Vec<String>>,
+        > = std::collections::HashMap::new();
+        let mut tier = std::collections::HashMap::new();
+        tier.insert("claude".to_string(), vec!["haiku".to_string()]);
+        model_map.insert("medium".to_string(), tier);
+        let config = RouterConfig {
+            mode: "round_robin".to_string(),
+            agents: vec!["claude".to_string()],
+            model_map,
+            ..Default::default()
+        };
+        let mut router = Router::new_for_test(config, vec!["claude".to_string()]);
+
+        route_new_tasks_global(&mut router, &store, "active/repo")
+            .await
+            .unwrap();
+
+        // Active-repo task must remain new (global sweep skips it).
+        assert_eq!(
+            store.get(active_id).await.unwrap().status,
+            TaskStatus::New,
+            "global sweep must not touch tasks for the active repo"
+        );
+
+        // Inactive-repo task must now be routed.
+        let after = store.get(inactive_id).await.unwrap();
+        assert_eq!(
+            after.status,
+            TaskStatus::Routed,
+            "global sweep must route tasks from inactive repos"
+        );
+        assert!(
+            matches!(&after.agent, Some(a) if !a.is_empty()),
+            "agent must be set after routing"
+        );
+    }
+
+    /// Tasks with the `no-agent` label must be skipped by the global sweep.
+    #[serial_test::serial(cooldown_state)]
+    #[tokio::test]
+    async fn global_sweep_skips_no_agent_tasks() {
+        use crate::engine::router::{Router, RouterConfig};
+        use crate::store::{TaskStatus, UpsertExternal};
+
+        crate::engine::cooldown::reset_global_state().await;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        let id = store
+            .upsert_external(&UpsertExternal {
+                repo: "inactive/repo",
+                ext_id: "99",
+                title: "No-agent task",
+                body: "",
+                author: "user",
+                url: "https://github.com/inactive/repo/issues/99",
+                labels: &["no-agent".to_string()],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+
+        let mut model_map: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, Vec<String>>,
+        > = std::collections::HashMap::new();
+        let mut tier = std::collections::HashMap::new();
+        tier.insert("claude".to_string(), vec!["haiku".to_string()]);
+        model_map.insert("medium".to_string(), tier);
+        let config = RouterConfig {
+            mode: "round_robin".to_string(),
+            agents: vec!["claude".to_string()],
+            model_map,
+            ..Default::default()
+        };
+        let mut router = Router::new_for_test(config, vec!["claude".to_string()]);
+
+        route_new_tasks_global(&mut router, &store, "active/repo")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get(id).await.unwrap().status,
+            TaskStatus::New,
+            "no-agent tasks must not be routed"
         );
     }
 }
