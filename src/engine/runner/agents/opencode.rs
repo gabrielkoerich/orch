@@ -55,6 +55,26 @@ pub(crate) fn reset_model_caches_for_test() {
     ALL_MODELS_REFRESH_IN_PROGRESS.store(false, Ordering::Release);
 }
 
+fn update_discovered_models_cache(
+    cache: &Mutex<(i64, Vec<String>)>,
+    discovered: Vec<String>,
+    cache_name: &'static str,
+) {
+    let now = chrono::Utc::now().timestamp();
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+
+    if discovered.is_empty() && !guard.1.is_empty() {
+        tracing::warn!(
+            cache = cache_name,
+            cached_models = guard.1.len(),
+            "opencode model discovery returned empty; preserving previous cache contents"
+        );
+        return;
+    }
+
+    *guard = (now, discovered);
+}
+
 /// Runner for OpenCode agent.
 pub struct OpenCodeRunner;
 
@@ -735,10 +755,7 @@ pub fn discover_free_opencode_models() -> Vec<String> {
                 .filter(|m| m.to_lowercase().contains("free"))
                 .collect::<Vec<_>>();
             let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
-            let now = chrono::Utc::now().timestamp();
-            if let Ok(mut guard) = cache.lock() {
-                *guard = (now, discovered);
-            }
+            update_discovered_models_cache(cache, discovered, "free");
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             // Use the current tokio runtime's handle to spawn the async discovery task,
@@ -783,10 +800,7 @@ pub fn discover_opencode_models() -> Vec<String> {
             });
             let discovered = run_opencode_models_discovery_async().await;
             let cache = ALL_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
-            let now = chrono::Utc::now().timestamp();
-            if let Ok(mut guard) = cache.lock() {
-                *guard = (now, discovered);
-            }
+            update_discovered_models_cache(cache, discovered, "all");
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(refresh);
@@ -1413,6 +1427,62 @@ mod tests {
         // Just verify it returns without panicking — actual content
         // depends on whether opencode is installed and responsive
         assert!(models.len() < 1000, "sanity check");
+    }
+
+    #[test]
+    fn empty_free_discovery_preserves_existing_cache_contents() {
+        reset_model_caches_for_test();
+        let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
+        {
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = (123, vec!["opencode/model-free".to_string()]);
+        }
+
+        update_discovered_models_cache(cache, Vec::new(), "free");
+
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(guard.0, 123);
+        assert_eq!(guard.1, vec!["opencode/model-free".to_string()]);
+    }
+
+    #[test]
+    fn empty_all_models_discovery_preserves_existing_cache_contents() {
+        reset_model_caches_for_test();
+        let cache = ALL_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
+        {
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = (
+                456,
+                vec![
+                    "opencode/model-free".to_string(),
+                    "opencode/model-paid".to_string(),
+                ],
+            );
+        }
+
+        update_discovered_models_cache(cache, Vec::new(), "all");
+
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(guard.0, 456);
+        assert_eq!(
+            guard.1,
+            vec![
+                "opencode/model-free".to_string(),
+                "opencode/model-paid".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_discovery_populates_empty_cache() {
+        reset_model_caches_for_test();
+        let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
+
+        update_discovered_models_cache(cache, Vec::new(), "free");
+
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(guard.0 > 0);
+        assert!(guard.1.is_empty());
     }
 
     // ── Fixture-based tests ─────────────────────────────────────
