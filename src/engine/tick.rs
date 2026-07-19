@@ -1551,6 +1551,45 @@ pub(crate) async fn tick_dispatch_tasks(
         .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
         .collect();
 
+    dispatch_tasks_for_repo(
+        backend,
+        tmux,
+        repo,
+        runner,
+        capture,
+        semaphore,
+        task_manager,
+        weight_tx,
+        dispatch_mode,
+        dispatching,
+        store,
+        session_map,
+        dispatchable,
+    )
+    .await
+}
+
+/// Dispatch a pre-fetched list of routed tasks for a single repo.
+///
+/// Shared by `tick_dispatch_tasks` (active-repo, per-tick dispatch) and
+/// `dispatch_routed_tasks_global` (inactive-repo sweep) so both paths spawn
+/// agents through the exact same worktree/tmux/runner logic.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_tasks_for_repo(
+    backend: &Arc<dyn ExternalBackend>,
+    tmux: &Arc<TmuxManager>,
+    repo: &str,
+    runner: &Arc<TaskRunner>,
+    capture: &Arc<CaptureService>,
+    semaphore: &Arc<Semaphore>,
+    task_manager: &Arc<TaskManager>,
+    weight_tx: &mpsc::Sender<WeightSignal>,
+    dispatch_mode: DispatchMode,
+    dispatching: &Arc<DashMap<String, String>>,
+    store: &Arc<TaskStore>,
+    session_map: &std::collections::HashMap<String, bool>,
+    dispatchable: Vec<ExternalTask>,
+) -> anyhow::Result<()> {
     if dispatchable.is_empty() {
         tracing::debug!(count = 0, "dispatchable tasks found");
         return Ok(());
@@ -1866,6 +1905,112 @@ pub(crate) async fn tick_dispatch_tasks(
     Ok(())
 }
 
+/// Filter routed tasks down to those belonging to a repo other than `current_repo`,
+/// drop `no-agent` tasks, and group the rest by repo.
+///
+/// Pure/side-effect-free so it can be unit tested without touching real tmux
+/// sessions or spawning a runner — see `dispatch_routed_tasks_global`, which is
+/// the only caller and does the actual (side-effectful) dispatch.
+fn group_orphaned_routed_tasks(
+    all_routed: Vec<crate::store::Task>,
+    current_repo: &str,
+) -> std::collections::HashMap<String, Vec<crate::store::Task>> {
+    let mut by_repo: std::collections::HashMap<String, Vec<crate::store::Task>> =
+        std::collections::HashMap::new();
+    for task in all_routed
+        .into_iter()
+        .filter(|t| t.repo != current_repo)
+        .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
+    {
+        by_repo.entry(task.repo.clone()).or_default().push(task);
+    }
+    by_repo
+}
+
+/// Global dispatch sweep: dispatch status:routed tasks from inactive or removed repos.
+///
+/// `tick_dispatch_tasks` is scoped to the active repo per-tick (its `task_manager`
+/// only queries that repo's tasks) and never processes tasks whose `repo` field
+/// differs from the current project. When a project is removed from the orch
+/// config, tasks that reach `routed` for it — including ones routed by the
+/// `route_new_tasks_global` sweep — have no code path left to dispatch them, so
+/// they stay `routed` forever. This sweep covers all repos so orphaned routed
+/// tasks are eventually dispatched.
+///
+/// `TaskRunner::resolve_project_dir` already falls back to the deterministic
+/// `~/.orch/projects/<owner>/<repo>.git` bare-clone convention when a repo is
+/// not listed in the active config, so dispatch works without a `ProjectEngine`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dispatch_routed_tasks_global(
+    tmux: &Arc<TmuxManager>,
+    capture: &Arc<CaptureService>,
+    semaphore: &Arc<Semaphore>,
+    weight_tx: &mpsc::Sender<WeightSignal>,
+    dispatch_mode: DispatchMode,
+    dispatching: &Arc<DashMap<String, String>>,
+    store: &Arc<TaskStore>,
+    session_map: &std::collections::HashMap<String, bool>,
+    current_repo: &str,
+) -> anyhow::Result<()> {
+    use crate::store::TaskStatus;
+
+    let all_routed = store.list_all_by_status_global(TaskStatus::Routed).await?;
+    let by_repo = group_orphaned_routed_tasks(all_routed, current_repo);
+
+    if by_repo.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!(
+        repos = by_repo.len(),
+        "global dispatch sweep: found routed tasks from inactive repos"
+    );
+
+    for (repo, tasks) in by_repo {
+        let backend: Arc<dyn ExternalBackend> = match crate::backends::github::GitHubBackend::new(
+            repo.clone(),
+        ) {
+            Ok(b) => Arc::new(b),
+            Err(e) => {
+                tracing::warn!(repo = %repo, err = %e, "global sweep: failed to construct backend, skipping repo");
+                continue;
+            }
+        };
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            repo.clone(),
+        ));
+        let runner = Arc::new(TaskRunner::new(repo.clone()).with_store(store.clone()));
+        let dispatchable: Vec<ExternalTask> = tasks
+            .iter()
+            .map(crate::engine::tasks::store_task_to_external)
+            .collect();
+
+        if let Err(e) = dispatch_tasks_for_repo(
+            &backend,
+            tmux,
+            &repo,
+            &runner,
+            capture,
+            semaphore,
+            &task_manager,
+            weight_tx,
+            dispatch_mode,
+            dispatching,
+            store,
+            session_map,
+            dispatchable,
+        )
+        .await
+        {
+            tracing::warn!(repo = %repo, err = %e, "global sweep: dispatch failed for repo");
+        }
+    }
+
+    Ok(())
+}
+
 /// Phase 4 of tick: unblock parent tasks whose sub-issues are all done.
 pub(crate) async fn tick_unblock_parents(
     backend: &Arc<dyn ExternalBackend>,
@@ -2082,6 +2227,25 @@ pub(crate) async fn tick(
         &session_map,
     )
     .await?;
+    // Global dispatch sweep for routed tasks from inactive or removed repos.
+    // tick_dispatch_tasks is scoped to the active repo; tasks from projects no longer
+    // in config are never returned by list_external_by_status and would stay in
+    // 'routed' indefinitely (see #3413).
+    if let Err(e) = dispatch_routed_tasks_global(
+        tmux,
+        capture,
+        semaphore,
+        weight_tx,
+        dispatch_mode,
+        dispatching,
+        store,
+        &session_map,
+        repo,
+    )
+    .await
+    {
+        tracing::warn!(err = %e, "global routed-task dispatch sweep failed");
+    }
     tick_unblock_parents(backend, task_manager, store, repo).await?;
     if let Err(e) = tick_job_scheduler(jobs_path, backend, Some(store), repo, transport).await {
         tracing::error!(?e, "job scheduler tick failed");
@@ -3384,6 +3548,172 @@ mod tests {
             store.get(id).await.unwrap().status,
             TaskStatus::New,
             "no-agent tasks must not be routed"
+        );
+    }
+
+    // ── dispatch_routed_tasks_global ─────────────────────────────────────────
+    //
+    // `dispatch_routed_tasks_global` itself is deliberately not exercised
+    // end-to-end here: once it finds an orphaned repo, it spawns the real
+    // runner, which creates a real tmux session and touches the network.
+    // The existing `dispatch_does_not_deadlock_under_write_lock` test avoids
+    // this same hazard by keeping the dispatchable set empty. The selection
+    // logic (which tasks belong to which repo) is pulled into the pure
+    // `group_orphaned_routed_tasks` helper below so it can be tested without
+    // those side effects.
+
+    /// Regression test for #3413: tasks routed for an inactive/removed repo were
+    /// stuck in `routed` indefinitely because `tick_dispatch_tasks` is repo-scoped.
+    ///
+    /// `group_orphaned_routed_tasks` must select tasks whose repo != the active
+    /// repo, group them by repo, and leave active-repo tasks out entirely.
+    #[tokio::test]
+    async fn group_orphaned_routed_tasks_selects_inactive_repo_tasks() {
+        use crate::store::{StoreRoute, TaskStatus, UpsertExternal};
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        async fn make_routed(store: &TaskStore, repo: &str, ext_id: &str) -> i64 {
+            let id = store
+                .upsert_external(&UpsertExternal {
+                    repo,
+                    ext_id,
+                    title: "Routed task",
+                    body: "",
+                    author: "user",
+                    url: &format!("https://github.com/{repo}/issues/{ext_id}"),
+                    labels: &[],
+                    origin: "github",
+                })
+                .await
+                .unwrap();
+            store
+                .store_route(&StoreRoute {
+                    id,
+                    agent: "claude",
+                    model: Some("sonnet"),
+                    complexity: "medium",
+                    estimate: 0,
+                    reason: "test",
+                    profile: "{}",
+                    skills: "[]",
+                })
+                .await
+                .unwrap();
+            store.update_status(id, TaskStatus::Routed).await.unwrap();
+            id
+        }
+
+        let active_id = make_routed(&store, "active/repo", "1").await;
+        let inactive_id_a = make_routed(&store, "inactive/repo", "2").await;
+        let other_inactive_id = make_routed(&store, "other-inactive/repo", "3").await;
+        let inactive_id_b = make_routed(&store, "inactive/repo", "4").await;
+
+        let all_routed = store
+            .list_all_by_status_global(TaskStatus::Routed)
+            .await
+            .unwrap();
+        let by_repo = group_orphaned_routed_tasks(all_routed, "active/repo");
+
+        assert!(
+            !by_repo.contains_key("active/repo"),
+            "global sweep must not select tasks for the active repo"
+        );
+        let inactive_ids: std::collections::HashSet<i64> = by_repo
+            .get("inactive/repo")
+            .expect("inactive/repo must be selected")
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(
+            inactive_ids,
+            [inactive_id_a, inactive_id_b].into_iter().collect(),
+            "global sweep must group all orphaned tasks for a repo together"
+        );
+        assert_eq!(
+            by_repo
+                .get("other-inactive/repo")
+                .map(|tasks| tasks.iter().map(|t| t.id).collect::<Vec<_>>()),
+            Some(vec![other_inactive_id])
+        );
+
+        // Sanity: the active-repo task really was created and routed, it's just
+        // excluded from the selection above.
+        assert_eq!(
+            store.get(active_id).await.unwrap().status,
+            TaskStatus::Routed
+        );
+    }
+
+    /// Tasks with the `no-agent` label must be skipped by the global dispatch sweep.
+    #[tokio::test]
+    async fn global_dispatch_sweep_skips_no_agent_tasks() {
+        use crate::store::{StoreRoute, TaskStatus, UpsertExternal};
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        let id = store
+            .upsert_external(&UpsertExternal {
+                repo: "inactive/repo",
+                ext_id: "99",
+                title: "No-agent routed task",
+                body: "",
+                author: "user",
+                url: "https://github.com/inactive/repo/issues/99",
+                labels: &["no-agent".to_string()],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .store_route(&StoreRoute {
+                id,
+                agent: "claude",
+                model: Some("sonnet"),
+                complexity: "medium",
+                estimate: 0,
+                reason: "test",
+                profile: "{}",
+                skills: "[]",
+            })
+            .await
+            .unwrap();
+        store.update_status(id, TaskStatus::Routed).await.unwrap();
+
+        // Safe to call the full sweep here: with the only orphaned task filtered
+        // out by the no-agent label, `group_orphaned_routed_tasks` returns an
+        // empty map and `dispatch_routed_tasks_global` returns before ever
+        // constructing a backend or spawning a runner.
+        let tmux = Arc::new(TmuxManager::new());
+        let transport = Arc::new(Transport::new());
+        let capture = Arc::new(CaptureService::new(transport));
+        let semaphore = Arc::new(Semaphore::new(4));
+        let (weight_tx, _weight_rx) = mpsc::channel(16);
+        let dispatching = Arc::new(DashMap::new());
+        let dispatch_mode = DispatchMode {
+            is_degraded: false,
+            healthy_agents: 1,
+            threshold: 1,
+        };
+
+        dispatch_routed_tasks_global(
+            &tmux,
+            &capture,
+            &semaphore,
+            &weight_tx,
+            dispatch_mode,
+            &dispatching,
+            &store,
+            &std::collections::HashMap::new(),
+            "active/repo",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store.get(id).await.unwrap().status,
+            TaskStatus::Routed,
+            "no-agent tasks must not be dispatched"
         );
     }
 }
