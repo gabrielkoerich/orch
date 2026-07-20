@@ -973,6 +973,12 @@ pub async fn serve() -> anyhow::Result<()> {
         "initialized project engines"
     );
 
+    // Full set of currently-configured project repos, used by the per-tick global
+    // sweeps (e.g. `dispatch_routed_tasks_global`) to distinguish "orphaned" tasks
+    // (repo no longer in config) from tasks belonging to some other active project.
+    let active_repos: std::collections::HashSet<String> =
+        project_engines.iter().map(|e| e.repo.clone()).collect();
+
     // Create the event bus for task status transitions
     let event_bus = events::EventBus::new(256);
     if let Err(e) = event_bus.start_ws_server().await {
@@ -1958,6 +1964,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                 &dispatching,
                                 &engine.store,
                                 Some(&transport),
+                                &active_repos,
                             ).await {
                                 tracing::error!(repo = %engine.repo, ?e, "tick failed for project");
                             }
@@ -2154,6 +2161,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                 &dispatching,
                                 &engine.store,
                                 Some(&transport),
+                                &active_repos,
                             ).await {
                                 tracing::error!(repo = %engine.repo, ?e, "webhook-triggered tick failed");
                             }
