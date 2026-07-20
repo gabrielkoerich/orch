@@ -1608,8 +1608,22 @@ impl TaskRunner {
             }
         }
 
-        // Fall back to current directory
-        Ok(std::env::current_dir()?)
+        // No resolvable project directory: not in active config, no legacy
+        // project_dir, no bare clone. Falling back to the service's own CWD
+        // here would silently point worktree creation at an unrelated
+        // directory (see issue #3416) — surface a clear error instead.
+        anyhow::bail!(
+            "no resolvable project directory for repo {} — not in active config, no bare clone at {}, no legacy project_dir set",
+            self.repo,
+            self.orch_home
+                .join("projects")
+                .join(self.repo.split('/').next().unwrap_or_default())
+                .join(format!(
+                    "{}.git",
+                    self.repo.split('/').nth(1).unwrap_or_default()
+                ))
+                .display()
+        )
     }
 }
 
@@ -2185,8 +2199,18 @@ mod tests {
         let result = runner.resolve_project_dir().await;
         std::env::remove_var("PROJECT_DIR");
 
-        // Should succeed (falls back to current dir) without panicking.
-        assert!(result.is_ok());
+        // No active config entry, no legacy project_dir, no bare clone for this
+        // repo: should return an explicit error rather than falling back to the
+        // service's own CWD (see issue #3416).
+        assert!(
+            result.is_err(),
+            "resolve_project_dir should error when no project dir can be resolved"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("owner/testrepo-nonexistent"),
+            "error should name the unresolvable repo: {err}"
+        );
     }
 
     // ── mock backend for process_delegations ─────────────────────────────────
