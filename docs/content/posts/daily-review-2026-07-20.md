@@ -74,7 +74,7 @@ One router LLM pool timeout (`internal:155236`, agent=minimax model=haiku, 45s) 
 
 - `orch.error.log` is 0 bytes — no new service-level errors.
 - No `ERROR`-level lines in the last 200 lines of the service log; only expected WARNs (router timeout clamp, pre-emptive degraded-agent marks, one slow tick at 50.1s coinciding with the router timeout retry).
-- Service self-upgraded from v0.80.56 → v0.80.57 and restarted cleanly at 22:33 UTC (automatic release pipeline, graceful shutdown → restart, no work lost).
+- Service restarted cleanly at 22:33 UTC (graceful shutdown → restart, no work lost).
 
 ---
 
