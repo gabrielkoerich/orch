@@ -1905,7 +1905,7 @@ async fn dispatch_tasks_for_repo(
     Ok(())
 }
 
-/// Filter routed tasks down to those belonging to a repo other than `current_repo`,
+/// Filter routed tasks down to those belonging to a repo outside `active_repos`,
 /// drop `no-agent` tasks, and group the rest by repo.
 ///
 /// Pure/side-effect-free so it can be unit tested without touching real tmux
@@ -1913,13 +1913,13 @@ async fn dispatch_tasks_for_repo(
 /// the only caller and does the actual (side-effectful) dispatch.
 fn group_orphaned_routed_tasks(
     all_routed: Vec<crate::store::Task>,
-    current_repo: &str,
+    active_repos: &std::collections::HashSet<String>,
 ) -> std::collections::HashMap<String, Vec<crate::store::Task>> {
     let mut by_repo: std::collections::HashMap<String, Vec<crate::store::Task>> =
         std::collections::HashMap::new();
     for task in all_routed
         .into_iter()
-        .filter(|t| t.repo != current_repo)
+        .filter(|t| !active_repos.contains(&t.repo))
         .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
     {
         by_repo.entry(task.repo.clone()).or_default().push(task);
@@ -1937,6 +1937,12 @@ fn group_orphaned_routed_tasks(
 /// they stay `routed` forever. This sweep covers all repos so orphaned routed
 /// tasks are eventually dispatched.
 ///
+/// `active_repos` must be the full set of currently-configured project repos,
+/// not just the repo of the tick that called this. `tick()` runs once per
+/// active project; passing only that project's own repo would make every
+/// other active repo's routed tasks look "orphaned" too and dispatch them a
+/// second time through this fallback path, racing the real per-repo dispatch.
+///
 /// `TaskRunner::resolve_project_dir` already falls back to the deterministic
 /// `~/.orch/projects/<owner>/<repo>.git` bare-clone convention when a repo is
 /// not listed in the active config, so dispatch works without a `ProjectEngine`.
@@ -1950,12 +1956,12 @@ pub(crate) async fn dispatch_routed_tasks_global(
     dispatching: &Arc<DashMap<String, String>>,
     store: &Arc<TaskStore>,
     session_map: &std::collections::HashMap<String, bool>,
-    current_repo: &str,
+    active_repos: &std::collections::HashSet<String>,
 ) -> anyhow::Result<()> {
     use crate::store::TaskStatus;
 
     let all_routed = store.list_all_by_status_global(TaskStatus::Routed).await?;
-    let by_repo = group_orphaned_routed_tasks(all_routed, current_repo);
+    let by_repo = group_orphaned_routed_tasks(all_routed, active_repos);
 
     if by_repo.is_empty() {
         return Ok(());
@@ -2183,6 +2189,7 @@ pub(crate) async fn tick(
     dispatching: &Arc<DashMap<String, String>>,
     store: &Arc<TaskStore>,
     transport: Option<&Arc<crate::channels::transport::Transport>>,
+    active_repos: &std::collections::HashSet<String>,
 ) -> anyhow::Result<()> {
     let _tick_span = tracing::info_span!("engine.tick").entered();
 
@@ -2230,7 +2237,8 @@ pub(crate) async fn tick(
     // Global dispatch sweep for routed tasks from inactive or removed repos.
     // tick_dispatch_tasks is scoped to the active repo; tasks from projects no longer
     // in config are never returned by list_external_by_status and would stay in
-    // 'routed' indefinitely (see #3413).
+    // 'routed' indefinitely (see #3413). Excludes the full active-repo set, not just
+    // `repo`, so this per-project tick doesn't treat other active repos as orphaned.
     if let Err(e) = dispatch_routed_tasks_global(
         tmux,
         capture,
@@ -2240,7 +2248,7 @@ pub(crate) async fn tick(
         dispatching,
         store,
         &session_map,
-        repo,
+        active_repos,
     )
     .await
     {
@@ -3613,7 +3621,9 @@ mod tests {
             .list_all_by_status_global(TaskStatus::Routed)
             .await
             .unwrap();
-        let by_repo = group_orphaned_routed_tasks(all_routed, "active/repo");
+        let active_repos: std::collections::HashSet<String> =
+            ["active/repo".to_string()].into_iter().collect();
+        let by_repo = group_orphaned_routed_tasks(all_routed, &active_repos);
 
         assert!(
             !by_repo.contains_key("active/repo"),
@@ -3641,6 +3651,90 @@ mod tests {
         // excluded from the selection above.
         assert_eq!(
             store.get(active_id).await.unwrap().status,
+            TaskStatus::Routed
+        );
+    }
+
+    /// Regression test for the PR #3413 review finding: `tick()` runs once per active
+    /// project, so a single `current_repo` string is the wrong exclusion — repo B's
+    /// routed tasks must not look "orphaned" during repo A's tick just because A != B.
+    /// `group_orphaned_routed_tasks` must exclude every repo in the full active set.
+    #[tokio::test]
+    async fn group_orphaned_routed_tasks_excludes_all_active_repos_not_just_current() {
+        use crate::store::{StoreRoute, TaskStatus, UpsertExternal};
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        async fn make_routed(store: &TaskStore, repo: &str, ext_id: &str) -> i64 {
+            let id = store
+                .upsert_external(&UpsertExternal {
+                    repo,
+                    ext_id,
+                    title: "Routed task",
+                    body: "",
+                    author: "user",
+                    url: &format!("https://github.com/{repo}/issues/{ext_id}"),
+                    labels: &[],
+                    origin: "github",
+                })
+                .await
+                .unwrap();
+            store
+                .store_route(&StoreRoute {
+                    id,
+                    agent: "claude",
+                    model: Some("sonnet"),
+                    complexity: "medium",
+                    estimate: 0,
+                    reason: "test",
+                    profile: "{}",
+                    skills: "[]",
+                })
+                .await
+                .unwrap();
+            store.update_status(id, TaskStatus::Routed).await.unwrap();
+            id
+        }
+
+        let repo_a_id = make_routed(&store, "active/repo-a", "1").await;
+        let repo_b_id = make_routed(&store, "active/repo-b", "2").await;
+        let orphaned_id = make_routed(&store, "inactive/repo", "3").await;
+
+        let all_routed = store
+            .list_all_by_status_global(TaskStatus::Routed)
+            .await
+            .unwrap();
+        // Simulate repo A's tick: current repo is "active/repo-a", but the full
+        // active project set also includes "active/repo-b".
+        let active_repos: std::collections::HashSet<String> =
+            ["active/repo-a".to_string(), "active/repo-b".to_string()]
+                .into_iter()
+                .collect();
+        let by_repo = group_orphaned_routed_tasks(all_routed, &active_repos);
+
+        assert!(
+            !by_repo.contains_key("active/repo-a"),
+            "the current repo's own tasks must not be swept"
+        );
+        assert!(
+            !by_repo.contains_key("active/repo-b"),
+            "another active repo's tasks must not be swept during repo A's tick"
+        );
+        assert_eq!(
+            by_repo
+                .get("inactive/repo")
+                .map(|tasks| tasks.iter().map(|t| t.id).collect::<Vec<_>>()),
+            Some(vec![orphaned_id]),
+            "a genuinely inactive repo's tasks must still be swept"
+        );
+
+        // Sanity: repo A and repo B tasks were really created and routed, just excluded.
+        assert_eq!(
+            store.get(repo_a_id).await.unwrap().status,
+            TaskStatus::Routed
+        );
+        assert_eq!(
+            store.get(repo_b_id).await.unwrap().status,
             TaskStatus::Routed
         );
     }
@@ -3696,6 +3790,8 @@ mod tests {
             threshold: 1,
         };
 
+        let active_repos: std::collections::HashSet<String> =
+            ["active/repo".to_string()].into_iter().collect();
         dispatch_routed_tasks_global(
             &tmux,
             &capture,
@@ -3705,7 +3801,7 @@ mod tests {
             &dispatching,
             &store,
             &std::collections::HashMap::new(),
-            "active/repo",
+            &active_repos,
         )
         .await
         .unwrap();
