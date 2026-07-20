@@ -189,6 +189,7 @@ fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
         | "no_action_needed"
         | "missed"
         | "changes_addressed"
+        | "changes_requested_addressed"
         | "review_addressed"
         | "already_finalized_in_attempt_1"
         | "alert"
@@ -1014,6 +1015,13 @@ Some output here.
     }
 
     #[test]
+    fn parse_normalizes_changes_requested_addressed_alias_to_done() {
+        let input = r#"{"status":"changes_requested_addressed","summary":"review feedback addressed","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
     fn parse_normalizes_review_addressed_alias_to_done() {
         let input = r#"{"status":"review_addressed","summary":"review feedback addressed","accomplished":[],"remaining":[],"files":[]}"#;
         let resp = parse(input).unwrap();
@@ -1235,6 +1243,7 @@ Some output here.
             ("changes_made", "done"),
             ("changes_pushed", "done"),
             ("changes_addressed", "done"),
+            ("changes_requested_addressed", "done"),
             ("fixed", "done"),
             ("running", "in_progress"),
             ("partial", "in_progress"),
