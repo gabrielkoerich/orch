@@ -202,14 +202,16 @@ async fn run_checks(
             // Batch-fetch all issue states and labels in a single GraphQL call.
             let external_active: Vec<_> = active_tasks
                 .iter()
+                .copied()
                 .filter(|t| t.origin != "internal")
                 .collect();
-            let issue_numbers: Vec<u64> = external_active
-                .iter()
-                .filter_map(|t| t.external_id.as_deref().and_then(|id| id.parse().ok()))
-                .collect();
+            let issue_numbers = collect_valid_external_issue_numbers(
+                external_active.iter().copied(),
+                repo,
+                "cli::doctor::run_checks(full)",
+            );
             let issue_states = gh
-                .batch_get_issue_states(repo, &issue_numbers)
+                .batch_get_issue_states(repo, &issue_numbers, "cli::doctor::run_checks(full)")
                 .await
                 .unwrap_or_default();
             for task in &external_active {
@@ -257,7 +259,10 @@ async fn run_checks(
             }
 
             // Active tasks: perform lightweight checks
-            let mut external_issue_numbers: Vec<u64> = Vec::new();
+            let external_active: Vec<_> = active_tasks
+                .iter()
+                .filter(|t| t.origin != "internal")
+                .collect();
             for task in &active_tasks {
                 // Stale in_progress
                 if task.status == TaskStatus::InProgress {
@@ -312,27 +317,25 @@ async fn run_checks(
                         }
                     }
                 }
-
-                // Collect external issue numbers for batch issue checks
-                if task.origin != "internal" {
-                    if let Some(ext) = &task.external_id {
-                        if let Ok(n) = ext.parse::<u64>() {
-                            external_issue_numbers.push(n);
-                        }
-                    }
-                }
             }
 
             // Batch issue state/label checks for external active tasks
+            let external_issue_numbers = collect_valid_external_issue_numbers(
+                external_active.iter().copied(),
+                repo,
+                "cli::doctor::run_checks(fast)",
+            );
             let issue_states = gh
-                .batch_get_issue_states(repo, &external_issue_numbers)
+                .batch_get_issue_states(
+                    repo,
+                    &external_issue_numbers,
+                    "cli::doctor::run_checks(fast)",
+                )
                 .await
                 .unwrap_or_default();
-            for task in &active_tasks {
-                if task.origin != "internal" {
-                    check_issue_status_mismatch(task, &issue_states, &mut findings);
-                    check_label_mismatch(task, &issue_states, &mut findings);
-                }
+            for task in &external_active {
+                check_issue_status_mismatch(task, &issue_states, &mut findings);
+                check_label_mismatch(task, &issue_states, &mut findings);
             }
 
             // Orphaned PRs: open PRs that don't match any active task by number or head ref
@@ -1726,5 +1729,132 @@ fn task_status_to_backend_status(status: TaskStatus) -> crate::backends::Status 
         TaskStatus::Blocked => crate::backends::Status::Blocked,
         TaskStatus::InReview => crate::backends::Status::InReview,
         TaskStatus::NeedsReview => crate::backends::Status::NeedsReview,
+    }
+}
+
+fn collect_valid_external_issue_numbers<'a>(
+    tasks: impl IntoIterator<Item = &'a Task>,
+    repo: &str,
+    caller_context: &str,
+) -> Vec<u64> {
+    let mut issue_numbers = Vec::new();
+
+    for task in tasks {
+        let Some(external_id) = task.external_id.as_deref() else {
+            continue;
+        };
+
+        match external_id.parse::<u64>() {
+            Ok(0) => {
+                tracing::warn!(
+                    repo,
+                    caller_context,
+                    store_id = task.id,
+                    external_id,
+                    "dropping invalid external_id before batch issue-state query"
+                );
+            }
+            Ok(issue_number) => issue_numbers.push(issue_number),
+            Err(error) => {
+                tracing::warn!(
+                    repo,
+                    caller_context,
+                    store_id = task.id,
+                    external_id,
+                    error = %error,
+                    "skipping non-numeric external_id in batch issue-state query"
+                );
+            }
+        }
+    }
+
+    issue_numbers.sort_unstable();
+    issue_numbers.dedup();
+    issue_numbers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_valid_external_issue_numbers;
+    use crate::store::{Task, TaskStatus};
+
+    fn task(id: i64, external_id: Option<&str>, origin: &str) -> Task {
+        Task {
+            id,
+            external_id: external_id.map(ToOwned::to_owned),
+            repo: "owner/repo".to_string(),
+            origin: origin.to_string(),
+            title: String::new(),
+            body: String::new(),
+            status: TaskStatus::New,
+            source: String::new(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
+            labels: Vec::new(),
+            agent: None,
+            model: None,
+            complexity: String::new(),
+            estimate: 0,
+            route_reason: String::new(),
+            agent_profile: String::new(),
+            selected_skills: String::new(),
+            route_attempts: 0,
+            attempts: 0,
+            branch: String::new(),
+            worktree: String::new(),
+            worktree_cleaned: false,
+            summary: String::new(),
+            last_error: String::new(),
+            parent_id: None,
+            block_reason: None,
+            pr_number: None,
+            pr_review_context: String::new(),
+            last_review_ts: String::new(),
+            review_ts_map: String::new(),
+            last_comment_review_ts: String::new(),
+            merge_conflict_retries: 0,
+            ci_merge_failures: 0,
+            pr_create_failures: 0,
+            push_failures: 0,
+            network_retries: 0,
+            review_agent_failures: 0,
+            review_cycles: 0,
+            review_invocations: 0,
+            review_session_expected: false,
+            needs_review_refires: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            input_cost_usd: 0.0,
+            output_cost_usd: 0.0,
+            total_cost_usd: 0.0,
+            model_reroute_chain: String::new(),
+            limit_reroute_chain: String::new(),
+            memory: Vec::new(),
+            delegations: Vec::new(),
+            auto_unblock_count: 0,
+            auto_unblock_last_at: String::new(),
+            auto_unblock_last_reason: String::new(),
+            ci_recovery_count: 0,
+            no_code_reroutes: 0,
+            no_code_last_agent: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn collect_valid_external_issue_numbers_filters_zero_and_non_numeric_ids() {
+        let tasks = [
+            task(1, Some("42"), "github"),
+            task(2, Some("0"), "github"),
+            task(3, Some("not-a-number"), "github"),
+            task(4, Some("42"), "github"),
+        ];
+
+        let issue_numbers =
+            collect_valid_external_issue_numbers(tasks.iter(), "owner/repo", "test");
+
+        assert_eq!(issue_numbers, vec![42]);
     }
 }
