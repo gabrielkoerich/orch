@@ -1668,8 +1668,24 @@ impl GhHttp {
         &self,
         repo: &str,
         issue_numbers: &[u64],
+        caller_context: &str,
     ) -> anyhow::Result<std::collections::HashMap<String, (String, Vec<String>)>> {
         if issue_numbers.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let (valid_issue_numbers, invalid_issue_numbers) =
+            sanitize_github_issue_numbers(issue_numbers);
+        if !invalid_issue_numbers.is_empty() {
+            tracing::warn!(
+                repo,
+                caller_context,
+                invalid_issue_numbers = ?invalid_issue_numbers,
+                total_supplied = issue_numbers.len(),
+                "dropping invalid GitHub issue numbers before batch issue-state GraphQL query"
+            );
+        }
+        if valid_issue_numbers.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
 
@@ -1681,7 +1697,7 @@ impl GhHttp {
         const CHUNK_SIZE: usize = 50;
         let mut result = std::collections::HashMap::new();
 
-        for chunk in issue_numbers.chunks(CHUNK_SIZE) {
+        for chunk in valid_issue_numbers.chunks(CHUNK_SIZE) {
             let aliases: String = chunk
                 .iter()
                 .map(|n| {
@@ -2749,6 +2765,19 @@ impl GhHttp {
             None => Ok(None),
         }
     }
+}
+
+fn sanitize_github_issue_numbers(issue_numbers: &[u64]) -> (Vec<u64>, Vec<u64>) {
+    let mut valid = Vec::with_capacity(issue_numbers.len());
+    let mut invalid = Vec::new();
+    for &issue_number in issue_numbers {
+        if issue_number == 0 {
+            invalid.push(issue_number);
+        } else {
+            valid.push(issue_number);
+        }
+    }
+    (valid, invalid)
 }
 
 // ── Public metrics ───────────────────────────────────────────────────
