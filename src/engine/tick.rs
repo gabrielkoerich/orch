@@ -2024,9 +2024,7 @@ pub(crate) async fn tick_unblock_parents(
     store: &Arc<TaskStore>,
     repo: &str,
 ) -> anyhow::Result<()> {
-    let blocked = task_manager
-        .list_external_by_status(Status::Blocked)
-        .await?;
+    let blocked = task_manager.list_all_by_status(Status::Blocked).await?;
 
     // Pre-filter: skip tasks that are blocked for a known reason (e.g. CI failure,
     // escalation). These are not waiting on children, so there is no point making
@@ -2063,13 +2061,58 @@ pub(crate) async fn tick_unblock_parents(
             let repo_owned = repo.to_string();
             tokio::spawn(async move {
                 let task_id = &task.id;
-                let children = match backend_clone.get_sub_issues(task_id).await {
-                    Ok(ids) => ids,
+
+                let mut children: Vec<ExternalId> = Vec::new();
+                let mut child_statuses: std::collections::HashMap<
+                    String,
+                    crate::store::TaskStatus,
+                > = std::collections::HashMap::new();
+
+                match store_clone.resolve_task_id(&repo_owned, &task_id.0).await {
+                    Ok(Some(parent_store_id)) => {
+                        match store_clone.list_children(&repo_owned, parent_store_id).await {
+                            Ok(store_children) => {
+                                for child in store_children {
+                                    let Some(child_external_id) = child.external_id else {
+                                        continue;
+                                    };
+                                    child_statuses.insert(child_external_id.clone(), child.status);
+                                    children.push(ExternalId(child_external_id));
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    task_id = task_id.0,
+                                    ?e,
+                                    "failed to list store-linked children"
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::debug!(
+                            task_id = task_id.0,
+                            ?e,
+                            "failed to resolve blocked task in store for child lookup"
+                        );
+                    }
+                }
+
+                match backend_clone.get_sub_issues(task_id).await {
+                    Ok(ids) => {
+                        let mut seen: std::collections::HashSet<String> =
+                            children.iter().map(|child| child.0.clone()).collect();
+                        for id in ids {
+                            if seen.insert(id.0.clone()) {
+                                children.push(id);
+                            }
+                        }
+                    }
                     Err(e) => {
                         tracing::debug!(task_id = task_id.0, ?e, "failed to get sub-issues");
-                        return;
                     }
-                };
+                }
 
                 // No children means nothing to wait on — skip (may be blocked for other reasons)
                 if children.is_empty() {
@@ -2085,16 +2128,12 @@ pub(crate) async fn tick_unblock_parents(
                 let child_exts: Vec<&str> =
                     child_ext_strs.iter().map(|s| s.as_str()).collect();
                 // Query store for statuses of any children present locally
-                let mut store_status_map: std::collections::HashMap<
-                    String,
-                    crate::store::TaskStatus,
-                > = std::collections::HashMap::new();
                 if let Ok(map) = store_clone
                     .get_statuses_by_external_ids(&repo_owned, &child_exts)
                     .await
                 {
                     for (k, v) in map.into_iter() {
-                        store_status_map.insert(k, v);
+                        child_statuses.insert(k, v);
                     }
                 } else {
                     tracing::debug!(
@@ -2105,7 +2144,7 @@ pub(crate) async fn tick_unblock_parents(
 
                 for child_id in &children {
                     // Check store first
-                    if let Some(status) = store_status_map.get(&child_id.0) {
+                    if let Some(status) = child_statuses.get(&child_id.0) {
                         if *status != crate::store::TaskStatus::Done {
                             all_done = false;
                             break;
@@ -2551,6 +2590,59 @@ mod tests {
         assert!(
             updates.is_empty(),
             "task with block_reason should be skipped — no API call, no unblock"
+        );
+    }
+
+    #[tokio::test]
+    async fn unblock_parents_unblocks_internal_parent_from_store_children() {
+        let mock = MockBackend::new();
+        let status_updates = mock.status_updates.clone();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "test/repo".to_string(),
+        ));
+
+        let parent_id = store
+            .create_internal("test/repo", "Parent", "", "job", "daily", None)
+            .await
+            .unwrap();
+        store
+            .update_status(parent_id, crate::store::TaskStatus::Blocked)
+            .await
+            .unwrap();
+        let child_id = store
+            .create(&crate::store::NewTask {
+                external_id: Some("91".to_string()),
+                repo: "test/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Child".to_string(),
+                body: String::new(),
+                source: String::new(),
+                source_id: String::new(),
+                author: String::new(),
+                url: String::new(),
+                labels: vec![],
+                parent_id: Some(parent_id),
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(child_id, crate::store::TaskStatus::Done)
+            .await
+            .unwrap();
+
+        tick_unblock_parents(&backend, &task_manager, &store, "test/repo")
+            .await
+            .unwrap();
+
+        let parent = store.get(parent_id).await.unwrap();
+        assert_eq!(parent.status, crate::store::TaskStatus::New);
+        assert!(
+            status_updates.lock().unwrap().is_empty(),
+            "internal parent should be updated in store without backend mirroring"
         );
     }
 

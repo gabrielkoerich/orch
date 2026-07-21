@@ -1620,6 +1620,38 @@ async fn task_with_parent_id() {
 }
 
 #[tokio::test]
+async fn upsert_external_sets_parent_id_from_parent_label() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let parent_id = store
+        .create_internal("owner/repo", "Parent", "", "manual", "", None)
+        .await
+        .unwrap();
+    let labels = vec![format!("parent:internal:{parent_id}")];
+
+    let child_id = store
+        .upsert_external(&UpsertExternal {
+            repo: "owner/repo",
+            ext_id: "42",
+            title: "Child",
+            body: "",
+            author: "bot",
+            url: "https://github.com/owner/repo/issues/42",
+            labels: &labels,
+            origin: "github",
+        })
+        .await
+        .unwrap();
+
+    let child = store.get(child_id).await.unwrap();
+    assert_eq!(child.parent_id, Some(parent_id));
+
+    let children = store.list_children("owner/repo", parent_id).await.unwrap();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].external_id.as_deref(), Some("42"));
+}
+
+#[tokio::test]
 async fn multiple_runs_per_task() {
     let store = TaskStore::open_memory().await.unwrap();
 
