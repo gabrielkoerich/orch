@@ -1265,13 +1265,20 @@ impl Router {
                         // then return immediately. Continuing to try further pool entries
                         // in the same tick would accumulate multiple timeout windows and
                         // stall the tick loop for minutes (issue #3187).
+                        //
+                        // Also record a standard cooldown, same as the non-timeout branch,
+                        // so a chronically-timing-out entry is skipped by is_model_in_cooldown
+                        // on future ticks instead of burning the full timeout window again
+                        // every time round-robin reaches it (issue #3422).
                         self.advance_pool_index_after_attempt(idx, n);
                         tracing::warn!(
                             agent,
                             model = model_str,
                             next_pool_idx = self.pool_index,
-                            "router LLM pool entry timed out — advancing pool index, will retry next tick"
+                            "router LLM pool entry timed out — recording cooldown, will retry next tick"
                         );
+                        crate::engine::runner::response::record_model_failure(agent, model_str)
+                            .await;
                         return Err(e);
                     } else {
                         tracing::warn!(
