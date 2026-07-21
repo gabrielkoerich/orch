@@ -61,7 +61,7 @@ The dominant new log anomaly is repeated GitHub GraphQL partial errors:
 
 `Could not resolve to an Issue with the number of 0.`
 
-This warning is recurring during sync ticks and is now tracked in **#3425**. The likely root cause is that `batch_get_issue_states()` is being given an invalid `0` issue number somewhere upstream; the function currently builds a GraphQL `issue(number: {n})` alias directly from its input.
+This warning is recurring during sync ticks and is now tracked in **#3425**. The likely root cause is the Phase 4 blocked-task auto-unblock scan in `src/engine/tick.rs`, which currently calls `get_sub_issues(task_id)` for every blocked task without filtering out `internal:` task IDs first. In `src/github/http.rs`, `get_sub_issues()` then does `number.parse::<i64>().unwrap_or(0)`, silently turning non-numeric internal IDs into GitHub `issue(number: 0)` GraphQL calls.
 
 This is not currently breaking task flow, but it is persistent log noise in a hot path and makes health review noisier than it should be.
 
@@ -118,7 +118,7 @@ The long-standing blocked backlog in another repo remains present and unchanged 
 
 **1 issue filed during this review:**
 
-- **#3425** — `bug(github): batch issue-state GraphQL queries accept issue number 0 and log partial errors every sync tick`
+- **#3425** — `bug(github): blocked-task sub-issue scans parse internal task ids as issue 0 during Phase 4`
 
 No second issue was filed. The other operational anomalies in the window were either already fixed today or were task/domain-specific rather than orch bugs.
 
@@ -126,7 +126,7 @@ No second issue was filed. The other operational anomalies in the window were ei
 
 ## Priorities for Tomorrow
 
-1. **Watch #3425** and identify the upstream caller feeding `0` into issue-state GraphQL batches.
+1. **Watch #3425** and add an `internal:` guard before Phase 4 sub-issue lookups, or reject non-numeric IDs inside `get_sub_issues()` before building GraphQL input.
 2. **Confirm #3423 stays effective** by checking whether router LLM timeouts now cool once and move on cleanly instead of repeating the same pool entry.
 3. **Confirm #3424 on the next delegated internal-parent cycle** so today's fix is exercised by more than one code path.
 4. **Monitor the blocked count** to see whether it returns to 50 after `internal:155254` is retried or remains elevated from a genuine downstream task backlog increase.
