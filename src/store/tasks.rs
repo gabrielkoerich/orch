@@ -393,6 +393,13 @@ pub struct UpsertExternal<'a> {
     pub origin: &'a str,
 }
 
+fn parent_external_id_from_labels(labels: &[String]) -> Option<&str> {
+    labels
+        .iter()
+        .find_map(|label| label.strip_prefix("parent:"))
+        .filter(|parent| !parent.is_empty())
+}
+
 impl TaskStore {
     /// Append a lifecycle activity event for a task.
     #[allow(clippy::too_many_arguments)]
@@ -641,14 +648,19 @@ impl TaskStore {
     /// Upsert an external task — insert if new, update title/body/labels if exists.
     pub async fn upsert_external(&self, ext: &UpsertExternal<'_>) -> anyhow::Result<i64> {
         let labels_json = serde_json::to_string(ext.labels)?;
+        let parent_id = match parent_external_id_from_labels(ext.labels) {
+            Some(parent_external_id) => self.resolve_task_id(ext.repo, parent_external_id).await?,
+            None => None,
+        };
         let row = sqlx::query(
-            "INSERT INTO tasks (external_id, repo, origin, title, body, author, url, labels)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO tasks (external_id, repo, origin, title, body, author, url, labels, parent_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(repo, external_id) DO UPDATE SET
             title = excluded.title,
             body = excluded.body,
             labels = excluded.labels,
-            url = excluded.url
+            url = excluded.url,
+            parent_id = COALESCE(excluded.parent_id, tasks.parent_id)
          RETURNING id",
         )
         .bind(ext.ext_id)
@@ -659,6 +671,7 @@ impl TaskStore {
         .bind(ext.author)
         .bind(ext.url)
         .bind(&labels_json)
+        .bind(parent_id)
         .fetch_one(&self.pool)
         .await?;
 
@@ -931,6 +944,19 @@ impl TaskStore {
         ))
         .bind(repo)
         .bind(status.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(Self::row_to_task).collect()
+    }
+
+    /// List tasks that are linked to the given parent task.
+    pub async fn list_children(&self, repo: &str, parent_id: i64) -> anyhow::Result<Vec<Task>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND parent_id = ? ORDER BY created_at ASC"
+        ))
+        .bind(repo)
+        .bind(parent_id)
         .fetch_all(&self.pool)
         .await?;
 
