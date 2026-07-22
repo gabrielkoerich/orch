@@ -2099,18 +2099,20 @@ pub(crate) async fn tick_unblock_parents(
                     }
                 }
 
-                match backend_clone.get_sub_issues(task_id).await {
-                    Ok(ids) => {
-                        let mut seen: std::collections::HashSet<String> =
-                            children.iter().map(|child| child.0.clone()).collect();
-                        for id in ids {
-                            if seen.insert(id.0.clone()) {
-                                children.push(id);
+                if !is_internal_id(&task_id.0) {
+                    match backend_clone.get_sub_issues(task_id).await {
+                        Ok(ids) => {
+                            let mut seen: std::collections::HashSet<String> =
+                                children.iter().map(|child| child.0.clone()).collect();
+                            for id in ids {
+                                if seen.insert(id.0.clone()) {
+                                    children.push(id);
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        tracing::debug!(task_id = task_id.0, ?e, "failed to get sub-issues");
+                        Err(e) => {
+                            tracing::debug!(task_id = task_id.0, ?e, "failed to get sub-issues");
+                        }
                     }
                 }
 
@@ -2321,6 +2323,8 @@ mod tests {
         sub_issues: std::collections::HashMap<String, Vec<ExternalId>>,
         /// Tasks returned by `get_task`. Keyed by id.0.
         tasks_by_id: std::collections::HashMap<String, ExternalTask>,
+        /// Recorded `get_sub_issues` calls.
+        get_sub_issues_calls: Arc<Mutex<Vec<String>>>,
         /// Recorded `update_status` calls.
         status_updates: Arc<Mutex<Vec<(String, Status)>>>,
         /// Recorded `remove_label` calls.
@@ -2335,6 +2339,7 @@ mod tests {
                 blocked_tasks: vec![],
                 sub_issues: Default::default(),
                 tasks_by_id: Default::default(),
+                get_sub_issues_calls: Arc::new(Mutex::new(vec![])),
                 status_updates: Arc::new(Mutex::new(vec![])),
                 removed_labels: Arc::new(Mutex::new(vec![])),
                 posted_comments: Arc::new(Mutex::new(vec![])),
@@ -2403,6 +2408,7 @@ mod tests {
             Ok(())
         }
         async fn get_sub_issues(&self, id: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
+            self.get_sub_issues_calls.lock().unwrap().push(id.0.clone());
             Ok(self.sub_issues.get(&id.0).cloned().unwrap_or_default())
         }
         async fn create_sub_task(
@@ -2596,6 +2602,7 @@ mod tests {
     #[tokio::test]
     async fn unblock_parents_unblocks_internal_parent_from_store_children() {
         let mock = MockBackend::new();
+        let get_sub_issues_calls = mock.get_sub_issues_calls.clone();
         let status_updates = mock.status_updates.clone();
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
@@ -2643,6 +2650,10 @@ mod tests {
         assert!(
             status_updates.lock().unwrap().is_empty(),
             "internal parent should be updated in store without backend mirroring"
+        );
+        assert!(
+            get_sub_issues_calls.lock().unwrap().is_empty(),
+            "internal parent should not query backend sub-issues"
         );
     }
 

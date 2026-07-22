@@ -27,6 +27,16 @@ use urlencoding;
 
 const GITHUB_API: &str = "https://api.github.com";
 
+fn parse_positive_issue_number(number: &str) -> anyhow::Result<i64> {
+    let parsed = number
+        .parse::<i64>()
+        .with_context(|| format!("invalid issue number: {number}"))?;
+    if parsed <= 0 {
+        anyhow::bail!("invalid issue number: {number}");
+    }
+    Ok(parsed)
+}
+
 // ── Rate-limit state ─────────────────────────────────────────────────
 
 /// Proactive rate-limit state derived from `X-RateLimit-*` response headers.
@@ -2287,6 +2297,13 @@ impl GhHttp {
             anyhow::bail!("invalid repo format: expected 'owner/repo', got '{}'", repo);
         }
         let (owner, repo_name) = (parts[0], parts[1]);
+        let number = match parse_positive_issue_number(number) {
+            Ok(number) => number,
+            Err(e) => {
+                tracing::debug!(repo, issue = number, ?e, "skipping sub-issues lookup");
+                return Ok(Vec::new());
+            }
+        };
 
         let mut all_numbers: Vec<u64> = Vec::new();
         let mut cursor: Option<String> = None;
@@ -2320,7 +2337,7 @@ impl GhHttp {
                     serde_json::json!({
                         "owner": owner,
                         "name": repo_name,
-                        "number": number.parse::<i64>().unwrap_or(0),
+                        "number": number,
                         "first": page_size,
                         "after": c,
                     }),
@@ -2340,7 +2357,7 @@ impl GhHttp {
                     serde_json::json!({
                         "owner": owner,
                         "name": repo_name,
-                        "number": number.parse::<i64>().unwrap_or(0),
+                        "number": number,
                         "first": page_size,
                     }),
                 )
@@ -3145,6 +3162,25 @@ mod tests {
         assert!(query.contains("issue1: issue(number: 1)"));
         assert!(query.contains("issue3: issue(number: 3)"));
         assert!(query.contains("labels(first: 100)"));
+    }
+
+    #[test]
+    fn parse_positive_issue_number_accepts_positive_values() {
+        assert_eq!(parse_positive_issue_number("42").unwrap(), 42);
+    }
+
+    #[test]
+    fn parse_positive_issue_number_rejects_zero() {
+        let err = parse_positive_issue_number("0").unwrap_err().to_string();
+        assert!(err.contains("invalid issue number: 0"));
+    }
+
+    #[test]
+    fn parse_positive_issue_number_rejects_internal_ids() {
+        let err = parse_positive_issue_number("internal:5")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid issue number: internal:5"));
     }
 
     #[test]
