@@ -1029,8 +1029,26 @@ async fn parse_review_output(
                     }
                 }
 
+                // Scan only bounded head/tail windows, not the full review text.
+                // The full transcript may contain agent work product (e.g. a
+                // diff or markdown report quoting an `outcome`/`rate_limit`
+                // table cell) that incidentally matches these patterns; real
+                // CLI errors appear at the start or end of the output. See
+                // `classify_from_text` in runner::agents for the same rationale.
+                let scan_head = runner::agents::patterns::safe_head(
+                    &text_for_review,
+                    runner::agents::patterns::RATE_LIMIT_SCAN_HEAD_BYTES,
+                );
+                let scan_tail = runner::agents::patterns::safe_tail(
+                    &text_for_review,
+                    runner::agents::patterns::RATE_LIMIT_SCAN_TAIL_BYTES,
+                );
+
                 if let Some(runner::agents::AgentError::RateLimit { message }) = (!ndjson_completed)
-                    .then(|| runner::agents::patterns::detect_rate_limit(&text_for_review))
+                    .then(|| {
+                        runner::agents::patterns::detect_rate_limit(scan_head)
+                            .or_else(|| runner::agents::patterns::detect_rate_limit(scan_tail))
+                    })
                     .flatten()
                 {
                     tracing::warn!(
@@ -1061,7 +1079,7 @@ async fn parse_review_output(
                 }
 
                 if let Some(runner::agents::AgentError::Auth { message }) =
-                    runner::agents::patterns::detect_auth_error(&text_for_review)
+                    runner::agents::patterns::detect_auth_error(scan_tail)
                 {
                     tracing::warn!(
                         task_id = task.id.0,
@@ -2780,6 +2798,48 @@ mod tests {
         let last_error =
             "codex failed: Reconnecting... (stream disconnected before completion: Broken pipe)";
         assert!(!should_skip_no_code_reroute_increment(last_error));
+    }
+
+    // ── review fallback rate-limit/auth scan is bounded, not full-text ──────
+    //
+    // Regression test for a review transcript whose unparseable fallback text
+    // is a long report/diff quoting a status table (`outcome` column values
+    // like `rate_limit`, `failed`, `timeout`). Scanning the full text falsely
+    // classified the review run as rate-limited even though the review agent
+    // never actually hit a rate limit.
+
+    #[test]
+    fn review_fallback_scan_ignores_rate_limit_word_buried_in_long_report() {
+        let padding = "x".repeat(10_000);
+        let text_for_review = format!(
+            "{padding}\n+| codex | gpt-5.4 | failed | 1 |\n+| codex | gpt-5.5 | failed / aborted / (empty) | 1 each |\n+| kimi | opus | rate_limit | 1 |\n{padding}"
+        );
+
+        let scan_head = runner::agents::patterns::safe_head(
+            &text_for_review,
+            runner::agents::patterns::RATE_LIMIT_SCAN_HEAD_BYTES,
+        );
+        let scan_tail = runner::agents::patterns::safe_tail(
+            &text_for_review,
+            runner::agents::patterns::RATE_LIMIT_SCAN_TAIL_BYTES,
+        );
+
+        assert!(runner::agents::patterns::detect_rate_limit(scan_head).is_none());
+        assert!(runner::agents::patterns::detect_rate_limit(scan_tail).is_none());
+    }
+
+    #[test]
+    fn review_fallback_scan_still_detects_real_rate_limit_at_tail() {
+        let padding = "x".repeat(10_000);
+        let text_for_review =
+            format!("{padding}\nError: rate limit exceeded, please try again later");
+
+        let scan_tail = runner::agents::patterns::safe_tail(
+            &text_for_review,
+            runner::agents::patterns::RATE_LIMIT_SCAN_TAIL_BYTES,
+        );
+
+        assert!(runner::agents::patterns::detect_rate_limit(scan_tail).is_some());
     }
 
     #[tokio::test]

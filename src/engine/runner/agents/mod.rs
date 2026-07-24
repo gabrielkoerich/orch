@@ -1607,7 +1607,7 @@ pub(crate) mod patterns {
     /// "unauthorized", HTTP status codes, etc. 3000 bytes is a conservative
     /// window large enough to capture multi-line error dumps but small enough
     /// to exclude most long-form agent outputs.
-    const RATE_LIMIT_SCAN_TAIL_BYTES: usize = 3000;
+    pub(crate) const RATE_LIMIT_SCAN_TAIL_BYTES: usize = 3000;
 
     /// How many bytes from the start of combined stdout+stderr we scan for
     /// rate limit patterns that appear as early system events.
@@ -1616,7 +1616,7 @@ pub(crate) mod patterns {
     /// `type:system` NDJSON events early in the stream, not in the tail.
     /// Scanning the head catches these before they get pushed out of the
     /// tail window by subsequent agent output.
-    const RATE_LIMIT_SCAN_HEAD_BYTES: usize = 3000;
+    pub(crate) const RATE_LIMIT_SCAN_HEAD_BYTES: usize = 3000;
 
     /// Run all pattern detectors against combined stdout+stderr.
     /// Returns the first matching AgentError, or a generic Unknown.
