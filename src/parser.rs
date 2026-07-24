@@ -163,6 +163,11 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
 /// them from canonical ones (e.g. for debugging/metrics).
 fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
     let normalized = resp.status.to_ascii_lowercase();
+    if normalized.starts_with("pushed to ") || normalized.starts_with("pushed ") {
+        resp.status = "done".to_string();
+        return resp;
+    }
+
     resp.status = match normalized.as_str() {
         // Canonical completion statuses.
         // Some agents return `complete` or `no_changes_needed` to indicate
@@ -1089,6 +1094,13 @@ Some output here.
     #[test]
     fn parse_normalizes_changes_pushed_alias_to_done() {
         let input = r#"{"status":"changes_pushed","summary":"changes pushed to branch","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
+    fn parse_normalizes_dynamic_pushed_to_branch_status_to_done() {
+        let input = r#"{"status":"pushed to internal-155195-weekly-review-patterns-progress-and-next","summary":"changes pushed to branch","accomplished":[],"remaining":[],"files":[]}"#;
         let resp = parse(input).unwrap();
         assert_eq!(resp.status, "done");
     }
