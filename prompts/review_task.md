@@ -26,6 +26,8 @@ Check **required checks only**:
 timeout 300 gh pr checks {{PR_NUMBER}} --watch --fail-fast --required || true
 ```
 
+Run this command in the foreground and wait for it to complete — do NOT use a background/async task tool for this step. The review is not complete until this command has finished and you have interpreted its output.
+
 **Non-required checks** are informational — the `--required` flag filters to required checks only. The only non-required check orch installs is `review-gate`. Do NOT request changes based on non-required check failures.
 
 Follow this decision tree exactly:
@@ -108,6 +110,7 @@ Flag `request_changes` if the PR:
 
 You MUST output the JSON block below even if you already ran this review earlier.
 Do NOT respond with prose summaries.
+Your turn must not end with a background task still running. If you started any background command, wait for it to finish before producing your final answer.
 
 ```json
 {
