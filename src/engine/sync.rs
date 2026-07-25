@@ -712,8 +712,11 @@ async fn try_unblock_ci_failure_task(
             .external_id
             .clone()
             .unwrap_or_else(|| format!("internal:{}", task.id));
+        // Update the store directly by the already-resolved numeric id instead of going
+        // through `task_manager.update_task_status`, which resolves by `self.repo` — this
+        // sweep runs cross-repo, so `task.repo` may not match the caller's own repo scope.
         task_manager
-            .update_task_status(&crate::backends::ExternalId(ext_id), Status::Done)
+            .mark_task_done_by_store_id(task.id, &task.repo, &crate::backends::ExternalId(ext_id))
             .await?;
         let fields = vec![
             ("block_reason", serde_json::Value::Null),

@@ -478,7 +478,7 @@ impl TaskManager {
             }
             store.update_status(store_id, task_status).await?;
             // Publish event to bus only after confirmed update
-            self.publish_event(id, status, &pre_snapshot, None);
+            self.publish_event(id, status, &pre_snapshot, &self.repo, None);
             return Ok(());
         }
 
@@ -505,7 +505,7 @@ impl TaskManager {
         }
 
         // Publish event to bus
-        self.publish_event(id, status, &pre_snapshot, None);
+        self.publish_event(id, status, &pre_snapshot, &self.repo, None);
 
         Ok(())
     }
@@ -534,7 +534,7 @@ impl TaskManager {
                 .update_status_and_fields(store_id, task_status, updates)
                 .await?;
             // Publish event to bus only after confirmed update
-            self.publish_event(id, status, &pre_snapshot, None);
+            self.publish_event(id, status, &pre_snapshot, &self.repo, None);
             return Ok(());
         }
 
@@ -558,7 +558,7 @@ impl TaskManager {
         }
 
         // Publish event to bus
-        self.publish_event(id, status, &pre_snapshot, None);
+        self.publish_event(id, status, &pre_snapshot, &self.repo, None);
 
         Ok(())
     }
@@ -589,7 +589,7 @@ impl TaskManager {
                 .update_status_if(store_id, task_status, expected_task_status)
                 .await?;
             if updated {
-                self.publish_event(id, status, &pre_snapshot, None);
+                self.publish_event(id, status, &pre_snapshot, &self.repo, None);
             }
             return Ok(updated);
         }
@@ -634,7 +634,7 @@ impl TaskManager {
             );
         }
 
-        self.publish_event(id, status, &pre_snapshot, None);
+        self.publish_event(id, status, &pre_snapshot, &self.repo, None);
         Ok(true)
     }
 
@@ -662,7 +662,7 @@ impl TaskManager {
                 store.set_block_reason(store_id, None).await?;
             }
             store.update_status(store_id, task_status).await?;
-            self.publish_event(id, status, &pre_snapshot, duration_seconds);
+            self.publish_event(id, status, &pre_snapshot, &self.repo, duration_seconds);
             return Ok(());
         }
 
@@ -684,7 +684,7 @@ impl TaskManager {
             );
         }
 
-        self.publish_event(id, status, &pre_snapshot, duration_seconds);
+        self.publish_event(id, status, &pre_snapshot, &self.repo, duration_seconds);
 
         Ok(())
     }
@@ -700,10 +700,22 @@ impl TaskManager {
             Ok(Some(id)) => id,
             _ => return (TaskSnapshot::default(), None),
         };
+        let snapshot = Self::snapshot_for_store_id(store, store_id, task_id).await;
+        (snapshot, Some(store_id))
+    }
+
+    /// Build a `TaskSnapshot` for an already-resolved numeric store id, without
+    /// going through `resolve_task_id`. `metric_task_id` is the external id string
+    /// used as the key in `task_metrics` for duration lookup.
+    async fn snapshot_for_store_id(
+        store: &TaskStore,
+        store_id: i64,
+        metric_task_id: &str,
+    ) -> TaskSnapshot {
         match store.get(store_id).await {
             Ok(task) => {
-                let duration_seconds = store.latest_task_metric_duration(task_id).await;
-                let snapshot = TaskSnapshot {
+                let duration_seconds = store.latest_task_metric_duration(metric_task_id).await;
+                TaskSnapshot {
                     old_status: Some(task.status.as_str().to_string()),
                     agent: task.agent.clone(),
                     model: task.model.clone(),
@@ -729,8 +741,7 @@ impl TaskManager {
                         Some(task.summary.clone())
                     },
                     duration_seconds,
-                };
-                (snapshot, Some(store_id))
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -738,7 +749,7 @@ impl TaskManager {
                     err = %e,
                     "failed to read task snapshot for event enrichment — event context will be empty"
                 );
-                (TaskSnapshot::default(), None)
+                TaskSnapshot::default()
             }
         }
     }
@@ -749,12 +760,13 @@ impl TaskManager {
         id: &ExternalId,
         status: Status,
         snapshot: &TaskSnapshot,
+        repo: &str,
         duration_seconds: Option<f64>,
     ) {
         if let Some(ref tx) = self.event_tx {
             let event = crate::engine::events::TaskEvent {
                 task_id: id.0.clone(),
-                repo: self.repo.clone(),
+                repo: repo.to_string(),
                 old_status: snapshot.old_status.clone().unwrap_or_default(),
                 new_status: status.as_label().trim_start_matches("status:").to_string(),
                 agent: snapshot.agent.clone(),
@@ -770,6 +782,28 @@ impl TaskManager {
             };
             let _ = tx.send(event);
         }
+    }
+
+    /// Mark an already-resolved task Done directly by its numeric store id and owning
+    /// repo, bypassing the repo-scoped `resolve_task_id` lookup that `self.repo` would
+    /// otherwise apply. For callers that already hold the correct store row from a
+    /// cross-repo query — e.g. the global CI-failure unblock sweep — and would otherwise
+    /// fail to resolve a task belonging to a different repo than this `TaskManager`.
+    pub async fn mark_task_done_by_store_id(
+        &self,
+        store_id: i64,
+        repo: &str,
+        ext_id: &ExternalId,
+    ) -> anyhow::Result<()> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("store required for status update"))?;
+
+        let snapshot = Self::snapshot_for_store_id(store, store_id, &ext_id.0).await;
+        store.update_status(store_id, TaskStatus::Done).await?;
+        self.publish_event(ext_id, Status::Done, &snapshot, repo, None);
+        Ok(())
     }
 
     /// List internal tasks by status from the store.
@@ -1183,6 +1217,48 @@ mod tests {
             event_rx.try_recv().is_err(),
             "no event should be published for a not-found internal task"
         );
+    }
+
+    /// Regression test for #3437: `update_task_status` resolves by `self.repo`, so a
+    /// `TaskManager` scoped to one repo cannot mark Done a task that belongs to a
+    /// different repo — exactly the case the global cross-repo CI-failure unblock sweep
+    /// hits. `mark_task_done_by_store_id` bypasses that repo-scoped resolution and must
+    /// succeed where `update_task_status` fails.
+    #[tokio::test]
+    async fn mark_task_done_by_store_id_succeeds_across_repos() {
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        let store_id = store
+            .create_internal(
+                "other/repo",
+                "Cross-repo task",
+                "body",
+                "cron",
+                "job:1",
+                None,
+            )
+            .await
+            .unwrap();
+        let ext_id = ExternalId(format!("internal:{store_id}"));
+
+        // TaskManager scoped to a different repo than the task belongs to.
+        let tm = TaskManager::with_store(backend, store.clone(), "active/repo".to_string());
+
+        // The repo-scoped path fails to even find the task.
+        let resolve_result = tm.update_task_status(&ext_id, Status::Done).await;
+        assert!(
+            resolve_result.is_err(),
+            "repo-scoped update_task_status must fail for a cross-repo task"
+        );
+
+        // The bypass path succeeds using the already-resolved store id + owning repo.
+        tm.mark_task_done_by_store_id(store_id, "other/repo", &ext_id)
+            .await
+            .unwrap();
+
+        let task = store.get(store_id).await.unwrap();
+        assert_eq!(task.status, TaskStatus::Done);
     }
 
     #[tokio::test]
