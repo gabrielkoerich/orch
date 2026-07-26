@@ -1083,6 +1083,50 @@ pub(crate) mod patterns {
         prev_is_boundary && next_is_boundary
     }
 
+    fn lower_offset_to_original_byte(text: &str, lower: &str, lower_pos: usize) -> usize {
+        let char_idx = lower[..lower_pos].chars().count();
+        text.char_indices()
+            .nth(char_idx)
+            .map_or(text.len(), |(i, _)| i)
+    }
+
+    fn line_bounds(text: &str, byte_pos: usize) -> (usize, usize) {
+        let start = text[..byte_pos].rfind('\n').map_or(0, |idx| idx + 1);
+        let end = text[byte_pos..]
+            .find('\n')
+            .map_or(text.len(), |idx| byte_pos + idx);
+        (start, end)
+    }
+
+    fn is_markdown_table_cell(text: &str, byte_pos: usize, pattern: &str) -> bool {
+        let (line_start, line_end) = line_bounds(text, byte_pos);
+        let line = &text[line_start..line_end];
+        let trimmed = line.trim_start();
+        if !(trimmed.starts_with('|')
+            || trimmed.starts_with("+|")
+            || trimmed.starts_with("-|")
+            || trimmed.starts_with(">|"))
+        {
+            return false;
+        }
+        if line.matches('|').count() < 2 {
+            return false;
+        }
+
+        let rel_pos = byte_pos.saturating_sub(line_start);
+        let after_match = rel_pos + pattern.len();
+        let prev_is_pipe = line[..rel_pos]
+            .chars()
+            .rev()
+            .find(|c| !c.is_whitespace())
+            .is_some_and(|c| c == '|');
+        let next_is_pipe = line[after_match..]
+            .chars()
+            .find(|c| !c.is_whitespace())
+            .is_some_and(|c| c == '|');
+        prev_is_pipe && next_is_pipe
+    }
+
     /// Check for rate limit / usage limit patterns in text.
     pub fn detect_rate_limit(text: &str) -> Option<AgentError> {
         let lower = text.to_lowercase();
@@ -1106,21 +1150,31 @@ pub(crate) mod patterns {
             "resourceexhausted", // Nvidia / gRPC provider capacity
             "worker local total request limit reached", // Nvidia nemotron via OpenCode
         ];
-        // Find the earliest match position so we can extract context around the
-        // actual error message rather than the tail (which may be unrelated JSON).
-        // Map the byte offset from `lower` back to `text` via char-count to avoid
-        // using a lowercased byte index on the original string (Unicode case-folding
-        // can change byte lengths, e.g. İ→i̇).
-        let match_pos = patterns
+        // Find the earliest valid match position so we can extract context around
+        // the actual error message rather than the tail (which may be unrelated
+        // JSON or markdown work product). Map the byte offset from `lower` back
+        // to `text` via char-count to avoid using a lowercased byte index on the
+        // original string (Unicode case-folding can change byte lengths, e.g.
+        // İ→i̇).
+        let match_info = patterns
             .iter()
-            .filter_map(|p| lower.find(p))
-            .min()
-            .map(|lower_pos| {
-                let char_idx = lower[..lower_pos].chars().count();
-                text.char_indices()
-                    .nth(char_idx)
-                    .map_or(text.len(), |(i, _)| i)
-            });
+            .filter_map(|pattern| lower.find(pattern).map(|lower_pos| (*pattern, lower_pos)))
+            .filter_map(|(pattern, lower_pos)| {
+                let byte_pos = lower_offset_to_original_byte(text, &lower, lower_pos);
+                if matches!(pattern, "rate_limit" | "ratelimit")
+                    && !is_word_boundary(text, byte_pos, pattern)
+                {
+                    return None;
+                }
+
+                if matches!(pattern, "rate_limit" | "ratelimit")
+                    && is_markdown_table_cell(text, byte_pos, pattern)
+                {
+                    return None;
+                }
+                Some((pattern, byte_pos))
+            })
+            .min_by_key(|(_, byte_pos)| *byte_pos);
         let has_429 = lower.contains("429");
         // HTTP 529 is used by Cloudflare for rate limiting. Only match in HTTP status
         // contexts (e.g. "HTTP 529", "status: 529") to avoid false positives from bare
@@ -1134,21 +1188,8 @@ pub(crate) mod patterns {
                     .is_some_and(|c| c.is_ascii_digit())
             }));
 
-        // Guard: skip "rate_limit"/"ratelimit" unless at a word boundary — prevents
-        // false positives from test identifiers like `record_rate_limit_returns_id`.
-        // Other patterns (natural-language phrases) are low risk.
-        if let Some(lower_pos) = match_pos {
-            for pat in ["rate_limit", "ratelimit"] {
-                if let Some(pat_pos) = lower.find(pat) {
-                    if pat_pos == lower_pos && !is_word_boundary(text, lower_pos, pat) {
-                        return None;
-                    }
-                }
-            }
-        }
-
-        if match_pos.is_some() || has_429 || has_529 {
-            let message = if let Some(pos) = match_pos {
+        if match_info.is_some() || has_429 || has_529 {
+            let message = if let Some((_, pos)) = match_info {
                 extract_context_around(text, pos, 300)
             } else {
                 safe_tail(text, 300).to_string()
@@ -2207,6 +2248,32 @@ mod tests {
         assert!(
             matches!(err, AgentError::RateLimit { .. }),
             "real rate limit at tail must be detected, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_ignores_markdown_rate_limit_table_at_tail() {
+        let padding = "normal agent work output ".repeat(250);
+        let text = format!(
+            "{padding}\n+| agent | model | outcome | count |\n+| codex | gpt-5.4 | failed | 1 |\n+| kimi | opus | rate_limit | 1 |\n"
+        );
+        let err = patterns::classify_from_text(1, &text);
+        assert!(
+            !matches!(err, AgentError::RateLimit { .. }),
+            "markdown table cell must not trigger rate limit, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_rate_limit_non_ascii_prefix_does_not_panic() {
+        // Regression test: non-ASCII characters before `rate_limit` that change
+        // byte length when lowercased (e.g. İ 2→3 bytes, ﬂ 3→2 bytes) must not
+        // cause is_word_boundary to index text at an invalid byte offset.
+        let text = "Aﬂαβrate_limit error: too many requests";
+        let err = patterns::classify_from_text(1, text);
+        assert!(
+            matches!(err, AgentError::RateLimit { .. }),
+            "real rate_limit should still be detected with non-ASCII prefix, got: {err:?}"
         );
     }
 
