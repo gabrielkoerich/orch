@@ -1160,13 +1160,13 @@ pub(crate) mod patterns {
             .iter()
             .filter_map(|pattern| lower.find(pattern).map(|lower_pos| (*pattern, lower_pos)))
             .filter_map(|(pattern, lower_pos)| {
+                let byte_pos = lower_offset_to_original_byte(text, &lower, lower_pos);
                 if matches!(pattern, "rate_limit" | "ratelimit")
-                    && !is_word_boundary(text, lower_pos, pattern)
+                    && !is_word_boundary(text, byte_pos, pattern)
                 {
                     return None;
                 }
 
-                let byte_pos = lower_offset_to_original_byte(text, &lower, lower_pos);
                 if matches!(pattern, "rate_limit" | "ratelimit")
                     && is_markdown_table_cell(text, byte_pos, pattern)
                 {
@@ -2261,6 +2261,19 @@ mod tests {
         assert!(
             !matches!(err, AgentError::RateLimit { .. }),
             "markdown table cell must not trigger rate limit, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_rate_limit_non_ascii_prefix_does_not_panic() {
+        // Regression test: non-ASCII characters before `rate_limit` that change
+        // byte length when lowercased (e.g. İ 2→3 bytes, ﬂ 3→2 bytes) must not
+        // cause is_word_boundary to index text at an invalid byte offset.
+        let text = "Aﬂαβrate_limit error: too many requests";
+        let err = patterns::classify_from_text(1, text);
+        assert!(
+            matches!(err, AgentError::RateLimit { .. }),
+            "real rate_limit should still be detected with non-ASCII prefix, got: {err:?}"
         );
     }
 
