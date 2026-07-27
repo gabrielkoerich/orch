@@ -13,7 +13,7 @@ End-of-day review covering the last 24 hours. Your ONLY output is a summary post
 3. `gh issue list --state open` — what's still pending
 4. `gh issue list --state closed --limit 30` — what was resolved in the last 24h
 5. `orch task list` — stuck, blocked, or failing tasks
-6. Read `~/.claude/skills/orch/SKILL.md` — new learnings, patterns, and operational notes captured today
+6. Read `./prompts/skills/orch/SKILL.md` — repo-tracked monitoring guidance and settled operational policy
 
 ## Check operational health (last 24h)
 
@@ -25,7 +25,7 @@ End-of-day review covering the last 24 hours. Your ONLY output is a summary post
 6. Is routing accurate? Any models failing silently? Any agents repeatedly cooled?
 7. Are agent prompts effective or do they need tuning?
 8. Performance bottlenecks (slow syncs, lock contention, API rate limits, dead models)?
-9. Are learnings captured in the orch skill reflected in code/config changes?
+9. Does current operational behavior still match `./prompts/skills/orch/SKILL.md` and the settled repo policy?
 
 ## Write the summary
 

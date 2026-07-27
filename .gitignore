@@ -11,6 +11,6 @@ contexts/
 docs/public/
 lcov.info
 opencode.json
-skills/
+/skills/
 tasks.yml
 tasks.yml.lock*
