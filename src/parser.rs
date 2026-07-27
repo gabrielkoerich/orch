@@ -188,6 +188,7 @@ fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
         | "changes_made"
         | "change_made"
         | "changes_pushed"
+        | "pushed"
         | "acknowledged"
         | "flat"
         | "no_action"
@@ -1094,6 +1095,13 @@ Some output here.
     #[test]
     fn parse_normalizes_changes_pushed_alias_to_done() {
         let input = r#"{"status":"changes_pushed","summary":"changes pushed to branch","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+    }
+
+    #[test]
+    fn parse_normalizes_bare_pushed_alias_to_done() {
+        let input = r#"{"status":"pushed","summary":"changes pushed to branch","accomplished":[],"remaining":[],"files":[]}"#;
         let resp = parse(input).unwrap();
         assert_eq!(resp.status, "done");
     }
