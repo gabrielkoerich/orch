@@ -1422,6 +1422,11 @@ pub(crate) fn is_transient_github_error(err_str: &str) -> bool {
         || lower.contains("connection refused")
         || lower.contains("connection closed")
         || lower.contains("transport error")
+        || lower.contains("failed to connect")
+        || lower.contains("failed to connect to github.com port")
+        || lower.contains("curl: (7) failed to connect")
+        || lower.contains("couldn't connect to server")
+        || lower.contains("could not connect to server")
     {
         return true;
     }
@@ -1803,6 +1808,23 @@ mod tests {
         assert!(is_transient_github_error(
             "transport error: connection lost"
         ));
+
+        // Git/Curl connect-failure patterns (review push failures)
+        assert!(is_transient_github_error(
+            "fatal: unable to access 'https://github.com/owner/repo.git/': Failed to connect to github.com port 443 after 20990 ms: Couldn't connect to server"
+        ));
+        assert!(is_transient_github_error(
+            "Failed to connect to github.com port 443: Connection timed out"
+        ));
+        assert!(is_transient_github_error(
+            "Failed to connect to github.com port 443: Connection refused"
+        ));
+        assert!(is_transient_github_error(
+            "curl: (7) Failed to connect to github.com port 443: Couldn't connect to server"
+        ));
+        assert!(is_transient_github_error(
+            "fatal: unable to access 'https://github.com/owner/repo.git/': Couldn't connect to server"
+        ));
     }
 
     #[test]
@@ -1872,8 +1894,14 @@ mod tests {
         assert!(is_transient_github_api_error(
             "gh error: transport error: connection reset by peer"
         ));
+        assert!(is_transient_github_api_error(
+            "push failed: fatal: unable to access 'https://github.com/owner/repo.git/': Failed to connect to github.com port 443 after 20990 ms: Couldn't connect to server"
+        ));
         assert!(!is_transient_github_api_error(
             "codex failed: Reconnecting... (stream disconnected before completion: Broken pipe)"
+        ));
+        assert!(!is_transient_github_api_error(
+            "agent stream failed: failed to connect to local relay"
         ));
     }
 
