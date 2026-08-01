@@ -49,21 +49,23 @@ The orchestration pipeline kept moving: `28` tasks reached `done` in the last 24
 
 | Agent | Model | Outcome | Count |
 |------|-------|---------|------:|
-| claude | `sonnet` | `success` | 21 |
+| claude | `sonnet` | `success` | 23 |
 | kimi | `opus` | `success` | 15 |
-| codex | `gpt-5.4` | `success` | 12 |
+| codex | `gpt-5.4` | `success` | 13 |
 | codex | `gpt-5.5` | `success` | 7 |
 | opencode | `opencode/ling-3.0-flash-free` | `success` | 5 |
 | opencode | `opencode/deepseek-v4-flash-free` | `success` | 3 |
 | opencode | `opencode/mimo-v2.5-free` | `success` | 3 |
 | opencode | `opencode/north-mini-code-free` | `success` | 3 |
+| claude | `sonnet` | *(empty)* | 1 |
+| opencode | `opencode/deepseek-v4-flash-free` | *(empty)* | 1 |
 | opencode | `opencode/ling-3.0-flash-free` | `failed` | 1 |
 | opencode | `opencode/ling-3.0-flash-free` | `parse_error` | 1 |
 | opencode | `opencode/nemotron-3-ultra-free` | `failed` | 1 |
 
-The two `claude/sonnet` rows with an empty outcome are this review task and the concurrent bean evening-retrospective task — both still in progress at query time, not failures.
+The two empty-outcome rows are runs still mid-flight at query time, not failures: one `claude/sonnet` run is this review task (`internal:155529`, currently on its second attempt after review feedback), and one `opencode/deepseek-v4-flash-free` run is `internal:155530` ("Daily evening retrospective" in `gabrielkoerich/bean`, currently `in_review`).
 
-This is a healthy failure profile: 3 non-success runs out of 71 total, and all 3 fall in known-classified categories (opencode network/streaming errors already handled by #3378/#3379).
+This is a healthy failure profile: 3 non-success runs out of 75 completed runs (excluding the 2 still in-flight), and all 3 fall in known-classified categories (opencode network/streaming errors already handled by #3378/#3379).
 
 ### Logs, Routing, and Cooldowns
 
@@ -85,7 +87,7 @@ Current task backlog:
 
 - `54` tasks `blocked` (unchanged from yesterday's count)
 - `2` tasks `needs_review`
-- `2` tasks `in_progress` (this review + the bean retrospective, both freshly dispatched)
+- `1` task `in_progress` (this review, on its second attempt); `internal:155530` (bean retrospective) has since moved to `in_review`
 
 No `blocked` tasks in `gabrielkoerich/orch` itself. The blocked backlog remains dominated by the same known downstream constraints as previous reviews:
 
