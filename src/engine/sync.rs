@@ -2638,9 +2638,20 @@ pub(crate) async fn ingest_external_tasks(
     }
 
     // Record last ingest time for next incremental fetch.
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    if let Err(e) = store.kv_set(&kv_key, &now).await {
-        tracing::error!(key = kv_key, err = %e, "ingest: failed to record last ingest time");
+    //
+    // Advance the cursor to the max `updated_at` actually observed in this fetch, not to
+    // wall-clock now(). Using now() creates a watermark race: an issue created or updated
+    // between the moment GitHub computed the `since` query results and the moment this line
+    // runs (API replication lag, or simply request latency) can be excluded from *this*
+    // fetch, and then the cursor jumps past its updated_at anyway. On every subsequent tick
+    // `since` is newer than that issue's updated_at, so it is silently skipped forever unless
+    // it receives a new comment/label to bump updated_at, or the engine restarts (which clears
+    // the cursor, see clear_issues_last_ingested). Deriving the cursor from observed data only
+    // is the same safe pattern used by the mentions cursor (see MentionCursor::advance above).
+    if let Some(latest) = all_tasks.iter().map(|(t, _)| t.updated_at.as_str()).max() {
+        if let Err(e) = store.kv_set(&kv_key, latest).await {
+            tracing::error!(key = kv_key, err = %e, "ingest: failed to record last ingest time");
+        }
     }
 
     Ok(())
@@ -2849,6 +2860,36 @@ mod tests {
             .unwrap();
         assert_eq!(task2.title, "Second issue");
         assert_eq!(task2.status, crate::store::TaskStatus::InProgress);
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn ingest_advances_cursor_to_max_observed_updated_at_not_wall_clock() {
+        // Regression test for the watermark race: the `issues_last_ingested` cursor must be
+        // derived from the max `updated_at` actually seen in the fetch, not from
+        // chrono::Utc::now(). Otherwise an issue whose updated_at lags real time (e.g. GitHub
+        // API replication lag between the `since` query and this line running) gets skipped by
+        // every subsequent `since` fetch forever, even though it was never actually ingested.
+        crate::engine::cooldown::reset_global_state().await;
+        let mut task = make_ext_task("1", "First issue");
+        task.updated_at = "2026-01-01T00:00:00Z".to_string();
+        let backend: Arc<dyn ExternalBackend> =
+            IngestMockBackend::with_tasks(vec![(Status::New, task)]);
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        ingest_external_tasks(&backend, "owner/repo", &store)
+            .await
+            .unwrap();
+
+        let cursor = store
+            .kv_get("issues_last_ingested:owner/repo")
+            .await
+            .unwrap();
+        assert_eq!(
+            cursor,
+            Some("2026-01-01T00:00:00Z".to_string()),
+            "cursor must match the max updated_at observed in the fetch, not wall-clock now()"
+        );
     }
 
     #[serial(cooldown_state)]
