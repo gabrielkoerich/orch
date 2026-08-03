@@ -78,6 +78,108 @@ async fn startup_cleanup(tmux: &TmuxManager) {
 use super::EngineConfig;
 use crate::store::{set_review_session_expected, store_set_by_id, store_touch_updated_at};
 
+async fn recover_routed_blocked_dispatch(
+    backend: &Arc<dyn ExternalBackend>,
+    store: &Arc<TaskStore>,
+    task_manager: &Arc<TaskManager>,
+    repo: &str,
+    task: &ExternalTask,
+    timing: &StuckTaskTiming,
+) {
+    tracing::warn!(
+        task_id = task.id.0,
+        age_mins = timing.age.num_minutes(),
+        threshold_mins = timing.threshold / 60,
+        "recovering routed task: dispatch blocked by stale tmux session → new"
+    );
+
+    if let Some(store_id) = match store.resolve_task_id(repo, &task.id.0).await {
+        Ok(Some(id)) => Some(id),
+        Ok(None) => {
+            tracing::warn!(
+                task_id = %task.id.0,
+                repo,
+                "resolve_task_id returned None during routed-task recovery"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::error!(
+                task_id = %task.id.0,
+                repo,
+                error = %e,
+                "resolve_task_id failed during routed-task recovery"
+            );
+            None
+        }
+    } {
+        if let Err(e) = store_set_by_id(
+            &Some(store),
+            store_id,
+            &[
+                ("agent", serde_json::Value::Null),
+                ("model", serde_json::Value::Null),
+                ("route_attempts", serde_json::json!(0)),
+            ],
+        )
+        .await
+        {
+            tracing::warn!(
+                task_id = task.id.0,
+                ?e,
+                "failed to clear routing fields for routed stuck task — will retry next tick"
+            );
+            return;
+        }
+    }
+
+    if let Err(e) = task_manager.update_task_status(&task.id, Status::New).await {
+        tracing::warn!(
+            task_id = task.id.0,
+            ?e,
+            "failed to reset routed stuck task status"
+        );
+        return;
+    }
+
+    crate::store::store_log_activity(
+        &Some(Arc::clone(store)),
+        repo,
+        &task.id.0,
+        "rerouted",
+        Some("routed"),
+        Some("new"),
+        None::<&str>,
+        None::<&str>,
+        Some(&serde_json::json!({
+            "failure_reason": "routed_blocked_by_existing_session",
+            "age_minutes": timing.age.num_minutes(),
+            "had_session": true,
+        })),
+    )
+    .await;
+
+    if !is_internal_id(&task.id.0) {
+        let backend_clone = Arc::clone(backend);
+        let task_id_clone = task.id.clone();
+        let body = format!(
+            "[{}] recovered: stuck routed task — existing tmux session blocked dispatch for {}m; cleared route for retry{}",
+            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+            timing.age.num_minutes(),
+            crate::engine::orch_footer()
+        );
+        tokio::spawn(async move {
+            if let Err(e) = backend_clone.post_comment(&task_id_clone, &body).await {
+                tracing::warn!(
+                    task_id = task_id_clone.0,
+                    ?e,
+                    "failed to post routed-task recovery comment"
+                );
+            }
+        });
+    }
+}
+
 /// Phase 1 of tick: poll tmux for finished sessions and clean them up.
 pub(crate) async fn tick_check_session_completions(
     tmux: &Arc<TmuxManager>,
@@ -499,6 +601,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
     session_map: &std::collections::HashMap<String, bool>,
 ) -> anyhow::Result<()> {
     let _span = tracing::info_span!("engine.tick.phase2.stuck_tasks").entered();
+
     let in_progress = match task_manager
         .list_external_by_status(Status::InProgress)
         .await
@@ -711,6 +814,54 @@ pub(crate) async fn tick_recover_stuck_tasks(
                 }
             });
         }
+    }
+
+    let mut routed = match task_manager.list_external_by_status(Status::Routed).await {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::warn!(?e, "failed to list routed tasks for stuck recovery");
+            vec![]
+        }
+    };
+    match task_manager
+        .list_internal_by_status(crate::store::TaskStatus::Routed)
+        .await
+    {
+        Ok(tasks) => routed.extend(tasks),
+        Err(e) => tracing::warn!(
+            ?e,
+            "failed to list internal routed tasks for stuck recovery"
+        ),
+    }
+    for task in &routed {
+        let Some(timing) = stuck_task_timing_from_map(
+            tmux,
+            repo,
+            &task.id.0,
+            &task.updated_at,
+            config,
+            "cannot parse updated_at, skipping routed stuck-task check",
+            session_map,
+        ) else {
+            continue;
+        };
+
+        if !timing.has_session {
+            continue;
+        }
+
+        let session_name = tmux.session_name(repo, &task.id.0);
+        if let Err(e) = tmux.kill_session(&session_name).await {
+            tracing::warn!(
+                task_id = task.id.0,
+                session = %session_name,
+                error = %e,
+                "failed to kill stale tmux session blocking routed task"
+            );
+            continue;
+        }
+
+        recover_routed_blocked_dispatch(backend, store, task_manager, repo, task, &timing).await;
     }
 
     // Global recovery for external tasks from repos that are not currently being ticked.
@@ -3228,6 +3379,83 @@ mod tests {
         assert_eq!(timing.threshold, config.no_session_stuck_timeout);
 
         let _ = tmux.kill_session(&session_name).await;
+    }
+
+    #[tokio::test]
+    async fn recover_stuck_tasks_reclaims_routed_task_blocked_by_stale_session() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let mock = MockBackend::new();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(TmuxManager::new());
+        let config = EngineConfig {
+            no_session_stuck_timeout: 600,
+            stuck_timeout: 1,
+            ..EngineConfig::default()
+        };
+
+        let id = store
+            .create_internal("owner/repo", "Blocked routed task", "", "cron", "1", None)
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::Routed)
+            .await
+            .unwrap();
+        set_task_updated_at_past(&store, id).await;
+
+        let task_id = format!("internal:{id}");
+        let session_name = tmux.session_name("owner/repo", &task_id);
+        let create_result = tokio::process::Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session_name,
+                "-c",
+                "/tmp",
+                "sleep 60",
+            ])
+            .output()
+            .await;
+
+        match create_result {
+            Ok(o) if o.status.success() => {}
+            _ => {
+                eprintln!("Skipping test: tmux not available or failed to create test session");
+                return;
+            }
+        }
+
+        let session_map = tmux.batch_session_active().await;
+        assert_eq!(session_map.get(&session_name).copied(), Some(true));
+
+        tick_recover_stuck_tasks(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &task_manager,
+            &config,
+            &store,
+            &session_map,
+        )
+        .await
+        .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(
+            task.status,
+            crate::store::TaskStatus::New,
+            "routed task blocked by a stale session should be reset for re-routing"
+        );
+        assert!(
+            !tmux.session_exists(&session_name).await,
+            "recovery should kill the stale tmux session so dispatch can proceed"
+        );
     }
 
     // ── tick_dispatch_tasks: deadlock regression test (#1361) ──────────────
