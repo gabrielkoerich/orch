@@ -588,9 +588,10 @@ fn should_use_backend(task_id: &str) -> bool {
     !is_internal_id(task_id)
 }
 
-/// Phase 2 of tick: detect tasks stuck in_progress or in_review without an active tmux session and reset them.
-/// - `in_progress` tasks → reset to `New` (clears routing state so the LLM router re-routes)
-/// - `in_review` tasks   → reset to `NeedsReview` (keeps routing state; review agent re-triggers)
+/// Phase 2 of tick: recover tasks stranded by missing or stale tmux state.
+/// - `in_progress` tasks → reset to `New` when their session is missing or the run timed out
+/// - `routed` tasks      → reset to `New` when an old live session keeps blocking re-dispatch
+/// - `in_review` tasks   → reset to `NeedsReview` when the review session disappeared
 pub(crate) async fn tick_recover_stuck_tasks(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
