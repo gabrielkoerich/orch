@@ -182,6 +182,11 @@ pub struct EngineConfig {
     /// release is detected. Default: true. Set `engine.auto_upgrade: false`
     /// to opt out of automatic upgrades.
     pub auto_upgrade: bool,
+    /// Seconds of continuous startup failure (GitHub unreachable / auth errors)
+    /// before the engine escalates from WARN to ERROR-level logging and sends a
+    /// one-time push notification to configured channels. Set to 0 to disable.
+    /// Default: 3600 (1 hour).
+    pub startup_failure_escalation_secs: u64,
 }
 
 impl Default for EngineConfig {
@@ -200,6 +205,7 @@ impl Default for EngineConfig {
             silence_cooldown: 3600,
             upgrade_check_interval: 3600,
             auto_upgrade: true,
+            startup_failure_escalation_secs: 3600,
         }
     }
 }
@@ -308,6 +314,19 @@ impl EngineConfig {
 
         if let Ok(val) = crate::config::get("engine.auto_upgrade") {
             config.auto_upgrade = val.eq_ignore_ascii_case("true");
+        }
+
+        if let Ok(val) = crate::config::get("engine.startup_failure_escalation_secs") {
+            if let Ok(secs) = val.parse::<u64>() {
+                config.startup_failure_escalation_secs = secs;
+            } else {
+                tracing::warn!(
+                    key = "engine.startup_failure_escalation_secs",
+                    value = %val,
+                    default_secs = config.startup_failure_escalation_secs,
+                    "invalid value for engine.startup_failure_escalation_secs, using default"
+                );
+            }
         }
 
         config
@@ -908,6 +927,118 @@ async fn check_and_notify_upgrade(
     let _ = store.kv_set(last_notified_key, &latest).await;
 }
 
+/// Send a one-time escalation notification when the startup retry loop has been
+/// spinning for longer than `startup_failure_escalation_secs`.
+///
+/// This is called *before* the channel registry is initialised (the retry loop
+/// sits above it in `serve()`), so we construct channel objects directly from
+/// config — mirroring the approach used during normal channel registration, but
+/// without relying on `ChannelRegistry`.
+async fn send_startup_escalation_notification(elapsed_secs: u64) {
+    let duration = crate::channels::notification::format_duration(elapsed_secs as f64);
+
+    let msg_telegram = format!(
+        "🚨 <b>Orch startup blocked — GitHub unreachable</b>\n\n\
+         The engine has been retrying backend connections for {}\n\
+         without success. All task processing, routing, and scheduled\n\
+         jobs are paused. Check service logs with `orch log -f`.",
+        duration
+    );
+
+    let msg_discord = format!(
+        "🚨 **Orch startup blocked — GitHub unreachable**\n\n\
+         The engine has been retrying backend connections for {}\n\
+         without success. All task processing, routing, and scheduled\n\
+         jobs are paused. Check service logs with `orch log -f`.",
+        duration
+    );
+
+    let msg_slack = format!(
+        "🚨 *Orch startup blocked — GitHub unreachable*\n\n\
+         The engine has been retrying backend connections for {}\n\
+         without success. All task processing, routing, and scheduled\n\
+         jobs are paused. Check service logs with `orch log -f`.",
+        duration
+    );
+
+    // Telegram
+    let tg_token = crate::config::get("channels.telegram.bot_token");
+    let tg_chat_id = crate::config::get("channels.telegram.chat_id");
+    if let (Ok(token), Ok(chat_id)) = (&tg_token, &tg_chat_id) {
+        if !token.is_empty() && !chat_id.is_empty() {
+            if let Ok(channel) = TelegramChannel::new(token.clone(), Some(chat_id.clone())) {
+                let msg = OutgoingMessage {
+                    thread_id: "startup_escalation".to_string(),
+                    body: msg_telegram.clone(),
+                    reply_to: None,
+                    metadata: serde_json::json!({ "preformatted_html": true }),
+                    topic_id: crate::config::get("channels.telegram.general_topic_id").ok(),
+                };
+                if let Err(e) = channel.send(&msg).await {
+                    tracing::warn!(?e, "failed to send startup escalation via telegram");
+                } else {
+                    tracing::info!("startup escalation notification sent to telegram");
+                }
+            }
+        }
+    }
+
+    // Discord
+    if let Ok(token) = crate::config::get("channels.discord.bot_token") {
+        let channel_id = crate::config::get("channels.discord.channel_id")
+            .or_else(|_| crate::config::get("channels.discord.general_channel_id"));
+        if !token.is_empty() {
+            if let Some(cid) = channel_id.ok().filter(|s| !s.is_empty()) {
+                let shard_id = crate::config::get("channels.discord.shard_id")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let shard_count = crate::config::get("channels.discord.shard_count")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(1);
+                if let Ok(gateway) = DiscordGateway::new(token, Some(cid), shard_id, shard_count) {
+                    let msg = OutgoingMessage {
+                        thread_id: "startup_escalation".to_string(),
+                        body: msg_discord.clone(),
+                        reply_to: None,
+                        metadata: serde_json::Value::Null,
+                        topic_id: None,
+                    };
+                    if let Err(e) = gateway.send(&msg).await {
+                        tracing::warn!(?e, "failed to send startup escalation via discord");
+                    } else {
+                        tracing::info!("startup escalation notification sent to discord");
+                    }
+                }
+            }
+        }
+    }
+
+    // Slack
+    if let Ok(token) = crate::config::get("channels.slack.bot_token") {
+        let channel_id = crate::config::get("channels.slack.channel_id");
+        if !token.is_empty() {
+            if let Ok(cid) = channel_id {
+                if let Ok(channel) = SlackChannel::new(token, Some(cid)) {
+                    let msg = OutgoingMessage {
+                        thread_id: "startup_escalation".to_string(),
+                        body: msg_slack.clone(),
+                        reply_to: None,
+                        metadata: serde_json::Value::Null,
+                        topic_id: None,
+                    };
+                    if let Err(e) = channel.send(&msg).await {
+                        tracing::warn!(?e, "failed to send startup escalation via slack");
+                    } else {
+                        tracing::info!("startup escalation notification sent to slack");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Start the orch service.
 ///
 /// This is the main entry point — called by `orch serve`.
@@ -944,23 +1075,49 @@ pub async fn serve() -> anyhow::Result<()> {
     // this loop to main().  If they did, anyhow would write "Error: …" to stderr,
     // which brew routes to orch.error.log — polluting it even when projects ARE
     // configured correctly but GitHub is temporarily unreachable.
+    let startup_escalation_secs = config.startup_failure_escalation_secs;
     let mut project_engines = {
         let mut delay_secs = 5u64;
         let mut attempt = 0u32;
+        let mut escalated = false;
+        let start = std::time::Instant::now();
         loop {
             attempt += 1;
             match init_project_engines().await {
                 Ok(engines) => break engines,
                 Err(e) => {
-                    // Demote all retries to debug — brew routes stderr to
-                    // orch.error.log, so any warn!/error! here would appear as
-                    // spurious noise even when projects are configured correctly
-                    // and the service will succeed on the next attempt.
-                    tracing::warn!(
-                        delay_secs,
-                        attempt,
-                        "project backends unavailable, retrying: {e}"
-                    );
+                    let elapsed = start.elapsed().as_secs();
+
+                    // Short blips (under the escalation threshold) stay at WARN
+                    // so they don't flood the operator's attention. Once the
+                    // outage crosses the threshold, escalate to ERROR-level
+                    // logging and send a one-time push notification to configured
+                    // channels — "transient" has clearly become "prolonged."
+                    if startup_escalation_secs > 0
+                        && !escalated
+                        && elapsed >= startup_escalation_secs
+                    {
+                        escalated = true;
+                        tracing::error!(
+                            delay_secs,
+                            attempt,
+                            elapsed_secs = elapsed,
+                            threshold_secs = startup_escalation_secs,
+                            "project backends unavailable for {} — escalating startup failure: {e}",
+                            crate::channels::notification::format_duration(elapsed as f64)
+                        );
+                        // Send one-time notification to configured channels.
+                        // Channels aren't registered yet at this stage, so we
+                        // construct them directly from config (mirrors orch notify).
+                        send_startup_escalation_notification(elapsed).await;
+                    } else {
+                        tracing::warn!(
+                            delay_secs,
+                            attempt,
+                            "project backends unavailable, retrying: {e}"
+                        );
+                    }
+
                     tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                     delay_secs = (delay_secs * 2).min(120);
                 }

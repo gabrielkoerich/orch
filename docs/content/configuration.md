@@ -23,6 +23,7 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `engine` | `graceful_shutdown_timeout` | Seconds to wait for in-flight tasks on SIGTERM | `600` |
 | `engine` | `auto_upgrade` | Automatically run `brew upgrade orch` on a schedule | `true` |
 | `engine` | `upgrade_check_interval` | How often to check for new orch versions (seconds) | `3600` |
+| `engine` | `startup_failure_escalation_secs` | Seconds of continuous startup failure before escalating to ERROR log + push notification (0 disables) | `3600` |
 | `workflow` | `auto_close` | Auto-close GitHub issues when tasks are `done` | `true` |
 | `workflow` | `enable_review_agent` | Run a [review agent](@/review-agent.md) after task completion | `false` |
 | `workflow` | `max_attempts` | Max attempts before marking task as blocked | `10` |
