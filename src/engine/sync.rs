@@ -1128,6 +1128,185 @@ pub(crate) async fn auto_unblock_ci_failure_blocked_tasks_global(
     Ok(())
 }
 
+/// Global sweep: re-fire stale NeedsReview tasks and escalate persistently-stuck ones
+/// to Blocked, across all repos (not just the currently active project).
+///
+/// The equivalent per-repo logic in `sync_tick` ("5d. Re-fire events for stale
+/// NeedsReview tasks") only runs for entries in `project_engines`, so a task that
+/// transitions to NeedsReview for a repo later removed from the active `projects:`
+/// list never refires or escalates — it sits in NeedsReview forever with
+/// `needs_review_refires` frozen. This mirrors the fix `auto_unblock_ci_failure_blocked_tasks_global`
+/// applied for the CI-failure-blocked class: query across all repos and write
+/// directly through the store (via the `*_by_store_id` TaskManager helpers) instead
+/// of resolving through a repo-scoped `TaskManager`. Called once per main tick from
+/// `tick_recover_stuck_tasks`, alongside `auto_unblock_ci_failure_blocked_tasks_global`.
+pub(crate) async fn refire_and_escalate_stale_needs_review_global(
+    task_manager: &Arc<TaskManager>,
+    store: &Arc<TaskStore>,
+    router: &Router,
+    dispatching: &Arc<DashMap<String, String>>,
+) -> anyhow::Result<()> {
+    const MIN_STALE_NEEDS_REVIEW_MINUTES: i64 = 1;
+    const MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS: u64 = 5;
+
+    let needs_review_tasks = match store
+        .list_all_by_status_global(TaskStatus::NeedsReview)
+        .await
+    {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::warn!(err = %e, "global NeedsReview refire sweep: failed to list needs_review tasks");
+            return Ok(());
+        }
+    };
+
+    if needs_review_tasks.is_empty() {
+        return Ok(());
+    }
+
+    // Mirrors the per-tick skip in `sync_tick`: if every review agent is currently
+    // cooled, re-firing now would waste the refire counter (and risk escalating tasks
+    // to Blocked) while the subscriber would only bail again.
+    let all_review_agents_cooled =
+        !router.available_agents.is_empty() && router.healthy_agent_count("review") == 0;
+    if all_review_agents_cooled {
+        tracing::info!(
+            count = needs_review_tasks.len(),
+            "global NeedsReview refire sweep: all review agents currently cooled — skipping this pass"
+        );
+        return Ok(());
+    }
+
+    for stored in needs_review_tasks {
+        let external = crate::engine::tasks::store_task_to_external(&stored);
+        let ext_id = external.id.clone();
+        let repo = stored.repo.clone();
+
+        let age_minutes = match chrono::DateTime::parse_from_rfc3339(&external.updated_at) {
+            Ok(updated_at) => {
+                let age = chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc);
+                if age.num_minutes() < MIN_STALE_NEEDS_REVIEW_MINUTES {
+                    continue;
+                }
+                Some(age.num_minutes())
+            }
+            Err(_) => None,
+        };
+
+        // Skip tasks actively being dispatched by their owning repo's engine loop.
+        let dispatch_key = format!("{}/{}", repo, ext_id.0);
+        if dispatching.contains_key(&dispatch_key) {
+            continue;
+        }
+
+        let current_refires = stored.needs_review_refires.max(0) as u64;
+        let new_refires = current_refires + 1;
+
+        if new_refires > MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS {
+            tracing::warn!(
+                task_id = stored.id,
+                repo = %repo,
+                new_refires,
+                "global NeedsReview refire sweep: escalating to Blocked after repeated refires"
+            );
+            let fields = [
+                (
+                    "block_reason",
+                    serde_json::json!("review agent rebroadcast escalated after repeated retries"),
+                ),
+                (
+                    "last_error",
+                    serde_json::json!(format!("escalated after {} retries", new_refires)),
+                ),
+            ];
+            if let Err(e) = task_manager
+                .update_task_status_and_result_by_store_id(
+                    stored.id,
+                    &repo,
+                    &ext_id,
+                    Status::Blocked,
+                    &fields,
+                )
+                .await
+            {
+                tracing::error!(task_id = stored.id, repo = %repo, err = %e, "global NeedsReview refire sweep: escalation to Blocked failed — skipping to avoid silent auto-unblock loop");
+                continue;
+            }
+            if let Err(e) = crate::store::store_increment_by_id(
+                &Some(Arc::clone(store)),
+                stored.id,
+                "needs_review_refires",
+            )
+            .await
+            {
+                tracing::warn!(
+                    task_id = stored.id,
+                    repo = %repo,
+                    err = %e,
+                    "global NeedsReview refire sweep: failed to increment needs_review_refires after escalation"
+                );
+            }
+            continue;
+        }
+
+        // Compute required age using exponential backoff: MIN * 2^(current_refires),
+        // matching the per-repo `sync_tick` behavior.
+        let required_minutes = MIN_STALE_NEEDS_REVIEW_MINUTES * (1i64 << (current_refires as u32));
+
+        let should_fire = match age_minutes {
+            Some(age) => age >= required_minutes,
+            None => true,
+        };
+
+        if !should_fire {
+            continue;
+        }
+
+        if let Err(e) = task_manager
+            .update_task_status_by_store_id(stored.id, &repo, &ext_id, Status::NeedsReview)
+            .await
+        {
+            tracing::warn!(
+                task_id = stored.id,
+                repo = %repo,
+                err = %e,
+                "global NeedsReview refire sweep: failed to re-fire NeedsReview event — not incrementing counter"
+            );
+            continue;
+        }
+
+        let fired_refires = match crate::store::store_increment_by_id(
+            &Some(Arc::clone(store)),
+            stored.id,
+            "needs_review_refires",
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    task_id = stored.id,
+                    repo = %repo,
+                    err = %e,
+                    "global NeedsReview refire sweep: failed to increment needs_review_refires after re-fire"
+                );
+                current_refires + 1
+            }
+        };
+
+        tracing::info!(
+            task_id = stored.id,
+            repo = %repo,
+            age_minutes,
+            refires = fired_refires,
+            required_minutes,
+            "global NeedsReview refire sweep: re-firing NeedsReview event for stale task"
+        );
+    }
+
+    Ok(())
+}
+
 /// Sync tick — runs every 45s.
 ///
 /// Handles less-frequent operations:
@@ -3809,6 +3988,190 @@ mod tests {
         assert_eq!(after.status, crate::store::TaskStatus::NeedsReview);
         assert_eq!(after.needs_review_refires, 5);
         assert!(after.block_reason.is_none());
+    }
+
+    // ── refire_and_escalate_stale_needs_review_global ──────────────────────
+
+    fn router_with_healthy_review_agent() -> crate::engine::router::Router {
+        use crate::engine::router::{Router, RouterConfig};
+        let mut config = RouterConfig::default();
+        config
+            .model_map
+            .entry("review".to_string())
+            .or_default()
+            .insert("claude".to_string(), vec!["sonnet".to_string()]);
+        let mut router = Router::new(config);
+        router.available_agents = vec!["claude".to_string()];
+        router
+    }
+
+    /// Regression test for #3469: the per-repo refire/escalation logic inside
+    /// `sync_tick` never runs for a repo that has been removed from the active
+    /// `projects:` list, so a task stuck in NeedsReview for such a repo never
+    /// refires. The global sweep must catch it via `list_all_by_status_global`
+    /// and write through the store directly, bypassing the repo-scoped
+    /// `TaskManager` (which is scoped to a *different*, currently-active repo).
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn global_refire_sweep_refires_stale_task_from_inactive_repo() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        // TaskManager scoped to the active repo — NOT the repo the task belongs to.
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            store.clone(),
+            "active/repo".to_string(),
+        ));
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+        let router = router_with_healthy_review_agent();
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "inactive/repo",
+                ext_id: "490",
+                title: "Stale needs_review from inactive repo",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::NeedsReview)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        refire_and_escalate_stale_needs_review_global(&task_manager, &store, &router, &dispatching)
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(
+            task.needs_review_refires, 1,
+            "cross-repo task must be refired"
+        );
+        assert_eq!(task.status, crate::store::TaskStatus::NeedsReview);
+    }
+
+    /// Companion to the refire test: after `MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS` refires,
+    /// a cross-repo task must escalate to Blocked, same as the per-repo `sync_tick` path.
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn global_refire_sweep_escalates_cross_repo_task_to_blocked() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            store.clone(),
+            "active/repo".to_string(),
+        ));
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+        let router = router_with_healthy_review_agent();
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "inactive/repo",
+                ext_id: "493",
+                title: "Exhausted refires from inactive repo",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::NeedsReview)
+            .await
+            .unwrap();
+        store
+            .set_fields(id, &[("needs_review_refires", serde_json::json!(5))])
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        refire_and_escalate_stale_needs_review_global(&task_manager, &store, &router, &dispatching)
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.status, crate::store::TaskStatus::Blocked);
+        assert_eq!(
+            task.block_reason.as_deref(),
+            Some("review agent rebroadcast escalated after repeated retries")
+        );
+    }
+
+    /// When every review agent is cooled, the global sweep must skip entirely —
+    /// re-firing while all agents are cooled would waste the refire counter and
+    /// could escalate a task to Blocked purely because agents happened to be
+    /// temporarily unavailable, mirroring `sync_tick`'s per-repo skip.
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn global_refire_sweep_skips_when_all_review_agents_cooled() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            store.clone(),
+            "active/repo".to_string(),
+        ));
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+        // RouterConfig::default() has no "review" model map entries, so the one
+        // available agent has no healthy model for "review" — all cooled.
+        let router = crate::engine::router::Router::new_for_test(
+            crate::engine::router::RouterConfig::default(),
+            vec!["claude".to_string()],
+        );
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "inactive/repo",
+                ext_id: "494",
+                title: "Stale needs_review while agents cooled",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::NeedsReview)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        refire_and_escalate_stale_needs_review_global(&task_manager, &store, &router, &dispatching)
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(
+            task.needs_review_refires, 0,
+            "counter must not be touched while cooled"
+        );
+        assert_eq!(task.status, crate::store::TaskStatus::NeedsReview);
     }
 
     /// A fresh InReview task (<1 min old) should NOT be reset — the review

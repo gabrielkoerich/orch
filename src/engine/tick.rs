@@ -592,6 +592,7 @@ fn should_use_backend(task_id: &str) -> bool {
 /// - `in_progress` tasks → reset to `New` when their session is missing or the run timed out
 /// - `routed` tasks      → reset to `New` when an old live session keeps blocking re-dispatch
 /// - `in_review` tasks   → reset to `NeedsReview` when the review session disappeared
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn tick_recover_stuck_tasks(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
@@ -600,6 +601,8 @@ pub(crate) async fn tick_recover_stuck_tasks(
     config: &EngineConfig,
     store: &Arc<TaskStore>,
     session_map: &std::collections::HashMap<String, bool>,
+    router: &Router,
+    dispatching: &Arc<DashMap<String, String>>,
 ) -> anyhow::Result<()> {
     let _span = tracing::info_span!("engine.tick.phase2.stuck_tasks").entered();
 
@@ -1310,6 +1313,23 @@ pub(crate) async fn tick_recover_stuck_tasks(
         crate::engine::sync::auto_unblock_ci_failure_blocked_tasks_global(task_manager, store).await
     {
         tracing::warn!(err = %e, "global CI-failure blocked sweep failed");
+    }
+
+    // Global sweep for stale NeedsReview tasks from inactive or removed projects.
+    // The refire/escalation logic in sync_tick's "5d" step is scoped to the active
+    // repo, so a task that reaches NeedsReview for a repo later removed from the
+    // active `projects:` list never refires or escalates to Blocked. This sweep
+    // covers all repos, writing directly through the store to avoid the repo-scoped
+    // `TaskManager` resolution failure (same pattern as the CI-failure sweep above).
+    if let Err(e) = crate::engine::sync::refire_and_escalate_stale_needs_review_global(
+        task_manager,
+        store,
+        router,
+        dispatching,
+    )
+    .await
+    {
+        tracing::warn!(err = %e, "global NeedsReview refire/escalation sweep failed");
     }
 
     Ok(())
@@ -2402,6 +2422,8 @@ pub(crate) async fn tick(
         config,
         store,
         &session_map,
+        router,
+        dispatching,
     )
     .await?;
     tick_route_tasks(backend, task_manager, router, store, repo).await?;
@@ -2464,6 +2486,16 @@ mod tests {
     use crate::tmux::TmuxManager;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
+
+    /// A router reporting one available agent with no healthy "review" model, so the
+    /// global NeedsReview refire sweep inside `tick_recover_stuck_tasks` treats every
+    /// review agent as cooled and skips — keeping it a no-op for tests unrelated to it.
+    fn cooled_review_router_for_test() -> Router {
+        Router::new_for_test(
+            crate::engine::router::RouterConfig::default(),
+            vec!["claude".to_string()],
+        )
+    }
 
     // ── minimal mock backend ─────────────────────────────────────────────────
 
@@ -2868,6 +2900,8 @@ mod tests {
             &config,
             &store,
             &std::collections::HashMap::new(),
+            &cooled_review_router_for_test(),
+            &Arc::new(DashMap::new()),
         )
         .await
         .unwrap();
@@ -2924,6 +2958,8 @@ mod tests {
             &config,
             &store,
             &std::collections::HashMap::new(),
+            &cooled_review_router_for_test(),
+            &Arc::new(DashMap::new()),
         )
         .await
         .unwrap();
@@ -2971,6 +3007,8 @@ mod tests {
             &config,
             &store,
             &std::collections::HashMap::new(),
+            &cooled_review_router_for_test(),
+            &Arc::new(DashMap::new()),
         )
         .await
         .unwrap();
@@ -3029,6 +3067,8 @@ mod tests {
             &config,
             &store,
             &std::collections::HashMap::new(),
+            &cooled_review_router_for_test(),
+            &Arc::new(DashMap::new()),
         )
         .await
         .unwrap();
@@ -3095,6 +3135,8 @@ mod tests {
             &config,
             &store,
             &std::collections::HashMap::new(),
+            &cooled_review_router_for_test(),
+            &Arc::new(DashMap::new()),
         )
         .await
         .unwrap();
@@ -3278,6 +3320,8 @@ mod tests {
             &config,
             &store,
             &std::collections::HashMap::new(),
+            &cooled_review_router_for_test(),
+            &Arc::new(DashMap::new()),
         )
         .await
         .unwrap();
@@ -3443,6 +3487,8 @@ mod tests {
             &config,
             &store,
             &session_map,
+            &cooled_review_router_for_test(),
+            &Arc::new(DashMap::new()),
         )
         .await
         .unwrap();
@@ -3657,6 +3703,8 @@ mod tests {
             &config,
             &store,
             &std::collections::HashMap::new(),
+            &cooled_review_router_for_test(),
+            &Arc::new(DashMap::new()),
         )
         .await
         .unwrap();

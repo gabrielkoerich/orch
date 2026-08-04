@@ -795,14 +795,60 @@ impl TaskManager {
         repo: &str,
         ext_id: &ExternalId,
     ) -> anyhow::Result<()> {
+        self.update_task_status_by_store_id(store_id, repo, ext_id, Status::Done)
+            .await
+    }
+
+    /// Update a task's status directly by its already-resolved numeric store id and
+    /// owning repo, bypassing the repo-scoped `resolve_task_id` lookup that `self.repo`
+    /// would otherwise apply. For callers that already hold the correct store row from a
+    /// cross-repo query — e.g. a global sweep over tasks from inactive/removed repos —
+    /// and would otherwise fail to resolve a task belonging to a different repo than this
+    /// `TaskManager`. Does not mirror to the backend (GitHub), since the caller's backend
+    /// instance may not correspond to the task's owning repo.
+    pub async fn update_task_status_by_store_id(
+        &self,
+        store_id: i64,
+        repo: &str,
+        ext_id: &ExternalId,
+        status: Status,
+    ) -> anyhow::Result<()> {
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("store required for status update"))?;
+        let task_status = status_to_task_status(status);
 
         let snapshot = Self::snapshot_for_store_id(store, store_id, &ext_id.0).await;
-        store.update_status(store_id, TaskStatus::Done).await?;
-        self.publish_event(ext_id, Status::Done, &snapshot, repo, None);
+        if task_status != TaskStatus::Blocked {
+            store.set_block_reason(store_id, None).await?;
+        }
+        store.update_status(store_id, task_status).await?;
+        self.publish_event(ext_id, status, &snapshot, repo, None);
+        Ok(())
+    }
+
+    /// Like [`Self::update_task_status_by_store_id`] but also sets additional result
+    /// fields atomically with the status transition (e.g. `block_reason`, `last_error`).
+    pub async fn update_task_status_and_result_by_store_id(
+        &self,
+        store_id: i64,
+        repo: &str,
+        ext_id: &ExternalId,
+        status: Status,
+        updates: &[(&str, serde_json::Value)],
+    ) -> anyhow::Result<()> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("store required for status update"))?;
+        let task_status = status_to_task_status(status);
+
+        let snapshot = Self::snapshot_for_store_id(store, store_id, &ext_id.0).await;
+        store
+            .update_status_and_fields(store_id, task_status, updates)
+            .await?;
+        self.publish_event(ext_id, status, &snapshot, repo, None);
         Ok(())
     }
 
