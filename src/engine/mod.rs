@@ -178,10 +178,6 @@ pub struct EngineConfig {
     /// How often to check for a newer orch release and notify channels (seconds).
     /// Set to 0 to disable. Default: 3600 (1 hour).
     pub upgrade_check_interval: u64,
-    /// Automatically run `brew upgrade orch` and restart the service when a newer
-    /// release is detected. Default: true. Set `engine.auto_upgrade: false`
-    /// to opt out of automatic upgrades.
-    pub auto_upgrade: bool,
     /// Seconds of continuous startup failure (GitHub unreachable / auth errors)
     /// before the engine escalates from WARN to ERROR-level logging and sends a
     /// one-time push notification to configured channels. Set to 0 to disable.
@@ -204,7 +200,6 @@ impl Default for EngineConfig {
             silence_grace_period: 300,
             silence_cooldown: 3600,
             upgrade_check_interval: 3600,
-            auto_upgrade: true,
             startup_failure_escalation_secs: 3600,
         }
     }
@@ -310,10 +305,6 @@ impl EngineConfig {
             } else {
                 tracing::warn!(key = "engine.upgrade_check_interval", value = %val, default = config.upgrade_check_interval, "invalid value for engine.upgrade_check_interval, using default");
             }
-        }
-
-        if let Ok(val) = crate::config::get("engine.auto_upgrade") {
-            config.auto_upgrade = val.eq_ignore_ascii_case("true");
         }
 
         if let Ok(val) = crate::config::get("engine.startup_failure_escalation_secs") {
@@ -757,43 +748,9 @@ async fn fetch_latest_release_version() -> Option<String> {
     }
 }
 
-/// Run `brew upgrade orch` then send SIGTERM to the current process so launchd
-/// restarts the service with the new binary. The signal is sent only after the
-/// brew command succeeds; on failure, nothing is restarted and the next check
-/// will try again.
-///
-/// Returns `true` if brew succeeded and SIGTERM was sent, `false` on any failure.
-async fn perform_auto_upgrade(latest: &str) -> bool {
-    tracing::info!(latest = %latest, "auto-upgrading orch via brew");
-
-    let status = Command::new("brew")
-        .args(["upgrade", "orch"])
-        .status()
-        .await;
-
-    match status {
-        Ok(s) if s.success() => {
-            tracing::info!(latest = %latest, "brew upgrade orch succeeded — restarting service");
-            // Send SIGTERM to self; launchd / brew services will restart the process
-            // with the newly installed binary.
-            let pid = std::process::id().to_string();
-            let _ = Command::new("kill").args(["-TERM", &pid]).status().await;
-            true
-        }
-        Ok(s) => {
-            tracing::warn!(exit_code = ?s.code(), "brew upgrade orch failed — will retry at next check");
-            false
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to spawn brew upgrade orch");
-            false
-        }
-    }
-}
-
-/// Check if a newer orch release is available. When `auto_upgrade` is true,
-/// runs `brew upgrade orch` and restarts the service. Otherwise sends channel
-/// notifications asking the operator to upgrade manually.
+/// Check if a newer orch release is available and send channel notifications
+/// asking the operator to upgrade manually. Upgrading is operator-only — the
+/// service never runs `brew` itself.
 ///
 /// Uses the store's KV to throttle checks (`upgrade:last_check_at`) and
 /// deduplicate notifications (`upgrade:last_notified_version`). Each distinct
@@ -804,7 +761,6 @@ async fn check_and_notify_upgrade(
     channels: &Arc<ChannelRegistry>,
     current_version: &str,
     check_interval: std::time::Duration,
-    auto_upgrade: bool,
 ) {
     let last_check_key = "upgrade:last_check_at";
     let last_notified_key = "upgrade:last_notified_version";
@@ -841,29 +797,8 @@ async fn check_and_notify_upgrade(
         "orch upgrade available"
     );
 
-    // When auto_upgrade is enabled, upgrade via brew and restart — no manual
-    // channel notification needed since the restart is self-evident.
-    if auto_upgrade {
-        // Deduplicate: don't re-trigger brew upgrade for the same latest version
-        // unless a previous attempt failed (in which case the key won't be set).
-        if let Ok(Some(last_notified)) = store.kv_get(last_notified_key).await {
-            if last_notified == latest {
-                tracing::debug!(latest = %latest, "auto-upgrade already attempted for this version");
-                return;
-            }
-        }
-        // Mark before attempting so a crash/restart mid-upgrade doesn't cause a rapid
-        // retry loop. On explicit failure the key is cleared below so the next hourly
-        // check can retry.
-        let _ = store.kv_set(last_notified_key, &latest).await;
-        if !perform_auto_upgrade(&latest).await {
-            // Brew failed — clear the dedup key so the next check cycle will retry.
-            let _ = store.kv_delete(last_notified_key).await;
-        }
-        return;
-    }
-
-    // Manual upgrade path: send channel notifications.
+    // Operator-only upgrade: send channel notifications so the operator can
+    // upgrade on their own schedule. The service never runs brew itself.
 
     // Deduplicate: don't re-notify for the same latest version.
     if let Ok(Some(last_notified)) = store.kv_get(last_notified_key).await {
@@ -1146,27 +1081,18 @@ pub async fn serve() -> anyhow::Result<()> {
     }
 
     // Check for a newer orch release in the background and log if the service is behind.
-    // The periodic checker runs immediately once the main loop starts, so any auto-upgrade
-    // or channel notification happens there after channels are initialized.
+    // The periodic checker sends channel notifications after channels are initialized;
+    // upgrading is operator-only and never runs automatically.
     {
         let current = env!("ORCH_VERSION").to_string();
-        let auto_upgrade = config.auto_upgrade;
         tokio::spawn(async move {
             if let Some(latest) = fetch_latest_release_version().await {
                 if latest != current {
-                    if auto_upgrade {
-                        tracing::warn!(
-                            current_version = %current,
-                            latest_version = %latest,
-                            "orch service is behind the latest release — automatic upgrade will run on the next upgrade check"
-                        );
-                    } else {
-                        tracing::warn!(
-                            current_version = %current,
-                            latest_version = %latest,
-                            "orch service is behind the latest release — run: brew update && brew upgrade orch && brew services restart orch"
-                        );
-                    }
+                    tracing::warn!(
+                        current_version = %current,
+                        latest_version = %latest,
+                        "orch service is behind the latest release — run: brew update && brew upgrade orch && brew services restart orch"
+                    );
                 }
             }
         });
@@ -2258,16 +2184,9 @@ pub async fn serve() -> anyhow::Result<()> {
                         let current = env!("ORCH_VERSION").to_string();
                         let check_interval =
                             std::time::Duration::from_secs(config.upgrade_check_interval);
-                        let auto_upgrade = config.auto_upgrade;
                         tokio::spawn(async move {
-                            check_and_notify_upgrade(
-                                &store,
-                                &channels,
-                                &current,
-                                check_interval,
-                                auto_upgrade,
-                            )
-                            .await;
+                            check_and_notify_upgrade(&store, &channels, &current, check_interval)
+                                .await;
                         });
                     }
                     last_upgrade_check = Some(std::time::Instant::now());
@@ -2672,7 +2591,6 @@ mod tests {
             std::time::Duration::from_secs(600)
         );
         assert_eq!(config.upgrade_check_interval, 3600);
-        assert!(config.auto_upgrade, "auto_upgrade default must be true");
     }
 
     #[test]
@@ -2689,8 +2607,6 @@ mod tests {
             std::time::Duration::from_secs(600)
         );
         assert_eq!(config.upgrade_check_interval, 3600);
-        // auto_upgrade may be overridden by user config; default is true
-        // (user config may disable it, so only check default struct)
     }
 
     #[test]
