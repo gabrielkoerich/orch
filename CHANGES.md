@@ -1,5 +1,42 @@
 # Changes Made
 
+## Add escalation for prolonged startup GitHub unreachable retry loop
+
+### Problem
+
+When GitHub is unreachable at service startup, the engine retries `init_project_engines()`
+in an unbounded loop with backoff capped at 120s. Short blips are fine, but a prolonged
+outage (network down, expired token, GitHub incident) could run silently for hours with
+only `WARN`-level log lines — no ERROR-level escalation, no push notification. A ~13h
+outage was observed with zero operator-visible signal.
+
+### Solution
+
+Added `engine.startup_failure_escalation_secs` config (default: 3600 = 1h). Once the
+startup retry loop has been spinning for longer than this threshold, a **one-time**
+escalation fires:
+
+1. **ERROR-level log line** with elapsed duration, attempt count, and the underlying error
+2. **One-time push notification** to all configured channels (Telegram, Discord, Slack),
+   sent directly from config since channels aren't registered yet at this stage
+
+Subsequent retries continue at `WARN` level to avoid spam, but the single escalation
+ensures the operator is alerted.
+
+### Files Modified
+- `src/engine/mod.rs`: Added `startup_failure_escalation_secs` to `EngineConfig`, config
+  parsing, `send_startup_escalation_notification` helper, and escalation logic in the
+  startup retry loop
+- `docs/content/configuration.md`: Documented new config key
+
+### Config
+```yaml
+engine:
+  startup_failure_escalation_secs: 3600  # 0 to disable escalation
+```
+
+---
+
 ## Fixed stuck-task recovery swallowing resolve_task_id errors
 
 ### Problem
