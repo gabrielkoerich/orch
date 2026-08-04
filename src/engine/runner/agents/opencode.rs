@@ -555,8 +555,15 @@ impl AgentRunner for OpenCodeRunner {
         };
 
         // Parse the text through standard parser
-        let response =
-            parser::parse(&text).map_err(|_| AgentError::InvalidResponse { raw: text.clone() })?;
+        let response = match parser::parse(&text) {
+            Ok(r) => r,
+            Err(_) => {
+                // Structured parse failed — try plain-text synthesis before
+                // giving up, same rescue path claude.rs uses (issue #3467).
+                super::synthesize_response_from_text(&text)
+                    .ok_or_else(|| AgentError::InvalidResponse { raw: text.clone() })?
+            }
+        };
 
         Ok(ParsedResponse {
             response,
@@ -1196,6 +1203,24 @@ mod tests {
         // Tokens from step_finish must still be propagated.
         assert_eq!(parsed.input_tokens, Some(500));
         assert_eq!(parsed.output_tokens, Some(0));
+    }
+
+    /// Regression test for issue #3467: when opencode's `text` event contains
+    /// a plain-prose completion summary (not JSON), parser::parse fails but
+    /// synthesize_response_from_text must rescue it instead of returning
+    /// InvalidResponse, mirroring the fallback claude.rs already has.
+    #[test]
+    fn parse_opencode_plain_prose_completion_synthesizes_response() {
+        let raw = r#"{"type":"step_start","timestamp":1000,"part":{"type":"step-start"}}
+{"type":"text","timestamp":1001,"part":{"type":"text","text":"Fixed the typo and corrected the deadline reference in the review."}}
+{"type":"step_finish","timestamp":1002,"part":{"type":"step-finish","reason":"stop","tokens":{"input":300,"output":40}}}"#;
+
+        let parsed = runner()
+            .parse_response(raw)
+            .expect("plain-prose completion text must synthesize successfully");
+        assert_eq!(parsed.response.status, "done");
+        assert_eq!(parsed.input_tokens, Some(300));
+        assert_eq!(parsed.output_tokens, Some(40));
     }
 
     #[test]

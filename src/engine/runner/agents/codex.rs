@@ -329,9 +329,18 @@ impl AgentRunner for CodexRunner {
                 })?;
 
         // Parse the agent text through our standard parser
-        let response = parser::parse(&agent_text).map_err(|_| AgentError::InvalidResponse {
-            raw: agent_text.clone(),
-        })?;
+        let response = match parser::parse(&agent_text) {
+            Ok(r) => r,
+            Err(_) => {
+                // Structured parse failed — try plain-text synthesis before
+                // giving up, same rescue path claude.rs uses (issue #3467).
+                super::synthesize_response_from_text(&agent_text).ok_or_else(|| {
+                    AgentError::InvalidResponse {
+                        raw: agent_text.clone(),
+                    }
+                })?
+            }
+        };
 
         Ok(ParsedResponse {
             response,
@@ -466,6 +475,23 @@ mod tests {
 
         let err = runner().parse_response(raw).unwrap_err();
         assert!(matches!(err, AgentError::ModelUnavailable { .. }));
+    }
+
+    /// Regression test for issue #3467: when codex's agent_message text is a
+    /// plain-prose completion summary (not JSON), parser::parse fails but
+    /// synthesize_response_from_text must rescue it instead of returning
+    /// InvalidResponse, mirroring the fallback claude.rs already has.
+    #[test]
+    fn parse_codex_plain_prose_completion_synthesizes_response() {
+        let raw = r#"{"type":"thread.started","thread_id":"t1"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"type":"agent_message","text":"Fixed the typo and corrected the deadline reference in the review."}}
+{"type":"turn.completed"}"#;
+
+        let parsed = runner()
+            .parse_response(raw)
+            .expect("plain-prose completion text must synthesize successfully");
+        assert_eq!(parsed.response.status, "done");
     }
 
     #[test]
