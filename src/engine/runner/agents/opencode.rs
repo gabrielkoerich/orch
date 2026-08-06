@@ -656,10 +656,12 @@ fn classify_opencode_message(message: &str) -> AgentError {
     //   "model not supported: X"
     //   "The free model has been deprecated. Transition to qwen/qwen3.6-plus for continued paid access."
     //   "No endpoints found for qwen/qwen3.6-plus:free."
+    //   "This model is unavailable for free. The paid version is available now - use this slug instead: X"
     let is_model_unavailable = (lower.contains("model")
         && (lower.contains("not found")
             || lower.contains("not supported")
-            || lower.contains("deprecated")))
+            || lower.contains("deprecated")
+            || lower.contains("unavailable for free")))
         || lower.contains("no endpoints found");
 
     if is_model_unavailable {
@@ -700,7 +702,25 @@ fn classify_opencode_message(message: &str) -> AgentError {
                 None
             };
 
-            from_colon.or(from_transition).unwrap_or_default()
+            // For "unavailable for free" messages like "... use this slug instead: X"
+            // extract the suggested replacement slug.
+            let from_slug_suggestion = if lower.contains("unavailable for free") {
+                message
+                    .split("use this slug instead: ")
+                    .nth(1)
+                    .map(|s| s.trim_end_matches('.').trim().to_string())
+                    .filter(|s| !s.is_empty())
+            } else {
+                None
+            };
+
+            // Transition/slug extractions are tied to specific message shapes and take
+            // priority over the generic colon split, which would otherwise grab the
+            // wrong substring (e.g. the "[404] ..." text before the real slug).
+            from_transition
+                .or(from_slug_suggestion)
+                .or(from_colon)
+                .unwrap_or_default()
         };
         return AgentError::ModelUnavailable {
             message: message.to_string(),
@@ -1291,6 +1311,25 @@ mod tests {
                 assert_eq!(
                     model, "qwen/qwen3.6-plus",
                     "expected model extracted from 'Transition to X', got: {model:?}"
+                );
+            }
+            other => panic!("expected ModelUnavailable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_opencode_model_unavailable_for_free() {
+        // Issue #3475: "This model is unavailable for free ... use this slug instead: X"
+        // must classify as ModelUnavailable, not fall through to the transient
+        // network-error path via the "Upstream request failed" substring.
+        let err = classify_opencode_message(
+            "network error: Error from provider (Console): Upstream request failed: [404] This model is unavailable for free. The paid version is available now - use this slug instead: inclusionai/ling-3.0-flash",
+        );
+        match err {
+            AgentError::ModelUnavailable { model, .. } => {
+                assert_eq!(
+                    model, "inclusionai/ling-3.0-flash",
+                    "expected model extracted from 'use this slug instead: X', got: {model:?}"
                 );
             }
             other => panic!("expected ModelUnavailable, got: {other:?}"),
