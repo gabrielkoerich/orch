@@ -1091,6 +1091,26 @@ pub fn find_opencode_result(ndjson: &str) -> Option<super::AgentResult> {
         }
     });
 
+    // The model was cut off for exceeding its output/reasoning token budget,
+    // not because it produced malformed prose. Distinguish this from a
+    // generic parse failure so callers don't apply the long
+    // format-incapable-model cooldown for a token-budget fluke.
+    let truncated_by_length = events
+        .iter()
+        .rev()
+        .find_map(|event| {
+            if event.get("type").and_then(|v| v.as_str()) == Some("step_finish") {
+                event
+                    .get("part")
+                    .and_then(|p| p.get("reason"))
+                    .and_then(|v| v.as_str())
+                    .map(|reason| reason == "length")
+            } else {
+                None
+            }
+        })
+        .unwrap_or(false);
+
     Some(super::AgentResult {
         is_error,
         result_text,
@@ -1098,6 +1118,7 @@ pub fn find_opencode_result(ndjson: &str) -> Option<super::AgentResult> {
         output_tokens,
         cost_usd,
         duration_ms: None,
+        truncated_by_length,
     })
 }
 
@@ -1704,6 +1725,7 @@ mod tests {
         assert_eq!(result.input_tokens, Some(5000));
         assert_eq!(result.output_tokens, Some(200));
         assert_eq!(result.cost_usd, Some(0.05));
+        assert!(!result.truncated_by_length);
     }
 
     #[test]
@@ -1712,6 +1734,24 @@ mod tests {
         let result = find_opencode_result(ndjson).expect("should find error result");
         assert!(result.is_error);
         assert!(result.result_text.contains("rate limit"));
+        assert!(!result.truncated_by_length);
+    }
+
+    /// step_finish reason=length signals the model was cut off by its
+    /// output/reasoning token budget, not malformed output — the flag must
+    /// be set so callers avoid the persistent-format-failure cooldown.
+    #[test]
+    fn find_opencode_result_length_truncation() {
+        let ndjson = concat!(
+            r#"{"type":"step_start","timestamp":1000,"part":{"type":"step-start"}}"#,
+            "\n",
+            r#"{"type":"text","timestamp":1001,"part":{"type":"text","text":"{\"decision\":"}}"#,
+            "\n",
+            r#"{"type":"step_finish","timestamp":1002,"part":{"type":"step-finish","reason":"length","tokens":{"input":5485,"output":759,"reasoning":31241}}}"#,
+        );
+        let result = find_opencode_result(ndjson).expect("should find result");
+        assert!(result.truncated_by_length);
+        assert!(!result.is_error, "length truncation is not a hard error");
     }
 
     #[test]

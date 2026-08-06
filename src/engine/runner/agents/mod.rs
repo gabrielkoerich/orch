@@ -169,6 +169,12 @@ pub struct AgentResult {
     pub cost_usd: Option<f64>,
     /// Wall-clock duration in milliseconds (if reported by the agent).
     pub duration_ms: Option<u64>,
+    /// True when the provider cut the response short by exceeding its
+    /// output/reasoning token budget (e.g. opencode's `step_finish` event
+    /// reporting `reason: "length"`), as opposed to producing malformed
+    /// output. Callers use this to distinguish a token-budget fluke from a
+    /// genuinely format-incapable model.
+    pub truncated_by_length: bool,
 }
 
 /// Concatenate text from all assistant-turn messages in the agent's NDJSON
