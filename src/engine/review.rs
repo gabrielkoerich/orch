@@ -1242,6 +1242,13 @@ async fn finalize_review_run(
         _ => "",
     };
 
+    if outcome == "success" {
+        // Mirror the runner's success path so review-only models don't ratchet
+        // into multi-day cooldowns from isolated failures never offset by resets.
+        crate::engine::cooldown::record_agent_success(&ctx.review_agent, ctx.review_model_str())
+            .await;
+    }
+
     complete_review_run(
         store,
         parsed.run_id,
@@ -3101,5 +3108,157 @@ mod tests {
             remaining1 >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
             "after success reset, first-failure cooldown should still be ~4h, got {remaining1}s"
         );
+    }
+
+    // ── review success resets failure_count (issue #3478) ──────────────────
+
+    fn test_review_task(id: &str) -> ExternalTask {
+        ExternalTask {
+            id: crate::backends::ExternalId(id.to_string()),
+            title: "Test review task".to_string(),
+            body: "".to_string(),
+            state: "open".to_string(),
+            labels: vec![],
+            author: "tester".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: "https://example.com/issues/1".to_string(),
+        }
+    }
+
+    fn test_review_context(agent: &str, model: &str, work_dir: &std::path::Path) -> ReviewContext {
+        ReviewContext {
+            store_id: None,
+            had_prev_push_failure: false,
+            review_attempt: 1,
+            worktree_path: work_dir.to_path_buf(),
+            branch_name: "gh-issue-1-test".to_string(),
+            pr_number: 1,
+            default_branch: "main".to_string(),
+            review_agent: agent.to_string(),
+            review_model: Some(model.to_string()),
+            review_task_id: "review-1".to_string(),
+            review_attempt_dir: work_dir.to_path_buf(),
+            output_file: work_dir.join("output.txt"),
+            invocation: runner::agent::AgentInvocation {
+                agent: agent.to_string(),
+                model: Some(model.to_string()),
+                work_dir: work_dir.to_path_buf(),
+                system_prompt: String::new(),
+                agent_message: String::new(),
+                task_id: "review-1".to_string(),
+                disallowed_tools: vec![],
+                git_author_name: "Test".to_string(),
+                git_author_email: "test@example.com".to_string(),
+                output_file: work_dir.join("output.txt"),
+                timeout_seconds: 0,
+                repo: "owner/repo".to_string(),
+                attempt: 1,
+            },
+        }
+    }
+
+    fn test_parsed_review(decision: ReviewDecision) -> ParsedReview {
+        ParsedReview {
+            run_id: None,
+            exit_code: 0,
+            stderr: String::new(),
+            raw_output: String::new(),
+            text_for_review: String::new(),
+            token_usage: RunTokenUsage::default(),
+            review_notes_for_comment: String::new(),
+            decision,
+        }
+    }
+
+    /// Regression test for issue #3478: a successful review run must reset
+    /// `failure_count:{agent}:{model}`, mirroring the runner's task-agent
+    /// success path. Without this, review-only models ratchet through the
+    /// persistent-model backoff ladder from isolated failures that are
+    /// separated by many successful reviews.
+    #[serial_test::serial(cooldown_state)]
+    #[tokio::test]
+    async fn finalize_review_run_success_resets_model_failure_count() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        crate::engine::cooldown::init_cooldown_store(store.clone()).await;
+
+        let agent = "test-3478-agent";
+        let model = "test-3478-model";
+        let failure_key = format!("failure_count:{agent}:{model}");
+
+        let err = runner::agents::AgentError::InvalidResponse {
+            raw: "empty review output".to_string(),
+        };
+        record_review_agent_failure("task-3478-a", agent, Some(model), &err).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            store.kv_get(&failure_key).await.unwrap().as_deref(),
+            Some("1"),
+            "sanity check: failure should have incremented the persisted count"
+        );
+
+        let work_dir = TempDir::new().unwrap();
+        let ctx = test_review_context(agent, model, work_dir.path());
+        let parsed = test_parsed_review(ReviewDecision::Approve);
+        let task = test_review_task("1");
+
+        finalize_review_run(&task, &ctx, &parsed, &store).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(
+            store.kv_get(&failure_key).await.unwrap().as_deref(),
+            Some("0"),
+            "successful review must reset failure_count:{{agent}}:{{model}} (issue #3478)"
+        );
+    }
+
+    /// Regression test for issue #3478: successful reviews interleaved between
+    /// isolated failures must keep each failure's backoff at the base duration
+    /// instead of escalating, since the previous success reset the counter.
+    #[serial_test::serial(cooldown_state)]
+    #[tokio::test]
+    async fn finalize_review_run_interleaved_success_keeps_cooldown_at_base() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        crate::engine::cooldown::init_cooldown_store(store.clone()).await;
+
+        let agent = "test-3478-interleave-agent";
+        let model = "test-3478-interleave-model";
+        let cooldown_key = format!("{agent}:{model}");
+
+        let work_dir = TempDir::new().unwrap();
+        let ctx = test_review_context(agent, model, work_dir.path());
+        let task = test_review_task("2");
+
+        for i in 0..4 {
+            let err = runner::agents::AgentError::InvalidResponse {
+                raw: format!("failure {i}"),
+            };
+            record_review_agent_failure("task-3478-b", agent, Some(model), &err).await;
+
+            let now = chrono::Utc::now().timestamp();
+            let until = crate::engine::cooldown::cooldown_until(&cooldown_key)
+                .expect("failure should set cooldown");
+            let remaining = until.saturating_sub(now);
+
+            assert!(
+                (crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30
+                    ..crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS + 60)
+                    .contains(&remaining),
+                "failure #{} must stay at base backoff since the prior success reset the \
+                 counter (issue #3478); got {remaining}s, base is {}s — an escalating value \
+                 here means review successes are not resetting failure_count",
+                i + 1,
+                crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS
+            );
+
+            // A successful review interleaves between each failure, mirroring the
+            // real-world pattern from issue #3478 (reviews for other tasks succeed
+            // in between isolated failures for this model).
+            let parsed = test_parsed_review(ReviewDecision::Approve);
+            finalize_review_run(&task, &ctx, &parsed, &store).await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 }
