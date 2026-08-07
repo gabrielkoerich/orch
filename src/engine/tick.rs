@@ -3244,7 +3244,10 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].outcome, "aborted");
         assert!(runs[0].completed_at.is_some());
-        assert_eq!(runs[0].error, "stuck-task recovery: internal no session found");
+        assert_eq!(
+            runs[0].error,
+            "stuck-task recovery: internal no session found"
+        );
     }
 
     #[tokio::test]
