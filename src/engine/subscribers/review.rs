@@ -670,6 +670,18 @@ async fn classify_review_failure(
         return ReviewOutcome::Reset;
     }
 
+    // The review output was cut off by the model's output/reasoning token
+    // budget, not a genuine parse/format failure. Same treatment as a parse
+    // error: re-route without counting toward MAX_REVIEW_AGENT_FAILURES.
+    if lower_reason.contains("truncated") {
+        tracing::warn!(
+            task_id,
+            reason,
+            "{context} output truncated by token budget — re-routing for retry without counting as failure"
+        );
+        return ReviewOutcome::Reset;
+    }
+
     // Transient mergeability check: GitHub hasn't finished computing yet.
     // This is a normal, expected transient state for freshly-pushed PRs.
     // Return RetryMerge (not Reset) so the task stays in InReview — avoids
@@ -797,6 +809,57 @@ async fn post_review_failure_comment(
             pr_number,
             error = %e,
             "failed to post review failure comment"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A truncated review output (opencode step_finish reason=length) must be
+    /// treated like a parse error: reset for retry without counting toward
+    /// MAX_REVIEW_AGENT_FAILURES, so a run of token-budget flukes never
+    /// permanently blocks the task (issue #3473).
+    #[tokio::test]
+    async fn classify_review_failure_truncated_resets_without_counting() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let repo = "owner/repo";
+        let store_id = store
+            .create_internal(
+                repo,
+                "Truncated review test",
+                "",
+                "review",
+                "review-1",
+                None,
+            )
+            .await
+            .unwrap();
+        let task_id = format!("internal:{store_id}");
+
+        for _ in 0..(MAX_REVIEW_AGENT_FAILURES + 1) {
+            let outcome = classify_review_failure(
+                &store,
+                repo,
+                &task_id,
+                "truncated: review output was cut off before completion \
+                 (output/reasoning token budget exceeded)",
+                "review agent",
+            )
+            .await;
+            assert!(
+                matches!(outcome, ReviewOutcome::Reset),
+                "truncated review failure must reset for retry, not block"
+            );
+        }
+
+        let task = opt_store_get_task(&Some(store.clone()), repo, &task_id)
+            .await
+            .expect("task should exist");
+        assert_eq!(
+            task.review_agent_failures, 0,
+            "truncated failures must not count toward review_agent_failures"
         );
     }
 }

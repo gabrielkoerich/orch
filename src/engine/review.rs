@@ -1108,6 +1108,46 @@ async fn parse_review_output(
                     )));
                 }
 
+                // The model was cut off for exceeding its output/reasoning
+                // token budget (opencode step_finish reason=length), not
+                // because it produced malformed prose. Keep this distinct
+                // from the generic parse_error path below: apply the
+                // standard exponential backoff instead of the 4h-7d
+                // persistent cooldown reserved for format-incapable models.
+                if agent_result
+                    .as_ref()
+                    .map(|r| r.truncated_by_length)
+                    .unwrap_or(false)
+                {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        agent = %ctx.review_agent,
+                        model = ?ctx.review_model,
+                        "review agent output truncated: step_finish reason=length \
+                         (token budget exceeded before completion)"
+                    );
+                    if let Some(model) = ctx.review_model.as_deref() {
+                        crate::engine::cooldown::record_model_failure(&ctx.review_agent, model)
+                            .await;
+                    }
+                    let stored_error = "truncated: review output was cut off before completion \
+                        (output/reasoning token budget exceeded)"
+                        .to_string();
+                    complete_review_run(
+                        store,
+                        run.run_id,
+                        Some(exit_code),
+                        &raw_output,
+                        &stderr,
+                        &text_for_review,
+                        "truncated",
+                        &stored_error,
+                        token_usage,
+                    )
+                    .await;
+                    return ReviewPhase::EarlyReturn(ReviewDecision::Failed(stored_error));
+                }
+
                 tracing::error!(
                     task_id = task.id.0,
                     error = %e,

@@ -730,6 +730,7 @@ pub fn find_claude_result(ndjson: &str) -> Option<super::AgentResult> {
                     output_tokens,
                     cost_usd,
                     duration_ms,
+                    truncated_by_length: false,
                 });
             }
         }
@@ -786,6 +787,7 @@ pub fn find_claude_result(ndjson: &str) -> Option<super::AgentResult> {
         output_tokens,
         cost_usd: None,
         duration_ms: None,
+        truncated_by_length: false,
     })
 }
 

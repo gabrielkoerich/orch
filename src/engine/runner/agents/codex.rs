@@ -435,6 +435,7 @@ pub fn find_codex_result(ndjson: &str) -> Option<super::AgentResult> {
         output_tokens: None,
         cost_usd: None,
         duration_ms: None,
+        truncated_by_length: false,
     })
 }
 
