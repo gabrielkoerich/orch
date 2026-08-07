@@ -75,7 +75,7 @@ pub enum RouteResultError {
 use crate::backends::ExternalTask;
 use crate::engine::cooldown::{
     cooldown_until, is_agent_degraded, is_agent_in_cooldown, is_model_in_cooldown,
-    refresh_degraded_agents, sync_from_kv,
+    record_agent_success, refresh_degraded_agents, sync_from_kv,
 };
 use crate::store::{get_task_field_direct, store_log_activity, TaskStore};
 use serde::{Deserialize, Serialize};
@@ -1255,6 +1255,7 @@ impl Router {
                         pool_idx = idx,
                         "router LLM pool entry succeeded"
                     );
+                    record_agent_success(agent, model_str).await;
                     return Ok(result);
                 }
                 Err(e) => {
@@ -1354,7 +1355,10 @@ impl Router {
                 )
                 .await
             {
-                Ok(result) => return Ok(result),
+                Ok(result) => {
+                    record_agent_success(&fb_agent, fb_model_str).await;
+                    return Ok(result);
+                }
                 Err(e) => {
                     let err_msg = e.to_string();
                     let is_timeout = err_msg.contains(TIMEOUT_PREFIX);
