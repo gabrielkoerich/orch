@@ -1058,6 +1058,58 @@ async fn finalize_incomplete_runs_ignores_completed_runs() {
 }
 
 #[tokio::test]
+async fn start_run_self_heals_orphaned_prior_run() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let task_id = store
+        .create(&NewTask {
+            repo: "owner/repo".to_string(),
+            origin: "internal".to_string(),
+            title: "Test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // Simulate a crash: start a run and never complete it
+    store
+        .start_run(&StartRun {
+            task_id,
+            attempt: 1,
+            run_type: "agent",
+            agent: "claude",
+            model: "sonnet",
+            command: "claude -p ...",
+            prompt: "system prompt",
+        })
+        .await
+        .unwrap();
+
+    // Starting the next attempt should finalize the orphaned row first
+    store
+        .start_run(&StartRun {
+            task_id,
+            attempt: 2,
+            run_type: "agent",
+            agent: "codex",
+            model: "gpt-5",
+            command: "codex -p ...",
+            prompt: "system prompt",
+        })
+        .await
+        .unwrap();
+
+    let runs = store.get_runs(task_id).await.unwrap();
+    assert_eq!(runs.len(), 2);
+    let first = runs.iter().find(|r| r.attempt == 1).unwrap();
+    let second = runs.iter().find(|r| r.attempt == 2).unwrap();
+    assert_eq!(first.outcome, "aborted");
+    assert!(first.completed_at.is_some());
+    assert_eq!(second.outcome, "");
+    assert!(second.completed_at.is_none());
+}
+
+#[tokio::test]
 async fn set_fields_updates_task() {
     let store = TaskStore::open_memory().await.unwrap();
 

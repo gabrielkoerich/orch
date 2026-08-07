@@ -93,7 +93,7 @@ async fn recover_routed_blocked_dispatch(
         "recovering routed task: dispatch blocked by stale tmux session → new"
     );
 
-    if let Some(store_id) = match store.resolve_task_id(repo, &task.id.0).await {
+    let resolved_store_id = match store.resolve_task_id(repo, &task.id.0).await {
         Ok(Some(id)) => Some(id),
         Ok(None) => {
             tracing::warn!(
@@ -112,7 +112,9 @@ async fn recover_routed_blocked_dispatch(
             );
             None
         }
-    } {
+    };
+
+    if let Some(store_id) = resolved_store_id {
         if let Err(e) = store_set_by_id(
             &Some(store),
             store_id,
@@ -131,6 +133,12 @@ async fn recover_routed_blocked_dispatch(
             );
             return;
         }
+        finalize_open_runs_for_recovery(
+            store,
+            store_id,
+            "stuck-task recovery: stale session blocking dispatch killed",
+        )
+        .await;
     }
 
     if let Err(e) = task_manager.update_task_status(&task.id, Status::New).await {
@@ -293,6 +301,22 @@ fn stuck_task_timing_from_map(
     })
 }
 
+/// Finalize any open `task_runs` rows for a task during recovery paths.
+/// Best-effort: logs a warning on failure but does not block recovery.
+async fn finalize_open_runs_for_recovery(store: &TaskStore, store_id: i64, reason: &str) {
+    if let Err(e) = store
+        .finalize_incomplete_runs(store_id, "aborted", reason)
+        .await
+    {
+        tracing::warn!(
+            store_id,
+            error = %e,
+            reason,
+            "failed to finalize incomplete runs during recovery"
+        );
+    }
+}
+
 /// Phase 1b of tick: detect agents that have produced no output since session start
 /// and have exceeded the silence grace period.
 ///
@@ -382,6 +406,12 @@ pub(crate) async fn tick_detect_silent_agents(
 
         // 2. Unregister from capture
         capture.unregister_session(repo, &task_id).await;
+
+        // Finalize any open audit run so the task_runs row is not orphaned
+        if let Some(store_id) = store_task.as_ref().map(|t| t.id) {
+            finalize_open_runs_for_recovery(store, store_id, "silence detection: session killed")
+                .await;
+        }
 
         let mut extended_note = String::new();
 
@@ -762,6 +792,16 @@ pub(crate) async fn tick_recover_stuck_tasks(
                 );
                 continue;
             }
+            finalize_open_runs_for_recovery(
+                store,
+                store_id,
+                if timing.has_session {
+                    "stuck-task recovery: active session killed"
+                } else {
+                    "stuck-task recovery: no session found"
+                },
+            )
+            .await;
         }
         if let Err(e) = task_manager.update_task_status(&task.id, Status::New).await {
             tracing::warn!(task_id = task.id.0, ?e, "failed to reset stuck task status");
@@ -942,6 +982,17 @@ pub(crate) async fn tick_recover_stuck_tasks(
             continue;
         }
 
+        finalize_open_runs_for_recovery(
+            store,
+            task.id,
+            if timing.has_session {
+                "stuck-task recovery: cross-repo active session killed"
+            } else {
+                "stuck-task recovery: cross-repo no session found"
+            },
+        )
+        .await;
+
         if let Err(e) = store
             .update_status(task.id, crate::store::TaskStatus::New)
             .await
@@ -1117,6 +1168,16 @@ pub(crate) async fn tick_recover_stuck_tasks(
                 );
                 continue;
             }
+            finalize_open_runs_for_recovery(
+                store,
+                store_id,
+                if timing.has_session {
+                    "stuck-task recovery: internal active session killed"
+                } else {
+                    "stuck-task recovery: internal no session found"
+                },
+            )
+            .await;
         }
         if let Err(e) = task_manager
             .update_task_status(&ExternalId(task_id.clone()), Status::New)
@@ -1208,6 +1269,16 @@ pub(crate) async fn tick_recover_stuck_tasks(
             continue;
         } else {
             set_review_session_expected(store, repo, &task.id.0, false).await;
+        }
+
+        // Finalize any open review run row
+        if let Ok(Some(store_id)) = store.resolve_task_id(repo, &task.id.0).await {
+            finalize_open_runs_for_recovery(
+                store,
+                store_id,
+                "stuck-task recovery: in_review session killed",
+            )
+            .await;
         }
 
         // Log activity for stuck in_review recovery
@@ -1302,6 +1373,16 @@ pub(crate) async fn tick_recover_stuck_tasks(
             );
         } else {
             set_review_session_expected(store, repo, &task_id, false).await;
+        }
+
+        // Finalize any open review run row
+        if let Ok(Some(store_id)) = store.resolve_task_id(repo, &task_id).await {
+            finalize_open_runs_for_recovery(
+                store,
+                store_id,
+                "stuck-task recovery: internal in_review session killed",
+            )
+            .await;
         }
     }
 
@@ -3091,6 +3172,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_stuck_tasks_finalizes_open_task_runs_rows() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let mock = MockBackend::new();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(TmuxManager::new());
+        let config = EngineConfig {
+            no_session_stuck_timeout: 600,
+            stuck_timeout: 1800,
+            ..EngineConfig::default()
+        };
+
+        let id = store
+            .create_internal("owner/repo", "Stuck with open run", "", "cron", "1", None)
+            .await
+            .unwrap();
+        store
+            .set_fields(
+                id,
+                &[
+                    ("agent", serde_json::json!("claude")),
+                    ("model", serde_json::json!("sonnet")),
+                    ("route_attempts", serde_json::json!(1)),
+                ],
+            )
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::InProgress)
+            .await
+            .unwrap();
+        set_task_updated_at_past(&store, id).await;
+
+        // Start an agent run that will be orphaned by recovery
+        store
+            .start_run(&crate::store::StartRun {
+                task_id: id,
+                attempt: 1,
+                run_type: "agent",
+                agent: "claude",
+                model: "sonnet",
+                command: "claude --model sonnet",
+                prompt: "fix it",
+            })
+            .await
+            .unwrap();
+
+        tick_recover_stuck_tasks(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &task_manager,
+            &config,
+            &store,
+            &std::collections::HashMap::new(),
+            &cooled_review_router_for_test(),
+            &Arc::new(DashMap::new()),
+        )
+        .await
+        .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.status, crate::store::TaskStatus::New);
+
+        let runs = store.get_runs(id).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].outcome, "aborted");
+        assert!(runs[0].completed_at.is_some());
+        assert_eq!(runs[0].error, "stuck-task recovery: internal no session found");
+    }
+
+    #[tokio::test]
     async fn recover_stuck_tasks_skips_external_in_review_waiting_for_human_review() {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let mock = MockBackend::new();
@@ -3264,6 +3421,91 @@ mod tests {
             "internal task should be routed to fallback or reset to new, got {:?}",
             task.status
         );
+    }
+
+    #[tokio::test]
+    async fn detect_silent_agents_finalizes_open_task_runs_rows() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let mock = MockBackend::new();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let transport = Arc::new(Transport::new());
+        let capture = Arc::new(CaptureService::new(transport));
+        let tmux = Arc::new(TmuxManager::new());
+        let config = EngineConfig {
+            silence_grace_period: 60,
+            silence_cooldown: 300,
+            ..EngineConfig::default()
+        };
+
+        let internal_id = store
+            .create_internal("owner/repo", "Silent with open run", "", "cron", "1", None)
+            .await
+            .unwrap();
+        store
+            .set_fields(
+                internal_id,
+                &[
+                    ("agent", serde_json::json!("claude")),
+                    ("model", serde_json::json!("sonnet")),
+                ],
+            )
+            .await
+            .unwrap();
+        store
+            .update_status(internal_id, crate::store::TaskStatus::InProgress)
+            .await
+            .unwrap();
+
+        let task_id = format!("internal:{internal_id}");
+        capture
+            .register_session("owner/repo", &task_id, "orch-test-silent-run")
+            .await;
+        capture
+            .set_buffer_state_for_test(
+                "owner/repo",
+                &task_id,
+                false,
+                false,
+                chrono::Utc::now() - chrono::Duration::seconds(120),
+            )
+            .await;
+
+        // Start an agent run that will be orphaned by silence detection
+        store
+            .start_run(&crate::store::StartRun {
+                task_id: internal_id,
+                attempt: 1,
+                run_type: "agent",
+                agent: "claude",
+                model: "sonnet",
+                command: "claude --model sonnet",
+                prompt: "fix it",
+            })
+            .await
+            .unwrap();
+
+        tick_detect_silent_agents(
+            &tmux,
+            "owner/repo",
+            &capture,
+            &backend,
+            &task_manager,
+            &config,
+            &store,
+        )
+        .await
+        .unwrap();
+
+        let runs = store.get_runs(internal_id).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].outcome, "aborted");
+        assert!(runs[0].completed_at.is_some());
+        assert_eq!(runs[0].error, "silence detection: session killed");
     }
 
     /// Regression test for the race between Phase 1 (tick_check_session_completions)
