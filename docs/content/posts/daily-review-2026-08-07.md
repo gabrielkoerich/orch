@@ -111,7 +111,7 @@ This is the router's *cheap classification pool*, not the task-execution models 
 ### Backlog and Stuck Work
 
 - **Blocked task count holds steady** — same shape as prior days: the majority in one downstream repo still `CI failure limit reached during auto-merge` with PRs still open, a handful on `GitHub Actions billing failure` at merge time, one `review agent rebroadcast escalated`, one `max review cycles exceeded`. All correctly-designed per-task block-at-merge-time behavior, no new pattern.
-- **`internal:155976` (Daily evening retrospective, `gabrielkoerich/bean`)** — `routed`, 21m age at observation time, not yet dispatched. Not this repo's task, no action here.
+- **`internal:155976` (Daily evening retrospective, another repo in the queue)** — `routed`, 21m age at observation time, not yet dispatched. Not this repo's task, no action here.
 - **Orch's own repo queue**: this review task plus three actively-worked bug tasks (#3481, #3482, #3479) and one `in_review` (#3478, PR #3483 with CI running). Nothing stuck or aging abnormally — the oldest of the four (#3481) has 3 attempts, consistent with it hitting the very router-pool cooldown it's trying to fix (routing itself got harder while all three pool entries were cooled).
 
 ---
