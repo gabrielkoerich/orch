@@ -2674,6 +2674,7 @@ mod tests {
     async fn integration_channel_to_tmux_to_capture() {
         use crate::channels::capture::CaptureService;
         use crate::channels::transport::Transport;
+        use crate::tmux::SessionGuard;
         use std::sync::Arc;
 
         // Create transport and capture service
@@ -2691,14 +2692,6 @@ mod tests {
             .expect("failed to start tmux session");
 
         // Guard ensures session cleanup even on panic
-        struct SessionGuard(String);
-        impl Drop for SessionGuard {
-            fn drop(&mut self) {
-                let _ = std::process::Command::new("tmux")
-                    .args(["kill-session", "-t", &self.0])
-                    .output();
-            }
-        }
         let _guard = SessionGuard(session_name.clone());
 
         // Register session with capture service and transport binding

@@ -560,30 +560,32 @@ impl TmuxManager {
 }
 
 #[cfg(test)]
+pub(crate) fn test_session_name() -> String {
+    format!(
+        "orch-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_else(|_| 0)
+    )
+}
+
+/// RAII guard that kills a tmux session on drop, even if the test panics.
+#[cfg(test)]
+pub(crate) struct SessionGuard(pub(crate) String);
+
+#[cfg(test)]
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", &self.0])
+            .output();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Helper to get a test session name with unique ID
-    fn test_session_name() -> String {
-        format!(
-            "orch-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or_else(|_| 0)
-        )
-    }
-
-    /// RAII guard that kills a tmux session on drop, even if the test panics.
-    struct SessionGuard(String);
-
-    impl Drop for SessionGuard {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("tmux")
-                .args(["kill-session", "-t", &self.0])
-                .output();
-        }
-    }
 
     #[test]
     fn session_name_internal_task_id_is_sanitized() {
