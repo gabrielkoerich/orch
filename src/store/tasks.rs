@@ -1807,6 +1807,42 @@ impl TaskStore {
 
     /// Start a new run, returning its ID.
     pub async fn start_run(&self, run: &StartRun<'_>) -> anyhow::Result<i64> {
+        // Self-heal: an earlier attempt of the same run_type may have been
+        // abandoned by a crash or SIGKILL that never reached
+        // complete_run/finalize_incomplete_runs. Close those out now so they
+        // don't leak as permanently-open rows. Scoped to the same run_type so
+        // a still-open run of a *different* run_type (e.g. an agent run left
+        // open when a review run starts) is untouched here — that case is
+        // handled by the explicit finalize_incomplete_runs calls in the
+        // engine's recovery paths, not this opportunistic self-heal. The
+        // current attempt is excluded so a legitimate retry of the same run
+        // still goes through the ON CONFLICT upsert below instead of being
+        // finalized out from under itself.
+        let orphaned: Vec<(i64,)> = sqlx::query_as(
+            "SELECT id FROM task_runs
+             WHERE task_id = ? AND run_type = ? AND attempt != ?
+               AND outcome IS NULL AND completed_at IS NULL",
+        )
+        .bind(run.task_id)
+        .bind(run.run_type)
+        .bind(run.attempt)
+        .fetch_all(&self.pool)
+        .await?;
+
+        for (run_id,) in orphaned {
+            self.complete_run(&CompleteRun {
+                run_id,
+                exit_code: Some(-1),
+                stdout: "",
+                stderr: "",
+                parsed: "",
+                outcome: "aborted",
+                error: "superseded by a new run start before this one completed",
+                tokens: RunTokenUsage::default(),
+            })
+            .await?;
+        }
+
         let row = sqlx::query(
             "INSERT INTO task_runs (task_id, attempt, run_type, agent, model, command, prompt, outcome)
          VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
