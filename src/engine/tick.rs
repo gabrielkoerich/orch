@@ -2483,7 +2483,7 @@ mod tests {
     use crate::channels::transport::Transport;
     use crate::engine::tasks::TaskManager;
     use crate::store::TaskStore;
-    use crate::tmux::TmuxManager;
+    use crate::tmux::{SessionGuard, TmuxManager};
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
@@ -3354,13 +3354,14 @@ mod tests {
             }
         }
 
+        let _guard = SessionGuard(session_name.clone());
+
         let set_option_result = tokio::process::Command::new("tmux")
             .args(["set-option", "-t", &session_name, "remain-on-exit", "on"])
             .output()
             .await;
         if !matches!(set_option_result, Ok(ref o) if o.status.success()) {
             eprintln!("Skipping test: unable to set tmux remain-on-exit option");
-            let _ = tmux.kill_session(&session_name).await;
             return;
         }
 
@@ -3370,7 +3371,6 @@ mod tests {
             .await;
         if !matches!(send_exit_result, Ok(ref o) if o.status.success()) {
             eprintln!("Skipping test: unable to exit tmux pane");
-            let _ = tmux.kill_session(&session_name).await;
             return;
         }
 
@@ -3396,7 +3396,6 @@ mod tests {
         }
         if session_map.get(&session_name).copied().unwrap_or(false) {
             eprintln!("Skipping test: session still alive in batch_session_active after retries (CI tmux lag)");
-            let _ = tmux.kill_session(&session_name).await;
             return;
         }
 
@@ -3422,8 +3421,6 @@ mod tests {
 
         assert!(!timing.has_session);
         assert_eq!(timing.threshold, config.no_session_stuck_timeout);
-
-        let _ = tmux.kill_session(&session_name).await;
     }
 
     #[tokio::test]
@@ -3642,6 +3639,8 @@ mod tests {
                 return;
             }
         }
+        let _guard = SessionGuard(session_name.clone());
+
         // Ensure remain-on-exit so the session lingers as dead long enough to be snapshot
         let _ = tokio::process::Command::new("tmux")
             .args(["set-option", "-t", &session_name, "remain-on-exit", "on"])
@@ -3689,7 +3688,6 @@ mod tests {
                     "Skipping test: tick_check_session_completions did not update stored \
                      updated_at — session was not in snapshot (CI tmux environment issue)"
                 );
-                let _ = tmux.kill_session(&session_name).await;
                 return;
             }
         }
@@ -3716,8 +3714,6 @@ mod tests {
             crate::store::TaskStatus::InProgress,
             "task should not be reclaimed to New"
         );
-
-        let _ = tmux.kill_session(&session_name).await;
     }
 
     // ── tick_job_scheduler: resilience to bad project configs ────────────────
