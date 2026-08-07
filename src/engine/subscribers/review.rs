@@ -729,6 +729,18 @@ async fn classify_review_failure(
         return ReviewOutcome::Reset;
     }
 
+    // Provider-side network errors (ConnectionRefused, timeouts, etc.) are
+    // transient infrastructure issues, not review feedback. Re-route without
+    // counting toward MAX_REVIEW_AGENT_FAILURES.
+    if crate::engine::runner::agents::patterns::detect_network_error(reason).is_some() {
+        tracing::warn!(
+            task_id,
+            reason,
+            "{context} hit transient provider network error — re-routing for retry without counting as failure"
+        );
+        return ReviewOutcome::Reset;
+    }
+
     let failures = match crate::store::store_increment(
         &Some(store.clone()),
         repo,
@@ -860,6 +872,53 @@ mod tests {
         assert_eq!(
             task.review_agent_failures, 0,
             "truncated failures must not count toward review_agent_failures"
+        );
+    }
+
+    /// Transient provider network errors (ConnectionRefused, timeouts) must be
+    /// treated like parse errors: reset for retry without counting toward
+    /// MAX_REVIEW_AGENT_FAILURES (issue #3482).
+    #[tokio::test]
+    async fn classify_review_failure_network_error_resets_without_counting() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let repo = "owner/repo";
+        let store_id = store
+            .create_internal(
+                repo,
+                "Network error review test",
+                "",
+                "review",
+                "review-2",
+                None,
+            )
+            .await
+            .unwrap();
+        let task_id = format!("internal:{store_id}");
+
+        let error_messages = [
+            "API Error: Unable to connect to API (ConnectionRefused)",
+            "connection refused",
+            "ECONNREFUSED",
+            "Upstream idle timeout exceeded",
+            "connect ETIMEDOUT",
+            "network request failed",
+        ];
+
+        for msg in &error_messages {
+            let outcome =
+                classify_review_failure(&store, repo, &task_id, msg, "review agent").await;
+            assert!(
+                matches!(outcome, ReviewOutcome::Reset),
+                "network error '{msg}' must reset for retry, not block"
+            );
+        }
+
+        let task = opt_store_get_task(&Some(store.clone()), repo, &task_id)
+            .await
+            .expect("task should exist");
+        assert_eq!(
+            task.review_agent_failures, 0,
+            "network errors must not count toward review_agent_failures"
         );
     }
 }
