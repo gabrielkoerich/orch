@@ -1098,18 +1098,9 @@ pub fn find_opencode_result(ndjson: &str) -> Option<super::AgentResult> {
     let truncated_by_length = events
         .iter()
         .rev()
-        .find_map(|event| {
-            if event.get("type").and_then(|v| v.as_str()) == Some("step_finish") {
-                event
-                    .get("part")
-                    .and_then(|p| p.get("reason"))
-                    .and_then(|v| v.as_str())
-                    .map(|reason| reason == "length")
-            } else {
-                None
-            }
-        })
-        .unwrap_or(false);
+        .find(|event| event.get("type").and_then(|v| v.as_str()) == Some("step_finish"))
+        .and_then(|event| event.get("part")?.get("reason")?.as_str())
+        .is_some_and(|reason| reason == "length");
 
     Some(super::AgentResult {
         is_error,

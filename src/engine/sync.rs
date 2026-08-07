@@ -293,8 +293,10 @@ fn classify_failure(error: &str, outcome: &str) -> FailureCategory {
     }
 
     if outcome == "parse_error"
+        || outcome == "truncated"
         || lower.contains("invalid response")
         || lower.contains("parse error")
+        || lower.contains("truncated")
     {
         return FailureCategory::ParseError;
     }
@@ -4747,6 +4749,31 @@ mod tests {
         let category = classify_failure("failed due to sparse index configuration", "error");
         assert_ne!(category, FailureCategory::ParseError);
         assert_eq!(category, FailureCategory::Unknown);
+    }
+
+    // ── classify_failure: truncated (issue #3473) ───────────────────────
+
+    /// A review output truncated by the model's token budget (opencode
+    /// step_finish reason=length) must classify as recoverable, so a task
+    /// blocked after repeated truncations can be auto-unblocked instead of
+    /// requiring manual intervention.
+    #[serial(cooldown_state)]
+    #[test]
+    fn classify_failure_truncated_is_recoverable() {
+        let category = classify_failure(
+            "truncated: review output was cut off before completion \
+             (output/reasoning token budget exceeded)",
+            "truncated",
+        );
+        assert_eq!(
+            category,
+            FailureCategory::ParseError,
+            "truncated outcome must classify as a recoverable parse-style failure"
+        );
+        assert!(
+            category.is_recoverable(),
+            "truncated failures must be recoverable so auto-unblock can retry"
+        );
     }
 
     #[serial(cooldown_state)]
