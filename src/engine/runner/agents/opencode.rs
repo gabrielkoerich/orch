@@ -485,9 +485,13 @@ impl AgentRunner for OpenCodeRunner {
 
         // Append variant flag when present
         let variant_part = variant_flag.unwrap_or_default();
+        // Feed both files via process substitution rather than a leading `cat |`
+        // pipe stage — a leading pipe would make `cat`, not opencode, the first
+        // stage in the runner script's pipeline, so PIPESTATUS[0] there would
+        // always report cat's (always-zero) exit code instead of opencode's.
         format!(
-            r#"cat "{sys_file}" "{msg_file}" | {timeout_cmd} opencode run {model_flag} {variant_part} {skip_perms}\
-  --format json -"#,
+            r#"{timeout_cmd} opencode run {model_flag} {variant_part} {skip_perms}\
+  --format json - < <(cat "{sys_file}" "{msg_file}")"#,
             sys_file = sys_file,
             msg_file = msg_file,
             timeout_cmd = timeout_cmd,
@@ -1391,6 +1395,20 @@ mod tests {
         assert!(
             !cmd.contains(".orch-opencode"),
             "should not reference .orch-opencode, got: {cmd}"
+        );
+        // Regression: the command must not start with a `cat sys msg |` pipe
+        // stage. `build_runner_script` captures the agent's exit status via
+        // `PIPESTATUS[0]` of `{agent_cmd} | tee ...` — a leading `cat |` would
+        // make PIPESTATUS[0] always report cat's (always-zero) exit code
+        // instead of opencode's real exit code. sys/msg files must be fed via
+        // input redirection instead.
+        assert!(
+            !cmd.trim_start().starts_with("cat "),
+            "opencode command must not start with a `cat |` pipe stage, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("< <(cat \"/tmp/sys.txt\" \"/tmp/msg.txt\")"),
+            "sys/msg files must be fed via process substitution, got: {cmd}"
         );
     }
 
