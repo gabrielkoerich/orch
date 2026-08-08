@@ -3,13 +3,13 @@
 //! ## CLI invocation
 //!
 //! ```bash
-//! cat "{sys_file}" "{msg_file}" | codex --model {model} \
+//! codex --model {model} \
 //!   exec \
 //!   -c 'sandbox_workspace_write.network_access=true' \
 //!   -c 'shell_environment_policy.inherit=all' \
 //!   --sandbox workspace-write \
 //!   -c 'approval_policy="never"' \
-//!   --json -
+//!   --json - < <(cat "{sys_file}" "{msg_file}")
 //! ```
 //!
 //! Note: all `-c` overrides must appear **after** the `exec` subcommand.
@@ -278,12 +278,16 @@ impl AgentRunner for CodexRunner {
         // initialisation — in particular, `sandbox_workspace_write.network_access=true`
         // has no effect when placed before `exec`, causing outbound network to be
         // blocked despite the documented contract. Place everything after `exec`.
+        // Feed both files via process substitution rather than a leading `cat |`
+        // pipe stage — a leading pipe would make `cat`, not codex, the first
+        // stage in the runner script's pipeline, so PIPESTATUS[0] there would
+        // always report cat's (always-zero) exit code instead of codex's.
         format!(
-            r#"cat "{sys_file}" "{msg_file}" | {timeout_cmd} codex {model_flag} \
+            r#"{timeout_cmd} codex {model_flag} \
   exec \
   -c 'sandbox_workspace_write.network_access=true' \
   -c 'shell_environment_policy.inherit=all' \
-  {permission_flags} {add_dir_flags} --json -"#,
+  {permission_flags} {add_dir_flags} --json - < <(cat "{sys_file}" "{msg_file}")"#,
             sys_file = sys_file,
             msg_file = msg_file,
             timeout_cmd = timeout_cmd,
@@ -584,6 +588,20 @@ mod tests {
         assert!(
             network_pos > exec_pos,
             "sandbox_workspace_write.network_access=true must appear AFTER exec, got: {cmd}"
+        );
+        // Regression: the command must not start with a `cat sys msg |` pipe
+        // stage. `build_runner_script` captures the agent's exit status via
+        // `PIPESTATUS[0]` of `{agent_cmd} | tee ...` — a leading `cat |` would
+        // make PIPESTATUS[0] always report cat's (always-zero) exit code
+        // instead of codex's real exit code. sys/msg files must be fed via
+        // input redirection instead.
+        assert!(
+            !cmd.trim_start().starts_with("cat "),
+            "codex command must not start with a `cat |` pipe stage, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("< <(cat \"/tmp/sys.txt\" \"/tmp/msg.txt\")"),
+            "sys/msg files must be fed via process substitution, got: {cmd}"
         );
     }
 
