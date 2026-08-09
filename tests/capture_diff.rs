@@ -51,6 +51,34 @@ mod channels {
 }
 
 #[allow(dead_code)]
+mod engine {
+    pub mod suspend {
+        use chrono::{DateTime, Duration, Utc};
+        use std::sync::Mutex;
+
+        static GAPS: Mutex<Vec<(DateTime<Utc>, Duration)>> = Mutex::new(Vec::new());
+
+        pub fn suspended_duration_since(since: DateTime<Utc>) -> Duration {
+            GAPS.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|(detected_at, _)| *detected_at > since)
+                .fold(Duration::zero(), |acc, (_, gap)| acc + *gap)
+        }
+
+        pub fn inject_gap_for_test(detected_at: DateTime<Utc>, gap: Duration) {
+            GAPS.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((detected_at, gap));
+        }
+
+        pub fn clear_for_test() {
+            GAPS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+    }
+}
+
+#[allow(dead_code)]
 #[path = "../src/channels/capture.rs"]
 mod capture;
 
@@ -137,4 +165,44 @@ async fn seen_alive_with_live_session_not_silenced() {
         silent.is_empty(),
         "seen_alive=true + live session must NOT appear in silent list (issue #2318)"
     );
+}
+
+/// Regression test for issue #3496: a session registered long enough ago to
+/// trip the silence grace period must NOT be reported silent when a host
+/// suspend/resume gap fully explains the wall-clock age. Without discounting,
+/// any laptop sleep longer than `silence_grace_period` produces a burst of
+/// false-positive reroutes across every in-flight task at once.
+#[tokio::test]
+async fn silent_detection_discounts_host_suspend_gap() {
+    let transport = Arc::new(Transport::new());
+    let svc = CaptureService::new(transport);
+    let repo = "owner/repo";
+
+    // Register a session; then back its `registered_at` up by 900s (7.5× the
+    // 120s grace), with 880s of that being a suspend gap detected 1 minute ago.
+    // Real elapsed runtime = 900 - 880 = 20s, well under grace.
+    svc.register_session(repo, "suspend-gap-task", "orch-suspend-gap")
+        .await;
+    engine::suspend::clear_for_test();
+    engine::suspend::inject_gap_for_test(
+        chrono::Utc::now() - chrono::Duration::seconds(60),
+        chrono::Duration::seconds(880),
+    );
+    svc.set_buffer_state_for_test(
+        repo,
+        "suspend-gap-task",
+        true,  // seen_alive
+        false, // has_output
+        chrono::Utc::now() - chrono::Duration::seconds(900),
+    )
+    .await;
+
+    let grace = std::time::Duration::from_secs(120);
+    let silent = svc.get_silent_sessions_for_repo(repo, grace).await;
+    assert!(
+        silent.is_empty(),
+        "session must NOT be silenced when suspend gap explains the wall-clock age (issue #3496)"
+    );
+
+    engine::suspend::clear_for_test();
 }

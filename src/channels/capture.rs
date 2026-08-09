@@ -231,7 +231,14 @@ impl CaptureService {
                 continue;
             }
 
-            let age = now.signed_duration_since(buf.registered_at);
+            let raw_age = now.signed_duration_since(buf.registered_at);
+            // Host suspend (laptop sleep) freezes the process just like it freezes
+            // the agent running inside it — suspended wall-clock time is not evidence
+            // of a hung agent. Discount any detected suspend/resume gaps that occurred
+            // since the session was registered, mirroring the watchdog fix in
+            // engine::tick (`stuck_task_timing_from_map`).
+            let suspended = crate::engine::suspend::suspended_duration_since(buf.registered_at);
+            let age = (raw_age - suspended).max(chrono::Duration::zero());
             if age.num_seconds() > grace_period.as_secs() as i64 {
                 silent.push((buf.task_id.clone(), buf.session.clone(), age.num_seconds()));
             }
