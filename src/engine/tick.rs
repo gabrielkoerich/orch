@@ -289,7 +289,12 @@ fn stuck_task_timing_from_map(
         }
     };
 
-    let age = chrono::Utc::now() - updated;
+    let raw_age = chrono::Utc::now() - updated;
+    // Host suspend (laptop sleep) freezes the process just like it freezes the agent
+    // running inside it — that frozen time is not evidence of a hang. Discount any
+    // detected suspend/resume gaps that occurred since this task was last touched.
+    let suspended = super::suspend::suspended_duration_since(updated);
+    let age = (raw_age - suspended).max(chrono::Duration::zero());
     if age.num_seconds() <= threshold as i64 {
         return None;
     }
@@ -3666,6 +3671,50 @@ mod tests {
 
         assert!(!timing.has_session);
         assert_eq!(timing.threshold, config.no_session_stuck_timeout);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(suspend_state)]
+    async fn stuck_task_timing_discounts_host_suspend_gap() {
+        super::super::suspend::clear_for_test();
+
+        let tmux = Arc::new(TmuxManager::new());
+        let repo = "owner/repo";
+        let task_id = "internal:99001";
+        let session_map = std::collections::HashMap::new();
+
+        let config = EngineConfig {
+            no_session_stuck_timeout: 1800,
+            stuck_timeout: 1800,
+            ..EngineConfig::default()
+        };
+
+        // Task was last touched 33 minutes ago (age_mins=33 matches the reported
+        // false-positive), but the host was suspended for 30 of those minutes —
+        // real elapsed runtime is only 3 minutes, well under the 30-minute threshold.
+        let updated_at = (chrono::Utc::now() - chrono::Duration::minutes(33)).to_rfc3339();
+        let suspend_gap_detected_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+        super::super::suspend::inject_gap_for_test(
+            suspend_gap_detected_at,
+            chrono::Duration::minutes(30),
+        );
+
+        let timing = stuck_task_timing_from_map(
+            &tmux,
+            repo,
+            task_id,
+            &updated_at,
+            &config,
+            "parse failure",
+            &session_map,
+        );
+
+        assert!(
+            timing.is_none(),
+            "task age should be discounted below the stuck threshold once suspend time is subtracted, got {timing:?}"
+        );
+
+        super::super::suspend::clear_for_test();
     }
 
     #[tokio::test]
