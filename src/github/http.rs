@@ -494,9 +494,17 @@ impl GhHttp {
                     return Ok(resp);
                 }
                 Err(e) => {
-                    // Network/transport error — treat as transient like 5xx
-                    tracing::warn!(err = %e, attempt, "HTTP send failed, will retry if attempts remain");
-                    last_err = Some(anyhow::anyhow!("HTTP send failed: {}", e));
+                    // Transport error — the request never reached GitHub (DNS failure,
+                    // connection refused, no route to host, TLS failure, etc). This is a
+                    // local/network condition, not evidence that GitHub itself is unhealthy,
+                    // so unlike the 5xx arm above it must NOT trip the shared "github:5xx"
+                    // circuit breaker: other subsystems (routing-phase skip, cooldown
+                    // throttling) key off that breaker as a signal about GitHub's health.
+                    tracing::warn!(err = %e, attempt, "HTTP request failed to send (transport error, GitHub not reached), will retry if attempts remain");
+                    last_err = Some(anyhow::anyhow!(
+                        "HTTP request failed to send (transport error): {}",
+                        e
+                    ));
                     if attempt + 1 < attempts {
                         // Cap exponent at 63 (max valid shift for u64) to prevent overflow
                         let exp = 1u64.checked_shl(attempt.min(63)).unwrap_or(u64::MAX);
@@ -506,12 +514,13 @@ impl GhHttp {
                         tokio::time::sleep(sleep_dur).await;
                         continue;
                     }
-                    // Exhausted attempts — set circuit-breaker and break so last_err is read
+                    // Exhausted attempts — break so last_err is read. Deliberately does not
+                    // call set_agent_cooldown("github:5xx", ...): GitHub was never reached,
+                    // so its health is unknown and the shared breaker must stay untouched.
                     tracing::warn!(
-                        "HTTP send failed after {} attempts — setting circuit-breaker",
+                        "HTTP request failed to send after {} attempts (transport error, GitHub not reached) — not tripping the github:5xx circuit-breaker",
                         attempts
                     );
-                    engine_cooldown::set_agent_cooldown("github:5xx", circuit_cooldown_secs).await;
                     break;
                 }
             }
@@ -3465,6 +3474,42 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert_eq!(err, "simulated request clone failure");
+        match guard {
+            Some(v) => std::env::set_var("GH_TOKEN", v),
+            None => std::env::remove_var("GH_TOKEN"),
+        }
+    }
+
+    /// A transport-level failure (connection refused — GitHub never reached)
+    /// must exhaust retries without tripping the shared "github:5xx" circuit
+    /// breaker: that breaker is read by the routing-phase skip and other
+    /// subsystems as a signal specifically about GitHub's health, which a
+    /// local connectivity blip says nothing about.
+    #[tokio::test]
+    async fn send_with_retries_transport_error_does_not_trip_5xx_breaker() {
+        let guard = std::env::var_os("GH_TOKEN");
+        std::env::set_var("GH_TOKEN", "test_token");
+
+        // Bind then immediately drop a listener to get a port nothing is
+        // listening on, so connecting reliably fails with "connection refused"
+        // rather than depending on an external unreachable host.
+        let addr = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        let url = format!("http://{addr}/");
+
+        let gh = test_client();
+        let make_req = || Ok(gh.client.get(&url));
+        let result = gh.send_with_retries(make_req, false).await;
+
+        assert!(result.is_err());
+        assert!(
+            !crate::engine::cooldown::is_agent_in_cooldown("github:5xx"),
+            "transport error must not trip the github:5xx circuit breaker"
+        );
+        assert!(crate::engine::cooldown::cooldown_until("github:5xx").is_none());
+
         match guard {
             Some(v) => std::env::set_var("GH_TOKEN", v),
             None => std::env::remove_var("GH_TOKEN"),
