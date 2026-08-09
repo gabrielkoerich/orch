@@ -188,10 +188,15 @@ async fn silent_detection_discounts_host_suspend_gap() {
         chrono::Utc::now() - chrono::Duration::seconds(60),
         chrono::Duration::seconds(880),
     );
+    // `seen_alive=false` — the common false-positive case: the session was
+    // never confirmed alive (e.g. the agent's first output was still pending)
+    // when the host suspended. Using `seen_alive=true` would skip the buffer
+    // entirely in the live-session branch (`!is_session_dead` → continue)
+    // and never reach the suspend-discount age computation.
     svc.set_buffer_state_for_test(
         repo,
         "suspend-gap-task",
-        true,  // seen_alive
+        false, // seen_alive
         false, // has_output
         chrono::Utc::now() - chrono::Duration::seconds(900),
     )
