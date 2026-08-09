@@ -25,6 +25,7 @@ pub mod review_poll;
 pub mod router;
 pub mod runner;
 pub mod subscribers;
+pub mod suspend;
 pub mod sync;
 pub mod tasks;
 pub mod tick;
@@ -1989,13 +1990,40 @@ pub async fn serve() -> anyhow::Result<()> {
                 // Warn if the tick loop hasn't completed in > 6× the tick interval (at least 60s).
                 let threshold = (tick_interval_secs * 6).max(60);
                 if stale_secs > threshold {
-                    tracing::error!(
-                        stale_secs,
-                        threshold,
-                        "WATCHDOG: tick loop has not completed a tick in {}s (threshold {}s) — possible stall",
-                        stale_secs,
-                        threshold,
-                    );
+                    // A host suspend/resume gap fully explains a stale window that
+                    // isn't an actual stall — the process (and its timers) were
+                    // simply not scheduled while the host was asleep.
+                    if let Some(gap) = crate::engine::suspend::gap_detected_within(
+                        std::time::Duration::from_secs(stale_secs),
+                    ) {
+                        let gap_secs = gap.num_seconds() as u64;
+                        if gap_secs >= stale_secs {
+                            tracing::info!(
+                                stale_secs,
+                                threshold,
+                                suspend_gap_secs = gap_secs,
+                                "tick loop stale window explained by host suspend/resume, not a stall"
+                            );
+                        } else {
+                            tracing::error!(
+                                stale_secs,
+                                threshold,
+                                suspend_gap_secs = gap_secs,
+                                "WATCHDOG: tick loop has not completed a tick in {}s (threshold {}s) — suspend gap of {}s only partially explains the stall",
+                                stale_secs,
+                                threshold,
+                                gap_secs,
+                            );
+                        }
+                    } else {
+                        tracing::error!(
+                            stale_secs,
+                            threshold,
+                            "WATCHDOG: tick loop has not completed a tick in {}s (threshold {}s) — possible stall",
+                            stale_secs,
+                            threshold,
+                        );
+                    }
                 }
             }
         });
@@ -2005,6 +2033,16 @@ pub async fn serve() -> anyhow::Result<()> {
         tokio::select! {
             _ = interval.tick() => {
                 let tick_start = std::time::Instant::now();
+
+                // Detect a host suspend/resume gap once per iteration, in one place.
+                // The watchdog and stuck-task recovery both read from this instead of
+                // re-deriving suspend information from their own wall-clock deltas.
+                if let Some(gap) = crate::engine::suspend::checkpoint() {
+                    tracing::info!(
+                        gap_secs = gap.num_seconds(),
+                        "host suspend/resume gap detected, discounting from stuck-task age checks"
+                    );
+                }
 
                 // Tick weight recovery for rate-limited agents
                 {
