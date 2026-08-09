@@ -1996,12 +1996,25 @@ pub async fn serve() -> anyhow::Result<()> {
                     if let Some(gap) = crate::engine::suspend::gap_detected_within(
                         std::time::Duration::from_secs(stale_secs),
                     ) {
-                        tracing::info!(
-                            stale_secs,
-                            threshold,
-                            suspend_gap_secs = gap.num_seconds(),
-                            "tick loop stale window explained by host suspend/resume, not a stall"
-                        );
+                        let gap_secs = gap.num_seconds() as u64;
+                        if gap_secs >= stale_secs {
+                            tracing::info!(
+                                stale_secs,
+                                threshold,
+                                suspend_gap_secs = gap_secs,
+                                "tick loop stale window explained by host suspend/resume, not a stall"
+                            );
+                        } else {
+                            tracing::error!(
+                                stale_secs,
+                                threshold,
+                                suspend_gap_secs = gap_secs,
+                                "WATCHDOG: tick loop has not completed a tick in {}s (threshold {}s) — suspend gap of {}s only partially explains the stall",
+                                stale_secs,
+                                threshold,
+                                gap_secs,
+                            );
+                        }
                     } else {
                         tracing::error!(
                             stale_secs,
