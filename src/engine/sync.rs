@@ -757,9 +757,14 @@ async fn try_unblock_ci_failure_task(
 /// When all review agents are cooled simultaneously the NeedsReview refire counter can
 /// exhaust (>5 attempts) before any agent becomes available, escalating the task to
 /// `Blocked` with `block_reason = "review agent rebroadcast escalated after repeated
-/// retries"`.  These tasks were never actually reviewed — `review_cycles == 0` is the
-/// distinguishing signal.  Once any review agent is routable again, reset them to
-/// `NeedsReview` and clear the refire counter so the subscriber can pick them up.
+/// retries"`. This exact block_reason is written exclusively by refire-counter
+/// exhaustion (see the three escalation sites that set it), regardless of how many
+/// review cycles preceded it — a task can hit this same cooldown-driven exhaustion on
+/// its first review pass (`review_cycles == 0`) or after surviving an earlier
+/// `CHANGES_REQUESTED` round and re-entering `NeedsReview` for a second pass
+/// (`review_cycles > 0`). The block_reason match alone is a sufficient and exact
+/// signal. Once any review agent is routable again, reset them to `NeedsReview` and
+/// clear the refire counter so the subscriber can pick them up.
 ///
 /// A minimum block age of `MIN_BLOCK_AGE_MINUTES` is enforced so that tasks escalated
 /// in the current tick are not immediately un-blocked by the same tick's recovery pass.
@@ -798,7 +803,7 @@ async fn auto_recover_rebroadcast_blocked_tasks(
     let candidates: Vec<_> = blocked
         .into_iter()
         .filter(|t| {
-            if t.block_reason.as_deref() != Some(REBROADCAST_BLOCK_REASON) || t.review_cycles != 0 {
+            if t.block_reason.as_deref() != Some(REBROADCAST_BLOCK_REASON) {
                 return false;
             }
             // Only recover tasks that have been blocked long enough to rule out
