@@ -4181,6 +4181,84 @@ mod tests {
         assert_eq!(task.status, crate::store::TaskStatus::NeedsReview);
     }
 
+    /// Regression test for #3499: a task blocked with the rebroadcast-escalation
+    /// reason after surviving one review round (`review_cycles > 0`) must be
+    /// recovered back to NeedsReview once review agents are routable again.
+    /// Previously the `review_cycles != 0` filter excluded these tasks, stranding
+    /// them permanently even when agents recovered.
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn auto_recover_rebroadcast_blocked_task_after_review_cycle() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let router = Arc::new(RwLock::new(router_with_healthy_review_agent()));
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "511",
+                title: "Rebroadcast blocked after review",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::Blocked)
+            .await
+            .unwrap();
+        // Mirror the state left by the refire-exhaustion escalation path.
+        store
+            .set_block_reason(
+                id,
+                Some("review agent rebroadcast escalated after repeated retries"),
+            )
+            .await
+            .unwrap();
+        store
+            .set_fields(id, &[("review_cycles", serde_json::json!(1))])
+            .await
+            .unwrap();
+        store
+            .set_fields(id, &[("needs_review_refires", serde_json::json!(6))])
+            .await
+            .unwrap();
+        // Backdate so the MIN_BLOCK_AGE_MINUTES (>=5 min) age filter passes.
+        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        auto_recover_rebroadcast_blocked_tasks("owner/repo", &router, &task_manager, &store)
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(
+            task.status,
+            crate::store::TaskStatus::NeedsReview,
+            "blocked rebroadcast task must be recovered to needs_review"
+        );
+        assert!(
+            task.block_reason.is_none(),
+            "block_reason must be cleared on recovery"
+        );
+        assert_eq!(
+            task.needs_review_refires, 0,
+            "needs_review_refires must be reset to 0 on recovery"
+        );
+    }
+
     /// A fresh InReview task (<1 min old) should NOT be reset — the review
     /// agent may still be starting up.
     #[serial(cooldown_state)]
