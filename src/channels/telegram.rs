@@ -278,6 +278,10 @@ impl Channel for TelegramChannel {
         };
 
         tokio::spawn(async move {
+            const POLL_BACKOFF_BASE: Duration = Duration::from_secs(5);
+            const POLL_BACKOFF_CAP: Duration = Duration::from_secs(60);
+            let mut backoff = POLL_BACKOFF_BASE;
+
             loop {
                 let current_offset = {
                     let off = offset.lock().await;
@@ -287,11 +291,17 @@ impl Channel for TelegramChannel {
                 let updates = match channel.get_updates(current_offset).await {
                     Ok(u) => u,
                     Err(e) => {
-                        tracing::warn!(?e, "failed to get telegram updates");
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        tracing::warn!(
+                            ?e,
+                            backoff_secs = backoff.as_secs(),
+                            "failed to get telegram updates"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(POLL_BACKOFF_CAP);
                         continue;
                     }
                 };
+                backoff = POLL_BACKOFF_BASE;
 
                 let has_updates = !updates.is_empty();
 
