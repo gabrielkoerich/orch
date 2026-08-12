@@ -783,11 +783,22 @@ async fn auto_recover_rebroadcast_blocked_tasks(
 
     // Bail early if no review agents are routable — re-firing while all agents are
     // cooled would immediately re-exhaust the counter.
-    let any_routable = {
+    let (any_routable, available_agent_count, healthy_review_agents) = {
         let r = router.read().await;
-        !r.available_agents.is_empty() && r.healthy_agent_count("review") > 0
+        let healthy_review_agents = r.healthy_agent_count("review");
+        (
+            !r.available_agents.is_empty() && healthy_review_agents > 0,
+            r.available_agents.len(),
+            healthy_review_agents,
+        )
     };
     if !any_routable {
+        tracing::debug!(
+            repo,
+            available_agent_count,
+            healthy_review_agents,
+            "rebroadcast-recovery: skipping this tick — no routable review agents"
+        );
         return Ok(());
     }
 
@@ -800,6 +811,10 @@ async fn auto_recover_rebroadcast_blocked_tasks(
     };
 
     let now = chrono::Utc::now();
+    let rebroadcast_blocked_count = blocked
+        .iter()
+        .filter(|t| t.block_reason.as_deref() == Some(REBROADCAST_BLOCK_REASON))
+        .count();
     let candidates: Vec<_> = blocked
         .into_iter()
         .filter(|t| {
@@ -819,6 +834,14 @@ async fn auto_recover_rebroadcast_blocked_tasks(
         .collect();
 
     if candidates.is_empty() {
+        if rebroadcast_blocked_count > 0 {
+            tracing::debug!(
+                repo,
+                rebroadcast_blocked_count,
+                min_block_age_minutes = MIN_BLOCK_AGE_MINUTES,
+                "rebroadcast-recovery: skipping this tick — matching blocked tasks found but none old enough yet"
+            );
+        }
         return Ok(());
     }
 
