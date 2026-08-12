@@ -424,17 +424,8 @@ impl Router {
         // `orch cooldown list` simultaneously reporting "No active cooldowns".
         sync_from_kv(store).await;
 
-        let config_ref = &self.config;
         let agents = self.available_agents.clone();
-        let model_checker = |agent: &str| -> bool {
-            // Agent has at least one available model across any complexity tier
-            for comp in &["simple", "medium", "complex", "review"] {
-                if config_ref.has_available_model_for_complexity(agent, comp) {
-                    return true;
-                }
-            }
-            false
-        };
+        let model_checker = |agent: &str| -> bool { self.agent_has_any_available_model(agent) };
         refresh_degraded_agents(
             store,
             &agents,
@@ -448,6 +439,15 @@ impl Router {
     /// Check if an agent is available.
     pub fn is_agent_available(&self, agent: &str) -> bool {
         self.available_agents.contains(&agent.to_string())
+    }
+
+    /// True if the agent has at least one uncooled model across any complexity
+    /// tier. Used where the eventual complexity isn't known yet (e.g. before
+    /// LLM classification), so we can't check a single tier.
+    fn agent_has_any_available_model(&self, agent: &str) -> bool {
+        ["simple", "medium", "complex", "review"]
+            .iter()
+            .any(|comp| self.config.has_available_model_for_complexity(agent, comp))
     }
 
     fn agent_is_routable(&self, agent: &str, complexity: &str) -> bool {
@@ -1193,13 +1193,20 @@ impl Router {
         task: &ExternalTask,
         repo: &str,
     ) -> anyhow::Result<RouteResult> {
-        // Filter out cooled and degraded agents so the LLM only sees available ones.
+        // Filter out cooled and degraded agents, and agents whose every
+        // configured model (across all complexity tiers, since the eventual
+        // complexity isn't known yet) is itself cooled, so the LLM only sees
+        // candidates that could actually be dispatched.
         // Fall back to the full list if all agents are cooled/degraded.
         // Cloned to avoid borrow conflict with &mut self in the loop.
         let uncooled_agents: Vec<String> = self
             .available_agents
             .iter()
-            .filter(|a| !is_agent_in_cooldown(a) && !is_agent_degraded(a))
+            .filter(|a| {
+                !is_agent_in_cooldown(a)
+                    && !is_agent_degraded(a)
+                    && self.agent_has_any_available_model(a)
+            })
             .cloned()
             .collect();
         if uncooled_agents.is_empty() {
@@ -3115,5 +3122,88 @@ Hope that helps!"#;
 
         // Cleanup
         clear_agent_degraded(agent);
+    }
+
+    // ---- route_with_llm candidate filter: agents with all models cooled (#3509) ----
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn agent_has_any_available_model_false_when_only_model_cooled() {
+        crate::engine::cooldown::reset_global_state().await;
+        let mut config = RouterConfig::default();
+        // Agent's only model, shared across every complexity tier it resolves to.
+        for tier in ["simple", "medium", "complex", "review"] {
+            config
+                .model_map
+                .entry(tier.to_string())
+                .or_default()
+                .insert(
+                    "test_all_cooled".to_string(),
+                    vec!["only-model".to_string()],
+                );
+        }
+
+        let mut router = Router::new(config);
+        router.available_agents = vec!["test_all_cooled".to_string()];
+
+        assert!(router.agent_has_any_available_model("test_all_cooled"));
+
+        record_model_failure("test_all_cooled", "only-model").await;
+        assert!(is_model_in_cooldown("test_all_cooled", "only-model"));
+
+        assert!(
+            !router.agent_has_any_available_model("test_all_cooled"),
+            "agent with its only model cooled across every tier should have no available model"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn llm_candidate_excludes_agent_with_all_models_cooled() {
+        // Regression test for #3509: route_with_llm's candidate filter must exclude an
+        // agent that has no agent-level cooldown but whose only resolvable model (across
+        // every complexity tier) is cooled, so it is never handed to the LLM classifier.
+        crate::engine::cooldown::reset_global_state().await;
+        let mut config = RouterConfig::default();
+        for tier in ["simple", "medium", "complex", "review"] {
+            config
+                .model_map
+                .entry(tier.to_string())
+                .or_default()
+                .insert("agent_cooled_model".to_string(), vec!["opus".to_string()]);
+            config
+                .model_map
+                .get_mut(tier)
+                .unwrap()
+                .insert("agent_healthy".to_string(), vec!["model-x".to_string()]);
+        }
+
+        let mut router = Router::new(config);
+        router.available_agents = vec![
+            "agent_cooled_model".to_string(),
+            "agent_healthy".to_string(),
+        ];
+
+        record_model_failure("agent_cooled_model", "opus").await;
+        assert!(is_model_in_cooldown("agent_cooled_model", "opus"));
+        // No agent-level cooldown — the old agent-only filter would still offer it.
+        assert!(!is_agent_in_cooldown("agent_cooled_model"));
+
+        let uncooled_agents: Vec<String> = router
+            .available_agents
+            .iter()
+            .filter(|a| {
+                !is_agent_in_cooldown(a)
+                    && !is_agent_degraded(a)
+                    && router.agent_has_any_available_model(a)
+            })
+            .cloned()
+            .collect();
+
+        assert_eq!(
+            uncooled_agents,
+            vec!["agent_healthy".to_string()],
+            "agent whose only model is cooled must be excluded from the LLM candidate list"
+        );
     }
 }
