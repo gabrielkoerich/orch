@@ -69,9 +69,18 @@ fn update_discovered_models_cache(
             cached_models = guard.1.len(),
             "opencode model discovery returned empty; preserving previous cache contents"
         );
+        // Still advance the timestamp so a persistently-failing discovery
+        // backs off for the full TTL window instead of being retried on
+        // every subsequent call.
+        guard.0 = now;
         return;
     }
 
+    tracing::debug!(
+        cache = cache_name,
+        discovered_models = discovered.len(),
+        "opencode model discovery refreshed cache"
+    );
     *guard = (now, discovered);
 }
 
@@ -1535,7 +1544,9 @@ mod tests {
         update_discovered_models_cache(cache, Vec::new(), "free");
 
         let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(guard.0, 123);
+        // Timestamp must advance on a failed refresh so the TTL provides a
+        // real backoff window instead of retrying on every subsequent call.
+        assert!(guard.0 > 123);
         assert_eq!(guard.1, vec!["opencode/model-free".to_string()]);
     }
 
@@ -1557,7 +1568,7 @@ mod tests {
         update_discovered_models_cache(cache, Vec::new(), "all");
 
         let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(guard.0, 456);
+        assert!(guard.0 > 456);
         assert_eq!(
             guard.1,
             vec![
