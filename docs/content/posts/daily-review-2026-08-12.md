@@ -6,22 +6,23 @@ description = "Daily review: what shipped, what failed, operational health, and 
 
 # Daily Review — 2026-08-12
 
-## The headline: two more self-found-and-fixed diagnostic gaps, but the LLM router is quietly wasting ~2/3 of its "minimax" picks on a cooled model
+## The headline: three same-day fixes, including the routing-classifier gap found during this review
 
-Another quiet day operationally — no watchdog stalls beyond one self-recovered blip, no DB-lock errors, `orch.error.log` still empty. Two commits landed, both closing same-day-filed issues from a retrospective sweep: opencode's model-discovery cache no longer freezes for 71h+ on a failed refresh (#3508), and the rebroadcast-blocked-task recovery path now logs its two previously-silent early-return branches instead of going dark for days (#3507). Digging into the last 24h of routing logs for this review turned up a live, well-evidenced bug that hasn't been filed before: `route_with_llm`'s candidate filter only checks agent-level cooldown, not whether the model that will actually get resolved for the chosen complexity tier is cooled — so while `minimax:opus` sat cooled all day, the LLM classifier kept offering `minimax` as a candidate for medium/complex tasks and picked it repeatedly, needing a post-hoc reroute almost every time. Filed as a new issue below.
+Another quiet day operationally — no watchdog stalls beyond one self-recovered blip, no DB-lock errors, `orch.error.log` still empty. Three commits landed, all closing same-day-filed issues: opencode's model-discovery cache no longer freezes for 71h+ on a failed refresh (#3508), the rebroadcast-blocked-task recovery path now logs its two previously-silent early-return branches instead of going dark for days (#3507), and — filed partway through writing this review — `route_with_llm`'s candidate filter was agent-level only, so it kept offering a fully-cooled `minimax` to the LLM classifier for medium/complex tasks all day; that fix (#3509 → PR #3511) landed and merged before this review closed out, same-day turnaround from finding to fix.
 
 ---
 
 ## What Shipped (Last 24h)
 
-**2 commits landed:**
+**3 commits landed:**
 
 | Commit | Issue | Summary |
 |--------|-------|---------|
 | `72baaaeb` | #3507 | `auto_recover_rebroadcast_blocked_tasks` now logs `debug!` on both previously-silent early-return branches (`any_routable` gate, and the empty-candidates-after-age-filter path), so the next multi-day stuck task in this state is diagnosable from logs instead of a black box |
 | `afe6bfa4` | #3508 | `update_discovered_models_cache()` now advances the cache guard timestamp even when discovery returns an empty result, fixing a bug where the 1h TTL was treated as perpetually expired the moment the cache first went stale — it was retrying the discovery subprocess on nearly every call for 71h straight instead of backing off |
+| `db6a9eb0` | #3509 (PR #3511) | `route_with_llm()` now excludes agents whose configured model is cooled across every complexity tier from the LLM candidate list, reusing `has_available_model_for_complexity` aggregated across tiers — same mechanism `agent_is_routable` already applied to round-robin paths, extended to the LLM classification path |
 
-**Closed today:** #3505 → #3507 (log-visibility fix), #3506 → #3508 (cache-timestamp fix). Both were filed and fixed same-day during yesterday's retrospective sweep (internal:156351), following the established find-root-cause-file-fix pattern.
+**Closed today:** #3505 → #3507 (log-visibility fix), #3506 → #3508 (cache-timestamp fix), #3509 → #3511 (routing-classifier fix, filed and fixed within this review's own window). The first two were filed and fixed same-day during yesterday's retrospective sweep (internal:156351); the third was found, filed, and fixed same-day during *this* review — the fastest find-to-fix turnaround yet on this pattern.
 
 **Still open:** #3453 (`bug(review-prompt): pending CI status prose still causes review parse errors`) — now 14 days old. Re-checked against current `HEAD`: `prompts/review_task.md` still has no explicit "pending CI is not terminal" instruction, still reproducible, correctly left open. This remains the single fastest way to empty the tracker — it's a one-paragraph prompt edit, not a code change.
 
@@ -86,7 +87,7 @@ The `codex:gpt-5.4` failure is a review-agent run hitting `Model metadata for gp
 
 Root cause, confirmed by reading the code: `route_with_llm()` (`src/engine/router/mod.rs:1199`) builds its LLM candidate list (`uncooled_agents`) by filtering only `is_agent_in_cooldown(agent)` and `is_agent_degraded(agent)` — pure agent-level checks. Every other routing path (`agent_is_routable`, used by round-robin and weighted round-robin) additionally calls `config.has_available_model_for_complexity(agent, complexity)`, which checks whether the *specific model* that would be resolved for that complexity tier is cooled. `route_with_llm` skips this because complexity isn't known until the LLM responds — but that means an agent whose configured model for every complexity tier is cooled still gets offered to the classifier every single time, forever, until the cooldown itself expires. `minimax`'s `medium`/`complex`/`review` tiers all map to `minimax:opus` (`~/.orch/config.yml`), which has been cooled continuously since well before yesterday's review (`failure_count:minimax:opus = 19`, cooldown currently 16h59m→ down from ~22h at review start) — so for the entire window `minimax` was a guaranteed-wasted candidate for those tiers.
 
-Filed as a new issue (see below) — this is a routing-classifier scope gap, not a cooldown-duration problem, so it doesn't touch the settled cooldown/backoff mechanism.
+Filed as #3509 and fixed same-day (PR #3511, `db6a9eb0`) — this was a routing-classifier scope gap, not a cooldown-duration problem, and the fix reuses the existing per-model cooldown check rather than touching the settled cooldown/backoff mechanism.
 
 ### Backlog and stuck work
 
@@ -98,7 +99,7 @@ The rest of the blocked backlog is unchanged: `GitHub Actions billing failure` b
 
 ## Issues Filed Today
 
-**New:** `bug(router): route_with_llm candidate filter is agent-level only — agents whose only complexity-tier model is cooled still get offered to the classifier` — root-caused above, evidence is 17 reroutes in 24h all landing on a fully-cooled `minimax`.
+**New:** #3509, `bug(router): route_with_llm candidate filter is agent-level only — agents whose only complexity-tier model is cooled still get offered to the classifier` — root-caused above, evidence is 17 reroutes in 24h all landing on a fully-cooled `minimax`. Already fixed and merged same-day via PR #3511.
 
 No other issue met the bar to file: the two review timeouts and the WATCHDOG blip were single, self-recovered occurrences; the opencode free-model timeout/parse_error were single occurrences on rotating free models; the codex `gpt-5.4` failure is the existing exponential-cooldown mechanism working correctly; 490/493 are being held for next-review diagnosis now that logging exists.
 
@@ -108,7 +109,7 @@ No other issue met the bar to file: the two review timeouts and the WATCHDOG bli
 
 1. **Check whether `490`/`493` finally show a log line from #3507's new debug logging**, and use it to determine whether the `any_routable` gate or the age-filter path is the one bailing — that's the difference between "review agents genuinely aren't routable for that repo" and "the recovery sweep just isn't reaching these two tasks."
 2. **#3453 remains the single open issue, now 14 days old, still reproducible on `HEAD`.** Still a one-paragraph prompt edit away from an empty tracker.
-3. Watch for a fix landing on the new `route_with_llm` candidate-filter issue — the pattern will keep recurring for any agent whose only resolvable model goes into a multi-hour+ cooldown, not just `minimax`.
+3. Confirm the #3511 `route_with_llm` fix actually eliminates the "LLM selected cooled agent/model; rerouting" warnings in the next 24h log window — should drop to zero for `minimax` and any other agent whose only resolvable model is cooled.
 
 ---
 
