@@ -1084,12 +1084,37 @@ pub fn find_opencode_result(ndjson: &str) -> Option<super::AgentResult> {
         extract_ndjson_text(&events).unwrap_or_default()
     };
 
-    if result_text.is_empty() && !is_error {
-        return None;
-    }
-
     // Extract tokens from step_finish
     let (input_tokens, output_tokens) = runner.extract_tokens(&events);
+
+    // The model was cut off for exceeding its output/reasoning token budget,
+    // not because it produced malformed prose. Distinguish this from a
+    // generic parse failure so callers don't apply the long
+    // format-incapable-model cooldown for a token-budget fluke. A reasoning
+    // model that spends its entire budget on hidden reasoning emits zero
+    // text and a final step_finish of reason="length" (or opencode's
+    // "unknown" with all-zero tokens) — same failure mode, must be computed
+    // before the empty-text early return below or it never gets checked.
+    let last_step_finish_reason = events
+        .iter()
+        .rev()
+        .find(|event| event.get("type").and_then(|v| v.as_str()) == Some("step_finish"))
+        .and_then(|event| {
+            event
+                .get("part")?
+                .get("reason")?
+                .as_str()
+                .map(str::to_string)
+        });
+    let truncated_by_length = match last_step_finish_reason.as_deref() {
+        Some("length") => true,
+        Some("unknown") => output_tokens == Some(0),
+        _ => false,
+    };
+
+    if result_text.is_empty() && !is_error && !truncated_by_length {
+        return None;
+    }
 
     // Extract cost from step_finish if available
     let cost_usd = events.iter().rev().find_map(|event| {
@@ -1103,17 +1128,6 @@ pub fn find_opencode_result(ndjson: &str) -> Option<super::AgentResult> {
             None
         }
     });
-
-    // The model was cut off for exceeding its output/reasoning token budget,
-    // not because it produced malformed prose. Distinguish this from a
-    // generic parse failure so callers don't apply the long
-    // format-incapable-model cooldown for a token-budget fluke.
-    let truncated_by_length = events
-        .iter()
-        .rev()
-        .find(|event| event.get("type").and_then(|v| v.as_str()) == Some("step_finish"))
-        .and_then(|event| event.get("part")?.get("reason")?.as_str())
-        .is_some_and(|reason| reason == "length");
 
     Some(super::AgentResult {
         is_error,
@@ -1772,6 +1786,56 @@ mod tests {
         let result = find_opencode_result(ndjson).expect("should find result");
         assert!(result.truncated_by_length);
         assert!(!result.is_error, "length truncation is not a hard error");
+    }
+
+    /// A reasoning model can burn its entire budget on hidden reasoning and
+    /// emit zero text before step_finish reason=length. The old early return
+    /// on empty result_text bailed out with None before truncated_by_length
+    /// was ever computed, so this got misclassified as parse_error and hit
+    /// the 4h-7d persistent-model cooldown instead of standard backoff.
+    #[test]
+    fn find_opencode_result_zero_output_length_truncation() {
+        let ndjson = concat!(
+            r#"{"type":"step_start","timestamp":1000,"part":{"type":"step-start"}}"#,
+            "\n",
+            r#"{"type":"step_finish","timestamp":1002,"part":{"type":"step-finish","reason":"length","tokens":{"total":71482,"input":39482,"output":0,"reasoning":40000}}}"#,
+        );
+        let result = find_opencode_result(ndjson).expect("should find result, not None");
+        assert!(result.truncated_by_length);
+        assert!(!result.is_error);
+        assert!(result.result_text.is_empty());
+    }
+
+    /// opencode also emits reason="unknown" with all-zero tokens for the same
+    /// zero-output failure mode — must be treated as an equivalent signal.
+    #[test]
+    fn find_opencode_result_zero_output_unknown_reason_truncation() {
+        let ndjson = concat!(
+            r#"{"type":"step_start","timestamp":1000,"part":{"type":"step-start"}}"#,
+            "\n",
+            r#"{"type":"step_finish","timestamp":1002,"part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0}}}"#,
+        );
+        let result = find_opencode_result(ndjson).expect("should find result, not None");
+        assert!(result.truncated_by_length);
+        assert!(!result.is_error);
+        assert!(result.result_text.is_empty());
+    }
+
+    /// reason="unknown" with nonzero output tokens means the model did
+    /// produce something and the step just wasn't cleanly terminated — not
+    /// the same "wrote nothing" signal, so it must not be flagged.
+    #[test]
+    fn find_opencode_result_unknown_reason_with_output_not_truncated() {
+        let ndjson = concat!(
+            r#"{"type":"step_start","timestamp":1000,"part":{"type":"step-start"}}"#,
+            "\n",
+            r#"{"type":"text","timestamp":1001,"part":{"type":"text","text":"partial answer"}}"#,
+            "\n",
+            r#"{"type":"step_finish","timestamp":1002,"part":{"type":"step-finish","reason":"unknown","tokens":{"input":100,"output":50,"reasoning":0}}}"#,
+        );
+        let result = find_opencode_result(ndjson).expect("should find result");
+        assert!(!result.truncated_by_length);
+        assert!(!result.is_error);
     }
 
     #[test]
