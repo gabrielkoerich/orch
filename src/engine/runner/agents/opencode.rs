@@ -59,6 +59,7 @@ fn update_discovered_models_cache(
     cache: &Mutex<(i64, Vec<String>)>,
     discovered: Vec<String>,
     cache_name: &'static str,
+    empty_reason: &'static str,
 ) {
     let now = chrono::Utc::now().timestamp();
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -67,6 +68,7 @@ fn update_discovered_models_cache(
         tracing::warn!(
             cache = cache_name,
             cached_models = guard.1.len(),
+            reason = empty_reason,
             "opencode model discovery returned empty; preserving previous cache contents"
         );
         // Still advance the timestamp so a persistently-failing discovery
@@ -789,13 +791,19 @@ pub fn discover_free_opencode_models() -> Vec<String> {
             let _guard = scopeguard::guard((), |_| {
                 FREE_MODELS_REFRESH_IN_PROGRESS.store(false, Ordering::Release);
             });
-            let discovered = run_opencode_models_discovery_async()
-                .await
+            let (models, empty_reason) = run_opencode_models_discovery_async().await;
+            let raw_count = models.len();
+            let discovered = models
                 .into_iter()
                 .filter(|m| m.to_lowercase().contains("free"))
                 .collect::<Vec<_>>();
+            let empty_reason = if discovered.is_empty() && raw_count > 0 {
+                "no_free_models_in_catalog"
+            } else {
+                empty_reason
+            };
             let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
-            update_discovered_models_cache(cache, discovered, "free");
+            update_discovered_models_cache(cache, discovered, "free", empty_reason);
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             // Use the current tokio runtime's handle to spawn the async discovery task,
@@ -838,9 +846,9 @@ pub fn discover_opencode_models() -> Vec<String> {
             let _guard = scopeguard::guard((), |_| {
                 ALL_MODELS_REFRESH_IN_PROGRESS.store(false, Ordering::Release);
             });
-            let discovered = run_opencode_models_discovery_async().await;
+            let (discovered, empty_reason) = run_opencode_models_discovery_async().await;
             let cache = ALL_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
-            update_discovered_models_cache(cache, discovered, "all");
+            update_discovered_models_cache(cache, discovered, "all", empty_reason);
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(refresh);
@@ -867,7 +875,7 @@ pub fn discover_opencode_models() -> Vec<String> {
 pub fn prime_free_model_cache() {
     let discovered_all = std::thread::spawn(|| {
         if let Ok(rt) = tokio::runtime::Runtime::new() {
-            rt.block_on(run_opencode_models_discovery_async())
+            rt.block_on(run_opencode_models_discovery_async()).0
         } else {
             vec![]
         }
@@ -894,10 +902,16 @@ pub fn prime_free_model_cache() {
 
 /// Async version of `run_opencode_models_discovery` that uses `tokio::time::sleep`
 /// instead of blocking `std::thread::sleep`.
-async fn run_opencode_models_discovery_async() -> Vec<String> {
+///
+/// Returns the discovered models plus a reason code describing why the list
+/// is empty (`"ok"` when discovery actually succeeded with a non-empty
+/// result). The reason is threaded into `update_discovered_models_cache` so
+/// the "returned empty" warning says which of the failure branches fired,
+/// without requiring `RUST_LOG=debug` in production.
+async fn run_opencode_models_discovery_async() -> (Vec<String>, &'static str) {
     if !crate::cmd_cache::command_exists("opencode") {
-        tracing::debug!("opencode not in PATH — skipping free model discovery");
-        return vec![];
+        tracing::warn!("opencode not in PATH — skipping model discovery");
+        return (vec![], "command_not_found");
     }
 
     let mut child = match tokio::process::Command::new("opencode")
@@ -908,8 +922,8 @@ async fn run_opencode_models_discovery_async() -> Vec<String> {
     {
         Ok(c) => c,
         Err(e) => {
-            tracing::debug!(error = %e, "failed to spawn opencode models");
-            return vec![];
+            tracing::warn!(error = %e, "failed to spawn opencode models");
+            return (vec![], "spawn_failed");
         }
     };
 
@@ -928,29 +942,35 @@ async fn run_opencode_models_discovery_async() -> Vec<String> {
                     }
                     None => String::new(),
                 };
-                return stdout
+                let models: Vec<String> = stdout
                     .lines()
                     .map(|l| l.trim().to_string())
                     .filter(|l| !l.is_empty())
                     .collect();
+                let reason = if models.is_empty() {
+                    "empty_output"
+                } else {
+                    "ok"
+                };
+                return (models, reason);
             }
             Ok(Some(status)) => {
-                tracing::debug!(?status, "opencode models command failed");
-                return vec![];
+                tracing::warn!(?status, "opencode models command failed");
+                return (vec![], "exit_status_failure");
             }
             Ok(None) => {
                 if start.elapsed() > timeout {
                     tracing::warn!("opencode models timed out after 30s, killing process");
                     let _ = child.kill().await;
                     let _ = child.wait().await;
-                    return vec![];
+                    return (vec![], "timeout");
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
             Err(e) => {
-                tracing::debug!(error = %e, "failed to wait on opencode models");
+                tracing::warn!(error = %e, "failed to wait on opencode models");
                 let _ = child.kill().await;
-                return vec![];
+                return (vec![], "wait_failed");
             }
         }
     }
@@ -1555,7 +1575,7 @@ mod tests {
             *guard = (123, vec!["opencode/model-free".to_string()]);
         }
 
-        update_discovered_models_cache(cache, Vec::new(), "free");
+        update_discovered_models_cache(cache, Vec::new(), "free", "empty_output");
 
         let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         // Timestamp must advance on a failed refresh so the TTL provides a
@@ -1579,7 +1599,7 @@ mod tests {
             );
         }
 
-        update_discovered_models_cache(cache, Vec::new(), "all");
+        update_discovered_models_cache(cache, Vec::new(), "all", "exit_status_failure");
 
         let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         assert!(guard.0 > 456);
@@ -1597,7 +1617,7 @@ mod tests {
         reset_model_caches_for_test();
         let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
 
-        update_discovered_models_cache(cache, Vec::new(), "free");
+        update_discovered_models_cache(cache, Vec::new(), "free", "command_not_found");
 
         let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         assert!(guard.0 > 0);
