@@ -664,6 +664,24 @@ pub(crate) async fn tick_recover_stuck_tasks(
             continue;
         };
 
+        // A dead tmux session with no `updated_at` refresh in a long time normally means
+        // the runner vanished (crashed, orch restarted). But it also matches the tail end
+        // of a *successful* run: the session exits the instant the agent finishes, while
+        // the runner is still polling for that exit (up to its own poll interval) and then
+        // writing results. If the runner's dispatch guard for this task is still held, the
+        // runner is alive and actively processing — let it finish rather than racing it.
+        if !timing.has_session {
+            let dispatch_key = format!("{repo}/{}", task.id.0);
+            if dispatching.contains_key(&dispatch_key) {
+                tracing::debug!(
+                    task_id = task.id.0,
+                    age_mins = timing.age.num_minutes(),
+                    "skipping stuck-task reclaim: runner still actively processing this task"
+                );
+                continue;
+            }
+        }
+
         if timing.has_session {
             tracing::warn!(
                 task_id = task.id.0,
@@ -949,6 +967,22 @@ pub(crate) async fn tick_recover_stuck_tasks(
             continue;
         };
 
+        // See the comment on the in-progress loop above: a dead session with a stale
+        // `updated_at` also matches the tail end of a run that just finished successfully.
+        // Skip the reclaim while the runner's dispatch guard for this task is still held.
+        if !timing.has_session {
+            let dispatch_key = format!("{}/{external_id}", task.repo);
+            if dispatching.contains_key(&dispatch_key) {
+                tracing::debug!(
+                    task_id = task.id,
+                    repo = %task.repo,
+                    age_mins = timing.age.num_minutes(),
+                    "skipping cross-repo stuck-task reclaim: runner still actively processing this task"
+                );
+                continue;
+            }
+        }
+
         if timing.has_session {
             tracing::warn!(
                 task_id = task.id,
@@ -1060,6 +1094,23 @@ pub(crate) async fn tick_recover_stuck_tasks(
         ) else {
             continue;
         };
+
+        // See the comment on the external in-progress loop above: a dead session with a
+        // stale `updated_at` also matches the tail end of a run that just finished
+        // successfully. Skip the reclaim while the runner's dispatch guard for this task
+        // is still held — this is the exact race that discards completed daily/scheduled
+        // internal tasks whose total runtime exceeds `no_session_stuck_timeout`.
+        if !timing.has_session {
+            let dispatch_key = format!("{repo}/{task_id}");
+            if dispatching.contains_key(&dispatch_key) {
+                tracing::debug!(
+                    task_id,
+                    age_mins = timing.age.num_minutes(),
+                    "skipping stuck-task reclaim: runner still actively processing this task"
+                );
+                continue;
+            }
+        }
 
         if timing.has_session {
             tracing::warn!(
@@ -3252,6 +3303,126 @@ mod tests {
         assert_eq!(
             runs[0].error,
             "stuck-task recovery: internal no session found"
+        );
+    }
+
+    /// Regression test for #3518: a completed agent run must not be discarded by the
+    /// stuck-task reclaim just because its tmux session has already exited.
+    ///
+    /// In production, sessions are created without `remain-on-exit`, so once the agent
+    /// process exits tmux removes the session immediately — there is no observable
+    /// "dead pane" state for `tick_check_session_completions` to catch, and the runner's
+    /// own `store_touch_updated_at` only fires after its own poll notices the exit (up to
+    /// its 5s poll interval) plus post-processing. For a task whose total runtime already
+    /// exceeds `no_session_stuck_timeout`, the very next tick that observes the (now
+    /// absent) session would otherwise reclaim it instantly — discarding a successful run.
+    ///
+    /// The fix: `tick_recover_stuck_tasks` skips the no-session reclaim while the task's
+    /// dispatch guard (the in-memory `dispatching` map keyed by "{repo}/{task_id}",
+    /// populated for the entire duration of `runner.run_with_context`) is still held —
+    /// i.e. while this process is still actively running the task, regardless of tmux
+    /// session state.
+    #[tokio::test]
+    async fn recover_stuck_tasks_skips_reclaim_while_dispatch_guard_held() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let mock = MockBackend::new();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(TmuxManager::new());
+        let config = EngineConfig {
+            no_session_stuck_timeout: 600,
+            stuck_timeout: 1800,
+            ..EngineConfig::default()
+        };
+
+        let id = store
+            .create_internal(
+                "owner/repo",
+                "Long-running daily job",
+                "",
+                "cron",
+                "1",
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .set_fields(
+                id,
+                &[
+                    ("agent", serde_json::json!("claude")),
+                    ("model", serde_json::json!("sonnet")),
+                    ("route_attempts", serde_json::json!(1)),
+                ],
+            )
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::InProgress)
+            .await
+            .unwrap();
+        // Simulate a task that has already run well past no_session_stuck_timeout,
+        // as a legitimately long agent run would.
+        set_task_updated_at_past(&store, id).await;
+
+        // Simulate the runner still actively processing this task: its dispatch guard
+        // is held even though the tmux session (empty session_map below) is already gone.
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+        dispatching.insert(
+            format!("owner/repo/internal:{id}"),
+            format!("internal:{id}"),
+        );
+
+        tick_recover_stuck_tasks(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &task_manager,
+            &config,
+            &store,
+            &std::collections::HashMap::new(),
+            &cooled_review_router_for_test(),
+            &dispatching,
+        )
+        .await
+        .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(
+            task.status,
+            crate::store::TaskStatus::InProgress,
+            "task should not be reclaimed while its dispatch guard is still held"
+        );
+
+        // No run should have been finalized/aborted either.
+        let runs = store.get_runs(id).await.unwrap();
+        assert!(runs.is_empty());
+
+        // Once the guard is released (runner finished), the very same conditions should
+        // reclaim the task as before — the fix must not disable the safety net entirely.
+        dispatching.clear();
+        tick_recover_stuck_tasks(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &task_manager,
+            &config,
+            &store,
+            &std::collections::HashMap::new(),
+            &cooled_review_router_for_test(),
+            &dispatching,
+        )
+        .await
+        .unwrap();
+        let task = store.get(id).await.unwrap();
+        assert_eq!(
+            task.status,
+            crate::store::TaskStatus::New,
+            "task should still be reclaimed once the dispatch guard is released"
         );
     }
 
