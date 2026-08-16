@@ -450,6 +450,20 @@ impl Router {
             .any(|comp| self.config.has_available_model_for_complexity(agent, comp))
     }
 
+    /// True if the agent has an available (uncooled) model for the `medium`
+    /// and `complex` tiers — the tiers real coding tasks are classified into
+    /// by the LLM classifier. Used to pre-filter the candidate list handed to
+    /// that classifier so an agent whose healthy tiers are only `simple` isn't
+    /// offered: the classifier can't be constrained to `simple`, so offering
+    /// such an agent produces a near-certain wasted classification call whenever
+    /// it picks `medium`/`complex` (issue #3521). `review` is not a candidate
+    /// outcome of initial classification and is deliberately excluded.
+    fn agent_has_available_model_for_coding_tiers(&self, agent: &str) -> bool {
+        ["medium", "complex"]
+            .iter()
+            .all(|comp| self.config.has_available_model_for_complexity(agent, comp))
+    }
+
     fn agent_is_routable(&self, agent: &str, complexity: &str) -> bool {
         if !self.is_agent_available(agent) {
             return false;
@@ -1193,10 +1207,13 @@ impl Router {
         task: &ExternalTask,
         repo: &str,
     ) -> anyhow::Result<RouteResult> {
-        // Filter out cooled and degraded agents, and agents whose every
-        // configured model (across all complexity tiers, since the eventual
-        // complexity isn't known yet) is itself cooled, so the LLM only sees
-        // candidates that could actually be dispatched.
+        // Filter out cooled and degraded agents, and agents without an available
+        // model for the coding tiers (`medium`/`complex`) that real tasks are
+        // classified into, so the LLM only sees candidates that could actually
+        // be dispatched for whatever complexity it picks. An agent whose only
+        // healthy tier is `simple` is excluded too: the classifier can't be
+        // constrained to `simple`, so leaving such an agent in would waste the
+        // call whenever it picks `medium`/`complex` (issue #3521).
         // Fall back to the full list if all agents are cooled/degraded.
         // Cloned to avoid borrow conflict with &mut self in the loop.
         let uncooled_agents: Vec<String> = self
@@ -1205,7 +1222,7 @@ impl Router {
             .filter(|a| {
                 !is_agent_in_cooldown(a)
                     && !is_agent_degraded(a)
-                    && self.agent_has_any_available_model(a)
+                    && self.agent_has_available_model_for_coding_tiers(a)
             })
             .cloned()
             .collect();
@@ -3195,7 +3212,7 @@ Hope that helps!"#;
             .filter(|a| {
                 !is_agent_in_cooldown(a)
                     && !is_agent_degraded(a)
-                    && router.agent_has_any_available_model(a)
+                    && router.agent_has_available_model_for_coding_tiers(a)
             })
             .cloned()
             .collect();
@@ -3204,6 +3221,75 @@ Hope that helps!"#;
             uncooled_agents,
             vec!["agent_healthy".to_string()],
             "agent whose only model is cooled must be excluded from the LLM candidate list"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn llm_candidate_excludes_agent_with_only_simple_tier_uncooled() {
+        // Regression test for #3521: an agent whose only healthy tier is `simple`
+        // (its `medium`/`complex` tiers resolve to the same cooled model) must be
+        // excluded from the LLM classification candidate list, otherwise the
+        // classifier can pick it for a `medium`/`complex` task it can't serve,
+        // wasting the classification call. Mirrors the real-world shape where
+        // `simple` → sonnet (uncooled) and `medium`/`complex` → opus (cooled).
+        crate::engine::cooldown::reset_global_state().await;
+        let mut config = RouterConfig::default();
+        config
+            .model_map
+            .entry("simple".to_string())
+            .or_default()
+            .insert("minimax_like".to_string(), vec!["sonnet".to_string()]);
+        config
+            .model_map
+            .entry("medium".to_string())
+            .or_default()
+            .insert("minimax_like".to_string(), vec!["opus".to_string()]);
+        config
+            .model_map
+            .entry("complex".to_string())
+            .or_default()
+            .insert("minimax_like".to_string(), vec!["opus".to_string()]);
+        // review must be irrelevant to the coding-tier filter
+        config
+            .model_map
+            .entry("review".to_string())
+            .or_default()
+            .insert("minimax_like".to_string(), vec!["opus".to_string()]);
+        for tier in ["simple", "medium", "complex", "review"] {
+            config
+                .model_map
+                .get_mut(tier)
+                .unwrap()
+                .insert("agent_healthy".to_string(), vec!["model-x".to_string()]);
+        }
+
+        let mut router = Router::new(config);
+        router.available_agents = vec!["minimax_like".to_string(), "agent_healthy".to_string()];
+
+        record_model_failure("minimax_like", "opus").await;
+        assert!(is_model_in_cooldown("minimax_like", "opus"));
+        // No agent-level cooldown, and the simple tier is healthy, so the loose
+        // "any tier" check still passes — this is exactly the leak #3511 missed.
+        assert!(!is_agent_in_cooldown("minimax_like"));
+        assert!(router.agent_has_any_available_model("minimax_like"));
+        assert!(!router.agent_has_available_model_for_coding_tiers("minimax_like"));
+
+        let uncooled_agents: Vec<String> = router
+            .available_agents
+            .iter()
+            .filter(|a| {
+                !is_agent_in_cooldown(a)
+                    && !is_agent_degraded(a)
+                    && router.agent_has_available_model_for_coding_tiers(a)
+            })
+            .cloned()
+            .collect();
+
+        assert_eq!(
+            uncooled_agents,
+            vec!["agent_healthy".to_string()],
+            "agent with only its simple tier uncooled must be excluded from the LLM candidate list"
         );
     }
 }
