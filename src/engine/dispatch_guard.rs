@@ -95,6 +95,11 @@ impl DispatchGuard {
 impl Drop for DispatchGuard {
     fn drop(&mut self) {
         self.map.remove(&self.key);
+        // Deliberately logged at drop time (not just claim time): this is the only
+        // signal that lets a future stuck-task-reclaim race be diagnosed from logs
+        // by comparing this timestamp against the reclaim check's own log line for
+        // the same key, instead of relying on static reasoning about ordering.
+        tracing::debug!(dispatch_key = %self.key, "dispatch guard released");
     }
 }
 

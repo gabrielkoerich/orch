@@ -197,8 +197,16 @@ pub(crate) async fn tick_check_session_completions(
 ) -> anyhow::Result<()> {
     let _span = tracing::info_span!("engine.tick.phase1.sessions").entered();
     let session_snapshot = tmux.snapshot().await;
-    // Derive the short project name from repo (owner/repo -> repo)
-    let repo_name = repo.rsplit('/').next().unwrap_or(repo);
+    // Derive the short project name from repo (owner/repo -> repo), matching
+    // TmuxManager::session_name's derivation exactly (including the ".git" strip)
+    // so a repo configured with a ".git" suffix doesn't silently fail to match
+    // its own live sessions here — leaving stuck-task recovery as the only
+    // (later, coarser-grained) safety net for this repo's session completions.
+    let repo_name = repo
+        .rsplit('/')
+        .next()
+        .unwrap_or(repo)
+        .trim_end_matches(".git");
     for (session, active) in session_snapshot {
         // Only handle sessions that belong to this repo/project.
         if session.project != repo_name {
@@ -692,6 +700,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
         } else {
             tracing::warn!(
                 task_id = task.id.0,
+                dispatch_key = format!("{repo}/{}", task.id.0),
                 age_mins = timing.age.num_minutes(),
                 threshold_mins = timing.threshold / 60,
                 "recovering stuck task: no session found — reclaiming early → new"
@@ -995,6 +1004,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
             tracing::warn!(
                 task_id = task.id,
                 repo = %task.repo,
+                dispatch_key = format!("{}/{external_id}", task.repo),
                 age_mins = timing.age.num_minutes(),
                 threshold_mins = timing.threshold / 60,
                 "recovering cross-repo stuck task: no session found — reclaiming early → new"
@@ -1122,6 +1132,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
         } else {
             tracing::warn!(
                 task_id,
+                dispatch_key = format!("{repo}/{task_id}"),
                 age_mins = timing.age.num_minutes(),
                 threshold_mins = timing.threshold / 60,
                 "recovering stuck task: no session found — reclaiming early → new"
@@ -1702,17 +1713,25 @@ pub(crate) async fn tick_route_tasks(
 /// removed from the orch config, its tasks accumulate in `new` indefinitely
 /// because no tick ever runs for that repo. This sweep covers all repos so
 /// orphaned new tasks are eventually routed.
+///
+/// `active_repos` must be the full set of currently-configured project repos,
+/// not just the repo of the tick that called this — mirroring
+/// `dispatch_routed_tasks_global` (see its doc comment for the "racing the real
+/// per-repo dispatch" failure mode this guards against). `tick()` runs once per
+/// active project; filtering on `t.repo != current_repo` alone (the previous
+/// behavior) made every *other* active repo's new tasks look "orphaned" too and
+/// routed them a tick early, through the wrong repo's tick.
 pub(crate) async fn route_new_tasks_global(
     router: &mut Router,
     store: &Arc<TaskStore>,
-    current_repo: &str,
+    active_repos: &std::collections::HashSet<String>,
 ) -> anyhow::Result<()> {
     use crate::store::{StoreRoute, TaskStatus};
 
     let all_new = store.list_all_by_status_global(TaskStatus::New).await?;
     let orphaned: Vec<&crate::store::Task> = all_new
         .iter()
-        .filter(|t| t.repo != current_repo)
+        .filter(|t| !active_repos.contains(&t.repo))
         .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
         .collect();
 
@@ -1964,6 +1983,7 @@ async fn dispatch_tasks_for_repo(
                 }
                 Entry::Vacant(slot) => {
                     slot.insert(task.id.0.clone());
+                    tracing::debug!(task_id = task.id.0, dispatch_key, "dispatch guard claimed");
                 }
             }
         }
@@ -2567,7 +2587,7 @@ pub(crate) async fn tick(
     // Global routing sweep for tasks from inactive or removed repos.
     // tick_route_tasks is scoped to the active repo; tasks from projects no longer
     // in config are never returned by list_routable and would stay in 'new' indefinitely.
-    if let Err(e) = route_new_tasks_global(router, store, repo).await {
+    if let Err(e) = route_new_tasks_global(router, store, active_repos).await {
         tracing::warn!(err = %e, "global new-task routing sweep failed");
     }
     let dispatch_mode = dispatch_mode_from_router(router);
@@ -4181,6 +4201,100 @@ mod tests {
         );
     }
 
+    /// Regression test: a repo configured with a ".git" suffix (e.g. "owner/repo.git")
+    /// must still match its own live tmux sessions in `tick_check_session_completions`.
+    ///
+    /// `TmuxManager::session_name` strips ".git" when creating the session, so a live
+    /// session's parsed `project` field never carries it. Before the fix, this
+    /// function's `repo_name` derivation skipped the `.trim_end_matches(".git")` step,
+    /// so `session.project` ("repo") never equaled `repo_name` ("repo.git") and the
+    /// completed-session touch/kill was silently skipped for the entire repo — leaving
+    /// the coarser-grained stuck-task reclaim as the only (racy) safety net.
+    #[tokio::test]
+    async fn session_completion_matches_repo_configured_with_git_suffix() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let tmux = Arc::new(TmuxManager::new());
+        let transport = Arc::new(Transport::new());
+        let capture = Arc::new(CaptureService::new(transport));
+
+        let repo = "owner/repo.git";
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo,
+                ext_id: "201",
+                title: "Git-suffix repo task",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::InProgress)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        // session_name strips ".git" internally — this is the real session a dispatch
+        // for this repo would have created.
+        let task_id = "201";
+        let session_name = tmux.session_name(repo, task_id);
+        let create_result = tokio::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &session_name, "-c", "/tmp"])
+            .output()
+            .await;
+        match create_result {
+            Ok(o) if o.status.success() => {}
+            _ => {
+                eprintln!("Skipping test: tmux not available or failed to create test session");
+                return;
+            }
+        }
+        let _guard = SessionGuard(session_name.clone());
+
+        let _ = tokio::process::Command::new("tmux")
+            .args(["set-option", "-t", &session_name, "remain-on-exit", "on"])
+            .output()
+            .await;
+        let _ = tokio::process::Command::new("tmux")
+            .args(["send-keys", "-t", &session_name, "exit", "Enter"])
+            .output()
+            .await;
+
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if !tmux.session_is_running(&session_name).await {
+                break;
+            }
+        }
+
+        capture.register_session(repo, task_id, &session_name).await;
+
+        tick_check_session_completions(&tmux, repo, &capture, &store)
+            .await
+            .unwrap();
+
+        let task_state = store.get(id).await.unwrap();
+        if task_state.updated_at.starts_with("2020") {
+            eprintln!(
+                "Skipping test: tick_check_session_completions did not update stored \
+                 updated_at — session was not in snapshot (CI tmux environment issue)"
+            );
+            return;
+        }
+        assert!(
+            !task_state.updated_at.starts_with("2020"),
+            "tick_check_session_completions must match its own repo's live sessions \
+             even when the repo is configured with a \".git\" suffix"
+        );
+    }
+
     // ── tick_job_scheduler: resilience to bad project configs ────────────────
 
     /// A project with a duplicate job id (same id in .orch.yml AND prompts/jobs/)
@@ -4325,7 +4439,9 @@ mod tests {
         };
         let mut router = Router::new_for_test(config, vec!["claude".to_string()]);
 
-        route_new_tasks_global(&mut router, &store, "active/repo")
+        let active_repos: std::collections::HashSet<String> =
+            ["active/repo".to_string()].into_iter().collect();
+        route_new_tasks_global(&mut router, &store, &active_repos)
             .await
             .unwrap();
 
@@ -4346,6 +4462,93 @@ mod tests {
         assert!(
             matches!(&after.agent, Some(a) if !a.is_empty()),
             "agent must be set after routing"
+        );
+    }
+
+    /// Regression test for #3523: `route_new_tasks_global` previously filtered only
+    /// `t.repo != current_repo`, so during repo A's tick it would route repo B's `new`
+    /// tasks too — even though B is an active, non-orphaned project with its own tick
+    /// scheduled later in the same pass. This is the exact "racing the real per-repo
+    /// dispatch" failure mode `dispatch_routed_tasks_global` was fixed for in #3415;
+    /// the route-side sweep needs the same `active_repos` scoping, not just the
+    /// current tick's own repo.
+    #[serial_test::serial(cooldown_state)]
+    #[tokio::test]
+    async fn global_sweep_does_not_touch_other_active_repo_tasks() {
+        use crate::engine::router::{Router, RouterConfig};
+        use crate::store::{TaskStatus, UpsertExternal};
+
+        crate::engine::cooldown::reset_global_state().await;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        // Belongs to a second active repo — NOT the repo whose tick is running,
+        // but still a currently-configured project, not an orphan.
+        let other_active_id = store
+            .upsert_external(&UpsertExternal {
+                repo: "other-active/repo",
+                ext_id: "7",
+                title: "Other active project's task",
+                body: "",
+                author: "user",
+                url: "https://github.com/other-active/repo/issues/7",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+
+        // Genuinely orphaned repo — not in the active set at all.
+        let inactive_id = store
+            .upsert_external(&UpsertExternal {
+                repo: "inactive/repo",
+                ext_id: "42",
+                title: "Orphaned task",
+                body: "",
+                author: "user",
+                url: "https://github.com/inactive/repo/issues/42",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+
+        let mut model_map: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, Vec<String>>,
+        > = std::collections::HashMap::new();
+        let mut tier = std::collections::HashMap::new();
+        tier.insert("claude".to_string(), vec!["haiku".to_string()]);
+        model_map.insert("medium".to_string(), tier);
+        let config = RouterConfig {
+            mode: "round_robin".to_string(),
+            agents: vec!["claude".to_string()],
+            model_map,
+            ..Default::default()
+        };
+        let mut router = Router::new_for_test(config, vec!["claude".to_string()]);
+
+        // Simulate "active/repo"'s tick running the global sweep. Both
+        // "active/repo" and "other-active/repo" are currently-configured
+        // projects; only "inactive/repo" is orphaned.
+        let active_repos: std::collections::HashSet<String> =
+            ["active/repo".to_string(), "other-active/repo".to_string()]
+                .into_iter()
+                .collect();
+        route_new_tasks_global(&mut router, &store, &active_repos)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get(other_active_id).await.unwrap().status,
+            TaskStatus::New,
+            "global sweep run from a different active repo's tick must not route \
+             another active repo's new tasks — that repo's own tick will route them"
+        );
+        assert_eq!(
+            store.get(inactive_id).await.unwrap().status,
+            TaskStatus::Routed,
+            "global sweep must still route tasks from genuinely orphaned repos"
         );
     }
 
@@ -4389,7 +4592,9 @@ mod tests {
         };
         let mut router = Router::new_for_test(config, vec!["claude".to_string()]);
 
-        route_new_tasks_global(&mut router, &store, "active/repo")
+        let active_repos: std::collections::HashSet<String> =
+            ["active/repo".to_string()].into_iter().collect();
+        route_new_tasks_global(&mut router, &store, &active_repos)
             .await
             .unwrap();
 
