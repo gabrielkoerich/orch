@@ -1702,17 +1702,25 @@ pub(crate) async fn tick_route_tasks(
 /// removed from the orch config, its tasks accumulate in `new` indefinitely
 /// because no tick ever runs for that repo. This sweep covers all repos so
 /// orphaned new tasks are eventually routed.
+///
+/// `active_repos` must be the full set of currently-configured project repos,
+/// not just the repo of the tick that called this — mirroring
+/// `dispatch_routed_tasks_global` (see its doc comment for the "racing the real
+/// per-repo dispatch" failure mode this guards against). `tick()` runs once per
+/// active project; filtering on `t.repo != current_repo` alone (the previous
+/// behavior) made every *other* active repo's new tasks look "orphaned" too and
+/// routed them a tick early, through the wrong repo's tick.
 pub(crate) async fn route_new_tasks_global(
     router: &mut Router,
     store: &Arc<TaskStore>,
-    current_repo: &str,
+    active_repos: &std::collections::HashSet<String>,
 ) -> anyhow::Result<()> {
     use crate::store::{StoreRoute, TaskStatus};
 
     let all_new = store.list_all_by_status_global(TaskStatus::New).await?;
     let orphaned: Vec<&crate::store::Task> = all_new
         .iter()
-        .filter(|t| t.repo != current_repo)
+        .filter(|t| !active_repos.contains(&t.repo))
         .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
         .collect();
 
@@ -2567,7 +2575,7 @@ pub(crate) async fn tick(
     // Global routing sweep for tasks from inactive or removed repos.
     // tick_route_tasks is scoped to the active repo; tasks from projects no longer
     // in config are never returned by list_routable and would stay in 'new' indefinitely.
-    if let Err(e) = route_new_tasks_global(router, store, repo).await {
+    if let Err(e) = route_new_tasks_global(router, store, active_repos).await {
         tracing::warn!(err = %e, "global new-task routing sweep failed");
     }
     let dispatch_mode = dispatch_mode_from_router(router);
@@ -4325,7 +4333,9 @@ mod tests {
         };
         let mut router = Router::new_for_test(config, vec!["claude".to_string()]);
 
-        route_new_tasks_global(&mut router, &store, "active/repo")
+        let active_repos: std::collections::HashSet<String> =
+            ["active/repo".to_string()].into_iter().collect();
+        route_new_tasks_global(&mut router, &store, &active_repos)
             .await
             .unwrap();
 
@@ -4346,6 +4356,93 @@ mod tests {
         assert!(
             matches!(&after.agent, Some(a) if !a.is_empty()),
             "agent must be set after routing"
+        );
+    }
+
+    /// Regression test for #3523: `route_new_tasks_global` previously filtered only
+    /// `t.repo != current_repo`, so during repo A's tick it would route repo B's `new`
+    /// tasks too — even though B is an active, non-orphaned project with its own tick
+    /// scheduled later in the same pass. This is the exact "racing the real per-repo
+    /// dispatch" failure mode `dispatch_routed_tasks_global` was fixed for in #3415;
+    /// the route-side sweep needs the same `active_repos` scoping, not just the
+    /// current tick's own repo.
+    #[serial_test::serial(cooldown_state)]
+    #[tokio::test]
+    async fn global_sweep_does_not_touch_other_active_repo_tasks() {
+        use crate::engine::router::{Router, RouterConfig};
+        use crate::store::{TaskStatus, UpsertExternal};
+
+        crate::engine::cooldown::reset_global_state().await;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        // Belongs to a second active repo — NOT the repo whose tick is running,
+        // but still a currently-configured project, not an orphan.
+        let other_active_id = store
+            .upsert_external(&UpsertExternal {
+                repo: "other-active/repo",
+                ext_id: "7",
+                title: "Other active project's task",
+                body: "",
+                author: "user",
+                url: "https://github.com/other-active/repo/issues/7",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+
+        // Genuinely orphaned repo — not in the active set at all.
+        let inactive_id = store
+            .upsert_external(&UpsertExternal {
+                repo: "inactive/repo",
+                ext_id: "42",
+                title: "Orphaned task",
+                body: "",
+                author: "user",
+                url: "https://github.com/inactive/repo/issues/42",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+
+        let mut model_map: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, Vec<String>>,
+        > = std::collections::HashMap::new();
+        let mut tier = std::collections::HashMap::new();
+        tier.insert("claude".to_string(), vec!["haiku".to_string()]);
+        model_map.insert("medium".to_string(), tier);
+        let config = RouterConfig {
+            mode: "round_robin".to_string(),
+            agents: vec!["claude".to_string()],
+            model_map,
+            ..Default::default()
+        };
+        let mut router = Router::new_for_test(config, vec!["claude".to_string()]);
+
+        // Simulate "active/repo"'s tick running the global sweep. Both
+        // "active/repo" and "other-active/repo" are currently-configured
+        // projects; only "inactive/repo" is orphaned.
+        let active_repos: std::collections::HashSet<String> =
+            ["active/repo".to_string(), "other-active/repo".to_string()]
+                .into_iter()
+                .collect();
+        route_new_tasks_global(&mut router, &store, &active_repos)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get(other_active_id).await.unwrap().status,
+            TaskStatus::New,
+            "global sweep run from a different active repo's tick must not route \
+             another active repo's new tasks — that repo's own tick will route them"
+        );
+        assert_eq!(
+            store.get(inactive_id).await.unwrap().status,
+            TaskStatus::Routed,
+            "global sweep must still route tasks from genuinely orphaned repos"
         );
     }
 
@@ -4389,7 +4486,9 @@ mod tests {
         };
         let mut router = Router::new_for_test(config, vec!["claude".to_string()]);
 
-        route_new_tasks_global(&mut router, &store, "active/repo")
+        let active_repos: std::collections::HashSet<String> =
+            ["active/repo".to_string()].into_iter().collect();
+        route_new_tasks_global(&mut router, &store, &active_repos)
             .await
             .unwrap();
 
