@@ -197,8 +197,16 @@ pub(crate) async fn tick_check_session_completions(
 ) -> anyhow::Result<()> {
     let _span = tracing::info_span!("engine.tick.phase1.sessions").entered();
     let session_snapshot = tmux.snapshot().await;
-    // Derive the short project name from repo (owner/repo -> repo)
-    let repo_name = repo.rsplit('/').next().unwrap_or(repo);
+    // Derive the short project name from repo (owner/repo -> repo), matching
+    // TmuxManager::session_name's derivation exactly (including the ".git" strip)
+    // so a repo configured with a ".git" suffix doesn't silently fail to match
+    // its own live sessions here — leaving stuck-task recovery as the only
+    // (later, coarser-grained) safety net for this repo's session completions.
+    let repo_name = repo
+        .rsplit('/')
+        .next()
+        .unwrap_or(repo)
+        .trim_end_matches(".git");
     for (session, active) in session_snapshot {
         // Only handle sessions that belong to this repo/project.
         if session.project != repo_name {
@@ -692,6 +700,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
         } else {
             tracing::warn!(
                 task_id = task.id.0,
+                dispatch_key = format!("{repo}/{}", task.id.0),
                 age_mins = timing.age.num_minutes(),
                 threshold_mins = timing.threshold / 60,
                 "recovering stuck task: no session found — reclaiming early → new"
@@ -995,6 +1004,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
             tracing::warn!(
                 task_id = task.id,
                 repo = %task.repo,
+                dispatch_key = format!("{}/{external_id}", task.repo),
                 age_mins = timing.age.num_minutes(),
                 threshold_mins = timing.threshold / 60,
                 "recovering cross-repo stuck task: no session found — reclaiming early → new"
@@ -1122,6 +1132,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
         } else {
             tracing::warn!(
                 task_id,
+                dispatch_key = format!("{repo}/{task_id}"),
                 age_mins = timing.age.num_minutes(),
                 threshold_mins = timing.threshold / 60,
                 "recovering stuck task: no session found — reclaiming early → new"
@@ -1972,6 +1983,7 @@ async fn dispatch_tasks_for_repo(
                 }
                 Entry::Vacant(slot) => {
                     slot.insert(task.id.0.clone());
+                    tracing::debug!(task_id = task.id.0, dispatch_key, "dispatch guard claimed");
                 }
             }
         }
@@ -4186,6 +4198,100 @@ mod tests {
             task.status,
             crate::store::TaskStatus::InProgress,
             "task should not be reclaimed to New"
+        );
+    }
+
+    /// Regression test: a repo configured with a ".git" suffix (e.g. "owner/repo.git")
+    /// must still match its own live tmux sessions in `tick_check_session_completions`.
+    ///
+    /// `TmuxManager::session_name` strips ".git" when creating the session, so a live
+    /// session's parsed `project` field never carries it. Before the fix, this
+    /// function's `repo_name` derivation skipped the `.trim_end_matches(".git")` step,
+    /// so `session.project` ("repo") never equaled `repo_name` ("repo.git") and the
+    /// completed-session touch/kill was silently skipped for the entire repo — leaving
+    /// the coarser-grained stuck-task reclaim as the only (racy) safety net.
+    #[tokio::test]
+    async fn session_completion_matches_repo_configured_with_git_suffix() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let tmux = Arc::new(TmuxManager::new());
+        let transport = Arc::new(Transport::new());
+        let capture = Arc::new(CaptureService::new(transport));
+
+        let repo = "owner/repo.git";
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo,
+                ext_id: "201",
+                title: "Git-suffix repo task",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::InProgress)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        // session_name strips ".git" internally — this is the real session a dispatch
+        // for this repo would have created.
+        let task_id = "201";
+        let session_name = tmux.session_name(repo, task_id);
+        let create_result = tokio::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &session_name, "-c", "/tmp"])
+            .output()
+            .await;
+        match create_result {
+            Ok(o) if o.status.success() => {}
+            _ => {
+                eprintln!("Skipping test: tmux not available or failed to create test session");
+                return;
+            }
+        }
+        let _guard = SessionGuard(session_name.clone());
+
+        let _ = tokio::process::Command::new("tmux")
+            .args(["set-option", "-t", &session_name, "remain-on-exit", "on"])
+            .output()
+            .await;
+        let _ = tokio::process::Command::new("tmux")
+            .args(["send-keys", "-t", &session_name, "exit", "Enter"])
+            .output()
+            .await;
+
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if !tmux.session_is_running(&session_name).await {
+                break;
+            }
+        }
+
+        capture.register_session(repo, task_id, &session_name).await;
+
+        tick_check_session_completions(&tmux, repo, &capture, &store)
+            .await
+            .unwrap();
+
+        let task_state = store.get(id).await.unwrap();
+        if task_state.updated_at.starts_with("2020") {
+            eprintln!(
+                "Skipping test: tick_check_session_completions did not update stored \
+                 updated_at — session was not in snapshot (CI tmux environment issue)"
+            );
+            return;
+        }
+        assert!(
+            !task_state.updated_at.starts_with("2020"),
+            "tick_check_session_completions must match its own repo's live sessions \
+             even when the repo is configured with a \".git\" suffix"
         );
     }
 

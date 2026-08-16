@@ -170,6 +170,11 @@ pub async fn store_touch_updated_at(store: &Option<Arc<TaskStore>>, repo: &str, 
             Ok(Some(store_id)) => {
                 if let Err(e) = s.touch_updated_at(store_id).await {
                     tracing::warn!(task_id, error = %e, "store touch_updated_at failed");
+                } else {
+                    // Logged on success (not just failure) so a stuck-task reclaim race
+                    // can be diagnosed from logs by checking whether this touch actually
+                    // landed before the reclaim's own age check ran.
+                    tracing::debug!(task_id, store_id, "store touch_updated_at succeeded");
                 }
             }
             Ok(None) => {} // task not in store — no-op is expected
