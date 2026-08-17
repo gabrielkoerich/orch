@@ -99,7 +99,14 @@ impl Drop for DispatchGuard {
         // signal that lets a future stuck-task-reclaim race be diagnosed from logs
         // by comparing this timestamp against the reclaim check's own log line for
         // the same key, instead of relying on static reasoning about ordering.
-        tracing::debug!(dispatch_key = %self.key, "dispatch guard released");
+        //
+        // info! (not debug!, issue #3526): the default log filter is "orch=info"
+        // (main.rs), so at debug! this line never reached orch.log in production —
+        // every prior occurrence of the reclaim race (#3518, #3519, #3523, #3525)
+        // had no way to show whether the guard was actually still held at reclaim
+        // time. Promoted alongside the matching "dispatch guard claimed" line and
+        // the stuck-task-reclaim skip logs in tick.rs.
+        tracing::info!(dispatch_key = %self.key, "dispatch guard released");
     }
 }
 
