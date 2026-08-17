@@ -681,8 +681,16 @@ pub(crate) async fn tick_recover_stuck_tasks(
         if !timing.has_session {
             let dispatch_key = format!("{repo}/{}", task.id.0);
             if dispatching.contains_key(&dispatch_key) {
-                tracing::debug!(
+                // Promoted from debug! to info!: the default log filter is "orch=info"
+                // (see main.rs), so this line — the only direct evidence that the guard
+                // check actually found and honored a held dispatch guard — was silently
+                // dropped in production. Every prior occurrence of the reclaim race
+                // (#3518/#3519/#3523/#3525/#3526) had to be diagnosed from timestamp
+                // correlation alone because this and the "dispatch guard
+                // claimed"/"released" lines never appeared in orch.log.
+                tracing::info!(
                     task_id = task.id.0,
+                    dispatch_key,
                     age_mins = timing.age.num_minutes(),
                     "skipping stuck-task reclaim: runner still actively processing this task"
                 );
@@ -982,9 +990,13 @@ pub(crate) async fn tick_recover_stuck_tasks(
         if !timing.has_session {
             let dispatch_key = format!("{}/{external_id}", task.repo);
             if dispatching.contains_key(&dispatch_key) {
-                tracing::debug!(
+                // See the same promotion note on the internal-task loop below: this was
+                // debug! (silently dropped under the default "orch=info" filter), leaving
+                // every prior reclaim-race occurrence undiagnosable from logs alone.
+                tracing::info!(
                     task_id = task.id,
                     repo = %task.repo,
+                    dispatch_key,
                     age_mins = timing.age.num_minutes(),
                     "skipping cross-repo stuck-task reclaim: runner still actively processing this task"
                 );
@@ -1113,8 +1125,18 @@ pub(crate) async fn tick_recover_stuck_tasks(
         if !timing.has_session {
             let dispatch_key = format!("{repo}/{task_id}");
             if dispatching.contains_key(&dispatch_key) {
-                tracing::debug!(
+                // Promoted from debug! to info! (issue #3526): the default log filter is
+                // "orch=info" (main.rs), so this line — along with the DispatchGuard
+                // claim/release lines in dispatch_guard.rs and dispatch_tasks_for_repo —
+                // never reached orch.log in production. Every occurrence of the reclaim
+                // race (#3518, #3519, #3523, #3525, #3526) had to be reasoned about from
+                // timestamp correlation across unrelated log lines instead of directly
+                // observing whether the guard was held, because the one log line that
+                // would prove it was silently filtered out. Promoting these closes that
+                // observability gap so the next occurrence carries conclusive evidence.
+                tracing::info!(
                     task_id,
+                    dispatch_key,
                     age_mins = timing.age.num_minutes(),
                     "skipping stuck-task reclaim: runner still actively processing this task"
                 );
@@ -1983,7 +2005,13 @@ async fn dispatch_tasks_for_repo(
                 }
                 Entry::Vacant(slot) => {
                     slot.insert(task.id.0.clone());
-                    tracing::debug!(task_id = task.id.0, dispatch_key, "dispatch guard claimed");
+                    // Promoted from debug! to info! (issue #3526): paired with the
+                    // "dispatch guard released" line in dispatch_guard.rs, this is the
+                    // only direct evidence of how long a dispatch guard was actually held
+                    // for a given key. Both were debug!, silently dropped under the
+                    // default "orch=info" filter (main.rs) — see the reclaim-skip log
+                    // promotions above for the full rationale.
+                    tracing::info!(task_id = task.id.0, dispatch_key, "dispatch guard claimed");
                 }
             }
         }
@@ -3443,6 +3471,165 @@ mod tests {
             task.status,
             crate::store::TaskStatus::New,
             "task should still be reclaimed once the dispatch guard is released"
+        );
+    }
+
+    /// Concurrency regression test for issue #3526: the reclaim race recurred twice
+    /// (internal:156563 in #3523, internal:156673 in #3526) *after* the #3519/#3525
+    /// fix landed, in production under the real multi-threaded tokio runtime. The
+    /// existing `recover_stuck_tasks_skips_reclaim_while_dispatch_guard_held` test
+    /// above only exercises sequential `.await` calls on a single-threaded test
+    /// runtime (`#[tokio::test]` defaults to `flavor = "current_thread"`), which can
+    /// never observe genuine cross-thread races in the shared `dispatching` DashMap.
+    ///
+    /// This test claims the guard exactly the way `dispatch_tasks_for_repo` does
+    /// (atomic `DashMap::entry` claim, `DispatchGuard` RAII release), hands it to a
+    /// spawned task running on a *different* worker thread that holds it until
+    /// explicitly told to release, and hammers the real `tick_recover_stuck_tasks`
+    /// from the main test task hundreds of times while the guard is deterministically
+    /// still held. If there were a visibility gap between `DashMap::entry().insert()`
+    /// on one thread and `DashMap::contains_key()` on another, this test would catch it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn recover_stuck_tasks_never_reclaims_while_guard_held_under_real_concurrency() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let mock = MockBackend::new();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(TmuxManager::new());
+        let config = EngineConfig {
+            no_session_stuck_timeout: 600,
+            stuck_timeout: 1800,
+            ..EngineConfig::default()
+        };
+
+        let id = store
+            .create_internal(
+                "owner/repo",
+                "Long-running daily job",
+                "",
+                "cron",
+                "1",
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .set_fields(
+                id,
+                &[
+                    ("agent", serde_json::json!("claude")),
+                    ("model", serde_json::json!("sonnet")),
+                    ("route_attempts", serde_json::json!(1)),
+                ],
+            )
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::InProgress)
+            .await
+            .unwrap();
+        set_task_updated_at_past(&store, id).await;
+
+        let dispatch_key = format!("owner/repo/internal:{id}");
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+
+        // Claim the guard synchronously, on this task, exactly like
+        // dispatch_tasks_for_repo does: the atomic entry-claim always happens before
+        // tokio::spawn hands the guard to the background task. (Claiming inside the
+        // spawned task itself would race the hammer loop below against tokio's own
+        // scheduling of that task onto a worker thread — a test artifact, not the
+        // real production ordering, which guarantees claim-before-spawn.)
+        let claim_task_id = format!("internal:{id}");
+        {
+            use dashmap::mapref::entry::Entry;
+            match dispatching.entry(dispatch_key.clone()) {
+                Entry::Vacant(slot) => {
+                    slot.insert(claim_task_id);
+                }
+                Entry::Occupied(_) => panic!("dispatch key already claimed"),
+            }
+        }
+        let guard = DispatchGuard::new(Arc::clone(&dispatching), dispatch_key.clone());
+
+        // Hold the guard on a spawned task — a different worker thread under the
+        // multi-thread runtime — mirroring the real runner holding it across genuine
+        // async work (worktree setup, agent session, response handling) inside
+        // `tokio::spawn(... run_with_context ...)`. It only drops the guard once
+        // explicitly told to via `release_rx`, so its lifetime is fully controlled
+        // by this test rather than raced against a timer — the release-signal
+        // ordering was itself a source of false positives in an earlier version of
+        // this test (a `sleep`-then-drop holder can legitimately release the guard
+        // in the gap between the hammer loop's last check and its next iteration,
+        // which is a correct outcome, not a bug, but made the assertion flaky).
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let holder = tokio::spawn(async move {
+            let _ = release_rx.await;
+            drop(guard);
+        });
+
+        // Hammer the real reclaim path concurrently from the main task while the
+        // guard is deterministically still held (the holder task is parked on
+        // `release_rx` and cannot drop the guard until we signal it below). Each
+        // iteration's `tick_recover_stuck_tasks` call may itself run on any worker
+        // thread the tokio scheduler picks, independent of the thread that claimed
+        // the guard — this is what actually exercises cross-thread DashMap
+        // visibility, not wall-clock racing against a timer.
+        const HAMMER_ITERATIONS: u32 = 300;
+        for i in 0..HAMMER_ITERATIONS {
+            tick_recover_stuck_tasks(
+                &backend,
+                &tmux,
+                "owner/repo",
+                &task_manager,
+                &config,
+                &store,
+                &std::collections::HashMap::new(),
+                &cooled_review_router_for_test(),
+                &dispatching,
+            )
+            .await
+            .unwrap();
+
+            let task = store.get(id).await.unwrap();
+            assert_eq!(
+                task.status,
+                crate::store::TaskStatus::InProgress,
+                "task must never be reclaimed while the dispatch guard is deterministically \
+                 still held, even under real cross-thread concurrency (dispatch_key={dispatch_key}, \
+                 iteration={i}, contains_key_now={}, map_len_now={})",
+                dispatching.contains_key(&dispatch_key),
+                dispatching.len(),
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // Now release the guard and confirm the holder task actually completed.
+        let _ = release_tx.send(());
+        holder.await.unwrap();
+
+        // Guard released — the safety net must still reclaim as before.
+        tick_recover_stuck_tasks(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &task_manager,
+            &config,
+            &store,
+            &std::collections::HashMap::new(),
+            &cooled_review_router_for_test(),
+            &dispatching,
+        )
+        .await
+        .unwrap();
+        let task = store.get(id).await.unwrap();
+        assert_eq!(
+            task.status,
+            crate::store::TaskStatus::New,
+            "task should be reclaimed once the dispatch guard is released"
         );
     }
 
