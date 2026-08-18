@@ -72,6 +72,19 @@ pub enum CreditExhaustionReason {
     BillingCycleExhausted,
 }
 
+impl CreditExhaustionReason {
+    /// Stable string for `task_runs.outcome`, distinct from the cooldown reason
+    /// string used by `record_credit_exhaustion`. Lets callers persist the actual
+    /// failure mode instead of collapsing it into a generic "rate_limit"/"failed".
+    pub fn outcome_str(self) -> &'static str {
+        match self {
+            CreditExhaustionReason::OutOfCredits => "credit_exhausted",
+            CreditExhaustionReason::OrgLevelDisabled => "org_level_disabled",
+            CreditExhaustionReason::BillingCycleExhausted => "billing_cycle_exhausted",
+        }
+    }
+}
+
 /// Short agent cooldown applied on silence detection (120 seconds).
 ///
 /// Forces the router to pick a different agent immediately on re-route,
@@ -448,6 +461,18 @@ pub async fn record_agent_failure_with_message(agent_name: &str, error_message: 
     let cooldown_until =
         chrono::Utc::now().timestamp() + compute_backoff(count, base, BACKOFF_MAX_SECS, true);
     set_cooldown_async(agent_name, cooldown_until, "agent_error").await;
+}
+
+/// Detect credit exhaustion from an error message and return the stable
+/// `task_runs.outcome` string for it (see `CreditExhaustionReason::outcome_str`).
+///
+/// Callers that classify `AgentError::RateLimit`/`AgentError::Auth` into an
+/// outcome string should consult this first — generic rate-limit patterns like
+/// "usage limit" also match billing-cycle exhaustion messages (e.g. Kimi's
+/// "You've reached your usage limit for this billing cycle"), which would
+/// otherwise be stored as a plain "rate_limit" outcome.
+pub fn detect_credit_exhaustion_outcome(error_message: &str) -> Option<&'static str> {
+    detect_credit_exhaustion(error_message).map(CreditExhaustionReason::outcome_str)
 }
 
 /// Detect credit exhaustion reasons from error message.
@@ -2414,6 +2439,47 @@ mod tests {
             ),
             Some(CreditExhaustionReason::BillingCycleExhausted)
         );
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn detect_credit_exhaustion_outcome_kimi_billing_cycle() {
+        // Regression test for issue #3529: the exact Kimi billing-cycle exhaustion
+        // message from task_runs (tasks 156734/156678) must resolve to the
+        // "billing_cycle_exhausted" outcome string, not fall through to a generic
+        // rate-limit/auth classification.
+        let msg = "Failed to authenticate. API Error: 403 You've reached your usage limit for \
+                    this billing cycle. Your quota will be refreshed soon.";
+        assert_eq!(
+            detect_credit_exhaustion_outcome(msg),
+            Some("billing_cycle_exhausted")
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn detect_credit_exhaustion_outcome_maps_all_reasons() {
+        assert_eq!(
+            detect_credit_exhaustion_outcome("out of credits"),
+            Some("credit_exhausted")
+        );
+        assert_eq!(
+            detect_credit_exhaustion_outcome("organization has been disabled"),
+            Some("org_level_disabled")
+        );
+        assert_eq!(
+            detect_credit_exhaustion_outcome("monthly quota exceeded"),
+            Some("billing_cycle_exhausted")
+        );
+    }
+
+    #[test]
+    fn detect_credit_exhaustion_outcome_returns_none_for_unrelated_errors() {
+        assert_eq!(
+            detect_credit_exhaustion_outcome("429 Too Many Requests"),
+            None
+        );
+        assert_eq!(detect_credit_exhaustion_outcome("connection reset"), None);
     }
 
     #[serial(cooldown_state)]
