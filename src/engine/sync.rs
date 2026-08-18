@@ -243,15 +243,26 @@ fn classify_failure(error: &str, outcome: &str) -> FailureCategory {
         return FailureCategory::Timeout;
     }
 
-    if outcome == "rate_limit" || lower.contains("rate limit") || lower.contains("usage limit") {
-        return FailureCategory::RateLimit;
-    }
-
     // Credit exhaustion is a transient condition (credits replenish, billing cycles
     // reset). Classifying it as recoverable allows auto-unblock to retry once the
     // credit-related cooldown expires, instead of permanently blocking the task.
-    if crate::engine::cooldown::detect_credit_exhaustion(&lower).is_some() {
+    //
+    // Checked before the generic rate-limit branch below: billing-cycle exhaustion
+    // messages (e.g. Kimi's "usage limit for this billing cycle") also contain
+    // "usage limit"/"rate limit" substrings, so checking outcome/content-based
+    // rate-limit patterns first would misclassify them as plain RateLimit (issue
+    // #3529). `outcome` also carries the specific string from `classify_run_outcome`
+    // when the task_run already recorded it.
+    if outcome == "billing_cycle_exhausted"
+        || outcome == "credit_exhausted"
+        || outcome == "org_level_disabled"
+        || crate::engine::cooldown::detect_credit_exhaustion(&lower).is_some()
+    {
         return FailureCategory::CreditExhausted;
+    }
+
+    if outcome == "rate_limit" || lower.contains("rate limit") || lower.contains("usage limit") {
+        return FailureCategory::RateLimit;
     }
 
     if error.trim().is_empty() {
@@ -4535,6 +4546,45 @@ mod tests {
             category.is_recoverable(),
             "ModelUnavailable must be recoverable so auto-unblock can re-route"
         );
+    }
+
+    // ── classify_failure: CreditExhausted (billing cycle) ──────────────
+    #[serial(cooldown_state)]
+    #[test]
+    fn classify_failure_kimi_billing_cycle_is_credit_exhausted_not_rate_limit() {
+        // Regression test for issue #3529: Kimi's billing-cycle exhaustion message
+        // contains "usage limit", which also matches the generic rate-limit content
+        // check. Credit exhaustion must be checked first so the failure is
+        // categorized as CreditExhausted, not RateLimit, even when the stored
+        // outcome is still "rate_limit" (e.g. from a task_run recorded before this
+        // fix landed).
+        let error = "kimi rate limit: Failed to authenticate. API Error: 403 You've reached \
+                      your usage limit for this billing cycle. Your quota will be refreshed soon.";
+        let category = classify_failure(error, "rate_limit");
+        assert_eq!(
+            category,
+            FailureCategory::CreditExhausted,
+            "billing-cycle exhaustion must classify as CreditExhausted, not RateLimit"
+        );
+        assert!(category.is_recoverable());
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn classify_failure_billing_cycle_exhausted_outcome_is_credit_exhausted() {
+        // New task_runs store the specific "billing_cycle_exhausted" outcome
+        // (post-fix). classify_failure must recognize it directly too.
+        let category = classify_failure("some billing message", "billing_cycle_exhausted");
+        assert_eq!(category, FailureCategory::CreditExhausted);
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn classify_failure_generic_rate_limit_is_still_rate_limit() {
+        // Genuine rate limits (no billing-cycle/credit-exhaustion markers) must
+        // remain RateLimit, not be swallowed by the reordered credit-exhaustion check.
+        let category = classify_failure("429 Too Many Requests", "rate_limit");
+        assert_eq!(category, FailureCategory::RateLimit);
     }
 
     // ── classify_failure: PrCreateFailed ──────────────────────────────

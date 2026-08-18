@@ -93,7 +93,17 @@ fn classify_run_outcome(
     }
     match parse_result {
         Err(agents::AgentError::Timeout { .. }) => "timeout",
-        Err(agents::AgentError::RateLimit { .. }) => "rate_limit",
+        // Generic rate-limit patterns (e.g. "usage limit") also match billing-cycle
+        // exhaustion messages, so consult the credit-exhaustion detector first —
+        // otherwise Kimi-style "usage limit for this billing cycle" errors are
+        // stored as a plain "rate_limit" outcome (issue #3529).
+        Err(agents::AgentError::RateLimit { message }) => {
+            crate::engine::cooldown::detect_credit_exhaustion_outcome(message)
+                .unwrap_or("rate_limit")
+        }
+        Err(agents::AgentError::Auth { message }) => {
+            crate::engine::cooldown::detect_credit_exhaustion_outcome(message).unwrap_or("failed")
+        }
         Err(agents::AgentError::InvalidResponse { .. }) => "parse_error",
         Err(_) => "failed",
         Ok(_)
@@ -1256,10 +1266,12 @@ impl TaskRunner {
             // to retry the same rate-limited agent immediately.
             //
             // Detection: classify_run_error_type() confirms "rate limit" in last_error.
-            // We detect rate limits from the last_error text (consistent with the
-            // classify_run_error_type() pattern used in record_metrics).
-            let has_rate_limit_error =
-                last_error.contains("rate limit") || last_error.contains("usage limit");
+            // Reuse the same classifier as `is_rate_limit_error` above rather than a raw
+            // substring check — billing-cycle exhaustion messages (e.g. Kimi's "usage
+            // limit for this billing cycle") also contain "usage limit"/"rate limit", so
+            // a bare substring check would record a rate-limit event into the router's
+            // health signal for a condition that isn't a genuine rate limit (issue #3529).
+            let has_rate_limit_error = classify_run_error_type(&last_error) == "rate_limit";
             if has_rate_limit_error {
                 // Record in the metrics store so the router's health check detects it.
                 if let Some(ref store) = self.store {
@@ -2001,6 +2013,65 @@ mod tests {
         let parse_result = ok_parse_result("fix_deployed");
         assert_eq!(
             classify_run_outcome("fix_deployed", &parse_result, false),
+            "failed"
+        );
+    }
+
+    #[test]
+    fn classify_run_outcome_kimi_billing_cycle_is_not_rate_limit() {
+        // Regression test for issue #3529: Kimi's exact billing-cycle exhaustion
+        // message was stored as outcome="rate_limit" because the generic "usage
+        // limit" pattern in detect_rate_limit() matched before credit-exhaustion
+        // detection ever ran. The outcome must reflect the actual failure mode.
+        let parse_result: Result<agents::ParsedResponse, agents::AgentError> =
+            Err(agents::AgentError::RateLimit {
+                message: "Failed to authenticate. API Error: 403 You've reached your usage \
+                          limit for this billing cycle. Your quota will be refreshed soon."
+                    .to_string(),
+            });
+        assert_eq!(
+            classify_run_outcome("needs_review", &parse_result, false),
+            "billing_cycle_exhausted"
+        );
+    }
+
+    #[test]
+    fn classify_run_outcome_generic_rate_limit_is_unaffected() {
+        // A genuine rate limit (no billing-cycle/credit-exhaustion markers) must
+        // still classify as "rate_limit".
+        let parse_result: Result<agents::ParsedResponse, agents::AgentError> =
+            Err(agents::AgentError::RateLimit {
+                message: "429 Too Many Requests".to_string(),
+            });
+        assert_eq!(
+            classify_run_outcome("needs_review", &parse_result, false),
+            "rate_limit"
+        );
+    }
+
+    #[test]
+    fn classify_run_outcome_auth_billing_cycle_is_not_failed() {
+        // Auth-classified billing-cycle exhaustion (e.g. "billing cycle exhausted"
+        // matches detect_auth_error's pattern list) must also be distinguished from
+        // a generic auth failure.
+        let parse_result: Result<agents::ParsedResponse, agents::AgentError> =
+            Err(agents::AgentError::Auth {
+                message: "billing cycle exhausted for this account".to_string(),
+            });
+        assert_eq!(
+            classify_run_outcome("needs_review", &parse_result, false),
+            "billing_cycle_exhausted"
+        );
+    }
+
+    #[test]
+    fn classify_run_outcome_generic_auth_error_is_unaffected() {
+        let parse_result: Result<agents::ParsedResponse, agents::AgentError> =
+            Err(agents::AgentError::Auth {
+                message: "401 Unauthorized".to_string(),
+            });
+        assert_eq!(
+            classify_run_outcome("needs_review", &parse_result, false),
             "failed"
         );
     }

@@ -21,8 +21,18 @@ const MAX_PR_CREATE_FAILURES: u64 = 3;
 fn outcome_for_agent_error(err: &runner::agents::AgentError) -> &'static str {
     match err {
         runner::agents::AgentError::Timeout { .. } => "timeout",
-        runner::agents::AgentError::RateLimit { .. } => "rate_limit",
-        runner::agents::AgentError::Auth { .. } => "auth_error",
+        // Consult credit-exhaustion detection first — generic rate-limit patterns
+        // (e.g. "usage limit") also match billing-cycle exhaustion messages, so
+        // reviews on a billing-cycle-exhausted model must not be stored as a
+        // plain "rate_limit"/"auth_error" outcome (issue #3529).
+        runner::agents::AgentError::RateLimit { message } => {
+            crate::engine::cooldown::detect_credit_exhaustion_outcome(message)
+                .unwrap_or("rate_limit")
+        }
+        runner::agents::AgentError::Auth { message } => {
+            crate::engine::cooldown::detect_credit_exhaustion_outcome(message)
+                .unwrap_or("auth_error")
+        }
         runner::agents::AgentError::InvalidResponse { .. } => "parse_error",
         _ => "failed",
     }
@@ -2503,6 +2513,37 @@ mod tests {
     use crate::github::types::{GitHubReview, GitHubReviewComment, GitHubUser, PullRequestReview};
     use crate::store::TaskStore;
     use tempfile::TempDir;
+
+    // ── outcome_for_agent_error ─────────────────────────────────────────────
+
+    #[test]
+    fn outcome_for_agent_error_kimi_billing_cycle_is_not_rate_limit() {
+        // Regression test for issue #3529: a review run hitting Kimi's billing-cycle
+        // exhaustion (task 156734 in the bug report) must not be stored as a plain
+        // "rate_limit" outcome.
+        let err = runner::agents::AgentError::RateLimit {
+            message: "Failed to authenticate. API Error: 403 You've reached your usage limit \
+                      for this billing cycle. Your quota will be refreshed soon."
+                .to_string(),
+        };
+        assert_eq!(outcome_for_agent_error(&err), "billing_cycle_exhausted");
+    }
+
+    #[test]
+    fn outcome_for_agent_error_generic_rate_limit_unaffected() {
+        let err = runner::agents::AgentError::RateLimit {
+            message: "429 Too Many Requests".to_string(),
+        };
+        assert_eq!(outcome_for_agent_error(&err), "rate_limit");
+    }
+
+    #[test]
+    fn outcome_for_agent_error_generic_auth_unaffected() {
+        let err = runner::agents::AgentError::Auth {
+            message: "401 Unauthorized".to_string(),
+        };
+        assert_eq!(outcome_for_agent_error(&err), "auth_error");
+    }
 
     // ── parse_pr_number_from_url ────────────────────────────────────────────
 
