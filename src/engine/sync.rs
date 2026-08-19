@@ -763,6 +763,14 @@ async fn try_unblock_ci_failure_task(
     Ok(false)
 }
 
+/// Exact `block_reason` written when a task's NeedsReview refire counter exhausts
+/// during a rebroadcast escalation (see the two production escalation sites: the
+/// per-repo `sync_tick` "5d" step and the global `refire_and_escalate_stale_needs_review_global`
+/// sweep). Shared with the two recovery sites (`auto_recover_rebroadcast_blocked_tasks`
+/// and `auto_recover_rebroadcast_blocked_tasks_global`) so escalation and recovery can
+/// never drift apart on the literal string.
+const REBROADCAST_BLOCK_REASON: &str = "review agent rebroadcast escalated after repeated retries";
+
 /// Auto-recover tasks blocked due to refire-counter exhaustion during agent cooldowns.
 ///
 /// When all review agents are cooled simultaneously the NeedsReview refire counter can
@@ -779,14 +787,16 @@ async fn try_unblock_ci_failure_task(
 ///
 /// A minimum block age of `MIN_BLOCK_AGE_MINUTES` is enforced so that tasks escalated
 /// in the current tick are not immediately un-blocked by the same tick's recovery pass.
+///
+/// This function only runs for the currently active repo (called from `sync_tick`); see
+/// [`auto_recover_rebroadcast_blocked_tasks_global`] for the cross-repo counterpart that
+/// covers tasks belonging to repos removed from the active project list.
 async fn auto_recover_rebroadcast_blocked_tasks(
     repo: &str,
     router: &Arc<RwLock<Router>>,
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
-    const REBROADCAST_BLOCK_REASON: &str =
-        "review agent rebroadcast escalated after repeated retries";
     // Must have been blocked for at least this long before we consider recovering it.
     // Prevents the recovery pass from immediately undoing an escalation that happened
     // earlier in the same sync_tick call.
@@ -898,6 +908,180 @@ async fn auto_recover_rebroadcast_blocked_tasks(
             task_id = task.id,
             ext_id = %ext_id,
             "auto-recovering rebroadcast-blocked task — review agents now available"
+        );
+    }
+
+    Ok(())
+}
+
+/// Global sweep: auto-recover rebroadcast-blocked tasks from inactive or removed
+/// projects, mirroring `auto_unblock_ci_failure_blocked_tasks_global` (CI-failure
+/// blocks) and `refire_and_escalate_stale_needs_review_global` (stale NeedsReview).
+///
+/// `auto_recover_rebroadcast_blocked_tasks` is called from `sync_tick` and only runs
+/// for the currently active repo. But `refire_and_escalate_stale_needs_review_global`
+/// — the function that actually *writes* `REBROADCAST_BLOCK_REASON` — already runs
+/// across all repos. That asymmetry means a task belonging to a repo later removed
+/// from the active `projects:` list can be escalated into this block_reason yet never
+/// recovered, because the only recovery path never executes for it. This sweep queries
+/// blocked tasks across all repos and applies the same recovery logic, writing directly
+/// through the store (via the `*_by_store_id` TaskManager helpers) instead of resolving
+/// through a repo-scoped `TaskManager`. Called once per main tick from
+/// `tick_recover_stuck_tasks`, alongside the other two global sweeps.
+///
+/// Before resetting a task back to `NeedsReview`, the attached PR's live state is
+/// checked first (mirroring `try_unblock_ci_failure_task`): if merged, the task is
+/// marked `done` directly; if closed without merging, the task is left blocked with an
+/// annotated reason instead of re-dispatching a review agent against a PR that no
+/// longer exists. Only tasks whose PR is still open (or has no PR attached) fall
+/// through to the reset-to-NeedsReview path, which — like the per-repo version — still
+/// requires at least one routable review agent.
+pub(crate) async fn auto_recover_rebroadcast_blocked_tasks_global(
+    router: &Router,
+    task_manager: &Arc<TaskManager>,
+    store: &Arc<TaskStore>,
+) -> anyhow::Result<()> {
+    const MIN_BLOCK_AGE_MINUTES: i64 = 5;
+
+    let all_blocked = match store.list_all_by_status_global(TaskStatus::Blocked).await {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::warn!(err = %e, "global rebroadcast-blocked sweep: failed to list blocked tasks");
+            return Ok(());
+        }
+    };
+
+    let now = chrono::Utc::now();
+    let candidates: Vec<_> = all_blocked
+        .into_iter()
+        .filter(|t| {
+            if t.block_reason.as_deref() != Some(REBROADCAST_BLOCK_REASON) {
+                return false;
+            }
+            // Only recover tasks blocked long enough to rule out same-tick escalations.
+            match chrono::DateTime::parse_from_rfc3339(&t.updated_at) {
+                Ok(updated_at) => {
+                    let age = now - updated_at.with_timezone(&chrono::Utc);
+                    age.num_minutes() >= MIN_BLOCK_AGE_MINUTES
+                }
+                Err(_) => true,
+            }
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    let gh = match crate::github::http::GhHttp::new() {
+        Ok(g) => Some(g),
+        Err(e) => {
+            tracing::warn!(err = %e, "global rebroadcast-blocked sweep: failed to create GhHttp — skipping PR-state checks this tick");
+            None
+        }
+    };
+
+    // Bail on the reset-to-NeedsReview path (but not the PR-state checks below) if no
+    // review agents are routable — re-firing while all agents are cooled would
+    // immediately re-exhaust the counter, same guard as the per-repo version.
+    let any_routable =
+        !router.available_agents.is_empty() && router.healthy_agent_count("review") > 0;
+
+    for task in candidates {
+        let ext_id = task
+            .external_id
+            .clone()
+            .unwrap_or_else(|| format!("internal:{}", task.id));
+
+        if let (Some(gh), Some(pr_number)) = (&gh, task.pr_number) {
+            match gh.get_pr(&task.repo, pr_number as u64).await {
+                Ok(pr) => {
+                    if pr.merged.unwrap_or(false) {
+                        tracing::info!(
+                            task_id = task.id,
+                            repo = %task.repo,
+                            pr_number,
+                            "global rebroadcast-blocked sweep: PR already merged — marking task done"
+                        );
+                        if let Err(e) = task_manager
+                            .mark_task_done_by_store_id(
+                                task.id,
+                                &task.repo,
+                                &crate::backends::ExternalId(ext_id.clone()),
+                            )
+                            .await
+                        {
+                            tracing::warn!(task_id = task.id, repo = %task.repo, err = %e, "global rebroadcast-blocked sweep: failed to mark merged task done");
+                            continue;
+                        }
+                        let fields: &[(&str, serde_json::Value)] = &[
+                            ("block_reason", serde_json::Value::Null),
+                            ("needs_review_refires", serde_json::json!(0)),
+                        ];
+                        if let Err(e) = store.set_fields(task.id, fields).await {
+                            tracing::warn!(task_id = task.id, err = %e, "global rebroadcast-blocked sweep: failed to clear fields after marking done");
+                        }
+                        continue;
+                    }
+                    if pr.state.eq_ignore_ascii_case("closed") {
+                        tracing::info!(
+                            task_id = task.id,
+                            repo = %task.repo,
+                            pr_number,
+                            "global rebroadcast-blocked sweep: PR closed unmerged — leaving task blocked, not re-dispatching"
+                        );
+                        let new_reason = format!(
+                            "{REBROADCAST_BLOCK_REASON} (PR #{pr_number} closed unmerged — no further auto-recovery)"
+                        );
+                        let fields: &[(&str, serde_json::Value)] =
+                            &[("block_reason", serde_json::json!(new_reason))];
+                        // set_fields_silent: this is a terminal annotation, not a real
+                        // status change — don't bump updated_at so triage queries keyed
+                        // off it aren't confused by a task that stays blocked forever.
+                        if let Err(e) = store.set_fields_silent(task.id, fields).await {
+                            tracing::warn!(task_id = task.id, err = %e, "global rebroadcast-blocked sweep: failed to annotate closed-unmerged block reason");
+                        }
+                        continue;
+                    }
+                    // PR still open — fall through to the reset-to-NeedsReview path.
+                }
+                Err(e) => {
+                    tracing::warn!(task_id = task.id, repo = %task.repo, pr_number, err = %e, "global rebroadcast-blocked sweep: failed to get PR status — skipping this tick");
+                    continue;
+                }
+            }
+        }
+
+        if !any_routable {
+            continue;
+        }
+
+        if let Err(e) = task_manager
+            .update_task_status_by_store_id(
+                task.id,
+                &task.repo,
+                &crate::backends::ExternalId(ext_id.clone()),
+                Status::NeedsReview,
+            )
+            .await
+        {
+            tracing::warn!(task_id = task.id, repo = %task.repo, err = %e, "global rebroadcast-blocked sweep: failed to reset task to needs_review — skipping");
+            continue;
+        }
+
+        let fields: &[(&str, serde_json::Value)] = &[
+            ("block_reason", serde_json::Value::Null),
+            ("needs_review_refires", serde_json::json!(0)),
+        ];
+        if let Err(e) = store.set_fields(task.id, fields).await {
+            tracing::warn!(task_id = task.id, err = %e, "global rebroadcast-blocked sweep: failed to clear block_reason/needs_review_refires after status reset");
+        }
+
+        tracing::info!(
+            task_id = task.id,
+            repo = %task.repo,
+            ext_id = %ext_id,
+            "global rebroadcast-blocked sweep: auto-recovered rebroadcast-blocked task — review agents now available"
         );
     }
 
@@ -1251,10 +1435,7 @@ pub(crate) async fn refire_and_escalate_stale_needs_review_global(
                 "global NeedsReview refire sweep: escalating to Blocked after repeated refires"
             );
             let fields = [
-                (
-                    "block_reason",
-                    serde_json::json!("review agent rebroadcast escalated after repeated retries"),
-                ),
+                ("block_reason", serde_json::json!(REBROADCAST_BLOCK_REASON)),
                 (
                     "last_error",
                     serde_json::json!(format!("escalated after {} retries", new_refires)),
@@ -1801,12 +1982,7 @@ pub(crate) async fn sync_tick(
                     "escalating NeedsReview task to Blocked after repeated refires"
                 );
                 let fields = [
-                    (
-                        "block_reason",
-                        serde_json::json!(
-                            "review agent rebroadcast escalated after repeated retries"
-                        ),
-                    ),
+                    ("block_reason", serde_json::json!(REBROADCAST_BLOCK_REASON)),
                     (
                         "last_error",
                         serde_json::json!(format!("escalated after {} retries", new_refires)),
@@ -5761,5 +5937,259 @@ mod tests {
         // Non-CI-failure tasks must remain blocked.
         let task = store.get(id).await.unwrap();
         assert_eq!(task.status, crate::store::TaskStatus::Blocked);
+    }
+
+    // ── auto_recover_rebroadcast_blocked_tasks_global ───────────────────────
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn global_rebroadcast_sweep_returns_ok_with_no_blocked_tasks() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let router = router_with_healthy_review_agent();
+        auto_recover_rebroadcast_blocked_tasks_global(&router, &task_manager, &store)
+            .await
+            .unwrap();
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn global_rebroadcast_sweep_ignores_non_rebroadcast_blocks() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            store.clone(),
+            "active/repo".to_string(),
+        ));
+        let router = router_with_healthy_review_agent();
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "inactive/repo",
+                ext_id: "30",
+                title: "Manual block",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::Blocked)
+            .await
+            .unwrap();
+        store
+            .set_fields(
+                id,
+                &[("block_reason", serde_json::json!("waiting for human input"))],
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        auto_recover_rebroadcast_blocked_tasks_global(&router, &task_manager, &store)
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.status, crate::store::TaskStatus::Blocked);
+        assert_eq!(
+            task.block_reason.as_deref(),
+            Some("waiting for human input")
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn global_rebroadcast_sweep_skips_freshly_blocked_tasks() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            store.clone(),
+            "active/repo".to_string(),
+        ));
+        let router = router_with_healthy_review_agent();
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "inactive/repo",
+                ext_id: "40",
+                title: "Just escalated",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::Blocked)
+            .await
+            .unwrap();
+        store
+            .set_fields(
+                id,
+                &[("block_reason", serde_json::json!(REBROADCAST_BLOCK_REASON))],
+            )
+            .await
+            .unwrap();
+        // No backdating — escalated "just now" in this same tick, must not be
+        // immediately un-blocked by the same pass.
+
+        auto_recover_rebroadcast_blocked_tasks_global(&router, &task_manager, &store)
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.status, crate::store::TaskStatus::Blocked);
+    }
+
+    /// Regression test for #3532: `auto_recover_rebroadcast_blocked_tasks` (the only
+    /// recovery path for this block_reason) is called from `sync_tick`, which never
+    /// runs for a repo removed from the active `projects:` list. The global sweep must
+    /// recover such a task by querying across all repos and writing through the store
+    /// directly, bypassing the repo-scoped `TaskManager` (scoped to a different,
+    /// currently-active repo).
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn global_rebroadcast_sweep_recovers_task_from_inactive_repo() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            store.clone(),
+            "active/repo".to_string(),
+        ));
+        let router = router_with_healthy_review_agent();
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "inactive/repo",
+                ext_id: "458",
+                title: "Rebroadcast blocked from inactive repo",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::Blocked)
+            .await
+            .unwrap();
+        store
+            .set_fields(
+                id,
+                &[
+                    ("block_reason", serde_json::json!(REBROADCAST_BLOCK_REASON)),
+                    ("needs_review_refires", serde_json::json!(6)),
+                ],
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        auto_recover_rebroadcast_blocked_tasks_global(&router, &task_manager, &store)
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(
+            task.status,
+            crate::store::TaskStatus::NeedsReview,
+            "cross-repo rebroadcast-blocked task must be recovered to needs_review"
+        );
+        assert!(
+            task.block_reason.is_none(),
+            "block_reason must be cleared on recovery"
+        );
+        assert_eq!(
+            task.needs_review_refires, 0,
+            "needs_review_refires must be reset to 0 on recovery"
+        );
+    }
+
+    /// Companion to the above: with no routable review agent anywhere, the global
+    /// sweep must not reset the task — that would immediately re-exhaust the refire
+    /// counter, same guard as the per-repo `auto_recover_rebroadcast_blocked_tasks`.
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn global_rebroadcast_sweep_skips_reset_without_routable_review_agent() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            store.clone(),
+            "active/repo".to_string(),
+        ));
+        // RouterConfig::default() has no "review" model map entries, so the one
+        // available agent has no healthy model for "review" — nothing is routable.
+        let router = crate::engine::router::Router::new_for_test(
+            crate::engine::router::RouterConfig::default(),
+            vec!["claude".to_string()],
+        );
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "inactive/repo",
+                ext_id: "459",
+                title: "Rebroadcast blocked, no routable agents",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::Blocked)
+            .await
+            .unwrap();
+        store
+            .set_fields(
+                id,
+                &[("block_reason", serde_json::json!(REBROADCAST_BLOCK_REASON))],
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        auto_recover_rebroadcast_blocked_tasks_global(&router, &task_manager, &store)
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.status, crate::store::TaskStatus::Blocked);
+        assert_eq!(task.block_reason.as_deref(), Some(REBROADCAST_BLOCK_REASON));
     }
 }

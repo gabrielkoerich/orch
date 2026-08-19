@@ -1502,6 +1502,23 @@ pub(crate) async fn tick_recover_stuck_tasks(
         tracing::warn!(err = %e, "global NeedsReview refire/escalation sweep failed");
     }
 
+    // Global sweep for rebroadcast-blocked tasks from inactive or removed projects.
+    // The escalation sweep above (`refire_and_escalate_stale_needs_review_global`) that
+    // *writes* this block_reason already runs across all repos, but the only recovery
+    // path (`auto_recover_rebroadcast_blocked_tasks`) is scoped to the active repo via
+    // `sync_tick` — so a task escalated for a repo later removed from the active
+    // `projects:` list could never recover. This sweep covers all repos (same pattern
+    // as the two sweeps above).
+    if let Err(e) = crate::engine::sync::auto_recover_rebroadcast_blocked_tasks_global(
+        router,
+        task_manager,
+        store,
+    )
+    .await
+    {
+        tracing::warn!(err = %e, "global rebroadcast-blocked recovery sweep failed");
+    }
+
     Ok(())
 }
 
