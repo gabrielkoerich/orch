@@ -672,11 +672,14 @@ fn classify_opencode_message(message: &str) -> AgentError {
     //   "The free model has been deprecated. Transition to qwen/qwen3.6-plus for continued paid access."
     //   "No endpoints found for qwen/qwen3.6-plus:free."
     //   "This model is unavailable for free. The paid version is available now - use this slug instead: X"
+    //   "This model is not available in your country."
     let is_model_unavailable = (lower.contains("model")
         && (lower.contains("not found")
             || lower.contains("not supported")
             || lower.contains("deprecated")
-            || lower.contains("unavailable for free")))
+            || lower.contains("unavailable for free")
+            || lower.contains("not available in your country")
+            || lower.contains("not available in your region")))
         || lower.contains("no endpoints found");
 
     if is_model_unavailable {
@@ -1406,6 +1409,20 @@ mod tests {
                     "expected model extracted from 'use this slug instead: X', got: {model:?}"
                 );
             }
+            other => panic!("expected ModelUnavailable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_opencode_model_not_available_in_country() {
+        // Issue #3535: "This model is not available in your country." must classify as
+        // ModelUnavailable (persistent per-model cooldown), not fall through to the
+        // generic AgentFailed bucket which applies a weaker cooldown plus an
+        // unwarranted agent-wide penalty.
+        let err =
+            classify_opencode_message("agent failed: This model is not available in your country.");
+        match err {
+            AgentError::ModelUnavailable { .. } => {}
             other => panic!("expected ModelUnavailable, got: {other:?}"),
         }
     }
