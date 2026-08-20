@@ -579,9 +579,9 @@ async fn push_branch_with_log(
                         .await;
                         ctx.set(&[(
                             "last_error",
-                            serde_json::json!(format!(
+                            serde_json::json!(
                                 "push failed: branch diverged from remote — rebased successfully, will retry with new agent"
-                            )),
+                            ),
                         )])
                         .await;
                         return PushResult::Rebased;
