@@ -438,18 +438,11 @@ pub fn spawn(
                         }
                         .await;
 
-                        let current_status;
-                        let current_block_reason;
-
-                        match fetched {
-                            Ok(Some((status, block_reason))) => {
-                                current_status = Some(status);
-                                current_block_reason = block_reason;
-                            }
+                        let (current_status, current_block_reason) = match fetched {
+                            Ok(Some((status, block_reason))) => (Some(status), block_reason),
                             Ok(None) => {
                                 // Task doesn't exist in store — treat as not in_review
-                                current_status = None;
-                                current_block_reason = None;
+                                (None, None)
                             }
                             Err(e) => {
                                 // DB error — log and keep the review outcome instead of discarding
@@ -460,10 +453,9 @@ pub fn spawn(
                                 );
                                 // Skip the stale outcome check and proceed with the outcome
                                 // by treating it as if the task is still InReview
-                                current_status = Some(crate::store::TaskStatus::InReview);
-                                current_block_reason = None;
+                                (Some(crate::store::TaskStatus::InReview), None)
                             }
-                        }
+                        };
 
                         if !matches!(current_status, Some(crate::store::TaskStatus::InReview)) {
                             let ci_blocked = matches!(

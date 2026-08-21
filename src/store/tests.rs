@@ -5222,7 +5222,7 @@ async fn review_invocations_preserved_across_reset_prevents_task_run_overwrite()
     let codex_attempt = store
         .increment(task_id, "review_invocations")
         .await
-        .unwrap() as i32; // → 2
+        .unwrap(); // → 2
     let codex_run_id = store
         .start_run(&StartRun {
             task_id,
@@ -5253,7 +5253,7 @@ async fn review_invocations_preserved_across_reset_prevents_task_run_overwrite()
     let kimi_attempt = store
         .increment(task_id, "review_invocations")
         .await
-        .unwrap() as i32; // → 3
+        .unwrap(); // → 3
     let kimi_run_id = store
         .start_run(&StartRun {
             task_id,
