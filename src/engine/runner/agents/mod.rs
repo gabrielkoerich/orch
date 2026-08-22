@@ -1421,6 +1421,9 @@ pub(crate) mod patterns {
             "upstream idle timeout",
             "streaming response failed",
             "upstream request failed",
+            // Provider-side mid-stream disconnects (e.g. kimi/claude API errors)
+            "stalled mid-stream",
+            "connection closed mid-response",
         ];
         // Map the byte offset from `lower` back to `text` via char-count (same
         // rationale as detect_rate_limit: Unicode case-folding can change byte lengths).
@@ -2530,6 +2533,34 @@ mod tests {
         assert!(
             matches!(err, AgentError::NetworkError { .. }),
             "ECONNRESET must be NetworkError, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_detects_stalled_mid_stream() {
+        // Regression test for issue #3541: kimi's "Response stalled mid-stream" must be
+        // classified as NetworkError, not Unknown/AgentFailed.
+        let err = patterns::classify_from_text(
+            1,
+            "API Error: Response stalled mid-stream. The response above may be incomplete.",
+        );
+        assert!(
+            matches!(err, AgentError::NetworkError { .. }),
+            "stalled mid-stream must be NetworkError, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_detects_connection_closed_mid_response() {
+        // Regression test for issue #3541: claude's "Connection closed mid-response" must be
+        // classified as NetworkError, not Unknown/AgentFailed.
+        let err = patterns::classify_from_text(
+            1,
+            "API Error: Connection closed mid-response. The response above may be incomplete.",
+        );
+        assert!(
+            matches!(err, AgentError::NetworkError { .. }),
+            "connection closed mid-response must be NetworkError, got: {err:?}"
         );
     }
 
