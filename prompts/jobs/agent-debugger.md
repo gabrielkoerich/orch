@@ -14,13 +14,13 @@ Read `./prompts/skills/orch/SKILL.md` first — it contains the repo-tracked ope
 
 1. Check recent task run logs for failures:
    ```
-    sqlite3 ~/.orch/orch.db "SELECT id, external_id, status, agent, model, last_error, block_reason, updated_at FROM tasks WHERE status IN ('blocked', 'needs_review') AND updated_at > datetime('now', '-12 hours') ORDER BY updated_at DESC LIMIT 20;"
+    sqlite3 ~/.orch/orch.db "SELECT id, external_id, status, agent, model, last_error, block_reason, updated_at FROM tasks WHERE status IN ('blocked', 'needs_review') AND datetime(updated_at) > datetime('now', '-12 hours') ORDER BY updated_at DESC LIMIT 20;"
    ```
 2. Check recent task run audit trails:
    ```
-   sqlite3 ~/.orch/orch.db "SELECT agent, model, outcome, COUNT(*) AS count FROM task_runs WHERE started_at > datetime('now', '-12 hours') AND outcome != 'success' GROUP BY agent, model, outcome ORDER BY count DESC;"
-   sqlite3 ~/.orch/orch.db "SELECT agent, started_at, error FROM task_runs WHERE outcome = 'rate_limit' AND started_at > datetime('now', '-24 hours') ORDER BY started_at;"
-   sqlite3 ~/.orch/orch.db "SELECT agent, outcome, SUM(total_cost_usd) AS total_cost, COUNT(*) AS runs FROM task_runs WHERE started_at > datetime('now', '-24 hours') GROUP BY agent, outcome;"
+   sqlite3 ~/.orch/orch.db "SELECT agent, model, outcome, COUNT(*) AS count FROM task_runs WHERE datetime(started_at) > datetime('now', '-12 hours') AND outcome != 'success' GROUP BY agent, model, outcome ORDER BY count DESC;"
+   sqlite3 ~/.orch/orch.db "SELECT agent, started_at, error FROM task_runs WHERE outcome = 'rate_limit' AND datetime(started_at) > datetime('now', '-24 hours') ORDER BY started_at;"
+   sqlite3 ~/.orch/orch.db "SELECT agent, outcome, SUM(total_cost_usd) AS total_cost, COUNT(*) AS runs FROM task_runs WHERE datetime(started_at) > datetime('now', '-24 hours') GROUP BY agent, outcome;"
    ```
 3. Read the service log for errors:
    ```
