@@ -4503,6 +4503,60 @@ async fn metrics_summary_counts_success_and_failure() {
 }
 
 #[tokio::test]
+async fn metrics_summary_excludes_rows_before_cutoff_on_same_calendar_day() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    // `completed_at` is stored as RFC3339 ('T' separator) but SQLite's
+    // `datetime('now', '-24 hours')` produces a space-separated string. 'T' (0x54)
+    // sorts after ' ' (0x20), so a plain string `>=` comparison used to treat any
+    // row sharing the cutoff's calendar day as "within the window" regardless of
+    // its actual time-of-day. Midnight of the cutoff's own day is unambiguously
+    // >=24h in the past yet shares that day's date with the cutoff, so it
+    // reproduces the bug deterministically without depending on wall-clock timing.
+    let cutoff_str: String = sqlx::query_scalar("SELECT datetime('now', '-24 hours')")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    let cutoff_date = &cutoff_str[..10];
+
+    let midnight = chrono::NaiveDateTime::parse_from_str(
+        &format!("{cutoff_date} 00:00:01"),
+        "%Y-%m-%d %H:%M:%S",
+    )
+    .unwrap()
+    .and_utc();
+
+    store
+        .insert_task_metric(&InsertTaskMetric {
+            repo: "",
+            task_id: "old",
+            agent: "claude",
+            model: None,
+            complexity: None,
+            outcome: "success",
+            duration_seconds: 10.0,
+            started_at: &midnight,
+            completed_at: &midnight,
+            attempts: 1,
+            files_changed: 0,
+            error_type: None,
+            input_tokens: None,
+            output_tokens: None,
+            input_cost_usd: None,
+            output_cost_usd: None,
+            total_cost_usd: None,
+        })
+        .await
+        .unwrap();
+
+    let summary = store.get_metrics_summary(24).await.unwrap();
+    assert_eq!(
+        summary.tasks_completed_24h, 0,
+        "a row from midnight of the cutoff's calendar day is >=24h old and must not be counted"
+    );
+}
+
+#[tokio::test]
 async fn cost_summary_returns_correct_periods() {
     let store = TaskStore::open_memory().await.unwrap();
     let summary = store.get_cost_summary().await.unwrap();

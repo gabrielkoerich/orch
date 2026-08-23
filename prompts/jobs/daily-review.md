@@ -19,8 +19,8 @@ End-of-day review covering the last 24 hours. Your ONLY output is a summary post
 
 1. Which tasks completed? What went well?
 2. Which tasks failed or needed retries? Why?
-3. Task/agent/model failure patterns: `sqlite3 ~/.orch/orch.db "SELECT agent, model, outcome, COUNT(*) FROM task_runs WHERE started_at > datetime('now', '-24 hours') GROUP BY agent, model, outcome ORDER BY COUNT(*) DESC;"`
-4. If `task_activity` exists: `sqlite3 ~/.orch/orch.db "SELECT event_type, COUNT(*) FROM task_activity WHERE timestamp > datetime('now', '-24 hours') GROUP BY event_type ORDER BY COUNT(*) DESC;" 2>/dev/null`
+3. Task/agent/model failure patterns: `sqlite3 ~/.orch/orch.db "SELECT agent, model, outcome, COUNT(*) FROM task_runs WHERE datetime(started_at) > datetime('now', '-24 hours') GROUP BY agent, model, outcome ORDER BY COUNT(*) DESC;"`
+4. If `task_activity` exists: `sqlite3 ~/.orch/orch.db "SELECT event_type, COUNT(*) FROM task_activity WHERE datetime(timestamp) > datetime('now', '-24 hours') GROUP BY event_type ORDER BY COUNT(*) DESC;" 2>/dev/null`
 5. Error patterns in `orch log 200`.
 6. Is routing accurate? Any models failing silently? Any agents repeatedly cooled?
 7. Are agent prompts effective or do they need tuning?

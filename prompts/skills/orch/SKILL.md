@@ -23,7 +23,7 @@ Start with observation, not intervention:
 ```bash
 orch task list --global
 orch log 100
-sqlite3 ~/.orch/orch.db "SELECT agent, model, outcome, COUNT(*) FROM task_runs WHERE started_at > datetime('now', '-24 hours') GROUP BY agent, model, outcome ORDER BY COUNT(*) DESC;"
+sqlite3 ~/.orch/orch.db "SELECT agent, model, outcome, COUNT(*) FROM task_runs WHERE datetime(started_at) > datetime('now', '-24 hours') GROUP BY agent, model, outcome ORDER BY COUNT(*) DESC;"
 ```
 
 When a specific task needs inspection:

@@ -161,9 +161,11 @@ impl TaskStore {
     pub async fn insert_task_metric(&self, metric: &InsertTaskMetric<'_>) -> anyhow::Result<i64> {
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query("DELETE FROM task_metrics WHERE completed_at < datetime('now', '-90 days')")
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "DELETE FROM task_metrics WHERE datetime(completed_at) < datetime('now', '-90 days')",
+        )
+        .execute(&mut *tx)
+        .await?;
 
         let row = sqlx::query(
         "INSERT INTO task_metrics (repo, task_id, agent, model, complexity, outcome, duration_seconds,
@@ -211,7 +213,7 @@ impl TaskStore {
                 AVG(CASE WHEN complexity = 'medium' THEN duration_seconds END) AS avg_medium,
                 AVG(CASE WHEN complexity = 'complex' THEN duration_seconds END) AS avg_complex
              FROM task_metrics
-             WHERE completed_at >= datetime('now', ?)",
+             WHERE datetime(completed_at) >= datetime('now', ?)",
         )
         .bind(&interval)
         .fetch_one(&self.pool)
@@ -228,7 +230,7 @@ impl TaskStore {
             "SELECT agent, COUNT(*) as total,
                 COALESCE(SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END), 0) as success_count
              FROM task_metrics
-             WHERE completed_at >= datetime('now', ?)
+             WHERE datetime(completed_at) >= datetime('now', ?)
              GROUP BY agent",
         )
         .bind(&interval)
@@ -301,7 +303,7 @@ impl TaskStore {
                     OR (m.task_id = t.external_id AND NOT EXISTS (
                         SELECT 1 FROM tasks t2 WHERE t2.id = CAST(m.task_id AS INTEGER) AND t2.repo = t.repo
                     ))
-                WHERE m.completed_at >= datetime('now', ?)
+                WHERE datetime(m.completed_at) >= datetime('now', ?)
             )
             SELECT
                 COALESCE(SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END), 0) AS completed,
@@ -332,7 +334,7 @@ impl TaskStore {
                  OR (m.task_id = t.external_id AND NOT EXISTS (
                      SELECT 1 FROM tasks t2 WHERE t2.id = CAST(m.task_id AS INTEGER) AND t2.repo = t.repo
                  ))
-             WHERE m.completed_at >= datetime('now', ?)
+             WHERE datetime(m.completed_at) >= datetime('now', ?)
              AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?
              GROUP BY m.agent",
         )
@@ -414,7 +416,7 @@ impl TaskStore {
              OR (m.task_id = t.external_id AND NOT EXISTS (
                  SELECT 1 FROM tasks t2 WHERE t2.id = CAST(m.task_id AS INTEGER) AND t2.repo = t.repo
              ))
-         WHERE m.completed_at >= datetime('now', ?)
+         WHERE datetime(m.completed_at) >= datetime('now', ?)
          AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
         )
         .bind(&interval)
@@ -507,7 +509,7 @@ impl TaskStore {
         let rows = sqlx::query(
             "SELECT task_id, agent, complexity, duration_seconds
          FROM task_metrics
-         WHERE completed_at >= datetime('now', ?) AND outcome = 'success'
+         WHERE datetime(completed_at) >= datetime('now', ?) AND outcome = 'success'
          ORDER BY duration_seconds DESC
          LIMIT 10",
         )
@@ -535,7 +537,7 @@ impl TaskStore {
         let rows = sqlx::query(
             "SELECT task_id, agent, complexity, duration_seconds
          FROM task_metrics
-         WHERE completed_at >= datetime('now', '-7 days') AND outcome = 'success'
+         WHERE datetime(completed_at) >= datetime('now', '-7 days') AND outcome = 'success'
          ORDER BY duration_seconds DESC
          LIMIT 10",
         )
@@ -561,7 +563,7 @@ impl TaskStore {
         let rows = sqlx::query(
             "SELECT error_type, COUNT(*) as count
          FROM task_metrics
-         WHERE completed_at >= datetime('now', ?)
+         WHERE datetime(completed_at) >= datetime('now', ?)
            AND outcome != 'success'
            AND error_type IS NOT NULL
          GROUP BY error_type
@@ -597,7 +599,7 @@ impl TaskStore {
                     COALESCE(SUM(total_cost_usd), 0.0) as total_cost_usd,
                     COUNT(*) as task_count
              FROM task_metrics
-             WHERE completed_at >= datetime('now', '-24 hours')",
+             WHERE datetime(completed_at) >= datetime('now', '-24 hours')",
                 "24h",
             ),
             (
@@ -608,7 +610,7 @@ impl TaskStore {
                     COALESCE(SUM(total_cost_usd), 0.0) as total_cost_usd,
                     COUNT(*) as task_count
              FROM task_metrics
-             WHERE completed_at >= datetime('now', '-7 days')",
+             WHERE datetime(completed_at) >= datetime('now', '-7 days')",
                 "7d",
             ),
             (
@@ -619,7 +621,7 @@ impl TaskStore {
                     COALESCE(SUM(total_cost_usd), 0.0) as total_cost_usd,
                     COUNT(*) as task_count
              FROM task_metrics
-             WHERE completed_at >= datetime('now', '-30 days')",
+             WHERE datetime(completed_at) >= datetime('now', '-30 days')",
                 "30d",
             ),
         ];
@@ -729,7 +731,7 @@ impl TaskStore {
             "SELECT external_id, agent, review_cycles, title
          FROM tasks
          WHERE review_cycles >= 2
-           AND updated_at >= datetime('now', ?)
+           AND datetime(updated_at) >= datetime('now', ?)
          ORDER BY review_cycles DESC
          LIMIT 10",
         )
@@ -758,7 +760,7 @@ impl TaskStore {
             "SELECT external_id, agent, review_cycles, title
          FROM tasks
          WHERE review_cycles >= 2
-           AND updated_at >= datetime('now', '-7 days')
+           AND datetime(updated_at) >= datetime('now', '-7 days')
          ORDER BY review_cycles DESC
          LIMIT 10",
         )
