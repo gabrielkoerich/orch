@@ -6,9 +6,12 @@
 //! (the watchdog in `engine::mod`) or a hung agent (`stuck_task_timing_from_map` in
 //! `engine::tick`).
 //!
-//! `checkpoint()` is the single detection point, called once per main tick loop
-//! iteration. Both consumers pull from the resulting gap log instead of re-deriving
-//! suspend information from their own wall-clock deltas.
+//! `checkpoint()` is the primary detection point, called once per main tick loop
+//! iteration; `suspended_duration_since` pulls from its gap log instead of re-deriving
+//! suspend information from its own wall-clock deltas. Callers that run on an
+//! independent timer and can't wait for the main loop's checkpoint (e.g. the tick
+//! watchdog, which would otherwise race it on wake from suspend) should use their own
+//! `SuspendDetector` instance instead.
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::sync::Mutex;
@@ -33,6 +36,24 @@ struct Checkpoint {
     wall: DateTime<Utc>,
 }
 
+/// Compare a previous checkpoint against now and return the suspend gap, if the
+/// wall-clock-minus-monotonic delta clears `SUSPEND_GAP_THRESHOLD`. Shared by the
+/// global checkpoint log and by independent `SuspendDetector` instances so both use
+/// identical detection math.
+fn gap_since(
+    prev: &Checkpoint,
+    now_instant: Instant,
+    now_wall: DateTime<Utc>,
+) -> Option<ChronoDuration> {
+    let monotonic_elapsed = now_instant.saturating_duration_since(prev.instant);
+    let wall_elapsed = (now_wall - prev.wall).to_std().unwrap_or_default();
+    let gap = wall_elapsed.saturating_sub(monotonic_elapsed);
+    if gap < SUSPEND_GAP_THRESHOLD {
+        return None;
+    }
+    Some(ChronoDuration::from_std(gap).unwrap_or_else(|_| ChronoDuration::zero()))
+}
+
 static LAST_CHECKPOINT: Mutex<Option<Checkpoint>> = Mutex::new(None);
 static GAP_LOG: Mutex<Vec<GapRecord>> = Mutex::new(Vec::new());
 
@@ -50,15 +71,8 @@ pub fn checkpoint() -> Option<ChronoDuration> {
         })
     };
     let prev = prev?;
+    let gap = gap_since(&prev, now_instant, now_wall)?;
 
-    let monotonic_elapsed = now_instant.saturating_duration_since(prev.instant);
-    let wall_elapsed = (now_wall - prev.wall).to_std().unwrap_or_default();
-    let gap = wall_elapsed.saturating_sub(monotonic_elapsed);
-    if gap < SUSPEND_GAP_THRESHOLD {
-        return None;
-    }
-
-    let gap = ChronoDuration::from_std(gap).unwrap_or_else(|_| ChronoDuration::zero());
     let mut log = GAP_LOG.lock().unwrap_or_else(|e| e.into_inner());
     log.push(GapRecord {
         detected_at: now_wall,
@@ -69,6 +83,42 @@ pub fn checkpoint() -> Option<ChronoDuration> {
         log.drain(0..excess);
     }
     Some(gap)
+}
+
+/// Independent suspend detector for callers that run on their own timer and can't
+/// rely on the shared `checkpoint()`/`GAP_LOG` pair, which is only written by the
+/// main tick loop. Two independently-scheduled tokio tasks that both freeze during a
+/// host suspend become "due" at roughly the same instant on wake with no ordering
+/// guarantee between them — a caller reading `GAP_LOG` right after wake can race the
+/// main loop's own `checkpoint()` call and observe no gap yet. A `SuspendDetector`
+/// avoids the race by tracking its own Instant/wall-clock baseline, so it detects the
+/// gap from its own frozen timer instead of waiting on another task to record it.
+pub struct SuspendDetector {
+    last: Option<Checkpoint>,
+}
+
+impl SuspendDetector {
+    pub fn new() -> Self {
+        Self { last: None }
+    }
+
+    /// Record a checkpoint on this detector and return the suspend gap (if any)
+    /// detected since the previous call.
+    pub fn check(&mut self) -> Option<ChronoDuration> {
+        let now_instant = Instant::now();
+        let now_wall = Utc::now();
+        let prev = self.last.replace(Checkpoint {
+            instant: now_instant,
+            wall: now_wall,
+        })?;
+        gap_since(&prev, now_instant, now_wall)
+    }
+}
+
+impl Default for SuspendDetector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Total suspend time detected since `since`. Subtract this from a wall-clock age
@@ -137,6 +187,20 @@ mod tests {
         assert_eq!(total, ChronoDuration::zero());
 
         clear_for_test();
+    }
+
+    #[test]
+    fn suspend_detector_first_check_has_no_baseline() {
+        let mut detector = SuspendDetector::new();
+        assert_eq!(detector.check(), None);
+    }
+
+    #[test]
+    fn suspend_detector_reports_no_gap_for_normal_elapsed_time() {
+        let mut detector = SuspendDetector::new();
+        detector.check();
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(detector.check(), None);
     }
 
     #[test]
