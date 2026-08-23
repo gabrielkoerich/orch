@@ -1979,8 +1979,14 @@ pub async fn serve() -> anyhow::Result<()> {
         tokio::spawn(async move {
             // Check every 30s whether the main loop is still ticking.
             let mut watchdog_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            // Own suspend baseline, independent of the main loop's checkpoint(). The
+            // watchdog's interval timer also freezes during a host suspend, so this
+            // detects the gap from its own wake-up instead of racing the main loop's
+            // checkpoint() for the same GAP_LOG entry (see #3544).
+            let mut suspend_detector = crate::engine::suspend::SuspendDetector::new();
             loop {
                 watchdog_interval.tick().await;
+                let own_gap = suspend_detector.check();
                 let last = last_tick_epoch.load(std::sync::atomic::Ordering::Relaxed);
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1992,10 +1998,20 @@ pub async fn serve() -> anyhow::Result<()> {
                 if stale_secs > threshold {
                     // A host suspend/resume gap fully explains a stale window that
                     // isn't an actual stall — the process (and its timers) were
-                    // simply not scheduled while the host was asleep.
-                    if let Some(gap) = crate::engine::suspend::gap_detected_within(
+                    // simply not scheduled while the host was asleep. Prefer this
+                    // watchdog's own detector (immune to the checkpoint race above);
+                    // fall back to the shared log in case the main loop's checkpoint()
+                    // already ran and recorded a larger gap.
+                    let shared_gap = crate::engine::suspend::gap_detected_within(
                         std::time::Duration::from_secs(stale_secs),
-                    ) {
+                    );
+                    let gap = match (own_gap, shared_gap) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (Some(a), None) => Some(a),
+                        (None, Some(b)) => Some(b),
+                        (None, None) => None,
+                    };
+                    if let Some(gap) = gap {
                         let gap_secs = gap.num_seconds() as u64;
                         if gap_secs >= stale_secs {
                             tracing::info!(
