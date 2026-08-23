@@ -2806,30 +2806,32 @@ pub(crate) async fn ingest_external_tasks(
     }
 
     // Track last ingest time for incremental fetches (same pattern as mentions_last_checked).
-    // Use 24h fallback on first run or if the key is missing.
-    // Note: on startup, the engine clears this key for all repos (see clear_issues_last_ingested)
-    // so the first ingest after a restart always uses the 24h window. This prevents issues
-    // created during engine downtime from being permanently skipped (GitHub's `since` filters
-    // by updated_at, not created_at, so issues created while the engine was down would otherwise
-    // be invisible).
+    // Use 24h fallback on first run (key genuinely missing) or if the key holds a normal
+    // timestamp cursor. On startup, the engine marks this key with `STARTUP_RESCAN_SENTINEL`
+    // for all repos (see clear_issues_last_ingested) instead of deleting it, so the first
+    // ingest after a restart can tell "never ingested before" (24h fallback is fine — any
+    // downtime gap is naturally bounded) apart from "cursor deliberately reset for a full
+    // rescan" (fetch with `since = None`, i.e. unbounded by time). A 24h fallback here would
+    // silently re-skip any issue whose `updated_at` already lags more than 24h — which is
+    // exactly the class of issue a startup rescan exists to recover.
     let kv_key = format!("issues_last_ingested:{repo}");
     let fallback = (chrono::Utc::now() - chrono::Duration::hours(24))
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
-    let since = store
-        .kv_get(&kv_key)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(fallback);
-    let since_for_fetch = since.clone();
+    let stored = store.kv_get(&kv_key).await.ok().flatten();
+    let since_for_fetch: Option<String> = match stored.as_deref() {
+        Some(STARTUP_RESCAN_SENTINEL) => None,
+        Some(ts) => Some(ts.to_string()),
+        None => Some(fallback),
+    };
 
     // Fetch all open issues in a single backend call and partition by status label locally.
     // The GitHub backend overrides list_active_open_issues() to use one list_all_open_issues()
     // request instead of a routable call + N per-status calls.
-    // Pass `since` to filter issues updated since last ingest for efficiency.
+    // Pass `since` to filter issues updated since last ingest for efficiency; `None` fetches
+    // all currently-open issues, unbounded by time (used for the once-per-restart rescan).
     let all_tasks: Vec<(crate::backends::ExternalTask, Option<Status>)> = match backend
-        .list_active_open_issues(Some(&since_for_fetch))
+        .list_active_open_issues(since_for_fetch.as_deref())
         .await
     {
         Ok(tasks) => tasks,
@@ -3053,21 +3055,30 @@ pub(crate) async fn ingest_external_tasks(
     Ok(())
 }
 
-/// Clear `issues_last_ingested:{repo}` for all repos on engine startup.
+/// Sentinel value written to `issues_last_ingested:{repo}` on startup to request an
+/// unbounded (`since = None`) rescan on the next ingest, as opposed to a genuinely
+/// missing key (first run ever), which still gets the cheaper 24h fallback.
+const STARTUP_RESCAN_SENTINEL: &str = "__startup_full_rescan__";
+
+/// Mark `issues_last_ingested:{repo}` for an unbounded full re-scan on the next ingest,
+/// for all repos, on engine startup.
 ///
-/// This ensures that the first ingest after a restart uses the 24h fallback window
-/// instead of an incremental `since` timestamp that may have been set before a period
-/// of engine downtime. Without this, issues created while the engine was down would be
-/// permanently invisible: GitHub's `since` filter uses `updated_at`, so any issue whose
-/// `updated_at` predates the stored timestamp is silently skipped.
+/// This ensures that the first ingest after a restart fetches all currently-open issues
+/// rather than resuming from an incremental `since` timestamp that may have been set
+/// before a period of engine downtime, or before a cursor-advancement bug stranded an
+/// issue outside any bounded window. A plain 24h fallback is not enough here: an issue
+/// whose `updated_at` already lags more than 24h (e.g. no comments/labels since it was
+/// filed) would be silently re-skipped by a time-bounded window on every restart.
 pub(crate) async fn clear_issues_last_ingested(store: &crate::store::TaskStore, repo: &str) {
     let kv_key = format!("issues_last_ingested:{repo}");
-    match store.kv_delete(&kv_key).await {
+    match store.kv_set(&kv_key, STARTUP_RESCAN_SENTINEL).await {
         Ok(_) => tracing::info!(
             repo,
-            "cleared issues_last_ingested for full re-scan on startup"
+            "marked issues_last_ingested for unbounded full re-scan on startup"
         ),
-        Err(e) => tracing::warn!(repo, err = %e, "failed to clear issues_last_ingested on startup"),
+        Err(e) => {
+            tracing::warn!(repo, err = %e, "failed to mark issues_last_ingested for startup rescan")
+        }
     }
 }
 
@@ -3091,6 +3102,9 @@ mod tests {
         comments: tokio::sync::Mutex<Vec<(String, String)>>,
         status_updates: tokio::sync::Mutex<Vec<(String, Status)>>,
         project_syncs: tokio::sync::Mutex<Vec<(String, Status)>>,
+        /// Records the `since` argument of every `list_active_open_issues` call, so tests
+        /// can assert whether a fetch was time-bounded or unbounded.
+        since_calls: tokio::sync::Mutex<Vec<Option<String>>>,
     }
 
     impl IngestMockBackend {
@@ -3117,6 +3131,7 @@ mod tests {
                 comments: tokio::sync::Mutex::new(Vec::new()),
                 status_updates: tokio::sync::Mutex::new(Vec::new()),
                 project_syncs: tokio::sync::Mutex::new(Vec::new()),
+                since_calls: tokio::sync::Mutex::new(Vec::new()),
             })
         }
     }
@@ -3146,8 +3161,12 @@ mod tests {
         }
         async fn list_active_open_issues(
             &self,
-            _: Option<&str>,
+            since: Option<&str>,
         ) -> anyhow::Result<Vec<(ExternalTask, Option<Status>)>> {
+            self.since_calls
+                .lock()
+                .await
+                .push(since.map(|s| s.to_string()));
             let mut result = Vec::new();
             for (label, tasks) in &self.tasks {
                 let status = match label.as_str() {
@@ -3285,6 +3304,54 @@ mod tests {
             cursor,
             Some("2026-01-01T00:00:00Z".to_string()),
             "cursor must match the max updated_at observed in the fetch, not wall-clock now()"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn ingest_after_startup_rescan_marker_fetches_unbounded() {
+        // Regression test for the stranded-issue bug: after clear_issues_last_ingested()
+        // marks the cursor for a startup rescan, the next ingest must fetch with
+        // `since = None` (unbounded), not a 24h-bounded fallback. A time-bounded fetch here
+        // would permanently re-skip any issue whose `updated_at` already lags more than 24h.
+        crate::engine::cooldown::reset_global_state().await;
+        let backend = IngestMockBackend::with_tasks(vec![(Status::New, make_ext_task("1", "x"))]);
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        clear_issues_last_ingested(&store, "owner/repo").await;
+
+        let backend_dyn: Arc<dyn ExternalBackend> = backend.clone();
+        ingest_external_tasks(&backend_dyn, "owner/repo", &store)
+            .await
+            .unwrap();
+
+        let calls = backend.since_calls.lock().await;
+        assert_eq!(
+            calls.as_slice(),
+            [None],
+            "startup rescan marker must produce an unbounded fetch (since = None)"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn ingest_with_missing_cursor_uses_24h_fallback() {
+        // A genuinely missing cursor (first ingest ever for a repo) is not the same as a
+        // startup-rescan marker — it should still get the cheap, bounded 24h fallback.
+        crate::engine::cooldown::reset_global_state().await;
+        let backend = IngestMockBackend::with_tasks(vec![(Status::New, make_ext_task("1", "x"))]);
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        let backend_dyn: Arc<dyn ExternalBackend> = backend.clone();
+        ingest_external_tasks(&backend_dyn, "owner/repo", &store)
+            .await
+            .unwrap();
+
+        let calls = backend.since_calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].is_some(),
+            "missing cursor should fall back to a bounded 24h window, not an unbounded fetch"
         );
     }
 
