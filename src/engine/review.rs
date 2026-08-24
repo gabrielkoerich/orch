@@ -1054,25 +1054,36 @@ async fn parse_review_output(
                     runner::agents::patterns::RATE_LIMIT_SCAN_TAIL_BYTES,
                 );
 
-                if let Some(runner::agents::AgentError::RateLimit { message }) = (!ndjson_completed)
+                if let Some(err) = (!ndjson_completed)
                     .then(|| {
                         runner::agents::patterns::detect_rate_limit(scan_head)
                             .or_else(|| runner::agents::patterns::detect_rate_limit(scan_tail))
                     })
                     .flatten()
                 {
+                    let runner::agents::AgentError::RateLimit { message } = &err else {
+                        unreachable!("detect_rate_limit only returns AgentError::RateLimit")
+                    };
                     tracing::warn!(
                         task_id = task.id.0,
                         agent = %ctx.review_agent,
                         "review agent hit rate limit — adding to cooldown"
                     );
-                    runner::response::record_agent_failure_with_message(
+                    // Route through record_review_agent_failure/outcome_for_agent_error
+                    // (not the generic record_agent_failure_with_message + hardcoded
+                    // "rate_limit" string) so billing-cycle exhaustion messages caught by
+                    // this inline text scan get the same model-scoped persistent cooldown
+                    // and outcome classification as the AgentError-based failure path
+                    // above (issue #3551, gap left by #3530).
+                    let summary = runner::fallback::summarize_rate_limit_error(message);
+                    let stored_error = format!("{} rate limit: {summary}", ctx.review_agent);
+                    record_review_agent_failure(
+                        &task.id.0,
                         &ctx.review_agent,
-                        &message,
+                        ctx.review_model.as_deref(),
+                        &err,
                     )
                     .await;
-                    let summary = runner::fallback::summarize_rate_limit_error(&message);
-                    let stored_error = format!("{} rate limit: {summary}", ctx.review_agent);
                     complete_review_run(
                         store,
                         run.run_id,
@@ -1080,7 +1091,7 @@ async fn parse_review_output(
                         &raw_output,
                         &stderr,
                         &text_for_review,
-                        "rate_limit",
+                        outcome_for_agent_error(&err),
                         &stored_error,
                         token_usage,
                     )
@@ -1088,17 +1099,21 @@ async fn parse_review_output(
                     return ReviewPhase::EarlyReturn(ReviewDecision::Failed(stored_error));
                 }
 
-                if let Some(runner::agents::AgentError::Auth { message }) =
-                    runner::agents::patterns::detect_auth_error(scan_tail)
-                {
+                if let Some(err) = runner::agents::patterns::detect_auth_error(scan_tail) {
+                    let runner::agents::AgentError::Auth { message } = &err else {
+                        unreachable!("detect_auth_error only returns AgentError::Auth")
+                    };
                     tracing::warn!(
                         task_id = task.id.0,
                         agent = %ctx.review_agent,
                         "review agent hit auth error — adding to cooldown"
                     );
-                    runner::response::record_agent_failure_with_message(
+                    let stored_error = format!("auth error: {message}");
+                    record_review_agent_failure(
+                        &task.id.0,
                         &ctx.review_agent,
-                        &message,
+                        ctx.review_model.as_deref(),
+                        &err,
                     )
                     .await;
                     complete_review_run(
@@ -1108,14 +1123,12 @@ async fn parse_review_output(
                         &raw_output,
                         &stderr,
                         &text_for_review,
-                        "auth_error",
-                        &format!("auth error: {message}"),
+                        outcome_for_agent_error(&err),
+                        &stored_error,
                         token_usage,
                     )
                     .await;
-                    return ReviewPhase::EarlyReturn(ReviewDecision::Failed(format!(
-                        "auth error: {message}"
-                    )));
+                    return ReviewPhase::EarlyReturn(ReviewDecision::Failed(stored_error));
                 }
 
                 // The model was cut off for exceeding its output/reasoning
@@ -3148,6 +3161,55 @@ mod tests {
         assert!(
             remaining1 >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
             "after success reset, first-failure cooldown should still be ~4h, got {remaining1}s"
+        );
+    }
+
+    /// Regression test for issue #3551: a billing-cycle-exhaustion message caught by
+    /// the review module's *inline text scan* (`detect_rate_limit` on raw review
+    /// output, used when the review process exits without a clean `AgentError`) must
+    /// get the same treatment as the `AgentError`-based failure path fixed by #3530 —
+    /// not a hardcoded `"rate_limit"` outcome plus a generic short agent cooldown.
+    #[serial_test::serial(cooldown_state)]
+    #[tokio::test]
+    async fn review_inline_scan_billing_cycle_message_gets_model_scoped_cooldown() {
+        crate::engine::cooldown::reset_global_state().await;
+        let agent = "kimi-3551-review-inline";
+        let model = "opus";
+        let key = format!("{agent}:{model}");
+
+        // Verbatim text from the observed kimi failure (issue #3551).
+        let text_for_review = "kimi rate limit: Failed to authenticate. API Error: 403 \
+            You've reached your usage limit for this billing cycle. Your quota will be \
+            refreshed next cycle.";
+
+        let scan_tail = runner::agents::patterns::safe_tail(
+            text_for_review,
+            runner::agents::patterns::RATE_LIMIT_SCAN_TAIL_BYTES,
+        );
+        let err = runner::agents::patterns::detect_rate_limit(scan_tail)
+            .expect("billing-cycle message must still be caught by the rate-limit scan");
+
+        assert_eq!(
+            outcome_for_agent_error(&err),
+            "billing_cycle_exhausted",
+            "inline-scanned billing-cycle message must not be stored as plain rate_limit"
+        );
+
+        record_review_agent_failure("test-3551", agent, Some(model), &err).await;
+
+        let now = chrono::Utc::now().timestamp();
+        let until = crate::engine::cooldown::cooldown_until(&key)
+            .expect("billing-cycle exhaustion must set a model-scoped cooldown");
+        let remaining = until.saturating_sub(now);
+        // Known model + BillingCycleExhausted routes to record_persistent_model_failure
+        // (~4h base, 7d cap), not the agent-wide record_credit_exhaustion (~24h) path —
+        // the quota is scoped to this model, so unrelated models on the same agent must
+        // stay routable.
+        assert!(
+            remaining >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
+            "billing-cycle exhaustion for a known model must apply the ~4h persistent \
+             model cooldown, got {remaining}s — may have used the generic short agent \
+             cooldown instead"
         );
     }
 
