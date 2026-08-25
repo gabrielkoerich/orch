@@ -91,6 +91,70 @@ pub struct AgentInvocation {
     pub attempt: u32,
 }
 
+/// Build the runner script content (saved to attempt dir), plus the small
+/// helper script it execs the agent command through under a pty. Returns
+/// `(runner_script, agent_cmd_script)`.
+fn build_tmux_runner_scripts(
+    inv: &AgentInvocation,
+    agent_cmd: &str,
+    attempt_dir: &std::path::Path,
+) -> anyhow::Result<(String, String)> {
+    let status_file = attempt_dir.join("exit.txt");
+    let stderr_file = attempt_dir.join("stderr.txt");
+    let agent_cmd_script_path = attempt_dir.join("agent_cmd.sh");
+    let sq_git_name = shell_single_quote(&inv.git_author_name);
+    let sq_git_email = shell_single_quote(&inv.git_author_email);
+    let sq_task_id = shell_single_quote(&inv.task_id);
+    let sq_output_file = shell_single_quote(&inv.output_file.display().to_string());
+    let sq_work_dir = shell_single_quote(&inv.work_dir.display().to_string());
+    let sq_status_file = shell_single_quote(&status_file.display().to_string());
+    let sq_stderr_file = shell_single_quote(&stderr_file.display().to_string());
+    let sq_agent_cmd_script = shell_single_quote(&agent_cmd_script_path.display().to_string());
+
+    // Runs the agent with stderr split off to a real file before the pty layer
+    // below merges stdout+stderr, exactly as the previous plain-pipe invocation did.
+    let agent_cmd_script = format!("#!/usr/bin/env bash\n{agent_cmd} 2>{sq_stderr_file}\n");
+
+    let runner_script = format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+
+status_file={sq_status_file}
+stderr_file={sq_stderr_file}
+trap 'status=$?; printf "%s\n" "$status" > "$status_file"' EXIT
+
+# Environment — ~/.path and ~/.private are loaded by orch at startup into the process env
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+export GIT_AUTHOR_NAME={sq_git_name}
+export GIT_COMMITTER_NAME={sq_git_name}
+export GIT_AUTHOR_EMAIL={sq_git_email}
+export GIT_COMMITTER_EMAIL={sq_git_email}
+export TASK_ID={sq_task_id}
+export OUTPUT_FILE={sq_output_file}
+unset CLAUDECODE  # allow nested claude invocations from orch
+
+cd {sq_work_dir} || {{
+    printf '%s\n' "worktree directory does not exist: {sq_work_dir}" > "$stderr_file"
+    exit 1
+}}
+
+# Run agent under a pty (via `script`) so its stdout is a tty, not a plain pipe —
+# many CLI runtimes silently switch to full block-buffering when stdout isn't a
+# tty, which can delay pane output long enough to trip silence detection even
+# while the agent is actively streaming. Tee to both output file and terminal
+# (tmux pane) for live streaming.
+set +e
+script -q /dev/null /bin/bash {sq_agent_cmd_script} | tee {sq_output_file}
+CMD_STATUS=${{PIPESTATUS[0]:-0}}
+set -e
+
+exit $CMD_STATUS
+"#,
+    );
+
+    Ok((runner_script, agent_cmd_script))
+}
+
 /// Spawn the agent in a tmux session.
 ///
 /// Returns the tmux session name.
@@ -161,54 +225,6 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
 
     // Build agent command using per-agent runner (used in non-PTY path below)
     let runner = super::agents::get_runner(&inv.agent);
-    // Build the runner script content (saved to attempt dir)
-    fn build_runner_script(
-        inv: &AgentInvocation,
-        agent_cmd: &str,
-        attempt_dir: &std::path::Path,
-    ) -> anyhow::Result<String> {
-        let status_file = attempt_dir.join("exit.txt");
-        let stderr_file = attempt_dir.join("stderr.txt");
-        let sq_git_name = shell_single_quote(&inv.git_author_name);
-        let sq_git_email = shell_single_quote(&inv.git_author_email);
-        let sq_task_id = shell_single_quote(&inv.task_id);
-        let sq_output_file = shell_single_quote(&inv.output_file.display().to_string());
-        let sq_work_dir = shell_single_quote(&inv.work_dir.display().to_string());
-        let sq_status_file = shell_single_quote(&status_file.display().to_string());
-        let sq_stderr_file = shell_single_quote(&stderr_file.display().to_string());
-        Ok(format!(
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-
-status_file={sq_status_file}
-stderr_file={sq_stderr_file}
-trap 'status=$?; printf "%s\n" "$status" > "$status_file"' EXIT
-
-# Environment — ~/.path and ~/.private are loaded by orch at startup into the process env
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-export GIT_AUTHOR_NAME={sq_git_name}
-export GIT_COMMITTER_NAME={sq_git_name}
-export GIT_AUTHOR_EMAIL={sq_git_email}
-export GIT_COMMITTER_EMAIL={sq_git_email}
-export TASK_ID={sq_task_id}
-export OUTPUT_FILE={sq_output_file}
-unset CLAUDECODE  # allow nested claude invocations from orch
-
-cd {sq_work_dir} || {{
-    printf '%s\n' "worktree directory does not exist: {sq_work_dir}" > "$stderr_file"
-    exit 1
-}}
-
-# Run agent — tee to both output file and terminal (tmux pane) for live streaming
-set +e
-{agent_cmd} 2>"$stderr_file" | tee {sq_output_file}
-CMD_STATUS=${{PIPESTATUS[0]:-0}}
-set -e
-
-exit $CMD_STATUS
-"#,
-        ))
-    }
 
     // Prepare environment map for tmux session (does not write GH token to disk)
     let mut env = std::collections::HashMap::new();
@@ -242,9 +258,13 @@ exit $CMD_STATUS
         &permissions,
     );
 
-    // Write runner script to per-task attempt dir
+    // Write runner script (and the agent-cmd helper script it execs under a pty)
+    // to the per-task attempt dir.
     let script_path = attempt_dir.join("runner.sh");
-    let script_content = build_runner_script(inv, &agent_cmd, &attempt_dir)?;
+    let agent_cmd_script_path = attempt_dir.join("agent_cmd.sh");
+    let (script_content, agent_cmd_script_content) =
+        build_tmux_runner_scripts(inv, &agent_cmd, &attempt_dir)?;
+    tokio::fs::write(&agent_cmd_script_path, &agent_cmd_script_content).await?;
     tokio::fs::write(&script_path, &script_content).await?;
 
     // Make executable
@@ -252,6 +272,11 @@ exit $CMD_STATUS
     {
         use std::os::unix::fs::PermissionsExt;
         tokio::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).await?;
+        tokio::fs::set_permissions(
+            &agent_cmd_script_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .await?;
     }
 
     let command = format!("bash \"{}\"", script_path.display());
@@ -621,6 +646,64 @@ mod tests {
 
         assert!(script.contains("worktree directory does not exist: '/tmp'"));
         assert!(script.contains("stderr_file='"));
+    }
+
+    #[test]
+    fn tmux_runner_script_runs_agent_under_pty_not_a_plain_pipe() {
+        // Regression test for #3554: piping the agent binary's stdout straight
+        // into `tee` leaves it non-tty, which makes many CLI runtimes switch to
+        // full block-buffering and can starve the tmux pane long enough to trip
+        // silence detection even while the agent is actively working. The agent
+        // command must run under `script` (a real pty) before hitting `tee`.
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let inv = test_invocation("pty-wrap-test");
+        let (runner_script, agent_cmd_script) =
+            build_tmux_runner_scripts(&inv, "echo hello", tmp.path())
+                .expect("runner scripts should build");
+
+        assert!(
+            runner_script.contains("script -q /dev/null /bin/bash"),
+            "agent must be exec'd under a pty via `script`, got: {runner_script}"
+        );
+        assert!(
+            runner_script.contains("| tee"),
+            "output must still be tee'd to the output file, got: {runner_script}"
+        );
+        assert!(
+            !runner_script.contains("echo hello 2>"),
+            "the raw agent command must not be piped directly into tee anymore, got: {runner_script}"
+        );
+        assert!(
+            agent_cmd_script.contains("echo hello 2>"),
+            "the agent command should run (with stderr split to a file) inside the pty-wrapped helper script, got: {agent_cmd_script}"
+        );
+    }
+
+    #[test]
+    fn tmux_runner_script_captures_agent_exit_status_via_pipestatus() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let inv = test_invocation("pty-exit-status-test");
+        let (runner_script, _) = build_tmux_runner_scripts(&inv, "echo hello", tmp.path())
+            .expect("runner scripts should build");
+
+        assert!(runner_script.contains("CMD_STATUS=${PIPESTATUS[0]:-0}"));
+        assert!(runner_script.contains("exit $CMD_STATUS"));
+    }
+
+    #[test]
+    fn tmux_runner_script_writes_executable_agent_cmd_helper() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let inv = test_invocation("pty-helper-path-test");
+        let (runner_script, agent_cmd_script) =
+            build_tmux_runner_scripts(&inv, "echo hello", tmp.path())
+                .expect("runner scripts should build");
+
+        let agent_cmd_script_path = tmp.path().join("agent_cmd.sh");
+        assert!(
+            runner_script.contains(&agent_cmd_script_path.display().to_string()),
+            "runner script must reference the agent_cmd.sh helper path, got: {runner_script}"
+        );
+        assert!(agent_cmd_script.starts_with("#!/usr/bin/env bash\n"));
     }
 
     #[test]
