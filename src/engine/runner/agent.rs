@@ -727,6 +727,35 @@ mod tests {
     }
 
     #[test]
+    fn review_prompt_forbids_ending_turn_on_pending_ci_status() {
+        // Regression test for #3453: a review agent must not stop with a
+        // prose "CI is still running" status update and leave the turn
+        // without JSON. The prompt must explicitly route PENDING/NOT RUN CI
+        // through the local-checks fallback and into the same-turn JSON output.
+        let task = crate::backends::ExternalTask {
+            id: crate::backends::ExternalId("155460".to_string()),
+            title: "test task".to_string(),
+            body: "test body".to_string(),
+            state: "open".to_string(),
+            labels: vec![],
+            author: "tester".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: "https://example.com/1".to_string(),
+        };
+        let prompt = build_review_prompt(&task, "", "", "", "main", 1);
+
+        assert!(
+            prompt.contains("Pending CI is never a terminal review state"),
+            "prompt must state pending CI is not terminal: {prompt}"
+        );
+        assert!(
+            prompt.contains("Never end your turn with a CI-waiting status update"),
+            "prompt must forbid ending the turn on a CI-waiting status update: {prompt}"
+        );
+    }
+
+    #[test]
     fn shell_single_quote_escapes_embedded_quotes() {
         use crate::engine::runner::agents::shell_single_quote;
 
