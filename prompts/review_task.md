@@ -58,6 +58,8 @@ IF required checks are NOT RUN or PENDING:
   → treat local results the same as "required checks PASS" or "FAIL" above
 ```
 
+Pending CI is never a terminal review state. Do not end your turn reporting that CI is still running or that you'll wait for a notification — the `--watch` command in this step already blocks in the foreground until CI settles or the timeout is hit. If it's still PENDING or NOT RUN after that, immediately run the local-checks fallback above and finish the review in this same turn.
+
 **Definition of auto-fixable**: ONLY the following commands qualify as auto-fixable:
 - `cargo fmt` / `cargo clippy --fix`
 - `npm run lint -- --fix` / `eslint --fix` / `prettier --write`
@@ -111,6 +113,7 @@ Flag `request_changes` if the PR:
 You MUST output the JSON block below even if you already ran this review earlier.
 Do NOT respond with prose summaries.
 Your turn must not end with a background task still running. If you started any background command, wait for it to finish before producing your final answer.
+Never end your turn with a CI-waiting status update. If CI is still PENDING or NOT RUN after the required `--watch` command completes, run the fallback local checks from Step 2 and output the JSON decision below using those results — in the same turn.
 
 ```json
 {
