@@ -2250,6 +2250,35 @@ impl GhHttp {
         Ok(())
     }
 
+    /// Update a PR's branch by merging the latest base branch into it
+    /// (equivalent of the "Update branch" button on GitHub, or `gh pr
+    /// update-branch`). Produces a new merge commit on the head branch,
+    /// which re-triggers CI — used to give a PR a chance to pick up a fix
+    /// that landed on the base branch after the PR's last CI run failed.
+    pub async fn update_pr_branch(&self, repo: &str, pr_number: u64) -> anyhow::Result<()> {
+        Self::proactive_throttle_rest().await;
+        Self::check_backoff()?;
+        let url = format!("{GITHUB_API}/repos/{repo}/pulls/{pr_number}/update-branch");
+        let auth = self.auth_header().await?;
+        let make_req = || {
+            Ok(self
+                .client
+                .put(&url)
+                .header(header::AUTHORIZATION, auth.clone())
+                .header(header::ACCEPT, "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28"))
+        };
+        let resp = self.send_with_retries(make_req, false).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            Self::maybe_record_rate_limit_from_body(status, &body);
+            anyhow::bail!("GitHub PR update-branch failed ({status}): {body}");
+        }
+        Self::record_success();
+        Ok(())
+    }
+
     /// Enable auto-merge on a PR via GraphQL.
     ///
     /// GitHub will automatically merge the PR once all required checks pass.

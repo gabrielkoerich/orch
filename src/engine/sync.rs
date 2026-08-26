@@ -741,6 +741,29 @@ async fn try_unblock_ci_failure_task(
         return Ok(true);
     }
 
+    // Give the PR an active chance to recover instead of only re-polling its state:
+    // merge the base branch into the PR branch, which produces a new commit and
+    // re-triggers CI. This picks up any fix that landed on the base branch after
+    // the PR's last CI run failed (e.g. a transient toolchain/lint issue in
+    // pre-existing code that the PR never touched). Re-enable auto-merge so GitHub
+    // completes the merge on its own once the refreshed CI run passes — no further
+    // action needed from this sweep.
+    match gh.update_pr_branch(repo, pr_number as u64).await {
+        Ok(()) => {
+            tracing::info!(
+                task_id = task.id,
+                pr_number,
+                "updated CI-failure-blocked PR branch against base to retrigger CI"
+            );
+            if let Err(e) = gh.enable_auto_merge(repo, pr_number as u64).await {
+                tracing::debug!(task_id = task.id, pr_number, err = %e, "failed to re-enable auto-merge after branch update");
+            }
+        }
+        Err(e) => {
+            tracing::debug!(task_id = task.id, pr_number, err = %e, "failed to update CI-failure-blocked PR branch (may already be up to date)");
+        }
+    }
+
     let pr_state = pr.state.as_str();
     let new_reason = format!(
         "CI failure limit reached during auto-merge (PR #{} still open, state: {})",
