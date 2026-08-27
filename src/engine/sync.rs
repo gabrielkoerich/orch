@@ -756,11 +756,12 @@ async fn try_unblock_ci_failure_task(
                 "updated CI-failure-blocked PR branch against base to retrigger CI"
             );
             if let Err(e) = gh.enable_auto_merge(repo, pr_number as u64).await {
-                tracing::debug!(task_id = task.id, pr_number, err = %e, "failed to re-enable auto-merge after branch update");
+                tracing::warn!(task_id = task.id, pr_number, err = %e, "failed to re-enable auto-merge after branch update");
             }
         }
         Err(e) => {
-            tracing::debug!(task_id = task.id, pr_number, err = %e, "failed to update CI-failure-blocked PR branch (may already be up to date)");
+            // warn, not debug, so a silently-broken corrective retry doesn't look like a working one (#3561)
+            tracing::warn!(task_id = task.id, pr_number, err = %e, "failed to update CI-failure-blocked PR branch (may already be up to date)");
         }
     }
 
