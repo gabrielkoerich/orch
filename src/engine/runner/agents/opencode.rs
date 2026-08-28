@@ -917,7 +917,7 @@ async fn run_opencode_models_discovery_async() -> (Vec<String>, &'static str) {
     let mut child = match tokio::process::Command::new("opencode")
         .args(["models"])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
     {
         Ok(c) => c,
@@ -955,7 +955,22 @@ async fn run_opencode_models_discovery_async() -> (Vec<String>, &'static str) {
                 return (models, reason);
             }
             Ok(Some(status)) => {
-                tracing::warn!(?status, "opencode models command failed");
+                let stderr = match child.stderr.take() {
+                    Some(mut s) => {
+                        let mut buf = String::new();
+                        use tokio::io::AsyncReadExt;
+                        let _ = s.read_to_string(&mut buf).await.ok();
+                        buf
+                    }
+                    None => String::new(),
+                };
+                let stderr_trimmed = stderr.trim();
+                let stderr_display = if stderr_trimmed.len() > 500 {
+                    format!("{}...", &stderr_trimmed[..500])
+                } else {
+                    stderr_trimmed.to_string()
+                };
+                tracing::warn!(?status, stderr = %stderr_display, "opencode models command failed");
                 return (vec![], "exit_status_failure");
             }
             Ok(None) => {
