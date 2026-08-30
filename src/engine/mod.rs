@@ -2102,6 +2102,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                 &engine.store,
                                 Some(&transport),
                                 &active_repos,
+                                &auto_merge_in_flight,
                             ).await {
                                 tracing::error!(repo = %engine.repo, ?e, "tick failed for project");
                             }
@@ -2292,6 +2293,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                 &engine.store,
                                 Some(&transport),
                                 &active_repos,
+                                &auto_merge_in_flight,
                             ).await {
                                 tracing::error!(repo = %engine.repo, ?e, "webhook-triggered tick failed");
                             }
