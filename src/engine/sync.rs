@@ -12,6 +12,8 @@
 use crate::backends::{ExternalBackend, Mention, Status};
 use crate::cmd::CommandErrorContext;
 use crate::config;
+use crate::engine::auto_merge::{is_pr_behind, required_checks_state};
+use crate::engine::cleanup::cleanup_task_worktree;
 use crate::engine::cooldown::{
     cooldown_reason, github_circuit_remaining_secs, is_agent_in_cooldown, is_github_circuit_open,
     is_model_in_cooldown, refresh_degraded_agents,
@@ -685,6 +687,7 @@ async fn try_unblock_ci_failure_task(
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
     task: &crate::store::Task,
+    auto_merge_in_flight: &Arc<DashSet<String>>,
 ) -> anyhow::Result<bool> {
     let pr_number = match task.pr_number {
         Some(n) => n,
@@ -741,13 +744,27 @@ async fn try_unblock_ci_failure_task(
         return Ok(true);
     }
 
-    // Give the PR an active chance to recover instead of only re-polling its state:
-    // merge the base branch into the PR branch, which produces a new commit and
-    // re-triggers CI. This picks up any fix that landed on the base branch after
-    // the PR's last CI run failed (e.g. a transient toolchain/lint issue in
-    // pre-existing code that the PR never touched). Re-enable auto-merge so GitHub
-    // completes the merge on its own once the refreshed CI run passes — no further
-    // action needed from this sweep.
+    // Skip if a recovery merge is already in flight for this task. The poll loop
+    // can take up to 10 minutes, and the same task may be seen by both the per-repo
+    // sync_tick and the global sweep in the same tick window.
+    let task_id_str = task
+        .external_id
+        .clone()
+        .unwrap_or_else(|| format!("internal:{}", task.id));
+    if auto_merge_in_flight.contains(&task_id_str) {
+        tracing::debug!(
+            task_id = task.id,
+            pr_number,
+            "CI-failure recovery merge already in flight — skipping"
+        );
+        return Ok(false);
+    }
+
+    // Give the PR an active chance to recover: merge the base branch into the PR
+    // branch to re-trigger CI, then re-enable GitHub auto-merge. GitHub's queue
+    // can silently stall even when checks are green and the branch is up to date,
+    // so after arming auto-merge we poll for completion and fall back to a direct
+    // merge once the PR is mergeable and CI is passing.
     match gh.update_pr_branch(repo, pr_number as u64).await {
         Ok(()) => {
             tracing::info!(
@@ -755,9 +772,6 @@ async fn try_unblock_ci_failure_task(
                 pr_number,
                 "updated CI-failure-blocked PR branch against base to retrigger CI"
             );
-            if let Err(e) = gh.enable_auto_merge(repo, pr_number as u64).await {
-                tracing::warn!(task_id = task.id, pr_number, err = %e, "failed to re-enable auto-merge after branch update");
-            }
         }
         Err(e) => {
             // warn, not debug, so a silently-broken corrective retry doesn't look like a working one (#3561)
@@ -765,6 +779,12 @@ async fn try_unblock_ci_failure_task(
         }
     }
 
+    if let Err(e) = gh.enable_auto_merge(repo, pr_number as u64).await {
+        tracing::warn!(task_id = task.id, pr_number, err = %e, "failed to re-enable auto-merge after branch update");
+    }
+
+    // Record this attempt so the cooldown advances even though the actual
+    // poll/merge now runs in the background.
     let pr_state = pr.state.as_str();
     let new_reason = format!(
         "CI failure limit reached during auto-merge (PR #{} still open, state: {})",
@@ -784,7 +804,250 @@ async fn try_unblock_ci_failure_task(
     // status/result changes, not periodic re-checks of an open PR.
     store.set_fields_silent(task.id, &fields).await?;
 
+    // Spawn the poll and direct-merge fallback in the background so the
+    // recovery sweep does not block the main tick loop (or sync_tick) while
+    // CI runs. The in-flight guard prevents double-spawns across ticks.
+    auto_merge_in_flight.insert(task_id_str.clone());
+    let gh_clone = gh.clone();
+    let repo_string = repo.to_string();
+    let task_manager_clone = Arc::clone(task_manager);
+    let store_clone = Arc::clone(store);
+    let task_clone = task.clone();
+    let in_flight_clone = Arc::clone(auto_merge_in_flight);
+
+    tokio::spawn(async move {
+        let _guard = scopeguard::guard((), |_| {
+            in_flight_clone.remove(&task_id_str);
+        });
+
+        match poll_and_merge_recovered_pr(&gh_clone, &repo_string, pr_number as u64, task_clone.id)
+            .await
+        {
+            Ok(true) => {
+                tracing::info!(
+                    task_id = task_clone.id,
+                    pr_number,
+                    "CI-failure-blocked PR merged during recovery sweep"
+                );
+                let ext_id = task_clone
+                    .external_id
+                    .clone()
+                    .unwrap_or_else(|| format!("internal:{}", task_clone.id));
+                let fields = [
+                    ("block_reason", serde_json::Value::Null),
+                    ("auto_unblock_count", serde_json::json!(0)),
+                    ("auto_unblock_last_at", serde_json::json!("")),
+                    ("auto_unblock_last_reason", serde_json::json!("")),
+                ];
+                if let Err(e) = task_manager_clone
+                    .update_task_status_and_result_by_store_id(
+                        task_clone.id,
+                        &task_clone.repo,
+                        &crate::backends::ExternalId(ext_id),
+                        Status::Done,
+                        &fields,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        task_id = task_clone.id,
+                        pr_number,
+                        err = %e,
+                        "failed to mark CI-failure-blocked task done after recovery merge"
+                    );
+                }
+                if let Err(e) =
+                    cleanup_task_worktree(&format!("{}", task_clone.id), &repo_string, &store_clone)
+                        .await
+                {
+                    tracing::warn!(
+                        task_id = task_clone.id,
+                        pr_number,
+                        err = %e,
+                        "cleanup after CI-failure recovery merge failed"
+                    );
+                }
+            }
+            Ok(false) => {
+                tracing::debug!(
+                    task_id = task_clone.id,
+                    pr_number,
+                    "CI-failure-blocked PR not merged this recovery tick — poll completed without merge"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    task_id = task_clone.id,
+                    pr_number,
+                    err = %e,
+                    "error while polling CI-failure-blocked PR for recovery"
+                );
+            }
+        }
+    });
+
     Ok(false)
+}
+
+/// Poll a recovered CI-failure PR until it merges or its checks settle, then
+/// attempt a direct merge if GitHub's auto-merge queue has not completed it.
+///
+/// GitHub's `enablePullRequestAutoMerge` hands the PR off to GitHub's queue and
+/// returns immediately; the queue can stall silently. This helper mirrors the
+/// primary `auto_merge_pr` polling pattern but is scoped to the recovery sweep:
+/// it waits for required checks to pass, verifies the PR is not behind the base
+/// branch, and calls `gh.merge_pr()` directly when the PR is ready but still
+/// open. Returns `Ok(true)` when the PR is merged/closed, `Ok(false)` when the
+/// PR needs to wait for a future tick.
+async fn poll_and_merge_recovered_pr(
+    gh: &crate::github::http::GhHttp,
+    repo: &str,
+    pr_number: u64,
+    task_id: i64,
+) -> anyhow::Result<bool> {
+    let max_wait_secs: u64 = config::get("workflow.ci_poll_max_wait_secs")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(600);
+    let base_interval_secs: u64 = config::get("workflow.ci_poll_interval_secs")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(15);
+    let max_wait = std::time::Duration::from_secs(max_wait_secs);
+    let start = std::time::Instant::now();
+    let mut poll_count: u32 = 0;
+
+    let initial_pr = gh.get_pr(repo, pr_number).await?;
+    let base_branch = initial_pr.base.ref_.clone();
+    let required_contexts = gh
+        .get_required_status_check_contexts(repo, &base_branch)
+        .await?;
+    let repo_has_workflows = if required_contexts.is_empty() {
+        gh.has_workflows(repo).await?
+    } else {
+        true
+    };
+
+    loop {
+        let pr = gh.get_pr(repo, pr_number).await?;
+        if pr.merged.unwrap_or(false) || pr.state.eq_ignore_ascii_case("closed") {
+            tracing::info!(
+                task_id = task_id,
+                pr_number,
+                "PR merged/closed during recovery poll"
+            );
+            return Ok(true);
+        }
+
+        if pr.mergeable == Some(false) {
+            tracing::info!(
+                task_id = task_id,
+                pr_number,
+                "PR has merge conflicts after recovery update — leaving for next recovery cycle"
+            );
+            return Ok(false);
+        }
+
+        if is_pr_behind(&pr) {
+            tracing::info!(
+                task_id = task_id,
+                pr_number,
+                "PR is behind base after recovery update — leaving for next recovery cycle"
+            );
+            return Ok(false);
+        }
+
+        let head_sha = pr.head.sha.clone();
+        let (state, total, passing, failing, pending) = if required_contexts.is_empty() {
+            gh.get_combined_status(
+                repo,
+                &head_sha,
+                repo_has_workflows,
+                pr.mergeable_state.as_deref(),
+            )
+            .await?
+        } else {
+            let check_runs = gh.get_check_runs(repo, &head_sha).await?;
+            let statuses = gh.get_commit_status_contexts(repo, &head_sha).await?;
+            let check_run_tuples = check_runs
+                .iter()
+                .map(|run| (run.name.clone(), run.status.clone(), run.conclusion.clone()))
+                .collect::<Vec<_>>();
+            required_checks_state(&required_contexts, &check_run_tuples, &statuses)
+        };
+
+        tracing::info!(
+            task_id = task_id,
+            pr_number,
+            state = %state,
+            total,
+            passing,
+            failing,
+            pending,
+            "CI recovery status check"
+        );
+
+        match state.as_str() {
+            "success" => {
+                tracing::info!(
+                    task_id = task_id,
+                    pr_number,
+                    "CI green after recovery — attempting direct merge"
+                );
+                match gh.merge_pr(repo, pr_number, true).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            task_id = task_id,
+                            pr_number,
+                            "direct merge succeeded after recovery"
+                        );
+                        return Ok(true);
+                    }
+                    Err(e) => {
+                        let err = e.to_string().to_ascii_lowercase();
+                        tracing::warn!(
+                            task_id = task_id,
+                            pr_number,
+                            err = %e,
+                            "direct merge failed after recovery"
+                        );
+                        // If the PR became merged between the get_pr call and the
+                        // merge attempt, treat it as success rather than a failed tick.
+                        if err.contains("already merged")
+                            || err.contains("no merge commit")
+                            || err.contains("pull request already merged")
+                        {
+                            return Ok(true);
+                        }
+                        return Ok(false);
+                    }
+                }
+            }
+            "failure" => {
+                tracing::info!(
+                    task_id = task_id,
+                    pr_number,
+                    "CI still failing after recovery — will retry later"
+                );
+                return Ok(false);
+            }
+            _ => {}
+        }
+
+        if start.elapsed() >= max_wait {
+            tracing::info!(
+                task_id = task_id,
+                pr_number,
+                "CI still pending after recovery poll timeout — will retry later"
+            );
+            return Ok(false);
+        }
+
+        poll_count += 1;
+        let multiplier = (2_u64).pow(poll_count.saturating_sub(1)).min(4);
+        let sleep_secs = base_interval_secs.saturating_mul(multiplier);
+        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+    }
 }
 
 /// Exact `block_reason` written when a task's NeedsReview refire counter exhausts
@@ -1117,6 +1380,7 @@ async fn auto_unblock_blocked_tasks(
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
     dispatching: &Arc<DashMap<String, String>>,
+    auto_merge_in_flight: &Arc<DashSet<String>>,
 ) -> anyhow::Result<()> {
     let blocked = match store.list_by_status(repo, TaskStatus::Blocked).await {
         Ok(tasks) => tasks,
@@ -1156,8 +1420,15 @@ async fn auto_unblock_blocked_tasks(
         for task in ci_failure_tasks {
             if ci_failure_unblock_cooldown_elapsed(&task) {
                 if let Some(ref gh) = gh {
-                    if let Err(e) =
-                        try_unblock_ci_failure_task(gh, repo, task_manager, store, &task).await
+                    if let Err(e) = try_unblock_ci_failure_task(
+                        gh,
+                        repo,
+                        task_manager,
+                        store,
+                        &task,
+                        auto_merge_in_flight,
+                    )
+                    .await
                     {
                         tracing::warn!(task_id = task.id, err = %e, "CI failure unblock check failed");
                     }
@@ -1333,6 +1604,7 @@ async fn auto_unblock_blocked_tasks(
 pub(crate) async fn auto_unblock_ci_failure_blocked_tasks_global(
     task_manager: &Arc<crate::engine::tasks::TaskManager>,
     store: &Arc<TaskStore>,
+    auto_merge_in_flight: &Arc<DashSet<String>>,
 ) -> anyhow::Result<()> {
     let all_blocked = match store.list_all_by_status_global(TaskStatus::Blocked).await {
         Ok(tasks) => tasks,
@@ -1362,8 +1634,15 @@ pub(crate) async fn auto_unblock_ci_failure_blocked_tasks_global(
         if !ci_failure_unblock_cooldown_elapsed(&task) {
             continue;
         }
-        if let Err(e) =
-            try_unblock_ci_failure_task(&gh, &task.repo, task_manager, store, &task).await
+        if let Err(e) = try_unblock_ci_failure_task(
+            &gh,
+            &task.repo,
+            task_manager,
+            store,
+            &task,
+            auto_merge_in_flight,
+        )
+        .await
         {
             tracing::warn!(
                 task_id = task.id,
@@ -2111,7 +2390,10 @@ pub(crate) async fn sync_tick(
     }
 
     // 5c. Auto-unblock tasks with recoverable failures.
-    if let Err(e) = auto_unblock_blocked_tasks(repo, task_manager, store, dispatching).await {
+    if let Err(e) =
+        auto_unblock_blocked_tasks(repo, task_manager, store, dispatching, auto_merge_in_flight)
+            .await
+    {
         tracing::warn!(err = %e, "auto-unblock failed");
     }
 
@@ -4687,9 +4969,15 @@ mod tests {
             .await
             .unwrap();
 
-        auto_unblock_blocked_tasks("owner/repo", &task_manager, &store, &dispatching)
-            .await
-            .unwrap();
+        auto_unblock_blocked_tasks(
+            "owner/repo",
+            &task_manager,
+            &store,
+            &dispatching,
+            &Arc::new(DashSet::new()),
+        )
+        .await
+        .unwrap();
 
         let task = store.get(id).await.unwrap();
         assert_eq!(task.status, TaskStatus::New);
@@ -4761,9 +5049,15 @@ mod tests {
             .await
             .unwrap();
 
-        auto_unblock_blocked_tasks("owner/repo", &task_manager, &store, &dispatching)
-            .await
-            .unwrap();
+        auto_unblock_blocked_tasks(
+            "owner/repo",
+            &task_manager,
+            &store,
+            &dispatching,
+            &Arc::new(DashSet::new()),
+        )
+        .await
+        .unwrap();
 
         let task = store.get(id).await.unwrap();
         assert_eq!(task.status, crate::store::TaskStatus::Blocked);
@@ -4964,9 +5258,15 @@ mod tests {
             .await
             .unwrap();
 
-        auto_unblock_blocked_tasks("owner/repo", &task_manager, &store, &dispatching)
-            .await
-            .unwrap();
+        auto_unblock_blocked_tasks(
+            "owner/repo",
+            &task_manager,
+            &store,
+            &dispatching,
+            &Arc::new(DashSet::new()),
+        )
+        .await
+        .unwrap();
 
         let task = store.get(id).await.unwrap();
         assert_eq!(
@@ -5055,9 +5355,15 @@ mod tests {
             .await
             .unwrap();
 
-        auto_unblock_blocked_tasks("owner/repo", &task_manager, &store, &dispatching)
-            .await
-            .unwrap();
+        auto_unblock_blocked_tasks(
+            "owner/repo",
+            &task_manager,
+            &store,
+            &dispatching,
+            &Arc::new(DashSet::new()),
+        )
+        .await
+        .unwrap();
 
         let task = store.get(id).await.unwrap();
         assert_eq!(
@@ -5132,9 +5438,15 @@ mod tests {
             .await
             .unwrap();
 
-        auto_unblock_blocked_tasks("owner/repo", &task_manager, &store, &dispatching)
-            .await
-            .unwrap();
+        auto_unblock_blocked_tasks(
+            "owner/repo",
+            &task_manager,
+            &store,
+            &dispatching,
+            &Arc::new(DashSet::new()),
+        )
+        .await
+        .unwrap();
 
         let task = store.get(id).await.unwrap();
         assert_eq!(task.status, TaskStatus::New);
@@ -5917,9 +6229,13 @@ mod tests {
             store.clone(),
             "owner/repo".to_string(),
         ));
-        auto_unblock_ci_failure_blocked_tasks_global(&task_manager, &store)
-            .await
-            .unwrap();
+        auto_unblock_ci_failure_blocked_tasks_global(
+            &task_manager,
+            &store,
+            &Arc::new(DashSet::new()),
+        )
+        .await
+        .unwrap();
     }
 
     #[serial(cooldown_state)]
@@ -5971,9 +6287,13 @@ mod tests {
             .await
             .unwrap();
 
-        auto_unblock_ci_failure_blocked_tasks_global(&task_manager, &store)
-            .await
-            .unwrap();
+        auto_unblock_ci_failure_blocked_tasks_global(
+            &task_manager,
+            &store,
+            &Arc::new(DashSet::new()),
+        )
+        .await
+        .unwrap();
 
         // Cooldown not elapsed — task must remain untouched.
         let task = store.get(id).await.unwrap();
@@ -6021,9 +6341,13 @@ mod tests {
             .await
             .unwrap();
 
-        auto_unblock_ci_failure_blocked_tasks_global(&task_manager, &store)
-            .await
-            .unwrap();
+        auto_unblock_ci_failure_blocked_tasks_global(
+            &task_manager,
+            &store,
+            &Arc::new(DashSet::new()),
+        )
+        .await
+        .unwrap();
 
         // Non-CI-failure tasks must remain blocked.
         let task = store.get(id).await.unwrap();

@@ -25,7 +25,7 @@ use crate::engine::tasks::{is_internal_id, TaskManager};
 use crate::repo_context::REPO_CONTEXT;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -646,6 +646,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
     session_map: &std::collections::HashMap<String, bool>,
     router: &Router,
     dispatching: &Arc<DashMap<String, String>>,
+    auto_merge_in_flight: &Arc<DashSet<String>>,
 ) -> anyhow::Result<()> {
     let _span = tracing::info_span!("engine.tick.phase2.stuck_tasks").entered();
 
@@ -1479,8 +1480,12 @@ pub(crate) async fn tick_recover_stuck_tasks(
     // auto_unblock_blocked_tasks runs inside sync_tick and is scoped to the active repo.
     // Tasks blocked for projects no longer in orch config are never processed there.
     // This sweep covers all repos so stale CI-failure blocks are eventually resolved.
-    if let Err(e) =
-        crate::engine::sync::auto_unblock_ci_failure_blocked_tasks_global(task_manager, store).await
+    if let Err(e) = crate::engine::sync::auto_unblock_ci_failure_blocked_tasks_global(
+        task_manager,
+        store,
+        auto_merge_in_flight,
+    )
+    .await
     {
         tracing::warn!(err = %e, "global CI-failure blocked sweep failed");
     }
@@ -2605,6 +2610,7 @@ pub(crate) async fn tick(
     store: &Arc<TaskStore>,
     transport: Option<&Arc<crate::channels::transport::Transport>>,
     active_repos: &std::collections::HashSet<String>,
+    auto_merge_in_flight: &Arc<DashSet<String>>,
 ) -> anyhow::Result<()> {
     let _tick_span = tracing::info_span!("engine.tick").entered();
 
@@ -2626,6 +2632,7 @@ pub(crate) async fn tick(
         &session_map,
         router,
         dispatching,
+        auto_merge_in_flight,
     )
     .await?;
     tick_route_tasks(backend, task_manager, router, store, repo).await?;
@@ -3104,6 +3111,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &cooled_review_router_for_test(),
             &Arc::new(DashMap::new()),
+            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -3162,6 +3170,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &cooled_review_router_for_test(),
             &Arc::new(DashMap::new()),
+            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -3211,6 +3220,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &cooled_review_router_for_test(),
             &Arc::new(DashMap::new()),
+            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -3271,6 +3281,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &cooled_review_router_for_test(),
             &Arc::new(DashMap::new()),
+            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -3354,6 +3365,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &cooled_review_router_for_test(),
             &Arc::new(DashMap::new()),
+            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -3452,6 +3464,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &cooled_review_router_for_test(),
             &dispatching,
+            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -3480,6 +3493,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &cooled_review_router_for_test(),
             &dispatching,
+            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -3607,6 +3621,7 @@ mod tests {
                 &std::collections::HashMap::new(),
                 &cooled_review_router_for_test(),
                 &dispatching,
+                &Arc::new(DashSet::new()),
             )
             .await
             .unwrap();
@@ -3639,6 +3654,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &cooled_review_router_for_test(),
             &dispatching,
+            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -3697,6 +3713,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &cooled_review_router_for_test(),
             &Arc::new(DashMap::new()),
+            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -3967,6 +3984,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &cooled_review_router_for_test(),
             &Arc::new(DashMap::new()),
+            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -4175,6 +4193,7 @@ mod tests {
             &session_map,
             &cooled_review_router_for_test(),
             &Arc::new(DashMap::new()),
+            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -4392,6 +4411,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &cooled_review_router_for_test(),
             &Arc::new(DashMap::new()),
+            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();

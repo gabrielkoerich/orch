@@ -104,7 +104,7 @@ enum WorktreeRebaseOutcome {
     Unavailable(String),
 }
 
-fn is_pr_behind(pr: &GitHubPullRequest) -> bool {
+pub(crate) fn is_pr_behind(pr: &GitHubPullRequest) -> bool {
     pr.mergeable_state
         .as_deref()
         .is_some_and(|state| state.eq_ignore_ascii_case("behind"))
@@ -573,7 +573,7 @@ async fn poll_mergeable_until(
     }
 }
 
-fn required_checks_state(
+pub(crate) fn required_checks_state(
     required_contexts: &[String],
     check_runs: &[(String, String, Option<String>)],
     statuses: &[(String, String)],
