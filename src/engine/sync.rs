@@ -12,6 +12,8 @@
 use crate::backends::{ExternalBackend, Mention, Status};
 use crate::cmd::CommandErrorContext;
 use crate::config;
+use crate::engine::auto_merge::{is_pr_behind, required_checks_state};
+use crate::engine::cleanup::cleanup_task_worktree;
 use crate::engine::cooldown::{
     cooldown_reason, github_circuit_remaining_secs, is_agent_in_cooldown, is_github_circuit_open,
     is_model_in_cooldown, refresh_degraded_agents,
@@ -741,13 +743,11 @@ async fn try_unblock_ci_failure_task(
         return Ok(true);
     }
 
-    // Give the PR an active chance to recover instead of only re-polling its state:
-    // merge the base branch into the PR branch, which produces a new commit and
-    // re-triggers CI. This picks up any fix that landed on the base branch after
-    // the PR's last CI run failed (e.g. a transient toolchain/lint issue in
-    // pre-existing code that the PR never touched). Re-enable auto-merge so GitHub
-    // completes the merge on its own once the refreshed CI run passes — no further
-    // action needed from this sweep.
+    // Give the PR an active chance to recover: merge the base branch into the PR
+    // branch to re-trigger CI, then re-enable GitHub auto-merge. GitHub's queue
+    // can silently stall even when checks are green and the branch is up to date,
+    // so after arming auto-merge we poll for completion and fall back to a direct
+    // merge once the PR is mergeable and CI is passing.
     match gh.update_pr_branch(repo, pr_number as u64).await {
         Ok(()) => {
             tracing::info!(
@@ -755,13 +755,67 @@ async fn try_unblock_ci_failure_task(
                 pr_number,
                 "updated CI-failure-blocked PR branch against base to retrigger CI"
             );
-            if let Err(e) = gh.enable_auto_merge(repo, pr_number as u64).await {
-                tracing::warn!(task_id = task.id, pr_number, err = %e, "failed to re-enable auto-merge after branch update");
-            }
         }
         Err(e) => {
             // warn, not debug, so a silently-broken corrective retry doesn't look like a working one (#3561)
             tracing::warn!(task_id = task.id, pr_number, err = %e, "failed to update CI-failure-blocked PR branch (may already be up to date)");
+        }
+    }
+
+    if let Err(e) = gh.enable_auto_merge(repo, pr_number as u64).await {
+        tracing::warn!(task_id = task.id, pr_number, err = %e, "failed to re-enable auto-merge after branch update");
+    }
+
+    match poll_and_merge_recovered_pr(gh, repo, pr_number as u64, task.id).await {
+        Ok(true) => {
+            tracing::info!(
+                task_id = task.id,
+                pr_number,
+                "CI-failure-blocked PR merged during recovery sweep"
+            );
+            let ext_id = task
+                .external_id
+                .clone()
+                .unwrap_or_else(|| format!("internal:{}", task.id));
+            let fields = [
+                ("block_reason", serde_json::Value::Null),
+                ("auto_unblock_count", serde_json::json!(0)),
+                ("auto_unblock_last_at", serde_json::json!("")),
+                ("auto_unblock_last_reason", serde_json::json!("")),
+            ];
+            task_manager
+                .update_task_status_and_result_by_store_id(
+                    task.id,
+                    &task.repo,
+                    &crate::backends::ExternalId(ext_id),
+                    Status::Done,
+                    &fields,
+                )
+                .await?;
+            if let Err(e) = cleanup_task_worktree(&format!("{}", task.id), repo, store).await {
+                tracing::warn!(
+                    task_id = task.id,
+                    pr_number,
+                    err = %e,
+                    "cleanup after CI-failure recovery merge failed"
+                );
+            }
+            return Ok(true);
+        }
+        Ok(false) => {
+            tracing::debug!(
+                task_id = task.id,
+                pr_number,
+                "CI-failure-blocked PR not merged this recovery tick"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                task_id = task.id,
+                pr_number,
+                err = %e,
+                "error while polling CI-failure-blocked PR for recovery"
+            );
         }
     }
 
@@ -785,6 +839,167 @@ async fn try_unblock_ci_failure_task(
     store.set_fields_silent(task.id, &fields).await?;
 
     Ok(false)
+}
+
+/// Poll a recovered CI-failure PR until it merges or its checks settle, then
+/// attempt a direct merge if GitHub's auto-merge queue has not completed it.
+///
+/// GitHub's `enablePullRequestAutoMerge` hands the PR off to GitHub's queue and
+/// returns immediately; the queue can stall silently. This helper mirrors the
+/// primary `auto_merge_pr` polling pattern but is scoped to the recovery sweep:
+/// it waits for required checks to pass, verifies the PR is not behind the base
+/// branch, and calls `gh.merge_pr()` directly when the PR is ready but still
+/// open. Returns `Ok(true)` when the PR is merged/closed, `Ok(false)` when the
+/// PR needs to wait for a future tick.
+async fn poll_and_merge_recovered_pr(
+    gh: &crate::github::http::GhHttp,
+    repo: &str,
+    pr_number: u64,
+    task_id: i64,
+) -> anyhow::Result<bool> {
+    let max_wait_secs: u64 = config::get("workflow.ci_poll_max_wait_secs")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(600);
+    let base_interval_secs: u64 = config::get("workflow.ci_poll_interval_secs")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(15);
+    let max_wait = std::time::Duration::from_secs(max_wait_secs);
+    let start = std::time::Instant::now();
+    let mut poll_count: u32 = 0;
+
+    let initial_pr = gh.get_pr(repo, pr_number).await?;
+    let base_branch = initial_pr.base.ref_.clone();
+    let required_contexts = gh
+        .get_required_status_check_contexts(repo, &base_branch)
+        .await?;
+    let repo_has_workflows = if required_contexts.is_empty() {
+        gh.has_workflows(repo).await?
+    } else {
+        true
+    };
+
+    loop {
+        let pr = gh.get_pr(repo, pr_number).await?;
+        if pr.merged.unwrap_or(false) || pr.state.eq_ignore_ascii_case("closed") {
+            tracing::info!(
+                task_id = task_id,
+                pr_number,
+                "PR merged/closed during recovery poll"
+            );
+            return Ok(true);
+        }
+
+        if pr.mergeable == Some(false) {
+            tracing::info!(
+                task_id = task_id,
+                pr_number,
+                "PR has merge conflicts after recovery update — leaving for next recovery cycle"
+            );
+            return Ok(false);
+        }
+
+        if is_pr_behind(&pr) {
+            tracing::info!(
+                task_id = task_id,
+                pr_number,
+                "PR is behind base after recovery update — leaving for next recovery cycle"
+            );
+            return Ok(false);
+        }
+
+        let head_sha = pr.head.sha.clone();
+        let (state, total, passing, failing, pending) = if required_contexts.is_empty() {
+            gh.get_combined_status(
+                repo,
+                &head_sha,
+                repo_has_workflows,
+                pr.mergeable_state.as_deref(),
+            )
+            .await?
+        } else {
+            let check_runs = gh.get_check_runs(repo, &head_sha).await?;
+            let statuses = gh.get_commit_status_contexts(repo, &head_sha).await?;
+            let check_run_tuples = check_runs
+                .iter()
+                .map(|run| (run.name.clone(), run.status.clone(), run.conclusion.clone()))
+                .collect::<Vec<_>>();
+            required_checks_state(&required_contexts, &check_run_tuples, &statuses)
+        };
+
+        tracing::info!(
+            task_id = task_id,
+            pr_number,
+            state = %state,
+            total,
+            passing,
+            failing,
+            pending,
+            "CI recovery status check"
+        );
+
+        match state.as_str() {
+            "success" => {
+                tracing::info!(
+                    task_id = task_id,
+                    pr_number,
+                    "CI green after recovery — attempting direct merge"
+                );
+                match gh.merge_pr(repo, pr_number, true).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            task_id = task_id,
+                            pr_number,
+                            "direct merge succeeded after recovery"
+                        );
+                        return Ok(true);
+                    }
+                    Err(e) => {
+                        let err = e.to_string().to_ascii_lowercase();
+                        tracing::warn!(
+                            task_id = task_id,
+                            pr_number,
+                            err = %e,
+                            "direct merge failed after recovery"
+                        );
+                        // If the PR became merged between the get_pr call and the
+                        // merge attempt, treat it as success rather than a failed tick.
+                        if err.contains("already merged")
+                            || err.contains("no merge commit")
+                            || err.contains("pull request already merged")
+                        {
+                            return Ok(true);
+                        }
+                        return Ok(false);
+                    }
+                }
+            }
+            "failure" => {
+                tracing::info!(
+                    task_id = task_id,
+                    pr_number,
+                    "CI still failing after recovery — will retry later"
+                );
+                return Ok(false);
+            }
+            _ => {}
+        }
+
+        if start.elapsed() >= max_wait {
+            tracing::info!(
+                task_id = task_id,
+                pr_number,
+                "CI still pending after recovery poll timeout — will retry later"
+            );
+            return Ok(false);
+        }
+
+        poll_count += 1;
+        let multiplier = (2_u64).pow(poll_count.saturating_sub(1)).min(4);
+        let sleep_secs = base_interval_secs.saturating_mul(multiplier);
+        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+    }
 }
 
 /// Exact `block_reason` written when a task's NeedsReview refire counter exhausts
