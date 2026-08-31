@@ -3276,12 +3276,12 @@ mod tests {
 
     /// Regression test for issue #3478: a successful review run must reset
     /// `failure_count:{agent}:{model}`, mirroring the runner's task-agent
-    /// success path. Without this, review-only models ratchet through the
-    /// persistent-model backoff ladder from isolated failures that are
-    /// separated by many successful reviews.
+    /// success path, for generic/transient failures (not the persistent-model
+    /// path — see issue #3571, which deliberately gives persistent failures
+    /// their own counter that a success does NOT reset).
     #[serial_test::serial(cooldown_state)]
     #[tokio::test]
-    async fn finalize_review_run_success_resets_model_failure_count() {
+    async fn finalize_review_run_success_resets_generic_model_failure_count() {
         crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         crate::engine::cooldown::init_cooldown_store(store.clone()).await;
@@ -3290,8 +3290,11 @@ mod tests {
         let model = "test-3478-model";
         let failure_key = format!("failure_count:{agent}:{model}");
 
-        let err = runner::agents::AgentError::InvalidResponse {
-            raw: "empty review output".to_string(),
+        // AgentFailed is a generic/transient error, routed to record_model_failure
+        // (not record_persistent_model_failure), so it should still be reset by
+        // an intervening success.
+        let err = runner::agents::AgentError::AgentFailed {
+            message: "agent reported a generic failure".to_string(),
         };
         record_review_agent_failure("task-3478-a", agent, Some(model), &err).await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -3317,11 +3320,13 @@ mod tests {
     }
 
     /// Regression test for issue #3478: successful reviews interleaved between
-    /// isolated failures must keep each failure's backoff at the base duration
-    /// instead of escalating, since the previous success reset the counter.
+    /// isolated generic failures must keep each failure's backoff at the base
+    /// duration instead of escalating, since the previous success reset the
+    /// counter. Uses AgentFailed (generic/transient), not InvalidResponse
+    /// (persistent-model path — see issue #3571).
     #[serial_test::serial(cooldown_state)]
     #[tokio::test]
-    async fn finalize_review_run_interleaved_success_keeps_cooldown_at_base() {
+    async fn finalize_review_run_interleaved_success_keeps_generic_cooldown_at_base() {
         crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         crate::engine::cooldown::init_cooldown_store(store.clone()).await;
@@ -3335,8 +3340,8 @@ mod tests {
         let task = test_review_task("2");
 
         for i in 0..4 {
-            let err = runner::agents::AgentError::InvalidResponse {
-                raw: format!("failure {i}"),
+            let err = runner::agents::AgentError::AgentFailed {
+                message: format!("failure {i}"),
             };
             record_review_agent_failure("task-3478-b", agent, Some(model), &err).await;
 
@@ -3346,14 +3351,12 @@ mod tests {
             let remaining = until.saturating_sub(now);
 
             assert!(
-                (crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30
-                    ..crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS + 60)
-                    .contains(&remaining),
+                remaining <= crate::engine::cooldown::BACKOFF_BASE_SECS + 60,
                 "failure #{} must stay at base backoff since the prior success reset the \
                  counter (issue #3478); got {remaining}s, base is {}s — an escalating value \
                  here means review successes are not resetting failure_count",
                 i + 1,
-                crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS
+                crate::engine::cooldown::BACKOFF_BASE_SECS
             );
 
             // A successful review interleaves between each failure, mirroring the
@@ -3363,5 +3366,59 @@ mod tests {
             finalize_review_run(&task, &ctx, &parsed, &store).await;
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    /// Regression test for issue #3571: unlike generic failures, persistent
+    /// model failures (e.g. review parse errors, InvalidResponse) must NOT be
+    /// reset by an intervening successful review. Otherwise a model that fails
+    /// structurally every so often — but succeeds most of the time — never
+    /// escalates past the 4h base cooldown and stays in rotation indefinitely.
+    #[serial_test::serial(cooldown_state)]
+    #[tokio::test]
+    async fn finalize_review_run_success_does_not_reset_persistent_model_failure_count() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        crate::engine::cooldown::init_cooldown_store(store.clone()).await;
+
+        let agent = "test-3571-agent";
+        let model = "test-3571-model";
+        let cooldown_key = format!("{agent}:{model}");
+
+        let work_dir = TempDir::new().unwrap();
+        let ctx = test_review_context(agent, model, work_dir.path());
+        let task = test_review_task("3");
+
+        // First structural (parse-error-equivalent) failure -> base 4h cooldown.
+        let err = runner::agents::AgentError::InvalidResponse {
+            raw: "empty review output".to_string(),
+        };
+        record_review_agent_failure("task-3571-a", agent, Some(model), &err).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // A successful review for the same model interleaves, exactly like the
+        // real-world pattern from issue #3571.
+        let parsed = test_parsed_review(ReviewDecision::Approve);
+        finalize_review_run(&task, &ctx, &parsed, &store).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Second structural failure must escalate from count 2 (~12h), not
+        // reset back to the 4h base, despite the intervening success.
+        let err2 = runner::agents::AgentError::InvalidResponse {
+            raw: "empty review output again".to_string(),
+        };
+        record_review_agent_failure("task-3571-b", agent, Some(model), &err2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let now = chrono::Utc::now().timestamp();
+        let until = crate::engine::cooldown::cooldown_until(&cooldown_key)
+            .expect("second failure should set cooldown");
+        let remaining = until.saturating_sub(now);
+
+        assert!(
+            remaining > crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS,
+            "second persistent model failure should escalate past the 4h base despite an \
+             intervening success (issue #3571); got {remaining}s, base is {}s",
+            crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS
+        );
     }
 }

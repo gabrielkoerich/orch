@@ -115,6 +115,11 @@ const FAILURE_COUNT_PREFIX: &str = "failure_count:";
 /// cross-contamination of backoff escalation — credit exhaustion uses different base/max durations).
 const CREDIT_FAILURE_COUNT_PREFIX: &str = "credit_failure_count:";
 
+/// KV key prefix for persistent model failure counts (separate from [`FAILURE_COUNT_PREFIX`] so
+/// `record_agent_success()` resetting the generic counter on an intervening success doesn't erase
+/// escalation progress for structurally unreliable models — see `record_persistent_model_failure`).
+const PERSISTENT_FAILURE_COUNT_PREFIX: &str = "persistent_failure_count:";
+
 struct CooldownEntry {
     /// Unix timestamp when the cooldown expires.
     cooldown_until: i64,
@@ -623,10 +628,21 @@ pub async fn record_model_failure(agent_name: &str, model: &str) {
 /// Used for failure modes that are commonly broken for long periods (for example
 /// silent exit-0 or opaque provider errors). Starts at 4h and escalates with
 /// the generic backoff formula up to 7 days.
+///
+/// Uses [`PERSISTENT_FAILURE_COUNT_PREFIX`], a counter independent of the generic
+/// `failure_count:` key that `record_agent_success()` resets on every successful
+/// run. Otherwise a single intervening success between persistent failures would
+/// reset escalation back to the 4h base, letting structurally unreliable models
+/// (intermittent parse errors, truncated runs) stay in rotation indefinitely.
 pub async fn record_persistent_model_failure(agent_name: &str, model: &str) {
     let key = format!("{agent_name}:{model}");
     let store_opt = cooldown_store().lock().await.clone();
-    let count = read_and_increment_failure_count(&store_opt, &key).await;
+    let count = read_and_increment_failure_count_with_prefix(
+        &store_opt,
+        PERSISTENT_FAILURE_COUNT_PREFIX,
+        &key,
+    )
+    .await;
     let cooldown_secs = compute_backoff(
         count,
         PERSISTENT_MODEL_BACKOFF_BASE_SECS,
@@ -804,6 +820,11 @@ pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
             if let Err(e) = store.kv_set(&credit_fc_key, "0").await {
                 tracing::warn!(key = credit_fc_key, err = %e, "failed to reset credit failure count");
             }
+            // Also reset the persistent-model-failure counter.
+            let persistent_fc_key = format!("{PERSISTENT_FAILURE_COUNT_PREFIX}{k}");
+            if let Err(e) = store.kv_set(&persistent_fc_key, "0").await {
+                tracing::warn!(key = persistent_fc_key, err = %e, "failed to reset persistent failure count");
+            }
         }
         // Also reset any persisted failure_count keys that are not in the
         // in-memory map (e.g. survived a restart or were set without a
@@ -819,6 +840,13 @@ pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
             for (cfc_key, _) in cfc_entries {
                 if let Err(e) = store.kv_set(&cfc_key, "0").await {
                     tracing::warn!(key = cfc_key, err = %e, "failed to reset credit failure count");
+                }
+            }
+        }
+        if let Ok(pfc_entries) = store.kv_list_prefix(PERSISTENT_FAILURE_COUNT_PREFIX).await {
+            for (pfc_key, _) in pfc_entries {
+                if let Err(e) = store.kv_set(&pfc_key, "0").await {
+                    tracing::warn!(key = pfc_key, err = %e, "failed to reset persistent failure count");
                 }
             }
         }
@@ -844,6 +872,11 @@ pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
         let credit_fc_key = format!("{CREDIT_FAILURE_COUNT_PREFIX}{key}");
         if let Err(e) = store.kv_set(&credit_fc_key, "0").await {
             tracing::warn!(key = credit_fc_key, err = %e, "failed to reset credit failure count");
+        }
+        // Also reset the persistent-model-failure counter.
+        let persistent_fc_key = format!("{PERSISTENT_FAILURE_COUNT_PREFIX}{key}");
+        if let Err(e) = store.kv_set(&persistent_fc_key, "0").await {
+            tracing::warn!(key = persistent_fc_key, err = %e, "failed to reset persistent failure count");
         }
         tracing::info!(key, "cleared cooldown and failure count");
     }
@@ -1490,13 +1523,62 @@ mod tests {
             "second persistent model cooldown should be ~12h, got {second_remaining}s"
         );
 
-        let count_key = format!("{FAILURE_COUNT_PREFIX}{agent}:{model}");
+        let count_key = format!("{PERSISTENT_FAILURE_COUNT_PREFIX}{agent}:{model}");
         let stored_count = store
             .kv_get(&count_key)
             .await
             .expect("kv read should succeed")
             .expect("failure count should be written");
         assert_eq!(stored_count, "2");
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn record_agent_success_does_not_reset_persistent_failure_count() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        *cooldown_store().lock().await = Some(store.clone());
+
+        let agent = "testagent_persistent_success";
+        let model = "testmodel_persistent_success";
+        let key = format!("{agent}:{model}");
+
+        // Two persistent failures escalate the counter to 2 (~12h cooldown).
+        record_persistent_model_failure(agent, model).await;
+        record_persistent_model_failure(agent, model).await;
+
+        let count_key = format!("{PERSISTENT_FAILURE_COUNT_PREFIX}{agent}:{model}");
+        let stored_count = store
+            .kv_get(&count_key)
+            .await
+            .expect("kv read should succeed")
+            .expect("failure count should be written");
+        assert_eq!(stored_count, "2");
+
+        // A successful run resets the generic failure_count but must NOT touch
+        // the persistent counter — otherwise an intervening success would erase
+        // escalation progress for a structurally unreliable model.
+        record_agent_success(agent, model).await;
+
+        let stored_count_after_success = store
+            .kv_get(&count_key)
+            .await
+            .expect("kv read should succeed")
+            .expect("persistent failure count should still exist");
+        assert_eq!(
+            stored_count_after_success, "2",
+            "persistent failure count must survive an intervening success"
+        );
+
+        // The next persistent failure should escalate from 3 (~36h), not reset to base (4h).
+        record_persistent_model_failure(agent, model).await;
+        let now = chrono::Utc::now().timestamp();
+        let third_until = cooldown_until(&key).expect("third cooldown should exist");
+        let third_remaining = third_until.saturating_sub(now);
+        assert!(
+            third_remaining > PERSISTENT_MODEL_BACKOFF_BASE_SECS,
+            "third persistent model failure should escalate past the 4h base, got {third_remaining}s"
+        );
     }
 
     #[serial(cooldown_state)]
