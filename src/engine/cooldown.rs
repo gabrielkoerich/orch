@@ -12,8 +12,12 @@
 //!
 //! When a rate limit includes a "try again at {date}" message, the cooldown
 //! is set to that specific timestamp instead of the default duration.
+//! Relative usage windows (e.g. "5-hour usage limit") are also detected and
+//! used to set a model-specific cooldown matching the advertised window.
 
 use chrono::TimeZone;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -616,6 +620,35 @@ pub async fn record_model_failure(agent_name: &str, model: &str) {
     let cooldown_until =
         chrono::Utc::now().timestamp() + compute_backoff(count, base, BACKOFF_MAX_SECS, true);
     set_cooldown_async(&key, cooldown_until, "model_error").await;
+}
+
+/// Record a rate-limit event for an agent+model.
+///
+/// If the error message advertises a relative usage window (e.g.
+/// "5-hour usage limit"), the cooldown is applied to the specific model for
+/// that window length. The quota is model-scoped, so the whole agent is not
+/// cooled. If no window is detected, fall back to the generic agent+model
+/// exponential backoff path.
+pub async fn record_rate_limit(agent_name: &str, model: Option<&str>, error_message: &str) {
+    if let Some(window_secs) = parse_relative_usage_window(error_message) {
+        if let Some(m) = model {
+            let cooldown_until = chrono::Utc::now().timestamp() + window_secs as i64;
+            set_model_cooldown(agent_name, m, window_secs).await;
+            tracing::info!(
+                agent = agent_name,
+                model = m,
+                window_secs,
+                cooldown_until,
+                "relative usage window detected: applying model-specific cooldown"
+            );
+            return;
+        }
+    }
+
+    record_agent_failure_with_message(agent_name, error_message).await;
+    if let Some(m) = model {
+        record_model_failure(agent_name, m).await;
+    }
 }
 
 /// Record a persistent model-specific failure and apply longer exponential backoff.
@@ -1372,6 +1405,62 @@ fn parse_retry_at(error_message: &str) -> Option<i64> {
     None
 }
 
+/// Parse a relative usage window (e.g. "5-hour usage limit") from an error
+/// message.
+///
+/// Returns the window length in seconds. Only matches in usage/quota/limit
+/// contexts ("usage limit", "quota", "window", "limit") to avoid interpreting
+/// unrelated numbers as cooldown durations.
+fn parse_relative_usage_window(error_message: &str) -> Option<u64> {
+    if error_message.is_empty() {
+        return None;
+    }
+
+    let lower = error_message.to_lowercase();
+    let has_context = lower.contains("usage limit")
+        || lower.contains("quota")
+        || lower.contains("window")
+        || lower.contains("limit");
+    if !has_context {
+        return None;
+    }
+
+    static WINDOW_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r"(?i)(?:^|\s|[\(\)\.,;:!?])(?:(\d+)\s*-?\s*(hour|hours|hr|hrs|minute|minutes|min|mins|day|days)|(hourly|daily|weekly|monthly))(?:$|\s|[\(\)\.,;:!?])"
+        )
+        .expect("usage window regex is valid")
+    });
+
+    let mut max_secs: Option<u64> = None;
+    for caps in WINDOW_RE.captures_iter(&lower) {
+        let secs = if let Some(num) = caps.get(1) {
+            let n: u64 = num.as_str().parse().ok()?;
+            let unit = caps.get(2)?.as_str().to_lowercase();
+            let multiplier = match unit.as_str() {
+                "hour" | "hours" | "hr" | "hrs" => 3600,
+                "minute" | "minutes" | "min" | "mins" => 60,
+                "day" | "days" => 86400,
+                _ => return None,
+            };
+            n.checked_mul(multiplier)?
+        } else if let Some(word) = caps.get(3) {
+            match word.as_str().to_lowercase().as_str() {
+                "hourly" => 3600,
+                "daily" => 86400,
+                "weekly" => 604800,
+                "monthly" => 2592000,
+                _ => return None,
+            }
+        } else {
+            continue;
+        };
+        max_secs = Some(max_secs.map_or(secs, |m| m.max(secs)));
+    }
+
+    max_secs
+}
+
 #[cfg(test)]
 pub(crate) async fn reset_global_state() {
     cooldowns().lock().unwrap().clear();
@@ -1599,6 +1688,107 @@ mod tests {
         assert!(
             parse_retry_at(msg).is_none(),
             "billing cycle without date should return None"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn parse_relative_usage_window_extracts_kimi_five_hour_window() {
+        let msg = "Failed to authenticate. API Error: 403 You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window expires.";
+        assert_eq!(
+            parse_relative_usage_window(msg),
+            Some(5 * 3600),
+            "should extract the 5-hour window as seconds"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn parse_relative_usage_window_handles_common_durations() {
+        assert_eq!(
+            parse_relative_usage_window("You've reached your hourly usage limit."),
+            Some(3600)
+        );
+        assert_eq!(
+            parse_relative_usage_window("You've reached your daily usage limit."),
+            Some(86400)
+        );
+        assert_eq!(
+            parse_relative_usage_window("You've reached your weekly limit."),
+            Some(604800)
+        );
+        assert_eq!(
+            parse_relative_usage_window("You've reached your 30-minute usage limit."),
+            Some(1800)
+        );
+        assert_eq!(
+            parse_relative_usage_window("You've reached your 2-day quota."),
+            Some(172800)
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn parse_relative_usage_window_returns_none_without_usage_context() {
+        // A bare rate-limit message with a number should not be interpreted as a
+        // relative usage window unless usage/quota/window context is present.
+        assert!(parse_relative_usage_window("429 Too Many Requests").is_none());
+        assert!(parse_relative_usage_window("rate limit exceeded").is_none());
+        assert!(parse_relative_usage_window("").is_none());
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn record_rate_limit_uses_model_specific_window_cooldown() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        *cooldown_store().lock().await = Some(store.clone());
+
+        let agent = "test_record_rl_window_agent";
+        let model = "test_record_rl_window_model";
+        let msg = "You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window expires.";
+
+        record_rate_limit(agent, Some(model), msg).await;
+
+        assert!(
+            is_model_in_cooldown(agent, model),
+            "model should be cooled for the relative usage window"
+        );
+        assert!(
+            !is_agent_in_cooldown(agent),
+            "agent should not be cooled for a model-scoped quota"
+        );
+
+        let key = format!("{agent}:{model}");
+        let remaining = cooldown_until(&key)
+            .expect("model cooldown should exist")
+            .saturating_sub(chrono::Utc::now().timestamp());
+        assert!(
+            remaining >= 5 * 3600 - 5,
+            "model cooldown should be at least ~5 hours, got {remaining}s"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn record_rate_limit_without_window_falls_back_to_agent_and_model() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        *cooldown_store().lock().await = Some(store.clone());
+
+        let agent = "test_record_rl_fallback_agent";
+        let model = "test_record_rl_fallback_model";
+        let msg = "429 Too Many Requests";
+
+        record_rate_limit(agent, Some(model), msg).await;
+
+        assert!(
+            is_agent_in_cooldown(agent),
+            "agent should be cooled when no relative window is detected"
+        );
+        assert!(
+            is_model_in_cooldown(agent, model),
+            "model should be cooled when no relative window is detected"
         );
     }
 
