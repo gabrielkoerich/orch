@@ -1285,14 +1285,7 @@ impl TaskRunner {
                 // Also record via the cooldown system so model_for_complexity() skips
                 // this model.  Use the stored last_error text as the message since
                 // classify_run_error_type() already confirmed it contains "rate limit".
-                crate::engine::cooldown::record_agent_failure_with_message(
-                    &agent_name,
-                    &last_error,
-                )
-                .await;
-                if let Some(m) = model {
-                    crate::engine::cooldown::record_model_failure(&agent_name, m).await;
-                }
+                crate::engine::cooldown::record_rate_limit(&agent_name, model, &last_error).await;
                 WeightSignal::RateLimited {
                     agent: agent_name.clone(),
                 }
