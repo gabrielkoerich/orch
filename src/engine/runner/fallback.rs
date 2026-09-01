@@ -262,6 +262,25 @@ pub async fn handle_error(
                 } else {
                     crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await;
                 }
+            } else if let (Some(model), Some(window_secs)) = (
+                model_name,
+                crate::engine::cooldown::parse_relative_usage_window(message),
+            ) {
+                // Vendor-advertised relative usage window (e.g. "weekly (7-day)
+                // usage limit") is authoritative — apply a model-specific cooldown
+                // for that exact duration instead of the generic exponential
+                // backoff. This is the same window-detection the `needs_review`
+                // call site (cooldown::record_rate_limit()) already applies; this
+                // in-task failover path bypassed it entirely, undoing the
+                // #3572/#3574 fix for the most common rate-limit path (issue #3580).
+                crate::engine::cooldown::set_model_cooldown(agent_name, model, window_secs).await;
+                tracing::info!(
+                    task_id,
+                    agent = agent_name,
+                    model,
+                    window_secs,
+                    "relative usage window detected: applying model-specific cooldown"
+                );
             } else {
                 crate::engine::cooldown::record_agent_failure_with_message(agent_name, message)
                     .await;
@@ -975,6 +994,56 @@ mod tests {
         assert!(
             crate::engine::cooldown::is_model_in_cooldown(agent, model),
             "model should be in model-level cooldown after Timeout (fixes issue #3576)"
+        );
+    }
+
+    /// Regression test for issue #3580: the in-task failover path (this
+    /// function) previously never called `parse_relative_usage_window()`, so a
+    /// vendor-advertised window like "weekly (7-day) usage limit" fell through
+    /// to the generic exponential backoff (5min base) instead of the ~7-day
+    /// window the vendor advertised. Only the `needs_review` call site in
+    /// `runner/mod.rs` applied the window fix from #3572/#3574 — this path did
+    /// not. Verify the model-specific cooldown now matches the parsed window
+    /// rather than the short exponential-backoff base.
+    ///
+    /// Note: `handle_failover()` still applies its own short agent-level
+    /// cooldown when switching to a fallback agent — that bookkeeping is
+    /// unrelated to and unaffected by this fix, so it isn't asserted here.
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn rate_limit_with_relative_window_sets_window_length_model_cooldown() {
+        crate::engine::cooldown::reset_global_state().await;
+        let runner = MockRunner { free: vec![] };
+        let agent = "test-agent-3580-kimi";
+        let model = "opus";
+        let key = format!("{agent}:{model}");
+
+        let err = AgentError::RateLimit {
+            message: "You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window expires.".to_string(),
+        };
+
+        let _result = handle_error(
+            "test-3580-a",
+            &err,
+            agent,
+            &runner,
+            Some(model),
+            Some("medium"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let until = crate::engine::cooldown::cooldown_until(&key)
+            .expect("relative usage window should set model cooldown");
+        let remaining = until.saturating_sub(now);
+
+        assert!(
+            remaining >= 7 * 86400 - 30,
+            "expected ~7-day model cooldown from the parsed window, got {remaining}s"
         );
     }
 
