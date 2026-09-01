@@ -1444,7 +1444,11 @@ fn parse_retry_at(error_message: &str) -> Option<i64> {
 /// Returns the window length in seconds. Only matches in usage/quota/limit
 /// contexts ("usage limit", "quota", "window", "limit") to avoid interpreting
 /// unrelated numbers as cooldown durations.
-fn parse_relative_usage_window(error_message: &str) -> Option<u64> {
+///
+/// `pub(crate)` so `engine::runner::fallback::handle_error()` can apply the
+/// same window-detection the `needs_review` call site
+/// (`record_rate_limit()`, below) already uses — see issue #3580.
+pub(crate) fn parse_relative_usage_window(error_message: &str) -> Option<u64> {
     if error_message.is_empty() {
         return None;
     }
