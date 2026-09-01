@@ -331,10 +331,19 @@ pub async fn handle_error(
             };
             (retryable, format!("{agent_name} auth error: {message}"))
         }
-        agents::AgentError::Timeout { elapsed } => (
-            response::RetryableError::Timeout,
-            format!("{agent_name} timed out after {}s", elapsed.as_secs()),
-        ),
+        agents::AgentError::Timeout { elapsed } => {
+            // Record model-specific cooldown so the same slow model isn't
+            // immediately reselected on the next attempt of this (or another)
+            // task — mirrors the InvalidResponse/AgentFailed arms above and the
+            // review-path fix in review.rs (issue #3307/#3310).
+            if let Some(model) = model_name {
+                response::record_model_failure(agent_name, model).await;
+            }
+            (
+                response::RetryableError::Timeout,
+                format!("{agent_name} timed out after {}s", elapsed.as_secs()),
+            )
+        }
         agents::AgentError::MissingTool { tool } => (
             response::RetryableError::MissingTooling,
             format!("missing tool: {tool}"),
@@ -922,6 +931,50 @@ mod tests {
         assert!(
             !crate::engine::cooldown::is_model_in_cooldown(agent, other_model),
             "other models should not be cooled by a single model's rate limit"
+        );
+    }
+
+    /// Regression test for issue #3576: a Timeout classification must record a
+    /// model-specific cooldown, not just clear the agent from the task. Without
+    /// this, the router's model_for_complexity() has no signal that this model
+    /// just burned a full timeout window and can immediately reselect it —
+    /// exactly what happened to task 162289 (same model timed out twice, 90
+    /// minutes apart). Mirrors the fix already applied to the review path in
+    /// review.rs (issue #3307/#3310).
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn timeout_sets_model_specific_cooldown() {
+        crate::engine::cooldown::reset_global_state().await;
+        let runner = MockRunner { free: vec![] };
+        let agent = "opencode";
+        let model = "opencode/nemotron-3-ultra-free";
+
+        assert!(
+            !crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            "model should not be in cooldown before handle_error"
+        );
+
+        let err = AgentError::Timeout {
+            elapsed: std::time::Duration::from_secs(1800),
+        };
+
+        let _result = handle_error(
+            "test-3576-timeout",
+            &err,
+            agent,
+            &runner,
+            Some(model),
+            Some("simple"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            "model should be in model-level cooldown after Timeout (fixes issue #3576)"
         );
     }
 
