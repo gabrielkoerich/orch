@@ -444,7 +444,23 @@ impl AgentRunner for ClaudeRunner {
             (None, Some(s)) => format!("{s}\n{stdout}\n{stderr}"),
             (None, None) => format!("{stdout}\n{stderr}"),
         };
-        super::patterns::classify_from_text(exit_code, &combined)
+        let classified = super::patterns::classify_from_text(exit_code, &combined);
+
+        // `classify_from_text`'s generic catch-all truncates to the last 300
+        // bytes of the combined text, which can cut a perfectly well-formed
+        // `error_result` line off mid-field-name (e.g. `is_error` becomes
+        // `i_error`) once enough NDJSON precedes it (issue #3577). When we
+        // already extracted a clean, complete error message from the result
+        // envelope but none of the specific pattern detectors matched it,
+        // prefer that clean message over the byte-truncated fallback.
+        if let (AgentError::Unknown { .. }, Some(message)) = (&classified, &error_result) {
+            if !message.is_empty() {
+                return AgentError::AgentFailed {
+                    message: message.clone(),
+                };
+            }
+        }
+        classified
     }
 
     fn router_command(
@@ -982,6 +998,45 @@ mod tests {
         assert!(
             msg.contains("session limit"),
             "error message should contain the rate limit reason, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn classify_error_prefers_clean_result_text_over_byte_truncated_tail() {
+        // Regression test for issue #3577: a well-formed `type:result`
+        // envelope with `is_error:true` was correctly extracted into
+        // `error_result`, but `classify_from_text`'s generic Unknown
+        // fallback then re-truncates the combined stdout+stderr to its last
+        // 300 bytes — which, once enough preceding NDJSON pushes the result
+        // line's start past that window, cuts it off mid-field-name (e.g.
+        // `"is_error"` becomes `"i_error"`). The stored error ends up a
+        // garbled JSON fragment instead of the clean message, and (in the
+        // fallback.rs non-zero-exit path) skips the model cooldown that the
+        // AgentFailed branch applies.
+        let padding = "{\"type\":\"system\",\"subtype\":\"init\"}\n".repeat(50);
+        let result_line = r#"{"is_error":true,"duration_api_ms":0,"num_turns":1,"stop_reason":"stop_sequence","session_id":"32a7c67c","total_cost_usd":0,"usage":{},"modelUsage":{},"permission_denials":[],"terminal_reason":"api_error","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subtype":"success","api_error_status":null,"result":"Failed to authenticate: OAuth session expired and could not be refreshed","type":"result","duration_ms":141,"uuid":"fe0ccff2-54d3-47cd-b5ba-a82f99a72b45"}"#;
+        let stdout = format!("{padding}{result_line}\n");
+        // Sanity check: the message text itself is not caught by any of the
+        // specific keyword detectors (auth/rate_limit/context_overflow), so
+        // without the fix this must fall to the generic Unknown branch.
+        assert!(
+            stdout.len() > 300,
+            "test stdout must exceed the tail-truncation window"
+        );
+
+        let err = runner().classify_error(1, &stdout, "");
+        assert!(
+            matches!(err, AgentError::AgentFailed { .. }),
+            "expected AgentFailed with the clean message, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert_eq!(
+            msg, "agent failed: Failed to authenticate: OAuth session expired and could not be refreshed",
+            "stored error must be the clean result text, not a byte-truncated JSON fragment"
+        );
+        assert!(
+            !msg.contains("i_error"),
+            "stored error must not contain the byte-truncated JSON fragment, got: {msg}"
         );
     }
 
