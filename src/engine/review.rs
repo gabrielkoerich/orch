@@ -741,7 +741,12 @@ async fn invoke_review_agent(
             tracing::error!(task_id = task.id.0, "review agent timed out");
             let _ = tmux.kill_session(&session).await;
             if let Some(model) = ctx.review_model.as_deref() {
-                crate::engine::cooldown::record_model_failure(&ctx.review_agent, model).await;
+                // Structural review failure: the model cannot finish review inside
+                // the allowed time. Use persistent backoff (4h base → 7d max) so
+                // a successful agent run on the same model does not reset the
+                // failure counter and let this model be re-selected for review.
+                crate::engine::cooldown::record_persistent_model_failure(&ctx.review_agent, model)
+                    .await;
             }
             complete_review_run(
                 store,
@@ -1133,10 +1138,10 @@ async fn parse_review_output(
 
                 // The model was cut off for exceeding its output/reasoning
                 // token budget (opencode step_finish reason=length), not
-                // because it produced malformed prose. Keep this distinct
-                // from the generic parse_error path below: apply the
-                // standard exponential backoff instead of the 4h-7d
-                // persistent cooldown reserved for format-incapable models.
+                // because it produced malformed prose. Like a timeout, this is
+                // a structural inability to finish review under the current
+                // budget, so use the persistent 4h-7d cooldown rather than the
+                // generic success-resettable model failure counter.
                 if agent_result
                     .as_ref()
                     .map(|r| r.truncated_by_length)
@@ -1150,8 +1155,11 @@ async fn parse_review_output(
                          (token budget exceeded before completion)"
                     );
                     if let Some(model) = ctx.review_model.as_deref() {
-                        crate::engine::cooldown::record_model_failure(&ctx.review_agent, model)
-                            .await;
+                        crate::engine::cooldown::record_persistent_model_failure(
+                            &ctx.review_agent,
+                            model,
+                        )
+                        .await;
                     }
                     let stored_error = "truncated: review output was cut off before completion \
                         (output/reasoning token budget exceeded)"
