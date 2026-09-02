@@ -703,6 +703,19 @@ async fn classify_review_failure(
         return ReviewOutcome::Reroute;
     }
 
+    // No configured review model for any available agent, or the selected agent
+    // has no review model. This is a configuration/cooldown gap, not a review
+    // failure. Defer without incrementing the failure counter so the task retries
+    // once a review model is available.
+    if lower_reason.contains("no review agent") || lower_reason.contains("review model missing") {
+        tracing::warn!(
+            task_id,
+            reason,
+            "{context}: no review model available — deferring retry until one is available"
+        );
+        return ReviewOutcome::RateLimited;
+    }
+
     if lower_reason.contains("rate limit") || lower_reason.contains("auth error") {
         tracing::warn!(
             task_id,
@@ -911,6 +924,51 @@ mod tests {
         assert_eq!(
             task.review_agent_failures, 0,
             "network errors must not count toward review_agent_failures"
+        );
+    }
+
+    /// When no agent has a configured review model (or the fallback agent has none),
+    /// the review must be deferred, not counted as a review failure. Counting it
+    /// would eventually block tasks for a configuration/cooldown gap (issue #3584).
+    #[tokio::test]
+    async fn classify_review_failure_missing_review_model_is_rate_limited() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let repo = "owner/repo";
+        let store_id = store
+            .create_internal(
+                repo,
+                "Missing review model test",
+                "",
+                "review",
+                "review-3",
+                None,
+            )
+            .await
+            .unwrap();
+        let task_id = format!("internal:{store_id}");
+
+        let error_messages = [
+            "no review agent with a configured review model is available for task internal:123",
+            "review model missing for task internal:123 after agent selection — refusing to dispatch",
+        ];
+
+        for _ in 0..(MAX_REVIEW_AGENT_FAILURES + 1) {
+            for msg in &error_messages {
+                let outcome =
+                    classify_review_failure(&store, repo, &task_id, msg, "review_and_merge").await;
+                assert!(
+                    matches!(outcome, ReviewOutcome::RateLimited),
+                    "missing review model error '{msg}' must defer, not block"
+                );
+            }
+        }
+
+        let task = opt_store_get_task(&Some(store.clone()), repo, &task_id)
+            .await
+            .expect("task should exist");
+        assert_eq!(
+            task.review_agent_failures, 0,
+            "missing review model errors must not count toward review_agent_failures"
         );
     }
 }
