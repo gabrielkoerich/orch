@@ -239,7 +239,7 @@ async fn select_review_agent(
     store_id: Option<i64>,
     router: &Arc<RwLock<Router>>,
     store: &Arc<TaskStore>,
-) -> (String, Option<String>) {
+) -> anyhow::Result<(String, Option<String>)> {
     let mut exclude_set: HashSet<String> = HashSet::new();
     if !task_agent.is_empty() {
         exclude_set.insert(task_agent.to_string());
@@ -284,7 +284,7 @@ async fn select_review_agent(
     }
 
     if let Some(agent) = chosen_agent {
-        (agent, chosen_model)
+        Ok((agent, chosen_model))
     } else {
         let final_exclude_refs: Vec<&str> = exclude_set.iter().map(|s| s.as_str()).collect();
         let fallback_agent = r
@@ -293,7 +293,13 @@ async fn select_review_agent(
         let fallback_model = r
             .config
             .model_for_complexity(&fallback_agent, "review", task_id);
-        (fallback_agent, fallback_model)
+        if fallback_model.is_none() {
+            anyhow::bail!(
+                "no review agent with a configured review model is available for task {}",
+                task_id
+            );
+        }
+        Ok((fallback_agent, fallback_model))
     }
 }
 
@@ -489,7 +495,13 @@ async fn build_review_context(
         .and_then(|t| t.agent.clone())
         .unwrap_or_default();
     let (review_agent, review_model) =
-        select_review_agent(&task.id.0, &task_agent, store_id, router, store).await;
+        select_review_agent(&task.id.0, &task_agent, store_id, router, store).await?;
+
+    anyhow::ensure!(
+        review_model.is_some(),
+        "review model missing for task {} after agent selection — refusing to dispatch",
+        task.id.0
+    );
 
     tracing::info!(
         task_id = task.id.0,
