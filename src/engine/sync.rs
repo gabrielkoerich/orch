@@ -765,7 +765,8 @@ async fn try_unblock_ci_failure_task(
     // can silently stall even when checks are green and the branch is up to date,
     // so after arming auto-merge we poll for completion and fall back to a direct
     // merge once the PR is mergeable and CI is passing.
-    match gh.update_pr_branch(repo, pr_number as u64).await {
+    let branch_update_result = gh.update_pr_branch(repo, pr_number as u64).await;
+    match branch_update_result {
         Ok(()) => {
             tracing::info!(
                 task_id = task.id,
@@ -773,9 +774,15 @@ async fn try_unblock_ci_failure_task(
                 "updated CI-failure-blocked PR branch against base to retrigger CI"
             );
         }
-        Err(e) => {
+        Err(ref e) => {
             // warn, not debug, so a silently-broken corrective retry doesn't look like a working one (#3561)
-            tracing::warn!(task_id = task.id, pr_number, err = %e, "failed to update CI-failure-blocked PR branch (may already be up to date)");
+            tracing::warn!(
+                task_id = task.id,
+                pr_number,
+                err = %e,
+                outcome = "branch_update_failed",
+                "failed to update CI-failure-blocked PR branch (may already be up to date)"
+            );
         }
     }
 
@@ -786,10 +793,17 @@ async fn try_unblock_ci_failure_task(
     // Record this attempt so the cooldown advances even though the actual
     // poll/merge now runs in the background.
     let pr_state = pr.state.as_str();
-    let new_reason = format!(
-        "CI failure limit reached during auto-merge (PR #{} still open, state: {})",
-        pr_number, pr_state
-    );
+    let new_reason = if let Err(ref e) = branch_update_result {
+        format!(
+            "CI failure limit reached during auto-merge (PR #{} still open, state: {}, branch update failed: {})",
+            pr_number, pr_state, e
+        )
+    } else {
+        format!(
+            "CI failure limit reached during auto-merge (PR #{} still open, state: {})",
+            pr_number, pr_state
+        )
+    };
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     // Increment auto_unblock_count so the cooldown backoff (24h, 3d, never) kicks in
     // and we don't hammer the GitHub API every tick for a PR that stays open.
@@ -916,6 +930,11 @@ async fn poll_and_merge_recovered_pr(
     let max_wait = std::time::Duration::from_secs(max_wait_secs);
     let start = std::time::Instant::now();
     let mut poll_count: u32 = 0;
+    // The branch can fall behind while CI runs. Retry the update-branch call a
+    // few times inside the poll loop instead of exiting and waiting for the next
+    // 24-hour recovery cooldown.
+    const MAX_BEHIND_RETRIES: u32 = 3;
+    let mut behind_retries: u32 = 0;
 
     let initial_pr = gh.get_pr(repo, pr_number).await?;
     let base_branch = initial_pr.base.ref_.clone();
@@ -943,18 +962,49 @@ async fn poll_and_merge_recovered_pr(
             tracing::info!(
                 task_id = task_id,
                 pr_number,
+                outcome = "poll_exited_without_merge",
+                reason = "merge_conflicts",
                 "PR has merge conflicts after recovery update — leaving for next recovery cycle"
             );
             return Ok(false);
         }
 
         if is_pr_behind(&pr) {
-            tracing::info!(
-                task_id = task_id,
-                pr_number,
-                "PR is behind base after recovery update — leaving for next recovery cycle"
-            );
-            return Ok(false);
+            if behind_retries >= MAX_BEHIND_RETRIES {
+                tracing::info!(
+                    task_id = task_id,
+                    pr_number,
+                    behind_retries,
+                    max_behind_retries = MAX_BEHIND_RETRIES,
+                    outcome = "poll_exited_without_merge",
+                    reason = "behind_retry_exhausted",
+                    "PR still behind base after recovery retries — leaving for next recovery cycle"
+                );
+                return Ok(false);
+            }
+            behind_retries += 1;
+            match gh.update_pr_branch(repo, pr_number).await {
+                Ok(()) => {
+                    tracing::info!(
+                        task_id = task_id,
+                        pr_number,
+                        behind_retries,
+                        "PR was behind base — updated branch and continuing recovery poll"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = task_id,
+                        pr_number,
+                        behind_retries,
+                        err = %e,
+                        outcome = "branch_update_failed",
+                        "failed to update behind PR branch during recovery poll"
+                    );
+                    return Ok(false);
+                }
+            }
         }
 
         let head_sha = pr.head.sha.clone();
@@ -1019,6 +1069,44 @@ async fn poll_and_merge_recovered_pr(
                         {
                             return Ok(true);
                         }
+                        // GitHub may reject the merge because the branch fell behind
+                        // again while CI was finishing. Retry the branch update inside
+                        // the poll window instead of waiting for the next sweep.
+                        if (err.contains("head branch is out of date")
+                            || err.contains("behind")
+                            || err.contains("409"))
+                            && behind_retries < MAX_BEHIND_RETRIES
+                        {
+                            behind_retries += 1;
+                            match gh.update_pr_branch(repo, pr_number).await {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        task_id = task_id,
+                                        pr_number,
+                                        behind_retries,
+                                        "merge rejected due to out-of-date branch — updated and continuing recovery poll"
+                                    );
+                                    continue;
+                                }
+                                Err(update_err) => {
+                                    tracing::warn!(
+                                        task_id = task_id,
+                                        pr_number,
+                                        behind_retries,
+                                        err = %update_err,
+                                        outcome = "branch_update_failed",
+                                        "failed to update out-of-date PR branch during recovery poll"
+                                    );
+                                }
+                            }
+                        }
+                        tracing::info!(
+                            task_id = task_id,
+                            pr_number,
+                            outcome = "poll_exited_without_merge",
+                            reason = "direct_merge_failed",
+                            "direct merge did not succeed — leaving for next recovery cycle"
+                        );
                         return Ok(false);
                     }
                 }
@@ -1027,6 +1115,8 @@ async fn poll_and_merge_recovered_pr(
                 tracing::info!(
                     task_id = task_id,
                     pr_number,
+                    outcome = "poll_exited_without_merge",
+                    reason = "ci_failure",
                     "CI still failing after recovery — will retry later"
                 );
                 return Ok(false);
@@ -1038,6 +1128,8 @@ async fn poll_and_merge_recovered_pr(
             tracing::info!(
                 task_id = task_id,
                 pr_number,
+                outcome = "poll_exited_without_merge",
+                reason = "poll_timeout",
                 "CI still pending after recovery poll timeout — will retry later"
             );
             return Ok(false);
