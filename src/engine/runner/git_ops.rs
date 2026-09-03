@@ -1892,9 +1892,10 @@ mod tests {
 
     #[test]
     fn sanitize_push_error_strips_url_credentials() {
-        let raw = "Post \"https://x-access-token:ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij@github.com/o/r.git/info/lfs/locks/verify\": dial tcp 140.82.112.4:443: i/o timeout";
+        // Shape must not look like a real GitHub PAT so gitleaks stays clean
+        let raw = "Post \"https://x-access-token:test-secret-1234567890abcdef@github.com/o/r.git/info/lfs/locks/verify\": dial tcp 140.82.112.4:443: i/o timeout";
         let sanitized = sanitize_push_error(raw);
-        assert!(!sanitized.contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"));
+        assert!(!sanitized.contains("test-secret-1234567890abcdef"));
         assert!(sanitized.contains("://***@github.com"));
         assert!(sanitized.contains("i/o timeout"));
     }
