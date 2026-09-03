@@ -208,7 +208,9 @@ async fn attempt_worktree_rebase_and_force_push(
             let push_result = tokio::time::timeout(
                 git_timeout,
                 tokio::process::Command::new("git")
-                    .args(["push", "--force-with-lease"])
+                    // lfs.locksverify=false skips the auxiliary LFS locks/verify
+                    // roundtrip; a transient timeout there must not fail the push
+                    .args(["-c", "lfs.locksverify=false", "push", "--force-with-lease"])
                     .current_dir(&wt_path)
                     .kill_on_drop(true)
                     .output(),

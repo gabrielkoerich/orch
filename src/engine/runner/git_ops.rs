@@ -9,7 +9,9 @@
 
 use crate::cmd::CommandErrorContext;
 use crate::github::http::GhHttp;
+use regex::Regex;
 use std::path::Path;
+use std::sync::LazyLock;
 
 use tokio::process::Command;
 
@@ -959,12 +961,22 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
     let auth_env = build_git_auth_env();
 
     // First attempt: normal push (no force).
+    // lfs.locksverify=false skips the auxiliary LFS locks/verify roundtrip in
+    // the pre-push hook; agents never hold LFS locks, and a transient timeout
+    // on that endpoint must not fail the whole push.
     // A 2-minute timeout prevents an indefinitely-stalled push from blocking
     // post-processing and triggering a stuck-task re-dispatch race.
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(120),
         Command::new("git")
-            .args(["push", "-u", "origin", branch_to_push])
+            .args([
+                "-c",
+                "lfs.locksverify=false",
+                "push",
+                "-u",
+                "origin",
+                branch_to_push,
+            ])
             .kill_on_drop(true)
             .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .current_dir(dir)
@@ -979,6 +991,49 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    // Transient network blip (timeout, reset) rather than a ref rejection —
+    // retry the identical push once before classifying the run as failed.
+    if is_transient_network_error(&stderr) {
+        tracing::warn!(
+            branch = branch_to_push,
+            stderr = %sanitize_push_error(&stderr),
+            "push failed with transient network error — retrying once"
+        );
+        let retry_output = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            Command::new("git")
+                .args([
+                    "-c",
+                    "lfs.locksverify=false",
+                    "push",
+                    "-u",
+                    "origin",
+                    branch_to_push,
+                ])
+                .kill_on_drop(true)
+                .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .current_dir(dir)
+                .output(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("git push (network retry) timed out after 120s"))??;
+
+        if retry_output.status.success() {
+            tracing::info!(branch = branch_to_push, "push succeeded on network retry");
+            return Ok(true);
+        }
+
+        let retry_stderr = String::from_utf8_lossy(&retry_output.stderr)
+            .trim()
+            .to_string();
+        tracing::warn!(
+            branch = branch_to_push,
+            stderr = %sanitize_push_error(&retry_stderr),
+            "push retry also failed"
+        );
+        anyhow::bail!("push failed: {}", sanitize_push_error(&retry_stderr));
+    }
 
     // Handle workflow scope error: the token lacks the `workflow` OAuth scope
     // required to push changes to `.github/workflows/`. Strip workflow files
@@ -995,7 +1050,14 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
                 let retry_output = tokio::time::timeout(
                     std::time::Duration::from_secs(120),
                     Command::new("git")
-                        .args(["push", "-u", "origin", branch_to_push])
+                        .args([
+                            "-c",
+                            "lfs.locksverify=false",
+                            "push",
+                            "-u",
+                            "origin",
+                            branch_to_push,
+                        ])
                         .kill_on_drop(true)
                         .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                         .current_dir(dir)
@@ -1056,7 +1118,15 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
             "push rejected (non-fast-forward), force-pushing with lease"
         );
         let output = Command::new("git")
-            .args(["push", "--force-with-lease", "-u", "origin", branch_to_push])
+            .args([
+                "-c",
+                "lfs.locksverify=false",
+                "push",
+                "--force-with-lease",
+                "-u",
+                "origin",
+                branch_to_push,
+            ])
             .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .current_dir(dir)
             .output_with_context()
@@ -1078,7 +1148,15 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
             match strip_workflow_files(dir, default_branch).await {
                 Ok(true) => {
                     let retry_output = Command::new("git")
-                        .args(["push", "--force-with-lease", "-u", "origin", branch_to_push])
+                        .args([
+                            "-c",
+                            "lfs.locksverify=false",
+                            "push",
+                            "--force-with-lease",
+                            "-u",
+                            "origin",
+                            branch_to_push,
+                        ])
                         .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                         .current_dir(dir)
                         .output_with_context()
@@ -1127,6 +1205,31 @@ fn push_needs_rebase(stderr: &str) -> bool {
         || lower.contains("rejected")
         || lower.contains("fetch first")
         || lower.contains("behind")
+}
+
+/// True when a push failure looks like a transient network error (dial
+/// timeout, i/o timeout, connection reset) rather than a ref rejection.
+/// A refused ref must not be retried, but a blipped endpoint deserves one
+/// immediate retry before the run is classified as `push_failed`.
+fn is_transient_network_error(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("i/o timeout")
+        || lower.contains("dial tcp")
+        || lower.contains("connection reset")
+        || lower.contains("connection refused")
+        || lower.contains("no route to host")
+        || lower.contains("temporary failure in name resolution")
+        || lower.contains("eof")
+}
+
+/// Strip credentials from push stderr before it is logged or returned:
+/// URL userinfo (`https://x-access-token:TOKEN@…`) plus any secrets caught
+/// by the leak patterns, so a failing push can never write a token to logs.
+fn sanitize_push_error(stderr: &str) -> String {
+    static URL_USERINFO: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"://[^/@\s]+@").expect("valid url userinfo regex"));
+    let no_userinfo = URL_USERINFO.replace_all(stderr, "://***@");
+    crate::security::redact(&no_userinfo)
 }
 
 /// Create a PR if one doesn't already exist.
@@ -1763,6 +1866,38 @@ mod tests {
         assert!(push_needs_rebase(
             "push rejected because the remote contains work"
         ));
+    }
+
+    #[test]
+    fn is_transient_network_error_detects_lfs_locks_timeout() {
+        let lfs_err = "Post \"https://x-access-token:***@github.com/o/r.git/info/lfs/locks/verify\": dial tcp 140.82.112.4:443: i/o timeout";
+        assert!(is_transient_network_error(lfs_err));
+        assert!(is_transient_network_error(
+            "dial tcp 140.82.112.4:443: connect: connection refused"
+        ));
+        assert!(is_transient_network_error(
+            "read tcp 10.0.0.1:51234->140.82.112.4:443: read: connection reset by peer"
+        ));
+    }
+
+    #[test]
+    fn is_transient_network_error_rejects_ref_rejections() {
+        assert!(!is_transient_network_error(
+            "! [rejected] branch -> branch (fetch first)"
+        ));
+        assert!(!is_transient_network_error(
+            "remote: error: GH006: Protected branch update failed"
+        ));
+    }
+
+    #[test]
+    fn sanitize_push_error_strips_url_credentials() {
+        // Shape must not look like a real GitHub PAT so gitleaks stays clean
+        let raw = "Post \"https://x-access-token:test-secret-1234567890abcdef@github.com/o/r.git/info/lfs/locks/verify\": dial tcp 140.82.112.4:443: i/o timeout";
+        let sanitized = sanitize_push_error(raw);
+        assert!(!sanitized.contains("test-secret-1234567890abcdef"));
+        assert!(sanitized.contains("://***@github.com"));
+        assert!(sanitized.contains("i/o timeout"));
     }
 
     #[test]
