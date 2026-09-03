@@ -9,7 +9,9 @@
 
 use crate::cmd::CommandErrorContext;
 use crate::github::http::GhHttp;
+use regex::Regex;
 use std::path::Path;
+use std::sync::LazyLock;
 
 use tokio::process::Command;
 
@@ -995,7 +997,7 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
     if is_transient_network_error(&stderr) {
         tracing::warn!(
             branch = branch_to_push,
-            stderr = %stderr,
+            stderr = %sanitize_push_error(&stderr),
             "push failed with transient network error — retrying once"
         );
         let retry_output = tokio::time::timeout(
@@ -1027,10 +1029,10 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
             .to_string();
         tracing::warn!(
             branch = branch_to_push,
-            stderr = %retry_stderr,
+            stderr = %sanitize_push_error(&retry_stderr),
             "push retry also failed"
         );
-        anyhow::bail!("push failed: {retry_stderr}");
+        anyhow::bail!("push failed: {}", sanitize_push_error(&retry_stderr));
     }
 
     // Handle workflow scope error: the token lacks the `workflow` OAuth scope
@@ -1218,6 +1220,16 @@ fn is_transient_network_error(stderr: &str) -> bool {
         || lower.contains("no route to host")
         || lower.contains("temporary failure in name resolution")
         || lower.contains("eof")
+}
+
+/// Strip credentials from push stderr before it is logged or returned:
+/// URL userinfo (`https://x-access-token:TOKEN@…`) plus any secrets caught
+/// by the leak patterns, so a failing push can never write a token to logs.
+fn sanitize_push_error(stderr: &str) -> String {
+    static URL_USERINFO: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"://[^/@\s]+@").expect("valid url userinfo regex"));
+    let no_userinfo = URL_USERINFO.replace_all(stderr, "://***@");
+    crate::security::redact(&no_userinfo)
 }
 
 /// Create a PR if one doesn't already exist.
@@ -1876,6 +1888,15 @@ mod tests {
         assert!(!is_transient_network_error(
             "remote: error: GH006: Protected branch update failed"
         ));
+    }
+
+    #[test]
+    fn sanitize_push_error_strips_url_credentials() {
+        let raw = "Post \"https://x-access-token:ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij@github.com/o/r.git/info/lfs/locks/verify\": dial tcp 140.82.112.4:443: i/o timeout";
+        let sanitized = sanitize_push_error(raw);
+        assert!(!sanitized.contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"));
+        assert!(sanitized.contains("://***@github.com"));
+        assert!(sanitized.contains("i/o timeout"));
     }
 
     #[test]
