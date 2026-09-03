@@ -1011,7 +1011,19 @@ async fn apply_fixes(
                 }
 
                 // Push
-                if !git_cmd(wt, &["push", "-u", "origin", &task.branch]).await {
+                if !git_cmd(
+                    wt,
+                    &[
+                        "-c",
+                        "lfs.locksverify=false",
+                        "push",
+                        "-u",
+                        "origin",
+                        &task.branch,
+                    ],
+                )
+                .await
+                {
                     eprintln!("  fix failed for #{}: git push failed", f.task_id);
                     skipped += 1;
                     continue;

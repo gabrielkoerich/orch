@@ -998,6 +998,8 @@ pub(crate) async fn delete_branches(task_id: &str, br: &str, repo_root: &std::pa
         .args([
             "-C",
             repo_root_str.as_ref(),
+            "-c",
+            "lfs.locksverify=false",
             "push",
             "origin",
             "--delete",
