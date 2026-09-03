@@ -25,3 +25,10 @@ paths = [
   '''^src/store/tests\.rs$''',
 ]
 regex = '''ghp_[A-Za-z0-9]{36,}'''
+
+[[allowlists]]
+description = "git_ops.rs contains a fake PAT literal in the push-error sanitizer test"
+paths = [
+  '''^src/engine/runner/git_ops\.rs$''',
+]
+regex = '''ghp_[A-Za-z0-9]{36,}'''
