@@ -2315,6 +2315,54 @@ Hope that helps!"#;
         assert_eq!(weights.get_weight("opencode"), DEFAULT_WEIGHT);
     }
 
+    #[test]
+    fn default_missing_weight_uses_minimum_of_configured() {
+        use super::weights::default_missing_weight;
+
+        let mut configured = std::collections::HashMap::new();
+        configured.insert("claude".to_string(), 0.2);
+        configured.insert("codex".to_string(), 0.2);
+        configured.insert("opencode".to_string(), 0.2);
+        configured.insert("kimi".to_string(), 0.2);
+
+        // minimax omitted from router.weights — must not silently outrank
+        // every explicitly configured agent (issue #3596).
+        assert_eq!(default_missing_weight(&configured), 0.2);
+    }
+
+    #[test]
+    fn default_missing_weight_falls_back_when_none_configured() {
+        use super::weights::default_missing_weight;
+
+        let configured = std::collections::HashMap::new();
+        assert_eq!(default_missing_weight(&configured), DEFAULT_WEIGHT);
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn ensure_agents_with_weights_missing_agent_does_not_outrank_configured() {
+        let mut weights = AgentWeights::default();
+        let mut configured = std::collections::HashMap::new();
+        configured.insert("claude".to_string(), 0.2);
+        configured.insert("codex".to_string(), 0.2);
+        configured.insert("opencode".to_string(), 0.2);
+        configured.insert("kimi".to_string(), 0.2);
+
+        let agents = vec![
+            "claude".to_string(),
+            "codex".to_string(),
+            "opencode".to_string(),
+            "kimi".to_string(),
+            "minimax".to_string(),
+        ];
+        weights.ensure_agents_with_weights(&agents, &configured);
+
+        // minimax was omitted from router.weights but must not get the old
+        // DEFAULT_WEIGHT of 1.0, which would outrank every configured agent.
+        assert_eq!(weights.get_weight("minimax"), 0.2);
+        assert_eq!(weights.get_weight("claude"), 0.2);
+    }
+
     #[serial(cooldown_state)]
     #[test]
     fn agent_weights_record_rate_limit() {
