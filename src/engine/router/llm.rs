@@ -718,7 +718,9 @@ impl LlmRouter {
             available_agents
                 .iter()
                 .map(|a| {
-                    let w = configured_weights.get(a).copied().unwrap_or(1.0);
+                    let w = configured_weights.get(a).copied().unwrap_or_else(|| {
+                        super::weights::default_missing_weight(configured_weights)
+                    });
                     format!("{a}: {w}")
                 })
                 .collect::<Vec<_>>()

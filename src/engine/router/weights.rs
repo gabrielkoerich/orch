@@ -20,6 +20,20 @@ pub(super) const MIN_WEIGHT: f64 = 0.05;
 /// How much to reduce weight on each rate limit hit (multiplicative decay).
 pub(super) const RATE_LIMIT_DECAY: f64 = 0.3;
 
+/// Weight to use for an agent that is absent from a configured `router.weights`
+/// map. Rather than the constant `DEFAULT_WEIGHT` (1.0) — which would silently
+/// outrank every agent the operator *did* configure — an omitted agent falls
+/// back to the minimum of the explicitly configured weights. An empty map
+/// means no weights are configured at all, so `DEFAULT_WEIGHT` applies to
+/// everyone equally.
+pub(super) fn default_missing_weight(configured_weights: &HashMap<String, f64>) -> f64 {
+    configured_weights
+        .values()
+        .copied()
+        .fold(None, |min, w| Some(min.map_or(w, |m: f64| m.min(w))))
+        .unwrap_or(DEFAULT_WEIGHT)
+}
+
 /// Generate jitter duration for recovery delay based on agent name.
 /// Uses a simple hash to create deterministic but varied jitter per agent.
 fn generate_recovery_jitter(agent: &str) -> Duration {
@@ -126,7 +140,9 @@ impl AgentWeights {
     /// Ensure all available agents have an entry, applying configured base weights.
     ///
     /// Agents with an explicit weight in `config.yml` use that as their base.
-    /// Agents without a configured weight default to `DEFAULT_WEIGHT` (1.0).
+    /// Agents without a configured weight default to the minimum of the
+    /// explicitly configured weights (see `default_missing_weight`), so an
+    /// omission never outranks an agent the operator actually configured.
     pub fn ensure_agents_with_weights(
         &mut self,
         agents: &[String],
@@ -136,7 +152,7 @@ impl AgentWeights {
             let base = configured_weights
                 .get(agent)
                 .copied()
-                .unwrap_or(DEFAULT_WEIGHT);
+                .unwrap_or_else(|| default_missing_weight(configured_weights));
             let state = self
                 .states
                 .entry(agent.clone())
@@ -201,10 +217,12 @@ impl AgentWeights {
         let weights: Vec<f64> = agents
             .iter()
             .map(|a| {
-                self.states
-                    .get(a)
-                    .map(|s| s.weight)
-                    .unwrap_or_else(|| self.base_weights.get(a).copied().unwrap_or(DEFAULT_WEIGHT))
+                self.states.get(a).map(|s| s.weight).unwrap_or_else(|| {
+                    self.base_weights
+                        .get(a)
+                        .copied()
+                        .unwrap_or_else(|| default_missing_weight(&self.base_weights))
+                })
             })
             .collect();
 
@@ -237,7 +255,7 @@ impl AgentWeights {
             self.base_weights
                 .get(agent)
                 .copied()
-                .unwrap_or(DEFAULT_WEIGHT)
+                .unwrap_or_else(|| default_missing_weight(&self.base_weights))
         })
     }
 

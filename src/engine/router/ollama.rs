@@ -203,7 +203,10 @@ impl OllamaRouter {
                 .agents
                 .iter()
                 .map(|a| {
-                    let w = config.weights.get(a).copied().unwrap_or(1.0);
+                    let w =
+                        config.weights.get(a).copied().unwrap_or_else(|| {
+                            super::weights::default_missing_weight(&config.weights)
+                        });
                     format!("{a}: {w}")
                 })
                 .collect::<Vec<_>>()
