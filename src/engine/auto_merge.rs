@@ -250,6 +250,49 @@ async fn record_ci_check(store: &Arc<TaskStore>, task_id: &str) -> anyhow::Resul
     store.kv_set(&key, &now).await
 }
 
+fn ci_pending_since_key(task_id: &str) -> String {
+    format!("ci_pending_since:{}", task_id)
+}
+
+/// Return how long CI has been continuously observed as `pending` for this
+/// task, persisting the first-seen timestamp in the KV store.
+///
+/// `auto_merge_pr` runs as many short-lived invocations rather than one long
+/// blocking call — `is_ci_check_in_cooldown` returns early well before
+/// `max_wait` elapses, and the next sync tick spawns a fresh invocation with
+/// its own local `Instant`. A local `start.elapsed()` therefore never
+/// accumulates past a few seconds, so the pending-timeout escalation can
+/// never fire. Persisting "first seen pending" here lets elapsed time
+/// accumulate across those invocations the same way `ci_check_ts` already
+/// does for the check cooldown.
+async fn ci_pending_elapsed(
+    store: &Arc<TaskStore>,
+    task_id: &str,
+) -> anyhow::Result<chrono::Duration> {
+    let key = ci_pending_since_key(task_id);
+    let now = chrono::Utc::now();
+    let since = match store.kv_get(&key).await? {
+        Some(ts) => chrono::DateTime::parse_from_rfc3339(&ts)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .ok(),
+        None => None,
+    };
+    match since {
+        Some(since) => Ok(now.signed_duration_since(since)),
+        None => {
+            store.kv_set(&key, &now.to_rfc3339()).await?;
+            Ok(chrono::Duration::zero())
+        }
+    }
+}
+
+/// Clear the persisted pending-since timestamp once CI leaves the pending
+/// state (success, failure, or after a timeout escalation fires) so the next
+/// pending streak starts fresh.
+async fn clear_ci_pending_since(store: &Arc<TaskStore>, task_id: &str) -> anyhow::Result<()> {
+    store.kv_delete(&ci_pending_since_key(task_id)).await
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Handle a detected merge conflict by attempting a worktree rebase.
 ///
@@ -942,7 +985,6 @@ pub(crate) async fn auto_merge_pr(
         .and_then(|s| s.parse().ok())
         .unwrap_or(15);
     let max_wait = std::time::Duration::from_secs(max_wait_secs);
-    let start = std::time::Instant::now();
     let mut poll_count: u32 = 0;
 
     // Poll for mergeability to avoid deferring to the next sync tick (~10-45s)
@@ -1057,8 +1099,16 @@ pub(crate) async fn auto_merge_pr(
         }
 
         match state.as_str() {
-            "success" => break,
+            "success" => {
+                if let Err(e) = clear_ci_pending_since(store, &task.id.0).await {
+                    tracing::warn!(task_id = task.id.0, err = %e, "failed to clear ci_pending_since after CI success");
+                }
+                break;
+            }
             "failure" => {
+                if let Err(e) = clear_ci_pending_since(store, &task.id.0).await {
+                    tracing::warn!(task_id = task.id.0, err = %e, "failed to clear ci_pending_since after CI failure");
+                }
                 match gh.get_pr(repo, pr_number).await {
                     Ok(current_pr) if is_pr_behind(&current_pr) => {
                         tracing::info!(
@@ -1377,8 +1427,22 @@ pub(crate) async fn auto_merge_pr(
                 return Ok(());
             }
             _ => {
-                // pending — wait up to max_wait
-                if start.elapsed() >= max_wait {
+                // pending — wait up to max_wait, tracked via a persisted
+                // "first seen pending" timestamp rather than the local
+                // `start` Instant (see `ci_pending_elapsed` doc comment).
+                let pending_elapsed = match ci_pending_elapsed(store, &task.id.0).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!(task_id = task.id.0, err = %e, "failed to read/persist ci_pending_since — skipping timeout check this tick");
+                        chrono::Duration::zero()
+                    }
+                };
+                if pending_elapsed
+                    >= chrono::Duration::from_std(max_wait).unwrap_or(chrono::Duration::MAX)
+                {
+                    if let Err(e) = clear_ci_pending_since(store, &task.id.0).await {
+                        tracing::warn!(task_id = task.id.0, err = %e, "failed to clear ci_pending_since before timeout escalation");
+                    }
                     let ci_failures = match store_increment(
                         &Some(Arc::clone(store)),
                         repo,
@@ -2730,6 +2794,50 @@ mod tests {
             stored.status,
             TaskStatus::Blocked,
             "task must be Blocked when max review cycles exceeded and stale check is unavailable"
+        );
+    }
+
+    /// Regression test for the bug where `auto_merge_pr`'s pending-CI timeout
+    /// never fired: elapsed pending time must accumulate in the KV store
+    /// across separate calls (simulating separate short-lived invocations),
+    /// not reset to zero each time like a function-local `Instant` would.
+    #[tokio::test]
+    async fn ci_pending_elapsed_persists_across_calls() {
+        use crate::store::TaskStore;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let task_id = "internal:1";
+
+        // First observation: no prior timestamp, so elapsed starts at zero
+        // and the "first seen pending" timestamp is persisted.
+        let first = ci_pending_elapsed(&store, task_id).await.unwrap();
+        assert!(
+            first.num_seconds() < 1,
+            "first pending observation should report ~zero elapsed, got {first:?}"
+        );
+
+        // Simulate time passing between two short-lived invocations by
+        // backdating the persisted timestamp directly, the way it would look
+        // if `is_ci_check_in_cooldown` had short-circuited several polls ago.
+        let backdated = chrono::Utc::now() - chrono::Duration::seconds(700);
+        store
+            .kv_set(&ci_pending_since_key(task_id), &backdated.to_rfc3339())
+            .await
+            .unwrap();
+
+        let second = ci_pending_elapsed(&store, task_id).await.unwrap();
+        assert!(
+            second.num_seconds() >= 600,
+            "elapsed pending time must accumulate across calls instead of resetting, got {second:?}"
+        );
+
+        // Clearing removes the persisted timestamp so the next observation
+        // starts a fresh streak at ~zero elapsed.
+        clear_ci_pending_since(&store, task_id).await.unwrap();
+        let after_clear = ci_pending_elapsed(&store, task_id).await.unwrap();
+        assert!(
+            after_clear.num_seconds() < 1,
+            "elapsed must reset to ~zero after clear_ci_pending_since, got {after_clear:?}"
         );
     }
 }
