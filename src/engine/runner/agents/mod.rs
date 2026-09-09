@@ -1445,6 +1445,47 @@ pub(crate) mod patterns {
         None
     }
 
+    /// Check for a plain-text "model not found" / "model unavailable" error.
+    ///
+    /// Mirrors the model-unavailable detection already present in codex.rs's
+    /// and opencode.rs's structured NDJSON classifiers (`classify_message`,
+    /// `classify_opencode_message`), for the case where the same failure
+    /// surfaces as raw stdout/stderr text instead of a recognizable NDJSON
+    /// event. Without this, the message falls through to `AgentError::Unknown`,
+    /// which bumps the agent-wide failure cooldown instead of the
+    /// model-scoped one that `ModelUnavailable` is exempted into.
+    pub fn detect_model_unavailable(text: &str) -> Option<AgentError> {
+        let lower = text.to_lowercase();
+        let is_model_unavailable = lower.contains("model metadata")
+            || lower.contains("no endpoints found")
+            || (lower.contains("model")
+                && (lower.contains("not found")
+                    || lower.contains("not supported")
+                    || lower.contains("does not exist")
+                    || lower.contains("deprecated")
+                    || lower.contains("unavailable for free")
+                    || lower.contains("not available in your country")
+                    || lower.contains("not available in your region")));
+        if !is_model_unavailable {
+            return None;
+        }
+        let model = extract_quoted(text, '`')
+            .or_else(|| extract_quoted(text, '\''))
+            .unwrap_or_default();
+        Some(AgentError::ModelUnavailable {
+            message: safe_tail(text, 300).to_string(),
+            model,
+        })
+    }
+
+    /// Extract text between the first matching pair of `quote` characters.
+    fn extract_quoted(text: &str, quote: char) -> Option<String> {
+        let start = text.find(quote)?;
+        let rest = &text[start + quote.len_utf8()..];
+        let end = rest.find(quote)?;
+        Some(rest[..end].to_string())
+    }
+
     /// Check for missing worktree / working directory setup failures.
     pub fn detect_worktree_missing(text: &str) -> Option<AgentError> {
         let lower = text.to_lowercase();
@@ -1717,6 +1758,9 @@ pub(crate) mod patterns {
             return e;
         }
         if let Some(e) = detect_rate_limit(scan_tail) {
+            return e;
+        }
+        if let Some(e) = detect_model_unavailable(scan_tail) {
             return e;
         }
         if let Some(e) = detect_network_error(scan_tail) {
@@ -2227,6 +2271,32 @@ mod tests {
     fn classify_from_text_worktree_missing() {
         let err = patterns::classify_from_text(1, "worktree directory does not exist: /tmp/wt");
         assert!(matches!(err, AgentError::AgentFailed { .. }));
+    }
+
+    #[test]
+    fn classify_from_text_model_not_found_backtick() {
+        // Issue #3604: plain-text "model not found" errors (no structured
+        // NDJSON event) must classify as ModelUnavailable, not fall through to
+        // Unknown, so the agent-wide cooldown is not bumped for a bad model name.
+        let text = "codex failed: model unavailable (gpt-5.5): Reconnecting... 2/5 \
+            (unexpected status 404 Not Found: The model `gpt-5.5` does not exist \
+            or you do not have access to it.)";
+        let err = patterns::classify_from_text(1, text);
+        match err {
+            AgentError::ModelUnavailable { model, .. } => assert_eq!(model, "gpt-5.5"),
+            other => panic!("expected ModelUnavailable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_from_text_model_metadata_not_found() {
+        let text = "Model metadata for `gpt-5.4` not found. Defaulting to fallback \
+            metadata; this can degrade performance and cause issues.";
+        let err = patterns::classify_from_text(1, text);
+        match err {
+            AgentError::ModelUnavailable { model, .. } => assert_eq!(model, "gpt-5.4"),
+            other => panic!("expected ModelUnavailable, got: {other:?}"),
+        }
     }
 
     #[test]
