@@ -271,15 +271,23 @@ async fn ci_pending_elapsed(
 ) -> anyhow::Result<chrono::Duration> {
     let key = ci_pending_since_key(task_id);
     let now = chrono::Utc::now();
-    let since = match store.kv_get(&key).await? {
-        Some(ts) => chrono::DateTime::parse_from_rfc3339(&ts)
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-            .ok(),
-        None => None,
-    };
-    match since {
-        Some(since) => Ok(now.signed_duration_since(since)),
-        None => {
+    // `auto_merge_pr` can run as two overlapping invocations for the same task
+    // (the review-agent's direct approval call in review.rs races the periodic
+    // review_open_prs sweep, which is not guarded against that call site). A
+    // plain "read, then write-if-absent" has a TOCTOU window where both
+    // invocations observe an absent key and each writes its own "now",
+    // silently discarding whichever wrote first and resetting the elapsed
+    // clock. `kv_insert_if_absent` performs the check-and-set in one SQL
+    // statement so only the first writer's timestamp survives.
+    let stored = store.kv_insert_if_absent(&key, &now.to_rfc3339()).await?;
+    match chrono::DateTime::parse_from_rfc3339(&stored) {
+        Ok(dt) => Ok(now.signed_duration_since(dt.with_timezone(&chrono::Utc))),
+        Err(_) => {
+            tracing::warn!(
+                task_id,
+                stored,
+                "ci_pending_since value unparseable — resetting"
+            );
             store.kv_set(&key, &now.to_rfc3339()).await?;
             Ok(chrono::Duration::zero())
         }
@@ -289,8 +297,22 @@ async fn ci_pending_elapsed(
 /// Clear the persisted pending-since timestamp once CI leaves the pending
 /// state (success, failure, or after a timeout escalation fires) so the next
 /// pending streak starts fresh.
-async fn clear_ci_pending_since(store: &Arc<TaskStore>, task_id: &str) -> anyhow::Result<()> {
-    store.kv_delete(&ci_pending_since_key(task_id)).await
+///
+/// `reason` identifies which branch triggered the clear (e.g. "ci_success",
+/// "ci_failure", "pending_timeout_escalation") and is logged alongside the
+/// value being cleared, so a future occurrence of the elapsed time silently
+/// resetting (see #3609) is diagnosable from logs alone instead of requiring
+/// another multi-day live reproduction.
+async fn clear_ci_pending_since(
+    store: &Arc<TaskStore>,
+    task_id: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let key = ci_pending_since_key(task_id);
+    if let Ok(Some(prior)) = store.kv_get(&key).await {
+        tracing::debug!(task_id, reason, prior_since = %prior, "clearing ci_pending_since");
+    }
+    store.kv_delete(&key).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1100,13 +1122,13 @@ pub(crate) async fn auto_merge_pr(
 
         match state.as_str() {
             "success" => {
-                if let Err(e) = clear_ci_pending_since(store, &task.id.0).await {
+                if let Err(e) = clear_ci_pending_since(store, &task.id.0, "ci_success").await {
                     tracing::warn!(task_id = task.id.0, err = %e, "failed to clear ci_pending_since after CI success");
                 }
                 break;
             }
             "failure" => {
-                if let Err(e) = clear_ci_pending_since(store, &task.id.0).await {
+                if let Err(e) = clear_ci_pending_since(store, &task.id.0, "ci_failure").await {
                     tracing::warn!(task_id = task.id.0, err = %e, "failed to clear ci_pending_since after CI failure");
                 }
                 match gh.get_pr(repo, pr_number).await {
@@ -1440,7 +1462,10 @@ pub(crate) async fn auto_merge_pr(
                 if pending_elapsed
                     >= chrono::Duration::from_std(max_wait).unwrap_or(chrono::Duration::MAX)
                 {
-                    if let Err(e) = clear_ci_pending_since(store, &task.id.0).await {
+                    if let Err(e) =
+                        clear_ci_pending_since(store, &task.id.0, "pending_timeout_escalation")
+                            .await
+                    {
                         tracing::warn!(task_id = task.id.0, err = %e, "failed to clear ci_pending_since before timeout escalation");
                     }
                     let ci_failures = match store_increment(
@@ -2833,11 +2858,44 @@ mod tests {
 
         // Clearing removes the persisted timestamp so the next observation
         // starts a fresh streak at ~zero elapsed.
-        clear_ci_pending_since(&store, task_id).await.unwrap();
+        clear_ci_pending_since(&store, task_id, "test")
+            .await
+            .unwrap();
         let after_clear = ci_pending_elapsed(&store, task_id).await.unwrap();
         assert!(
             after_clear.num_seconds() < 1,
             "elapsed must reset to ~zero after clear_ci_pending_since, got {after_clear:?}"
+        );
+    }
+
+    /// Regression test for #3609: `auto_merge_pr` can run as two overlapping
+    /// invocations for the same task (the review-agent's direct approval call
+    /// in review.rs is not guarded by the same `auto_merge_in_flight` set as
+    /// the periodic review_open_prs sweep). A racing call that observes CI as
+    /// newly pending must not overwrite an already-persisted "since" — doing
+    /// so silently resets the elapsed clock and the 600s timeout escalation
+    /// never fires, even though a human-visible log line shows CI pending
+    /// continuously well past `max_wait`.
+    #[tokio::test]
+    async fn ci_pending_elapsed_atomic_insert_survives_concurrent_racers() {
+        use crate::store::TaskStore;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let task_id = "internal:2";
+
+        let backdated = chrono::Utc::now() - chrono::Duration::seconds(700);
+        store
+            .kv_set(&ci_pending_since_key(task_id), &backdated.to_rfc3339())
+            .await
+            .unwrap();
+
+        // A second, racing invocation observing the same pending state must
+        // read back the already-persisted timestamp instead of clobbering it
+        // with its own "now".
+        let racer = ci_pending_elapsed(&store, task_id).await.unwrap();
+        assert!(
+            racer.num_seconds() >= 600,
+            "a racing call must not reset an already-persisted ci_pending_since, got {racer:?}"
         );
     }
 }
