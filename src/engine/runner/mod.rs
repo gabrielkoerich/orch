@@ -259,6 +259,9 @@ fn parse_success_output(
             if let Some(e) = agents::patterns::detect_auth_error(&agent_result.result_text) {
                 return Err(e);
             }
+            if let Some(e) = agents::patterns::detect_model_unavailable(&agent_result.result_text) {
+                return Err(e);
+            }
             return Err(agents::AgentError::AgentFailed {
                 message: agent_result.result_text,
             });
@@ -2761,6 +2764,28 @@ mod tests {
                 assert_eq!(message, "I failed because of reasons");
             }
             _ => panic!("expected AgentFailed, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_success_output_classifies_model_unavailable_from_is_error_result() {
+        // Regression test for issue #3607: the is_error=true NDJSON path
+        // (used by codex's find_codex_result, which stringifies its own
+        // classified AgentError into result_text) must re-classify a
+        // model-not-found message as ModelUnavailable so it gets
+        // model-scoped cooldown treatment instead of degrading to a
+        // generic AgentFailed, which triggers an agent-wide cooldown.
+        let ndjson = r#"{"type":"result","subtype":"success","is_error":true,"result":"model unavailable (gpt-5.5): Reconnecting... 2/5 (unexpected status 404 Not Found: The model `gpt-5.5` does not exist or you do not have access to it.)"}"#;
+
+        let runner = FailingMockRunner;
+        let result = parse_success_output("999", "claude", &runner, ndjson);
+
+        let err = result.expect_err("should return error");
+        match err {
+            agents::AgentError::ModelUnavailable { model, .. } => {
+                assert_eq!(model, "gpt-5.5");
+            }
+            _ => panic!("expected ModelUnavailable, got {err:?}"),
         }
     }
 
