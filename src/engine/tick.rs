@@ -1434,12 +1434,16 @@ pub(crate) async fn tick_recover_stuck_tasks(
         }
 
         let review_task_id = format!("{}-review", task_id);
+        let in_review_config = crate::engine::EngineConfig {
+            no_session_stuck_timeout: config.in_review_no_session_stuck_timeout,
+            ..config.clone()
+        };
         let Some(timing) = stuck_task_timing_from_map(
             tmux,
             repo,
             &review_task_id,
             &task.updated_at,
-            config,
+            &in_review_config,
             "cannot parse updated_at, skipping stuck internal in_review check",
             session_map,
         ) else {
