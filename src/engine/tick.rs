@@ -13,8 +13,9 @@ use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::channels::capture::CaptureService;
 use crate::config;
 use crate::engine::cooldown::{
-    github_circuit_remaining_secs, is_github_circuit_open, record_agent_failure_with_message,
-    record_silence_detection, set_agent_cooldown, set_model_cooldown, SILENCE_AGENT_COOLDOWN_SECS,
+    github_circuit_remaining_secs, is_agent_in_cooldown, is_github_circuit_open,
+    is_model_in_cooldown, record_agent_failure_with_message, record_silence_detection,
+    set_agent_cooldown, set_model_cooldown, SILENCE_AGENT_COOLDOWN_SECS,
     SILENCE_EXTENDED_COOLDOWN_SECS,
 };
 use crate::engine::dispatch_guard::DispatchGuard;
@@ -2043,15 +2044,58 @@ async fn dispatch_tasks_for_repo(
         }
         // RAII guard — removes dispatch_key on drop even if the spawned task panics.
         let dispatch_guard = DispatchGuard::new(dispatching.clone(), dispatch_key.clone());
+        let task_id = task.id.0.clone();
+
+        // Load routing result from store (stored during Phase 3a). Loaded before the
+        // tmux/semaphore/in_progress steps so a stale cooldown can bail out cheaply.
+        let route_result = match get_route_result(store, repo, &task_id).await {
+            Ok(r) => Some(r),
+            Err(RouteResultError::NoAgent { .. }) => {
+                tracing::warn!(
+                    task_id,
+                    "routed task missing agent — resetting to new for re-routing (#1604)"
+                );
+                if let Err(e2) = task_manager.update_task_status(&task.id, Status::New).await {
+                    tracing::error!(task_id, error = %e2, "failed to reset task to new");
+                }
+                continue; // dispatch_guard drops here, removing the key
+            }
+            Err(e) => {
+                tracing::warn!(task_id, error = %e, "get_route_result failed — dispatching without route info");
+                None
+            }
+        };
+
+        // Re-check the assigned agent/model against the cooldown store: routing and
+        // dispatch are decoupled by ticks, and a failure recorded after this task was
+        // routed but before it dispatched would otherwise burn a full run on an
+        // already-cooled agent/model. Leave the task in Routed so the next tick's
+        // dispatch pass re-evaluates it — no new per-task defer state (see #3243).
+        if let Some(route) = route_result.as_ref() {
+            let agent_cooled = is_agent_in_cooldown(&route.agent);
+            let model_cooled = route
+                .model
+                .as_deref()
+                .is_some_and(|model| is_model_in_cooldown(&route.agent, model));
+            if agent_cooled || model_cooled {
+                tracing::warn!(
+                    task_id,
+                    agent = route.agent,
+                    model = route.model.as_deref().unwrap_or(""),
+                    "routed agent/model entered cooldown after routing — deferring dispatch to next tick"
+                );
+                continue; // dispatch_guard drops here, removing the key
+            }
+        }
 
         // Check if already running (has active session)
-        let session_name = tmux.session_name(repo, &task.id.0);
+        let session_name = tmux.session_name(repo, &task_id);
         if tmux
             .session_blocks_dispatch_from_map(&session_name, session_map)
             .await
         {
             tracing::warn!(
-                task_id = task.id.0,
+                task_id,
                 session_name,
                 "task has existing tmux session, skipping dispatch"
             );
@@ -2068,7 +2112,6 @@ async fn dispatch_tasks_for_repo(
         };
 
         // Mark in_progress BEFORE spawning to prevent double dispatch.
-        let task_id = task.id.0.clone();
         let set_in_progress_result = task_manager
             .update_task_status(&task.id, Status::InProgress)
             .await;
@@ -2080,7 +2123,6 @@ async fn dispatch_tasks_for_repo(
         tracing::info!(task_id, "dispatching task");
 
         // Register session for capture
-        let session_name = tmux.session_name(repo, &task_id);
         capture
             .register_session(repo, &task_id, &session_name)
             .await;
@@ -2096,28 +2138,6 @@ async fn dispatch_tasks_for_repo(
         let repo_owned = repo.to_string();
         let task_manager_for_spawn = task_manager.clone();
         let store_for_spawn = store.clone();
-
-        // Load routing result from store (stored during Phase 3a)
-        let route_result = match get_route_result(store, repo, &task_id).await {
-            Ok(r) => Some(r),
-            Err(RouteResultError::NoAgent { .. }) => {
-                tracing::warn!(
-                    task_id,
-                    "routed task missing agent — resetting to new for re-routing (#1604)"
-                );
-                if let Err(e2) = task_manager
-                    .update_task_status(&task_owned.id, Status::New)
-                    .await
-                {
-                    tracing::error!(task_id, error = %e2, "failed to reset task to new");
-                }
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(task_id, error = %e, "get_route_result failed — dispatching without route info");
-                None
-            }
-        };
 
         let repo_ctx = repo_owned.clone();
         tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
@@ -4282,6 +4302,100 @@ mod tests {
             result.is_ok(),
             "tick_dispatch_tasks deadlocked! It tried to acquire a read lock \
              on router_arc while a write lock was already held (issue #1361)"
+        );
+    }
+
+    /// Regression test for #3599: a task routed to an agent/model that entered
+    /// cooldown *after* routing but *before* dispatch must not be dispatched —
+    /// the stale route was decided before the failure that triggered the
+    /// cooldown was known. Dispatch must re-check the assigned agent/model
+    /// against the same cooldown store used at routing time and, if stale,
+    /// leave the task in `Routed` for the next tick to re-evaluate (no PR is
+    /// spawned, no per-task defer timer is written).
+    #[tokio::test]
+    async fn dispatch_skips_task_whose_routed_model_entered_cooldown() {
+        use crate::store::{StoreRoute, TaskStatus as DbStatus, UpsertExternal};
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let mock = MockBackend::new();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(TmuxManager::new());
+        let runner = Arc::new(TaskRunner::new("owner/repo".to_string()));
+        let semaphore = Arc::new(Semaphore::new(4));
+        let (weight_tx, _weight_rx) = mpsc::channel(16);
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+        let transport = Arc::new(Transport::new());
+        let capture = Arc::new(CaptureService::new(transport));
+
+        let id = store
+            .upsert_external(&UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "999",
+                title: "Stale routed task",
+                body: "",
+                author: "user",
+                url: "https://github.com/owner/repo/issues/999",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .store_route(&StoreRoute {
+                id,
+                agent: "minimax",
+                model: Some("opus"),
+                complexity: "medium",
+                estimate: 0,
+                reason: "test",
+                profile: "{}",
+                skills: "[]",
+            })
+            .await
+            .unwrap();
+        store.update_status(id, DbStatus::Routed).await.unwrap();
+
+        // Simulate a billing/rate-limit cooldown recorded for minimax:opus after
+        // this task was routed but before it dispatched.
+        crate::engine::cooldown::set_model_cooldown("minimax", "opus", 300).await;
+
+        let dispatch_mode = DispatchMode {
+            is_degraded: false,
+            healthy_agents: 1,
+            threshold: 1,
+        };
+
+        tick_dispatch_tasks(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &runner,
+            &capture,
+            &semaphore,
+            &task_manager,
+            &weight_tx,
+            dispatch_mode,
+            &dispatching,
+            &store,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(
+            task.status,
+            DbStatus::Routed,
+            "task whose routed model is now cooled down must stay Routed, not be dispatched"
+        );
+        assert!(
+            dispatching.is_empty(),
+            "dispatch guard must be released when skipping a stale-cooldown task"
         );
     }
 
