@@ -45,6 +45,38 @@ static ENGINE_START_TIME: LazyLock<u64> = LazyLock::new(|| {
 /// Flag to ensure startup cleanup only runs once.
 static STARTUP_CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
 
+/// Per outer engine-loop quota for expensive routing calls.
+///
+/// `tick()` runs once per active project. Without a quota shared by all those
+/// project ticks, `router.max_tasks_per_tick = 1` still permits one slow LLM
+/// routing call per project plus one global sweep route per project, multiplying
+/// 45s router timeouts into multi-minute watchdog stalls.
+pub(crate) struct RoutingTickQuota {
+    remaining: usize,
+}
+
+impl RoutingTickQuota {
+    pub(crate) fn new(max: usize) -> Self {
+        Self { remaining: max }
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.remaining == 0
+    }
+
+    fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    fn consume_one(&mut self) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+}
+
 /// Cleanup stale tmux sessions from previous engine runs.
 /// Called once at startup to kill sessions created before this process started.
 async fn startup_cleanup(tmux: &TmuxManager) {
@@ -1539,8 +1571,14 @@ pub(crate) async fn tick_route_tasks(
     router: &mut Router,
     store: &Arc<TaskStore>,
     repo: &str,
+    routing_quota: &mut RoutingTickQuota,
 ) -> anyhow::Result<()> {
     let _span = tracing::info_span!("engine.tick.phase3a.route").entered();
+    if routing_quota.is_exhausted() {
+        tracing::debug!("routing quota exhausted for this tick — skipping repo routing phase");
+        return Ok(());
+    }
+
     // Global GitHub 5xx circuit breaker — skip routing during sustained GitHub outages
     // to avoid routing-heavy retry storms. Tasks will remain in 'new' status and be
     // retried when the circuit closes.
@@ -1570,9 +1608,11 @@ pub(crate) async fn tick_route_tasks(
         );
     }
 
-    // Limit routing to at most N tasks per tick to prevent blocking on LLM calls
-    let max_per_tick = crate::engine::router::config::max_tasks_per_routing_tick();
-    for task in routable.into_iter().take(max_per_tick) {
+    // Limit routing to the remaining global quota for this outer engine tick.
+    for task in routable.into_iter().take(routing_quota.remaining()) {
+        if !routing_quota.consume_one() {
+            break;
+        }
         let _task_span = tracing::info_span!("engine.route", task_id = %task.id.0).entered();
 
         let task_start = Instant::now();
@@ -1774,8 +1814,14 @@ pub(crate) async fn route_new_tasks_global(
     router: &mut Router,
     store: &Arc<TaskStore>,
     active_repos: &std::collections::HashSet<String>,
+    routing_quota: &mut RoutingTickQuota,
 ) -> anyhow::Result<()> {
     use crate::store::{StoreRoute, TaskStatus};
+
+    if routing_quota.is_exhausted() {
+        tracing::debug!("routing quota exhausted for this tick — skipping global routing sweep");
+        return Ok(());
+    }
 
     let all_new = store.list_all_by_status_global(TaskStatus::New).await?;
     let orphaned: Vec<&crate::store::Task> = all_new
@@ -1795,8 +1841,10 @@ pub(crate) async fn route_new_tasks_global(
 
     router.refresh_health(store).await;
 
-    let max_per_tick = crate::engine::router::config::max_tasks_per_routing_tick();
-    for task in orphaned.into_iter().take(max_per_tick) {
+    for task in orphaned.into_iter().take(routing_quota.remaining()) {
+        if !routing_quota.consume_one() {
+            break;
+        }
         let ext_task = crate::engine::tasks::store_task_to_external(task);
         let task_start = Instant::now();
         match router.route(&ext_task, store, &task.repo).await {
@@ -2635,6 +2683,7 @@ pub(crate) async fn tick(
     transport: Option<&Arc<crate::channels::transport::Transport>>,
     active_repos: &std::collections::HashSet<String>,
     auto_merge_in_flight: &Arc<DashSet<String>>,
+    routing_quota: &mut RoutingTickQuota,
 ) -> anyhow::Result<()> {
     let _tick_span = tracing::info_span!("engine.tick").entered();
 
@@ -2659,11 +2708,11 @@ pub(crate) async fn tick(
         auto_merge_in_flight,
     )
     .await?;
-    tick_route_tasks(backend, task_manager, router, store, repo).await?;
+    tick_route_tasks(backend, task_manager, router, store, repo, routing_quota).await?;
     // Global routing sweep for tasks from inactive or removed repos.
     // tick_route_tasks is scoped to the active repo; tasks from projects no longer
     // in config are never returned by list_routable and would stay in 'new' indefinitely.
-    if let Err(e) = route_new_tasks_global(router, store, active_repos).await {
+    if let Err(e) = route_new_tasks_global(router, store, active_repos, routing_quota).await {
         tracing::warn!(err = %e, "global new-task routing sweep failed");
     }
     let dispatch_mode = dispatch_mode_from_router(router);
@@ -4783,7 +4832,8 @@ mod tests {
 
         let active_repos: std::collections::HashSet<String> =
             ["active/repo".to_string()].into_iter().collect();
-        route_new_tasks_global(&mut router, &store, &active_repos)
+        let mut routing_quota = RoutingTickQuota::new(1);
+        route_new_tasks_global(&mut router, &store, &active_repos, &mut routing_quota)
             .await
             .unwrap();
 
@@ -4877,7 +4927,8 @@ mod tests {
             ["active/repo".to_string(), "other-active/repo".to_string()]
                 .into_iter()
                 .collect();
-        route_new_tasks_global(&mut router, &store, &active_repos)
+        let mut routing_quota = RoutingTickQuota::new(1);
+        route_new_tasks_global(&mut router, &store, &active_repos, &mut routing_quota)
             .await
             .unwrap();
 
@@ -4936,7 +4987,8 @@ mod tests {
 
         let active_repos: std::collections::HashSet<String> =
             ["active/repo".to_string()].into_iter().collect();
-        route_new_tasks_global(&mut router, &store, &active_repos)
+        let mut routing_quota = RoutingTickQuota::new(1);
+        route_new_tasks_global(&mut router, &store, &active_repos, &mut routing_quota)
             .await
             .unwrap();
 
@@ -4944,6 +4996,84 @@ mod tests {
             store.get(id).await.unwrap().status,
             TaskStatus::New,
             "no-agent tasks must not be routed"
+        );
+    }
+
+    /// Regression test for #3615: the routing limit must be consumed by a
+    /// shared per-engine-tick quota, not independently by every repo/global
+    /// routing pass. Otherwise one slow router timeout per pass can stack into
+    /// a multi-minute watchdog stall.
+    #[serial_test::serial(cooldown_state)]
+    #[tokio::test]
+    async fn global_sweep_honors_shared_routing_quota() {
+        use crate::engine::router::{Router, RouterConfig};
+        use crate::store::{TaskStatus, UpsertExternal};
+
+        crate::engine::cooldown::reset_global_state().await;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        for ext_id in ["1", "2"] {
+            store
+                .upsert_external(&UpsertExternal {
+                    repo: "inactive/repo",
+                    ext_id,
+                    title: "Orphaned task",
+                    body: "",
+                    author: "user",
+                    url: &format!("https://github.com/inactive/repo/issues/{ext_id}"),
+                    labels: &[],
+                    origin: "github",
+                })
+                .await
+                .unwrap();
+        }
+
+        let mut model_map: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, Vec<String>>,
+        > = std::collections::HashMap::new();
+        let mut tier = std::collections::HashMap::new();
+        tier.insert("claude".to_string(), vec!["haiku".to_string()]);
+        model_map.insert("medium".to_string(), tier);
+        let config = RouterConfig {
+            mode: "round_robin".to_string(),
+            agents: vec!["claude".to_string()],
+            model_map,
+            ..Default::default()
+        };
+        let mut router = Router::new_for_test(config, vec!["claude".to_string()]);
+
+        let active_repos: std::collections::HashSet<String> =
+            ["active/repo".to_string()].into_iter().collect();
+        let mut routing_quota = RoutingTickQuota::new(1);
+        route_new_tasks_global(&mut router, &store, &active_repos, &mut routing_quota)
+            .await
+            .unwrap();
+
+        let all_tasks = store.list_all_global().await.unwrap();
+        let routed = all_tasks
+            .iter()
+            .filter(|task| task.status == TaskStatus::Routed)
+            .count();
+        let still_new = all_tasks
+            .iter()
+            .filter(|task| task.status == TaskStatus::New)
+            .count();
+
+        assert_eq!(routed, 1, "only one task may consume the shared quota");
+        assert_eq!(still_new, 1, "remaining tasks wait for the next tick");
+
+        route_new_tasks_global(&mut router, &store, &active_repos, &mut routing_quota)
+            .await
+            .unwrap();
+        let after_exhausted = store.list_all_global().await.unwrap();
+        assert_eq!(
+            after_exhausted
+                .iter()
+                .filter(|task| task.status == TaskStatus::Routed)
+                .count(),
+            1,
+            "an exhausted shared quota must not reset within the same tick"
         );
     }
 
