@@ -339,21 +339,112 @@ async fn build_review_context(
         t.worktree.trim().is_empty() && t.branch.trim().is_empty() && t.pr_number.is_none()
     });
     if no_code_review {
-        tracing::info!(
-            task_id = task.id.0,
-            "no worktree/branch/pr for needs_review task — skipping review and marking done"
-        );
-        if let Err(e) = task_manager
-            .update_task_status(&task.id, Status::Done)
-            .await
+        if crate::engine::tasks::is_internal_id(&task.id.0) {
+            // Internal tasks legitimately reach needs_review with nothing to review.
+            tracing::info!(
+                task_id = task.id.0,
+                "no worktree/branch/pr for internal needs_review task — skipping review and marking done"
+            );
+            if let Err(e) = task_manager
+                .update_task_status(&task.id, Status::Done)
+                .await
+            {
+                tracing::error!(
+                    task_id = task.id.0,
+                    err = %e,
+                    "update_task_status(Done) failed for no-code review skip"
+                );
+            }
+            return Ok(ReviewPhase::EarlyReturn(ReviewDecision::Skipped));
+        }
+
+        // External task with no code produced: re-route instead of marking done.
+        // Shares the no_code_reroutes circuit breaker with the no-PR/no-commits path below.
+        let max_reroutes: u32 = config::get("workflow.max_reroute_attempts")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .or_else(|| {
+                config::get("workflow.max_attempts")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+            })
+            .unwrap_or(3);
+
+        let reroutes = match store_increment(
+            &Some(Arc::clone(store)),
+            repo,
+            &task.id.0,
+            "no_code_reroutes",
+        )
+        .await
         {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(task_id = task.id.0, err = %e, "failed to increment no_code_reroutes — skipping reroute/block decision this tick");
+                return Ok(ReviewPhase::EarlyReturn(ReviewDecision::Failed(format!(
+                    "transient store error: {e}"
+                ))));
+            }
+        };
+
+        if reroutes as u32 >= max_reroutes {
             tracing::error!(
                 task_id = task.id.0,
-                err = %e,
-                "update_task_status(Done) failed for no-code review skip"
+                reroutes,
+                max_reroutes,
+                "reached max reroute attempts for no-worktree/branch/pr result — blocking for human review"
             );
+            let msg = format!(
+                "no worktree/branch/pr after {}/{} reroute attempts",
+                reroutes, max_reroutes
+            );
+            let fields = [
+                (
+                    "block_reason",
+                    serde_json::json!(format!(
+                        "max reroute attempts ({}) reached — no worktree/branch/pr produced",
+                        max_reroutes
+                    )),
+                ),
+                ("last_error", serde_json::json!(msg)),
+                ("agent", serde_json::json!(null)),
+                ("model", serde_json::json!(null)),
+            ];
+            if let Err(e) = task_manager
+                .update_task_status_and_result(&task.id, Status::Blocked, &fields)
+                .await
+            {
+                tracing::error!(task_id = task.id.0, err = %e, "update_task_status_and_result(Blocked) failed — skipping block to avoid silent auto-unblock loop");
+            }
+            return Ok(ReviewPhase::EarlyReturn(ReviewDecision::Blocked(msg)));
         }
-        return Ok(ReviewPhase::EarlyReturn(ReviewDecision::Skipped));
+
+        tracing::warn!(
+            task_id = task.id.0,
+            reroutes,
+            max_reroutes,
+            "no worktree/branch/pr for external needs_review task — re-routing to a different agent"
+        );
+        if let Err(e) = store_set_result(
+            &Some(Arc::clone(store)),
+            repo,
+            &task.id.0,
+            &[
+                ("agent", serde_json::json!(null)),
+                ("model", serde_json::json!(null)),
+                (
+                    "last_error",
+                    serde_json::json!("no worktree/branch/pr produced"),
+                ),
+            ],
+        )
+        .await
+        {
+            tracing::error!(task_id = task.id.0, err = %e, "failed to clear agent/model for reroute — skipping status transition");
+        } else if let Err(e) = task_manager.update_task_status(&task.id, Status::New).await {
+            tracing::error!(task_id = task.id.0, err = %e, "update_task_status(New) failed — task may be stuck in InReview");
+        }
+        return Ok(ReviewPhase::EarlyReturn(ReviewDecision::Rerouted));
     }
 
     let mut worktree_path = match stored_task.as_ref().map(|t| t.worktree.as_str()) {
@@ -2544,7 +2635,7 @@ mod tests {
     use crate::backends::ExternalTask;
     use crate::engine::router::RouterConfig;
     use crate::github::types::{GitHubReview, GitHubReviewComment, GitHubUser, PullRequestReview};
-    use crate::store::TaskStore;
+    use crate::store::{TaskStatus, TaskStore};
     use tempfile::TempDir;
 
     // ── outcome_for_agent_error ─────────────────────────────────────────────
@@ -2912,6 +3003,134 @@ mod tests {
         let expected_footer = attribution_footer("Review started", "kimi", Some("opus"));
         let expected = format!("🔍 Automated review started{}", expected_footer);
         assert_eq!(review_started_comment("kimi", "opus"), expected);
+    }
+
+    // ── build_review_context: no worktree/branch/pr (issue #3623) ───────────
+
+    fn no_code_review_task(id: &str) -> ExternalTask {
+        ExternalTask {
+            id: crate::backends::ExternalId(id.to_string()),
+            title: "opencode discovery timeout".to_string(),
+            body: "".to_string(),
+            state: "open".to_string(),
+            labels: vec![],
+            author: "tester".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: "https://example.com/issues/1".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_review_context_reroutes_external_task_with_no_code() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let repo = "owner/repo";
+        let ext = no_code_review_task("3617");
+        store.ensure_external_task(repo, &ext).await.unwrap();
+
+        let backend = Arc::new(crate::backends::test_helpers::NoopBackend);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            Arc::clone(&store),
+            repo.to_string(),
+        ));
+        let router = Arc::new(RwLock::new(Router::new(RouterConfig::default())));
+
+        let phase = build_review_context(&ext, repo, &router, &task_manager, &store)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(phase, ReviewPhase::EarlyReturn(ReviewDecision::Rerouted)),
+            "external task with no worktree/branch/pr must reroute, not skip-to-done"
+        );
+
+        let stored = store
+            .get_by_external_id(repo, &ext.id.0)
+            .await
+            .unwrap()
+            .expect("task must still exist");
+        assert_eq!(stored.status, TaskStatus::New);
+        assert!(stored.agent.is_none());
+        assert!(stored.model.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_review_context_blocks_external_task_after_max_reroutes() {
+        // Isolate from the real ~/.orch/config.yml (which may set a different
+        // workflow.max_attempts) so the default of 3 reroutes is deterministic.
+        let temp_home = TempDir::new().unwrap();
+        let orch_dir = temp_home.path().join(".orch");
+        std::fs::create_dir_all(&orch_dir).unwrap();
+        let old_orch_home = std::env::var_os("ORCH_HOME");
+        std::env::set_var("ORCH_HOME", &orch_dir);
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let repo = "owner/repo";
+        let ext = no_code_review_task("3618");
+        store.ensure_external_task(repo, &ext).await.unwrap();
+
+        let backend = Arc::new(crate::backends::test_helpers::NoopBackend);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            Arc::clone(&store),
+            repo.to_string(),
+        ));
+        let router = Arc::new(RwLock::new(Router::new(RouterConfig::default())));
+
+        // Default max_reroute_attempts is 3 — exhaust it.
+        for _ in 0..3 {
+            let phase = build_review_context(&ext, repo, &router, &task_manager, &store)
+                .await
+                .unwrap();
+            if let ReviewPhase::EarlyReturn(ReviewDecision::Blocked(_)) = phase {
+                break;
+            }
+        }
+
+        let stored = store
+            .get_by_external_id(repo, &ext.id.0)
+            .await
+            .unwrap()
+            .expect("task must still exist");
+        assert_eq!(stored.status, TaskStatus::Blocked);
+
+        if let Some(old) = old_orch_home {
+            std::env::set_var("ORCH_HOME", old);
+        } else {
+            std::env::remove_var("ORCH_HOME");
+        }
+    }
+
+    #[tokio::test]
+    async fn build_review_context_marks_internal_task_done_with_no_code() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let repo = "owner/repo";
+        let internal_id = store
+            .create_internal(repo, "Daily retrospective", "", "job", "job-1", None)
+            .await
+            .unwrap();
+        let ext_id = format!("internal:{internal_id}");
+        let ext = no_code_review_task(&ext_id);
+
+        let backend = Arc::new(crate::backends::test_helpers::NoopBackend);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            Arc::clone(&store),
+            repo.to_string(),
+        ));
+        let router = Arc::new(RwLock::new(Router::new(RouterConfig::default())));
+
+        let phase = build_review_context(&ext, repo, &router, &task_manager, &store)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            phase,
+            ReviewPhase::EarlyReturn(ReviewDecision::Skipped)
+        ));
+        let stored = store.get(internal_id).await.unwrap();
+        assert_eq!(stored.status, TaskStatus::Done);
     }
 
     #[test]
