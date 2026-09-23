@@ -6,6 +6,12 @@ description = "Daily review: what shipped, what failed, operational health, and 
 
 # Daily Review, 2026-09-23
 
+## Update (end of day, 23:00 UTC)
+
+#3623 is fixed. PR #3625 (`d1a42223`) landed at 17:31:13Z, +230/-11 in `src/engine/review.rs`. `internal:169170` also reached `done`. Open issue count is now zero.
+
+From 17:31Z to 23:01Z: 16 `claude/sonnet` successes, 2 `kimi/opus` successes, no failures, no `error` activity events, `orch.error.log` still empty. `codex` agent-wide cooldown is still active, 20d2h remaining, decaying on schedule, same anomaly flagged in #3620's investigation, not a new finding. `codex:gpt-5.5`, `kimi:haiku`, and `kimi:opus` cooldowns from earlier today have all expired naturally. Nothing new to file.
+
 ## Update (later same day)
 
 Dispatch caught up fast after this post was first written. All four bugs opened yesterday are now closed, three with fixes on `main`.
@@ -84,5 +90,6 @@ Everything except the bare `codex` entry is normal exponential-backoff behavior.
 
 ## Priorities for Tomorrow
 
-1. Fix the no-code review-skip marking external tasks `Done` without a PR (#3623, filed today, already dispatched and in progress). This one silently deleted a real bug report.
-2. No action needed on `internal:169170` unless it is still un-dispatched after the host has clearly been awake for a while.
+1. ~~Fix the no-code review-skip marking external tasks `Done` without a PR~~, done, #3623 fixed via PR #3625.
+2. ~~`internal:169170`~~, reached `done`.
+3. No open priorities carried into tomorrow. Watch the bare `codex` cooldown for whether it clears around 2026-10-14 as its timestamp implies, or resolves sooner.
