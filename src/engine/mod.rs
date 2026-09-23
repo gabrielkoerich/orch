@@ -2082,6 +2082,9 @@ pub async fn serve() -> anyhow::Result<()> {
                 } else {
                     // Core tick: poll tasks for all projects
                     let mut router_guard = router.write().await;
+                    let mut routing_quota = tick::RoutingTickQuota::new(
+                        crate::engine::router::config::max_tasks_per_routing_tick(),
+                    );
                     for engine in &project_engines {
                         let repo = engine.repo.clone();
                         let project_jobs_path = engine.project_dir.join(".orch.yml");
@@ -2103,6 +2106,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                 Some(&transport),
                                 &active_repos,
                                 &auto_merge_in_flight,
+                                &mut routing_quota,
                             ).await {
                                 tracing::error!(repo = %engine.repo, ?e, "tick failed for project");
                             }
@@ -2273,6 +2277,9 @@ pub async fn serve() -> anyhow::Result<()> {
                     tracing::info!("webhook event triggered immediate tick");
 
                     let mut router_guard = router.write().await;
+                    let mut routing_quota = tick::RoutingTickQuota::new(
+                        crate::engine::router::config::max_tasks_per_routing_tick(),
+                    );
                     for engine in &project_engines {
                         let repo = engine.repo.clone();
                         let project_jobs_path = engine.project_dir.join(".orch.yml");
@@ -2294,6 +2301,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                 Some(&transport),
                                 &active_repos,
                                 &auto_merge_in_flight,
+                                &mut routing_quota,
                             ).await {
                                 tracing::error!(repo = %engine.repo, ?e, "webhook-triggered tick failed");
                             }
