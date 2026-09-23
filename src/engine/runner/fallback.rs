@@ -164,7 +164,9 @@ async fn try_free_model_reroute(
     let next_free = free.iter().find(|m| {
         !exclude_models.contains(&m.as_str())
             && !tried_set.contains(m.as_str())
-            && (!check_cooldowns || !response::is_model_in_cooldown(agent_name, m))
+            && (!check_cooldowns
+                || (!crate::engine::cooldown::is_agent_in_cooldown(agent_name)
+                    && !response::is_model_in_cooldown(agent_name, m)))
     })?;
     tracing::info!(task_id, model = %next_free, "{}", reason_prefix);
     let new_tried = if tried_models.is_empty() {
@@ -385,14 +387,20 @@ pub async fn handle_error(
                 response::record_model_failure(agent_name, model).await;
             }
 
-            // Try next model before switching agent
+            // Try next model before switching agent, unless the agent is cooled
+            // (an agent-wide cooldown must not be defeated by model substitution)
+            let agent_cooled = crate::engine::cooldown::is_agent_in_cooldown(agent_name);
             let models = agent_runner.available_models();
             let current_model = model_name.unwrap_or("");
-            let next_model = models.iter().find(|m| {
-                m.as_str() != current_model
-                    && m.as_str() != model
-                    && !response::is_model_in_cooldown(agent_name, m)
-            });
+            let next_model = if agent_cooled {
+                None
+            } else {
+                models.iter().find(|m| {
+                    m.as_str() != current_model
+                        && m.as_str() != model
+                        && !response::is_model_in_cooldown(agent_name, m)
+                })
+            };
             if let Some(next) = next_model {
                 tracing::info!(task_id, model = %next, "retrying with different model");
                 let msg = format!("model {model} unavailable, trying {next}");
@@ -756,6 +764,66 @@ mod tests {
 
     struct MockRunner {
         free: Vec<String>,
+    }
+
+    struct MockRunnerWithModels {
+        models: Vec<String>,
+    }
+
+    impl AgentRunner for MockRunnerWithModels {
+        fn name(&self) -> &str {
+            "opencode"
+        }
+
+        fn build_command(
+            &self,
+            _model: Option<&str>,
+            _timeout_cmd: &str,
+            _sys_file: &str,
+            _msg_file: &str,
+            _permissions: &PermissionRules,
+        ) -> String {
+            String::new()
+        }
+
+        fn parse_response(&self, _raw: &str) -> Result<ParsedResponse, AgentError> {
+            Ok(ParsedResponse {
+                response: AgentResponse {
+                    status: "done".to_string(),
+                    summary: String::new(),
+                    accomplished: vec![],
+                    remaining: vec![],
+                    files: vec![],
+                    error: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    learnings: vec![],
+                    delegations: vec![],
+                },
+                input_tokens: None,
+                output_tokens: None,
+                duration_ms: None,
+            })
+        }
+
+        fn classify_error(&self, _exit_code: i32, _stdout: &str, _stderr: &str) -> AgentError {
+            AgentError::Unknown {
+                exit_code: 0,
+                message: String::new(),
+            }
+        }
+
+        fn available_models(&self) -> Vec<String> {
+            self.models.clone()
+        }
+
+        fn router_command(
+            &self,
+            _prompt: &str,
+            _model: Option<&str>,
+        ) -> anyhow::Result<tokio::process::Command> {
+            anyhow::bail!("not implemented")
+        }
     }
 
     impl AgentRunner for MockRunner {
@@ -1796,5 +1864,45 @@ more logs"#;
             remaining < crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS,
             "transient unavailability should use short cooldown (<4h), got {remaining}s"
         );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn model_unavailable_does_not_reuse_same_agent_when_agent_cooled() {
+        crate::engine::cooldown::reset_global_state().await;
+        let agent = "codex-3620";
+        let failing_model = "gpt-5.4";
+        let other_model = "gpt-5.5";
+        let runner = MockRunnerWithModels {
+            models: vec![failing_model.to_string(), other_model.to_string()],
+        };
+
+        crate::engine::cooldown::set_agent_cooldown(agent, 3600).await;
+
+        let err = AgentError::ModelUnavailable {
+            model: failing_model.to_string(),
+            message: "model gpt-5.4 unavailable".to_string(),
+        };
+
+        let result = handle_error(
+            "test-3620",
+            &err,
+            agent,
+            &runner,
+            Some(failing_model),
+            Some("medium"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        if let ErrorHandleResult::EarlyReturn { status } = result {
+            assert_ne!(
+                status, "routed",
+                "agent-wide cooldown was defeated by same-agent model substitution"
+            );
+        }
     }
 }
