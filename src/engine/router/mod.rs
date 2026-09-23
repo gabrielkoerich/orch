@@ -1387,6 +1387,13 @@ impl Router {
                     let err_msg = e.to_string();
                     let is_timeout = err_msg.contains(TIMEOUT_PREFIX);
                     if is_timeout {
+                        // Cool down on timeout like pool entries (#3422), else a
+                        // chronically-timing-out fallback burns the full timeout window every tick (#3616)
+                        crate::engine::runner::response::record_model_failure(
+                            &fb_agent,
+                            fb_model_str,
+                        )
+                        .await;
                         tracing::warn!(
                             agent = %fb_agent,
                             model = %fb_model_str,
