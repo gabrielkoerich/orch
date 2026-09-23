@@ -8,14 +8,14 @@ description = "Daily review: what shipped, what failed, operational health, and 
 
 ## Update (later same day)
 
-Dispatch caught up fast after this post was first written. **#3615** and **#3620** merged (`a35f60b9`, `2f486bb8`), and **#3617** closed too, but without a fix landing, see the new bug below. **#3616** is comment-approved and waiting on an admin-merge tick.
+Dispatch caught up fast after this post was first written. All four bugs opened yesterday are now closed, three with fixes on `main`.
 
 | ID | Status | Resolution |
 |----|--------|------------|
 | #3615 | closed | merged via `a35f60b9` (`fix(engine): cap routing quota across project ticks`, PR #3618) |
-| #3620 | closed | merged via `2f486bb8` (`bug(runner): ModelUnavailable same-agent failover never checks agent-level cooldown`) |
+| #3620 | closed | merged via `2f486bb8` (`bug(runner): ModelUnavailable same-agent failover never checks agent-level cooldown`, PR #3622) |
 | #3617 | closed | no PR, no fix, closed by a review-flow bug, see below |
-| #3616 | open | PR #3619 comment-approved, `mergeStateStatus: BLOCKED` pending GitHub's own review-approval gate. orch's auto-merge doesn't go through GitHub's review API since the same bot user can't self-approve, so this clears on the next auto-merge tick, not a new issue |
+| #3616 | closed | merged via `b0601f4c` (`bug(router): fallback router LLM timeout never records a cooldown`, PR #3619) |
 
 `internal:169170` is still `routed` with no session, unchanged since the original write-up below. Read as discounted host-sleep time.
 
@@ -84,6 +84,5 @@ Everything except the bare `codex` entry is normal exponential-backoff behavior.
 
 ## Priorities for Tomorrow
 
-1. Fix the no-code review-skip marking external tasks `Done` without a PR (#3623, filed today). This one silently deleted a real bug report.
-2. Confirm #3616 merges on the next auto-merge tick. PR #3619 is comment-approved and all required checks are green.
-3. No action needed on `internal:169170` unless it is still un-dispatched after the host has clearly been awake for a while.
+1. Fix the no-code review-skip marking external tasks `Done` without a PR (#3623, filed today, already dispatched and in progress). This one silently deleted a real bug report.
+2. No action needed on `internal:169170` unless it is still un-dispatched after the host has clearly been awake for a while.
