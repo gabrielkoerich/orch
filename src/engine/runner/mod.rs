@@ -115,6 +115,11 @@ fn classify_run_outcome(
             "success"
         }
         Ok(_) if status == "blocked" => "blocked",
+        // Non-canonical status that clearly reads as completion — success, not
+        // "unrecognized status" (#3627).
+        Ok(_) if crate::status_heuristics::status_looks_like_descriptive_completion(status) => {
+            "success"
+        }
         Ok(_) => "failed",
     }
 }

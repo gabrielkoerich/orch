@@ -12,6 +12,7 @@ mod home;
 mod parser;
 mod repo_context;
 pub mod security;
+mod status_heuristics;
 mod store;
 mod template;
 mod tmux;

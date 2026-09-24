@@ -159,8 +159,8 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
 /// prevents opaque `"no error info available"` failures when an agent returns
 /// a valid but non-canonical status.
 ///
-/// Unknown statuses are kept as-is so that downstream code can distinguish
-/// them from canonical ones (e.g. for debugging/metrics).
+/// Unknown statuses that read as completions normalize to done via the shared
+/// heuristic in `status_heuristics`; the rest stay as-is for the audit trail.
 fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
     let normalized = resp.status.to_ascii_lowercase();
     if normalized.starts_with("pushed to ") || normalized.starts_with("pushed ") {
@@ -225,9 +225,19 @@ fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
         {
             s.to_string()
         }
-        // Unknown non-canonical status — keep as-is so the audit trail records
-        // exactly what the agent returned. This lets operators identify which
-        // statuses need to be added to the normalization map.
+        // Unknown status reading as completion, done if the response carries orch
+        // fields — domain records without them stay non-canonical and get rejected (#3336)
+        _ if !resp.summary.is_empty()
+            || !resp.accomplished.is_empty()
+            || !resp.files.is_empty()
+            || resp.error.is_some() =>
+        {
+            if crate::status_heuristics::status_looks_like_descriptive_completion(&normalized) {
+                "done".to_string()
+            } else {
+                resp.status.clone()
+            }
+        }
         _ => resp.status.clone(),
     };
     resp
@@ -1179,6 +1189,22 @@ Some output here.
         let resp = parse(input).unwrap();
         // Kept as-is (not normalized away) so build_run_audit can report it explicitly.
         assert_eq!(resp.status, "fix_deployed");
+    }
+
+    #[test]
+    fn parse_normalizes_heuristic_completion_alias_to_done() {
+        // #3627: bare "addressed" and compound "duplicate_skipped" are not in the
+        // literal alias map but clearly read as completion via the shared heuristic.
+        for status in &["addressed", "duplicate_skipped"] {
+            let input = format!(
+                r#"{{"status":"{status}","summary":"done","accomplished":[],"remaining":[],"files":[]}}"#
+            );
+            let resp = parse(&input).unwrap();
+            assert_eq!(
+                resp.status, "done",
+                "status '{status}' should normalize to done"
+            );
+        }
     }
 
     #[test]

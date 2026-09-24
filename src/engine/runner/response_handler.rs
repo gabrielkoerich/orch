@@ -198,56 +198,12 @@ fn classify_final_status(input: &DecisionInput<'_>) -> String {
         "done".to_string()
     } else if input.agent_status == "blocked" && input.is_retryable_blocked {
         "new".to_string()
-    } else if status_looks_like_descriptive_completion(input.agent_status) {
+    } else if crate::status_heuristics::status_looks_like_descriptive_completion(input.agent_status)
+    {
         "done".to_string()
     } else {
         input.agent_status.to_string()
     }
-}
-
-fn status_looks_like_descriptive_completion(status: &str) -> bool {
-    let normalized = status.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        return false;
-    }
-
-    // Keep this conservative: only infer completion when we see clear success
-    // language and no clear failure/blocked cues.
-    let has_success_cue = [
-        "complete",
-        "completed",
-        "done",
-        "finished",
-        "success",
-        "succeeded",
-        "nothing to do",
-        "nothing to trade",
-        "no changes needed",
-        "already implemented",
-    ]
-    .iter()
-    .any(|cue| normalized.contains(cue));
-
-    if !has_success_cue {
-        return false;
-    }
-
-    let has_failure_cue = [
-        "error",
-        "failed",
-        "failure",
-        "blocked",
-        "cannot",
-        "can't",
-        "unable",
-        "retry",
-        "rate limit",
-        "timed out",
-    ]
-    .iter()
-    .any(|cue| normalized.contains(cue));
-
-    !has_failure_cue
 }
 
 // ── Internal context ──────────────────────────────────────────────────────────

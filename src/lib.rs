@@ -27,6 +27,7 @@ pub mod home;
 pub mod parser;
 pub mod repo_context;
 pub mod security;
+pub mod status_heuristics;
 pub mod store;
 pub mod template;
 pub mod tmux;
