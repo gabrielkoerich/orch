@@ -1850,7 +1850,11 @@ impl TaskStore {
             agent = excluded.agent, model = excluded.model,
             command = excluded.command, prompt = excluded.prompt,
             outcome = NULL,
-            started_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            started_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+            completed_at = NULL, error = NULL, exit_code = NULL,
+            stdout = NULL, stderr = NULL, parsed_response = NULL,
+            duration_secs = NULL, input_tokens = NULL, output_tokens = NULL,
+            total_cost_usd = NULL
          RETURNING id",
         )
         .bind(run.task_id)
@@ -2725,6 +2729,58 @@ mod row_to_task_tests {
             .await
             .unwrap();
         (store, task_id, run_id)
+    }
+
+    #[tokio::test]
+    async fn start_run_upsert_clears_stale_completion_fields() {
+        let (store, task_id, run_id) = store_with_run().await;
+        store
+            .complete_run(&CompleteRun {
+                run_id,
+                exit_code: Some(0),
+                stdout: "",
+                stderr: "",
+                parsed: "",
+                outcome: "success",
+                error: "boom",
+                tokens: RunTokenUsage::default(),
+            })
+            .await
+            .unwrap();
+
+        // Re-dispatch the same (task_id, attempt, run_type) key.
+        let same_run_id = store
+            .start_run(&crate::store::StartRun {
+                task_id,
+                attempt: 1,
+                run_type: "agent",
+                agent: "claude",
+                model: "sonnet",
+                command: "claude -p ...",
+                prompt: "system prompt",
+            })
+            .await
+            .unwrap();
+        assert_eq!(run_id, same_run_id, "upsert must reuse the same row");
+
+        let row = sqlx::query(
+            "SELECT outcome, completed_at, exit_code, error FROM task_runs WHERE id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        let outcome: Option<String> = row.try_get("outcome").unwrap();
+        let completed_at: Option<String> = row.try_get("completed_at").unwrap();
+        let exit_code: Option<i64> = row.try_get("exit_code").unwrap();
+        let error: Option<String> = row.try_get("error").unwrap();
+        assert_eq!(outcome, None);
+        assert_eq!(
+            completed_at, None,
+            "stale completion timestamp must be cleared"
+        );
+        assert_eq!(exit_code, None);
+        assert_eq!(error, None);
     }
 
     // NOTE: Unlike the task table (where all required columns are TEXT and NULL
