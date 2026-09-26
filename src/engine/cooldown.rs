@@ -163,6 +163,25 @@ fn cooldown_store() -> &'static tokio::sync::Mutex<Option<Arc<crate::store::Task
 ///
 /// Must be called once at engine startup, after the `TaskStore` is opened.
 /// Loads unexpired cooldowns from KV and registers the store for future writes.
+/* Parses the `{"until": N, "reason": "..."}` cooldown KV format, falling back
+to the legacy bare-integer format (reason unknown) so existing rows keep
+working across the upgrade without a migration. */
+fn parse_cooldown_value(value: &str) -> Option<(i64, String)> {
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(value) {
+        let until = map.get("until")?.as_i64()?;
+        let reason = map
+            .get("reason")
+            .and_then(|r| r.as_str())
+            .unwrap_or("persisted")
+            .to_string();
+        return Some((until, reason));
+    }
+    value
+        .parse::<i64>()
+        .ok()
+        .map(|until| (until, "persisted".to_string()))
+}
+
 pub async fn init_cooldown_store(store: Arc<crate::store::TaskStore>) {
     match store.kv_list_prefix(KV_PREFIX).await {
         Ok(rows) => {
@@ -171,13 +190,13 @@ pub async fn init_cooldown_store(store: Arc<crate::store::TaskStore>) {
             let mut loaded = 0;
             for (key, value) in rows {
                 let cooldown_key = key.trim_start_matches(KV_PREFIX);
-                if let Ok(cooldown_until) = value.parse::<i64>() {
+                if let Some((cooldown_until, reason)) = parse_cooldown_value(&value) {
                     if now < cooldown_until {
                         map.insert(
                             cooldown_key.to_string(),
                             CooldownEntry {
                                 cooldown_until,
-                                reason: "persisted".to_string(),
+                                reason,
                             },
                         );
                         loaded += 1;
@@ -240,14 +259,14 @@ pub async fn sync_from_kv(store: &Arc<crate::store::TaskStore>) {
     };
     let now = chrono::Utc::now().timestamp();
 
-    // explicit_kv[key] = Some(ts > now) for active cooldowns, Some(None) for
-    // cleared/expired ("0" or past-timestamp) rows. Keys not present in
-    // explicit_kv mean KV has no row at all — those are left alone.
-    let mut explicit_kv: HashMap<String, Option<i64>> = HashMap::with_capacity(rows.len());
+    // Some((ts, reason)) for active cooldowns, None for cleared/expired rows.
+    // Missing key means no KV row at all, left alone below.
+    let mut explicit_kv: HashMap<String, Option<(i64, String)>> =
+        HashMap::with_capacity(rows.len());
     for (kv_key, value) in &rows {
         let cooldown_key = kv_key.trim_start_matches(KV_PREFIX);
-        if let Ok(ts) = value.parse::<i64>() {
-            let normalized = if ts > now { Some(ts) } else { None };
+        if let Some((ts, reason)) = parse_cooldown_value(value) {
+            let normalized = if ts > now { Some((ts, reason)) } else { None };
             explicit_kv.insert(cooldown_key.to_string(), normalized);
         }
     }
@@ -268,7 +287,7 @@ pub async fn sync_from_kv(store: &Arc<crate::store::TaskStore>) {
 
     // Adopt KV's authoritative timestamp for active cooldowns.
     for (key, normalized) in explicit_kv {
-        if let Some(ts) = normalized {
+        if let Some((ts, reason)) = normalized {
             match map.get_mut(&key) {
                 Some(entry) => {
                     if entry.cooldown_until != ts {
@@ -281,7 +300,7 @@ pub async fn sync_from_kv(store: &Arc<crate::store::TaskStore>) {
                         key,
                         CooldownEntry {
                             cooldown_until: ts,
-                            reason: "synced_from_kv".to_string(),
+                            reason,
                         },
                     );
                     updated += 1;
@@ -959,7 +978,7 @@ async fn set_cooldown_async(key: &str, cooldown_until: i64, reason: &str) -> boo
     let store_opt = cooldown_store().lock().await.clone();
     if let Some(store) = store_opt {
         let kv_key = format!("{KV_PREFIX}{key}");
-        let value = cooldown_until.to_string();
+        let value = serde_json::json!({"until": cooldown_until, "reason": reason}).to_string();
         if let Err(e) = store.kv_set(&kv_key, &value).await {
             tracing::warn!(
                 kv_key,
@@ -1579,10 +1598,38 @@ mod tests {
         let kv_key = format!("{KV_PREFIX}testagent_persist:testmodel_persist");
         let stored = store.kv_get(&kv_key).await.unwrap();
         assert!(stored.is_some(), "model failure should be persisted to KV");
-        let ts: i64 = stored.unwrap().parse().expect("timestamp string");
+        let (ts, reason) = parse_cooldown_value(&stored.unwrap()).expect("cooldown value");
         let now = chrono::Utc::now().timestamp();
         // Should be in the future (cooldown_until, not failed_at)
         assert!(ts > now, "persisted timestamp should be in the future");
+        assert_eq!(reason, "model_error");
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn cooldown_reason_survives_restart_via_kv() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        let agent = "test_reason_restart";
+        let future = chrono::Utc::now().timestamp() + 600;
+
+        init_cooldown_store(store.clone()).await;
+        set_cooldown_async(agent, future, "billing_cycle_exhausted").await;
+
+        // Simulate a service restart: drop the in-memory map, reload from KV.
+        {
+            let mut map = cooldown_lock();
+            map.clear();
+        }
+        init_cooldown_store(store).await;
+
+        let entries = list_all_cooldowns();
+        let entry = entries.iter().find(|(key, ..)| key == agent);
+        assert_eq!(
+            entry.map(|(_, _, reason)| reason.as_str()),
+            Some("billing_cycle_exhausted"),
+            "cooldown reason must survive a restart, not collapse to 'persisted'"
+        );
     }
 
     #[serial(cooldown_state)]
