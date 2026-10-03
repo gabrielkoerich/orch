@@ -461,6 +461,12 @@ async fn handle_pr_rebase_recovery(
                         "route_reason",
                         serde_json::json!("re-dispatch after auto-merge rebase conflict"),
                     ),
+                    (
+                        "pr_review_context",
+                        serde_json::json!(
+                            "Merging your PR failed: rebasing onto the default branch hit a content conflict. The worktree has the rebase in progress (see `git status`). Resolve the conflict markers keeping your changes, `git add` the files and run `git rebase --continue`. Do not redo the task from scratch."
+                        ),
+                    ),
                 ],
             )
             .await
