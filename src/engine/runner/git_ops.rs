@@ -584,6 +584,12 @@ pub async fn rebase_on_branch(dir: &Path, branch: &str) -> anyhow::Result<bool> 
 /// codex whose workspace-write sandbox blocks writes outside the worktree).
 /// Non-fatal: if rebase fails (conflicts), the agent may still be able to work.
 pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
+    // auto_merge leaves a conflicted rebase in place for the agent, aborting it here would undo that
+    if rebase_in_progress(dir).await {
+        tracing::info!("rebase already in progress, skipping pre-dispatch rebase");
+        return;
+    }
+
     // Fetch current branch (for retries with existing remote commits)
     // and default branch (for rebase) in one call.
     let _ = Command::new("git")
@@ -642,6 +648,23 @@ pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
         }
         Err(e) => tracing::warn!(err = %e, "rebase error"),
     }
+}
+
+async fn rebase_in_progress(dir: &Path) -> bool {
+    for name in ["rebase-merge", "rebase-apply"] {
+        let out = Command::new("git")
+            .args(["rev-parse", "--git-path", name])
+            .current_dir(dir)
+            .output_with_context()
+            .await;
+        if let Ok(o) = out {
+            let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !p.is_empty() && dir.join(p).exists() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Build git config environment variables that inject GitHub token credentials.
