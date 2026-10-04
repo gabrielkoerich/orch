@@ -32,11 +32,6 @@ jobs:
         with:
           tool: cargo-llvm-cov,cargo-nextest
 
-      - name: Install zola
-        uses: taiki-e/install-action@v2
-        with:
-          tool: zola@0.22.1
-
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
@@ -60,7 +55,11 @@ jobs:
           echo "✓ No SELECT * found in store files"
 
       - name: Check Zola docs build
-        run: zola --root docs build
+        uses: gabrielkoerich/zola-docs-action@v1
+        with:
+          path: docs
+          zola-version: "0.22.1"
+          upload: "false"
 
       - name: Check formatting
         run: cargo fmt -- --check
@@ -305,13 +304,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: taiki-e/install-action@v2
+      - uses: gabrielkoerich/zola-docs-action@v1
         with:
-          tool: zola@0.22.1
-      - run: zola --root docs build
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: docs/public
+          path: docs
+          zola-version: "0.22.1"
       - id: deployment
         uses: actions/deploy-pages@v4
 

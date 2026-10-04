@@ -200,3 +200,21 @@ hermetic-tests: review-images
         -e CARGO_BUILD_JOBS=2 \
         orch-review-run \
         'cargo nextest run --offline --no-fail-fast'
+
+# Install the zola-docs theme for the docs site, CI does the same through zola-docs-action
+docs-theme:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src="$HOME/Projects/zola-docs-action/theme"
+    if [ ! -d "$src" ]; then
+        tmp=$(mktemp -d)
+        git clone -q --depth 1 https://github.com/gabrielkoerich/zola-docs-action "$tmp"
+        src="$tmp/theme"
+    fi
+    mkdir -p docs/themes
+    [ -d docs/themes/zola-docs ] && trash docs/themes/zola-docs
+    cp -R "$src" docs/themes/zola-docs
+
+# Serve the docs site locally
+docs: docs-theme
+    zola --root docs serve --drafts
