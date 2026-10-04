@@ -510,10 +510,26 @@ pub async fn handle_error(
             // Record model+agent cooldowns so the router skips this model on retry,
             // then route through handle_failover() to get proper reroute-chain
             // tracking, exhaustion checks, and fallback pacing.
-            if let Some(model) = model_name {
-                response::record_model_failure(agent_name, model).await;
+            // Credit-shaped errors that escaped the Auth/RateLimit classifiers still
+            // need the credit cooldown and counter, not the generic 5 min backoff.
+            if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
+                match model_name {
+                    Some(model)
+                        if reason
+                            == crate::engine::cooldown::CreditExhaustionReason::BillingCycleExhausted =>
+                    {
+                        crate::engine::cooldown::record_persistent_model_failure(agent_name, model)
+                            .await;
+                    }
+                    _ => crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await,
+                }
+            } else {
+                if let Some(model) = model_name {
+                    response::record_model_failure(agent_name, model).await;
+                }
+                crate::engine::cooldown::record_agent_failure_with_message(agent_name, message)
+                    .await;
             }
-            crate::engine::cooldown::record_agent_failure_with_message(agent_name, message).await;
             (
                 response::RetryableError::Failed,
                 format!("{agent_name} failed: {message}"),

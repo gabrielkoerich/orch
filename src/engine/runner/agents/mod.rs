@@ -1284,6 +1284,7 @@ pub(crate) mod patterns {
             "billing failed",
             "billing cycle exhausted",
             "insufficient credit",
+            "insufficient balance",
             "credit balance too low",
             "payment required",
         ];
