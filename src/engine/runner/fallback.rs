@@ -219,7 +219,9 @@ pub async fn handle_error(
         "agent error, attempting recovery"
     );
 
-    // Map AgentError to RetryableError for the existing handle_failover()
+    // Map AgentError to RetryableError for handle_failover(). credit_recorded
+    // skips the generic failure_count bump for already-recorded credit errors
+    let mut credit_recorded = false;
     let (retryable, error_msg) = match agent_err {
         agents::AgentError::RateLimit { message, .. } => {
             let is_provider_returned_error = message
@@ -247,6 +249,7 @@ pub async fn handle_error(
             let mut billing_cycle_model_scoped = false;
 
             if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
+                credit_recorded = true;
                 // For billing cycle exhaustion where we know the specific model, apply
                 // model-level persistent cooldown only. The quota is scoped to that
                 // provider sub-model (e.g. github-copilot/gpt-5-mini), not the entire
@@ -322,6 +325,7 @@ pub async fn handle_error(
             let mut billing_cycle_model_scoped = false;
 
             if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
+                credit_recorded = true;
                 // Billing cycle exhaustion scoped to a known model gets model-level
                 // persistent cooldown only — agent-wide cooldown would block unrelated models.
                 if reason == crate::engine::cooldown::CreditExhaustionReason::BillingCycleExhausted
@@ -513,6 +517,7 @@ pub async fn handle_error(
             // Credit-shaped errors that escaped the Auth/RateLimit classifiers still
             // need the credit cooldown and counter, not the generic 5 min backoff.
             if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
+                credit_recorded = true;
                 match model_name {
                     Some(model)
                         if reason
@@ -745,8 +750,16 @@ pub async fn handle_error(
         }
     }
 
-    let status =
-        response::handle_failover(task_id, agent_name, retryable, &error_msg, store, repo).await;
+    let status = response::handle_failover(
+        task_id,
+        agent_name,
+        retryable,
+        &error_msg,
+        credit_recorded,
+        store,
+        repo,
+    )
+    .await;
     match status.as_str() {
         "new" => tracing::warn!(task_id, "failover exhausted (retryable), task reset to new"),
         "blocked" => tracing::warn!(task_id, "failover exhausted (hard failure), task blocked"),
@@ -1034,6 +1047,66 @@ mod tests {
         assert!(
             !crate::engine::cooldown::is_model_in_cooldown(agent, other_model),
             "other models should not be cooled by a single model's rate limit"
+        );
+    }
+
+    /**
+     * Regression test for issue #3652: a credit-exhaustion error records its
+     * own credit_failure_count cooldown, but handle_failover() used to also
+     * bump the generic failure_count:<agent> counter. After a few credit
+     * errors the next ordinary failure would start at the 24h/48h extended
+     * backoff tier instead of the 5 minute base. The generic counter must be
+     * untouched here while credit_failure_count is incremented. The agent
+     * name is deliberately not a configured agent, so handle_failover() finds
+     * it as a fallback and takes the recording path this test exercises
+     **/
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn credit_exhaustion_does_not_bump_generic_failure_count() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = std::sync::Arc::new(
+            crate::store::TaskStore::open_memory()
+                .await
+                .expect("in-memory store"),
+        );
+        crate::engine::cooldown::init_cooldown_store(store.clone()).await;
+
+        let runner = MockRunner { free: vec![] };
+        let agent = "test-agent-3652-credit-no-bump";
+
+        let err = AgentError::RateLimit {
+            message: "out of credits, please recharge your balance".to_string(),
+        };
+
+        let _result = handle_error(
+            "test-3652-a",
+            &err,
+            agent,
+            &runner,
+            None,
+            Some("simple"),
+            1,
+            &Some(store.clone()),
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        let credit_count = store
+            .kv_get(&format!("credit_failure_count:{agent}"))
+            .await
+            .unwrap();
+        assert!(
+            credit_count.is_some(),
+            "credit_failure_count should be incremented by the credit error"
+        );
+        let generic_count = store
+            .kv_get(&format!("failure_count:{agent}"))
+            .await
+            .unwrap();
+        assert!(
+            generic_count.is_none(),
+            "failure_count must not be bumped by credit errors, got {generic_count:?}"
         );
     }
 
