@@ -4,29 +4,28 @@ use super::worktree::resolve_branch_start_point;
 use crate::cmd::CommandErrorContext;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex};
 use tokio::process::Command;
 
-// Serializes template refresh and cloning, so a clone never sees a half-updated template
-static TEMPLATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// One lock per template, so a clone never sees a half-updated template and projects do not block each other
+static TEMPLATE_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn template_lock(template: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    TEMPLATE_LOCKS
+        .lock()
+        .unwrap()
+        .entry(template.to_path_buf())
+        .or_default()
+        .clone()
+}
 
 // Clone support per (template dir, worktree dir), probed once per process
 static PROBES: LazyLock<Mutex<HashMap<(PathBuf, PathBuf), bool>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-// Never cloned, virtualenvs hold absolute paths in scripts and shebangs
-const SKIP: &[&str] = &[".git", ".venv", "venv"];
-
-// Lockfile and its install command, the first lockfile found wins
-const INSTALLERS: &[(&str, &[&str])] = &[
-    ("bun.lock", &["bun", "install", "--frozen-lockfile"]),
-    ("bun.lockb", &["bun", "install", "--frozen-lockfile"]),
-    ("yarn.lock", &["yarn", "install", "--frozen-lockfile"]),
-    ("package-lock.json", &["npm", "ci"]),
-];
-
-const INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
+// Never cloned, the worktree gets its own gitdir
+const SKIP: &[&str] = &[".git"];
 
 fn clone_flags() -> &'static [&'static str] {
     if cfg!(target_os = "macos") {
@@ -87,43 +86,6 @@ async fn volume_can_clone(src_dir: &Path, dst_dir: &Path) -> bool {
     ok
 }
 
-// Install dependencies in the template when the lockfile changed since the last install
-async fn sync_deps(template: &Path) {
-    let Some((lock, cmd)) = INSTALLERS
-        .iter()
-        .find(|(lock, _)| template.join(lock).is_file())
-    else {
-        return;
-    };
-    let Ok(bytes) = tokio::fs::read(template.join(lock)).await else {
-        return;
-    };
-    // ponytail: DefaultHasher is not stable across Rust releases, worst case is one extra install
-    let hash = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        bytes.hash(&mut h);
-        format!("{lock}:{:x}", h.finish())
-    };
-    let marker = PathBuf::from(format!("{}.deps", template.display()));
-    if tokio::fs::read_to_string(&marker).await.ok().as_deref() == Some(hash.as_str()) {
-        return;
-    }
-    let mut install = Command::new(cmd[0]);
-    install.args(&cmd[1..]).current_dir(template);
-    let run = install.output();
-    match tokio::time::timeout(INSTALL_TIMEOUT, run).await {
-        Ok(Ok(o)) if o.status.success() => {
-            let _ = tokio::fs::write(&marker, hash).await;
-        }
-        other => tracing::warn!(
-            template = %template.display(),
-            result = ?other.map(|r| r.map(|o| o.status)),
-            "template dependency install failed, clones will lack dependencies"
-        ),
-    }
-}
-
 // Create the template checkout, or move it to the current default branch tip
 async fn refresh_template(
     main_dir: &Path,
@@ -137,7 +99,6 @@ async fn refresh_template(
             .await
             .is_ok()
     {
-        sync_deps(template).await;
         return Ok(());
     }
     let _ = tokio::fs::remove_dir_all(template).await;
@@ -153,7 +114,6 @@ async fn refresh_template(
         ],
     )
     .await?;
-    sync_deps(template).await;
     Ok(())
 }
 
@@ -219,8 +179,9 @@ pub async fn create_worktree(
         anyhow::bail!("volume cannot clone files");
     }
 
-    let _guard = TEMPLATE_LOCK.lock().await;
     let template = templates.join(project);
+    let lock = template_lock(&template);
+    let _guard = lock.lock().await;
     refresh_template(main_dir, &template, default_branch).await?;
     if template.join(".gitmodules").exists() {
         // A cloned submodule `.git` file would point into the template's gitdir
@@ -285,6 +246,9 @@ mod tests {
 
         // Volumes without clone support (ext4, HFS+) take the else branch
         let supported = volume_can_clone(&templates, wt_dir.parent().unwrap()).await;
+        if cfg!(target_os = "macos") && std::env::var("CI").is_ok() {
+            assert!(supported, "macOS CI runner must support clonefile");
+        }
         let res = create_worktree(project.path(), "p", &wt_dir, "task-1", "main").await;
         if supported {
             res.expect("clone path should succeed");

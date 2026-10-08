@@ -240,6 +240,22 @@ jobs:
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
           echo "Version: $NEW_VERSION (${BUMP} bump)"
 
+  # Runs the copy-on-write worktree tests where clonefile works. The test fails if the probe finds no clone support.
+  test-cow-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.94.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-cow-macos"
+
+      - name: Run cow tests
+        run: cargo test --lib engine::runner::cow
+
   # Cross-compile build jobs for macOS targets.
   # Skip when check-release says skip=true (chore/docs commits).
   build-macos:
