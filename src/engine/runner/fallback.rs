@@ -370,15 +370,13 @@ pub async fn handle_error(
             format!("missing tool: {tool}"),
         ),
         agents::AgentError::ModelUnavailable { model, message } => {
-            // "Model not found" and "not supported" indicate the model cannot be used
-            // for the current account or provider surface. Treat these as persistent
-            // model failures: apply the persistent-model backoff (4h base → 7d max)
-            // so the router avoids re-selecting the same model for a while without
-            // immediately jumping to the permanent 7-day cap. This reduces wasted
-            // dispatches while still allowing recovery if the model becomes available.
+            // "Not found", "not supported" and region blocks never lift on their own, so they
+            // get the persistent model backoff (4h base → 7d max), not the transient 5min one
             let lower = message.to_lowercase();
-            let is_permanently_gone =
-                lower.contains("not found") || lower.contains("not supported");
+            let is_permanently_gone = lower.contains("not found")
+                || lower.contains("not supported")
+                || lower.contains("not available in your country")
+                || lower.contains("not available in your region");
             if is_permanently_gone {
                 // Persistent model failure backoff (starts at 4h, escalates to 7d)
                 crate::engine::cooldown::record_persistent_model_failure(agent_name, model).await;
@@ -1788,6 +1786,53 @@ more logs"#;
             "expected ~4h (persistent) cooldown for 'not supported', got {remaining}s — \
              may have applied transient 5min cooldown instead (issue #3215)"
         );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn model_not_available_in_country_applies_persistent_cooldown() {
+        crate::engine::cooldown::reset_global_state().await;
+        let runner = MockRunner { free: vec![] };
+        let agent = "opencode-3650-country";
+        let model = "some-region-locked-model";
+        let key = format!("{agent}:{model}");
+
+        // issue #3650: region/country blocks need the persistent backoff, not the 5min one
+        for message in [
+            "This model is not available in your country.",
+            "This model is not available in your region.",
+        ] {
+            crate::engine::cooldown::reset_global_state().await;
+            let err = AgentError::ModelUnavailable {
+                model: model.to_string(),
+                message: message.to_string(),
+            };
+
+            let _result = handle_error(
+                "test-3650",
+                &err,
+                agent,
+                &runner,
+                Some(model),
+                Some("medium"),
+                1,
+                &None,
+                "owner/repo",
+            )
+            .await
+            .unwrap();
+
+            let now = chrono::Utc::now().timestamp();
+            let until = crate::engine::cooldown::cooldown_until(&key)
+                .expect("region block should set model cooldown");
+            let remaining = until.saturating_sub(now);
+
+            assert!(
+                remaining >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
+                "expected ~4h (persistent) cooldown for '{message}', got {remaining}s — \
+                 may have applied transient 5min cooldown instead (issue #3650)"
+            );
+        }
     }
 
     /// ThinkingBlockConflict must NOT set any agent or model cooldown.
