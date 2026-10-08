@@ -658,7 +658,7 @@ pub async fn record_rate_limit(agent_name: &str, model: Option<&str>, error_mess
     if let Some(window_secs) = parse_relative_usage_window(error_message) {
         if let Some(m) = model {
             let cooldown_until = chrono::Utc::now().timestamp() + window_secs as i64;
-            set_model_cooldown(agent_name, m, window_secs).await;
+            set_model_cooldown(agent_name, m, window_secs, "rate_limit_usage_window").await;
             tracing::info!(
                 agent = agent_name,
                 model = m,
@@ -706,14 +706,16 @@ pub async fn record_persistent_model_failure(agent_name: &str, model: &str) {
     set_cooldown_async(&key, cooldown_until, "persistent_model_error").await;
 }
 
-/// Set a model cooldown with a custom duration (in seconds).
+/// Set a model cooldown with a custom duration (in seconds) and reason.
 ///
-/// Used by silence detection to cooldown the specific model that failed to
-/// produce any output, with a configurable duration.
-pub async fn set_model_cooldown(agent_name: &str, model: &str, duration_secs: u64) {
+/// Generic model-cooldown setter shared by silence detection and the
+/// rate-limit relative-usage-window path. The reason is persisted with
+/// the cooldown (KV + in-memory entry) so operators can tell the two
+/// apart in `orch cooldown list`.
+pub async fn set_model_cooldown(agent_name: &str, model: &str, duration_secs: u64, reason: &str) {
     let key = format!("{agent_name}:{model}");
     let cooldown_until = chrono::Utc::now().timestamp() + duration_secs as i64;
-    set_cooldown_async(&key, cooldown_until, "silence_detected").await;
+    set_cooldown_async(&key, cooldown_until, reason).await;
 }
 
 /// Set a short agent-level cooldown (in seconds).
@@ -776,7 +778,13 @@ pub async fn record_silence_detection(agent_name: &str, model: &str) -> Option<S
     let count = timestamps.len();
     let mut extended_cooldown_applied = false;
     if count >= SILENCE_COUNT_THRESHOLD {
-        set_model_cooldown(agent_name, model, SILENCE_EXTENDED_COOLDOWN_SECS).await;
+        set_model_cooldown(
+            agent_name,
+            model,
+            SILENCE_EXTENDED_COOLDOWN_SECS,
+            "silence_detected",
+        )
+        .await;
         extended_cooldown_applied = true;
         timestamps.clear();
     }
@@ -1944,6 +1952,11 @@ mod tests {
         assert!(
             remaining >= 5 * 3600 - 5,
             "model cooldown should be at least ~5 hours, got {remaining}s"
+        );
+        assert_eq!(
+            cooldown_reason(&key).as_deref(),
+            Some("rate_limit_usage_window"),
+            "relative usage-window cooldown must be labeled as a rate limit, not silence"
         );
     }
 
