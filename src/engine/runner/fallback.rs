@@ -1213,6 +1213,56 @@ mod tests {
 
     #[serial(cooldown_state)]
     #[tokio::test]
+    async fn agent_failed_insufficient_balance_sets_credit_cooldown() {
+        crate::engine::cooldown::reset_global_state().await;
+        let runner = MockRunner { free: vec![] };
+        let agent = "test-agent-3642-insufficient-balance";
+
+        // Confirm no cooldown before the error.
+        assert!(
+            !crate::engine::cooldown::is_agent_in_cooldown(agent),
+            "agent should not be in cooldown before handle_error"
+        );
+
+        let err = agents::AgentError::AgentFailed {
+            message: "402 Payment Required: insufficient balance".to_string(),
+        };
+
+        // Run handle_error — no store so handle_failover will find no agents and return Continue.
+        let _result = handle_error(
+            "test-3642-a",
+            &err,
+            agent,
+            &runner,
+            Some("sonnet"),
+            Some("medium"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        // The credit exhaustion path (from #3642) should set a cooldown of at least
+        // CREDIT_BACKOFF_BASE_SECS (1h), not the generic 5-min backoff.
+        // Without #3642, the AgentFailed arm would have gone to the else branch
+        // and called record_agent_failure_with_message, setting a 5-min cooldown.
+        assert!(
+            crate::engine::cooldown::is_agent_in_cooldown(agent),
+            "agent should be in cooldown after handle_error for AgentFailed with insufficient balance"
+        );
+
+        let until = crate::engine::cooldown::cooldown_until(agent)
+            .expect("agent cooldown should be active");
+        let remaining = until - chrono::Utc::now().timestamp();
+        assert!(
+            remaining >= crate::engine::cooldown::CREDIT_BACKOFF_BASE_SECS - 30,
+            "credit cooldown should be at least the 1h base, got {remaining}s"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
     async fn silent_exit0_retries_free_model_for_simple_complexity() {
         crate::engine::cooldown::reset_global_state().await;
         let runner = MockRunner {
