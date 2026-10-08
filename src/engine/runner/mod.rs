@@ -18,6 +18,7 @@
 pub mod agent;
 pub mod agents;
 pub mod context;
+pub mod cow;
 pub mod diff;
 pub mod direct;
 pub mod fallback;

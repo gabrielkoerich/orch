@@ -300,7 +300,11 @@ pub async fn resolve_main_repo(project_dir: &Path) -> PathBuf {
 ///    the default branch so unpushed local commits in the operator's main
 ///    checkout don't leak into the worktree.
 /// 3. `default_branch` as a last resort (no origin remote / never fetched).
-async fn resolve_branch_start_point(repo_root: &str, branch: &str, default_branch: &str) -> String {
+pub(super) async fn resolve_branch_start_point(
+    repo_root: &str,
+    branch: &str,
+    default_branch: &str,
+) -> String {
     let verify = |reference: String| async move {
         Command::new("git")
             .args(["-C", repo_root, "rev-parse", "--verify", &reference])
@@ -599,57 +603,27 @@ pub async fn setup_worktree(
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let output = Command::new("git")
-            .args([
-                "-C",
-                &main_dir.to_string_lossy(),
-                "worktree",
-                "add",
-                &worktree_dir.to_string_lossy(),
-                &branch_name_str,
-            ])
-            .output_with_context()
-            .await?;
+        let cloned = match super::cow::create_worktree(
+            &main_dir,
+            &project_name(&main_dir),
+            &worktree_dir,
+            &branch_name_str,
+            &default_branch,
+        )
+        .await
+        {
+            Ok(()) => {
+                tracing::info!(task_id, "worktree cloned from project template");
+                true
+            }
+            Err(e) => {
+                tracing::debug!(task_id, error = %e, "copy-on-write worktree unavailable, using git worktree add");
+                false
+            }
+        };
 
-        if !output.status.success() && tokio::fs::metadata(&worktree_dir).await.is_err() {
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            // Retry: prune and recreate
-            tracing::warn!(
-                task_id,
-                stdout = %stdout,
-                stderr = %stderr,
-                "worktree creation failed, retrying after prune"
-            );
-
-            let _ = Command::new("git")
-                .args(["-C", &main_dir.to_string_lossy(), "worktree", "prune"])
-                .output_with_context()
-                .await;
-
-            let _ = Command::new("git")
-                .args([
-                    "-C",
-                    &main_dir.to_string_lossy(),
-                    "branch",
-                    "-D",
-                    &branch_name_str,
-                ])
-                .output_with_context()
-                .await;
-
-            let _ = Command::new("git")
-                .args([
-                    "-C",
-                    &main_dir.to_string_lossy(),
-                    "branch",
-                    &branch_name_str,
-                    &start_point,
-                ])
-                .output_with_context()
-                .await;
-
-            let retry_output = Command::new("git")
+        if !cloned {
+            let output = Command::new("git")
                 .args([
                     "-C",
                     &main_dir.to_string_lossy(),
@@ -659,34 +633,84 @@ pub async fn setup_worktree(
                     &branch_name_str,
                 ])
                 .output_with_context()
-                .await;
+                .await?;
 
-            let mut retry_stdout = String::new();
-            let mut retry_stderr = String::new();
-            let mut retry_error = String::new();
-            match retry_output {
-                Ok(output) => {
-                    retry_stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    retry_stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                    tracing::warn!(
-                        task_id,
-                        stdout = %retry_stdout,
-                        stderr = %retry_stderr,
-                        "worktree creation retry failed"
-                    );
-                }
-                Err(err) => {
-                    retry_error = err.to_string();
-                    tracing::warn!(
-                        task_id,
-                        error = %retry_error,
-                        "worktree creation retry failed to run"
-                    );
-                }
-            }
+            if !output.status.success() && tokio::fs::metadata(&worktree_dir).await.is_err() {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                // Retry: prune and recreate
+                tracing::warn!(
+                    task_id,
+                    stdout = %stdout,
+                    stderr = %stderr,
+                    "worktree creation failed, retrying after prune"
+                );
 
-            if tokio::fs::metadata(&worktree_dir).await.is_err() {
-                anyhow::bail!(
+                let _ = Command::new("git")
+                    .args(["-C", &main_dir.to_string_lossy(), "worktree", "prune"])
+                    .output_with_context()
+                    .await;
+
+                let _ = Command::new("git")
+                    .args([
+                        "-C",
+                        &main_dir.to_string_lossy(),
+                        "branch",
+                        "-D",
+                        &branch_name_str,
+                    ])
+                    .output_with_context()
+                    .await;
+
+                let _ = Command::new("git")
+                    .args([
+                        "-C",
+                        &main_dir.to_string_lossy(),
+                        "branch",
+                        &branch_name_str,
+                        &start_point,
+                    ])
+                    .output_with_context()
+                    .await;
+
+                let retry_output = Command::new("git")
+                    .args([
+                        "-C",
+                        &main_dir.to_string_lossy(),
+                        "worktree",
+                        "add",
+                        &worktree_dir.to_string_lossy(),
+                        &branch_name_str,
+                    ])
+                    .output_with_context()
+                    .await;
+
+                let mut retry_stdout = String::new();
+                let mut retry_stderr = String::new();
+                let mut retry_error = String::new();
+                match retry_output {
+                    Ok(output) => {
+                        retry_stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        retry_stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                        tracing::warn!(
+                            task_id,
+                            stdout = %retry_stdout,
+                            stderr = %retry_stderr,
+                            "worktree creation retry failed"
+                        );
+                    }
+                    Err(err) => {
+                        retry_error = err.to_string();
+                        tracing::warn!(
+                            task_id,
+                            error = %retry_error,
+                            "worktree creation retry failed to run"
+                        );
+                    }
+                }
+
+                if tokio::fs::metadata(&worktree_dir).await.is_err() {
+                    anyhow::bail!(
                     "failed to create worktree at {} for task {} (stdout: {}, stderr: {}, retry stdout: {}, retry stderr: {}, retry error: {})",
                     worktree_dir.display(),
                     task_id,
@@ -696,6 +720,7 @@ pub async fn setup_worktree(
                     retry_stderr,
                     retry_error
                 );
+                }
             }
         }
     }
