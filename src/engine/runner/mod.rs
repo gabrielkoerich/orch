@@ -152,12 +152,11 @@ fn classify_run_error_type(last_error: &str) -> &'static str {
         "max_attempts"
     } else {
         let lower = last_error.to_ascii_lowercase();
-        if lower.contains("cargo build failed")
-            || lower.contains("cargo test")
-            || lower.contains("cargo clippy")
-            || lower.contains("clippy")
+        if lower.contains("build failed")
+            || lower.contains("tests failed")
+            || lower.contains("test failed")
             || lower.contains("test suite failed")
-            || lower.contains("nextest")
+            || lower.contains("lint failed")
         {
             "ci_failure"
         } else {
@@ -1883,11 +1882,10 @@ mod tests {
             ("invalid response from agent", "parse_error"),
             ("parse error: missing json", "parse_error"),
             ("exceeded max attempts while rerouting", "max_attempts"),
-            ("cargo test failed", "ci_failure"),
-            ("cargo build failed: error[E0308]", "ci_failure"),
-            ("cargo clippy -- -D warnings failed", "ci_failure"),
-            ("clippy failed on warning", "ci_failure"),
-            ("nextest run exited 1", "ci_failure"),
+            ("unit test failed", "ci_failure"),
+            ("build failed: type mismatch", "ci_failure"),
+            ("lint failed on warning", "ci_failure"),
+            ("3 tests failed", "ci_failure"),
             ("test suite failed: 3 tests failed", "ci_failure"),
         ];
 
