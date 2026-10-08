@@ -6670,11 +6670,7 @@ async fn control_search_messages_since_filters_old() {
     assert!(recent_bean[0].content.contains("recent"));
 }
 
-/// Verify that migrations run cleanly on a fresh database.
-///
-/// This catches the most common agent mistake: modifying an existing migration
-/// file instead of creating a new one. SQLx checksums are immutable — if a
-/// migration file changes after it was applied, this test fails.
+/// The full migration set must apply cleanly on an empty database.
 #[tokio::test]
 async fn migrations_run_on_fresh_db() {
     let result = TaskStore::open_memory().await;
@@ -6710,6 +6706,57 @@ async fn migrations_are_idempotent() {
     let _ = std::fs::remove_file(&tmp);
     let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
     let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+}
+
+/**
+ * Guard against editing an already-applied migration. `migrations/` files are immutable once
+ * merged: SQLx stores a checksum per applied migration and refuses to start on a mismatch. Tests
+ * that open a fresh DB cannot catch an edit, so checksums are committed in
+ * `migrations/checksums.txt` and recomputed here. A mismatch means a file was edited; a missing
+ * entry means a new migration was added without appending its line
+ **/
+#[tokio::test]
+async fn migrations_match_committed_checksums() {
+    use sha2::Digest;
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let committed = std::fs::read_to_string(dir.join("checksums.txt"))
+        .expect("migrations/checksums.txt must exist");
+    let mut expected: std::collections::HashMap<String, String> = committed
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let (sum, name) = l.split_once("  ").expect("checksum line: <sha256>  <file>");
+            (name.trim().to_string(), sum.to_string())
+        })
+        .collect();
+
+    let mut actual_count = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+            continue;
+        }
+        actual_count += 1;
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let sum = format!("{:x}", sha2::Sha256::digest(std::fs::read(&path).unwrap()));
+        let committed_sum = expected.remove(&name).unwrap_or_else(|| {
+            panic!(
+                "{name} has no entry in checksums.txt, append its checksum when adding a migration"
+            )
+        });
+        assert_eq!(
+            sum, committed_sum,
+            "{name} was modified after its checksum was committed, add a new migration instead"
+        );
+    }
+
+    assert_eq!(
+        expected.len(),
+        0,
+        "checksums.txt lists files that no longer exist: {expected:?}"
+    );
+    assert!(actual_count > 0, "no migration files found");
 }
 
 // ── Recent rate limit counts (health check query) ───────────────
