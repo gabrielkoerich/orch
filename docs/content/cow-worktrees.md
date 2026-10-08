@@ -14,7 +14,7 @@ Implementation: `src/engine/runner/cow.rs`, called from `setup_worktree()`.
 
 1. Probe once per process whether the template dir and the worktrees dir can clone files. If not, use `git worktree add`.
 2. Under a per-template lock, move the template to `origin/<default>` (`git checkout --detach --force`). Create it with `git worktree add --detach` if missing or broken.
-3. Warm the template. Clone each gitignored top-level directory of the operator's checkout (`git ls-files --others --ignored --exclude-standard --directory`) into a staging dir beside the template, then swap it in place of the template's copy. Loose ignored files such as `.env` are not copied. Bare clones have no checkout and skip this step.
+3. Warm the template. Clone each gitignored directory of the operator's checkout, at any depth (`git ls-files --others --ignored --exclude-standard --directory`), into a staging dir beside the template, then swap it into the same relative path in the template. A path with a hidden component (a name starting with `.`) is skipped. Loose ignored files such as `.env` are not copied. Bare clones have no checkout and skip this step.
 4. `git worktree add --no-checkout <dir> <branch>` creates the gitdir entry and the `.git` file.
 5. Clone every top-level template entry except `.git` into `<dir>`. macOS runs `cp -cRp` (`clonefile`). Linux runs `cp -a --reflink=always` (`FICLONE`).
 6. Copy the template index into the new gitdir, run `git update-index --refresh`, then `git reset --hard`. Only files where the task branch differs from the template commit are rewritten.
@@ -35,6 +35,7 @@ Any failure removes the half-built worktree and falls back to `git worktree add`
 | Probe by cloning a small file | Parsing filesystem names misses mount options like XFS without reflink |
 | One lock per template | A global lock lets one slow install stall every project |
 | Template holds the checkout's ignored directories | Orch runs no install or build. It reuses what the project's own tooling already produced, so `cow.rs` names no language or tool |
+| Skip any path with a hidden component | Hidden ignored directories hold local tool and agent config, and a settings file there could change a task agent's permissions. The rule names no tool |
 | Directories only, no loose ignored files | Keeps `.env` and similar files out of agent worktrees without naming any file |
 | Warm from the checkout, fall back to merged tasks | Output from failed tasks can be broken |
 | One clone per task, per-worktree build dirs | A shared build dir (e.g. `CARGO_TARGET_DIR`) names a tool, serialises builds on its lock and lets branches overwrite each other |
@@ -42,6 +43,7 @@ Any failure removes the half-built worktree and falls back to `git worktree add`
 ## Costs
 
 - Clones share source files, dependencies and build output. Blocks stay shared until the agent's build rewrites them.
+- Hidden dependency directories such as virtualenvs are not shared. They do not survive a move anyway.
 - Every task creation re-clones the checkout's ignored directories (copy-on-write, so no disk, but time grows with file count).
 - The operator may be building while orch clones, so the template can hold partial output. The agent's tooling must detect that and rebuild. Orch does not check.
 - Output that embeds absolute paths (virtualenvs, some build caches) points at the checkout or template path. Whether it recovers depends on the tool, and orch does not special-case any. The agent reinstalls if needed.
@@ -65,7 +67,7 @@ Apple Silicon, APFS, `cp` of a 1.9 GB directory (the `target/` of this repo):
 
 `git update-index --refresh` on 518 tracked files took under 10 ms. The cost grows with tracked file count, since every cloned file has a new inode and gets re-hashed.
 
-Not measured yet: free-space drop (`df`) for N worktrees before and after a first build, plain vs warmed. Whether a first `cargo build` in a warmed clone recompiles only changed crates (mtimes are kept by `cp -p`/`-a`, and `git reset --hard` only rewrites files that differ, but the package path differs from the template path). End to end task setup on a large JS repo and a large Rust repo. Linux timings.
+Not measured yet (still open in #3682): the warm-up skip when the source did not change, and the free-space drop (`df`) for N worktrees before and after a first build, plain vs warmed. Whether a first `cargo build` in a warmed clone recompiles only changed crates (mtimes are kept by `cp -p`/`-a`, and `git reset --hard` only rewrites files that differ, but the package path differs from the template path). End to end task setup on a large JS repo and a large Rust repo. Linux timings.
 
 CI coverage: `test-cow-macos` (APFS) and `test-cow-linux` (XFS with `reflink=1` on a loop volume, `TMPDIR` on the mount) run the clone path. Both set `ORCH_COW_EXPECT_CLONE=1`, so the tests fail if the probe finds no clone support. They also check that ignored directories from the checkout reach the template and the clone, that a merged task's ignored directories reach the template of a bare clone, and that `.git` and loose ignored files are never copied. Plain unit tests on ext4 take the fallback branch.
 
