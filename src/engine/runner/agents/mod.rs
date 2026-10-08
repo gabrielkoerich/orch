@@ -2106,6 +2106,38 @@ mod tests {
     }
 
     #[test]
+    fn pattern_detect_auth_insufficient_balance() {
+        // Regression test for issue #3642: "insufficient balance" (and by extension
+        // "402 Payment Required: insufficient balance") must be detected as an auth
+        // error so it routes through the credit exhaustion path, not the generic 5-min
+        // backoff. This ensures the #3642 cooldown behavior is properly triggered.
+        assert!(
+            patterns::detect_auth_error("402 Payment Required: insufficient balance").is_some(),
+            "insufficient balance must be detected as auth error"
+        );
+        assert!(
+            patterns::detect_auth_error("insufficient balance").is_some(),
+            "bare insufficient balance must be detected as auth error"
+        );
+        // The stored message should contain the matched pattern.
+        let err = patterns::detect_auth_error("402 Payment Required: insufficient balance")
+            .expect("should detect auth error");
+        let AgentError::Auth { message } = err else {
+            panic!("expected Auth, got {err:?}");
+        };
+        assert!(
+            message.to_lowercase().contains("insufficient balance"),
+            "stored message should contain the matched pattern, got: {message}"
+        );
+        // The message should be the line containing the auth error, not the tail.
+        assert!(
+            message.lines().count() <= 2,
+            "message should be the auth line, not the full tail: {}",
+            message.len()
+        );
+    }
+
+    #[test]
     fn auth_error_message_contains_match_not_tail() {
         // Simulate real agent output: auth error appears early, NDJSON session
         // metadata at the end. Stored message must be the error line, not the
