@@ -117,7 +117,8 @@ async fn refresh_template(
     Ok(())
 }
 
-// Gitignored top-level directories of a checkout, which hold whatever its tooling produced
+// Gitignored directories of a checkout at any depth, which hold whatever its tooling produced.
+// A path with a hidden component is local tool or agent config, so it is never shared
 async fn ignored_dirs(src: &Path) -> anyhow::Result<Vec<String>> {
     let out = git(
         src,
@@ -133,7 +134,7 @@ async fn ignored_dirs(src: &Path) -> anyhow::Result<Vec<String>> {
     Ok(out
         .lines()
         .filter_map(|l| l.strip_suffix('/'))
-        .filter(|n| !n.is_empty() && !n.contains('/') && !SKIP.contains(n))
+        .filter(|n| !n.is_empty() && !n.split('/').any(|c| c.starts_with('.')))
         .map(String::from)
         .collect())
 }
@@ -158,7 +159,11 @@ async fn warm_template(src: &Path, template: &Path) -> anyhow::Result<()> {
             clone_path(&src.join(&dir), &staging).await?;
             let dst = template.join(&dir);
             let _ = tokio::fs::remove_dir_all(&dst).await;
-            tokio::fs::rename(staging.join(&dir), dst).await?;
+            if let Some(parent) = dst.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            let base = Path::new(&dir).file_name().unwrap_or_default();
+            tokio::fs::rename(staging.join(base), dst).await?;
             anyhow::Ok(())
         }
         .await;
@@ -419,13 +424,24 @@ mod tests {
     #[serial_test::serial(orch_home)]
     async fn checkout_ignored_dirs_reach_template_and_clone() {
         let (_remote, project, home) = repo_with_origin();
-        std::fs::write(project.path().join(".gitignore"), "out/\n.env\n").unwrap();
+        std::fs::write(
+            project.path().join(".gitignore"),
+            "out/\n.env\n.local/\nnode/\n",
+        )
+        .unwrap();
         sh(project.path(), &["add", "."]);
         sh(project.path(), &["commit", "-m", "ignore"]);
         sh(project.path(), &["push", "origin", "HEAD:main"]);
         sh(project.path(), &["fetch", "origin"]);
         std::fs::create_dir_all(project.path().join("out/sub")).unwrap();
         std::fs::write(project.path().join("out/sub/dep.bin"), "dep\n").unwrap();
+        std::fs::create_dir_all(project.path().join(".local")).unwrap();
+        std::fs::write(project.path().join(".local/settings"), "x\n").unwrap();
+        std::fs::create_dir_all(project.path().join("pkg/a/node")).unwrap();
+        std::fs::write(project.path().join("pkg/a/node/dep.bin"), "nested\n").unwrap();
+        std::fs::create_dir_all(project.path().join("pkg/a/.hidden/node")).unwrap();
+        std::fs::write(project.path().join("pkg/a/.hidden/node/x"), "x\n").unwrap();
+        std::fs::write(project.path().join("pkg/a/keep.txt"), "k\n").unwrap();
         std::fs::write(project.path().join(".env"), "secret\n").unwrap();
 
         std::env::set_var("ORCH_HOME", home.path());
@@ -453,6 +469,15 @@ mod tests {
                     "dep\n"
                 );
                 assert!(!root.join(".env").exists(), "loose ignored file was copied");
+                assert!(!root.join(".local").exists(), "hidden dir was copied");
+                assert!(
+                    !root.join("pkg/a/.hidden").exists(),
+                    "nested hidden dir was copied"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(root.join("pkg/a/node/dep.bin")).unwrap(),
+                    "nested\n"
+                );
             }
             // The worktree keeps its own gitdir
             assert!(wt_dir.join(".git").is_file());

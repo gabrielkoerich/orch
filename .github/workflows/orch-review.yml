@@ -28,15 +28,13 @@ jobs:
             docs:
               - 'docs/**'
 
-      - name: Install zola
-        if: steps.changes.outputs.docs == 'true'
-        uses: taiki-e/install-action@v2
-        with:
-          tool: zola@0.22.1
-
       - name: Build docs
         if: steps.changes.outputs.docs == 'true'
-        run: zola --root docs build
+        uses: gabrielkoerich/zola-docs-action@v1
+        with:
+          path: docs
+          zola-version: "0.22.1"
+          upload: "false"
 
       - name: Skip docs build when no docs changed
         if: steps.changes.outputs.docs != 'true'
