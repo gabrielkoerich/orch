@@ -67,7 +67,21 @@ Apple Silicon, APFS, `cp` of a 1.9 GB directory (the `target/` of this repo):
 
 `git update-index --refresh` on 518 tracked files took under 10 ms. The cost grows with tracked file count, since every cloned file has a new inode and gets re-hashed.
 
-Not measured yet (still open in #3682): the warm-up skip when the source did not change, and the free-space drop (`df`) for N worktrees before and after a first build, plain vs warmed. Whether a first `cargo build` in a warmed clone recompiles only changed crates (mtimes are kept by `cp -p`/`-a`, and `git reset --hard` only rewrites files that differ, but the package path differs from the template path). End to end task setup on a large JS repo and a large Rust repo. Linux timings.
+### Plain vs warmed worktree (this repo, Rust, APFS)
+
+Method: template = linked worktree at `origin/main` plus clones of the checkout's non-hidden ignored top-level directories. Per task, the steps of `cow.rs`: `git worktree add --no-checkout`, `cp -cRp` of every template entry except `.git`, copy the template index, `update-index --refresh`, `reset --hard`. Plain = `git worktree add`. Disk is the bytes in files written after the clone (`find target -newer <marker>`). Cloned files keep their mtime and the build tool writes new files, so this is the space the task adds. `df` was too noisy on APFS (snapshots, purgeable space, other writers) and was dropped.
+
+| | Plain worktree | Warmed clone |
+|---|---|---|
+| Create | under 1 s, 8 MB | 5 to 6 s, 3 to 50 MB |
+| `cargo build` | 245 crates, 73 s, `target/` 2.4 GB | 1 crate (the workspace crate), 55 to 72 s |
+| `cargo clippy --all-targets` + `cargo test --no-run` | 481 units, 164 s, 4.5 GB written | 227 units, 100 s, 3.5 GB written (11.5 GB shared with the template) |
+
+The template itself cost about 20 MB. The checkout's `target/` (6.8 GB) is mostly old artifacts. A fresh build needs 2.4 to 4 GB.
+
+Conclusion: for this project warming cuts build time by about 40% and saves about 1 GB per task. Most bytes a task writes are the workspace crate's own artifacts (binaries, test binaries, incremental cache), which every task rebuilds. Projects where dependencies outweigh the workspace code gain more. Create takes 5 to 6 s, so no warm-up skip is added. Add one only if a larger project measures a warm-up that dominates task start.
+
+Not measured: end to end setup on a large JS repo and Linux timings.
 
 CI coverage: `test-cow-macos` (APFS) and `test-cow-linux` (XFS with `reflink=1` on a loop volume, `TMPDIR` on the mount) run the clone path. Both set `ORCH_COW_EXPECT_CLONE=1`, so the tests fail if the probe finds no clone support. They also check that ignored directories from the checkout reach the template and the clone, that a merged task's ignored directories reach the template of a bare clone, and that `.git` and loose ignored files are never copied. Plain unit tests on ext4 take the fallback branch.
 
