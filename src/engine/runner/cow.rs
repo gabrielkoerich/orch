@@ -5,7 +5,6 @@ use crate::cmd::CommandErrorContext;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
 use tokio::process::Command;
 
 // One lock per template, so a clone never sees a half-updated template and projects do not block each other
@@ -25,25 +24,8 @@ fn template_lock(template: &Path) -> Arc<tokio::sync::Mutex<()>> {
 static PROBES: LazyLock<Mutex<HashMap<(PathBuf, PathBuf), bool>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-// Never cloned, virtualenvs hold absolute paths in scripts and shebangs
-const SKIP: &[&str] = &[".git", ".venv", "venv"];
-
-// JS lockfile and its install command, the first lockfile found wins
-const JS_INSTALLERS: &[(&str, &[&str])] = &[
-    ("bun.lock", &["bun", "install", "--frozen-lockfile"]),
-    ("bun.lockb", &["bun", "install", "--frozen-lockfile"]),
-    ("pnpm-lock.yaml", &["pnpm", "install", "--frozen-lockfile"]),
-    ("yarn.lock", &["yarn", "install", "--frozen-lockfile"]),
-    ("package-lock.json", &["npm", "ci"]),
-];
-
-// Runs next to the JS installer, warms `target/` so clones reuse dependency artifacts
-const CARGO_WARMUP: (&str, &[&str]) = (
-    "Cargo.lock",
-    &["cargo", "build", "--locked", "--all-targets"],
-);
-
-const INSTALL_TIMEOUT: Duration = Duration::from_secs(1800);
+// Never cloned, the worktree gets its own gitdir
+const SKIP: &[&str] = &[".git"];
 
 fn clone_flags() -> &'static [&'static str] {
     if cfg!(target_os = "macos") {
@@ -104,53 +86,6 @@ async fn volume_can_clone(src_dir: &Path, dst_dir: &Path) -> bool {
     ok
 }
 
-// Run the install for one lockfile unless its hash already has an outcome recorded.
-// A failed hash is not retried until the lockfile changes
-async fn sync_one(template: &Path, lock: &str, cmd: &[&str], timeout: Duration) {
-    let Ok(bytes) = tokio::fs::read(template.join(lock)).await else {
-        return;
-    };
-    // ponytail: DefaultHasher is not stable across Rust releases, worst case is one extra install
-    let hash = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        bytes.hash(&mut h);
-        format!("{:x}", h.finish())
-    };
-    let marker = PathBuf::from(format!("{}.deps.{lock}", template.display()));
-    let known = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
-    if known == format!("ok:{hash}") || known == format!("fail:{hash}") {
-        return;
-    }
-    let mut install = Command::new(cmd[0]);
-    install
-        .args(&cmd[1..])
-        .current_dir(template)
-        .kill_on_drop(true);
-    let outcome = match tokio::time::timeout(timeout, install.output()).await {
-        Ok(Ok(o)) if o.status.success() => "ok",
-        other => {
-            tracing::warn!(
-                template = %template.display(),
-                result = ?other.map(|r| r.map(|o| o.status)),
-                "template dependency install failed, clones will lack dependencies until the lockfile changes"
-            );
-            "fail"
-        }
-    };
-    let _ = tokio::fs::write(&marker, format!("{outcome}:{hash}")).await;
-}
-
-// Install dependencies in the template when a lockfile changed since the last attempt
-async fn sync_deps(template: &Path) {
-    let js = JS_INSTALLERS
-        .iter()
-        .find(|(lock, _)| template.join(lock).is_file());
-    for (lock, cmd) in js.into_iter().chain([&CARGO_WARMUP]) {
-        sync_one(template, lock, cmd, INSTALL_TIMEOUT).await;
-    }
-}
-
 // Create the template checkout, or move it to the current default branch tip
 async fn refresh_template(
     main_dir: &Path,
@@ -164,7 +99,6 @@ async fn refresh_template(
             .await
             .is_ok()
     {
-        sync_deps(template).await;
         return Ok(());
     }
     let _ = tokio::fs::remove_dir_all(template).await;
@@ -180,7 +114,6 @@ async fn refresh_template(
         ],
     )
     .await?;
-    sync_deps(template).await;
     Ok(())
 }
 
@@ -349,34 +282,5 @@ mod tests {
         std::env::remove_var("ORCH_HOME");
         assert!(res.is_err());
         assert!(!wt_dir.exists());
-    }
-
-    #[tokio::test]
-    async fn timed_out_install_is_killed() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("x.lock"), "a").unwrap();
-        sync_one(
-            dir.path(),
-            "x.lock",
-            &["sh", "-c", "sleep 1; touch ran"],
-            Duration::from_millis(100),
-        )
-        .await;
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert!(!dir.path().join("ran").exists());
-    }
-
-    #[tokio::test]
-    async fn failed_install_is_not_retried_until_lockfile_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        let lock = dir.path().join("x.lock");
-        std::fs::write(&lock, "a").unwrap();
-        sync_one(dir.path(), "x.lock", &["false"], INSTALL_TIMEOUT).await;
-        let touch: &[&str] = &["touch", "ran"];
-        sync_one(dir.path(), "x.lock", touch, INSTALL_TIMEOUT).await;
-        assert!(!dir.path().join("ran").exists());
-        std::fs::write(&lock, "b").unwrap();
-        sync_one(dir.path(), "x.lock", touch, INSTALL_TIMEOUT).await;
-        assert!(dir.path().join("ran").exists());
     }
 }
