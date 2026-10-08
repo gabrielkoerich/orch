@@ -1,22 +1,4 @@
-mod backends;
-mod channels;
-mod cli;
-mod cmd;
-mod cmd_cache;
-mod config;
-mod control;
-mod cron;
-mod engine;
-mod github;
-mod home;
-mod parser;
-mod repo_context;
-pub mod security;
-mod status_heuristics;
-mod store;
-mod template;
-mod tmux;
-mod webhook_status;
+use orch::{cli, config, cron, engine, home, parser, template};
 
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
@@ -1230,7 +1212,7 @@ async fn main() -> anyhow::Result<()> {
                     attempt,
                     format,
                 } => {
-                    use crate::cli::session::ExportFormat;
+                    use orch::cli::session::ExportFormat;
                     let fmt = format
                         .parse::<ExportFormat>()
                         .unwrap_or(ExportFormat::Markdown);
@@ -1404,7 +1386,7 @@ async fn main() -> anyhow::Result<()> {
                     attempt,
                     format,
                 } => {
-                    use crate::cli::session::ExportFormat;
+                    use orch::cli::session::ExportFormat;
                     let fmt = format
                         .parse::<ExportFormat>()
                         .unwrap_or(ExportFormat::Markdown);
