@@ -46,7 +46,8 @@ pub const CREDIT_BACKOFF_BASE_SECS: i64 = 60 * 60;
 /// Base backoff for org-level disabling: 2 hours.
 pub const ORG_BACKOFF_BASE_SECS: i64 = 2 * 60 * 60;
 
-/// Maximum backoff for credit exhaustion and org-level disabling: 8 hours.
+/// Standard cap for credit exhaustion and org-level disabling: 8 hours.
+/// Repeated failures at the cap move to the extended tiers (48h, then 96h)
 pub const CREDIT_BACKOFF_MAX_SECS: i64 = 8 * 60 * 60;
 
 /// Base cooldown for billing cycle exhaustion: 24 hours.
@@ -345,10 +346,10 @@ const EXTENDED_TIER_2_MULTIPLIER: i64 = 12;
 /// | 1     | 300       | 300    |
 /// | 2     | 300       | 900    |
 /// | 3     | 300       | 2700   |
-/// | 4     | 300       | 8100 → capped |
-/// | 5-7   | 14400     | 14400 (max, not yet extended) |
-/// | 8-11  | 86400     | 86400 (24h extended tier) |
-/// | 12+   | 172800    | 172800 (48h extended tier) |
+/// | 4     | 300       | 8100   |
+/// | 5-6   | 14400     | 14400 (max, not yet extended) |
+/// | 7-9   | 86400     | 86400 (24h extended tier) |
+/// | 10+   | 172800    | 172800 (48h extended tier) |
 ///
 /// The extended tier applies when the model has hit the max cap multiple times,
 /// indicating a persistently broken model that won't self-resolve quickly.
@@ -580,8 +581,8 @@ pub fn detect_credit_exhaustion(error_message: &str) -> Option<CreditExhaustionR
 ///
 /// Applies exponential backoff based on the agent's failure count.
 /// All variants use escalating backoff:
-/// - `OutOfCredits`: starts at 1h, caps at 8h (credits can be refilled any time)
-/// - `OrgLevelDisabled`: starts at 2h, caps at 8h
+/// - `OutOfCredits`: 1h, 3h, then 8h (credits can be refilled any time), 48h from the 5th failure, 96h from the 8th
+/// - `OrgLevelDisabled`: 2h, 6h, then 8h, 48h from the 5th failure, 96h from the 8th
 /// - `BillingCycleExhausted`: starts at 24h, caps at 7 days (monthly event)
 ///
 /// Billing cycle exhaustion was previously a flat 24h, but this caused daily
