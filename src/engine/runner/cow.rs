@@ -214,6 +214,11 @@ mod tests {
         assert!(st.success(), "git {args:?}");
     }
 
+    // CI jobs on a clone-capable volume set this so a failed probe fails the test
+    fn expect_clone() -> bool {
+        std::env::var("ORCH_COW_EXPECT_CLONE").is_ok_and(|v| v == "1")
+    }
+
     fn repo_with_origin() -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) {
         let remote = tempfile::tempdir().unwrap();
         sh(remote.path(), &["init", "--bare", "-b", "main"]);
@@ -225,6 +230,7 @@ mod tests {
         sh(project.path(), &["config", "user.email", "t@t.com"]);
         sh(project.path(), &["config", "user.name", "T"]);
         std::fs::write(project.path().join("a.txt"), "a\n").unwrap();
+        std::fs::write(project.path().join("d.txt"), "d\n").unwrap();
         sh(project.path(), &["add", "."]);
         sh(project.path(), &["commit", "-m", "init"]);
         sh(project.path(), &["push", "origin", "HEAD:main"]);
@@ -246,8 +252,11 @@ mod tests {
 
         // Volumes without clone support (ext4, HFS+) take the else branch
         let supported = volume_can_clone(&templates, wt_dir.parent().unwrap()).await;
-        if cfg!(target_os = "macos") && std::env::var("CI").is_ok() {
-            assert!(supported, "macOS CI runner must support clonefile");
+        if expect_clone() {
+            assert!(
+                supported,
+                "ORCH_COW_EXPECT_CLONE is set but the volume cannot clone"
+            );
         }
         let res = create_worktree(project.path(), "p", &wt_dir, "task-1", "main").await;
         if supported {
@@ -266,6 +275,58 @@ mod tests {
         } else {
             assert!(res.is_err());
             assert!(!wt_dir.exists(), "failed clone must leave no directory");
+        }
+        std::env::remove_var("ORCH_HOME");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(orch_home)]
+    async fn branch_differing_from_template_gets_its_own_files() {
+        let (_remote, project, home) = repo_with_origin();
+        std::env::set_var("ORCH_HOME", home.path());
+        let templates = home.path().join("state/templates");
+        std::fs::create_dir_all(&templates).unwrap();
+        let wt_dir = home.path().join("worktrees/p/task-3");
+        std::fs::create_dir_all(wt_dir.parent().unwrap()).unwrap();
+
+        // Task branch: a.txt changed, b.txt added, d.txt deleted
+        sh(
+            project.path(),
+            &["checkout", "-q", "-b", "task-3", "origin/main"],
+        );
+        std::fs::write(project.path().join("a.txt"), "changed\n").unwrap();
+        std::fs::write(project.path().join("b.txt"), "b\n").unwrap();
+        std::fs::remove_file(project.path().join("d.txt")).unwrap();
+        sh(project.path(), &["add", "-A"]);
+        sh(project.path(), &["commit", "-m", "task"]);
+        sh(project.path(), &["checkout", "-q", "--detach"]);
+
+        let supported = volume_can_clone(&templates, wt_dir.parent().unwrap()).await;
+        if expect_clone() {
+            assert!(
+                supported,
+                "ORCH_COW_EXPECT_CLONE is set but the volume cannot clone"
+            );
+        }
+        if supported {
+            create_worktree(project.path(), "p", &wt_dir, "task-3", "main")
+                .await
+                .expect("clone path should succeed");
+            assert_eq!(
+                std::fs::read_to_string(wt_dir.join("a.txt")).unwrap(),
+                "changed\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(wt_dir.join("b.txt")).unwrap(),
+                "b\n"
+            );
+            assert!(!wt_dir.join("d.txt").exists());
+            let status = std::process::Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(&wt_dir)
+                .output()
+                .unwrap();
+            assert!(status.stdout.is_empty(), "clone must have a clean index");
         }
         std::env::remove_var("ORCH_HOME");
     }

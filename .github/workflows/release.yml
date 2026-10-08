@@ -254,6 +254,37 @@ jobs:
           prefix-key: "v1-cow-macos"
 
       - name: Run cow tests
+        env:
+          ORCH_COW_EXPECT_CLONE: "1"
+        run: cargo test --lib engine::runner::cow
+
+  # Runs the copy-on-write worktree tests on an XFS reflink loop volume. The test fails if the probe finds no clone support.
+  test-cow-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.94.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-cow-linux"
+
+      - name: Create XFS reflink volume
+        run: |
+          command -v mkfs.xfs >/dev/null || sudo apt-get install -y xfsprogs
+          truncate -s 2G /tmp/xfs.img
+          mkfs.xfs -m reflink=1 /tmp/xfs.img
+          sudo mkdir /mnt/xfs
+          sudo mount -o loop /tmp/xfs.img /mnt/xfs
+          sudo mkdir /mnt/xfs/tmp
+          sudo chown -R "$USER" /mnt/xfs
+
+      - name: Run cow tests
+        env:
+          ORCH_COW_EXPECT_CLONE: "1"
+          TMPDIR: /mnt/xfs/tmp
         run: cargo test --lib engine::runner::cow
 
   # Cross-compile build jobs for macOS targets.

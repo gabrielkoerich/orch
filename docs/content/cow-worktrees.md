@@ -52,7 +52,11 @@ Apple Silicon, APFS, `cp` of a 1.9 GB directory (the `target/` of this repo):
 
 `git update-index --refresh` on 518 tracked files took under 10 ms. The cost grows with tracked file count, since every cloned file has a new inode and gets re-hashed.
 
-Not measured: end to end task setup on a large JS repo and a large Rust repo, and Linux. Linux reflink (XFS, Btrfs) is untested and has no CI coverage. Unit tests on Ubuntu take the fallback branch. The `test-cow-macos` job runs the clone path and fails if the probe finds no clone support.
+Not measured: end to end task setup on a large JS repo and a large Rust repo, and Linux timings.
+
+CI coverage: `test-cow-macos` (APFS) and `test-cow-linux` (XFS with `reflink=1` on a loop volume, `TMPDIR` on the mount) run the clone path. Both set `ORCH_COW_EXPECT_CLONE=1`, so the tests fail if the probe finds no clone support. Plain unit tests on ext4 take the fallback branch.
+
+On Linux, `cp -a --reflink=always <template>/<entry> <dir>` copies the entry into the existing `<dir>` without nesting. `.git` is skipped, so the `.git` file is never overwritten. The tests check this through the resulting file contents and a clean `git status`.
 
 ## Operating
 
