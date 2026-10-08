@@ -65,7 +65,7 @@ Apple Silicon, APFS, `cp` of a 1.9 GB directory (the `target/` of this repo):
 
 `git update-index --refresh` on 518 tracked files took under 10 ms. The cost grows with tracked file count, since every cloned file has a new inode and gets re-hashed.
 
-Not measured yet: free-space drop (`df`) for N worktrees before and after a first build, plain vs warmed. Whether a first `cargo build` in a warmed clone recompiles only changed crates (mtimes are kept by `cp -p`/`-a`, and `git reset --hard` only rewrites files that differ, but the package path differs from the template path). Linux timings. End to end task setup on a large JS repo and a large Rust repo, and Linux timings.
+Not measured yet: free-space drop (`df`) for N worktrees before and after a first build, plain vs warmed. Whether a first `cargo build` in a warmed clone recompiles only changed crates (mtimes are kept by `cp -p`/`-a`, and `git reset --hard` only rewrites files that differ, but the package path differs from the template path). End to end task setup on a large JS repo and a large Rust repo. Linux timings.
 
 CI coverage: `test-cow-macos` (APFS) and `test-cow-linux` (XFS with `reflink=1` on a loop volume, `TMPDIR` on the mount) run the clone path. Both set `ORCH_COW_EXPECT_CLONE=1`, so the tests fail if the probe finds no clone support. They also check that ignored directories from the checkout reach the template and the clone, that a merged task's ignored directories reach the template of a bare clone, and that `.git` and loose ignored files are never copied. Plain unit tests on ext4 take the fallback branch.
 
