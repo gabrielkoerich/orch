@@ -182,6 +182,7 @@ struct ReviewContext {
     review_attempt_dir: std::path::PathBuf,
     output_file: std::path::PathBuf,
     invocation: runner::agent::AgentInvocation,
+    same_agent_fallback: bool,
 }
 
 impl ReviewContext {
@@ -239,7 +240,7 @@ async fn select_review_agent(
     store_id: Option<i64>,
     router: &Arc<RwLock<Router>>,
     store: &Arc<TaskStore>,
-) -> anyhow::Result<(String, Option<String>)> {
+) -> anyhow::Result<(String, Option<String>, bool)> {
     let mut exclude_set: HashSet<String> = HashSet::new();
     if !task_agent.is_empty() {
         exclude_set.insert(task_agent.to_string());
@@ -284,7 +285,8 @@ async fn select_review_agent(
     }
 
     if let Some(agent) = chosen_agent {
-        Ok((agent, chosen_model))
+        let same = !task_agent.is_empty() && agent == task_agent;
+        Ok((agent, chosen_model, same))
     } else {
         let final_exclude_refs: Vec<&str> = exclude_set.iter().map(|s| s.as_str()).collect();
         let fallback_agent = r
@@ -299,7 +301,8 @@ async fn select_review_agent(
                 task_id
             );
         }
-        Ok((fallback_agent, fallback_model))
+        let same = !task_agent.is_empty() && fallback_agent == task_agent;
+        Ok((fallback_agent, fallback_model, same))
     }
 }
 
@@ -585,7 +588,7 @@ async fn build_review_context(
         .as_ref()
         .and_then(|t| t.agent.clone())
         .unwrap_or_default();
-    let (review_agent, review_model) =
+    let (review_agent, review_model, same_agent_fallback) =
         select_review_agent(&task.id.0, &task_agent, store_id, router, store).await?;
 
     anyhow::ensure!(
@@ -593,6 +596,28 @@ async fn build_review_context(
         "review model missing for task {} after agent selection — refusing to dispatch",
         task.id.0
     );
+
+    if same_agent_fallback {
+        tracing::warn!(
+            task_id = task.id.0,
+            agent = %review_agent,
+            "no other agent available for review — falling back to the agent that wrote the code"
+        );
+        store_log_activity(
+            &Some(Arc::clone(store)),
+            repo,
+            &task.id.0,
+            "review_agent_fallback",
+            None,
+            None,
+            Some(&review_agent),
+            review_model.as_deref(),
+            Some(&serde_json::json!({
+                "reason": "all available agents excluded (author + previous reviewers)",
+            })),
+        )
+        .await;
+    }
 
     tracing::info!(
         task_id = task.id.0,
@@ -651,6 +676,7 @@ async fn build_review_context(
         review_attempt_dir,
         output_file,
         invocation,
+        same_agent_fallback,
     }))
 }
 
@@ -1681,7 +1707,12 @@ async fn post_review_comment(
             return Ok(());
         }
     };
-    let pr_comment = build_pr_review_comment(decision, review_notes_for_comment);
+    let mut pr_comment = build_pr_review_comment(decision, review_notes_for_comment);
+    if ctx.same_agent_fallback && !pr_comment.is_empty() {
+        pr_comment.push_str(
+            "\n> Note: no other agent was available, so this PR was reviewed by the same agent that wrote the code.\n",
+        );
+    }
 
     if !pr_comment.is_empty() {
         let footer =
@@ -3497,6 +3528,7 @@ mod tests {
                 repo: "owner/repo".to_string(),
                 attempt: 1,
             },
+            same_agent_fallback: false,
         }
     }
 

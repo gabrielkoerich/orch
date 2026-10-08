@@ -17,7 +17,7 @@ Issue → Branch + Worktree → Agent works → Push → PR → Review Agent →
 3. **Agent works** — runs inside worktree, edits files, commits changes
 4. **Push** — engine pushes the branch after agent finishes
 5. **PR** — engine creates PR and links it to the issue
-6. **Review** — different agent reviews the PR (approve / request changes)
+6. **Review:** a different agent reviews the PR when one is available, the authoring agent reviews otherwise (approve / request changes)
 7. **Fix + Reply** — fix review findings, commit fixes (engine pushes)
 8. **Merge** — engine merges PR after review approval and CI passes
 9. **Release** — CI auto-tags, generates changelog, creates GitHub release, updates Homebrew

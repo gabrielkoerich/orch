@@ -134,6 +134,6 @@ Source files:
 2. **Route the task** — the LLM router chooses executor + builds a specialized profile and selects skills.
 3. **Run the task** — the chosen executor runs in agentic mode inside a tmux session in the task worktree (`PROJECT_DIR`) with controlled tool access.
 4. **Output** — the agent writes results to `~/.orch/state/{repo}/tasks/{id}/attempts/{n}/output.json`; task metadata is updated in the SQLite store (`~/.orch/orch.db`).
-5. **Review** — if enabled, a different agent reviews the PR and posts a GitHub review comment.
+5. **Review:** if enabled, a different agent reviews the PR when one is available (the authoring agent reviews otherwise) and posts a GitHub review comment.
 6. **Delegation** — if the agent returns `delegations`, child tasks are created and the parent is blocked until children finish.
 7. **Error handling** — if the agent fails or returns `blocked`, the error is commented on the GitHub issue with a `needs_review` label.
