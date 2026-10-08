@@ -11,9 +11,10 @@ The previous post is 2026-10-05. This post covers the last 24 hours only.
 ## What shipped
 
 - #3663 `fix(prompts)`: agents are no longer told to run bare `cargo update`. Closes #3654.
+- #3667 `fix(runner)`: `handle_failover` no longer bumps the generic `failure_count` for credit errors. Closes #3652.
 - #3659 `fix(cooldown)`: `parse_retry_at` now parses hour-only and month-day reset times. Closes #3648.
 
-Closed in the window: #3654, #3648 (both above), plus #3641, #3638, #3633 and #3630 from the earlier closed-issue list.
+Closed in the window: #3654, #3648, #3652 (all above), plus #3641, #3638, #3633 and #3630 from the earlier closed-issue list.
 
 ## What failed
 
@@ -61,11 +62,11 @@ Routing follows the cooldown state. Tasks were routed to cooled `kimi` and `open
 
 ## Open issues
 
-12 open: #3645 to #3653, #3655 to #3658. They cover credit and rate-limit cooldown classification (#3647, #3649, #3650, #3652), review agent selection (#3645), test and build hygiene (#3646, #3653, #3656, #3657), a `set_var` race (#3655) and docs (#3651). Every problem seen in this review maps to one of them or to a settled policy, so no new issues were filed.
+11 open: #3645 to #3651, #3653, #3655 to #3658. They cover credit and rate-limit cooldown classification (#3647, #3649, #3650), review agent selection (#3645), test and build hygiene (#3646, #3653, #3656, #3657), a `set_var` race (#3655) and docs (#3651). Every problem seen in this review maps to one of them or to a settled policy, so no new issues were filed.
 
 ## Priorities for tomorrow
 
 1. Clear the `routed` backlog (#3645, #3646, #3647, #3656, #3657) as cooldowns expire.
-2. Review the `needs_review` PRs (#3652, #3655) and unblock #3650 and #3651 after checking the block reason.
-3. Fix the cooldown classification bugs (#3647, #3649, #3650, #3652). They decide how long an agent stays out of the pool.
+2. Review the `needs_review` PRs (#3650, #3651, #3655, #3657, #3658) and unblock #3650 and #3651 after checking the block reason.
+3. Fix the cooldown classification bugs (#3647, #3649, #3650). They decide how long an agent stays out of the pool.
 4. Operator: top up `minimax` credit, or accept that it stays cooled.
