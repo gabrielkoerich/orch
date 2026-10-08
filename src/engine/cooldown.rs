@@ -718,6 +718,12 @@ pub async fn set_model_cooldown(agent_name: &str, model: &str, duration_secs: u6
     set_cooldown_async(&key, cooldown_until, reason).await;
 }
 
+/// Set a model cooldown that ends at a vendor-provided Unix timestamp.
+pub async fn set_model_cooldown_until(agent_name: &str, model: &str, until: i64) {
+    let key = format!("{agent_name}:{model}");
+    set_cooldown_async(&key, until, "vendor_reset_at").await;
+}
+
 /// Set a short agent-level cooldown (in seconds).
 ///
 /// Used by silence detection to temporarily block the whole agent so the
@@ -1333,7 +1339,7 @@ pub fn github_circuit_remaining_secs() -> u64 {
 /// Parse a "try again at {date}" or "reset at {date}" from an error message.
 ///
 /// Returns a Unix timestamp if a retry-at date is found.
-fn parse_retry_at(error_message: &str) -> Option<i64> {
+pub(crate) fn parse_retry_at(error_message: &str) -> Option<i64> {
     if error_message.is_empty() {
         return None;
     }
@@ -1832,6 +1838,24 @@ mod tests {
             let ts = parse_retry_at(msg).unwrap_or_else(|| panic!("should parse: {msg}"));
             assert!(ts > now, "{msg}");
         }
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn parse_retry_at_weekly_resets_without_year() {
+        use chrono::Datelike;
+        let t = chrono::Local::now() + chrono::Duration::days(2);
+        let msg = format!(
+            "You've hit your weekly limit · resets {} {} at 1am (America/Sao_Paulo)",
+            t.format("%b"),
+            t.day()
+        );
+        let ts = parse_retry_at(&msg).expect("should parse year-less reset date");
+        let remaining = ts - chrono::Utc::now().timestamp();
+        assert!(
+            remaining > 3600 && remaining < 3 * 86400,
+            "expected ~2d retry-at, got {remaining}s"
+        );
     }
 
     #[serial(cooldown_state)]

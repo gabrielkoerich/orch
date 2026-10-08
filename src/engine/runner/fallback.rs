@@ -195,6 +195,32 @@ async fn try_free_model_reroute(
     })
 }
 
+/// Apply a vendor-provided future reset date as the model cooldown.
+///
+/// Skipped for credit exhaustion reasons other than billing cycle, which keep their agent-wide cooldowns.
+/// Returns true when the cooldown was set.
+async fn apply_vendor_reset_date(
+    agent_name: &str,
+    model_name: Option<&str>,
+    message: &str,
+) -> bool {
+    use crate::engine::cooldown::CreditExhaustionReason;
+    let Some(model) = model_name else {
+        return false;
+    };
+    match crate::engine::cooldown::detect_credit_exhaustion(message) {
+        None | Some(CreditExhaustionReason::BillingCycleExhausted) => {}
+        Some(_) => return false,
+    }
+    match crate::engine::cooldown::parse_retry_at(message) {
+        Some(until) if until > chrono::Utc::now().timestamp() => {
+            crate::engine::cooldown::set_model_cooldown_until(agent_name, model, until).await;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Handle an agent error: classify it, attempt recovery strategies, and update store.
 ///
 /// Returns `Ok(ErrorHandleResult::EarlyReturn)` when the task was rerouted and
@@ -248,7 +274,13 @@ pub async fn handle_error(
             // specific model's plan quota was exhausted (issue #3382).
             let mut billing_cycle_model_scoped = false;
 
-            if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
+            if apply_vendor_reset_date(agent_name, model_name, message).await {
+                let reason = crate::engine::cooldown::detect_credit_exhaustion(message);
+                credit_recorded = reason.is_some();
+                billing_cycle_model_scoped = reason
+                    == Some(crate::engine::cooldown::CreditExhaustionReason::BillingCycleExhausted);
+            } else if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message)
+            {
                 credit_recorded = true;
                 // For billing cycle exhaustion where we know the specific model, apply
                 // model-level persistent cooldown only. The quota is scoped to that
@@ -330,7 +362,13 @@ pub async fn handle_error(
             // concurrent tasks start another run against the same unavailable model.
             let mut billing_cycle_model_scoped = false;
 
-            if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
+            if apply_vendor_reset_date(agent_name, model_name, message).await {
+                let reason = crate::engine::cooldown::detect_credit_exhaustion(message);
+                credit_recorded = reason.is_some();
+                billing_cycle_model_scoped = reason
+                    == Some(crate::engine::cooldown::CreditExhaustionReason::BillingCycleExhausted);
+            } else if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message)
+            {
                 credit_recorded = true;
                 // Billing cycle exhaustion scoped to a known model gets model-level
                 // persistent cooldown only — agent-wide cooldown would block unrelated models.
@@ -1290,6 +1328,62 @@ mod tests {
         assert!(
             remaining >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
             "expected persistent model cooldown (~4h) for codex model-unavailable, got {remaining}s"
+        );
+    }
+
+    async fn vendor_reset_remaining(agent: &str, model: &str, message: &str) -> i64 {
+        crate::engine::cooldown::reset_global_state().await;
+        let runner = MockRunner { free: vec![] };
+        let err = crate::engine::runner::agents::AgentError::RateLimit {
+            message: message.to_string(),
+        };
+        let _ = handle_error(
+            "test-3649",
+            &err,
+            agent,
+            &runner,
+            Some(model),
+            Some("simple"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+        let until = crate::engine::cooldown::cooldown_until(&format!("{agent}:{model}"))
+            .expect("model cooldown should be set");
+        until - chrono::Utc::now().timestamp()
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn vendor_reset_date_overrides_weekly_window() {
+        use chrono::Datelike;
+        let t = chrono::Local::now() + chrono::Duration::days(2);
+        let msg = format!(
+            "You've hit your weekly limit · resets {} {} at 1am (America/Sao_Paulo)",
+            t.format("%b"),
+            t.day()
+        );
+        let remaining = vendor_reset_remaining("claude", "sonnet", &msg).await;
+        assert!(
+            remaining > 3600 && remaining < 3 * 86400,
+            "expected ~2d cooldown, got {remaining}s"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn vendor_reset_date_overrides_billing_cycle_backoff() {
+        let t = chrono::Local::now() + chrono::Duration::days(3);
+        let msg = format!(
+            "You've hit your usage limit. Upgrade to Pro (https://x), or try again at {}.",
+            t.format("%b %d, %Y %I:%M %p")
+        );
+        let remaining = vendor_reset_remaining("codex", "gpt-5.4", &msg).await;
+        assert!(
+            remaining > 2 * 86400 + 80000 - 3600 && remaining < 4 * 86400,
+            "expected ~3d cooldown, got {remaining}s"
         );
     }
 
