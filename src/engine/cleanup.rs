@@ -537,16 +537,17 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
     store: &Arc<TaskStore>,
     opts: &JanitorOptions,
 ) -> anyhow::Result<bool> {
-    let (worktree, branch, keep_remote_branch) =
+    let (worktree, branch, keep_remote_branch, merged) =
         store::opt_store_get_task(&Some(Arc::clone(store)), repo, task_id)
             .await
             .map(|t| {
                 // Blocked tasks with a PR should keep their remote branch so the
                 // PR stays open for human review.
                 let keep = t.status == TaskStatus::Blocked && t.pr_number.is_some();
-                (Some(t.worktree), Some(t.branch), keep)
+                let merged = t.status == TaskStatus::Done;
+                (Some(t.worktree), Some(t.branch), keep, merged)
             })
-            .unwrap_or((None, None, false));
+            .unwrap_or((None, None, false, false));
 
     let worktree_path = worktree.as_ref().map(std::path::PathBuf::from);
 
@@ -714,6 +715,16 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
                 Ok(root) => root,
                 Err(_) => resolve_repo_root(repo).await?,
             };
+            if merged {
+                crate::engine::runner::cow::warm_from_merged(
+                    std::path::Path::new(&repo_root),
+                    &crate::engine::runner::worktree::project_name(std::path::Path::new(
+                        &repo_root,
+                    )),
+                    &wt,
+                )
+                .await;
+            }
             let removed = remove_worktree_and_branch(
                 task_id,
                 &wt,
