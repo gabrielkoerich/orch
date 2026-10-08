@@ -998,11 +998,11 @@ fn parse_since_or_default(since: &str) -> u32 {
     })
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // Augment PATH with common tool locations.
     // launchd services inherit a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin)
     // that excludes Homebrew, Cargo, npm globals, etc.
+    // Env writes must happen before the runtime starts its worker threads.
     ensure_path();
 
     // Load private environment variables from ~/.private into the process.
@@ -1010,6 +1010,13 @@ async fn main() -> anyhow::Result<()> {
     // (router, agents) without requiring the shell to source the file first.
     load_private_env();
 
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if matches!(cli.command, Commands::Serve) {
