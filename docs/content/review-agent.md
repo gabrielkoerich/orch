@@ -1,10 +1,10 @@
 +++
 title = "Review Agent"
-description = "Automated PR reviews using a different agent"
+description = "Automated PR reviews using a different agent when one is available"
 weight = 10
 +++
 
-The review agent automatically reviews pull requests after an agent completes a task. It picks a different agent from the one that wrote the code (and from any agents that previously reviewed the same task), and posts a real GitHub PR review.
+The review agent automatically reviews pull requests after an agent completes a task. It picks a different agent from the one that wrote the code (and from any agents that previously reviewed the same task), and posts a real GitHub PR review. If no other agent is available, the authoring agent reviews and the fallback is logged as a `review_agent_fallback` task activity and noted in the review comment.
 
 ## How It Works
 

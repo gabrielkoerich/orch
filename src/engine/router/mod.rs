@@ -601,7 +601,7 @@ impl Router {
     /// Get the first available agent.
     /// Pick next agent via round-robin (for review or other non-task routing).
     /// Pick the next review agent, optionally excluding one (e.g. the task's original agent).
-    /// Falls back to the excluded agent only if it's the only one available.
+    /// Falls back to the first candidate whenever every candidate is excluded (#3645).
     pub fn next_round_robin_agent(&mut self, exclude: &[&str], complexity: &str) -> Option<String> {
         // Use available_agents_for_complexity which already filters using agent_is_routable,
         // eliminating duplicate cooldown/degraded/model checks.
