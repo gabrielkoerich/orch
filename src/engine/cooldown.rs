@@ -1406,6 +1406,35 @@ fn parse_retry_at(error_message: &str) -> Option<i64> {
                 .map(|(t, _)| t)
                 .unwrap_or(date_str)
                 .trim();
+            // Hour-only values like "8am" have no minute field, which chrono needs, so insert ":00"
+            let mut compact = time_only.replace(" am", "am").replace(" pm", "pm");
+            let split = compact.rfind(' ').map_or(0, |i| i + 1);
+            let last = &compact[split..];
+            if !last.contains(':')
+                && (last.ends_with("am") || last.ends_with("pm"))
+                && last.len() > 2
+            {
+                let at = split + last.len() - 2;
+                compact.insert_str(at, ":00");
+            }
+            // "Jun 9 at 1am" has no year, so take the next future occurrence
+            let md = compact.replace(" at ", " ");
+            let now_local = chrono::Local::now();
+            let this_year = chrono::Datelike::year(&now_local);
+            for year in [this_year, this_year + 1] {
+                let with_year = format!("{year} {md}");
+                if let Ok(dt) =
+                    chrono::NaiveDateTime::parse_from_str(&with_year, "%Y %b %d %I:%M%p")
+                {
+                    use chrono::TimeZone;
+                    if let Some(local_dt) = chrono::Local.from_local_datetime(&dt).earliest() {
+                        if local_dt > now_local {
+                            return Some(local_dt.timestamp());
+                        }
+                    }
+                }
+            }
+            let time_only = compact.as_str();
             for tf in &["%I:%M %p", "%I:%M%p", "%I %p", "%H:%M"] {
                 if let Ok(t) = chrono::NaiveTime::parse_from_str(time_only, tf) {
                     // Build a NaiveDateTime for today at that time, then choose
@@ -1779,6 +1808,21 @@ mod tests {
         use chrono::Datelike;
         assert_eq!(dt.month(), 3);
         assert_eq!(dt.day(), 26);
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn parse_retry_at_hour_only_and_month_day() {
+        let now = chrono::Utc::now().timestamp();
+        for msg in [
+            "You've hit your session limit · resets 8am (America/Sao_Paulo)",
+            "You've hit your session limit · resets 6pm (America/Sao_Paulo)",
+            "You've hit your session limit · resets 12am (America/Sao_Paulo)",
+            "You've hit your weekly limit · resets Jun 9 at 1am (America/Sao_Paulo)",
+        ] {
+            let ts = parse_retry_at(msg).unwrap_or_else(|| panic!("should parse: {msg}"));
+            assert!(ts > now, "{msg}");
+        }
     }
 
     #[serial(cooldown_state)]
