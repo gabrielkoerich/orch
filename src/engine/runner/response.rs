@@ -343,20 +343,20 @@ impl RetryableError {
     }
 }
 
-/// Handle failover for any retryable error type.
-/// Returns the resulting status string:
-/// - "new" if rerouted to a fallback agent, or if all agents exhausted with a retryable error
-///   (rate limit / auth / model unavailable) so the task waits for cooldowns to expire.
-/// - "blocked" if all agents exhausted with a hard (non-retryable) failure.
-/// - "needs_review" if no fallback agents are available (but not all configured agents exhausted).
-///
-/// Note: DB recording of rate limit events is handled by the caller (mod.rs)
-/// which has async context. This function only handles store state + cooldowns.
+/**
+ * Handle failover for any retryable error type. Returns "new" on reroute (or
+ * retryable exhaustion), "blocked" on hard exhaustion, "needs_review" when no
+ * fallback agents are available. `credit_recorded` means the caller already ran
+ * `record_credit_exhaustion`; the generic `failure_count:` counter must not be
+ * bumped here or the next ordinary failure starts at the extended backoff tier
+ * (issue #3652). Rate-limit event DB recording is done by the caller (mod.rs)
+ **/
 pub async fn handle_failover(
     task_id: &str,
     agent_name: &str,
     error_type: RetryableError,
     error_message: &str,
+    credit_recorded: bool,
     store: &Option<Arc<TaskStore>>,
     repo: &str,
 ) -> String {
@@ -463,16 +463,17 @@ pub async fn handle_failover(
             "failover: switching to fallback agent"
         );
 
-        // Record agent failure for cooldown tracking.
-        // Skip for MissingTooling — it's permanent, not transient.
-        // Skip for ModelUnavailable — only the specific model is dead; the
-        // agent itself is fine and its other models still route normally
-        // (the model-level cooldown was already set by the caller).
+        // Record agent failure for cooldown tracking. Skipped for
+        // MissingTooling/ModelUnavailable; see handle_failover docs above
         if !matches!(
             error_type,
             RetryableError::MissingTooling | RetryableError::ModelUnavailable
         ) {
-            record_agent_failure_with_message(agent_name, error_message).await;
+            // Credit errors skip the generic counter (already counted via
+            // credit_failure_count); the 120s cooldown below still applies
+            if !credit_recorded {
+                record_agent_failure_with_message(agent_name, error_message).await;
+            }
 
             // Apply brief 120s cooldown on the failed agent so the router skips it
             // on the next routing attempt. This prevents the router from immediately
@@ -531,13 +532,13 @@ pub async fn handle_failover(
     // No fallback available
     tracing::warn!(task_id, agent = agent_name, "no fallback agents available");
 
-    // Record agent failure for cooldown tracking.
-    // Skip for MissingTooling (permanent) and ModelUnavailable (agent is fine,
-    // only the specific model is dead — model-level cooldown was already set).
+    // Record agent failure for cooldown tracking. Skipped for
+    // MissingTooling/ModelUnavailable and already-counted credit errors
     if !matches!(
         error_type,
         RetryableError::MissingTooling | RetryableError::ModelUnavailable
-    ) {
+    ) && !credit_recorded
+    {
         record_agent_failure_with_message(agent_name, error_message).await;
     }
 
