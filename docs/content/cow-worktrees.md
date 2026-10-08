@@ -14,9 +14,14 @@ Implementation: `src/engine/runner/cow.rs`, called from `setup_worktree()`.
 
 1. Probe once per process whether the template dir and the worktrees dir can clone files. If not, use `git worktree add`.
 2. Under a per-template lock, move the template to `origin/<default>` (`git checkout --detach --force`). Create it with `git worktree add --detach` if missing or broken.
-3. `git worktree add --no-checkout <dir> <branch>` creates the gitdir entry and the `.git` file.
-4. Clone every top-level template entry except `.git` into `<dir>`. macOS runs `cp -cRp` (`clonefile`). Linux runs `cp -a --reflink=always` (`FICLONE`).
-5. Copy the template index into the new gitdir, run `git update-index --refresh`, then `git reset --hard`. Only files where the task branch differs from the template commit are rewritten.
+3. Warm the template. Clone each gitignored top-level directory of the operator's checkout (`git ls-files --others --ignored --exclude-standard --directory`) into a staging dir beside the template, then swap it in place of the template's copy. Loose ignored files such as `.env` are not copied. Bare clones have no checkout and skip this step.
+4. `git worktree add --no-checkout <dir> <branch>` creates the gitdir entry and the `.git` file.
+5. Clone every top-level template entry except `.git` into `<dir>`. macOS runs `cp -cRp` (`clonefile`). Linux runs `cp -a --reflink=always` (`FICLONE`).
+6. Copy the template index into the new gitdir, run `git update-index --refresh`, then `git reset --hard`. Only files where the task branch differs from the template commit are rewritten.
+
+After a task PR merges and before its worktree is removed, projects that are bare clones warm the template from that worktree the same way (`warm_from_merged()`, called from the cleanup path for `done` tasks). Failed or blocked tasks never warm the template, since they can leave broken output.
+
+The agent then runs its usual install or build. The tool sees most output as current and rewrites only what changed, so only those blocks are copied. `git checkout --detach --force` keeps ignored files and orch never runs `git clean`.
 
 Any failure removes the half-built worktree and falls back to `git worktree add`. Resume, saved branch, parent branch inheritance, corrupted index recovery and cleanup are unchanged. They only see an existing directory with a valid gitdir.
 
@@ -29,11 +34,19 @@ Any failure removes the half-built worktree and falls back to `git worktree add`
 | Clone files, keep the gitdir per worktree | Cloning `.git` would share index and HEAD state |
 | Probe by cloning a small file | Parsing filesystem names misses mount options like XFS without reflink |
 | One lock per template | A global lock lets one slow install stall every project |
-| Template is a plain checkout, no dependency install | Orch must work with any language. Task agents install and build in their own worktree, following the project's `AGENTS.md` |
+| Template holds the checkout's ignored directories | Orch runs no install or build. It reuses what the project's own tooling already produced, so `cow.rs` names no language or tool |
+| Directories only, no loose ignored files | Keeps `.env` and similar files out of agent worktrees without naming any file |
+| Warm from the checkout, fall back to merged tasks | Output from failed tasks can be broken |
+| One clone per task, per-worktree build dirs | A shared build dir (e.g. `CARGO_TARGET_DIR`) names a tool, serialises builds on its lock and lets branches overwrite each other |
 
 ## Costs
 
-- Clones share source files only. Each task installs its own dependencies and builds as before.
+- Clones share source files, dependencies and build output. Blocks stay shared until the agent's build rewrites them.
+- Every task creation re-clones the checkout's ignored directories (copy-on-write, so no disk, but time grows with file count).
+- The operator may be building while orch clones, so the template can hold partial output. The agent's tooling must detect that and rebuild. Orch does not check.
+- Output that embeds absolute paths (virtualenvs, some build caches) points at the checkout or template path. Whether it recovers depends on the tool, and orch does not special-case any. The agent reinstalls if needed.
+- The template only grows with the checkout's ignored directories, and each refresh replaces them whole, so stale files do not pile up. Delete the template to reset it.
+- Merged-task warming overwrites a directory with the one from the last merged task.
 - The first task per project pays for the template checkout. Later tasks for the same project wait on the lock while a refresh runs. Other projects are not blocked.
 - The template is one more full checkout on disk, and it appears in `git worktree list`.
 - Writes to a cloned file copy its blocks.
@@ -52,9 +65,9 @@ Apple Silicon, APFS, `cp` of a 1.9 GB directory (the `target/` of this repo):
 
 `git update-index --refresh` on 518 tracked files took under 10 ms. The cost grows with tracked file count, since every cloned file has a new inode and gets re-hashed.
 
-Not measured: end to end task setup on a large JS repo and a large Rust repo, and Linux timings.
+Not measured yet: free-space drop (`df`) for N worktrees before and after a first build, plain vs warmed. Whether a first `cargo build` in a warmed clone recompiles only changed crates (mtimes are kept by `cp -p`/`-a`, and `git reset --hard` only rewrites files that differ, but the package path differs from the template path). End to end task setup on a large JS repo and a large Rust repo. Linux timings.
 
-CI coverage: `test-cow-macos` (APFS) and `test-cow-linux` (XFS with `reflink=1` on a loop volume, `TMPDIR` on the mount) run the clone path. Both set `ORCH_COW_EXPECT_CLONE=1`, so the tests fail if the probe finds no clone support. Plain unit tests on ext4 take the fallback branch.
+CI coverage: `test-cow-macos` (APFS) and `test-cow-linux` (XFS with `reflink=1` on a loop volume, `TMPDIR` on the mount) run the clone path. Both set `ORCH_COW_EXPECT_CLONE=1`, so the tests fail if the probe finds no clone support. They also check that ignored directories from the checkout reach the template and the clone, that a merged task's ignored directories reach the template of a bare clone, and that `.git` and loose ignored files are never copied. Plain unit tests on ext4 take the fallback branch.
 
 On Linux, `cp -a --reflink=always <template>/<entry> <dir>` copies the entry into the existing `<dir>` without nesting. `.git` is skipped, so the `.git` file is never overwritten. The tests check this through the resulting file contents and a clean `git status`.
 

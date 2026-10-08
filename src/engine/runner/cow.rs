@@ -117,6 +117,85 @@ async fn refresh_template(
     Ok(())
 }
 
+// Gitignored top-level directories of a checkout, which hold whatever its tooling produced
+async fn ignored_dirs(src: &Path) -> anyhow::Result<Vec<String>> {
+    let out = git(
+        src,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        ],
+    )
+    .await?;
+    Ok(out
+        .lines()
+        .filter_map(|l| l.strip_suffix('/'))
+        .filter(|n| !n.is_empty() && !n.contains('/') && !SKIP.contains(n))
+        .map(String::from)
+        .collect())
+}
+
+// Swap a clone of each ignored directory of `src` into the template, caller holds the template lock.
+// Loose ignored files stay out, so local secrets never reach a worktree
+async fn warm_template(src: &Path, template: &Path) -> anyhow::Result<()> {
+    let name = template.file_name().unwrap_or_default().to_string_lossy();
+    let staging = template.with_file_name(format!(".{name}.warm"));
+    for dir in ignored_dirs(src).await? {
+        // A directory the template commit tracks is not build output
+        if !git(template, &["ls-files", "--", &dir])
+            .await
+            .unwrap_or_default()
+            .is_empty()
+        {
+            continue;
+        }
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        tokio::fs::create_dir_all(&staging).await?;
+        let res = async {
+            clone_path(&src.join(&dir), &staging).await?;
+            let dst = template.join(&dir);
+            let _ = tokio::fs::remove_dir_all(&dst).await;
+            tokio::fs::rename(staging.join(&dir), dst).await?;
+            anyhow::Ok(())
+        }
+        .await;
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        if let Err(e) = res {
+            tracing::debug!(dir = %dir, error = %e, "template warm-up skipped a directory");
+        }
+    }
+    Ok(())
+}
+
+// Called after a task PR merges and before its worktree is removed.
+// Projects with a working checkout are warmed from that checkout instead
+pub async fn warm_from_merged(repo_root: &Path, project: &str, wt_dir: &Path) {
+    let bare = git(repo_root, &["rev-parse", "--is-bare-repository"])
+        .await
+        .is_ok_and(|v| v == "true");
+    if !bare {
+        return;
+    }
+    let Ok(templates) = crate::home::state_dir().map(|d| d.join("templates")) else {
+        return;
+    };
+    let template = templates.join(project);
+    let Some(wt_parent) = wt_dir.parent() else {
+        return;
+    };
+    if !template.join(".git").exists() || !volume_can_clone(&templates, wt_parent).await {
+        return;
+    }
+    let lock = template_lock(&template);
+    let _guard = lock.lock().await;
+    if let Err(e) = warm_template(wt_dir, &template).await {
+        tracing::debug!(error = %e, "template warm-up from merged task failed");
+    }
+}
+
 async fn populate(
     main_dir: &Path,
     template: &Path,
@@ -186,6 +265,11 @@ pub async fn create_worktree(
     if template.join(".gitmodules").exists() {
         // A cloned submodule `.git` file would point into the template's gitdir
         anyhow::bail!("submodules are not supported");
+    }
+
+    // Bare clones have no ignored files, so the listing fails or is empty and nothing changes
+    if let Err(e) = warm_template(main_dir, &template).await {
+        tracing::debug!(error = %e, "template warm-up from checkout failed");
     }
 
     let res = populate(main_dir, &template, wt_dir, branch).await;
@@ -327,6 +411,124 @@ mod tests {
                 .output()
                 .unwrap();
             assert!(status.stdout.is_empty(), "clone must have a clean index");
+        }
+        std::env::remove_var("ORCH_HOME");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(orch_home)]
+    async fn checkout_ignored_dirs_reach_template_and_clone() {
+        let (_remote, project, home) = repo_with_origin();
+        std::fs::write(project.path().join(".gitignore"), "out/\n.env\n").unwrap();
+        sh(project.path(), &["add", "."]);
+        sh(project.path(), &["commit", "-m", "ignore"]);
+        sh(project.path(), &["push", "origin", "HEAD:main"]);
+        sh(project.path(), &["fetch", "origin"]);
+        std::fs::create_dir_all(project.path().join("out/sub")).unwrap();
+        std::fs::write(project.path().join("out/sub/dep.bin"), "dep\n").unwrap();
+        std::fs::write(project.path().join(".env"), "secret\n").unwrap();
+
+        std::env::set_var("ORCH_HOME", home.path());
+        let templates = home.path().join("state/templates");
+        std::fs::create_dir_all(&templates).unwrap();
+        let wt_dir = home.path().join("worktrees/p/task-4");
+        std::fs::create_dir_all(wt_dir.parent().unwrap()).unwrap();
+        sh(project.path(), &["branch", "task-4", "origin/main"]);
+
+        let supported = volume_can_clone(&templates, wt_dir.parent().unwrap()).await;
+        if expect_clone() {
+            assert!(
+                supported,
+                "ORCH_COW_EXPECT_CLONE is set but the volume cannot clone"
+            );
+        }
+        if supported {
+            create_worktree(project.path(), "p", &wt_dir, "task-4", "main")
+                .await
+                .expect("clone path should succeed");
+            let tpl = templates.join("p");
+            for root in [&tpl, &wt_dir] {
+                assert_eq!(
+                    std::fs::read_to_string(root.join("out/sub/dep.bin")).unwrap(),
+                    "dep\n"
+                );
+                assert!(!root.join(".env").exists(), "loose ignored file was copied");
+            }
+            // The worktree keeps its own gitdir
+            assert!(wt_dir.join(".git").is_file());
+            assert_ne!(
+                std::fs::read_to_string(wt_dir.join(".git")).unwrap(),
+                std::fs::read_to_string(tpl.join(".git")).unwrap()
+            );
+            // A second refresh replaces the directory instead of merging into it
+            std::fs::remove_file(project.path().join("out/sub/dep.bin")).unwrap();
+            std::fs::write(project.path().join("out/new.bin"), "new\n").unwrap();
+            let wt2 = home.path().join("worktrees/p/task-5");
+            sh(project.path(), &["branch", "task-5", "origin/main"]);
+            create_worktree(project.path(), "p", &wt2, "task-5", "main")
+                .await
+                .unwrap();
+            assert!(wt2.join("out/new.bin").exists());
+            assert!(!wt2.join("out/sub/dep.bin").exists());
+        }
+        std::env::remove_var("ORCH_HOME");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(orch_home)]
+    async fn merged_task_ignored_dirs_reach_template_of_bare_project() {
+        let (remote, project, home) = repo_with_origin();
+        std::fs::write(project.path().join(".gitignore"), "out/\n").unwrap();
+        sh(project.path(), &["add", "."]);
+        sh(project.path(), &["commit", "-m", "ignore"]);
+        sh(project.path(), &["push", "origin", "HEAD:main"]);
+        let bare = home.path().join("bare.git");
+        sh(
+            home.path(),
+            &[
+                "clone",
+                "--bare",
+                remote.path().to_str().unwrap(),
+                "bare.git",
+            ],
+        );
+        sh(&bare, &["branch", "task-6", "main"]);
+
+        std::env::set_var("ORCH_HOME", home.path());
+        let templates = home.path().join("state/templates");
+        std::fs::create_dir_all(&templates).unwrap();
+        let wt_dir = home.path().join("worktrees/pb/task-6");
+        std::fs::create_dir_all(wt_dir.parent().unwrap()).unwrap();
+
+        let supported = volume_can_clone(&templates, wt_dir.parent().unwrap()).await;
+        if expect_clone() {
+            assert!(
+                supported,
+                "ORCH_COW_EXPECT_CLONE is set but the volume cannot clone"
+            );
+        }
+        if supported {
+            create_worktree(&bare, "pb", &wt_dir, "task-6", "main")
+                .await
+                .expect("clone path should succeed");
+            let tpl = templates.join("pb");
+            assert!(!tpl.join("out").exists());
+
+            std::fs::create_dir_all(wt_dir.join("out")).unwrap();
+            std::fs::write(wt_dir.join("out/dep.bin"), "dep\n").unwrap();
+            std::fs::write(wt_dir.join("loose.log"), "x\n").unwrap();
+
+            // A project with a working checkout is not warmed from tasks
+            warm_from_merged(project.path(), "pb", &wt_dir).await;
+            assert!(!tpl.join("out").exists());
+
+            warm_from_merged(&bare, "pb", &wt_dir).await;
+            assert_eq!(
+                std::fs::read_to_string(tpl.join("out/dep.bin")).unwrap(),
+                "dep\n"
+            );
+            assert!(!tpl.join("loose.log").exists());
+            assert!(tpl.join(".git").is_file());
         }
         std::env::remove_var("ORCH_HOME");
     }
