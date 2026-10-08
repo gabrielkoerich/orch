@@ -278,7 +278,13 @@ pub async fn handle_error(
                 // call site (cooldown::record_rate_limit()) already applies; this
                 // in-task failover path bypassed it entirely, undoing the
                 // #3572/#3574 fix for the most common rate-limit path (issue #3580).
-                crate::engine::cooldown::set_model_cooldown(agent_name, model, window_secs).await;
+                crate::engine::cooldown::set_model_cooldown(
+                    agent_name,
+                    model,
+                    window_secs,
+                    "rate_limit_usage_window",
+                )
+                .await;
                 tracing::info!(
                     task_id,
                     agent = agent_name,
@@ -1199,6 +1205,11 @@ mod tests {
         assert!(
             remaining >= 7 * 86400 - 30,
             "expected ~7-day model cooldown from the parsed window, got {remaining}s"
+        );
+        assert_eq!(
+            crate::engine::cooldown::cooldown_reason(&key).as_deref(),
+            Some("rate_limit_usage_window"),
+            "relative usage-window cooldown must be labeled as a rate limit, not silence"
         );
     }
 

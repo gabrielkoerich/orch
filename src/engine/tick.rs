@@ -463,7 +463,13 @@ pub(crate) async fn tick_detect_silent_agents(
 
         // 3. Cooldown the specific model (not the whole agent)
         if !agent_name.is_empty() && !model_name.is_empty() {
-            set_model_cooldown(&agent_name, &model_name, config.silence_cooldown).await;
+            set_model_cooldown(
+                &agent_name,
+                &model_name,
+                config.silence_cooldown,
+                "silence_detected",
+            )
+            .await;
             if let Some(result) = record_silence_detection(&agent_name, &model_name).await {
                 if result.extended_cooldown_applied {
                     extended_note = format!(
@@ -781,7 +787,13 @@ pub(crate) async fn tick_recover_stuck_tasks(
                 .unwrap_or_default();
 
             if !agent_name.is_empty() && !model_name.is_empty() {
-                set_model_cooldown(&agent_name, &model_name, config.silence_cooldown).await;
+                set_model_cooldown(
+                    &agent_name,
+                    &model_name,
+                    config.silence_cooldown,
+                    "silence_detected",
+                )
+                .await;
                 record_agent_failure_with_message(
                     &agent_name,
                     &format!(
@@ -1226,7 +1238,13 @@ pub(crate) async fn tick_recover_stuck_tasks(
                 .unwrap_or_default();
 
             if !agent_name.is_empty() && !model_name.is_empty() {
-                set_model_cooldown(&agent_name, &model_name, config.silence_cooldown).await;
+                set_model_cooldown(
+                    &agent_name,
+                    &model_name,
+                    config.silence_cooldown,
+                    "silence_detected",
+                )
+                .await;
                 record_agent_failure_with_message(
                     &agent_name,
                     &format!(
@@ -4411,7 +4429,13 @@ mod tests {
 
         // Simulate a billing/rate-limit cooldown recorded for minimax:opus after
         // this task was routed but before it dispatched.
-        crate::engine::cooldown::set_model_cooldown("minimax", "opus", 300).await;
+        crate::engine::cooldown::set_model_cooldown(
+            "minimax",
+            "opus",
+            300,
+            "rate_limit_usage_window",
+        )
+        .await;
 
         let dispatch_mode = DispatchMode {
             is_degraded: false,

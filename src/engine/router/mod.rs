@@ -3054,8 +3054,8 @@ Hope that helps!"#;
             ..Default::default()
         };
         let router = Router::new(config);
-        set_model_cooldown("claude", "haiku-4-5-20251001", 300).await; // 5 min
-        set_model_cooldown("opencode", "haiku-4-5-20251001", 600).await; // 10 min
+        set_model_cooldown("claude", "haiku-4-5-20251001", 300, "silence_detected").await; // 5 min
+        set_model_cooldown("opencode", "haiku-4-5-20251001", 600, "silence_detected").await; // 10 min
 
         let earliest = router.earliest_pool_cooldown();
         assert!(earliest.is_some());
@@ -3079,9 +3079,9 @@ Hope that helps!"#;
         };
         let router = Router::new(config);
         // Set cooldown on a non-pool model — should not affect earliest_pool_cooldown
-        set_model_cooldown("claude", "opus", 999).await;
+        set_model_cooldown("claude", "opus", 999, "silence_detected").await;
         // Set cooldown on a pool entry (opencode:pool-model-b)
-        set_model_cooldown("opencode", "pool-model-b", 300).await;
+        set_model_cooldown("opencode", "pool-model-b", 300, "silence_detected").await;
 
         let earliest = router.earliest_pool_cooldown();
         assert!(earliest.is_some());
