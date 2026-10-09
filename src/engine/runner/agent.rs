@@ -129,6 +129,11 @@ export GIT_AUTHOR_NAME={sq_git_name}
 export GIT_COMMITTER_NAME={sq_git_name}
 export GIT_AUTHOR_EMAIL={sq_git_email}
 export GIT_COMMITTER_EMAIL={sq_git_email}
+# Env config overrides the operator's global commit.gpgsign, the signing agent
+# (1Password etc) is often locked in unattended sessions and blocks `git commit`
+export GIT_CONFIG_COUNT="1"
+export GIT_CONFIG_KEY_0="commit.gpgsign"
+export GIT_CONFIG_VALUE_0="false"
 export TASK_ID={sq_task_id}
 export OUTPUT_FILE={sq_output_file}
 unset CLAUDECODE  # allow nested claude invocations from orch
@@ -688,6 +693,18 @@ mod tests {
 
         assert!(runner_script.contains("CMD_STATUS=${PIPESTATUS[0]:-0}"));
         assert!(runner_script.contains("exit $CMD_STATUS"));
+    }
+
+    #[test]
+    fn tmux_runner_script_disables_commit_signing() {
+        // Locked signing agent must not fail `git commit` inside agent sessions
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let inv = test_invocation("gpgsign-test");
+        let (runner_script, _) = build_tmux_runner_scripts(&inv, "echo hello", tmp.path())
+            .expect("runner scripts should build");
+
+        assert!(runner_script.contains("GIT_CONFIG_KEY_0=\"commit.gpgsign\""));
+        assert!(runner_script.contains("GIT_CONFIG_VALUE_0=\"false\""));
     }
 
     #[test]
