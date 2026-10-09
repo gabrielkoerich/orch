@@ -382,42 +382,15 @@ impl OpenCodeRunner {
             |event| {
                 let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 match event_type {
-                    "error" => {
-                        // OpenCode error events have multiple shapes:
-                        // 1. {"type":"error","message":"..."}
-                        // 2. {"type":"error","error":"string message"}
-                        // 3. {"type":"error","error":{"name":"...","data":{"message":"..."}}}
-                        Some(
-                            event
-                                .get("message")
-                                .and_then(|v| v.as_str())
-                                .or_else(|| event.get("error").and_then(|v| v.as_str()))
-                                .or_else(|| {
-                                    event
-                                        .get("error")
-                                        .and_then(|e| e.get("data"))
-                                        .and_then(|d| d.get("message"))
-                                        .and_then(|m| m.as_str())
-                                })
-                                .or_else(|| {
-                                    event
-                                        .get("error")
-                                        .and_then(|e| e.get("name"))
-                                        .and_then(|n| n.as_str())
-                                })
-                                .unwrap_or("unknown error")
-                                .to_string(),
-                        )
-                    }
+                    "error" => Some(opencode_error_text(event)),
                     "step_finish" => {
                         let part = event.get("part")?;
                         let reason = part.get("reason").and_then(|v| v.as_str()).unwrap_or("");
                         if reason == "error" || reason == "failed" {
                             Some(
                                 part.get("error")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("step failed")
-                                    .to_string(),
+                                    .map(error_value_text)
+                                    .unwrap_or_else(|| "step failed".to_string()),
                             )
                         } else {
                             None
@@ -428,6 +401,40 @@ impl OpenCodeRunner {
             },
             classify_opencode_message,
         )
+    }
+}
+
+/// Render an error value as text: strings as-is, objects by their message/name or raw JSON
+fn error_value_text(v: &serde_json::Value) -> String {
+    if let Some(s) = v.as_str() {
+        return s.to_string();
+    }
+    v.get("data")
+        .and_then(|d| d.get("message").or(Some(d)))
+        .and_then(|m| m.as_str())
+        .or_else(|| v.get("message").and_then(|m| m.as_str()))
+        .or_else(|| v.get("name").and_then(|n| n.as_str()))
+        .map(str::to_string)
+        .unwrap_or_else(|| v.to_string())
+}
+
+/// Extract the message from an opencode `error` event, keeping the raw JSON when no shape matches
+fn opencode_error_text(event: &serde_json::Value) -> String {
+    if let Some(s) = event.get("message").and_then(|v| v.as_str()) {
+        return s.to_string();
+    }
+    match event.get("error") {
+        Some(e) => {
+            let text = error_value_text(e);
+            if e.is_object() && text == *e {
+                tracing::warn!(event = %event, "unrecognized opencode error event shape");
+            }
+            text
+        }
+        None => {
+            tracing::warn!(event = %event, "unrecognized opencode error event shape");
+            event.to_string()
+        }
     }
 }
 
@@ -1913,5 +1920,30 @@ mod tests {
     #[test]
     fn find_opencode_result_plain_text_returns_none() {
         assert!(find_opencode_result("just some plain text").is_none());
+    }
+}
+
+#[cfg(test)]
+mod error_text_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn unrecognized_error_shape_keeps_raw_json() {
+        let e = json!({"type":"error","error":{"code":429,"detail":"slow down"}});
+        assert!(opencode_error_text(&e).contains("slow down"));
+        let e = json!({"type":"error"});
+        assert!(opencode_error_text(&e).contains("\"type\""));
+    }
+
+    #[test]
+    fn known_shapes_still_extract() {
+        assert_eq!(opencode_error_text(&json!({"message":"a"})), "a");
+        assert_eq!(opencode_error_text(&json!({"error":"b"})), "b");
+        assert_eq!(opencode_error_text(&json!({"error":{"message":"c"}})), "c");
+        assert_eq!(
+            opencode_error_text(&json!({"error":{"name":"N","data":{"message":"d"}}})),
+            "d"
+        );
     }
 }
