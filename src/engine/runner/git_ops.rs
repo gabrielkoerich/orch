@@ -413,7 +413,8 @@ pub async fn auto_commit(
     // git commit — override author/committer to match the agent identity
     let (git_name, git_email) = git_identity(agent);
     let commit = Command::new("git")
-        .args(["commit", "-m", &commit_msg])
+        // Same policy as the rebase path: never depend on the operator's signing agent
+        .args(["-c", "commit.gpgsign=false", "commit", "-m", &commit_msg])
         .env("GIT_AUTHOR_NAME", &git_name)
         .env("GIT_COMMITTER_NAME", &git_name)
         .env("GIT_AUTHOR_EMAIL", &git_email)
@@ -904,7 +905,8 @@ async fn strip_workflow_files(dir: &Path, default_branch: &str) -> anyhow::Resul
 
     let (git_name, git_email) = git_identity("orchestrator");
     let commit = Command::new("git")
-        .args(["commit", "-m", &commit_msg])
+        // Same policy as the rebase path: never depend on the operator's signing agent
+        .args(["-c", "commit.gpgsign=false", "commit", "-m", &commit_msg])
         .env("GIT_AUTHOR_NAME", &git_name)
         .env("GIT_COMMITTER_NAME", &git_name)
         .env("GIT_AUTHOR_EMAIL", &git_email)
@@ -2138,6 +2140,50 @@ mod tests {
         assert!(!has_changes(&dir).await);
 
         // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn auto_commit_ignores_repo_signing_config() {
+        // Repo demands signing via a signer that always fails — auto_commit
+        // must still commit (it passes -c commit.gpgsign=false)
+        let dir =
+            std::env::temp_dir().join(format!("orch_test_auto_commit_gpg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["config", "commit.gpgsign", "true"],
+            vec!["config", "gpg.program", "/usr/bin/false"],
+        ] {
+            let _ = Command::new("git")
+                .args(&args)
+                .current_dir(&dir)
+                .output()
+                .await;
+        }
+        std::fs::write(dir.join("init.txt"), "init").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "init.txt"])
+            .current_dir(&dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .output()
+            .await;
+
+        std::fs::write(dir.join("signed_off.txt"), "content").unwrap();
+        assert!(has_changes(&dir).await);
+
+        let result = auto_commit(&dir, "3", "Test title", "test", 1).await;
+        assert!(result.unwrap());
+        assert!(!has_changes(&dir).await);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
