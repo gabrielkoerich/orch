@@ -14,3 +14,4 @@ opencode.json
 /skills/
 tasks.yml
 tasks.yml.lock*
+.DS_Store
