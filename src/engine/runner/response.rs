@@ -651,6 +651,19 @@ pub struct ReviewIssue {
 /// by the agent-specific parser). Tries direct JSON parse, then markdown
 /// code block extraction.
 pub fn parse_review_response(text: &str) -> anyhow::Result<ReviewResponse> {
+    let resp = parse_review_json(text)?;
+    if matches!(resp.decision.as_str(), "approve" | "request_changes") {
+        return Ok(resp);
+    }
+
+    // Weak models echo the prompt template ("approve|request_changes"), strip it so it
+    // does not match the "request_changes" keyword
+    let stripped = text.replace("approve|request_changes", "");
+    infer_review_response_from_text(&stripped)
+        .ok_or_else(|| anyhow::anyhow!("invalid review decision: {}", resp.decision))
+}
+
+fn parse_review_json(text: &str) -> anyhow::Result<ReviewResponse> {
     // Try direct JSON parse
     if let Ok(resp) = serde_json::from_str::<ReviewResponse>(text) {
         return Ok(resp);
@@ -1178,6 +1191,16 @@ That's all."#;
         let resp = parse_review_response(text).unwrap();
         assert_eq!(resp.decision, "approve");
         assert_eq!(resp.notes, "LGTM");
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn parse_review_response_template_echo_infers_from_notes() {
+        let json = r#"{"decision":"approve|request_changes","notes":"LGTM","issues":[]}"#;
+        assert_eq!(parse_review_response(json).unwrap().decision, "approve");
+
+        let no_signal = r#"{"decision":"approve|request_changes","notes":"hmm","issues":[]}"#;
+        assert!(parse_review_response(no_signal).is_err());
     }
 
     #[serial(cooldown_state)]
