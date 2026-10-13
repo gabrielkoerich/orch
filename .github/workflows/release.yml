@@ -1,15 +1,15 @@
 name: CI
 
+# Push only, never pull_request, read "CI does not run on PRs" in AGENTS.md before changing this
 on:
   push:
-  pull_request:
   workflow_dispatch: {}
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.head_ref || github.ref_name }}
+  group: release-${{ github.ref_name }}
   cancel-in-progress: true
 
 jobs:
@@ -242,6 +242,7 @@ jobs:
 
   # Runs the copy-on-write worktree tests where clonefile works. The test fails if the probe finds no clone support.
   test-cow-macos:
+    if: github.ref == 'refs/heads/main'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
@@ -260,6 +261,7 @@ jobs:
 
   # Runs the copy-on-write worktree tests on an XFS reflink loop volume. The test fails if the probe finds no clone support.
   test-cow-linux:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

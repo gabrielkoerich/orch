@@ -488,7 +488,16 @@ External-contributor PRs (forks, first-time contributors, anyone outside the tru
 
 **Sandboxing is not a substitute for static review.** A clean `cargo nextest run` proves nothing — by then `build.rs` has already run. Read every file in the diff first.
 
-**CI does not run on external PRs by design.** All workflows in `.github/workflows/` trigger on `push:` only — no `pull_request:` (and never `pull_request_target:`, which runs the workflow definition from the base branch but checks out the PR head with full secrets access — the classic supply-chain attack vector). PRs from forks do not auto-execute Actions. If CI verification on a fork is needed, a maintainer pulls the change into a branch on this repo after static review.
+**CI does not run on PRs by design.** All workflows in `.github/workflows/` trigger on `push:` only — no `pull_request:` (and never `pull_request_target:`, which runs the workflow definition from the base branch but checks out the PR head with full secrets access — the classic supply-chain attack vector). PRs from forks do not auto-execute Actions. If CI verification on a fork is needed, a maintainer pulls the change into a branch on this repo after static review.
+
+Do not add `pull_request:` back, not even to get GitHub's "Approve and run" button for first-time contributors. Commit `4cb7b176` did that and was undone for these reasons:
+
+- Orch's PRs come from branches in this repo. The `push:` run on the branch already reports the required checks (`check`, `test`, `secrets`) on the head commit, so the PR shows them without a PR trigger.
+- With both triggers, every push to a PR branch starts two CI runs. They share one concurrency group with `cancel-in-progress`, so the PR run cancels the push run and the Actions list fills with cancelled runs.
+- The duplicate runs double the macOS jobs. GitHub limits concurrent macOS runners per account, so extra macOS jobs queue and get dropped.
+- Fork PRs are rare and go through `just review-pr`. The owner can merge them without the checks.
+
+The `test-cow-*` jobs run on `main` only for the same reason: they test only `engine::runner::cow`, and the macOS one takes a macOS runner on every push.
 
 ## Agent sandbox
 
