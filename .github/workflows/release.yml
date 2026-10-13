@@ -97,7 +97,21 @@ jobs:
           cache-all-crates: true
           # cache-workspace-crates: true
 
+      # The whole suite uses an XFS reflink TMPDIR so the cow tests exercise cloning, they fail if the probe finds no clone support
+      - name: Create XFS reflink volume
+        run: |
+          command -v mkfs.xfs >/dev/null || sudo apt-get install -y xfsprogs
+          truncate -s 8G /tmp/xfs.img
+          mkfs.xfs -m reflink=1 /tmp/xfs.img
+          sudo mkdir /mnt/xfs
+          sudo mount -o loop /tmp/xfs.img /mnt/xfs
+          sudo mkdir /mnt/xfs/tmp
+          sudo chown -R "$USER" /mnt/xfs
+
       - name: Run tests with coverage
+        env:
+          ORCH_COW_EXPECT_CLONE: "1"
+          TMPDIR: /mnt/xfs/tmp
         run: cargo llvm-cov nextest --lcov --output-path lcov.info
 
       - name: Upload coverage artifact
@@ -239,36 +253,6 @@ jobs:
           echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
           echo "Version: $NEW_VERSION (${BUMP} bump)"
-
-  # Runs the copy-on-write worktree tests on an XFS reflink loop volume. The test fails if the probe finds no clone support.
-  test-cow-linux:
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.94.1
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-cow-linux"
-
-      - name: Create XFS reflink volume
-        run: |
-          command -v mkfs.xfs >/dev/null || sudo apt-get install -y xfsprogs
-          truncate -s 2G /tmp/xfs.img
-          mkfs.xfs -m reflink=1 /tmp/xfs.img
-          sudo mkdir /mnt/xfs
-          sudo mount -o loop /tmp/xfs.img /mnt/xfs
-          sudo mkdir /mnt/xfs/tmp
-          sudo chown -R "$USER" /mnt/xfs
-
-      - name: Run cow tests
-        env:
-          ORCH_COW_EXPECT_CLONE: "1"
-          TMPDIR: /mnt/xfs/tmp
-        run: cargo test --lib engine::runner::cow
 
   # The only macOS job, GitHub has few macOS arm64 runners and extra macOS jobs queue until they are dropped
   # Runs the clonefile cow tests on every main push and builds both release targets unless check-release skips

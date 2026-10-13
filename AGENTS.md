@@ -497,7 +497,7 @@ Do not add `pull_request:` back, not even to get GitHub's "Approve and run" butt
 - The duplicate runs double the macOS jobs. GitHub limits concurrent macOS runners per account, so extra macOS jobs queue and get dropped.
 - Fork PRs are rare and go through `just review-pr`. The owner can merge them without the checks.
 
-The copy-on-write tests run on `main` only for the same reason: they test only `engine::runner::cow`. On macOS they run inside `build-macos`, which is the only macOS job. GitHub has few macOS arm64 runners, and when a push asked for three, they queued until GitHub dropped them ("not acquired by Runner"). Do not split `build-macos` into a matrix or add another macOS job.
+The copy-on-write tests have no jobs of their own. On Linux they run in `test`, whose whole suite uses an XFS reflink `TMPDIR`. On macOS they run on `main` only, inside `build-macos`, which is the only macOS job. GitHub has few macOS arm64 runners, and when a push asked for three, they queued until GitHub dropped them ("not acquired by Runner"). Do not split `build-macos` into a matrix or add another macOS job.
 
 ## Agent sandbox
 
