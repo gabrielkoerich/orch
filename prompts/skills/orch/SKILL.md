@@ -1,6 +1,6 @@
 ---
 name: orch
-description: "Use when monitoring orch operations from this repository: daily reviews, retrospectives, agent-debugging, task health checks, blocked-task triage, routing/cooldown inspection, or global status reporting. Do not use this as a generic coding skill. Do not use it when the task is ordinary feature work unrelated to orch operations."
+description: "Use when monitoring orch operations from this repository: weekly reviews, retrospectives, agent-debugging, task health checks, blocked-task triage, routing/cooldown inspection, or global status reporting. Do not use this as a generic coding skill. Do not use it when the task is ordinary feature work unrelated to orch operations."
 ---
 
 # Orch Operations Skill
@@ -139,8 +139,8 @@ Do not re-file:
 
 ## Scope of edits from monitoring jobs
 
-The daily review and agent-debugger jobs should treat this file as reference material, not as something to rewrite opportunistically.
+The weekly review and agent-debugger jobs should treat this file as reference material, not as something to rewrite opportunistically.
 
-- Daily review: summarize, diagnose, and file issues when warranted.
+- Weekly review: summarize, diagnose, and file issues when warranted.
 - Agent debugger: analyze failures and file root-cause issues.
 - If you notice this skill has drifted from repo policy again, file or update a dedicated issue instead of patching random home-directory copies.

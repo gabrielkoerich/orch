@@ -1,27 +1,27 @@
 ---
-id: daily-review
-schedule: 0 23 * * *
-title: Daily review (last 24h)
+id: weekly-review
+schedule: 0 23 * * 0
+title: Weekly review (last 7 days)
 ---
 
-End-of-day review covering the last 24 hours. Your ONLY output is a summary post — do NOT modify code.
+End-of-week review covering the last 7 days. Your ONLY output is a summary post — do NOT modify code.
 
-## Gather context (last 24h)
+## Gather context (last 7 days)
 
-1. `git log --since="24 hours ago" --oneline` — everything that landed today
+1. `git log --since="7 days ago" --oneline` — everything that landed this week
 2. Read the most recent post in `./docs/content/posts/` — current state and prior context
 3. `gh issue list --state open` — what's still pending
-4. `gh issue list --state closed --limit 30` — what was resolved in the last 24h
+4. `gh issue list --state closed --limit 100` — what was resolved in the last 7 days
 5. `orch task list` — stuck, blocked, or failing tasks
 6. Read `./prompts/skills/orch/SKILL.md` — repo-tracked monitoring guidance and settled operational policy
 
-## Check operational health (last 24h)
+## Check operational health (last 7 days)
 
 1. Which tasks completed? What went well?
 2. Which tasks failed or needed retries? Why?
-3. Task/agent/model failure patterns: `sqlite3 ~/.orch/orch.db "SELECT agent, model, outcome, COUNT(*) FROM task_runs WHERE datetime(started_at) > datetime('now', '-24 hours') GROUP BY agent, model, outcome ORDER BY COUNT(*) DESC;"`
-4. If `task_activity` exists: `sqlite3 ~/.orch/orch.db "SELECT event_type, COUNT(*) FROM task_activity WHERE datetime(timestamp) > datetime('now', '-24 hours') GROUP BY event_type ORDER BY COUNT(*) DESC;" 2>/dev/null`
-5. Error patterns in `orch log 200`.
+3. Task/agent/model failure patterns: `sqlite3 ~/.orch/orch.db "SELECT agent, model, outcome, COUNT(*) FROM task_runs WHERE datetime(started_at) > datetime('now', '-7 days') GROUP BY agent, model, outcome ORDER BY COUNT(*) DESC;"`
+4. If `task_activity` exists: `sqlite3 ~/.orch/orch.db "SELECT event_type, COUNT(*) FROM task_activity WHERE datetime(timestamp) > datetime('now', '-7 days') GROUP BY event_type ORDER BY COUNT(*) DESC;" 2>/dev/null`
+5. Error patterns in `orch log 1000`.
 6. Is routing accurate? Any models failing silently? Any agents repeatedly cooled?
 7. Are agent prompts effective or do they need tuning?
 8. Performance bottlenecks (slow syncs, lock contention, API rate limits, dead models)?
@@ -29,10 +29,10 @@ End-of-day review covering the last 24 hours. Your ONLY output is a summary post
 
 ## Write the summary
 
-Save to `./docs/content/posts/daily-review-YYYY-MM-DD.md` (today's UTC date).
+Save to `./docs/content/posts/weekly-review-YYYY-MM-DD.md` (today's UTC date).
 If the file already exists, update it with new information or improvements. If there's nothing new to add, skip — don't rewrite or duplicate.
 
-Include: what shipped (commits + closed issues), what failed and why, operational health, stuck tasks, routing accuracy, and clear priorities for tomorrow.
+Include: what shipped (commits + closed issues), what failed and why, operational health, stuck tasks, routing accuracy, and clear priorities for next week.
 
 ## Create GitHub issues if needed
 
