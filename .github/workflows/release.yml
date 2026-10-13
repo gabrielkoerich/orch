@@ -296,38 +296,15 @@ jobs:
           path: dist/orch-arm64
           retention-days: 1
 
-  # Build Zola docs and deploy to GitHub Pages on every push to main.
-  deploy:
-    needs: [check, test, secrets]
-    if: github.ref == 'refs/heads/main'
-    concurrency:
-      group: pages
-      cancel-in-progress: false
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page-url }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - id: deployment
-        uses: gabrielkoerich/zola-docs-action@v1
-        with:
-          path: docs
-          zola-version: "0.22.1"
-          deploy: "true"
-          cloudflare-token: ${{ secrets.CF_API_TOKEN }}
-
   # Create GitHub release with binaries
   release:
-    needs: [deploy, check-release, build-macos]
+    needs: [check, test, secrets, check-release, build-macos]
     if: github.ref == 'refs/heads/main' && needs.check-release.outputs.skip == 'false'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Starts pages.yml, which a release made with GITHUB_TOKEN would not trigger
+      actions: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -427,6 +404,13 @@ jobs:
             checksums.txt
 
           echo "Created release $VERSION"
+
+      # The docs describe this release, so they go out after it and are built from its tag
+      - name: Publish the docs for this release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check-release.outputs.version }}
+        run: gh workflow run pages.yml --repo "$GITHUB_REPOSITORY" --ref main -f ref="$VERSION"
 
       - name: Update Homebrew formula
         env:

@@ -1,0 +1,49 @@
+name: Docs
+
+# Runs after each release, started by release.yml, or by hand after a theme change
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Tag or branch to build, the latest release when empty
+        default: ""
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page-url }}
+    steps:
+      - name: Pick the release to publish
+        id: ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.ref }}
+        run: |
+          if [ -z "$REF" ]; then
+            REF=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          fi
+          echo "Publishing the docs from $REF"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+
+      - id: deployment
+        uses: gabrielkoerich/zola-docs-action@v1
+        with:
+          path: docs
+          zola-version: "0.22.1"
+          deploy: "true"
+          cloudflare-token: ${{ secrets.CF_API_TOKEN }}
