@@ -2,6 +2,9 @@
 title = "Channels — Telegram, Discord & Slack"
 description = "Set up and operate the Telegram, Discord, and Slack integrations"
 weight = 8
+
+[extra]
+short_title = "Channels"
 +++
 
 Orch supports bidirectional communication via Telegram, Discord, and Slack. Each channel receives incoming commands and streams task completion notifications back to you.
