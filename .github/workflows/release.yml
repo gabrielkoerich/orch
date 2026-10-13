@@ -347,16 +347,17 @@ jobs:
       id-token: write
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.deployment.outputs.page-url }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: gabrielkoerich/zola-docs-action@v1
+      - id: deployment
+        uses: gabrielkoerich/zola-docs-action@v1
         with:
           path: docs
           zola-version: "0.22.1"
-      - id: deployment
-        uses: actions/deploy-pages@v4
+          deploy: "true"
+          cloudflare-token: ${{ secrets.CF_API_TOKEN }}
 
   # Create GitHub release with binaries
   release:
