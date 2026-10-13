@@ -240,25 +240,6 @@ jobs:
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
           echo "Version: $NEW_VERSION (${BUMP} bump)"
 
-  # Runs the copy-on-write worktree tests where clonefile works. The test fails if the probe finds no clone support.
-  test-cow-macos:
-    if: github.ref == 'refs/heads/main'
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.94.1
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-cow-macos"
-
-      - name: Run cow tests
-        env:
-          ORCH_COW_EXPECT_CLONE: "1"
-        run: cargo test --lib engine::runner::cow
-
   # Runs the copy-on-write worktree tests on an XFS reflink loop volume. The test fails if the probe finds no clone support.
   test-cow-linux:
     if: github.ref == 'refs/heads/main'
@@ -289,51 +270,57 @@ jobs:
           TMPDIR: /mnt/xfs/tmp
         run: cargo test --lib engine::runner::cow
 
-  # Cross-compile build jobs for macOS targets.
-  # Skip when check-release says skip=true (chore/docs commits).
+  # The only macOS job, GitHub has few macOS arm64 runners and extra macOS jobs queue until they are dropped
+  # Runs the clonefile cow tests on every main push and builds both release targets unless check-release skips
   build-macos:
     needs: [check-release]
-    if: github.ref == 'refs/heads/main' && needs.check-release.outputs.skip == 'false'
-    strategy:
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            arch: arm64
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            arch: x86_64
-    runs-on: ${{ matrix.os }}
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.94.1
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-build"
-          key: ${{ matrix.target }}
           cache-all-crates: true
 
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Run cow tests
+        env:
+          ORCH_COW_EXPECT_CLONE: "1"
+        run: cargo test --lib engine::runner::cow
+
+      - name: Build release binaries
+        if: needs.check-release.outputs.skip == 'false'
         env:
           ORCH_BUILD_VERSION: ${{ needs.check-release.outputs.version }}
-
-      - name: Package binary
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/orch dist/orch-${{ matrix.arch }}
-          chmod +x dist/orch-${{ matrix.arch }}
+          for pair in aarch64-apple-darwin:arm64 x86_64-apple-darwin:x86_64; do
+            target="${pair%%:*}"
+            cargo build --release --target "$target"
+            cp "target/$target/release/orch" "dist/orch-${pair##*:}"
+          done
+          chmod +x dist/orch-*
 
-      - name: Upload binary artifact
+      - name: Upload arm64 binary
+        if: needs.check-release.outputs.skip == 'false'
         uses: actions/upload-artifact@v4
         with:
-          name: orch-${{ matrix.arch }}
-          path: dist/orch-${{ matrix.arch }}
+          name: orch-arm64
+          path: dist/orch-arm64
+          retention-days: 1
+
+      - name: Upload x86_64 binary
+        if: needs.check-release.outputs.skip == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: orch-x86_64
+          path: dist/orch-x86_64
           retention-days: 1
 
   # Build Zola docs and deploy to GitHub Pages on every push to main.
