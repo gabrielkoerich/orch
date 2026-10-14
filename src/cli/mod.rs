@@ -107,18 +107,6 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Format NDJSON from stdin, e.g. `cat output.json | orch stream --pipe`
-pub fn stream_pipe() -> anyhow::Result<()> {
-    use std::io::{self, BufRead, IsTerminal};
-
-    let mut formatter = ndjson::Formatter::new(io::stdout().is_terminal());
-    for line in io::stdin().lock().lines() {
-        ndjson::print(&formatter.format(&line.unwrap_or_default()));
-    }
-
-    Ok(())
-}
-
 /// The orch review gate workflow template, loaded from the repo's own workflow file.
 /// Installed by `orch init` into `.github/workflows/orch-review.yml`.
 const ORCH_REVIEW_WORKFLOW: &str = include_str!("../../.github/workflows/orch-review.yml");

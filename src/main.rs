@@ -377,10 +377,6 @@ enum Commands {
         /// Print raw NDJSON instead of human-readable output (deprecated: use `--formatted=false`)
         #[arg(long, hide = true)]
         raw: bool,
-        /// Read NDJSON from stdin and pipe through the NDJSON formatter.
-        /// Example: `cat output.json | orch stream --pipe`
-        #[arg(long, default_value_t = false)]
-        pipe: bool,
     },
     /// Chat with the orch control session
     #[command(
@@ -1090,14 +1086,8 @@ async fn async_main() -> anyhow::Result<()> {
             task_id,
             formatted,
             raw,
-            pipe,
         } => {
             let formatted = if raw { false } else { formatted };
-            if pipe {
-                // Read NDJSON from stdin and format lines
-                cli::stream_pipe()?;
-                return Ok(());
-            }
             cli::stream::run(task_id.as_deref(), formatted).await?;
         }
         Commands::Chat {
