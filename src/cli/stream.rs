@@ -83,6 +83,7 @@ pub async fn run(task_id: Option<&str>, formatted: bool) -> anyhow::Result<()> {
             said_waiting = true;
         }
 
+        let live: Vec<String> = found.iter().map(|(key, _)| key.clone()).collect();
         for (key, path) in found {
             let tail = tails
                 .entry(key)
@@ -90,7 +91,10 @@ pub async fn run(task_id: Option<&str>, formatted: bool) -> anyhow::Result<()> {
             if tail.path != path {
                 *tail = Tail::open(path, color);
             }
+        }
 
+        // A session that just ended gets this last read, its final message lands after the work
+        for tail in tails.values_mut() {
             let mut entries = Vec::new();
             for line in tail.read_lines() {
                 if formatted {
@@ -121,6 +125,7 @@ pub async fn run(task_id: Option<&str>, formatted: bool) -> anyhow::Result<()> {
                 println!("{line}");
             }
         }
+        tails.retain(|key, _| live.contains(key));
 
         std::io::stdout().flush()?;
         tokio::time::sleep(Duration::from_secs(1)).await;
