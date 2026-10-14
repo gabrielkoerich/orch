@@ -73,6 +73,8 @@ pub async fn run(task_id: Option<&str>, formatted: bool) -> anyhow::Result<()> {
     }
 
     let mut tails: HashMap<String, Tail> = HashMap::new();
+    let mut colors: HashMap<String, &str> = HashMap::new();
+    let mut tag_width = 0;
     let mut last_label = String::new();
     loop {
         for (key, path) in sources(task_id).await {
@@ -92,6 +94,27 @@ pub async fn run(task_id: Option<&str>, formatted: bool) -> anyhow::Result<()> {
                 }
             }
             if entries.is_empty() {
+                continue;
+            }
+
+            // Many agents interleave, so every entry carries its task, one watched task gets headers
+            if task_id.is_none() {
+                let tag = tag(&tail.path);
+                tag_width = tag_width.max(tag.chars().count());
+                let next = TAG_COLORS[colors.len() % TAG_COLORS.len()];
+                let code = *colors.entry(key_of(&tail.path)).or_insert(next);
+                let gutter = |show: bool| {
+                    let text = if show { tag.as_str() } else { "" };
+                    let text = format!("{text:<tag_width$} │");
+                    if color {
+                        format!("\x1b[{code}m{text}\x1b[0m")
+                    } else {
+                        text
+                    }
+                };
+                for line in tag_lines(&entries, formatted, gutter) {
+                    println!("{line}");
+                }
                 continue;
             }
 
@@ -188,16 +211,54 @@ fn subdirs(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `<repo> <task> · attempt <n>` from `.../<repo>/tasks/<task>/attempts/<n>/output.json`
-fn label(path: &Path) -> String {
-    let parts: Vec<String> = path
-        .iter()
+const TAG_COLORS: [&str; 6] = ["36", "35", "33", "34", "96", "95"];
+
+/// Entry lines with `gutter(true)` on each step's first line and `gutter(false)` on the rest
+fn tag_lines(entries: &[String], formatted: bool, gutter: impl Fn(bool) -> String) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in entries {
+        let step = !formatted || !entry.starts_with(ndjson::RESULT_PREFIX);
+        if formatted && step {
+            out.push(gutter(false));
+        }
+
+        for (i, line) in entry.lines().enumerate() {
+            out.push(format!("{} {line}", gutter(step && i == 0)));
+        }
+    }
+    out
+}
+
+/// `<repo>#<task> a<n>` from `.../<repo>/tasks/<task>/attempts/<n>/output.json`
+fn tag(path: &Path) -> String {
+    match path_parts(path).as_slice() {
+        [attempt, _, task, _, repo] => {
+            let task = task.strip_prefix("internal:").unwrap_or(task);
+            format!("{repo}#{task} a{attempt}")
+        }
+        _ => path.display().to_string(),
+    }
+}
+
+/// Task dir of an output file, so a task keeps its colour across attempts
+fn key_of(path: &Path) -> String {
+    path.ancestors()
+        .nth(3)
+        .map_or_else(String::new, |p| p.display().to_string())
+}
+
+fn path_parts(path: &Path) -> Vec<String> {
+    path.iter()
         .rev()
         .skip(1)
         .take(5)
         .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    match parts.as_slice() {
+        .collect()
+}
+
+/// `<repo> <task> · attempt <n>` from `.../<repo>/tasks/<task>/attempts/<n>/output.json`
+fn label(path: &Path) -> String {
+    match path_parts(path).as_slice() {
         [attempt, _, task, _, repo] => format!("{repo} {task} · attempt {attempt}"),
         _ => path.display().to_string(),
     }
@@ -243,5 +304,43 @@ mod tests {
     fn label_from_attempt_path() {
         let path = Path::new("/s/owner/repo/tasks/3601-review/attempts/2/output.json");
         assert_eq!(label(path), "repo 3601-review · attempt 2");
+    }
+
+    #[test]
+    fn tag_drops_internal_prefix() {
+        let path = Path::new("/s/owner/bean/tasks/internal:189488-review/attempts/1/output.json");
+        assert_eq!(tag(path), "bean#189488-review a1");
+        assert_eq!(key_of(path), "/s/owner/bean/tasks/internal:189488-review");
+    }
+
+    #[test]
+    fn tag_lines_label_each_step_only() {
+        let entries = vec![
+            "⏺ Read(a.rs)".to_string(),
+            "  ⎿  Read 3 lines".to_string(),
+            "⏺ Fixing it.\n  Then test.".to_string(),
+        ];
+        let gutter = |show: bool| if show { "t1 │" } else { "   │" }.to_string();
+        assert_eq!(
+            tag_lines(&entries, true, gutter),
+            vec![
+                "   │",
+                "t1 │ ⏺ Read(a.rs)",
+                "   │   ⎿  Read 3 lines",
+                "   │",
+                "t1 │ ⏺ Fixing it.",
+                "   │   Then test.",
+            ]
+        );
+    }
+
+    #[test]
+    fn tag_lines_raw_tags_every_line() {
+        let entries = vec!["{\"a\":1}".to_string(), "{\"b\":2}".to_string()];
+        let gutter = |show: bool| if show { "t │" } else { "  │" }.to_string();
+        assert_eq!(
+            tag_lines(&entries, false, gutter),
+            vec!["t │ {\"a\":1}", "t │ {\"b\":2}"]
+        );
     }
 }
