@@ -13,7 +13,10 @@
 //! while delegating command building and routing to `ClaudeRunner`.
 
 use super::claude::ClaudeRunner;
-use super::{truncate_at_char_boundary, AgentError, AgentRunner, ParsedResponse, PermissionRules};
+use super::{
+    truncate_at_char_boundary, AgentError, AgentRunner, ParsedResponse, PermissionRules,
+    StreamEvent,
+};
 
 /// Count Edit and Write tool_use events in NDJSON stream output.
 fn count_edit_tools(raw: &str) -> usize {
@@ -135,6 +138,10 @@ impl AgentRunner for MiniMaxClaudeRunner {
     #[cfg(test)]
     fn name(&self) -> &str {
         self.inner.name()
+    }
+
+    fn stream_events(&self, event: &serde_json::Value) -> Vec<StreamEvent> {
+        self.inner.stream_events(event)
     }
 
     fn build_command(

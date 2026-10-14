@@ -44,7 +44,10 @@
 //! {"type":"turn.failed","error":{"message":"..."}}
 //! ```
 
-use super::{AgentError, AgentRunner, ParsedResponse, PermissionRules, SandboxLevel};
+use super::{
+    json_error_message, json_str, AgentError, AgentRunner, ParsedResponse, PermissionRules,
+    SandboxLevel, StreamEvent,
+};
 use crate::parser;
 
 /// Runner for Codex agent.
@@ -197,6 +200,10 @@ impl AgentRunner for CodexRunner {
     #[cfg(test)]
     fn name(&self) -> &str {
         "codex"
+    }
+
+    fn stream_events(&self, event: &serde_json::Value) -> Vec<StreamEvent> {
+        stream_events(event)
     }
 
     fn extract_text(&self, raw: &str) -> Result<String, AgentError> {
@@ -948,5 +955,159 @@ mod tests {
         let result = find_codex_result(ndjson).expect("should find result");
         assert!(!result.is_error);
         assert_eq!(result.result_text, "All tests passed");
+    }
+}
+
+// Codex wraps every command as `/bin/zsh -lc '<command>'` or `-lc "<command>"`
+static SHELL_WRAP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"(?s)^\S*/(?:ba|z)?sh -l?c (?:'(.*)'|"(.*)")$"#)
+        .expect("shell wrap regex is valid")
+});
+
+/// Codex `--json`: each finished step is an `item.completed` event
+fn stream_events(v: &serde_json::Value) -> Vec<StreamEvent> {
+    match json_str(v, "/type") {
+        "item.completed" => item_events(&v["item"]),
+        "turn.completed" => vec![StreamEvent::Done(String::new())],
+        "turn.failed" | "error" => vec![StreamEvent::Error(json_error_message(v))],
+        _ => vec![],
+    }
+}
+
+fn item_events(item: &serde_json::Value) -> Vec<StreamEvent> {
+    let id = json_str(item, "/id").to_string();
+    let call = |name: &str, input: serde_json::Value| StreamEvent::ToolCall {
+        id: id.clone(),
+        name: name.to_string(),
+        input,
+    };
+    match json_str(item, "/type") {
+        "agent_message" => vec![StreamEvent::Text(json_str(item, "/text").to_string())],
+        "reasoning" => vec![StreamEvent::Thinking(json_str(item, "/text").to_string())],
+        "command_execution" => {
+            let command = json_str(item, "/command");
+            let command = SHELL_WRAP
+                .captures(command)
+                .and_then(|c| c.get(1).or(c.get(2)))
+                .map_or(command, |m| m.as_str());
+            vec![
+                call("Bash", serde_json::json!({ "command": command })),
+                StreamEvent::ToolResult {
+                    id: id.clone(),
+                    name: "Bash".to_string(),
+                    output: json_str(item, "/aggregated_output").to_string(),
+                    is_error: item["exit_code"].as_i64().is_some_and(|c| c != 0),
+                },
+            ]
+        }
+        "file_change" => item["changes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|c| call("Edit", serde_json::json!({ "path": c["path"] })))
+            .collect(),
+        "mcp_tool_call" => {
+            let name = format!("{}.{}", json_str(item, "/server"), json_str(item, "/tool"));
+            vec![call(&name, item["arguments"].clone())]
+        }
+        "web_search" => vec![call(
+            "Search",
+            serde_json::json!({ "query": json_str(item, "/query") }),
+        )],
+        "error" => vec![StreamEvent::Error(json_str(item, "/message").to_string())],
+        _ => vec![],
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn events(line: &str) -> Vec<StreamEvent> {
+        CodexRunner.stream_events(&serde_json::from_str(line).unwrap())
+    }
+
+    #[test]
+    fn message_and_reasoning() {
+        let msg = r#"{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"Fixing."}}"#;
+        assert_eq!(events(msg), vec![StreamEvent::Text("Fixing.".into())]);
+        let think =
+            r#"{"type":"item.completed","item":{"id":"i1","type":"reasoning","text":"**Plan**"}}"#;
+        assert_eq!(
+            events(think),
+            vec![StreamEvent::Thinking("**Plan**".into())]
+        );
+    }
+
+    #[test]
+    fn command_unwraps_shell_and_carries_result() {
+        let line = r#"{"type":"item.completed","item":{"id":"i2","type":"command_execution","command":"/bin/zsh -lc 'git status --short'","aggregated_output":"M a.rs\n","exit_code":1}}"#;
+        assert_eq!(
+            events(line),
+            vec![
+                StreamEvent::ToolCall {
+                    id: "i2".into(),
+                    name: "Bash".into(),
+                    input: json!({"command": "git status --short"}),
+                },
+                StreamEvent::ToolResult {
+                    id: "i2".into(),
+                    name: "Bash".into(),
+                    output: "M a.rs\n".into(),
+                    is_error: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn command_unwraps_double_quoted_shell() {
+        let line = r#"{"type":"item.completed","item":{"id":"i4","type":"command_execution","command":"/bin/zsh -lc \"rg --files .github\"","aggregated_output":"","exit_code":0}}"#;
+        assert_eq!(
+            events(line)[0],
+            StreamEvent::ToolCall {
+                id: "i4".into(),
+                name: "Bash".into(),
+                input: json!({"command": "rg --files .github"}),
+            }
+        );
+    }
+
+    #[test]
+    fn file_change_is_an_edit_per_path() {
+        let line = r#"{"type":"item.completed","item":{"id":"i3","type":"file_change","changes":[{"path":"a.rs","kind":"update"},{"path":"b.rs","kind":"add"}]}}"#;
+        let calls: Vec<String> = events(line)
+            .into_iter()
+            .map(|e| match e {
+                StreamEvent::ToolCall { name, input, .. } => format!("{name} {}", input["path"]),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(calls, vec![r#"Edit "a.rs""#, r#"Edit "b.rs""#]);
+    }
+
+    #[test]
+    fn errors_and_turn_end() {
+        assert_eq!(
+            events(r#"{"type":"error","message":"Reconnecting... 2/5"}"#),
+            vec![StreamEvent::Error("Reconnecting... 2/5".into())]
+        );
+        assert_eq!(
+            events(r#"{"type":"turn.failed","error":{"message":"quota exceeded"}}"#),
+            vec![StreamEvent::Error("quota exceeded".into())]
+        );
+        assert_eq!(
+            events(r#"{"type":"turn.completed","usage":{}}"#),
+            vec![StreamEvent::Done(String::new())]
+        );
+    }
+
+    #[test]
+    fn started_items_are_dropped() {
+        let started =
+            r#"{"type":"item.started","item":{"type":"command_execution","command":"ls"}}"#;
+        assert!(events(started).is_empty());
+        assert!(events(r#"{"type":"thread.started","thread_id":"t"}"#).is_empty());
     }
 }

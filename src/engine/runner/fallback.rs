@@ -842,6 +842,13 @@ mod tests {
     }
 
     impl AgentRunner for MockRunnerWithModels {
+        fn stream_events(
+            &self,
+            _event: &serde_json::Value,
+        ) -> Vec<crate::engine::runner::agents::StreamEvent> {
+            vec![]
+        }
+
         fn name(&self) -> &str {
             "opencode"
         }
@@ -898,6 +905,13 @@ mod tests {
     }
 
     impl AgentRunner for MockRunner {
+        fn stream_events(
+            &self,
+            _event: &serde_json::Value,
+        ) -> Vec<crate::engine::runner::agents::StreamEvent> {
+            vec![]
+        }
+
         fn name(&self) -> &str {
             "opencode"
         }

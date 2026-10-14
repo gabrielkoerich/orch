@@ -2663,6 +2663,10 @@ mod tests {
             "opencode"
         }
 
+        fn stream_events(&self, _event: &serde_json::Value) -> Vec<agents::StreamEvent> {
+            vec![]
+        }
+
         fn build_command(
             &self,
             _model: Option<&str>,
