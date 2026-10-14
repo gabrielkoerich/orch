@@ -12,19 +12,16 @@ pub mod prune;
 pub mod service;
 pub mod session;
 pub mod stats;
+pub mod stream;
 pub mod task;
 pub mod tree;
 pub mod webhook;
 
-use crate::channels::capture::CaptureService;
-use crate::channels::transport::Transport;
-use crate::channels::OutputChunk;
 use crate::cmd::SyncCommandErrorContext;
 use crate::config;
 use crate::engine::tasks::TaskManager;
 use anyhow::Context;
 use std::sync::Arc;
-use tokio::sync::broadcast;
 
 /// Initialize orch for a project.
 pub fn init(repo: Option<String>) -> anyhow::Result<()> {
@@ -110,22 +107,13 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Read NDJSON lines from stdin and format each line with `ndjson::format_line`.
-/// This is intended as a lightweight pipe mode so external tools (tmux capture)
-/// can reuse the CLI's NDJSON formatter without running the full orch service.
+/// Format NDJSON from stdin, e.g. `cat output.json | orch stream --pipe`
 pub fn stream_pipe() -> anyhow::Result<()> {
-    use std::io::{self, BufRead};
+    use std::io::{self, BufRead, IsTerminal};
 
-    let stdin = io::stdin();
-    let handle = stdin.lock();
-    for line in handle.lines() {
-        let line = line.unwrap_or_default();
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(formatted) = ndjson::format_line(&line) {
-            println!("{}", formatted);
-        }
+    let mut formatter = ndjson::Formatter::new(io::stdout().is_terminal());
+    for line in io::stdin().lock().lines() {
+        ndjson::print(&formatter.format(&line.unwrap_or_default()));
     }
 
     Ok(())
@@ -423,260 +411,6 @@ pub fn parse_since(s: &str) -> Option<u32> {
         // bare number treated as hours
         s.parse::<u32>().ok()
     }
-}
-
-/// Print a content chunk in human-readable form, formatting each NDJSON line.
-///
-/// Multi-line chunks are split and each line is formatted independently.
-/// Lines that `ndjson::format_line` maps to `None` are suppressed.
-fn print_formatted(content: &str) {
-    for line in content.lines() {
-        if let Some(formatted) = ndjson::format_line(line) {
-            println!("{formatted}");
-        }
-    }
-    // If the content doesn't end with a newline, `lines()` already handles that,
-    // but we may need to flush for non-newline-terminated partial lines.
-}
-
-/// Stream live output from a running task.
-///
-/// When `formatted` is true (default), NDJSON lines are parsed and formatted
-/// into human-readable output. Pass `formatted: false` to print raw NDJSON.
-pub async fn stream_task(task_id: &str, formatted: bool) -> anyhow::Result<()> {
-    let transport = Arc::new(Transport::new());
-
-    let tmux = crate::tmux::TmuxManager::new();
-    let repo = crate::config::get_current_repo().unwrap_or_default();
-    let session_name = tmux.session_name(&repo, task_id);
-    transport
-        .bind(&repo, task_id, &session_name, "cli", "stream", None)
-        .await;
-
-    // Start a CaptureService to poll the tmux session and push chunks to transport.
-    // This is necessary because the CLI's Transport is isolated from the engine's.
-    let capture = Arc::new(CaptureService::new(transport.clone()));
-    capture
-        .register_session(&repo, task_id, &session_name)
-        .await;
-    let capture_handle = tokio::spawn({
-        let capture = capture.clone();
-        async move { capture.run().await }
-    });
-
-    let mut rx = match transport.subscribe(&repo, task_id).await {
-        Some(rx) => rx,
-        None => {
-            capture_handle.abort();
-            anyhow::bail!("no active session for task {}", task_id);
-        }
-    };
-
-    println!(
-        "Streaming output from task {} (session: {})",
-        task_id, session_name
-    );
-    println!("Press Ctrl+C to stop streaming");
-    println!("---");
-
-    loop {
-        match rx.recv().await {
-            Ok(chunk) => {
-                if formatted {
-                    print_formatted(&chunk.content);
-                } else {
-                    print!("{}", chunk.content);
-                }
-                std::io::Write::flush(&mut std::io::stdout())?;
-
-                if chunk.is_final {
-                    println!("\n--- Stream ended ---");
-                    break;
-                }
-            }
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!("skipped {} missed messages", n);
-            }
-            Err(broadcast::error::RecvError::Closed) => {
-                println!("\n--- Stream closed ---");
-                break;
-            }
-        }
-    }
-
-    // Clean up: unregister and stop capture
-    capture.unregister_session(&repo, task_id).await;
-    capture_handle.abort();
-
-    Ok(())
-}
-
-/// Stream output from all running orch tmux sessions.
-///
-/// Discovers sessions on startup and every tick, automatically picking up
-/// new sessions that appear while streaming. Prefixes each line with the
-/// session name so interleaved output is distinguishable.
-///
-/// When `formatted` is true (default), NDJSON lines are formatted into
-/// human-readable output. Pass `formatted: false` to print raw NDJSON.
-pub async fn stream_all(formatted: bool) -> anyhow::Result<()> {
-    use std::collections::HashSet;
-    use tokio::sync::broadcast;
-
-    let transport = Arc::new(crate::channels::transport::Transport::new());
-    let capture = Arc::new(crate::channels::capture::CaptureService::new(
-        transport.clone(),
-    ));
-
-    // Track which sessions we've already registered
-    let known: Arc<tokio::sync::Mutex<HashSet<String>>> =
-        Arc::new(tokio::sync::Mutex::new(HashSet::new()));
-
-    // Discover sessions and register any new ones. Returns list of newly added session names.
-    let discover = {
-        let transport = transport.clone();
-        let capture = capture.clone();
-        let known = known.clone();
-        move || {
-            let transport = transport.clone();
-            let capture = capture.clone();
-            let known = known.clone();
-            async move {
-                let sessions = crate::channels::tmux::list_orch_sessions()
-                    .await
-                    .unwrap_or_default();
-                let mut added = Vec::new();
-                let mut known = known.lock().await;
-                for session in sessions {
-                    if known.contains(&session) {
-                        continue;
-                    }
-                    // Use session name as the task key (unique, descriptive)
-                    transport
-                        .bind("cli", &session, &session, "cli", "stream-all", None)
-                        .await;
-                    capture.register_session("cli", &session, &session).await;
-                    known.insert(session.clone());
-                    added.push(session);
-                }
-                added
-            }
-        }
-    };
-
-    // Initial discovery
-    let initial = discover().await;
-    if initial.is_empty() {
-        println!("No running orch sessions found. Waiting for sessions...");
-    } else {
-        println!(
-            "Streaming {} session(s): {}",
-            initial.len(),
-            initial.join(", ")
-        );
-    }
-    println!("Press Ctrl+C to stop");
-    println!("---");
-
-    // Spawn capture loop (runs while sessions are registered, but we keep re-discovering)
-    let capture_handle = tokio::spawn({
-        let capture = capture.clone();
-        async move { capture.start().await }
-    });
-
-    // Spawn discovery loop — checks for new sessions every 3 seconds
-    let discover_handle = tokio::spawn({
-        let discover = discover.clone();
-        async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
-            loop {
-                interval.tick().await;
-                let added = discover().await;
-                for s in &added {
-                    eprintln!("+ new session: {s}");
-                }
-            }
-        }
-    });
-
-    // Merge output from all sessions via a single aggregated channel.
-    // We poll transport bindings periodically and subscribe to new ones.
-    let (merged_tx, mut merged_rx) = tokio::sync::mpsc::channel::<(String, OutputChunk)>(512);
-
-    // Spawn subscriber watcher — subscribes to broadcast channels of new sessions
-    let subscriber_handle = tokio::spawn({
-        let transport = transport.clone();
-        let known_subs: Arc<tokio::sync::Mutex<HashSet<String>>> =
-            Arc::new(tokio::sync::Mutex::new(HashSet::new()));
-        let merged_tx = merged_tx.clone();
-        async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-                let bindings = transport.active_sessions().await;
-                for binding in bindings {
-                    let session = binding.tmux_session.clone();
-                    let mut subs = known_subs.lock().await;
-                    if subs.contains(&session) {
-                        continue;
-                    }
-                    subs.insert(session.clone());
-                    let mut rx = binding.output_tx.subscribe();
-                    let tx = merged_tx.clone();
-                    tokio::spawn(async move {
-                        loop {
-                            match rx.recv().await {
-                                Ok(chunk) => {
-                                    if tx.send((session.clone(), chunk)).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                                Err(broadcast::error::RecvError::Closed) => break,
-                            }
-                        }
-                    });
-                }
-            }
-        }
-    });
-
-    // Drop our copy so the channel closes when all senders are gone
-    drop(merged_tx);
-
-    // Print merged output with session prefix
-    while let Some((session, chunk)) = merged_rx.recv().await {
-        if chunk.content.is_empty() && chunk.is_final {
-            eprintln!("- session ended: {session}");
-            continue;
-        }
-        // Prefix each line with the session name (strip the "orch-" prefix for brevity)
-        let label = session.strip_prefix("orch-").unwrap_or(&session);
-        if formatted {
-            for line in chunk.content.lines() {
-                if let Some(formatted) = ndjson::format_line(line) {
-                    for fline in formatted.lines() {
-                        println!("[{label}] {fline}");
-                    }
-                }
-            }
-        } else {
-            for line in chunk.content.lines() {
-                println!("[{label}] {line}");
-            }
-        }
-        // If content didn't end with newline, don't add extra one
-        if !chunk.content.is_empty() && !chunk.content.ends_with('\n') {
-            std::io::Write::flush(&mut std::io::stdout())?;
-        }
-    }
-
-    // Clean up
-    capture_handle.abort();
-    discover_handle.abort();
-    subscriber_handle.abort();
-
-    Ok(())
 }
 
 /// List accessible GitHub Projects V2 boards.

@@ -770,6 +770,52 @@ pub fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> usize {
     end
 }
 
+/// One step of an agent's work, as `orch stream` shows it
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamEvent {
+    Started {
+        model: String,
+    },
+    Text(String),
+    Thinking(String),
+    /// `id` links the call to its result, empty when the agent has none
+    ToolCall {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    /// `name` is empty when only `id` names the call
+    ToolResult {
+        id: String,
+        name: String,
+        output: String,
+        is_error: bool,
+    },
+    Done(String),
+    Error(String),
+}
+
+/// String at a JSON pointer, empty when missing
+pub(crate) fn json_str<'a>(v: &'a serde_json::Value, pointer: &str) -> &'a str {
+    v.pointer(pointer)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+}
+
+/// Error text from any of the shapes agents use: `message`, `error`, `error.message`, `error.data.message`
+pub(crate) fn json_error_message(v: &serde_json::Value) -> String {
+    [
+        "/message",
+        "/error",
+        "/error/message",
+        "/error/data/message",
+    ]
+    .iter()
+    .find_map(|p| v.pointer(p).and_then(serde_json::Value::as_str))
+    .unwrap_or("unknown error")
+    .to_string()
+}
+
 /// Per-agent runner trait.
 ///
 /// Each agent implements this to handle its specific CLI invocation,
@@ -817,6 +863,9 @@ pub trait AgentRunner: Send + Sync {
     fn extract_text(&self, raw: &str) -> Result<String, AgentError> {
         Ok(raw.to_string())
     }
+
+    /// Transcript steps for one parsed line of this agent's NDJSON output
+    fn stream_events(&self, event: &serde_json::Value) -> Vec<StreamEvent>;
 
     /// Classify an error from exit code + stdout + stderr into an AgentError.
     ///
@@ -1051,6 +1100,10 @@ macro_rules! delegate_agent_runner {
 
             fn classify_error(&self, exit_code: i32, stdout: &str, stderr: &str) -> AgentError {
                 self.$inner.classify_error(exit_code, stdout, stderr)
+            }
+
+            fn stream_events(&self, event: &serde_json::Value) -> Vec<StreamEvent> {
+                self.$inner.stream_events(event)
             }
 
             fn router_command(

@@ -9,7 +9,9 @@
 //! output format differences from native Claude.
 
 use super::minimax::MiniMaxClaudeRunner;
-use super::{delegate_agent_runner, AgentError, AgentRunner, ParsedResponse, PermissionRules};
+use super::{
+    delegate_agent_runner, AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent,
+};
 
 /// Runner for Kimi-via-Claude agents (same output handling as MiniMaxClaude).
 /// Named `KimiClaudeRunner` to distinguish from a future native Kimi CLI runner.

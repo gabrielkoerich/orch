@@ -46,7 +46,7 @@
 
 #[cfg(test)]
 use super::SandboxLevel;
-use super::{AgentError, AgentRunner, ParsedResponse, PermissionRules};
+use super::{json_str, AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent};
 use crate::parser;
 
 /// Runner for Claude-compatible agents (Claude, Kimi, MiniMax).
@@ -300,6 +300,10 @@ impl AgentRunner for ClaudeRunner {
     #[cfg(test)]
     fn name(&self) -> &str {
         &self.binary
+    }
+
+    fn stream_events(&self, event: &serde_json::Value) -> Vec<StreamEvent> {
+        stream_events(event)
     }
 
     fn extract_text(&self, raw: &str) -> Result<String, super::AgentError> {
@@ -1822,5 +1826,147 @@ mod tests {
             "expected extracted assistant text, got: {text}"
         );
         assert!(!text.contains("type"), "must not return raw NDJSON: {text}");
+    }
+}
+
+/// Claude `stream-json`: calls and text are blocks in `assistant` messages, results in `user` ones
+pub(crate) fn stream_events(v: &serde_json::Value) -> Vec<StreamEvent> {
+    let blocks = || v["message"]["content"].as_array().into_iter().flatten();
+    match json_str(v, "/type") {
+        "system" if json_str(v, "/subtype") == "init" => vec![StreamEvent::Started {
+            model: json_str(v, "/model").to_string(),
+        }],
+        "assistant" => blocks()
+            .filter_map(|b| match json_str(b, "/type") {
+                "text" => Some(StreamEvent::Text(json_str(b, "/text").to_string())),
+                "thinking" => Some(StreamEvent::Thinking(json_str(b, "/thinking").to_string())),
+                "tool_use" => Some(StreamEvent::ToolCall {
+                    id: json_str(b, "/id").to_string(),
+                    name: json_str(b, "/name").to_string(),
+                    input: b["input"].clone(),
+                }),
+                _ => None,
+            })
+            .collect(),
+        "user" => blocks()
+            .filter(|b| json_str(b, "/type") == "tool_result")
+            .map(|b| StreamEvent::ToolResult {
+                id: json_str(b, "/tool_use_id").to_string(),
+                name: String::new(),
+                output: match &b["content"] {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Array(parts) => parts
+                        .iter()
+                        .filter_map(|p| p["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    _ => String::new(),
+                },
+                is_error: b["is_error"].as_bool() == Some(true),
+            })
+            .collect(),
+        "result" => {
+            let failed = v["is_error"].as_bool() == Some(true)
+                || json_str(v, "/subtype").starts_with("error");
+            if failed {
+                return vec![StreamEvent::Error(json_str(v, "/result").to_string())];
+            }
+
+            let turns = v["num_turns"].as_u64().unwrap_or(0);
+            let secs = v["duration_ms"].as_u64().unwrap_or(0) / 1000;
+            let time = if secs >= 60 {
+                format!("{}m {}s", secs / 60, secs % 60)
+            } else {
+                format!("{secs}s")
+            };
+            vec![StreamEvent::Done(format!("{turns} turns · {time}"))]
+        }
+        _ => vec![],
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn events(line: &str) -> Vec<StreamEvent> {
+        ClaudeRunner::new("claude").stream_events(&serde_json::from_str(line).unwrap())
+    }
+
+    #[test]
+    fn init_reports_model() {
+        let line = r#"{"type":"system","subtype":"init","model":"claude-sonnet-5","cwd":"/w"}"#;
+        assert_eq!(
+            events(line),
+            vec![StreamEvent::Started {
+                model: "claude-sonnet-5".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn assistant_blocks_in_order() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"plan"},{"type":"text","text":"Reading."},{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"a.rs"}}]}}"#;
+        assert_eq!(
+            events(line),
+            vec![
+                StreamEvent::Thinking("plan".into()),
+                StreamEvent::Text("Reading.".into()),
+                StreamEvent::ToolCall {
+                    id: "t1".into(),
+                    name: "Read".into(),
+                    input: json!({"file_path": "a.rs"}),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_result_string_and_block_content() {
+        let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"},{"type":"tool_result","tool_use_id":"t2","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}],"is_error":true}]}}"#;
+        assert_eq!(
+            events(line),
+            vec![
+                StreamEvent::ToolResult {
+                    id: "t1".into(),
+                    name: String::new(),
+                    output: "ok".into(),
+                    is_error: false,
+                },
+                StreamEvent::ToolResult {
+                    id: "t2".into(),
+                    name: String::new(),
+                    output: "a\nb".into(),
+                    is_error: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn result_success_and_error() {
+        let ok = r#"{"type":"result","subtype":"success","is_error":false,"num_turns":66,"duration_ms":580214}"#;
+        assert_eq!(
+            events(ok),
+            vec![StreamEvent::Done("66 turns · 9m 40s".into())]
+        );
+        let err = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":"too many turns"}"#;
+        assert_eq!(
+            events(err),
+            vec![StreamEvent::Error("too many turns".into())]
+        );
+    }
+
+    #[test]
+    fn noise_events_are_dropped() {
+        for line in [
+            r#"{"type":"system","subtype":"thinking_tokens","tokens":12}"#,
+            r#"{"type":"system","subtype":"task_started"}"#,
+            r#"{"type":"rate_limit_event","rate_limit_info":{}}"#,
+            r#"{"type":"tool_progress"}"#,
+        ] {
+            assert!(events(line).is_empty(), "{line}");
+        }
     }
 }

@@ -256,7 +256,7 @@ impl TmuxManager {
     ///
     /// Returns `None` if the name does not start with the orch prefix or
     /// cannot be parsed into a valid (project, task_id) pair.
-    fn parse_session_name(&self, name: &str) -> Option<(String, String)> {
+    pub(crate) fn parse_session_name(&self, name: &str) -> Option<(String, String)> {
         let after_prefix = name.strip_prefix(&self.prefix)?;
 
         // Strip optional "-review" suffix, reattach to the task_id later.

@@ -378,8 +378,7 @@ enum Commands {
         #[arg(long, hide = true)]
         raw: bool,
         /// Read NDJSON from stdin and pipe through the NDJSON formatter.
-        /// Useful for piping tmux capture-pane output:
-        /// `tmux capture-pane -p -t session:pane | orch stream --pipe`
+        /// Example: `cat output.json | orch stream --pipe`
         #[arg(long, default_value_t = false)]
         pipe: bool,
     },
@@ -756,7 +755,7 @@ enum TaskAction {
         #[arg(short, long)]
         note: Option<String>,
     },
-    /// Watch a task's status changes in real-time
+    /// Watch a task's agent work live, including its review (status changes: `orch task events`)
     Watch {
         /// Task ID
         id: String,
@@ -1044,7 +1043,7 @@ async fn async_main() -> anyhow::Result<()> {
             task,
         } => {
             if let Some(id) = task {
-                cli::stream_task(&id, true).await?;
+                cli::stream::run(Some(&id), true).await?;
             } else if follow {
                 cli::log("watch")?;
             } else {
@@ -1099,10 +1098,7 @@ async fn async_main() -> anyhow::Result<()> {
                 cli::stream_pipe()?;
                 return Ok(());
             }
-            match task_id {
-                Some(id) => cli::stream_task(&id, formatted).await?,
-                None => cli::stream_all(formatted).await?,
-            }
+            cli::stream::run(task_id.as_deref(), formatted).await?;
         }
         Commands::Chat {
             action,
@@ -1202,7 +1198,7 @@ async fn async_main() -> anyhow::Result<()> {
                 cli::task::close(&id, note.as_deref()).await?;
             }
             TaskAction::Watch { id } => {
-                cli::events::stream(None, Some(&id)).await?;
+                cli::stream::run(Some(&id), true).await?;
             }
             TaskAction::Reopen { id } => {
                 cli::task::reopen(&id).await?;

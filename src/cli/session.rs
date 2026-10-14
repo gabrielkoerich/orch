@@ -74,8 +74,7 @@ impl ParsedOutput {
 
 /// Parse NDJSON content into a structured [`ParsedOutput`].
 ///
-/// Handles all three agent formats (Claude, Codex, OpenCode) detected by
-/// `ndjson::format_line`.  Only write/edit tool calls contribute to
+/// Handles all three agent formats (Claude, Codex, OpenCode).  Only write/edit tool calls contribute to
 /// `files_changed`; read calls go to `files_read`.  Bash calls that start
 /// with `git` are captured as `git_commands`.  Assistant text messages
 /// longer than 40 chars are kept as `key_messages` (capped at 10).
@@ -184,7 +183,12 @@ fn parse_output(content: &str) -> ParsedOutput {
     }
 
     ParsedOutput {
-        files_changed: files_changed.into_iter().collect(),
+        files_changed: files_changed
+            .into_iter()
+            .chain(ndjson::extract_files_changed(content))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect(),
         files_read: files_read.into_iter().collect(),
         tool_counts,
         git_commands,
@@ -326,14 +330,9 @@ async fn export_markdown(
     println!("## Output");
     println!();
 
-    let lines: Vec<&str> = content.lines().collect();
-
-    for line in &lines {
-        if let Some(formatted) = ndjson::format_line(line) {
-            for fline in formatted.lines() {
-                println!("{fline}");
-            }
-        }
+    let mut formatter = ndjson::Formatter::new(false);
+    for line in content.lines() {
+        ndjson::print(&formatter.format(line));
     }
 
     // ── Result ────────────────────────────────────────────────────────────

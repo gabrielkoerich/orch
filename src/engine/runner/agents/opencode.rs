@@ -24,7 +24,10 @@
 //! Discoverable via: `opencode models | grep free`
 //! Discovered dynamically at startup with 1-hour cache.
 
-use super::{AgentError, AgentRunner, ParsedResponse, PermissionRules};
+use super::{
+    json_error_message, json_str, AgentError, AgentRunner, ParsedResponse, PermissionRules,
+    StreamEvent,
+};
 use crate::parser;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -442,6 +445,10 @@ impl AgentRunner for OpenCodeRunner {
     #[cfg(test)]
     fn name(&self) -> &str {
         "opencode"
+    }
+
+    fn stream_events(&self, event: &serde_json::Value) -> Vec<StreamEvent> {
+        stream_events(event)
     }
 
     fn extract_text(&self, raw: &str) -> Result<String, AgentError> {
@@ -1944,6 +1951,128 @@ mod error_text_tests {
         assert_eq!(
             opencode_error_text(&json!({"error":{"name":"N","data":{"message":"d"}}})),
             "d"
+        );
+    }
+}
+
+/// OpenCode `--format json`: a `tool_use` event carries both the call and its finished state
+fn stream_events(v: &serde_json::Value) -> Vec<StreamEvent> {
+    let text = || {
+        v.pointer("/part/text")
+            .or_else(|| v.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    match json_str(v, "/type") {
+        "text" => vec![StreamEvent::Text(text())],
+        "reasoning" => vec![StreamEvent::Thinking(text())],
+        "tool_use" => {
+            let part = &v["part"];
+            let state = &part["state"];
+            let id = json_str(part, "/callID").to_string();
+            let name = json_str(part, "/tool").to_string();
+            let mut out = vec![StreamEvent::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                input: state["input"].clone(),
+            }];
+            let result = match json_str(state, "/status") {
+                "completed" => Some((json_str(state, "/output").to_string(), false)),
+                "error" => Some((json_error_message(state), true)),
+                _ => None,
+            };
+            if let Some((output, is_error)) = result {
+                out.push(StreamEvent::ToolResult {
+                    id,
+                    name,
+                    output,
+                    is_error,
+                });
+            }
+
+            out
+        }
+        "step_finish" if json_str(v, "/part/reason") == "stop" => {
+            vec![StreamEvent::Done(String::new())]
+        }
+        "error" => vec![StreamEvent::Error(json_error_message(v))],
+        _ => vec![],
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn events(line: &str) -> Vec<StreamEvent> {
+        OpenCodeRunner::new().stream_events(&serde_json::from_str(line).unwrap())
+    }
+
+    #[test]
+    fn text_in_part_or_top_level() {
+        assert_eq!(
+            events(r#"{"type":"text","part":{"type":"text","text":"Reviewing."}}"#),
+            vec![StreamEvent::Text("Reviewing.".into())]
+        );
+        assert_eq!(
+            events(r#"{"type":"text","text":"Plain."}"#),
+            vec![StreamEvent::Text("Plain.".into())]
+        );
+    }
+
+    #[test]
+    fn completed_tool_has_call_and_result() {
+        let line = r#"{"type":"tool_use","part":{"type":"tool","tool":"read","callID":"c1","state":{"status":"completed","input":{"filePath":"src/lib.rs"},"output":"a\nb"}}}"#;
+        assert_eq!(
+            events(line),
+            vec![
+                StreamEvent::ToolCall {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    input: json!({"filePath": "src/lib.rs"}),
+                },
+                StreamEvent::ToolResult {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    output: "a\nb".into(),
+                    is_error: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_tool_result_is_error() {
+        let line = r#"{"type":"tool_use","part":{"tool":"bash","callID":"c2","state":{"status":"error","input":{"command":"x"},"error":"not found"}}}"#;
+        assert_eq!(
+            events(line)[1],
+            StreamEvent::ToolResult {
+                id: "c2".into(),
+                name: "bash".into(),
+                output: "not found".into(),
+                is_error: true,
+            }
+        );
+    }
+
+    #[test]
+    fn only_final_step_is_done() {
+        assert!(events(r#"{"type":"step_finish","part":{"reason":"tool-calls"}}"#).is_empty());
+        assert_eq!(
+            events(r#"{"type":"step_finish","part":{"reason":"stop"}}"#),
+            vec![StreamEvent::Done(String::new())]
+        );
+        assert!(events(r#"{"type":"step_start"}"#).is_empty());
+    }
+
+    #[test]
+    fn error_event() {
+        let line = r#"{"type":"error","error":{"name":"UnknownError","data":{"message":"Provider returned error"}}}"#;
+        assert_eq!(
+            events(line),
+            vec![StreamEvent::Error("Provider returned error".into())]
         );
     }
 }
