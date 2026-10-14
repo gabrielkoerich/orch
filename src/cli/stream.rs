@@ -73,16 +73,28 @@ pub async fn run(task_id: Option<&str>, formatted: bool) -> anyhow::Result<()> {
     }
 
     let mut tails: HashMap<String, Tail> = HashMap::new();
-    let mut last_label = String::new();
+    let mut colors: HashMap<String, &str> = HashMap::new();
+    let mut tag_width = 0;
+    let mut said_waiting = false;
     loop {
-        for (key, path) in sources(task_id).await {
+        let found = sources(task_id).await?;
+        if let (Some(id), true, false) = (task_id, found.is_empty(), said_waiting) {
+            println!("No output for task {id} yet, waiting for it to start");
+            said_waiting = true;
+        }
+
+        let live: Vec<String> = found.iter().map(|(key, _)| key.clone()).collect();
+        for (key, path) in found {
             let tail = tails
                 .entry(key)
                 .or_insert_with(|| Tail::open(path.clone(), color));
             if tail.path != path {
                 *tail = Tail::open(path, color);
             }
+        }
 
+        // A session that just ended gets this last read, its final message lands after the work
+        for tail in tails.values_mut() {
             let mut entries = Vec::new();
             for line in tail.read_lines() {
                 if formatted {
@@ -95,23 +107,25 @@ pub async fn run(task_id: Option<&str>, formatted: bool) -> anyhow::Result<()> {
                 continue;
             }
 
-            let label = label(&tail.path);
-            if label != last_label {
-                let header = format!("── {label} ──");
+            // Output scrolls fast, so every entry carries its task and attempt
+            let tag = tag(&tail.path);
+            tag_width = tag_width.max(tag.chars().count());
+            let next = TAG_COLORS[colors.len() % TAG_COLORS.len()];
+            let code = *colors.entry(key_of(&tail.path)).or_insert(next);
+            let gutter = |show: bool| {
+                let text = if show { tag.as_str() } else { "" };
+                let text = format!("{text:<tag_width$} │");
                 if color {
-                    println!("\n\x1b[1;36m{header}\x1b[0m");
+                    format!("\x1b[{code}m{text}\x1b[0m")
                 } else {
-                    println!("\n{header}");
+                    text
                 }
-                last_label = label;
-            }
-
-            if formatted {
-                ndjson::print(&entries);
-            } else {
-                entries.iter().for_each(|l| println!("{l}"));
+            };
+            for line in tag_lines(&entries, formatted, gutter) {
+                println!("{line}");
             }
         }
+        tails.retain(|key, _| live.contains(key));
 
         std::io::stdout().flush()?;
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -119,19 +133,17 @@ pub async fn run(task_id: Option<&str>, formatted: bool) -> anyhow::Result<()> {
 }
 
 /// Output files to follow, keyed by the session or task they belong to
-async fn sources(task_id: Option<&str>) -> Vec<(String, PathBuf)> {
+async fn sources(task_id: Option<&str>) -> anyhow::Result<Vec<(String, PathBuf)>> {
     if let Some(id) = task_id {
-        let name = task_dir_name(id);
-        let name = name.strip_suffix("-review").unwrap_or(&name).to_string();
-        let review = format!("{name}-review");
-        return latest_output(None, &[name, review])
+        let names = watch_dir_names(id, task_dir_exists)?;
+        return Ok(latest_output(None, &names)
             .map(|p| (id.to_string(), p))
             .into_iter()
-            .collect();
+            .collect());
     }
 
     let tmux = crate::tmux::TmuxManager::new();
-    crate::channels::tmux::list_orch_sessions()
+    Ok(crate::channels::tmux::list_orch_sessions()
         .await
         .unwrap_or_default()
         .into_iter()
@@ -140,7 +152,42 @@ async fn sources(task_id: Option<&str>) -> Vec<(String, PathBuf)> {
             let path = latest_output(Some(&project), &[task_dir_name(&task)])?;
             Some((session, path))
         })
-        .collect()
+        .collect())
+}
+
+/// Task dirs for a watched id and its review. A bare number may name an internal task, unless
+/// a GitHub task has the same number
+fn watch_dir_names(task_id: &str, exists: impl Fn(&str) -> bool) -> anyhow::Result<Vec<String>> {
+    let name = task_dir_name(task_id);
+    let base = name.strip_suffix("-review").unwrap_or(&name);
+    let with_review = |b: &str| vec![format!("{b}-review"), b.to_string()];
+    if base.starts_with("internal:") {
+        return Ok(with_review(base));
+    }
+
+    let github = with_review(base);
+    let internal = with_review(&format!("internal:{base}"));
+    let has_github = github.iter().any(|n| exists(n));
+    let has_internal = internal.iter().any(|n| exists(n));
+    match (has_github, has_internal) {
+        (true, true) => anyhow::bail!(
+            "{base} matches GitHub task {base} and internal task internal:{base}, \
+             watch internal:{base} for the internal one"
+        ),
+        (false, true) => Ok(internal),
+        _ => Ok(github),
+    }
+}
+
+/// Whether any repo has state for a task dir named `name`
+fn task_dir_exists(name: &str) -> bool {
+    let Ok(state) = crate::home::state_dir() else {
+        return false;
+    };
+    subdirs(&state)
+        .iter()
+        .flat_map(|owner| subdirs(owner))
+        .any(|repo| repo.join("tasks").join(name).is_dir())
 }
 
 /// Session names replace `:` with `-`, task dirs keep the `internal:` id
@@ -188,19 +235,49 @@ fn subdirs(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `<repo> <task> · attempt <n>` from `.../<repo>/tasks/<task>/attempts/<n>/output.json`
-fn label(path: &Path) -> String {
-    let parts: Vec<String> = path
-        .iter()
+const TAG_COLORS: [&str; 6] = ["36", "35", "33", "34", "96", "95"];
+
+/// Entry lines with `gutter(true)` on each step's first line and `gutter(false)` on the rest
+fn tag_lines(entries: &[String], formatted: bool, gutter: impl Fn(bool) -> String) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in entries {
+        let step = !formatted || !entry.starts_with(ndjson::RESULT_PREFIX);
+        if formatted && step {
+            out.push(gutter(false));
+        }
+
+        for (i, line) in entry.lines().enumerate() {
+            out.push(format!("{} {line}", gutter(step && i == 0)));
+        }
+    }
+    out
+}
+
+/// `<repo>#<task> a<n>` from `.../<repo>/tasks/<task>/attempts/<n>/output.json`
+fn tag(path: &Path) -> String {
+    match path_parts(path).as_slice() {
+        [attempt, _, task, _, repo] => {
+            let task = task.strip_prefix("internal:").unwrap_or(task);
+            format!("{repo}#{task} a{attempt}")
+        }
+        _ => path.display().to_string(),
+    }
+}
+
+/// Task dir of an output file, so a task keeps its colour across attempts
+fn key_of(path: &Path) -> String {
+    path.ancestors()
+        .nth(3)
+        .map_or_else(String::new, |p| p.display().to_string())
+}
+
+fn path_parts(path: &Path) -> Vec<String> {
+    path.iter()
         .rev()
         .skip(1)
         .take(5)
         .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    match parts.as_slice() {
-        [attempt, _, task, _, repo] => format!("{repo} {task} · attempt {attempt}"),
-        _ => path.display().to_string(),
-    }
+        .collect()
 }
 
 #[cfg(test)]
@@ -240,8 +317,72 @@ mod tests {
     }
 
     #[test]
-    fn label_from_attempt_path() {
-        let path = Path::new("/s/owner/repo/tasks/3601-review/attempts/2/output.json");
-        assert_eq!(label(path), "repo 3601-review · attempt 2");
+    fn watch_dir_names_resolve_bare_and_prefixed_ids() {
+        let only = |dirs: &'static [&'static str]| move |n: &str| dirs.contains(&n);
+
+        // Bare id of an internal task
+        assert_eq!(
+            watch_dir_names("189497", only(&["internal:189497"])).unwrap(),
+            vec!["internal:189497-review", "internal:189497"]
+        );
+        // Bare id of a GitHub task, or of a task with no state yet
+        assert_eq!(
+            watch_dir_names("3601-review", only(&["3601"])).unwrap(),
+            vec!["3601-review", "3601"]
+        );
+        assert_eq!(
+            watch_dir_names("42", only(&[])).unwrap(),
+            vec!["42-review", "42"]
+        );
+        // Prefixed ids never look at GitHub tasks
+        assert_eq!(
+            watch_dir_names("internal:8", only(&["8"])).unwrap(),
+            vec!["internal:8-review", "internal:8"]
+        );
+    }
+
+    #[test]
+    fn watch_dir_names_reject_ambiguous_bare_id() {
+        let both = |n: &str| n == "77" || n == "internal:77-review";
+        let err = watch_dir_names("77", both).unwrap_err().to_string();
+        assert!(err.contains("watch internal:77"), "{err}");
+    }
+
+    #[test]
+    fn tag_drops_internal_prefix() {
+        let path = Path::new("/s/owner/bean/tasks/internal:189488-review/attempts/1/output.json");
+        assert_eq!(tag(path), "bean#189488-review a1");
+        assert_eq!(key_of(path), "/s/owner/bean/tasks/internal:189488-review");
+    }
+
+    #[test]
+    fn tag_lines_label_each_step_only() {
+        let entries = vec![
+            "⏺ Read(a.rs)".to_string(),
+            "  ⎿  Read 3 lines".to_string(),
+            "⏺ Fixing it.\n  Then test.".to_string(),
+        ];
+        let gutter = |show: bool| if show { "t1 │" } else { "   │" }.to_string();
+        assert_eq!(
+            tag_lines(&entries, true, gutter),
+            vec![
+                "   │",
+                "t1 │ ⏺ Read(a.rs)",
+                "   │   ⎿  Read 3 lines",
+                "   │",
+                "t1 │ ⏺ Fixing it.",
+                "   │   Then test.",
+            ]
+        );
+    }
+
+    #[test]
+    fn tag_lines_raw_tags_every_line() {
+        let entries = vec!["{\"a\":1}".to_string(), "{\"b\":2}".to_string()];
+        let gutter = |show: bool| if show { "t │" } else { "  │" }.to_string();
+        assert_eq!(
+            tag_lines(&entries, false, gutter),
+            vec!["t │ {\"a\":1}", "t │ {\"b\":2}"]
+        );
     }
 }

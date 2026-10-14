@@ -84,6 +84,7 @@ impl Formatter {
                     return vec![];
                 }
 
+                let text = pretty_json(text).unwrap_or_else(|| text.to_string());
                 vec![format!("⏺ {}", text.replace('\n', "\n  "))]
             }
             StreamEvent::Thinking(text) => {
@@ -237,6 +238,22 @@ pub fn extract_files_changed(content: &str) -> Vec<String> {
         formatter.format(line);
     }
     formatter.changed_files()
+}
+
+/// Indented JSON when a message is a JSON object or array, bare or in a ```json fence
+fn pretty_json(text: &str) -> Option<String> {
+    let body = text
+        .strip_prefix("```json")
+        .or_else(|| text.strip_prefix("```"))
+        .and_then(|t| t.strip_suffix("```"))
+        .unwrap_or(text)
+        .trim();
+    if !body.starts_with(['{', '[']) {
+        return None;
+    }
+
+    let value: Value = serde_json::from_str(body).ok()?;
+    serde_json::to_string_pretty(&value).ok()
 }
 
 /// One line for a tool call's input: the command, path, pattern or query it acts on
@@ -398,6 +415,23 @@ mod tests {
         assert_eq!(
             fmt(&[r#"{"type":"error","message":"usage limit"}"#]),
             vec!["✗ usage limit"]
+        );
+    }
+
+    #[test]
+    fn json_message_is_pretty_printed() {
+        let msg = r#"{"type":"item.completed","item":{"type":"agent_message","text":"{\"decision\":\"approve\",\"issues\":[]}"}}"#;
+        let fenced = r#"{"type":"item.completed","item":{"type":"agent_message","text":"```json\n{\"decision\":\"approve\"}\n```"}}"#;
+        let plain =
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"{not json} here"}}"#;
+        let start = r#"{"type":"thread.started"}"#;
+        assert_eq!(
+            fmt(&[start, msg, fenced, plain]),
+            vec![
+                "⏺ {\n    \"decision\": \"approve\",\n    \"issues\": []\n  }",
+                "⏺ {\n    \"decision\": \"approve\"\n  }",
+                "⏺ {not json} here",
+            ]
         );
     }
 
