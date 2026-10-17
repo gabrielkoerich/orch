@@ -11,6 +11,7 @@ name = "orch"
 path = "src/main.rs"
 
 [dependencies]
+git-cow = "0.2"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
