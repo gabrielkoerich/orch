@@ -8,7 +8,7 @@ weight = 4
 
 Orch keeps one template checkout per project at `~/.orch/state/templates/<project>`. A new task worktree gets its files from a copy-on-write clone of the template. Clones share disk blocks with the template until one side writes. The worktree stays at `~/.orch/worktrees/<project>/<branch>/` and is a normal linked git worktree.
 
-Implementation: `src/engine/runner/cow.rs`, called from `setup_worktree()`.
+Implementation: the [git-cow](https://github.com/gabrielkoerich/git-cow) crate does the cloning. `src/engine/runner/cow.rs` wraps it with orch's template folder, start point, `ORCH_COW_WORKTREES` switch and the bare-repository rule for warming, called from `setup_worktree()`.
 
 ## How it works
 
@@ -33,7 +33,7 @@ Any failure removes the half-built worktree and falls back to `git worktree add`
 | Template is a linked worktree of the project repo | A separate clone doubles the object store and needs its own fetch |
 | Clone files, keep the gitdir per worktree | Cloning `.git` would share index and HEAD state |
 | Probe by cloning a small file | Parsing filesystem names misses mount options like XFS without reflink |
-| One lock per template | A global lock lets one slow install stall every project |
+| One lock file per template, from git-cow | A global lock lets one slow install stall every project, and an in-process lock misses a second process |
 | Template holds the checkout's ignored directories | Orch runs no install or build. It reuses what the project's own tooling already produced, so `cow.rs` names no language or tool |
 | Skip any path with a hidden component | Hidden ignored directories hold local tool and agent config, and a settings file there could change a task agent's permissions. The rule names no tool |
 | Directories only, no loose ignored files | Keeps `.env` and similar files out of agent worktrees without naming any file |
