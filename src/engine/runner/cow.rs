@@ -1,245 +1,33 @@
-//! Copy-on-write task worktrees cloned from a per-project template, see docs/content/cow-worktrees.md
+//! Copy-on-write task worktrees cloned from a per-project template by the git-cow crate, see docs/content/cow-worktrees.md
 
 use super::worktree::resolve_branch_start_point;
-use crate::cmd::CommandErrorContext;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex};
-use tokio::process::Command;
 
-// One lock per template, so a clone never sees a half-updated template and projects do not block each other
-static TEMPLATE_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn template_lock(template: &Path) -> Arc<tokio::sync::Mutex<()>> {
-    TEMPLATE_LOCKS
-        .lock()
-        .unwrap()
-        .entry(template.to_path_buf())
-        .or_default()
-        .clone()
-}
-
-// Clone support per (template dir, worktree dir), probed once per process
-static PROBES: LazyLock<Mutex<HashMap<(PathBuf, PathBuf), bool>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-// Never cloned, the worktree gets its own gitdir
-const SKIP: &[&str] = &[".git"];
-
-fn clone_flags() -> &'static [&'static str] {
-    if cfg!(target_os = "macos") {
-        // clonefile(2)
-        &["-cRp"]
-    } else {
-        // FICLONE ioctl, fails instead of copying when the volume cannot clone
-        &["-a", "--reflink=always"]
-    }
-}
-
-async fn clone_path(src: &Path, dst: &Path) -> anyhow::Result<()> {
-    let out = Command::new("cp")
-        .args(clone_flags())
-        .arg(src)
-        .arg(dst)
-        .output_with_context()
-        .await?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "cp {}: {}",
-            src.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-async fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output_with_context()
-        .await?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-// Try to clone one small file from `src_dir` into `dst_dir`
-async fn volume_can_clone(src_dir: &Path, dst_dir: &Path) -> bool {
-    let key = (src_dir.to_path_buf(), dst_dir.to_path_buf());
-    if let Some(known) = PROBES.lock().unwrap().get(&key) {
-        return *known;
-    }
-    let src = src_dir.join(".cow-probe-src");
-    let dst = dst_dir.join(".cow-probe-dst");
-    let _ = tokio::fs::remove_file(&dst).await;
-    let ok = tokio::fs::write(&src, b"x").await.is_ok() && clone_path(&src, &dst).await.is_ok();
-    let _ = tokio::fs::remove_file(&src).await;
-    let _ = tokio::fs::remove_file(&dst).await;
-    PROBES.lock().unwrap().insert(key, ok);
-    ok
-}
-
-// Create the template checkout, or move it to the current default branch tip
-async fn refresh_template(
-    main_dir: &Path,
-    template: &Path,
-    default_branch: &str,
-) -> anyhow::Result<()> {
-    let main = main_dir.to_string_lossy();
-    let start = resolve_branch_start_point(&main, default_branch, default_branch).await;
-    if template.join(".git").exists()
-        && git(template, &["checkout", "--detach", "--force", &start])
-            .await
-            .is_ok()
-    {
-        return Ok(());
-    }
-    let _ = tokio::fs::remove_dir_all(template).await;
-    let _ = git(main_dir, &["worktree", "prune"]).await;
-    git(
-        main_dir,
-        &[
-            "worktree",
-            "add",
-            "--detach",
-            &template.to_string_lossy(),
-            &start,
-        ],
-    )
-    .await?;
-    Ok(())
-}
-
-// Gitignored directories of a checkout at any depth, which hold whatever its tooling produced.
-// A path with a hidden component is local tool or agent config, so it is never shared
-async fn ignored_dirs(src: &Path) -> anyhow::Result<Vec<String>> {
-    let out = git(
-        src,
-        &[
-            "ls-files",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "--directory",
-        ],
-    )
-    .await?;
-    Ok(out
-        .lines()
-        .filter_map(|l| l.strip_suffix('/'))
-        .filter(|n| !n.is_empty() && !n.split('/').any(|c| c.starts_with('.')))
-        .map(String::from)
-        .collect())
-}
-
-// Swap a clone of each ignored directory of `src` into the template, caller holds the template lock.
-// Loose ignored files stay out, so local secrets never reach a worktree
-async fn warm_template(src: &Path, template: &Path) -> anyhow::Result<()> {
-    let name = template.file_name().unwrap_or_default().to_string_lossy();
-    let staging = template.with_file_name(format!(".{name}.warm"));
-    for dir in ignored_dirs(src).await? {
-        // A directory the template commit tracks is not build output
-        if !git(template, &["ls-files", "--", &dir])
-            .await
-            .unwrap_or_default()
-            .is_empty()
-        {
-            continue;
-        }
-        let _ = tokio::fs::remove_dir_all(&staging).await;
-        tokio::fs::create_dir_all(&staging).await?;
-        let res = async {
-            clone_path(&src.join(&dir), &staging).await?;
-            let dst = template.join(&dir);
-            let _ = tokio::fs::remove_dir_all(&dst).await;
-            if let Some(parent) = dst.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            let base = Path::new(&dir).file_name().unwrap_or_default();
-            tokio::fs::rename(staging.join(base), dst).await?;
-            anyhow::Ok(())
-        }
-        .await;
-        let _ = tokio::fs::remove_dir_all(&staging).await;
-        if let Err(e) = res {
-            tracing::debug!(dir = %dir, error = %e, "template warm-up skipped a directory");
-        }
-    }
-    Ok(())
+fn template_dir(project: &str) -> anyhow::Result<PathBuf> {
+    Ok(crate::home::state_dir()?.join("templates").join(project))
 }
 
 // Called after a task PR merges and before its worktree is removed.
 // Projects with a working checkout are warmed from that checkout instead
 pub async fn warm_from_merged(repo_root: &Path, project: &str, wt_dir: &Path) {
-    let bare = git(repo_root, &["rev-parse", "--is-bare-repository"])
-        .await
-        .is_ok_and(|v| v == "true");
-    if !bare {
-        return;
-    }
-    let Ok(templates) = crate::home::state_dir().map(|d| d.join("templates")) else {
+    let (repo, wt) = (repo_root.to_path_buf(), wt_dir.to_path_buf());
+    let Ok(template) = template_dir(project) else {
         return;
     };
-    let template = templates.join(project);
-    let Some(wt_parent) = wt_dir.parent() else {
-        return;
-    };
-    if !template.join(".git").exists() || !volume_can_clone(&templates, wt_parent).await {
-        return;
-    }
-    let lock = template_lock(&template);
-    let _guard = lock.lock().await;
-    if let Err(e) = warm_template(wt_dir, &template).await {
+    let res = tokio::task::spawn_blocking(move || {
+        let bare =
+            git_cow::git(&repo, &["rev-parse", "--is-bare-repository"]).is_ok_and(|v| v == "true");
+        let wt_parent = wt.parent().unwrap_or(&wt);
+        let templates = template.parent().unwrap_or(&template);
+        if !bare || !template.join(".git").exists() || !git_cow::can_clone(templates, wt_parent) {
+            return Ok(());
+        }
+        git_cow::warm(&wt, &template)
+    })
+    .await;
+    if let Ok(Err(e)) = res {
         tracing::debug!(error = %e, "template warm-up from merged task failed");
     }
-}
-
-async fn populate(
-    main_dir: &Path,
-    template: &Path,
-    wt_dir: &Path,
-    branch: &str,
-) -> anyhow::Result<()> {
-    // --no-checkout creates the gitdir entry and the `.git` file, so git state stays per worktree
-    git(
-        main_dir,
-        &[
-            "worktree",
-            "add",
-            "--no-checkout",
-            &wt_dir.to_string_lossy(),
-            branch,
-        ],
-    )
-    .await?;
-
-    let mut entries = tokio::fs::read_dir(template).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        if SKIP.contains(&entry.file_name().to_string_lossy().as_ref()) {
-            continue;
-        }
-        clone_path(&entry.path(), wt_dir).await?;
-    }
-
-    // The template index describes the cloned files. Refresh its stat data for the new inodes,
-    // then reset only the files where the task branch differs from the template commit
-    let tpl_git = git(template, &["rev-parse", "--absolute-git-dir"]).await?;
-    let wt_git = git(wt_dir, &["rev-parse", "--absolute-git-dir"]).await?;
-    tokio::fs::copy(
-        Path::new(&tpl_git).join("index"),
-        Path::new(&wt_git).join("index"),
-    )
-    .await?;
-    let _ = git(wt_dir, &["update-index", "-q", "--refresh"]).await;
-    git(wt_dir, &["reset", "--hard", "-q"]).await?;
-    Ok(())
 }
 
 // Create `wt_dir` as a worktree of `branch` by cloning the project template.
@@ -254,40 +42,20 @@ pub async fn create_worktree(
     if std::env::var("ORCH_COW_WORKTREES").is_ok_and(|v| v == "0") {
         anyhow::bail!("disabled by ORCH_COW_WORKTREES=0");
     }
-    let templates = crate::home::state_dir()?.join("templates");
-    tokio::fs::create_dir_all(&templates).await?;
-    let wt_parent = wt_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("worktree has no parent"))?;
-    if !volume_can_clone(&templates, wt_parent).await {
-        anyhow::bail!("volume cannot clone files");
-    }
-
-    let template = templates.join(project);
-    let lock = template_lock(&template);
-    let _guard = lock.lock().await;
-    refresh_template(main_dir, &template, default_branch).await?;
-    if template.join(".gitmodules").exists() {
-        // A cloned submodule `.git` file would point into the template's gitdir
-        anyhow::bail!("submodules are not supported");
-    }
-
-    // Bare clones have no ignored files, so the listing fails or is empty and nothing changes
-    if let Err(e) = warm_template(main_dir, &template).await {
-        tracing::debug!(error = %e, "template warm-up from checkout failed");
-    }
-
-    let res = populate(main_dir, &template, wt_dir, branch).await;
-    if res.is_err() {
-        let _ = git(
-            main_dir,
-            &["worktree", "remove", "--force", &wt_dir.to_string_lossy()],
-        )
-        .await;
-        let _ = tokio::fs::remove_dir_all(wt_dir).await;
-        let _ = git(main_dir, &["worktree", "prune"]).await;
-    }
-    res
+    let template = template_dir(project)?;
+    let start =
+        resolve_branch_start_point(&main_dir.to_string_lossy(), default_branch, default_branch)
+            .await;
+    let (repo, wt, branch) = (
+        main_dir.to_path_buf(),
+        wt_dir.to_path_buf(),
+        branch.to_string(),
+    );
+    tokio::task::spawn_blocking(move || {
+        git_cow::add(&repo, &template, &start, &wt, None, Some(&branch))
+    })
+    .await??;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -342,7 +110,7 @@ mod tests {
         sh(project.path(), &["branch", "task-1", "origin/main"]);
 
         // Volumes without clone support (ext4, HFS+) take the else branch
-        let supported = volume_can_clone(&templates, wt_dir.parent().unwrap()).await;
+        let supported = git_cow::can_clone(&templates, wt_dir.parent().unwrap());
         if expect_clone() {
             assert!(
                 supported,
@@ -392,7 +160,7 @@ mod tests {
         sh(project.path(), &["commit", "-m", "task"]);
         sh(project.path(), &["checkout", "-q", "--detach"]);
 
-        let supported = volume_can_clone(&templates, wt_dir.parent().unwrap()).await;
+        let supported = git_cow::can_clone(&templates, wt_dir.parent().unwrap());
         if expect_clone() {
             assert!(
                 supported,
@@ -453,7 +221,7 @@ mod tests {
         std::fs::create_dir_all(wt_dir.parent().unwrap()).unwrap();
         sh(project.path(), &["branch", "task-4", "origin/main"]);
 
-        let supported = volume_can_clone(&templates, wt_dir.parent().unwrap()).await;
+        let supported = git_cow::can_clone(&templates, wt_dir.parent().unwrap());
         if expect_clone() {
             assert!(
                 supported,
@@ -527,7 +295,7 @@ mod tests {
         let wt_dir = home.path().join("worktrees/pb/task-6");
         std::fs::create_dir_all(wt_dir.parent().unwrap()).unwrap();
 
-        let supported = volume_can_clone(&templates, wt_dir.parent().unwrap()).await;
+        let supported = git_cow::can_clone(&templates, wt_dir.parent().unwrap());
         if expect_clone() {
             assert!(
                 supported,
