@@ -44,7 +44,7 @@ Any failure removes the half-built worktree and falls back to `git worktree add`
 
 - Clones share source files, dependencies and build output. Blocks stay shared until the agent's build rewrites them.
 - Hidden dependency directories such as virtualenvs are not shared. They do not survive a move anyway.
-- Every task creation re-clones the checkout's ignored directories (copy-on-write, so no disk, but time grows with file count).
+- The template is warmed from the checkout at most once an hour (git-cow's default), so a task can start with build output up to an hour old and rebuild a little more.
 - The operator may be building while orch clones, so the template can hold partial output. The agent's tooling must detect that and rebuild. Orch does not check.
 - Output that embeds absolute paths (virtualenvs, some build caches) points at the checkout or template path. Whether it recovers depends on the tool, and orch does not special-case any. The agent reinstalls if needed.
 - The template only grows with the checkout's ignored directories, and each refresh replaces them whole, so stale files do not pile up. Delete the template to reset it.

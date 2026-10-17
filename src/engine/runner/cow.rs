@@ -255,7 +255,8 @@ mod tests {
                 std::fs::read_to_string(wt_dir.join(".git")).unwrap(),
                 std::fs::read_to_string(tpl.join(".git")).unwrap()
             );
-            // A second refresh replaces the directory instead of merging into it
+            // git-cow warms the template from the checkout at most once an hour, so a second task
+            // right after the first keeps the build output the template already has
             std::fs::remove_file(project.path().join("out/sub/dep.bin")).unwrap();
             std::fs::write(project.path().join("out/new.bin"), "new\n").unwrap();
             let wt2 = home.path().join("worktrees/p/task-5");
@@ -263,8 +264,8 @@ mod tests {
             create_worktree(project.path(), "p", &wt2, "task-5", "main")
                 .await
                 .unwrap();
-            assert!(wt2.join("out/new.bin").exists());
-            assert!(!wt2.join("out/sub/dep.bin").exists());
+            assert!(wt2.join("out/sub/dep.bin").exists());
+            assert!(!wt2.join("out/new.bin").exists());
         }
         std::env::remove_var("ORCH_HOME");
     }
