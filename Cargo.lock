@@ -814,6 +814,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "git-cow"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a94fce6def66b5d88fbc7c93b70542f4eef9bc7ff8d9ede89d79d667ff50aff1"
+
+[[package]]
 name = "h2"
 version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1627,6 +1633,7 @@ dependencies = [
  "dashmap",
  "dirs",
  "futures",
+ "git-cow",
  "hmac",
  "jsonwebtoken",
  "notify",
