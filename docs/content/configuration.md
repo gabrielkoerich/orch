@@ -64,7 +64,7 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `channels.discord` | `bot_token` | Discord bot token | `""` |
 | `channels.telegram` | `bot_token` / `chat_id` | Telegram bot credentials | `""` |
 | `notifications` | `level` | Minimum notification level (`info` / `warn` / `error`) | `info` |
-| `agents` | (list of strings) | Agent CLIs to discover in `$PATH` (e.g. `[claude, codex, opencode]`) | `[]` |
+| `agents` | (list of strings) | Agent CLIs to discover in `$PATH` (e.g. `[claude, codex, opencode, grok]`) | `[]` |
 | `model_map` | `simple/medium/complex/review` | Per-complexity model name per agent | `{}` |
 
 > Authoritative reference: `config.example.yml` in the orch repo. Run `orch config <key>` to read the live value for any dotted key (e.g. `orch config engine.tick_interval`).

@@ -1512,6 +1512,8 @@ mod tests {
                 "user.email=test@test.com",
                 "-c",
                 "user.name=Test",
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
                 "--allow-empty",
                 "-m",

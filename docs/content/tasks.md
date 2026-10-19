@@ -17,7 +17,7 @@ Key fields:
 | `repo` | Repository slug (`owner/repo`) |
 | `title`, `body`, `labels` | Task description and metadata |
 | `status` | `new`, `routed`, `in_progress`, `done`, `in_review`, `blocked`, `needs_review` |
-| `agent` | Executor (`codex`, `claude`, `opencode`, `kimi`, `minimax`) |
+| `agent` | Executor (`codex`, `claude`, `opencode`, `kimi`, `minimax`, `grok`) |
 | `model` | Model chosen by the router |
 | `complexity` | Router-assigned complexity (`simple`, `medium`, `complex`) |
 | `summary`, `reason` | What was done / why blocked |

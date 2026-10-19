@@ -295,11 +295,13 @@ mod tests {
     use super::*;
 
     fn sh(dir: &Path, args: &[&str]) {
-        let st = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .status()
-            .unwrap();
+        let mut cmd = std::process::Command::new("git");
+        cmd.current_dir(dir);
+        // Global commit.gpgsign calls the operator's signer (1Password)
+        if args.first() == Some(&"commit") {
+            cmd.args(["-c", "commit.gpgsign=false"]);
+        }
+        let st = cmd.args(args).status().unwrap();
         assert!(st.success(), "git {args:?}");
     }
 

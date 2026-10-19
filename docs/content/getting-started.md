@@ -22,6 +22,8 @@ brew install --cask codex         # Codex (if available)
 brew install opencode             # OpenCode
 ```
 
+The `grok` CLI must be on `PATH`. Orch discovers it by the binary name `grok`.
+
 Optional: `gh` for GitHub sync, `bats` for tests.
 
 ## Quick Start

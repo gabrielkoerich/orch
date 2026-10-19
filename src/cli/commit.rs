@@ -746,6 +746,12 @@ mod tests {
             .current_dir(dir.path())
             .output()
             .unwrap();
+        // The operator's global commit.gpgsign would call 1Password
+        Command::new("git")
+            .args(["config", "commit.gpgsign", "false"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
         std::fs::write(dir.path().join("README.md"), "hello\n").unwrap();
         Command::new("git")
             .args(["add", "."])

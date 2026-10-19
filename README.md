@@ -2,11 +2,11 @@
 
 [![CI](https://github.com/gabrielkoerich/orch/actions/workflows/release.yml/badge.svg)](https://github.com/gabrielkoerich/orch/actions/workflows/release.yml)
 
-An autonomous task orchestration engine that delegates work to AI coding agents (Claude, Codex, OpenCode, Kimi, MiniMax). Runs as a background service, manages isolated worktrees, syncs with GitHub Issues, and handles the full task lifecycle from routing to PR creation.
+An autonomous task orchestration engine that delegates work to AI coding agents (Claude, Codex, OpenCode, Kimi, MiniMax, Grok). Runs as a background service, manages isolated worktrees, syncs with GitHub Issues, and handles the full task lifecycle from routing to PR creation.
 
 ## Features
 
-- **Multi-agent support** — Route tasks to Claude, Codex, OpenCode, Kimi, or MiniMax based on task complexity
+- **Multi-agent support** — Route tasks to Claude, Codex, OpenCode, Kimi, MiniMax, or Grok based on task complexity
 - **Multi-project** — Manage multiple repositories from a single service
 - **GitHub Issues integration** — Two-way sync with GitHub Issues as the source of truth
 - **GitHub Projects V2** — Automatic project board column sync on status changes
@@ -255,6 +255,7 @@ orch> /model sonnet                 # Infer agent (claude)
 orch> /model minimax:sonnet         # Explicit agent:model
 orch> /model opencode:minimax-m2.5-free  # OpenCode with specific model
 orch> /agent codex                  # Switch agent and its default model
+orch> /agent grok                   # Switch to Grok (CLI default model)
 orch> /agent                        # Show current agent:model
 orch> /model                        # Show current agent:model
 ```
@@ -310,6 +311,7 @@ agents:
   - opencode
   - kimi
   - minimax
+  - grok
 
 git:
   name: "orch[bot]"
@@ -379,6 +381,7 @@ Override the router by adding labels to GitHub issues:
 | `agent:opencode` | Force OpenCode executor |
 | `agent:kimi` | Force Kimi executor |
 | `agent:minimax` | Force MiniMax executor |
+| `agent:grok` | Force Grok executor |
 | `complexity:simple` | Use simple model tier |
 | `complexity:medium` | Use medium model tier |
 | `complexity:complex` | Use complex model tier |
@@ -451,7 +454,7 @@ src/
         ├── context.rs   # Prompt context building
         ├── worktree.rs  # Git worktree management
         ├── agent.rs     # Agent invocation + prompt building
-        ├── agents/      # Per-agent runners (Claude, Codex, OpenCode, Kimi, MiniMax)
+        ├── agents/      # Per-agent runners (Claude, Codex, OpenCode, Kimi, MiniMax, Grok)
         ├── response.rs  # Response parsing, weight signals
         ├── response_handler.rs # Success path: commit, push, PR
         ├── fallback.rs  # Error classification and recovery strategies

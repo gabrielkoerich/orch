@@ -1524,6 +1524,8 @@ async fn restore_review_config_if_needed(
     if staged {
         let _ = Command::new("git")
             .args([
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
                 "-m",
                 "revert: restore .orch.yml (review agent must not modify project config)",
@@ -2890,11 +2892,13 @@ mod tests {
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .status()
-            .unwrap();
+        let mut cmd = std::process::Command::new("git");
+        cmd.current_dir(dir);
+        // Global commit.gpgsign calls the operator's signer (1Password)
+        if args.first() == Some(&"commit") {
+            cmd.args(["-c", "commit.gpgsign=false"]);
+        }
+        let status = cmd.args(args).status().unwrap();
         assert!(status.success(), "git {:?} failed", args);
     }
 

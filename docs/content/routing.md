@@ -59,8 +59,9 @@ To exclude an agent from routing entirely, remove it from the `agents:` discover
 | `opencode` | Lightweight coding and quick iterations |
 | `kimi` | Alternative coding agent |
 | `minimax` | Alternative coding agent |
+| `grok` | Coding agent (Grok CLI) |
 
-Agents are auto-discovered from PATH. The router only picks from installed agents.
+Agents are auto-discovered from PATH. The router only picks from installed agents. A `grok` task also needs a `grok` model in the matching `model_map` tier. Take the id from `grok models`.
 
 ## Complexity-Based Model Selection
 
