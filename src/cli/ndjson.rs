@@ -95,6 +95,7 @@ impl Formatter {
                 vec![self.paint(THINK, &format!("✻ {first}"))]
             }
             StreamEvent::ToolCall { id, name, input } => {
+                let name = display_tool(&name).to_string();
                 self.record_change(&name, &input);
                 let call = self.tool_call(&name, &input);
                 self.tools.insert(id, name);
@@ -291,6 +292,21 @@ fn shorten(text: &str) -> String {
     match std::env::var("HOME") {
         Ok(home) if !home.is_empty() => text.replace(&home, "~"),
         _ => text.into_owned(),
+    }
+}
+
+/// Grok tool ids shown with the same names as the other agents
+fn display_tool(name: &str) -> &str {
+    match name {
+        "read_file" | "hashline_read" => "Read",
+        "search_replace" | "hashline_edit" | "strreplace" => "Edit",
+        "run_terminal_cmd" | "run_terminal_command" => "Bash",
+        "list_dir" => "List",
+        "grep" | "hashline_grep" => "Grep",
+        "web_search" => "WebSearch",
+        "web_fetch" => "WebFetch",
+        "write" => "Write",
+        other => other,
     }
 }
 

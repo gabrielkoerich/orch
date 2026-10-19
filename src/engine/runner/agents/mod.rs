@@ -1,12 +1,13 @@
 //! Per-agent runner trait, error types, and agent registry.
 //!
-//! Each agent (Claude, Codex, OpenCode) has a different CLI invocation,
+//! Each agent (Claude, Codex, OpenCode, Grok) has a different CLI invocation,
 //! output format, and error pattern. This module defines a common trait
 //! so the runner can delegate parsing and error classification to the
 //! correct implementation.
 
 pub mod claude;
 pub mod codex;
+pub mod grok;
 pub mod kimi;
 pub mod minimax;
 pub mod opencode;
@@ -192,6 +193,7 @@ pub fn collect_assistant_messages_text(_agent: &str, ndjson: &str) -> String {
 pub fn find_agent_result(agent: &str, ndjson: &str) -> Option<AgentResult> {
     match agent {
         "claude" | "kimi" | "minimax" => claude::find_claude_result(ndjson),
+        "grok" => grok::find_grok_result(ndjson),
         "opencode" => opencode::find_opencode_result(ndjson),
         "codex" => codex::find_codex_result(ndjson),
         _ => claude::find_claude_result(ndjson),
@@ -912,6 +914,11 @@ pub trait AgentRunner: Send + Sync {
     ) -> anyhow::Result<tokio::process::Command>;
 }
 
+/// Agents whose CLI takes `--session-id` for a new session and `--resume` to continue it
+pub fn supports_session(agent: &str) -> bool {
+    matches!(agent, "claude" | "kimi" | "minimax" | "grok")
+}
+
 /// Get the appropriate AgentRunner implementation for an agent name.
 pub fn get_runner(agent_name: &str) -> Box<dyn AgentRunner> {
     // Agents that are known to be claude-compatible (same NDJSON output format)
@@ -923,6 +930,7 @@ pub fn get_runner(agent_name: &str) -> Box<dyn AgentRunner> {
         "minimax" => Box::new(minimax::MiniMaxClaudeRunner::new(agent_name)),
         "codex" => Box::new(codex::CodexRunner),
         "opencode" => Box::new(opencode::OpenCodeRunner::new()),
+        "grok" => Box::new(grok::GrokRunner),
         // Unknown agents fall back to Claude-compatible parsing
         other => {
             // Only warn if the agent is not known to be claude-compatible
@@ -1914,6 +1922,9 @@ mod tests {
         assert_eq!(get_runner("minimax").name(), "minimax");
         assert_eq!(get_runner("codex").name(), "codex");
         assert_eq!(get_runner("opencode").name(), "opencode");
+        assert_eq!(get_runner("grok").name(), "grok");
+        assert!(supports_session("grok"));
+        assert!(!supports_session("codex"));
         // olm and glm are claude-compatible and should return correct name
         assert_eq!(get_runner("olm").name(), "olm");
         assert_eq!(get_runner("glm").name(), "glm");
@@ -1957,7 +1968,7 @@ mod tests {
             .finish()
             .init();
 
-        for agent in &["claude", "kimi", "minimax", "olm", "glm"] {
+        for agent in &["claude", "kimi", "minimax", "olm", "glm", "grok"] {
             get_runner(agent);
         }
 

@@ -1,6 +1,6 @@
 //! Agent command building + tmux invocation.
 //!
-//! Supports Claude, Codex, OpenCode (plus Kimi/MiniMax as Claude aliases).
+//! Supports Claude, Codex, OpenCode, Grok (plus Kimi/MiniMax as Claude aliases).
 //! Runs the agent via a runner.sh script executed as the tmux session shell.
 
 use crate::engine::runner::agents::shell_single_quote;
@@ -63,7 +63,7 @@ fn render_prompt_template(template: &str, vars: HashMap<String, String>) -> Stri
 
 /// Agent invocation configuration.
 pub struct AgentInvocation {
-    /// Agent name (claude, codex, opencode, kimi, minimax)
+    /// Agent name (claude, codex, opencode, grok, kimi, minimax)
     pub agent: String,
     /// Model override (e.g., "claude-sonnet-4-6", "o3", "gpt-4.1")
     pub model: Option<String>,
