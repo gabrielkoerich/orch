@@ -9,6 +9,7 @@ Once routed, agents run in full agentic mode with tool access:
 - **Claude**: `-p` (non-interactive), `--permission-mode bypassPermissions` (autonomous) or `acceptEdits` (supervised), `--output-format json`, system prompt via `--append-system-prompt`
 - **Codex**: `exec` subcommand with `--sandbox workspace-write -c 'approval_policy="never"'` (autonomous) or `--dangerously-bypass-approvals-and-sandbox` (full access); `-c 'sandbox_workspace_write.network_access=true'`; system+agent prompt combined
 - **OpenCode**: `opencode run` with `--dangerously-skip-permissions` and combined prompt
+- **Grok**: `grok --output-format streaming-messages-json`, `--permission-mode bypassPermissions` (autonomous) or `acceptEdits` (supervised), system prompt via `--system-prompt-override`, task prompt via `--prompt-file`. Task runs use `--sandbox off` because the workspace profile cannot write a worktree git dir that lives outside the cwd. Deny rules still block `rm` and `git push`.
 - **Kimi / MiniMax**: spawned via their CLIs with the prompt as stdin; combined system+task prompt
 
 Agents execute inside an isolated git worktree created for the task (not your main repo), so they can read project files, edit code, and run commands.

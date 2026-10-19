@@ -46,7 +46,10 @@
 
 #[cfg(test)]
 use super::SandboxLevel;
-use super::{json_str, AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent};
+use super::{
+    json_error_message, json_str, AgentError, AgentRunner, ParsedResponse, PermissionRules,
+    StreamEvent,
+};
 use crate::parser;
 
 /// Runner for Claude-compatible agents (Claude, Kimi, MiniMax).
@@ -304,6 +307,10 @@ impl AgentRunner for ClaudeRunner {
 
     fn stream_events(&self, event: &serde_json::Value) -> Vec<StreamEvent> {
         stream_events(event)
+    }
+
+    fn router_transcript(&self) -> super::RouterTranscript {
+        super::RouterTranscript::Messages
     }
 
     fn extract_text(&self, raw: &str) -> Result<String, super::AgentError> {
@@ -1865,6 +1872,7 @@ pub(crate) fn stream_events(v: &serde_json::Value) -> Vec<StreamEvent> {
                 is_error: b["is_error"].as_bool() == Some(true),
             })
             .collect(),
+        "error" => vec![StreamEvent::Error(json_error_message(v))],
         "result" => {
             let failed = v["is_error"].as_bool() == Some(true)
                 || json_str(v, "/subtype").starts_with("error");

@@ -144,6 +144,10 @@ impl AgentRunner for MiniMaxClaudeRunner {
         self.inner.stream_events(event)
     }
 
+    fn router_transcript(&self) -> super::RouterTranscript {
+        self.inner.router_transcript()
+    }
+
     fn build_command(
         &self,
         model: Option<&str>,

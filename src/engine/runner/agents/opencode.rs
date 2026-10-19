@@ -451,6 +451,10 @@ impl AgentRunner for OpenCodeRunner {
         stream_events(event)
     }
 
+    fn router_transcript(&self) -> super::RouterTranscript {
+        super::RouterTranscript::OpenCode
+    }
+
     fn extract_text(&self, raw: &str) -> Result<String, AgentError> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {

@@ -45,6 +45,7 @@ graph TB
         OC["opencode"]
         KI["kimi"]
         MM["minimax"]
+        GR["grok"]
     end
 
     subgraph "tmux Sessions"
@@ -68,6 +69,7 @@ graph TB
     CONTROL --> CL
     CONTROL --> CO
     CONTROL --> OC
+    CONTROL --> GR
 
     TRANSPORT --> CH_ROUTER
     CH_ROUTER --> TASKS

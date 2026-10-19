@@ -1,12 +1,13 @@
 //! Per-agent runner trait, error types, and agent registry.
 //!
-//! Each agent (Claude, Codex, OpenCode) has a different CLI invocation,
+//! Each agent (Claude, Codex, OpenCode, Grok) has a different CLI invocation,
 //! output format, and error pattern. This module defines a common trait
 //! so the runner can delegate parsing and error classification to the
 //! correct implementation.
 
 pub mod claude;
 pub mod codex;
+pub mod grok;
 pub mod kimi;
 pub mod minimax;
 pub mod opencode;
@@ -192,6 +193,7 @@ pub fn collect_assistant_messages_text(_agent: &str, ndjson: &str) -> String {
 pub fn find_agent_result(agent: &str, ndjson: &str) -> Option<AgentResult> {
     match agent {
         "claude" | "kimi" | "minimax" => claude::find_claude_result(ndjson),
+        "grok" => grok::find_grok_result(ndjson),
         "opencode" => opencode::find_opencode_result(ndjson),
         "codex" => codex::find_codex_result(ndjson),
         _ => claude::find_claude_result(ndjson),
@@ -816,6 +818,17 @@ pub(crate) fn json_error_message(v: &serde_json::Value) -> String {
     .to_string()
 }
 
+/// Router stdout shape. Each runner reports its own
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouterTranscript {
+    /// Claude Messages NDJSON (`type:result`)
+    Messages,
+    /// OpenCode NDJSON (`type:text`, `step_*`)
+    OpenCode,
+    /// Stdout is used as-is
+    Raw,
+}
+
 /// Per-agent runner trait.
 ///
 /// Each agent implements this to handle its specific CLI invocation,
@@ -900,6 +913,11 @@ pub trait AgentRunner: Send + Sync {
         vec![]
     }
 
+    /// Router stdout shape. The router matches on this instead of agent names
+    fn router_transcript(&self) -> RouterTranscript {
+        RouterTranscript::Raw
+    }
+
     /// Build a minimal CLI command for LLM-based routing.
     ///
     /// The command should run the agent with `prompt` as the sole task and
@@ -910,6 +928,11 @@ pub trait AgentRunner: Send + Sync {
         prompt: &str,
         model: Option<&str>,
     ) -> anyhow::Result<tokio::process::Command>;
+}
+
+/// Agents whose CLI takes `--session-id` for a new session and `--resume` to continue it
+pub fn supports_session(agent: &str) -> bool {
+    matches!(agent, "claude" | "kimi" | "minimax" | "grok")
 }
 
 /// Get the appropriate AgentRunner implementation for an agent name.
@@ -923,6 +946,7 @@ pub fn get_runner(agent_name: &str) -> Box<dyn AgentRunner> {
         "minimax" => Box::new(minimax::MiniMaxClaudeRunner::new(agent_name)),
         "codex" => Box::new(codex::CodexRunner),
         "opencode" => Box::new(opencode::OpenCodeRunner::new()),
+        "grok" => Box::new(grok::GrokRunner),
         // Unknown agents fall back to Claude-compatible parsing
         other => {
             // Only warn if the agent is not known to be claude-compatible
@@ -1104,6 +1128,10 @@ macro_rules! delegate_agent_runner {
 
             fn stream_events(&self, event: &serde_json::Value) -> Vec<StreamEvent> {
                 self.$inner.stream_events(event)
+            }
+
+            fn router_transcript(&self) -> crate::engine::runner::agents::RouterTranscript {
+                self.$inner.router_transcript()
             }
 
             fn router_command(
@@ -1914,6 +1942,41 @@ mod tests {
         assert_eq!(get_runner("minimax").name(), "minimax");
         assert_eq!(get_runner("codex").name(), "codex");
         assert_eq!(get_runner("opencode").name(), "opencode");
+        assert_eq!(get_runner("grok").name(), "grok");
+        assert_eq!(
+            get_runner("claude").router_transcript(),
+            RouterTranscript::Messages
+        );
+        assert_eq!(
+            get_runner("kimi").router_transcript(),
+            RouterTranscript::Messages
+        );
+        assert_eq!(
+            get_runner("minimax").router_transcript(),
+            RouterTranscript::Messages
+        );
+        assert_eq!(
+            get_runner("grok").router_transcript(),
+            RouterTranscript::Messages
+        );
+        assert_eq!(
+            get_runner("glm").router_transcript(),
+            RouterTranscript::Messages
+        );
+        assert_eq!(
+            get_runner("olm").router_transcript(),
+            RouterTranscript::Messages
+        );
+        assert_eq!(
+            get_runner("opencode").router_transcript(),
+            RouterTranscript::OpenCode
+        );
+        assert_eq!(
+            get_runner("codex").router_transcript(),
+            RouterTranscript::Raw
+        );
+        assert!(supports_session("grok"));
+        assert!(!supports_session("codex"));
         // olm and glm are claude-compatible and should return correct name
         assert_eq!(get_runner("olm").name(), "olm");
         assert_eq!(get_runner("glm").name(), "glm");
@@ -1957,7 +2020,7 @@ mod tests {
             .finish()
             .init();
 
-        for agent in &["claude", "kimi", "minimax", "olm", "glm"] {
+        for agent in &["claude", "kimi", "minimax", "olm", "glm", "grok"] {
             get_runner(agent);
         }
 

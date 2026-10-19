@@ -846,9 +846,14 @@ mod tests {
 
     /// Helper: run a git command in `dir`, panicking on failure.
     fn git(dir: &std::path::Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+        let mut cmd = std::process::Command::new("git");
+        cmd.current_dir(dir);
+        // Global commit.gpgsign calls the operator's signer (1Password)
+        if args.first() == Some(&"commit") {
+            cmd.args(["-c", "commit.gpgsign=false"]);
+        }
+        let out = cmd
             .args(args)
-            .current_dir(dir)
             .output()
             .unwrap_or_else(|e| panic!("git {:?} failed to start: {e}", args));
         if !out.status.success() {

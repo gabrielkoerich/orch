@@ -8,7 +8,7 @@
 //! ## Session continuity
 //!
 //! Each named session (e.g., "default", "ops") gets a UUID stored in SQLite KV
-//! (`control:session_id:{name}`). Claude-compatible agents (claude, kimi, minimax)
+//! (`control:session_id:{name}`). Session agents (claude, kimi, minimax, grok)
 //! receive `--session-id <uuid>` so they resume prior conversation state.
 //! The UUID is regenerated when the agent or model changes.
 //!
@@ -18,7 +18,7 @@
 //! - `agent:model` — explicit agent + model (e.g., `minimax:sonnet`, `opencode:minimax-m2.5-free`)
 //! - `model` — infer agent from model name (e.g., `sonnet` → claude, `gpt-4o` → codex)
 //!
-//! All agents: claude, codex, opencode, kimi, minimax
+//! All agents: claude, codex, opencode, kimi, minimax, grok
 //! - kimi and minimax are claude-compatible wrappers (separate binaries in PATH)
 //! - opencode supports `opencode models` for listing available models
 
@@ -86,6 +86,8 @@ fn default_model_for_agent(agent: &str) -> &'static str {
     match agent {
         "codex" => "gpt-4o",
         "opencode" => "deepseek-r1",
+        // Empty means omit --model and let the grok CLI use its configured default
+        "grok" => "",
         _ => "sonnet",
     }
 }
@@ -141,6 +143,8 @@ fn infer_agent(model: &str) -> &'static str {
         "codex"
     } else if lower.contains("deepseek") || lower.contains("qwen") {
         "opencode"
+    } else if lower.contains("grok") {
+        "grok"
     } else {
         // claude models (sonnet, opus, haiku) and unknown → default to claude
         "claude"
@@ -399,12 +403,24 @@ pub async fn set_agent_spec(store: &TaskStore, agent: &str) -> Result<ModelSpec>
     Ok(spec)
 }
 
+fn display_model(model: &str) -> &str {
+    if model.is_empty() {
+        "default"
+    } else {
+        model
+    }
+}
+
 fn format_current_spec(spec: &ModelSpec) -> String {
-    format!("Current: {}:{}", spec.agent, spec.model)
+    format!("Current: {}:{}", spec.agent, display_model(&spec.model))
 }
 
 fn format_switched_spec(spec: &ModelSpec) -> String {
-    format!("Switched to **{}:{}** (validated)", spec.agent, spec.model)
+    format!(
+        "Switched to **{}:{}** (validated)",
+        spec.agent,
+        display_model(&spec.model)
+    )
 }
 
 async fn handle_control_command(
@@ -750,7 +766,7 @@ pub async fn send_message(
     // and persist ALL intermediate assistant responses so local transcript matches provider.
     // For other agents (codex, opencode), split into chunks and send each as independent
     // invocation (no --resume), each getting its own persisted assistant response.
-    let agent_has_sessions = matches!(agent.as_str(), "claude" | "kimi" | "minimax");
+    let agent_has_sessions = crate::engine::runner::agents::supports_session(&agent);
     let (chunks, delivery_mode) = if full_message.len() > MAX_CONTROL_MESSAGE_BYTES {
         tracing::info!(
             bytes = full_message.len(),
@@ -1290,6 +1306,7 @@ mod tests {
         assert_eq!(infer_agent("gpt-4o"), "codex");
         assert_eq!(infer_agent("o3"), "codex");
         assert_eq!(infer_agent("deepseek-r1"), "opencode");
+        assert_eq!(infer_agent("grok"), "grok");
     }
 
     #[tokio::test]

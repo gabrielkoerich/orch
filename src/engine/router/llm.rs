@@ -366,14 +366,18 @@ fn classify_router_llm_failure(agent: &str, stdout: &str, stderr: &str) -> Strin
     "router LLM failed with no output (empty stdout and stderr)".to_string()
 }
 
+fn router_transcript(agent: &str) -> agents::RouterTranscript {
+    agents::get_runner(agent).router_transcript()
+}
+
 /// Extract agent text for classification purposes.
 ///
 /// This is a simplified version of `extract_agent_text()` that doesn't bail on
 /// system-only envelopes — instead it returns the raw text so the caller can
 /// classify the failure.
 fn extract_agent_text_for_classification(agent: &str, raw: &str) -> anyhow::Result<String> {
-    match agent {
-        "opencode" => {
+    match router_transcript(agent) {
+        agents::RouterTranscript::OpenCode => {
             let events = agents::parse_ndjson(raw.trim());
             if events.is_empty() {
                 Ok(raw.to_string())
@@ -381,7 +385,7 @@ fn extract_agent_text_for_classification(agent: &str, raw: &str) -> anyhow::Resu
                 Ok(opencode::extract_ndjson_text(&events).unwrap_or_else(|| raw.to_string()))
             }
         }
-        "claude" | "kimi" | "minimax" => match claude::extract_stream_json_result_text(raw) {
+        agents::RouterTranscript::Messages => match claude::extract_stream_json_result_text(raw) {
             Ok(text) => Ok(text),
             Err(AgentError::AgentFailed { message }) => {
                 Err(anyhow::anyhow!("router LLM returned error: {message}"))
@@ -395,7 +399,7 @@ fn extract_agent_text_for_classification(agent: &str, raw: &str) -> anyhow::Resu
             }
             Err(err) => Err(anyhow::anyhow!("router LLM returned error: {err}")),
         },
-        _ => Ok(raw.to_string()),
+        agents::RouterTranscript::Raw => Ok(raw.to_string()),
     }
 }
 
@@ -1109,8 +1113,8 @@ impl LlmRouter {
     }
 
     fn extract_agent_text(&self, agent: &str, raw: &str) -> anyhow::Result<String> {
-        match agent {
-            "opencode" => {
+        match router_transcript(agent) {
+            agents::RouterTranscript::OpenCode => {
                 let events = agents::parse_ndjson(raw.trim());
                 if events.is_empty() {
                     // No parseable NDJSON lines — treat as plain text
@@ -1155,19 +1159,21 @@ impl LlmRouter {
                     }
                 }
             }
-            "claude" | "kimi" | "minimax" => match claude::extract_stream_json_result_text(raw) {
-                Ok(text) => {
-                    // Defensive: some wrappers emit a single `system init` envelope
-                    // before the actual result. If the extracted text looks like a
-                    // system/init envelope (no useful result), try a more lenient
-                    // NDJSON extractor that scans all lines for text/result events.
-                    let trimmed_text = text.trim();
-                    // If the extracted text is itself a JSON envelope that only
-                    // contains a `type: system` or `subtype: init` event (startup
-                    // envelope), treat it as non-informative and try a lenient
-                    // NDJSON extractor that scans all lines for text/result events.
-                    let looks_like_system_init =
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed_text) {
+            agents::RouterTranscript::Messages => {
+                match claude::extract_stream_json_result_text(raw) {
+                    Ok(text) => {
+                        // Defensive: some wrappers emit a single `system init` envelope
+                        // before the actual result. If the extracted text looks like a
+                        // system/init envelope (no useful result), try a more lenient
+                        // NDJSON extractor that scans all lines for text/result events.
+                        let trimmed_text = text.trim();
+                        // If the extracted text is itself a JSON envelope that only
+                        // contains a `type: system` or `subtype: init` event (startup
+                        // envelope), treat it as non-informative and try a lenient
+                        // NDJSON extractor that scans all lines for text/result events.
+                        let looks_like_system_init = if let Ok(val) =
+                            serde_json::from_str::<serde_json::Value>(trimmed_text)
+                        {
                             val.get("type").and_then(|v| v.as_str()) == Some("system")
                                 || val
                                     .get("subtype")
@@ -1178,33 +1184,34 @@ impl LlmRouter {
                             false
                         };
 
-                    if looks_like_system_init {
-                        if let Some(fallback) = opencode::extract_router_text(raw) {
-                            return Ok(fallback);
+                        if looks_like_system_init {
+                            if let Some(fallback) = opencode::extract_router_text(raw) {
+                                return Ok(fallback);
+                            }
+                            anyhow::bail!(
+                                "router LLM produced only system/init envelope with no text result"
+                            )
                         }
-                        anyhow::bail!(
-                            "router LLM produced only system/init envelope with no text result"
-                        )
-                    }
 
-                    Ok(text)
-                }
-                Err(AgentError::AgentFailed { message }) => {
-                    anyhow::bail!("router LLM returned error: {message}")
-                }
-                Err(AgentError::InvalidResponse { raw }) => {
-                    // If the agent's extract_text failed to parse structured
-                    // response, try a conservative NDJSON extraction for router
-                    // text (opencode-style). If that returns some usable text,
-                    // prefer it; otherwise treat as plain raw text.
-                    if let Some(text) = opencode::extract_router_text(&raw) {
-                        return Ok(text);
+                        Ok(text)
                     }
-                    Ok(raw)
+                    Err(AgentError::AgentFailed { message }) => {
+                        anyhow::bail!("router LLM returned error: {message}")
+                    }
+                    Err(AgentError::InvalidResponse { raw }) => {
+                        // If the agent's extract_text failed to parse structured
+                        // response, try a conservative NDJSON extraction for router
+                        // text (opencode-style). If that returns some usable text,
+                        // prefer it; otherwise treat as plain raw text.
+                        if let Some(text) = opencode::extract_router_text(&raw) {
+                            return Ok(text);
+                        }
+                        Ok(raw)
+                    }
+                    Err(err) => anyhow::bail!("router LLM returned error: {err}"),
                 }
-                Err(err) => anyhow::bail!("router LLM returned error: {err}"),
-            },
-            _ => Ok(raw.to_string()),
+            }
+            agents::RouterTranscript::Raw => Ok(raw.to_string()),
         }
     }
 
@@ -1730,6 +1737,17 @@ mod tests {
 {"type":"result","subtype":"success","is_error":false,"result":"{\"executor\":\"kimi\",\"complexity\":\"medium\",\"reason\":\"wrapper\"}"}"#;
         let resp = router.parse_llm_response("kimi", raw).unwrap();
         assert_eq!(resp.executor, "kimi");
+    }
+
+    #[test]
+    fn parse_messages_stream_follows_the_runner() {
+        let router = make_router();
+        let raw = r#"{"type":"system","subtype":"init"}
+{"type":"result","subtype":"success","is_error":false,"result":"{\"executor\":\"grok\",\"complexity\":\"medium\",\"reason\":\"wrapper\"}"}"#;
+        for agent in ["grok", "glm", "olm", "minimax"] {
+            let resp = router.parse_llm_response(agent, raw).unwrap();
+            assert_eq!(resp.executor, "grok", "{agent}");
+        }
     }
 
     #[test]

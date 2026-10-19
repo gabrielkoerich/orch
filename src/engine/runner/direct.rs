@@ -3,7 +3,9 @@
 //! Used by the control session and the router LLM to run agents
 //! in a fire-and-forget mode without a persistent tmux session.
 
-use crate::engine::runner::agents::{get_runner, shell_single_quote, AgentError, PermissionRules};
+use crate::engine::runner::agents::{
+    get_runner, shell_single_quote, supports_session, AgentError, PermissionRules,
+};
 use anyhow::Result;
 use std::time::Duration;
 
@@ -88,9 +90,9 @@ pub struct SessionContinuation<'a> {
 
 /// Run an agent one-shot with an optional `--session-id` or `--resume` for conversation continuity.
 ///
-/// For claude-compatible agents (claude, kimi, minimax), appends `--session-id <uuid>`
-/// when starting a new session, or `--resume <uuid>` when continuing an existing session.
-/// Other agents ignore the parameter.
+/// For agents that support sessions (claude, kimi, minimax, grok), appends
+/// `--session-id <uuid>` when starting a new session, or `--resume <uuid>` when
+/// continuing one. Other agents ignore the parameter.
 pub async fn run_direct_with_session(
     agent: &str,
     model: Option<&str>,
@@ -113,26 +115,45 @@ pub async fn run_direct_with_session(
     let mut shell_cmd =
         runner.build_command(model, &timeout_cmd, &sys_file, &msg_file, &permissions);
 
-    // Append --session-id (new) or --resume (existing) for claude-compatible agents
     if let Some(s) = session {
-        if matches!(agent, "claude" | "kimi" | "minimax") {
-            let flag = if s.resume { "--resume" } else { "--session-id" };
-            // Insert flag before the stdin redirect (< "msg_file")
-            if let Some(pos) = shell_cmd.rfind("< \"") {
-                let quoted = shell_single_quote(s.session_id);
-                shell_cmd.insert_str(pos, &format!("{flag} {quoted} \\\n  "));
-            } else {
-                tracing::warn!(
-                    agent,
-                    flag,
-                    session_id = s.session_id,
-                    "could not insert session flag: '< \"' pattern not found in shell command"
-                );
-            }
-        }
+        shell_cmd = insert_session_flag(agent, shell_cmd, s);
     }
 
     run_shell_command(&shell_cmd, work_dir, timeout, agent).await
+}
+
+/// Append `--session-id` or `--resume` for agents that keep a conversation.
+///
+/// Claude-family commands redirect the prompt with `< "file"`, so the flag is
+/// inserted before that redirect. Grok takes `--prompt-file` and has no
+/// redirect, so the flag is appended.
+fn insert_session_flag(
+    agent: &str,
+    mut shell_cmd: String,
+    session: SessionContinuation<'_>,
+) -> String {
+    if !supports_session(agent) {
+        return shell_cmd;
+    }
+    let flag = if session.resume {
+        "--resume"
+    } else {
+        "--session-id"
+    };
+    let quoted = shell_single_quote(session.session_id);
+    if let Some(pos) = shell_cmd.rfind("< \"") {
+        shell_cmd.insert_str(pos, &format!("{flag} {quoted} \\\n  "));
+    } else if agent == "grok" {
+        shell_cmd.push_str(&format!(" \\\n  {flag} {quoted}"));
+    } else {
+        tracing::warn!(
+            agent,
+            flag,
+            session_id = session.session_id,
+            "could not insert session flag: '< \"' pattern not found in shell command"
+        );
+    }
+    shell_cmd
 }
 
 /// Execute an already-built `tokio::process::Command` one-shot, returning raw stdout.
@@ -277,6 +298,52 @@ pub(crate) fn extract_from_envelope(raw: &str) -> (String, Option<u64>, Option<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_flag_appends_for_grok_prompt_file() {
+        let cmd = "grok --prompt-file '/tmp/msg.txt'".to_string();
+        let updated = insert_session_flag(
+            "grok",
+            cmd,
+            SessionContinuation {
+                session_id: "abc",
+                resume: false,
+            },
+        );
+        assert!(updated.contains("--session-id 'abc'"), "{updated}");
+        assert!(updated.contains("--prompt-file"), "{updated}");
+    }
+
+    #[test]
+    fn session_flag_inserts_before_stdin_redirect() {
+        let cmd = "claude -p < \"/tmp/msg.txt\"".to_string();
+        let updated = insert_session_flag(
+            "claude",
+            cmd,
+            SessionContinuation {
+                session_id: "abc",
+                resume: true,
+            },
+        );
+        assert!(updated.contains("--resume 'abc'"), "{updated}");
+        let resume = updated.find("--resume").unwrap();
+        let redirect = updated.find("< \"").unwrap();
+        assert!(resume < redirect, "{updated}");
+    }
+
+    #[test]
+    fn session_flag_ignored_for_codex() {
+        let cmd = "codex exec".to_string();
+        let updated = insert_session_flag(
+            "codex",
+            cmd.clone(),
+            SessionContinuation {
+                session_id: "abc",
+                resume: false,
+            },
+        );
+        assert_eq!(updated, cmd);
+    }
 
     #[test]
     fn test_extract_from_envelope_claude_json() {
