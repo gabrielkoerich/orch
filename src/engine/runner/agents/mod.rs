@@ -818,6 +818,17 @@ pub(crate) fn json_error_message(v: &serde_json::Value) -> String {
     .to_string()
 }
 
+/// Router stdout shape. Each runner reports its own
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouterTranscript {
+    /// Claude Messages NDJSON (`type:result`)
+    Messages,
+    /// OpenCode NDJSON (`type:text`, `step_*`)
+    OpenCode,
+    /// Stdout is used as-is
+    Raw,
+}
+
 /// Per-agent runner trait.
 ///
 /// Each agent implements this to handle its specific CLI invocation,
@@ -900,6 +911,11 @@ pub trait AgentRunner: Send + Sync {
     /// Free/fallback models for last-resort failover.
     fn free_models(&self) -> Vec<String> {
         vec![]
+    }
+
+    /// Router stdout shape. The router matches on this instead of agent names
+    fn router_transcript(&self) -> RouterTranscript {
+        RouterTranscript::Raw
     }
 
     /// Build a minimal CLI command for LLM-based routing.
@@ -1112,6 +1128,10 @@ macro_rules! delegate_agent_runner {
 
             fn stream_events(&self, event: &serde_json::Value) -> Vec<StreamEvent> {
                 self.$inner.stream_events(event)
+            }
+
+            fn router_transcript(&self) -> crate::engine::runner::agents::RouterTranscript {
+                self.$inner.router_transcript()
             }
 
             fn router_command(
@@ -1923,6 +1943,38 @@ mod tests {
         assert_eq!(get_runner("codex").name(), "codex");
         assert_eq!(get_runner("opencode").name(), "opencode");
         assert_eq!(get_runner("grok").name(), "grok");
+        assert_eq!(
+            get_runner("claude").router_transcript(),
+            RouterTranscript::Messages
+        );
+        assert_eq!(
+            get_runner("kimi").router_transcript(),
+            RouterTranscript::Messages
+        );
+        assert_eq!(
+            get_runner("minimax").router_transcript(),
+            RouterTranscript::Messages
+        );
+        assert_eq!(
+            get_runner("grok").router_transcript(),
+            RouterTranscript::Messages
+        );
+        assert_eq!(
+            get_runner("glm").router_transcript(),
+            RouterTranscript::Messages
+        );
+        assert_eq!(
+            get_runner("olm").router_transcript(),
+            RouterTranscript::Messages
+        );
+        assert_eq!(
+            get_runner("opencode").router_transcript(),
+            RouterTranscript::OpenCode
+        );
+        assert_eq!(
+            get_runner("codex").router_transcript(),
+            RouterTranscript::Raw
+        );
         assert!(supports_session("grok"));
         assert!(!supports_session("codex"));
         // olm and glm are claude-compatible and should return correct name

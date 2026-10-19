@@ -43,6 +43,10 @@ impl AgentRunner for GrokRunner {
         claude::stream_events(event)
     }
 
+    fn router_transcript(&self) -> super::RouterTranscript {
+        super::RouterTranscript::Messages
+    }
+
     fn extract_text(&self, raw: &str) -> Result<String, AgentError> {
         Self::parser().extract_text(raw)
     }

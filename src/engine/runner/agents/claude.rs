@@ -309,6 +309,10 @@ impl AgentRunner for ClaudeRunner {
         stream_events(event)
     }
 
+    fn router_transcript(&self) -> super::RouterTranscript {
+        super::RouterTranscript::Messages
+    }
+
     fn extract_text(&self, raw: &str) -> Result<String, super::AgentError> {
         // Empty input: return empty string (not an error), matching historical behavior.
         if raw.trim().is_empty() {

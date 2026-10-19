@@ -2358,7 +2358,13 @@ mod tests {
             .output()
             .await;
         let _ = Command::new("git")
-            .args(["-c", "commit.gpgsign=false", "commit", "-m", "add feature and workflow"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "add feature and workflow",
+            ])
             .current_dir(&dir)
             .output()
             .await;
@@ -2467,7 +2473,13 @@ mod tests {
             .output()
             .await;
         let _ = Command::new("git")
-            .args(["-c", "commit.gpgsign=false", "commit", "-m", "add feature only"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "add feature only",
+            ])
             .current_dir(&dir)
             .output()
             .await;

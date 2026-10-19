@@ -366,14 +366,18 @@ fn classify_router_llm_failure(agent: &str, stdout: &str, stderr: &str) -> Strin
     "router LLM failed with no output (empty stdout and stderr)".to_string()
 }
 
+fn router_transcript(agent: &str) -> agents::RouterTranscript {
+    agents::get_runner(agent).router_transcript()
+}
+
 /// Extract agent text for classification purposes.
 ///
 /// This is a simplified version of `extract_agent_text()` that doesn't bail on
 /// system-only envelopes — instead it returns the raw text so the caller can
 /// classify the failure.
 fn extract_agent_text_for_classification(agent: &str, raw: &str) -> anyhow::Result<String> {
-    match agent {
-        "opencode" => {
+    match router_transcript(agent) {
+        agents::RouterTranscript::OpenCode => {
             let events = agents::parse_ndjson(raw.trim());
             if events.is_empty() {
                 Ok(raw.to_string())
@@ -381,23 +385,21 @@ fn extract_agent_text_for_classification(agent: &str, raw: &str) -> anyhow::Resu
                 Ok(opencode::extract_ndjson_text(&events).unwrap_or_else(|| raw.to_string()))
             }
         }
-        "claude" | "kimi" | "minimax" | "grok" => {
-            match claude::extract_stream_json_result_text(raw) {
-                Ok(text) => Ok(text),
-                Err(AgentError::AgentFailed { message }) => {
-                    Err(anyhow::anyhow!("router LLM returned error: {message}"))
-                }
-                Err(AgentError::InvalidResponse { raw }) => {
-                    if let Some(text) = opencode::extract_router_text(&raw) {
-                        Ok(text)
-                    } else {
-                        Ok(raw)
-                    }
-                }
-                Err(err) => Err(anyhow::anyhow!("router LLM returned error: {err}")),
+        agents::RouterTranscript::Messages => match claude::extract_stream_json_result_text(raw) {
+            Ok(text) => Ok(text),
+            Err(AgentError::AgentFailed { message }) => {
+                Err(anyhow::anyhow!("router LLM returned error: {message}"))
             }
-        }
-        _ => Ok(raw.to_string()),
+            Err(AgentError::InvalidResponse { raw }) => {
+                if let Some(text) = opencode::extract_router_text(&raw) {
+                    Ok(text)
+                } else {
+                    Ok(raw)
+                }
+            }
+            Err(err) => Err(anyhow::anyhow!("router LLM returned error: {err}")),
+        },
+        agents::RouterTranscript::Raw => Ok(raw.to_string()),
     }
 }
 
@@ -1111,8 +1113,8 @@ impl LlmRouter {
     }
 
     fn extract_agent_text(&self, agent: &str, raw: &str) -> anyhow::Result<String> {
-        match agent {
-            "opencode" => {
+        match router_transcript(agent) {
+            agents::RouterTranscript::OpenCode => {
                 let events = agents::parse_ndjson(raw.trim());
                 if events.is_empty() {
                     // No parseable NDJSON lines — treat as plain text
@@ -1157,7 +1159,7 @@ impl LlmRouter {
                     }
                 }
             }
-            "claude" | "kimi" | "minimax" | "grok" => {
+            agents::RouterTranscript::Messages => {
                 match claude::extract_stream_json_result_text(raw) {
                     Ok(text) => {
                         // Defensive: some wrappers emit a single `system init` envelope
@@ -1209,7 +1211,7 @@ impl LlmRouter {
                     Err(err) => anyhow::bail!("router LLM returned error: {err}"),
                 }
             }
-            _ => Ok(raw.to_string()),
+            agents::RouterTranscript::Raw => Ok(raw.to_string()),
         }
     }
 
@@ -1735,6 +1737,17 @@ mod tests {
 {"type":"result","subtype":"success","is_error":false,"result":"{\"executor\":\"kimi\",\"complexity\":\"medium\",\"reason\":\"wrapper\"}"}"#;
         let resp = router.parse_llm_response("kimi", raw).unwrap();
         assert_eq!(resp.executor, "kimi");
+    }
+
+    #[test]
+    fn parse_messages_stream_follows_the_runner() {
+        let router = make_router();
+        let raw = r#"{"type":"system","subtype":"init"}
+{"type":"result","subtype":"success","is_error":false,"result":"{\"executor\":\"grok\",\"complexity\":\"medium\",\"reason\":\"wrapper\"}"}"#;
+        for agent in ["grok", "glm", "olm", "minimax"] {
+            let resp = router.parse_llm_response(agent, raw).unwrap();
+            assert_eq!(resp.executor, "grok", "{agent}");
+        }
     }
 
     #[test]
