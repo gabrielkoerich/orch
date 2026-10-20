@@ -20,6 +20,40 @@ const _: () = assert!(TELEGRAM_HTTP_TIMEOUT_SECS > TELEGRAM_LONG_POLL_TIMEOUT_SE
 ///
 /// Telegram's HTML parser is strict: bare `<`, `>`, or `&` cause
 /// "can't parse entities" errors. This function escapes those characters.
+// Telegram refuses a message over 4096 characters, so parts stay below it with room to spare
+const MAX_MESSAGE_CHARS: usize = 4000;
+
+/* Split plain text into parts whose escaped form fits one message. It breaks at line ends, and
+hard-splits only a line too long by itself. Splitting before escaping means no part can cut an
+entity such as `&amp;` in half */
+fn split_for_telegram(text: &str, max: usize) -> Vec<String> {
+    let size = |s: &str| html_escape(s).chars().count();
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    for line in text.split_inclusive('\n') {
+        if !current.is_empty() && size(&current) + size(line) > max {
+            parts.push(std::mem::take(&mut current));
+        }
+        if size(line) <= max {
+            current.push_str(line);
+            continue;
+        }
+
+        for c in line.chars() {
+            let mut buf = [0u8; 4];
+            let c = c.encode_utf8(&mut buf);
+            if size(&current) + size(c) > max {
+                parts.push(std::mem::take(&mut current));
+            }
+            current.push_str(c);
+        }
+    }
+    if !current.is_empty() || parts.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -153,9 +187,11 @@ impl TelegramChannel {
         text: &str,
         topic_id: Option<i64>,
     ) -> anyhow::Result<()> {
-        let escaped = html_escape(text);
-        self.send_formatted_message(chat_id, &escaped, topic_id)
-            .await
+        for part in split_for_telegram(text, MAX_MESSAGE_CHARS) {
+            self.send_formatted_message(chat_id, &html_escape(&part), topic_id)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn send_formatted_message(
@@ -480,6 +516,46 @@ impl Channel for TelegramChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_short_message_is_one_part() {
+        assert_eq!(split_for_telegram("hello\nworld", 4000), ["hello\nworld"]);
+        assert_eq!(split_for_telegram("", 4000), [""]);
+    }
+
+    #[test]
+    fn a_long_message_splits_at_line_ends_and_loses_nothing() {
+        let text: String = (0..400)
+            .map(|i| format!("line {i} with some text\n"))
+            .collect();
+        let parts = split_for_telegram(&text, 4000);
+        assert!(parts.len() > 1);
+        assert_eq!(parts.concat(), text);
+        for part in &parts {
+            assert!(html_escape(part).chars().count() <= 4000);
+            assert!(part.ends_with('\n'), "a part ended mid line");
+        }
+    }
+
+    #[test]
+    fn escaping_counts_toward_the_limit_and_an_entity_is_never_cut() {
+        let text = "&".repeat(3000);
+        let parts = split_for_telegram(&text, 4000);
+        assert_eq!(parts.concat(), text);
+        for part in &parts {
+            let escaped = html_escape(part);
+            assert!(escaped.chars().count() <= 4000);
+            assert_eq!(escaped.matches("&amp;").count(), part.len());
+        }
+    }
+
+    #[test]
+    fn a_line_longer_than_the_limit_is_hard_split_on_char_boundaries() {
+        let text = "é".repeat(9000);
+        let parts = split_for_telegram(&text, 4000);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts.concat(), text);
+    }
     use serde_json::json;
 
     #[test]
