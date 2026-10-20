@@ -11,6 +11,15 @@ brew tap gabrielkoerich/homebrew-tap
 brew install orch
 ```
 
+On Linux, install the prebuilt binary with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), or build from source with cargo:
+
+```bash
+cargo binstall orch-cli      # prebuilt x86_64 binary
+cargo install orch-cli       # from source, needs libssl-dev and pkg-config
+```
+
+Run it as a systemd user service with `orch serve` as its command, then `orch service start|stop|restart|status` drives it through `systemctl --user`.
+
 All dependencies (`yq`, `jq`, `just`, `python3`, `rg`, `fd`) are installed automatically.
 
 ### Agent CLIs
