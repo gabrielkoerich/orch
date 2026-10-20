@@ -12,6 +12,14 @@ categories = ["command-line-utilities", "development-tools"]
 # Only what the build reads: include_str! pulls prompts, test fixtures and the review workflow
 include = ["src/**", "prompts/**", "migrations/**", "tests/**", ".github/workflows/orch-review.yml", "build.rs", "README.md"]
 
+# cargo binstall orch-cli downloads the release binary, a target with no asset falls back to building from source
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/orch-{ target }"
+pkg-fmt = "bin"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/orch-arm64"
+
 [lib]
 name = "orch"
 path = "src/lib.rs"

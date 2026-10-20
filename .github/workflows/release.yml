@@ -296,9 +296,41 @@ jobs:
           path: dist/orch-arm64
           retention-days: 1
 
+  # Runs beside build-macos, both wait only on check-release. Named by target so cargo binstall finds it
+  build-linux:
+    needs: [check-release]
+    if: github.ref == 'refs/heads/main' && needs.check-release.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.94.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-build"
+          cache-all-crates: true
+
+      - name: Build release binary
+        env:
+          ORCH_BUILD_VERSION: ${{ needs.check-release.outputs.version }}
+        run: |
+          cargo build --release --target x86_64-unknown-linux-gnu
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-gnu/release/orch dist/orch-x86_64-unknown-linux-gnu
+          chmod +x dist/orch-x86_64-unknown-linux-gnu
+
+      - name: Upload Linux binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: orch-x86_64-unknown-linux-gnu
+          path: dist/orch-x86_64-unknown-linux-gnu
+          retention-days: 1
+
   # Create GitHub release with binaries
   release:
-    needs: [check, test, secrets, check-release, build-macos]
+    needs: [check, test, secrets, check-release, build-macos, build-linux]
     if: github.ref == 'refs/heads/main' && needs.check-release.outputs.skip == 'false'
     runs-on: ubuntu-latest
     permissions:
@@ -413,6 +445,7 @@ jobs:
             --title "$VERSION" \
             --notes-file release_notes.md \
             artifacts/orch-arm64/orch-arm64 \
+            artifacts/orch-x86_64-unknown-linux-gnu/orch-x86_64-unknown-linux-gnu \
             checksums.txt
 
           echo "Created release $VERSION"
