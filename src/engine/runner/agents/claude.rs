@@ -97,10 +97,19 @@ impl ClaudeRunner {
             .unwrap_or(false);
 
         // Extract the result text
-        let result_text = envelope
-            .get("result")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let error_text = if is_error {
+            envelope_error_text(envelope)
+        } else {
+            String::new()
+        };
+        let result_text = if is_error {
+            error_text.as_str()
+        } else {
+            envelope
+                .get("result")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+        };
 
         if is_error {
             // Classify the error from the result text.
@@ -179,6 +188,32 @@ impl ClaudeRunner {
     }
 }
 
+/// Error text of an `is_error` envelope: `result`, else the joined `errors[]`, else `subtype`.
+/// Some agents (e.g. billing failures) put the message only in `errors[]`
+fn envelope_error_text(obj: &serde_json::Map<String, serde_json::Value>) -> String {
+    let result = obj.get("result").and_then(|v| v.as_str()).unwrap_or("");
+    if !result.is_empty() {
+        return result.to_string();
+    }
+    let errors = obj
+        .get("errors")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| e.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    if !errors.is_empty() {
+        return errors;
+    }
+    obj.get("subtype")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
 /// Helper: extract error from a JSON object if it is a `type:result` envelope
 /// with `is_error=true`. Uses pattern detection for proper error classification
 /// (auth, rate limit, context overflow) rather than always returning AgentFailed.
@@ -192,7 +227,8 @@ fn extract_error_from_envelope(
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
     {
-        let result_text = obj.get("result").and_then(|v| v.as_str()).unwrap_or("");
+        let result_text = envelope_error_text(obj);
+        let result_text = result_text.as_str();
         // Use result_text only (not combined with raw JSON) so the error
         // message stays clean — the raw NDJSON stats blob must not leak
         // into the logged reason string.
@@ -416,8 +452,7 @@ impl AgentRunner for ClaudeRunner {
             if obj.get("is_error").and_then(|v| v.as_bool()) != Some(true) {
                 return None;
             }
-            let result_str = obj.get("result")?.as_str()?;
-            Some(result_str.to_string())
+            Some(envelope_error_text(obj)).filter(|t| !t.is_empty())
         })();
 
         // Also check for system-level error events (e.g., session limit mid-stream).
@@ -861,6 +896,28 @@ mod tests {
 
     fn runner() -> ClaudeRunner {
         ClaudeRunner::new("claude")
+    }
+
+    #[test]
+    fn error_envelope_uses_errors_array_when_result_missing() {
+        let raw = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["API error (status 402 Payment Required): usage balance exhausted"]}"#;
+        match runner().parse_response(raw) {
+            Err(AgentError::AgentFailed { message } | AgentError::Auth { message }) => {
+                assert!(crate::engine::cooldown::detect_credit_exhaustion(&message).is_some());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_envelope_falls_back_to_subtype() {
+        let raw = r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#;
+        match runner().parse_response(raw) {
+            Err(AgentError::AgentFailed { message }) => {
+                assert_eq!(message, "error_during_execution")
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]
