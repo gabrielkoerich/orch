@@ -72,6 +72,7 @@ pub struct OutputChunk {
 }
 
 /// The core channel trait. All external interfaces implement this.
+#[allow(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
 #[async_trait]
 pub trait Channel: Send + Sync {
     /// Human-readable channel name.

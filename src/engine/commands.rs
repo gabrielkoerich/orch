@@ -13,6 +13,7 @@ use std::sync::Arc;
 ///
 /// Exists so tests can inject a mock that simulates DB failures without
 /// coupling the test harness to a real SQLite pool.
+#[allow(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
 #[async_trait]
 pub trait CommandStoreOps: Send + Sync {
     async fn resolve_task_id(&self, repo: &str, task_id: &str) -> anyhow::Result<Option<i64>>;
