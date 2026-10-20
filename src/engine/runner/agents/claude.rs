@@ -771,11 +771,17 @@ pub fn find_claude_result(ndjson: &str) -> Option<super::AgentResult> {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
-                let result_text = envelope
-                    .get("result")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let result_text = if is_error {
+                    // Error envelopes put the real message in errors[] (billing,
+                    // rate limits) with `result` empty — don't lose it (issue #3713)
+                    envelope_error_text(envelope)
+                } else {
+                    envelope
+                        .get("result")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
 
                 let (input_tokens, output_tokens) = extract_usage(envelope);
                 let duration_ms = envelope.get("duration_ms").and_then(|v| v.as_u64());
@@ -1650,6 +1656,17 @@ mod tests {
         let result = find_claude_result(ndjson).expect("should find result");
         assert!(result.is_error);
         assert!(result.result_text.contains("rate limit"));
+    }
+
+    #[test]
+    fn find_claude_result_error_envelope_with_empty_result_uses_errors() {
+        // Grok 402: no `result` field, message only in errors[] — must not
+        // become an empty AgentFailed (issue #3713)
+        let ndjson = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,"errors":["Internal error: {\"message\":\"API error (status 402 Payment Required): Grok Build usage balance exhausted\",\"http_status\":402}"]}"#;
+        let result = find_claude_result(ndjson).expect("should find result");
+        assert!(result.is_error);
+        assert!(result.result_text.contains("usage balance exhausted"));
+        assert!(crate::engine::cooldown::detect_credit_exhaustion(&result.result_text).is_some());
     }
 
     #[test]
