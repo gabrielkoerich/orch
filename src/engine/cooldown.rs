@@ -570,6 +570,8 @@ pub fn detect_credit_exhaustion(error_message: &str) -> Option<CreditExhaustionR
         || lower.contains("insufficient balance")
         || lower.contains("please recharge")
         || lower.contains("no resource package")
+        || lower.contains("balance exhausted")
+        || lower.contains("402 payment required")
     {
         return Some(CreditExhaustionReason::OutOfCredits);
     }
