@@ -321,6 +321,18 @@ jobs:
           echo "Downloaded artifacts:"
           find artifacts -type f -ls
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.94.1
+
+      # Publish first: a tag without a crate is worse than a crate without a tag, and a rerun then tags it
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.check-release.outputs.version }}
+        run: |
+          sed -i "0,/^version = .*/s//version = \"${VERSION#v}\"/" Cargo.toml
+          ORCH_BUILD_VERSION="$VERSION" cargo publish --allow-dirty
+
       - name: Create tag
         env:
           GH_TOKEN: ${{ github.token }}
