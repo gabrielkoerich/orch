@@ -1,10 +1,20 @@
 [package]
-name = "orch"
+# The crate name orch is taken on crates.io, the binary and the library keep the name orch
+name = "orch-cli"
 version = "0.1.0"
 edition = "2021"
-description = "Orch — The Agent Orchestration Engine (Rust core)"
+description = "Orch, the agent orchestration engine: runs coding agents on tasks and cron jobs"
 license = "MIT"
 repository = "https://github.com/gabrielkoerich/orch"
+readme = "README.md"
+keywords = ["agents", "orchestration", "cron", "claude", "codex"]
+categories = ["command-line-utilities", "development-tools"]
+# Only what the build reads: include_str! pulls prompts, test fixtures and the review workflow
+include = ["src/**", "prompts/**", "migrations/**", "tests/**", ".github/workflows/orch-review.yml", "build.rs", "README.md"]
+
+[lib]
+name = "orch"
+path = "src/lib.rs"
 
 [[bin]]
 name = "orch"
