@@ -428,8 +428,15 @@ impl GhHttp {
             .unwrap_or(300);
 
         let mut last_err: Option<anyhow::Error> = None;
+        // A cached token can go bad mid-process (revoked, rotated, stale keychain read).
+        // On the first 401 Bad credentials: evict the cache, re-resolve once, resend
+        let mut auth_override: Option<String> = None;
+        let mut auth_retried = false;
         for attempt in 0..attempts {
-            let req = make_req()?;
+            let mut req = make_req()?;
+            if let Some(auth) = &auth_override {
+                req = req.header(header::AUTHORIZATION, auth.clone());
+            }
             let resp_result = req.send().await;
 
             match resp_result {
@@ -439,6 +446,40 @@ impl GhHttp {
                         Self::record_graphql_response(&resp);
                     } else {
                         Self::record_response(&resp);
+                    }
+
+                    if resp.status() == StatusCode::UNAUTHORIZED {
+                        let status = resp.status();
+                        let body = resp.text().await.unwrap_or_default();
+                        if body.contains("Bad credentials") && !auth_retried {
+                            tracing::warn!(
+                                "GitHub API 401 Bad credentials — clearing cached token and re-resolving"
+                            );
+                            self.token_resolver.clear_cache().await;
+                            match self.auth_header().await {
+                                Ok(new_auth) => {
+                                    auth_retried = true;
+                                    auth_override = Some(new_auth);
+                                }
+                                Err(e) => {
+                                    last_err = Some(
+                                        e.context("GitHub token re-resolution failed after 401"),
+                                    );
+                                    break;
+                                }
+                            }
+                            // ponytail: consumes one 5xx-retry slot, attempts default is 3
+                            continue;
+                        }
+                        if auth_retried {
+                            // Fresh token also rejected; leave the cache empty so the next
+                            // call re-resolves and picks up env/config fixes immediately
+                            self.token_resolver.clear_cache().await;
+                            anyhow::bail!(
+                                "GitHub authentication failed ({status}): token re-resolved after cache clear but still rejected"
+                            );
+                        }
+                        anyhow::bail!("GitHub API request failed ({status}): {body}");
                     }
 
                     // If server error, treat as transient and retry
@@ -3962,6 +4003,104 @@ mod tests {
             assert!(
                 err.contains("422") || err.contains("failed"),
                 "error should indicate failure: {err}"
+            );
+        }
+    }
+
+    // ── 401 token-refresh tests (wiremock) ────────────────────────────────
+
+    #[cfg(test)]
+    mod auth_retry {
+        use super::test_client;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        fn bad_credentials() -> ResponseTemplate {
+            ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "message": "Bad credentials",
+                "status": 401
+            }))
+        }
+
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn retries_once_with_fresh_token_after_401() {
+            let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
+            let prev = std::env::var_os("GH_TOKEN");
+            std::env::set_var("GH_TOKEN", "bad_token");
+
+            let server = MockServer::start().await;
+            let hits = Arc::new(AtomicUsize::new(0));
+            let hits_in_handler = hits.clone();
+            Mock::given(method("GET"))
+                .respond_with(move |_req: &Request| {
+                    if hits_in_handler.fetch_add(1, Ordering::SeqCst) == 0 {
+                        // The 401 handler clears the cache and re-resolves; simulate the
+                        // operator having fixed the env var in the meantime
+                        std::env::set_var("GH_TOKEN", "good_token");
+                        bad_credentials()
+                    } else {
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ok": true }))
+                    }
+                })
+                .mount(&server)
+                .await;
+
+            let gh = test_client();
+            let result: anyhow::Result<serde_json::Value> =
+                gh.get_json(&format!("{}/x", server.uri())).await;
+
+            match prev {
+                Some(v) => std::env::set_var("GH_TOKEN", v),
+                None => std::env::remove_var("GH_TOKEN"),
+            }
+
+            assert!(
+                result.is_ok(),
+                "retry with re-resolved token should succeed: {:?}",
+                result.err()
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 2, "exactly one retry expected");
+        }
+
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn double_401_bails_with_distinct_auth_error() {
+            let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
+            let prev = std::env::var_os("GH_TOKEN");
+            std::env::set_var("GH_TOKEN", "bad_token");
+
+            let server = MockServer::start().await;
+            let hits = Arc::new(AtomicUsize::new(0));
+            let hits_in_handler = hits.clone();
+            Mock::given(method("GET"))
+                .respond_with(move |_req: &Request| {
+                    hits_in_handler.fetch_add(1, Ordering::SeqCst);
+                    bad_credentials()
+                })
+                .mount(&server)
+                .await;
+
+            let gh = test_client();
+            let result: anyhow::Result<serde_json::Value> =
+                gh.get_json(&format!("{}/x", server.uri())).await;
+
+            match prev {
+                Some(v) => std::env::set_var("GH_TOKEN", v),
+                None => std::env::remove_var("GH_TOKEN"),
+            }
+
+            let err = result.expect_err("persisting 401 must fail").to_string();
+            assert!(
+                err.contains("token re-resolved after cache clear but still rejected"),
+                "expected distinct auth-failure error, got: {err}"
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                2,
+                "must retry exactly once, not loop"
             );
         }
     }

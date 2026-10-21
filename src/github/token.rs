@@ -15,7 +15,11 @@
 //! 4. `gh auth token` CLI (via `allow_gh_fallback = true`)
 
 use anyhow::Context;
+#[cfg(test)]
+use once_cell::sync::Lazy;
 use std::env;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -217,7 +221,6 @@ impl TokenResolver {
     }
 
     /// Clear the cached token (useful when token is known to be invalid).
-    #[allow(dead_code)]
     pub async fn clear_cache(&self) {
         let mut cached = self.cached.write().await;
         *cached = None;
@@ -266,20 +269,21 @@ impl TokenResolver {
     fn resolve_env_token() -> Option<String> {
         if let Ok(t) = env::var("GH_TOKEN") {
             if !t.is_empty() {
-                tracing::debug!("Resolved GitHub token from GH_TOKEN environment variable");
+                // Info, not debug: when a token turns out bad, the source is the first thing to check
+                tracing::info!("Resolved GitHub token from GH_TOKEN environment variable");
                 return Some(t);
             }
         }
         if let Ok(t) = env::var("GITHUB_TOKEN") {
             if !t.is_empty() {
-                tracing::debug!("Resolved GitHub token from GITHUB_TOKEN environment variable");
+                tracing::info!("Resolved GitHub token from GITHUB_TOKEN environment variable");
                 return Some(t);
             }
         }
         // Config-based token (explicit override in ~/.orch/config.yml)
         if let Ok(t) = crate::config::get("gh.auth.token") {
             if !t.is_empty() {
-                tracing::debug!("Resolved GitHub token from gh.auth.token config");
+                tracing::info!("Resolved GitHub token from gh.auth.token config");
                 return Some(t);
             }
         }
@@ -326,7 +330,7 @@ impl TokenResolver {
             Ok(out) if out.status.success() => {
                 let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !token.is_empty() {
-                    tracing::debug!(gh_path, "Resolved GitHub token via gh CLI");
+                    tracing::info!(gh_path, "Resolved GitHub token via gh CLI (keychain)");
                     return Ok(Some(token));
                 }
             }
@@ -465,13 +469,13 @@ pub fn create_token_resolver() -> TokenResolver {
     TokenResolver::from_config(mode.as_deref(), app_id, private_key_path, allow_gh_fallback)
 }
 
+/// Serializes tests that mutate `GH_TOKEN`/`GITHUB_TOKEN`, shared with http.rs tests
+#[cfg(test)]
+pub(crate) static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use once_cell::sync::Lazy;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     #[test]
     fn token_mode_from_config_env() {
