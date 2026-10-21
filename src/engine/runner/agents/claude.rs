@@ -335,36 +335,19 @@ pub(crate) fn extract_stream_json_result_text(raw: &str) -> Result<String, Agent
     Ok(trimmed.to_string())
 }
 
-impl AgentRunner for ClaudeRunner {
-    #[cfg(test)]
-    fn name(&self) -> &str {
-        &self.binary
-    }
-
-    fn stream_events(&self, event: &serde_json::Value) -> Vec<StreamEvent> {
-        stream_events(event)
-    }
-
-    fn router_transcript(&self) -> super::RouterTranscript {
-        super::RouterTranscript::Messages
-    }
-
-    fn extract_text(&self, raw: &str) -> Result<String, super::AgentError> {
-        // Empty input: return empty string (not an error), matching historical behavior.
-        if raw.trim().is_empty() {
-            return Ok(String::new());
-        }
-        extract_stream_json_result_text(raw)
-    }
-
-    fn build_command(
+impl ClaudeRunner {
+    fn build_command_inner(
         &self,
+        profile: Option<&crate::engine::strict_profiles::ProfilePin>,
         model: Option<&str>,
         timeout_cmd: &str,
         sys_file: &str,
         msg_file: &str,
         permissions: &PermissionRules,
     ) -> String {
+        let effort_flag = profile
+            .map(|p| format!(" --effort {}", super::shell_single_quote(&p.effort)))
+            .unwrap_or_default();
         let model_flag = model
             .map(|m| format!("--model {}", super::shell_single_quote(m)))
             .unwrap_or_default();
@@ -395,7 +378,7 @@ impl AgentRunner for ClaudeRunner {
         };
 
         format!(
-            r#"{timeout_cmd} {binary} -p --verbose {model_flag} \
+            r#"{timeout_cmd} {binary} -p --verbose {model_flag}{effort_flag} \
   --permission-mode {permission_mode} \
   --output-format stream-json \
   {tool_flag} \
@@ -409,6 +392,62 @@ impl AgentRunner for ClaudeRunner {
             sys_file = sys_file,
             msg_file = msg_file,
         )
+    }
+}
+
+impl AgentRunner for ClaudeRunner {
+    #[cfg(test)]
+    fn name(&self) -> &str {
+        &self.binary
+    }
+
+    fn stream_events(&self, event: &serde_json::Value) -> Vec<StreamEvent> {
+        stream_events(event)
+    }
+
+    fn router_transcript(&self) -> super::RouterTranscript {
+        super::RouterTranscript::Messages
+    }
+
+    fn extract_text(&self, raw: &str) -> Result<String, super::AgentError> {
+        // Empty input: return empty string (not an error), matching historical behavior.
+        if raw.trim().is_empty() {
+            return Ok(String::new());
+        }
+        extract_stream_json_result_text(raw)
+    }
+
+    fn build_command(
+        &self,
+        model: Option<&str>,
+        timeout_cmd: &str,
+        sys_file: &str,
+        msg_file: &str,
+        permissions: &PermissionRules,
+    ) -> String {
+        self.build_command_inner(None, model, timeout_cmd, sys_file, msg_file, permissions)
+    }
+
+    fn build_profile_command(
+        &self,
+        pin: &crate::engine::strict_profiles::ProfilePin,
+        timeout_cmd: &str,
+        sys_file: &str,
+        msg_file: &str,
+        permissions: &PermissionRules,
+    ) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            self.binary == "claude" && pin.cli == "claude" && pin.cli_provider == "anthropic",
+            "strict Claude provider/backend mismatch"
+        );
+        Ok(self.build_command_inner(
+            Some(pin),
+            Some(&pin.model),
+            timeout_cmd,
+            sys_file,
+            msg_file,
+            permissions,
+        ))
     }
 
     fn parse_response(&self, raw: &str) -> Result<ParsedResponse, AgentError> {

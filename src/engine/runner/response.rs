@@ -360,6 +360,14 @@ pub async fn handle_failover(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
 ) -> String {
+    match crate::engine::strict_profiles::block_no_fallback(store, repo, task_id).await {
+        Ok(true) => return "blocked".into(),
+        Err(error) => {
+            tracing::error!(%error, "cannot determine strict routing; failover blocked");
+            return "blocked".into();
+        }
+        Ok(false) => {}
+    }
     // Get the reroute chain
     let chain = get_reroute_chain(task_id, store, repo).await;
     let chain = update_reroute_chain(task_id, agent_name, &chain, store, repo).await;

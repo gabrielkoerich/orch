@@ -196,47 +196,31 @@ impl CodexRunner {
     }
 }
 
-impl AgentRunner for CodexRunner {
-    #[cfg(test)]
-    fn name(&self) -> &str {
-        "codex"
-    }
-
-    fn stream_events(&self, event: &serde_json::Value) -> Vec<StreamEvent> {
-        stream_events(event)
-    }
-
-    fn extract_text(&self, raw: &str) -> Result<String, AgentError> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return Ok(String::new());
-        }
-
-        let events = super::parse_ndjson(trimmed);
-        if events.is_empty() {
-            return Ok(trimmed.to_string());
-        }
-
-        // Propagate terminal errors (rate limit, auth) so the review pipeline
-        // can record cooldowns and abort cleanly.
-        if let Some(err) = self.detect_error(&events) {
-            return Err(err);
-        }
-
-        // Return agent_message text, or fall back to the raw output.
-        Ok(self
-            .extract_agent_text(&events)
-            .unwrap_or_else(|| trimmed.to_string()))
-    }
-
-    fn build_command(
+impl CodexRunner {
+    fn build_command_inner(
         &self,
+        profile: Option<&crate::engine::strict_profiles::ProfilePin>,
         model: Option<&str>,
         timeout_cmd: &str,
         sys_file: &str,
         msg_file: &str,
         permissions: &PermissionRules,
     ) -> String {
+        let profile_flags = profile
+            .map(|p| {
+                format!(
+                    "-c {} -c {} ",
+                    super::shell_single_quote(&format!(
+                        "model_provider={}",
+                        serde_json::json!(p.cli_provider)
+                    )),
+                    super::shell_single_quote(&format!(
+                        "model_reasoning_effort={}",
+                        serde_json::json!(p.effort)
+                    ))
+                )
+            })
+            .unwrap_or_default();
         let model_flag = model
             .map(|m| format!("--model {}", super::shell_single_quote(m)))
             .unwrap_or_default();
@@ -292,7 +276,7 @@ impl AgentRunner for CodexRunner {
         format!(
             r#"{timeout_cmd} codex {model_flag} \
   exec \
-  -c 'sandbox_workspace_write.network_access=true' \
+  {profile_flags}-c 'sandbox_workspace_write.network_access=true' \
   -c 'shell_environment_policy.inherit=all' \
   {permission_flags} {add_dir_flags} --json - < <(cat "{sys_file}" "{msg_file}")"#,
             sys_file = sys_file,
@@ -302,6 +286,70 @@ impl AgentRunner for CodexRunner {
             permission_flags = permission_flags,
             add_dir_flags = add_dir_flags,
         )
+    }
+}
+
+impl AgentRunner for CodexRunner {
+    #[cfg(test)]
+    fn name(&self) -> &str {
+        "codex"
+    }
+
+    fn stream_events(&self, event: &serde_json::Value) -> Vec<StreamEvent> {
+        stream_events(event)
+    }
+
+    fn extract_text(&self, raw: &str) -> Result<String, AgentError> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(String::new());
+        }
+
+        let events = super::parse_ndjson(trimmed);
+        if events.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+
+        // Propagate terminal errors (rate limit, auth) so the review pipeline
+        // can record cooldowns and abort cleanly.
+        if let Some(err) = self.detect_error(&events) {
+            return Err(err);
+        }
+
+        // Return agent_message text, or fall back to the raw output.
+        Ok(self
+            .extract_agent_text(&events)
+            .unwrap_or_else(|| trimmed.to_string()))
+    }
+
+    fn build_command(
+        &self,
+        model: Option<&str>,
+        timeout_cmd: &str,
+        sys_file: &str,
+        msg_file: &str,
+        permissions: &PermissionRules,
+    ) -> String {
+        self.build_command_inner(None, model, timeout_cmd, sys_file, msg_file, permissions)
+    }
+
+    fn build_profile_command(
+        &self,
+        pin: &crate::engine::strict_profiles::ProfilePin,
+        timeout_cmd: &str,
+        sys_file: &str,
+        msg_file: &str,
+        permissions: &PermissionRules,
+    ) -> anyhow::Result<String> {
+        anyhow::ensure!(pin.cli == "codex", "strict backend mismatch");
+        Ok(self.build_command_inner(
+            Some(pin),
+            Some(&pin.model),
+            timeout_cmd,
+            sys_file,
+            msg_file,
+            permissions,
+        ))
     }
 
     fn parse_response(&self, raw: &str) -> Result<ParsedResponse, AgentError> {

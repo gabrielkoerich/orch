@@ -63,6 +63,7 @@ fn render_prompt_template(template: &str, vars: HashMap<String, String>) -> Stri
 
 /// Agent invocation configuration.
 pub struct AgentInvocation {
+    pub strict_profile: Option<crate::engine::strict_profiles::ProfilePin>,
     /// Agent name (claude, codex, opencode, grok, kimi, minimax)
     pub agent: String,
     /// Model override (e.g., "claude-sonnet-4-6", "o3", "gpt-4.1")
@@ -164,6 +165,11 @@ exit $CMD_STATUS
 ///
 /// Returns the tmux session name.
 pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow::Result<String> {
+    crate::engine::strict_profiles::guard_spawn(
+        inv.strict_profile.as_ref(),
+        &inv.agent,
+        inv.model.as_deref(),
+    )?;
     // Prepare attempt directory and prompt files (system + message).
     let attempt_dir =
         crate::home::task_attempt_dir_async(&inv.repo, &inv.task_id, inv.attempt).await?;
@@ -255,13 +261,22 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
     } else {
         String::new()
     };
-    let agent_cmd = runner.build_command(
-        inv.model.as_deref(),
-        &timeout_cmd,
-        &sys_file.to_string_lossy(),
-        &msg_file.to_string_lossy(),
-        &permissions,
-    );
+    let agent_cmd = match &inv.strict_profile {
+        Some(pin) => runner.build_profile_command(
+            pin,
+            &timeout_cmd,
+            &sys_file.to_string_lossy(),
+            &msg_file.to_string_lossy(),
+            &permissions,
+        )?,
+        None => runner.build_command(
+            inv.model.as_deref(),
+            &timeout_cmd,
+            &sys_file.to_string_lossy(),
+            &msg_file.to_string_lossy(),
+            &permissions,
+        ),
+    };
 
     // Write runner script (and the agent-cmd helper script it execs under a pty)
     // to the per-task attempt dir.
@@ -510,6 +525,11 @@ pub fn build_review_prompt(
 /// IMPORTANT: this must not embed secrets (GH_TOKEN) into the script.
 #[allow(dead_code)]
 pub fn build_runner_script(inv: &AgentInvocation) -> anyhow::Result<String> {
+    crate::engine::strict_profiles::guard_spawn(
+        inv.strict_profile.as_ref(),
+        &inv.agent,
+        inv.model.as_deref(),
+    )?;
     // Prepare attempt directory and prompt files
     let attempt_dir = crate::home::task_attempt_dir(&inv.repo, &inv.task_id, inv.attempt)?;
     std::fs::create_dir_all(&attempt_dir)?;
@@ -529,6 +549,11 @@ fn build_runner_script_in_dir(
     inv: &AgentInvocation,
     attempt_dir: &std::path::Path,
 ) -> anyhow::Result<String> {
+    crate::engine::strict_profiles::guard_spawn(
+        inv.strict_profile.as_ref(),
+        &inv.agent,
+        inv.model.as_deref(),
+    )?;
     let sys_file = attempt_dir.join("prompt-sys.md");
     let msg_file = attempt_dir.join("prompt-msg.md");
 
@@ -550,13 +575,22 @@ fn build_runner_script_in_dir(
     } else {
         String::new()
     };
-    let agent_cmd = runner.build_command(
-        inv.model.as_deref(),
-        &timeout_cmd,
-        &sys_file.to_string_lossy(),
-        &msg_file.to_string_lossy(),
-        &permissions,
-    );
+    let agent_cmd = match &inv.strict_profile {
+        Some(pin) => runner.build_profile_command(
+            pin,
+            &timeout_cmd,
+            &sys_file.to_string_lossy(),
+            &msg_file.to_string_lossy(),
+            &permissions,
+        )?,
+        None => runner.build_command(
+            inv.model.as_deref(),
+            &timeout_cmd,
+            &sys_file.to_string_lossy(),
+            &msg_file.to_string_lossy(),
+            &permissions,
+        ),
+    };
 
     let status_file = attempt_dir.join("exit.txt");
     let stderr_file = attempt_dir.join("stderr.txt");
@@ -585,6 +619,7 @@ mod tests {
 
     fn test_invocation(task_id: &str) -> AgentInvocation {
         AgentInvocation {
+            strict_profile: None,
             agent: "claude".to_string(),
             model: None,
             work_dir: PathBuf::from("/tmp"),

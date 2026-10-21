@@ -1667,43 +1667,46 @@ pub(crate) async fn tick_route_tasks(
                     // Fire-and-forget: label operations are cosmetic (routing already
                     // persisted in DB). Spawning them prevents blocking the tick loop
                     // on 6-9 sequential HTTP calls (~3-9s overhead per routed task).
-                    let backend_clone = Arc::clone(backend);
-                    let task_id_clone = task.id.clone();
-                    let task_labels: Vec<String> = task.labels.clone();
-                    let new_labels = {
-                        let mut labels = vec![
-                            format!("agent:{}", result.agent),
-                            format!("complexity:{}", result.complexity),
-                        ];
-                        if let Some(ref model) = result.model {
-                            labels.push(format!("model:{model}"));
-                        }
-                        labels
-                    };
-                    tokio::spawn(async move {
-                        // Remove old agent/complexity/model labels
-                        for label in &task_labels {
-                            if label.starts_with("agent:")
-                                || label.starts_with("complexity:")
-                                || label.starts_with("model:")
-                            {
-                                if let Err(e) =
-                                    backend_clone.remove_label(&task_id_clone, label).await
+                    if result.strict_profile.is_none() {
+                        let backend_clone = Arc::clone(backend);
+                        let task_id_clone = task.id.clone();
+                        let task_labels: Vec<String> = task.labels.clone();
+                        let new_labels = {
+                            let mut labels = vec![
+                                format!("agent:{}", result.agent),
+                                format!("complexity:{}", result.complexity),
+                            ];
+                            if let Some(ref model) = result.model {
+                                labels.push(format!("model:{model}"));
+                            }
+                            labels
+                        };
+                        tokio::spawn(async move {
+                            // Remove old agent/complexity/model labels
+                            for label in &task_labels {
+                                if label.starts_with("agent:")
+                                    || label.starts_with("complexity:")
+                                    || label.starts_with("model:")
                                 {
-                                    tracing::warn!(task_id = task_id_clone.0, label, error = %e, "failed to remove stale routing label during re-route");
+                                    if let Err(e) =
+                                        backend_clone.remove_label(&task_id_clone, label).await
+                                    {
+                                        tracing::warn!(task_id = task_id_clone.0, label, error = %e, "failed to remove stale routing label during re-route");
+                                    }
                                 }
                             }
-                        }
-                        // Add new labels
-                        if let Err(e) = backend_clone.set_labels(&task_id_clone, &new_labels).await
-                        {
-                            tracing::warn!(
-                                task_id = task_id_clone.0,
-                                ?e,
-                                "failed to set routing labels"
-                            );
-                        }
-                    });
+                            // Add new labels
+                            if let Err(e) =
+                                backend_clone.set_labels(&task_id_clone, &new_labels).await
+                            {
+                                tracing::warn!(
+                                    task_id = task_id_clone.0,
+                                    ?e,
+                                    "failed to set routing labels"
+                                );
+                            }
+                        });
+                    }
 
                     // Transition to routed
                     if let Err(e) = task_manager
@@ -1873,6 +1876,15 @@ pub(crate) async fn route_new_tasks_global(
                     duration_ms = task_start.elapsed().as_millis(),
                     "global sweep: route completed"
                 );
+                if let Some(pin) = &result.strict_profile {
+                    if let Err(error) =
+                        crate::engine::strict_profiles::persist_pin(store, pin).await
+                    {
+                        tracing::warn!(%error, "strict pin persistence failed; route blocked");
+                        continue;
+                    }
+                }
+
                 let profile_json = serde_json::to_string(&result.profile).unwrap_or_default();
                 let skills_json =
                     serde_json::to_string(&result.selected_skills).unwrap_or_default();

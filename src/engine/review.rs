@@ -314,6 +314,12 @@ async fn build_review_context(
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<ReviewPhase<ReviewContext>> {
+    if crate::engine::strict_profiles::task_is_strict(&Some(Arc::clone(store)), repo, &task.id.0)
+        .await?
+    {
+        return Err(crate::engine::strict_profiles::GuardError::ProofOnly.into());
+    }
+
     let stored_task = store
         .get_by_external_id(repo, &task.id.0)
         .await
@@ -647,6 +653,7 @@ async fn build_review_context(
         .max(1800);
 
     let invocation = runner::agent::AgentInvocation {
+        strict_profile: None,
         agent: review_agent.clone(),
         model: review_model.clone(),
         work_dir: worktree_path.clone(),
@@ -3518,6 +3525,7 @@ mod tests {
             review_attempt_dir: work_dir.to_path_buf(),
             output_file: work_dir.join("output.txt"),
             invocation: runner::agent::AgentInvocation {
+                strict_profile: None,
                 agent: agent.to_string(),
                 model: Some(model.to_string()),
                 work_dir: work_dir.to_path_buf(),

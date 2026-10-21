@@ -238,6 +238,13 @@ pub async fn handle_error(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
 ) -> anyhow::Result<ErrorHandleResult> {
+    if crate::engine::strict_profiles::block_no_fallback(store, repo, task_id).await? {
+        return Ok(ErrorHandleResult::Continue {
+            status: "blocked".into(),
+            error: "strict profile: fallback disabled".into(),
+        });
+    }
+
     tracing::warn!(
         task_id,
         agent = agent_name,

@@ -24,6 +24,7 @@ pub mod review;
 pub mod review_poll;
 pub mod router;
 pub mod runner;
+pub mod strict_profiles;
 pub mod subscribers;
 pub mod suspend;
 pub mod sync;
@@ -979,6 +980,8 @@ async fn send_startup_escalation_notification(elapsed_secs: u64) {
 ///
 /// This is the main entry point — called by `orch serve`.
 pub async fn serve() -> anyhow::Result<()> {
+    // This experimental mode must not start a scheduler or touch existing services.
+    strict_profiles::guard_unpinned_path()?;
     let killed = crate::home::kill_other_orch_serve_processes(std::time::Duration::from_secs(30));
     if killed > 0 {
         tracing::info!(count = killed, "terminated stale orch serve processes");
