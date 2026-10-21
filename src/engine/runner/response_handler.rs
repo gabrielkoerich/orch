@@ -716,8 +716,15 @@ async fn create_pr_with_log(
             //   GitHub API fallback in create_pr_if_needed also fails, this is a
             //   terminal configuration error.  We set pr_base_invalid so the
             //   classifier blocks the task instead of re-dispatching forever.
+            // A GitHub auth error is terminal too: the commits are pushed, so only a token fix helps
             let mut pr_base_invalid = false;
-            if err_str.contains("422") {
+            if agents::patterns::detect_auth_error(&err_str).is_some() {
+                tracing::error!(
+                    task_id = ctx.task_id,
+                    "PR creation failed with GitHub auth error — blocking task"
+                );
+                pr_base_invalid = true;
+            } else if err_str.contains("422") {
                 if err_str.contains("No commits between") || err_str.contains("head") {
                     tracing::info!(
                         task_id = ctx.task_id,
@@ -1171,9 +1178,8 @@ async fn apply_post_decision_effects(
         ctx.set(&[(
             "last_error",
             serde_json::json!(
-                "PR creation failed: the base branch is invalid. The agent's commits were pushed successfully, \
-                 but GitHub rejected the PR because the base branch does not exist in the repository. \
-                 Verify the repository has a valid default branch and manually create the PR if needed."
+                "PR creation failed terminally (invalid base branch or GitHub auth error). The agent's commits were pushed successfully. \
+                 Check the repository default branch and the GitHub token, then create the PR manually or unblock the task."
             ),
         )])
         .await;
