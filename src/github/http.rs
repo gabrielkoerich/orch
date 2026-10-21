@@ -25,7 +25,11 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use urlencoding;
 
+#[cfg(not(test))]
 const GITHUB_API: &str = "https://api.github.com";
+// Tests that reach a real GhHttp must fail fast here, never send the operator's token to GitHub
+#[cfg(test)]
+const GITHUB_API: &str = "http://127.0.0.1:9";
 
 fn parse_positive_issue_number(number: &str) -> anyhow::Result<i64> {
     let parsed = number

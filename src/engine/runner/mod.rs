@@ -639,16 +639,9 @@ impl TaskRunner {
                 return Ok(None);
             }
             Ok(task_init::GuardOutcome::MaxAttempts) => {
-                // Update GitHub status to NeedsReview so engine stops re-dispatching.
-                if let Some(b) = backend {
-                    let id = crate::backends::ExternalId(task_id.to_string());
-                    if let Err(e) = b
-                        .update_status(&id, crate::backends::Status::NeedsReview)
-                        .await
-                    {
-                        tracing::warn!(task_id, err = %e, "failed to update backend status to NeedsReview after max attempts");
-                    }
-
+                // The caller marks the task blocked from the returned status, a task that ran out
+                // of attempts did not finish, so it must never reach done
+                if backend.is_some() {
                     // If this was label-forced to a specific agent, remove the agent label
                     // so that /retry can route to a different agent instead of looping.
                     let route_reason = self
@@ -666,7 +659,7 @@ impl TaskRunner {
                     }
                 }
                 return Ok(Some(RunExecution {
-                    status: "needs_review".to_string(),
+                    status: "blocked".to_string(),
                     exit_code: None,
                     audit: RunAudit {
                         stdout: String::new(),

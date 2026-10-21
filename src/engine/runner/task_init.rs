@@ -32,7 +32,7 @@ pub enum GuardOutcome {
     Proceed(u32),
     /// Task should be skipped (already running, status=needs_review, etc.).
     Skip,
-    /// Task has exceeded max attempts — caller should update GitHub to NeedsReview.
+    /// Task has exceeded max attempts, caller marks it blocked.
     MaxAttempts,
 }
 
@@ -75,7 +75,10 @@ pub async fn check_guards(
             store,
             repo,
             task_id,
-            &[("last_error", serde_json::json!(msg))],
+            &[
+                ("last_error", serde_json::json!(msg)),
+                ("block_reason", serde_json::json!(msg)),
+            ],
         )
         .await
         {
@@ -348,4 +351,39 @@ pub async fn prepare_task(
         attempt_dir,
         new_attempts: next_attempt,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::NewTask;
+
+    #[tokio::test]
+    async fn max_attempts_writes_block_reason() {
+        let task_store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let store_id = task_store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        task_store
+            .set_fields(store_id, &[("attempts", serde_json::json!(1000))])
+            .await
+            .unwrap();
+        let store = Some(task_store.clone());
+
+        let outcome = check_guards(&format!("internal:{store_id}"), "owner/repo", &store)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, GuardOutcome::MaxAttempts));
+        let task = task_store.get(store_id).await.unwrap();
+        assert!(task
+            .block_reason
+            .is_some_and(|r| r.contains("exceeded max attempts")));
+    }
 }
