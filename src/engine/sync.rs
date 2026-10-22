@@ -1044,7 +1044,7 @@ async fn poll_and_merge_recovered_pr(
                     pr_number,
                     "CI green after recovery — attempting direct merge"
                 );
-                match gh.merge_pr(repo, pr_number, true).await {
+                match gh.merge_pr(repo, pr_number, true, &head_sha).await {
                     Ok(()) => {
                         tracing::info!(
                             task_id = task_id,
@@ -1068,6 +1068,20 @@ async fn poll_and_merge_recovered_pr(
                             || err.contains("pull request already merged")
                         {
                             return Ok(true);
+                        }
+                        // The head moved after we read it. Updating the branch from
+                        // the base would not check CI on the new commit.
+                        if err.contains("head branch was modified")
+                            || err.contains("sha does not match")
+                        {
+                            tracing::info!(
+                                task_id = task_id,
+                                pr_number,
+                                outcome = "poll_exited_without_merge",
+                                reason = "head_moved",
+                                "merge rejected because the head sha changed"
+                            );
+                            return Ok(false);
                         }
                         // GitHub may reject the merge because the branch fell behind
                         // again while CI was finishing. Retry the branch update inside

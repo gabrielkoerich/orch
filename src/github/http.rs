@@ -31,6 +31,18 @@ const GITHUB_API: &str = "https://api.github.com";
 #[cfg(test)]
 const GITHUB_API: &str = "http://127.0.0.1:9";
 
+pub(crate) fn is_full_commit_sha(sha: &str) -> bool {
+    let len = sha.len();
+    (len == 40 || len == 64) && sha.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn merge_pr_body(head_sha: &str) -> serde_json::Value {
+    serde_json::json!({
+        "merge_method": "squash",
+        "sha": head_sha,
+    })
+}
+
 fn parse_positive_issue_number(number: &str) -> anyhow::Result<i64> {
     let parsed = number
         .parse::<i64>()
@@ -2243,16 +2255,23 @@ impl GhHttp {
     }
 
     /// Merge a PR using the REST API (squash merge).
+    ///
+    /// `head_sha` is the commit CI was checked against. GitHub rejects the
+    /// merge when the PR head is a different commit.
     pub async fn merge_pr(
         &self,
         repo: &str,
         pr_number: u64,
         delete_branch: bool,
+        head_sha: &str,
     ) -> anyhow::Result<()> {
+        if !is_full_commit_sha(head_sha) {
+            anyhow::bail!("merge_pr requires the full head sha, got {head_sha:?}");
+        }
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let url = format!("{GITHUB_API}/repos/{repo}/pulls/{pr_number}/merge");
-        let payload = serde_json::json!({ "merge_method": "squash" });
+        let payload = merge_pr_body(head_sha);
         let auth = self.auth_header().await?;
         let make_req = || {
             Ok(self
@@ -3201,6 +3220,17 @@ mod tests {
         });
 
         format!("http://{addr}")
+    }
+
+    #[test]
+    fn merge_pr_body_pins_the_head_sha() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let body = merge_pr_body(sha);
+        assert_eq!(body["merge_method"], "squash");
+        assert_eq!(body["sha"], sha);
+        assert!(is_full_commit_sha(sha));
+        assert!(!is_full_commit_sha("abc"));
+        assert!(!is_full_commit_sha(""));
     }
 
     fn test_client() -> GhHttp {
