@@ -2868,20 +2868,12 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn read_project_channel_config_handles_unreadable_file() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir");
-        let orch_yml = dir.path().join(".orch.yml");
-        std::fs::write(&orch_yml, "channels:\n  telegram:\n    topic_id: \"1\"\n")
-            .expect("write .orch.yml");
-        // Make the file unreadable.
-        std::fs::set_permissions(&orch_yml, std::fs::Permissions::from_mode(0o000))
-            .expect("set permissions");
+        // A directory fails to read for every user, root included, where chmod 000 does not
+        std::fs::create_dir(dir.path().join(".orch.yml")).expect("create .orch.yml dir");
         let cfg = read_project_channel_config(dir.path());
         // Should return defaults (not panic) and emit a warn! log with the read error.
         assert!(cfg.telegram_topic_id.is_none());
         assert!(cfg.discord_channel_id.is_none());
-        // Restore permissions so tempdir cleanup succeeds.
-        std::fs::set_permissions(&orch_yml, std::fs::Permissions::from_mode(0o644))
-            .expect("restore permissions");
     }
 }
