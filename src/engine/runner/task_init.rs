@@ -218,12 +218,17 @@ pub async fn prepare_task(
     )
     .await;
 
+    let shipcheck = agent::Shipcheck::detect(&wt.work_dir).await;
+    agent::install_shipcheck_hooks(&wt.work_dir, shipcheck, std::path::Path::new("shipcheck"))
+        .await;
+
     // Build prompts
     let system_prompt = agent::build_system_prompt(
         &pseudo_task,
         &ctx,
         route_result.as_ref(),
         &wt.default_branch,
+        shipcheck,
     );
     let agent_message = agent::build_agent_message(&pseudo_task, &ctx, attempts);
 
