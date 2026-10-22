@@ -394,10 +394,6 @@ fn parse_success_output(
     }
 }
 
-/// Parse session output, handling the kimi/minimax/glm exit-1-with-completed-edge case.
-///
-/// Tries `parse_success_output` first when stdout is non-empty. If that succeeds,
-/// returns success regardless of exit code. If it fails and `exit_code != 0`,
 /// Whether the last `type: result` line reports `subtype: success` or
 /// `terminal_reason: completed`. Grok omits `terminal_reason`.
 fn result_envelope_completed(raw_stdout: &str) -> bool {
@@ -412,10 +408,14 @@ fn result_envelope_completed(raw_stdout: &str) -> bool {
         })
 }
 
-/// checks for `"terminal_reason":"completed"` or cost-telemetry-only stdout
-/// (`"costUSD":`) in stdout before falling back to `classify_error` — so valid
-/// sessions that exit 1 produce `InvalidResponse` (soft error, re-route) instead
-/// of a garbled `Unknown`/`Auth` error (hard failure with spurious cooldown).
+/**
+ * Tries `parse_success_output` first when stdout is non-empty. If that succeeds,
+ * returns success regardless of exit code. If it fails and `exit_code != 0`,
+ * checks for `"terminal_reason":"completed"` or cost-telemetry-only stdout
+ * (`"costUSD":`) before falling back to `classify_error`, so valid sessions that
+ * exit 1 produce `InvalidResponse` (soft error, re-route) instead of a garbled
+ * `Unknown`/`Auth` error (hard failure with spurious cooldown)
+ **/
 pub fn parse_session_output(
     task_id: &str,
     agent_name: &str,
