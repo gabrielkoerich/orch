@@ -8,6 +8,8 @@ use crate::config;
 use crate::github::http::GhHttp;
 use std::collections::HashMap;
 
+pub(crate) mod label_status;
+
 /// Project board info returned by list queries.
 #[derive(Debug, Clone)]
 pub struct ProjectInfo {

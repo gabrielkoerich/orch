@@ -5,6 +5,7 @@
 
 use super::{ExternalBackend, ExternalId, ExternalTask, Mention, Status};
 use crate::github::http::{status_label_color, GhHttp};
+use crate::github::projects::label_status::{LabelSyncConfig, LabelSyncState};
 use crate::github::projects::ProjectSync;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
@@ -75,6 +76,7 @@ fn classify_active_open_issue(
 pub struct GitHubBackend {
     repo: String,
     gh: GhHttp,
+    project_label_state: tokio::sync::Mutex<LabelSyncState>,
 }
 
 /// Returns `true` if `id` is a valid GitHub issue number (positive integer).
@@ -91,7 +93,24 @@ impl GitHubBackend {
         Ok(Self {
             repo,
             gh: GhHttp::new()?,
+            project_label_state: tokio::sync::Mutex::new(LabelSyncState::default()),
         })
+    }
+
+    async fn sync_project_status(
+        &self,
+        project: &ProjectSync,
+        node_id: &str,
+        status: &Status,
+    ) -> anyhow::Result<()> {
+        if LabelSyncConfig::from_config()?.manages(&self.repo, project.project_id()) {
+            // Preserve existing ingestion membership behavior. The reconciler
+            // owns the field value and reads the current labels on the next sync.
+            project.add_item(node_id).await?;
+            Ok(())
+        } else {
+            project.sync_item_status(node_id, status).await
+        }
     }
 }
 
@@ -172,12 +191,19 @@ impl ExternalBackend for GitHubBackend {
             .to_string();
 
         // Add to project board and set initial status
-        project
-            .sync_item_status(&node_id, &status)
+        self.sync_project_status(&project, &node_id, &status)
             .await
             .map_err(|e| anyhow::anyhow!("project board sync failed: {e}"))?;
 
         Ok(Some(node_id))
+    }
+
+    async fn reconcile_project_statuses(&self) -> anyhow::Result<()> {
+        let mut state = self.project_label_state.lock().await;
+        LabelSyncConfig::from_config()?
+            .reconcile(&self.gh, &self.repo, &mut state)
+            .await
+            .map(|_| ())
     }
 
     async fn sync_estimate_to_project(&self, id: &ExternalId, estimate: u8) -> anyhow::Result<()> {
@@ -322,7 +348,9 @@ impl ExternalBackend for GitHubBackend {
                     // Label update succeeded — now sync project board (non-fatal)
                     if let Some(ref node_id) = issue_node_id {
                         if let Some(project) = ProjectSync::from_config() {
-                            if let Err(e) = project.sync_item_status(node_id, &status).await {
+                            if let Err(e) =
+                                self.sync_project_status(&project, node_id, &status).await
+                            {
                                 tracing::warn!(
                                     task_id = id.0,
                                     err = %e,

@@ -285,6 +285,15 @@ mod tests {
         assert!(Cli::try_parse_from(["orch", "service", "doctor"]).is_ok());
         assert!(Cli::try_parse_from(["orch", "service", "prune"]).is_ok());
         assert!(Cli::try_parse_from(["orch", "project", "board", "info"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "orch",
+            "project",
+            "board",
+            "reconcile",
+            "--repo",
+            "owner/repo"
+        ])
+        .is_ok());
         assert!(Cli::try_parse_from(["orch", "config", "agents"]).is_ok());
         assert!(Cli::try_parse_from(["orch", "log", "-f", "--task", "123"]).is_ok());
     }
@@ -848,6 +857,12 @@ enum BoardAction {
     },
     /// Re-discover field IDs and update config
     Sync,
+    /// Reconcile label-managed board Status fields once, without starting agents
+    Reconcile {
+        /// Repository to reconcile (defaults to the current repository)
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Show current board config
     Info,
 }
@@ -965,6 +980,7 @@ async fn run_board_action(action: BoardAction) -> anyhow::Result<()> {
         BoardAction::List => cli::board_list().await,
         BoardAction::Link { id } => cli::board_link(&id).await,
         BoardAction::Sync => cli::board_sync().await,
+        BoardAction::Reconcile { repo } => cli::board_reconcile(repo.as_deref()).await,
         BoardAction::Info => cli::board_info(),
     }
 }
