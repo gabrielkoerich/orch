@@ -160,8 +160,11 @@ need a longer engine sync interval or a lower cap.
 Exactly one `status:*` label is authoritative. No status label leaves the card
 unchanged; multiple status labels, an unmapped label, ambiguous/missing options,
 incomplete pagination or partial GraphQL errors are reported rather than guessed.
-A missing mutation acknowledgement stops the pass; the next sync reads the board
-again before retrying. After three consecutive unknown outcomes for the same
+A missing mutation acknowledgement stops the pass; field mutations make a single
+HTTP attempt, so transport/5xx failures cannot resend a write before the next
+sync reads the board again. Shared rate tracking, backoff and circuit checks
+still apply. A preflight failure before sending does not consume the unknown
+outcome limit. After three consecutive unknown outcomes for the same
 item and option, that backend stops attempting the update until it observes a
 matching value, the desired option changes, or the operator restarts the process.
 Other items can still converge. This avoids unlimited writes after unknown results.
