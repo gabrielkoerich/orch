@@ -19,19 +19,44 @@ const REVIEW_SYSTEM_TEMPLATE: &str = include_str!("../../../prompts/review_syste
 
 const SHIPCHECK_RULE_PATH: &str = ".codex/rules/orch-shipcheck.rules";
 
+// Only the commands the agent prompt uses, never clean, post, login or daemon
+const SHIPCHECK_RULES: &str = r#"prefix_rule(pattern=["shipcheck", "run"], decision="allow")
+prefix_rule(pattern=["shipcheck", "commit"], decision="allow")
+prefix_rule(pattern=["shipcheck", "status"], decision="allow")
+prefix_rule(pattern=["shipcheck", "logs"], decision="allow")
+prefix_rule(pattern=["shipcheck", "doctor"], decision="allow")
+"#;
+
 // Codex runs a command a rule allows outside its sandbox, so shipcheck reaches Docker and its
 // results dir while the agent's own commands still cannot write there
 async fn install_shipcheck_rule(work_dir: &std::path::Path) -> anyhow::Result<()> {
-    let rule = work_dir.join(SHIPCHECK_RULE_PATH);
-    if let Some(dir) = rule.parent() {
-        tokio::fs::create_dir_all(dir).await?;
+    // The worktree holds repository content, so never follow a symlink it plants on the path
+    let mut dir = work_dir.to_path_buf();
+    for part in [".codex", "rules"] {
+        dir.push(part);
+        match tokio::fs::symlink_metadata(&dir).await {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => anyhow::bail!("{} is not a directory", dir.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tokio::fs::create_dir(&dir).await?;
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
 
-    tokio::fs::write(
-        &rule,
-        "prefix_rule(pattern=[\"shipcheck\"], decision=\"allow\")\n",
-    )
-    .await?;
+    // remove_file drops a symlink itself, and create_new never follows one
+    let rule = work_dir.join(SHIPCHECK_RULE_PATH);
+    match tokio::fs::remove_file(&rule).await {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&rule)
+        .await?;
+    tokio::io::AsyncWriteExt::write_all(&mut file, SHIPCHECK_RULES.as_bytes()).await?;
 
     // Keep the rule out of the agent's commits
     let output = tokio::process::Command::new("git")
@@ -842,29 +867,83 @@ mod tests {
         assert_eq!(shell_single_quote("$HOME"), "'$HOME'");
     }
 
+    fn git_init(dir: &std::path::Path) {
+        let out = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+
     #[tokio::test]
     async fn install_shipcheck_rule_writes_rule_and_keeps_tree_clean() {
         let dir = tempfile::tempdir().unwrap();
-        let git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir.path())
-                .output()
-                .unwrap()
-        };
-        git(&["init", "-q"]);
+        git_init(dir.path());
 
         install_shipcheck_rule(dir.path()).await.unwrap();
         install_shipcheck_rule(dir.path()).await.unwrap();
 
         let rule = std::fs::read_to_string(dir.path().join(SHIPCHECK_RULE_PATH)).unwrap();
-        assert_eq!(
-            rule,
-            "prefix_rule(pattern=[\"shipcheck\"], decision=\"allow\")\n"
-        );
+        assert_eq!(rule, SHIPCHECK_RULES);
+        for cmd in ["run", "commit", "status", "logs", "doctor"] {
+            assert!(
+                rule.contains(&format!(r#"["shipcheck", "{cmd}"]"#)),
+                "{cmd}"
+            );
+        }
+        assert!(!rule.contains(r#"["shipcheck"]"#));
+        for cmd in [
+            "clean", "post", "login", "logout", "daemon", "init", "install",
+        ] {
+            assert!(!rule.contains(&format!(r#""{cmd}""#)), "{cmd}");
+        }
+
         let exclude = std::fs::read_to_string(dir.path().join(".git/info/exclude")).unwrap();
         assert_eq!(exclude.matches("orch-shipcheck.rules").count(), 1);
-        let status = git(&["status", "--porcelain", "--untracked-files=all"]);
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
         assert!(status.stdout.is_empty(), "{:?}", status);
+    }
+
+    #[tokio::test]
+    async fn install_shipcheck_rule_refuses_symlinked_dirs() {
+        for link in [".codex", ".codex/rules"] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = tempfile::tempdir().unwrap();
+            git_init(dir.path());
+            std::fs::create_dir_all(dir.path().join(".codex")).unwrap();
+            if link == ".codex" {
+                std::fs::remove_dir(dir.path().join(".codex")).unwrap();
+            }
+            std::os::unix::fs::symlink(target.path(), dir.path().join(link)).unwrap();
+
+            assert!(install_shipcheck_rule(dir.path()).await.is_err(), "{link}");
+            assert_eq!(
+                std::fs::read_dir(target.path()).unwrap().count(),
+                0,
+                "{link}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn install_shipcheck_rule_replaces_a_symlinked_file_without_following_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let outside = target.path().join("victim");
+        std::fs::write(&outside, "keep").unwrap();
+        git_init(dir.path());
+        std::fs::create_dir_all(dir.path().join(".codex/rules")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.path().join(SHIPCHECK_RULE_PATH)).unwrap();
+
+        install_shipcheck_rule(dir.path()).await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+        let meta = std::fs::symlink_metadata(dir.path().join(SHIPCHECK_RULE_PATH)).unwrap();
+        assert!(meta.is_file());
     }
 }
