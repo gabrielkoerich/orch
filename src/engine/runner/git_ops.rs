@@ -11,6 +11,7 @@ use crate::cmd::CommandErrorContext;
 use crate::github::http::GhHttp;
 use regex::Regex;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 
 use tokio::process::Command;
@@ -591,6 +592,10 @@ pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
         return;
     }
 
+    // A later force push leases this tip, so fetching someone else's commits cannot permit replacing them
+    let branch = get_current_branch(dir).await;
+    record_push_lease(dir, &branch, default_branch).await;
+
     // Fetch current branch (for retries with existing remote commits)
     // and default branch (for rebase) in one call.
     let _ = Command::new("git")
@@ -938,6 +943,171 @@ async fn strip_workflow_files(dir: &Path, default_branch: &str) -> anyhow::Resul
     Ok(true)
 }
 
+const LEASE_ABSENT: &str = "absent";
+
+/// Force pushes that found no recorded lease and fell back to the fetched tip
+static LEASE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+async fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output_with_context()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn lease_key(branch: &str) -> String {
+    format!("branch.{branch}.orchPushLease")
+}
+
+async fn read_push_lease(dir: &Path, branch: &str) -> Option<String> {
+    git_stdout(dir, &["config", "--get", &lease_key(branch)]).await
+}
+
+async fn write_push_lease(dir: &Path, branch: &str, value: &str) {
+    if git_stdout(dir, &["config", &lease_key(branch), value])
+        .await
+        .is_none()
+    {
+        tracing::warn!(branch, "failed to record push lease");
+    }
+}
+
+async fn remote_tracking_sha(dir: &Path, branch: &str) -> Option<String> {
+    let rev = format!("refs/remotes/origin/{branch}");
+    git_stdout(dir, &["rev-parse", "--verify", "--quiet", &rev])
+        .await
+        .filter(|sha| crate::github::http::is_full_commit_sha(sha))
+}
+
+async fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> bool {
+    git_stdout(dir, &["merge-base", "--is-ancestor", ancestor, descendant])
+        .await
+        .is_some()
+}
+
+/// Record the remote tip this worktree may replace, before a fetch moves `origin/<branch>`. The lease
+/// moves only to a tip HEAD contains, such as the agent's own push, never to one only fetched
+pub(crate) async fn record_push_lease(dir: &Path, branch: &str, default_branch: &str) {
+    if branch.is_empty() || branch == default_branch {
+        return;
+    }
+
+    let tip = remote_tracking_sha(dir, branch).await;
+    match (read_push_lease(dir, branch).await, tip) {
+        (Some(lease), Some(tip)) if lease != tip && is_ancestor(dir, &tip, "HEAD").await => {
+            write_push_lease(dir, branch, &tip).await;
+        }
+        (Some(_), _) => {}
+        (None, tip) => {
+            let expect = tip.unwrap_or_else(|| LEASE_ABSENT.to_string());
+            write_push_lease(dir, branch, &expect).await;
+        }
+    }
+}
+
+async fn note_pushed_head(dir: &Path, branch: &str) {
+    if let Some(sha) = git_stdout(dir, &["rev-parse", "--verify", "HEAD"]).await {
+        write_push_lease(dir, branch, &sha).await;
+    }
+}
+
+/// True when `tip` is GitHub's "Update branch" of `lease`: a merge with first parent `lease` and
+/// second parent on the default branch, or a rebase whose commits all have a twin in `lease`
+async fn is_github_branch_update(dir: &Path, tip: &str, lease: &str, default_branch: &str) -> bool {
+    let base = format!("origin/{default_branch}");
+    let Some(line) = git_stdout(dir, &["rev-list", "--parents", "-n", "1", tip]).await else {
+        return false;
+    };
+    let parents: Vec<&str> = line.split_whitespace().skip(1).collect();
+    if let [first, second] = parents[..] {
+        return first == lease && is_ancestor(dir, second, &base).await;
+    }
+
+    // `git cherry` marks each commit in base..tip with `-` when `lease` holds the same patch
+    let Some(cherry) = git_stdout(dir, &["cherry", lease, tip, &base]).await else {
+        return false;
+    };
+    is_ancestor(dir, &base, tip).await
+        && !cherry.is_empty()
+        && cherry.lines().all(|l| l.starts_with('-'))
+}
+
+async fn expected_force_sha(
+    dir: &Path,
+    branch: &str,
+    default_branch: &str,
+) -> anyhow::Result<String> {
+    let tip = remote_tracking_sha(dir, branch).await;
+    match read_push_lease(dir, branch).await {
+        Some(lease) if lease == LEASE_ABSENT => anyhow::bail!(
+            "force push rejected: remote branch {branch} was absent when the lease was recorded"
+        ),
+        Some(lease) => match tip {
+            Some(tip)
+                if tip != lease
+                    && is_github_branch_update(dir, &tip, &lease, default_branch).await =>
+            {
+                tracing::info!(branch, %lease, %tip, "remote tip is GitHub's update of the leased branch, leasing it");
+                Ok(tip)
+            }
+            _ => Ok(lease),
+        },
+        None => {
+            let Some(tip) = tip else {
+                anyhow::bail!("force push rejected: no remote sha recorded for {branch}");
+            };
+            let fallbacks = LEASE_FALLBACKS.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::warn!(
+                branch,
+                fallbacks,
+                "no push lease recorded, using the fetched origin tip"
+            );
+            Ok(tip)
+        }
+    }
+}
+
+/// Force-push `branch` only if the remote still holds the leased sha
+pub(crate) async fn force_push_leased(
+    dir: &Path,
+    branch: &str,
+    default_branch: &str,
+) -> anyhow::Result<()> {
+    let expected = expected_force_sha(dir, branch, default_branch).await?;
+    let lease = format!("--force-with-lease={branch}:{expected}");
+    tracing::info!(branch, expected_sha = %expected, "force-pushing with an expected remote sha");
+    let auth_env = build_git_auth_env();
+    let output = Command::new("git")
+        .args([
+            "-c",
+            "lfs.locksverify=false",
+            "push",
+            &lease,
+            "-u",
+            "origin",
+            branch,
+        ])
+        .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .current_dir(dir)
+        .kill_on_drop(true)
+        .output_with_context()
+        .await?;
+    if output.status.success() {
+        note_pushed_head(dir, branch).await;
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    anyhow::bail!("{}", sanitize_push_error(&stderr))
+}
+
 /// Push the branch to origin.
 pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyhow::Result<bool> {
     let current = get_current_branch(dir).await;
@@ -968,6 +1138,7 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
             branch = branch_to_push,
             "remote branch exists and is up to date, skipping push"
         );
+        note_pushed_head(dir, branch_to_push).await;
         return Ok(true);
     }
     if !remote_exists && !has_unpushed {
@@ -1013,6 +1184,7 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
 
     if output.status.success() {
         tracing::info!(branch = branch_to_push, "push succeeded");
+        note_pushed_head(dir, branch_to_push).await;
         return Ok(true);
     }
 
@@ -1047,6 +1219,7 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
 
         if retry_output.status.success() {
             tracing::info!(branch = branch_to_push, "push succeeded on network retry");
+            note_pushed_head(dir, branch_to_push).await;
             return Ok(true);
         }
 
@@ -1097,6 +1270,7 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
                         branch = branch_to_push,
                         "push succeeded after stripping workflow files"
                     );
+                    note_pushed_head(dir, branch_to_push).await;
                     return Ok(true);
                 }
 
@@ -1134,36 +1308,20 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
         }
     }
 
-    // If non-fast-forward, the branch was likely rebased on the default branch
-    // by `rebase_on_default()` before the agent started — the local history is
-    // correct but diverges from the remote. Force-push with lease to update it
-    // without pulling (which would duplicate commits from main).
+    // Non-fast-forward after `rebase_on_default`. The lease was recorded before that fetch,
+    // so this replaces only a tip this worktree already built on
     if push_needs_rebase(&stderr) && remote_exists {
         tracing::info!(
             branch = branch_to_push,
             "push rejected (non-fast-forward), force-pushing with lease"
         );
-        let output = Command::new("git")
-            .args([
-                "-c",
-                "lfs.locksverify=false",
-                "push",
-                "--force-with-lease",
-                "-u",
-                "origin",
-                branch_to_push,
-            ])
-            .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .current_dir(dir)
-            .output_with_context()
-            .await?;
-
-        if output.status.success() {
-            tracing::info!(branch = branch_to_push, "force push succeeded");
-            return Ok(true);
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = match force_push_leased(dir, branch_to_push, default_branch).await {
+            Ok(()) => {
+                tracing::info!(branch = branch_to_push, "force push succeeded");
+                return Ok(true);
+            }
+            Err(e) => e.to_string(),
+        };
 
         // Check if force push also hit the workflow scope error
         if is_workflow_scope_error(&stderr) {
@@ -1173,35 +1331,15 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
             );
             match strip_workflow_files(dir, default_branch).await {
                 Ok(true) => {
-                    let retry_output = Command::new("git")
-                        .args([
-                            "-c",
-                            "lfs.locksverify=false",
-                            "push",
-                            "--force-with-lease",
-                            "-u",
-                            "origin",
-                            branch_to_push,
-                        ])
-                        .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-                        .current_dir(dir)
-                        .output_with_context()
-                        .await?;
-
-                    if retry_output.status.success() {
-                        tracing::info!(
-                            branch = branch_to_push,
-                            "force push succeeded after stripping workflow files"
-                        );
-                        return Ok(true);
+                    if let Err(e) = force_push_leased(dir, branch_to_push, default_branch).await {
+                        anyhow::bail!("force push failed after stripping workflow files: {e}");
                     }
 
-                    let retry_stderr = String::from_utf8_lossy(&retry_output.stderr)
-                        .trim()
-                        .to_string();
-                    anyhow::bail!(
-                        "force push failed after stripping workflow files: {retry_stderr}"
+                    tracing::info!(
+                        branch = branch_to_push,
+                        "force push succeeded after stripping workflow files"
                     );
+                    return Ok(true);
                 }
                 Ok(false) => {
                     anyhow::bail!(
@@ -1240,6 +1378,7 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
                     branch = branch_to_push,
                     "push succeeded after rebasing on the moved remote branch"
                 );
+                note_pushed_head(dir, branch_to_push).await;
                 return Ok(true);
             }
 
@@ -1883,7 +2022,7 @@ async fn append_pr_footer_if_missing(
 }
 
 /// Get the current branch name.
-async fn get_current_branch(dir: &Path) -> String {
+pub(crate) async fn get_current_branch(dir: &Path) -> String {
     let output = Command::new("git")
         .args(["branch", "--show-current"])
         .current_dir(dir)
@@ -2881,5 +3020,441 @@ mod tests {
         assert!(!is_stale_lease_error(
             "! [rejected] feat -> feat (fetch first)"
         ));
+    }
+
+    fn git_ok(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn git_sha(dir: &std::path::Path, rev: &str) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", rev])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git rev-parse {rev} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn init_identity(dir: &std::path::Path) {
+        git_ok(dir, &["config", "user.email", "test@example.com"]);
+        git_ok(dir, &["config", "user.name", "Test"]);
+        git_ok(dir, &["config", "commit.gpgsign", "false"]);
+    }
+
+    fn write_commit(dir: &std::path::Path, file: &str, body: &str, msg: &str) {
+        std::fs::write(dir.join(file), body).unwrap();
+        git_ok(dir, &["add", file]);
+        git_ok(dir, &["commit", "-m", msg]);
+    }
+
+    /// A bare origin with `main` and a pushed `feature`, and a clone `a` on `feature`
+    fn publish_feature(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let bare = root.join("bare.git");
+        let a = root.join("a");
+        git_ok(root, &["init", "-b", "main", a.to_str().unwrap()]);
+        init_identity(&a);
+        write_commit(&a, "README.md", "base\n", "base");
+        git_ok(
+            root,
+            &["init", "--bare", "-b", "main", bare.to_str().unwrap()],
+        );
+        git_ok(&a, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&a, &["push", "-u", "origin", "main"]);
+        git_ok(&a, &["checkout", "-b", "feature"]);
+        write_commit(&a, "feature.txt", "feature\n", "feature");
+        git_ok(&a, &["push", "-u", "origin", "feature"]);
+        (bare, a)
+    }
+
+    fn clone_on(
+        root: &std::path::Path,
+        bare: &std::path::Path,
+        name: &str,
+        branch: &str,
+    ) -> std::path::PathBuf {
+        let dir = root.join(name);
+        git_ok(
+            root,
+            &["clone", bare.to_str().unwrap(), dir.to_str().unwrap()],
+        );
+        init_identity(&dir);
+        if branch != "main" {
+            git_ok(
+                &dir,
+                &["checkout", "-b", branch, &format!("origin/{branch}")],
+            );
+        }
+
+        dir
+    }
+
+    #[tokio::test]
+    async fn leased_force_push_does_not_replace_a_newer_remote_tip() {
+        let root = tempfile::tempdir().unwrap();
+        let (bare, a) = publish_feature(root.path());
+        let b = clone_on(root.path(), &bare, "b", "feature");
+        record_push_lease(&b, "feature", "main").await;
+        let leased = git_sha(&b, "refs/remotes/origin/feature");
+
+        write_commit(&a, "feature.txt", "from a\n", "from a");
+        git_ok(&a, &["push", "origin", "feature"]);
+        let newer = git_sha(&a, "HEAD");
+
+        git_ok(&b, &["fetch", "origin"]);
+        write_commit(&b, "feature.txt", "from b\n", "from b");
+        let pushed = push_branch(&b, "feature", "main").await;
+        assert!(
+            pushed.is_err(),
+            "force push should be rejected, got {pushed:?}"
+        );
+        assert_eq!(git_sha(&bare, "refs/heads/feature"), newer);
+
+        // A retry sees the fetched tip, which HEAD does not contain, so the lease stays
+        record_push_lease(&b, "feature", "main").await;
+        assert_eq!(read_push_lease(&b, "feature").await, Some(leased));
+        let again = push_branch(&b, "feature", "main").await;
+        assert!(
+            again.is_err(),
+            "second force push should stay rejected, got {again:?}"
+        );
+        assert_eq!(git_sha(&bare, "refs/heads/feature"), newer);
+    }
+
+    #[tokio::test]
+    async fn leased_force_push_allows_rewrite_of_the_recorded_tip() {
+        let root = tempfile::tempdir().unwrap();
+        let (bare, a) = publish_feature(root.path());
+        record_push_lease(&a, "feature", "main").await;
+        std::fs::write(a.join("feature.txt"), "rewritten\n").unwrap();
+        git_ok(&a, &["commit", "-am", "--amend", "-m", "feature rewritten"]);
+
+        let pushed = push_branch(&a, "feature", "main").await;
+        assert!(
+            pushed.is_ok(),
+            "rewrite of the leased tip should push, got {pushed:?}"
+        );
+        assert_eq!(git_sha(&bare, "refs/heads/feature"), git_sha(&a, "HEAD"));
+        assert_eq!(
+            read_push_lease(&a, "feature").await,
+            Some(git_sha(&a, "HEAD"))
+        );
+    }
+
+    #[tokio::test]
+    async fn push_after_update_branch_merge_force_pushes_the_rebased_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let (bare, a) = publish_feature(root.path());
+        record_push_lease(&a, "feature", "main").await;
+
+        // GitHub's "Update branch": main moves, then main is merged into feature on the remote
+        let c = clone_on(root.path(), &bare, "c", "main");
+        write_commit(&c, "main.txt", "main\n", "main moves");
+        git_ok(&c, &["push", "origin", "main"]);
+        git_ok(&c, &["checkout", "-b", "feature", "origin/feature"]);
+        git_ok(
+            &c,
+            &[
+                "merge",
+                "--no-ff",
+                "-m",
+                "Merge main into feature",
+                "origin/main",
+            ],
+        );
+        git_ok(&c, &["push", "origin", "feature"]);
+
+        rebase_on_default(&a, "main").await;
+        write_commit(&a, "feature.txt", "review fix\n", "review fix");
+        let pushed = push_branch(&a, "feature", "main").await;
+        assert!(
+            pushed.is_ok(),
+            "push after update-branch should succeed, got {pushed:?}"
+        );
+        assert_eq!(git_sha(&bare, "refs/heads/feature"), git_sha(&a, "HEAD"));
+    }
+
+    #[tokio::test]
+    async fn agent_push_moves_the_lease_to_a_tip_head_contains() {
+        let root = tempfile::tempdir().unwrap();
+        let (_bare, a) = publish_feature(root.path());
+        record_push_lease(&a, "feature", "main").await;
+
+        write_commit(&a, "feature.txt", "agent step\n", "agent step");
+        git_ok(&a, &["push", "origin", "feature"]);
+        record_push_lease(&a, "feature", "main").await;
+        assert_eq!(
+            read_push_lease(&a, "feature").await,
+            Some(git_sha(&a, "HEAD"))
+        );
+    }
+
+    #[tokio::test]
+    async fn record_push_lease_skips_the_default_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let (_bare, a) = publish_feature(root.path());
+        git_ok(&a, &["checkout", "main"]);
+        record_push_lease(&a, "main", "main").await;
+        assert_eq!(read_push_lease(&a, "main").await, None);
+    }
+
+    /// GitHub's "Update branch" by merge: main moves, then main is merged into feature
+    fn github_update_by_merge(root: &std::path::Path, bare: &std::path::Path, name: &str) {
+        let c = clone_on(root, bare, name, "main");
+        write_commit(&c, "main.txt", "main\n", "main moves");
+        git_ok(&c, &["push", "origin", "main"]);
+        git_ok(&c, &["checkout", "-b", "feature", "origin/feature"]);
+        git_ok(
+            &c,
+            &[
+                "merge",
+                "--no-ff",
+                "-m",
+                "Merge main into feature",
+                "origin/main",
+            ],
+        );
+        git_ok(&c, &["push", "origin", "feature"]);
+    }
+
+    /// GitHub's "Update branch" by rebase: main moves, then feature is replayed on it
+    fn github_update_by_rebase(
+        root: &std::path::Path,
+        bare: &std::path::Path,
+        name: &str,
+    ) -> std::path::PathBuf {
+        let c = clone_on(root, bare, name, "main");
+        write_commit(&c, "main.txt", "main\n", "main moves");
+        git_ok(&c, &["push", "origin", "main"]);
+        git_ok(&c, &["checkout", "-b", "feature", "origin/feature"]);
+        git_ok(&c, &["rebase", "origin/main"]);
+        git_ok(&c, &["push", "--force", "origin", "feature"]);
+        c
+    }
+
+    fn remote_has(root: &std::path::Path, bare: &std::path::Path, file: &str) -> bool {
+        let check = root.join("check");
+        if !check.exists() {
+            git_ok(
+                root,
+                &["clone", bare.to_str().unwrap(), check.to_str().unwrap()],
+            );
+        }
+
+        git_ok(&check, &["fetch", "origin"]);
+        git_ok(&check, &["checkout", "--detach", "origin/feature"]);
+        check.join(file).exists()
+    }
+
+    #[tokio::test]
+    async fn push_after_update_branch_rebase_force_pushes_the_rebased_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let (bare, a) = publish_feature(root.path());
+        record_push_lease(&a, "feature", "main").await;
+        github_update_by_rebase(root.path(), &bare, "c");
+
+        rebase_on_default(&a, "main").await;
+        write_commit(&a, "fix.txt", "review fix\n", "review fix");
+        let pushed = push_branch(&a, "feature", "main").await;
+        assert!(
+            pushed.is_ok(),
+            "push after a rebase update should succeed, got {pushed:?}"
+        );
+        assert_eq!(git_sha(&bare, "refs/heads/feature"), git_sha(&a, "HEAD"));
+    }
+
+    #[tokio::test]
+    async fn rebase_update_with_a_foreign_commit_keeps_the_foreign_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let (bare, a) = publish_feature(root.path());
+        record_push_lease(&a, "feature", "main").await;
+        let c = github_update_by_rebase(root.path(), &bare, "c");
+        write_commit(&c, "other.txt", "other machine\n", "other machine");
+        git_ok(&c, &["push", "origin", "feature"]);
+
+        rebase_on_default(&a, "main").await;
+        write_commit(&a, "fix.txt", "review fix\n", "review fix");
+        let _ = push_branch(&a, "feature", "main").await;
+        assert!(
+            remote_has(root.path(), &bare, "other.txt"),
+            "the other machine's commit was dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_of_a_non_default_branch_is_not_a_github_update() {
+        let root = tempfile::tempdir().unwrap();
+        let (bare, a) = publish_feature(root.path());
+        record_push_lease(&a, "feature", "main").await;
+        let c = clone_on(root.path(), &bare, "c", "feature");
+        git_ok(&c, &["checkout", "-b", "side", "origin/main"]);
+        write_commit(&c, "side.txt", "side\n", "side work");
+        git_ok(&c, &["checkout", "feature"]);
+        git_ok(&c, &["merge", "--no-ff", "-m", "Merge side", "side"]);
+        git_ok(&c, &["push", "origin", "feature"]);
+
+        rebase_on_default(&a, "main").await;
+        write_commit(&a, "fix.txt", "review fix\n", "review fix");
+        let _ = push_branch(&a, "feature", "main").await;
+        assert!(
+            remote_has(root.path(), &bare, "side.txt"),
+            "the merged side branch was dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_merge_on_top_of_a_foreign_push_keeps_the_foreign_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let (bare, a) = publish_feature(root.path());
+        record_push_lease(&a, "feature", "main").await;
+        let c = clone_on(root.path(), &bare, "c", "feature");
+        write_commit(&c, "other.txt", "other machine\n", "other machine");
+        git_ok(&c, &["push", "origin", "feature"]);
+        github_update_by_merge(root.path(), &bare, "d");
+
+        rebase_on_default(&a, "main").await;
+        write_commit(&a, "fix.txt", "review fix\n", "review fix");
+        let _ = push_branch(&a, "feature", "main").await;
+        assert!(
+            remote_has(root.path(), &bare, "other.txt"),
+            "the other machine's commit was dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_push_leased_accepts_github_updates() {
+        for by_rebase in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (bare, a) = publish_feature(root.path());
+            record_push_lease(&a, "feature", "main").await;
+            if by_rebase {
+                github_update_by_rebase(root.path(), &bare, "c");
+            } else {
+                github_update_by_merge(root.path(), &bare, "c");
+            }
+
+            git_ok(&a, &["fetch", "origin"]);
+            git_ok(&a, &["rebase", "origin/main"]);
+            let pushed = force_push_leased(&a, "feature", "main").await;
+            assert!(pushed.is_ok(), "by_rebase={by_rebase}: {pushed:?}");
+            assert_eq!(git_sha(&bare, "refs/heads/feature"), git_sha(&a, "HEAD"));
+        }
+    }
+
+    #[tokio::test]
+    async fn force_push_leased_refuses_a_foreign_push() {
+        let root = tempfile::tempdir().unwrap();
+        let (bare, a) = publish_feature(root.path());
+        record_push_lease(&a, "feature", "main").await;
+        let c = clone_on(root.path(), &bare, "c", "feature");
+        write_commit(&c, "other.txt", "other machine\n", "other machine");
+        git_ok(&c, &["push", "origin", "feature"]);
+        let foreign = git_sha(&c, "HEAD");
+
+        git_ok(&a, &["fetch", "origin"]);
+        record_push_lease(&a, "feature", "main").await;
+        std::fs::write(a.join("feature.txt"), "rewritten\n").unwrap();
+        git_ok(&a, &["commit", "-am", "--amend", "-m", "rewritten"]);
+        assert!(force_push_leased(&a, "feature", "main").await.is_err());
+        assert_eq!(git_sha(&bare, "refs/heads/feature"), foreign);
+    }
+
+    #[tokio::test]
+    async fn force_push_leased_refuses_a_branch_created_after_an_absent_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let (bare, a) = publish_feature(root.path());
+        git_ok(&a, &["checkout", "-b", "fresh", "main"]);
+        record_push_lease(&a, "fresh", "main").await;
+        assert_eq!(
+            read_push_lease(&a, "fresh").await.as_deref(),
+            Some(LEASE_ABSENT)
+        );
+
+        let c = clone_on(root.path(), &bare, "c", "main");
+        git_ok(&c, &["checkout", "-b", "fresh"]);
+        write_commit(&c, "other.txt", "other machine\n", "other machine");
+        git_ok(&c, &["push", "origin", "fresh"]);
+        let foreign = git_sha(&c, "HEAD");
+
+        git_ok(&a, &["fetch", "origin"]);
+        write_commit(&a, "mine.txt", "mine\n", "mine");
+        assert!(force_push_leased(&a, "fresh", "main").await.is_err());
+        assert_eq!(git_sha(&bare, "refs/heads/fresh"), foreign);
+    }
+
+    #[tokio::test]
+    async fn first_push_records_the_pushed_head_as_the_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let (_bare, a) = publish_feature(root.path());
+        git_ok(&a, &["checkout", "-b", "fresh", "main"]);
+        write_commit(&a, "mine.txt", "mine\n", "mine");
+        assert!(push_branch(&a, "fresh", "main").await.unwrap());
+        assert_eq!(
+            read_push_lease(&a, "fresh").await,
+            Some(git_sha(&a, "HEAD"))
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_lease_falls_back_to_the_fetched_tip_and_counts_it() {
+        let root = tempfile::tempdir().unwrap();
+        let (_bare, a) = publish_feature(root.path());
+        let before = LEASE_FALLBACKS.load(Ordering::Relaxed);
+        let expected = expected_force_sha(&a, "feature", "main").await.unwrap();
+        assert_eq!(expected, git_sha(&a, "refs/remotes/origin/feature"));
+        assert!(LEASE_FALLBACKS.load(Ordering::Relaxed) > before);
+    }
+
+    #[tokio::test]
+    async fn agent_push_then_foreign_push_keeps_the_agent_tip_as_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let (bare, a) = publish_feature(root.path());
+        record_push_lease(&a, "feature", "main").await;
+        write_commit(&a, "step.txt", "agent step\n", "agent step");
+        git_ok(&a, &["push", "origin", "feature"]);
+        let agent_tip = git_sha(&a, "HEAD");
+
+        let c = clone_on(root.path(), &bare, "c", "feature");
+        write_commit(&c, "other.txt", "other machine\n", "other machine");
+        git_ok(&c, &["push", "origin", "feature"]);
+
+        // Callers record before they fetch, so the lease moves to the agent's push and no further
+        record_push_lease(&a, "feature", "main").await;
+        git_ok(&a, &["fetch", "origin"]);
+        record_push_lease(&a, "feature", "main").await;
+        assert_eq!(read_push_lease(&a, "feature").await, Some(agent_tip));
+        let foreign = git_sha(&bare, "refs/heads/feature");
+        git_ok(&a, &["commit", "--amend", "-m", "agent step rewritten"]);
+        assert!(force_push_leased(&a, "feature", "main").await.is_err());
+        assert_eq!(git_sha(&bare, "refs/heads/feature"), foreign);
+    }
+
+    #[tokio::test]
+    async fn branch_without_remote_and_head_without_twins_are_not_github_updates() {
+        let root = tempfile::tempdir().unwrap();
+        let (_bare, a) = publish_feature(root.path());
+        let lease = git_sha(&a, "HEAD");
+        let main = git_sha(&a, "origin/main");
+        // A tip equal to main has nothing in base..tip, which must not count as a rebase update
+        assert!(!is_github_branch_update(&a, &main, &lease, "main").await);
+        assert!(
+            !is_github_branch_update(
+                &a,
+                "0000000000000000000000000000000000000000",
+                &lease,
+                "main"
+            )
+            .await
+        );
     }
 }
