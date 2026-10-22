@@ -1033,8 +1033,8 @@ impl TaskRunner {
         route_result: Option<&RouteResult>,
     ) -> anyhow::Result<WeightSignal> {
         let task_id = &task.id.0;
-        if crate::engine::strict_profiles::task_is_strict(&self.store, &self.repo, task_id).await? {
-            return Err(crate::engine::strict_profiles::GuardError::ProofOnly.into());
+        if crate::engine::strict_profiles::block_dispatch(&self.store, &self.repo, task_id).await? {
+            return Ok(WeightSignal::Blocked);
         }
         let agent = route_result.map(|r| r.agent.as_str());
         let agent_name = agent.unwrap_or("claude").to_string();

@@ -317,6 +317,8 @@ async fn build_review_context(
     if crate::engine::strict_profiles::task_is_strict(&Some(Arc::clone(store)), repo, &task.id.0)
         .await?
     {
+        let pin = crate::engine::strict_profiles::review_pin(store, repo, &task.id.0, task).await?;
+        crate::engine::strict_profiles::guard_spawn(Some(&pin), &pin.cli, Some(&pin.model))?;
         return Err(crate::engine::strict_profiles::GuardError::ProofOnly.into());
     }
 
@@ -2635,6 +2637,13 @@ pub(crate) async fn review_and_merge(
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<ReviewDecision> {
+    if crate::engine::strict_profiles::task_is_strict(&Some(Arc::clone(store)), repo, &task.id.0)
+        .await?
+    {
+        let pin = crate::engine::strict_profiles::review_pin(store, repo, &task.id.0, task).await?;
+        crate::engine::strict_profiles::guard_spawn(Some(&pin), &pin.cli, Some(&pin.model))?;
+        return Err(crate::engine::strict_profiles::GuardError::ProofOnly.into());
+    }
     set_review_session_expected(store, repo, &task.id.0, true).await;
 
     let ctx = match build_review_context(task, repo, router, task_manager, store).await? {

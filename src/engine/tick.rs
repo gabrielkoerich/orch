@@ -1718,70 +1718,75 @@ pub(crate) async fn tick_route_tasks(
                     }
                 }
 
-                // Dual-write: upsert task + store route result in SQLite
-                match store.ensure_external_task(repo, task).await {
-                    Ok(store_id) => {
-                        let profile_json =
-                            serde_json::to_string(&result.profile).unwrap_or_default();
-                        let skills_json =
-                            serde_json::to_string(&result.selected_skills).unwrap_or_default();
-                        if let Err(e) = store
-                            .store_route(&crate::store::StoreRoute {
-                                id: store_id,
-                                agent: &result.agent,
-                                model: result.model.as_deref(),
-                                complexity: &result.complexity,
-                                estimate: result.estimate,
-                                reason: &result.reason,
-                                profile: &profile_json,
-                                skills: &skills_json,
-                            })
-                            .await
-                        {
+                // Strict routes were committed with their pin above. Replaying
+                // the generic upsert here would restore stale labels after a
+                // concurrent hold/archive and rewrite the route non-atomically.
+                if result.strict_profile.is_none() {
+                    // Dual-write: upsert task + store route result in SQLite
+                    match store.ensure_external_task(repo, task).await {
+                        Ok(store_id) => {
+                            let profile_json =
+                                serde_json::to_string(&result.profile).unwrap_or_default();
+                            let skills_json =
+                                serde_json::to_string(&result.selected_skills).unwrap_or_default();
+                            if let Err(e) = store
+                                .store_route(&crate::store::StoreRoute {
+                                    id: store_id,
+                                    agent: &result.agent,
+                                    model: result.model.as_deref(),
+                                    complexity: &result.complexity,
+                                    estimate: result.estimate,
+                                    reason: &result.reason,
+                                    profile: &profile_json,
+                                    skills: &skills_json,
+                                })
+                                .await
+                            {
+                                tracing::debug!(
+                                    task_id = task.id.0,
+                                    ?e,
+                                    "dual-write: store_route failed"
+                                );
+                            }
+                            if let Err(e) = store
+                                .update_status(store_id, crate::store::TaskStatus::Routed)
+                                .await
+                            {
+                                tracing::debug!(
+                                    task_id = task.id.0,
+                                    ?e,
+                                    "dual-write: update_status failed"
+                                );
+                            }
+                            // Sync the estimate to GitHub Projects if the router assigned one.
+                            // Fire-and-forget: do NOT await inline — GraphQL mutations can take
+                            // up to 30 s and would block the entire tick loop on every routed task.
+                            if result.estimate > 0 {
+                                let backend_clone = Arc::clone(backend);
+                                let task_id = task.id.clone();
+                                let estimate = result.estimate;
+                                tokio::spawn(async move {
+                                    if let Err(e) = backend_clone
+                                        .sync_estimate_to_project(&task_id, estimate)
+                                        .await
+                                    {
+                                        tracing::debug!(
+                                            task_id = task_id.0,
+                                            estimate,
+                                            err = %e,
+                                            "dual-write: estimate project sync failed"
+                                        );
+                                    }
+                                });
+                            }
+                        }
+                        Err(e) => {
                             tracing::debug!(
                                 task_id = task.id.0,
                                 ?e,
-                                "dual-write: store_route failed"
+                                "dual-write: ensure_external_task failed"
                             );
                         }
-                        if let Err(e) = store
-                            .update_status(store_id, crate::store::TaskStatus::Routed)
-                            .await
-                        {
-                            tracing::debug!(
-                                task_id = task.id.0,
-                                ?e,
-                                "dual-write: update_status failed"
-                            );
-                        }
-                        // Sync the estimate to GitHub Projects if the router assigned one.
-                        // Fire-and-forget: do NOT await inline — GraphQL mutations can take
-                        // up to 30 s and would block the entire tick loop on every routed task.
-                        if result.estimate > 0 {
-                            let backend_clone = Arc::clone(backend);
-                            let task_id = task.id.clone();
-                            let estimate = result.estimate;
-                            tokio::spawn(async move {
-                                if let Err(e) = backend_clone
-                                    .sync_estimate_to_project(&task_id, estimate)
-                                    .await
-                                {
-                                    tracing::debug!(
-                                        task_id = task_id.0,
-                                        estimate,
-                                        err = %e,
-                                        "dual-write: estimate project sync failed"
-                                    );
-                                }
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            task_id = task.id.0,
-                            ?e,
-                            "dual-write: ensure_external_task failed"
-                        );
                     }
                 }
 
@@ -1866,7 +1871,11 @@ pub(crate) async fn route_new_tasks_global(
         if !routing_quota.consume_one() {
             break;
         }
-        let ext_task = crate::engine::tasks::store_task_to_external(task);
+        let ext_task = if crate::engine::strict_profiles::configured() {
+            crate::engine::strict_profiles::cached_task_snapshot(task)
+        } else {
+            crate::engine::tasks::store_task_to_external(task)
+        };
         let task_start = Instant::now();
         match router.route(&ext_task, store, &task.repo).await {
             Ok(result) => {
@@ -1876,38 +1885,43 @@ pub(crate) async fn route_new_tasks_global(
                     duration_ms = task_start.elapsed().as_millis(),
                     "global sweep: route completed"
                 );
-                if let Some(pin) = &result.strict_profile {
-                    if let Err(error) =
-                        crate::engine::strict_profiles::persist_pin(store, pin).await
+                if result.strict_profile.is_some() {
+                    if let Err(error) = crate::engine::strict_profiles::persist_route(
+                        store,
+                        &task.repo,
+                        &ext_task.id.0,
+                        &result,
+                    )
+                    .await
                     {
                         tracing::warn!(%error, "strict pin persistence failed; route blocked");
                         continue;
                     }
-                }
-
-                let profile_json = serde_json::to_string(&result.profile).unwrap_or_default();
-                let skills_json =
-                    serde_json::to_string(&result.selected_skills).unwrap_or_default();
-                if let Err(e) = store
-                    .store_route(&StoreRoute {
-                        id: task.id,
-                        agent: &result.agent,
-                        model: result.model.as_deref(),
-                        complexity: &result.complexity,
-                        estimate: result.estimate,
-                        reason: &result.reason,
-                        profile: &profile_json,
-                        skills: &skills_json,
-                    })
-                    .await
-                {
-                    tracing::warn!(
-                        task_id = %ext_task.id.0,
-                        repo = %task.repo,
-                        err = %e,
-                        "global sweep: failed to store route result; skipping status update"
-                    );
-                    continue;
+                } else {
+                    let profile_json = serde_json::to_string(&result.profile).unwrap_or_default();
+                    let skills_json =
+                        serde_json::to_string(&result.selected_skills).unwrap_or_default();
+                    if let Err(e) = store
+                        .store_route(&StoreRoute {
+                            id: task.id,
+                            agent: &result.agent,
+                            model: result.model.as_deref(),
+                            complexity: &result.complexity,
+                            estimate: result.estimate,
+                            reason: &result.reason,
+                            profile: &profile_json,
+                            skills: &skills_json,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            task_id = %ext_task.id.0,
+                            repo = %task.repo,
+                            err = %e,
+                            "global sweep: failed to store route result; skipping status update"
+                        );
+                        continue;
+                    }
                 }
                 if let Err(e) = store.update_status(task.id, TaskStatus::Routed).await {
                     tracing::warn!(
@@ -2066,6 +2080,28 @@ async fn dispatch_tasks_for_repo(
     };
 
     for (idx, task) in dispatchable.into_iter().enumerate() {
+        if crate::engine::strict_profiles::task_is_strict(
+            &Some(Arc::clone(store)),
+            repo,
+            &task.id.0,
+        )
+        .await?
+        {
+            let reason = crate::engine::strict_profiles::GuardError::ProofOnly.to_string();
+            // Preserve native status mirroring and events while rejecting before
+            // any InProgress transition, dispatch claim, capture or tmux work.
+            task_manager
+                .update_task_status_and_result(
+                    &task.id,
+                    Status::Blocked,
+                    &[
+                        ("last_error", serde_json::json!(reason)),
+                        ("block_reason", serde_json::json!(reason)),
+                    ],
+                )
+                .await?;
+            continue;
+        }
         // In degraded mode, add delay between dispatches to pace the system
         if idx > 0 && dispatch_mode.is_degraded {
             let delay_ms = sequential_delay;

@@ -696,6 +696,10 @@ impl Router {
                 return Err(strict::GuardError::PinMismatch.into());
             }
             if let Some(stored) = store.get_by_external_id(repo, &task.id.0).await? {
+                let cached = strict::cached_task_snapshot(&stored);
+                if policy.resolve(&cached, repo, &worker_host)? != pin {
+                    return Err(strict::GuardError::PinMismatch.into());
+                }
                 if existing_pin.is_some() {
                     pin.check_selection(stored.agent.as_deref(), stored.model.as_deref())?;
                 }
@@ -1507,26 +1511,17 @@ impl Router {
         store: &std::sync::Arc<TaskStore>,
         repo: &str,
     ) -> anyhow::Result<()> {
-        if let Some(pin) = &result.strict_profile {
-            anyhow::ensure!(
-                pin.repository == repo && pin.issue_id == task_id,
-                "strict task mismatch"
-            );
-            pin.check_selection(Some(&result.agent), result.model.as_deref())?;
-            anyhow::ensure!(
-                store.resolve_task_id(repo, task_id).await?.is_some(),
-                "strict task missing from store"
-            );
-            crate::engine::strict_profiles::persist_pin(store, pin).await?;
-        } else {
-            anyhow::ensure!(
-                !crate::engine::strict_profiles::configured()
-                    && crate::engine::strict_profiles::stored_pin(store, repo, task_id)
-                        .await?
-                        .is_none(),
-                "strict route pin required"
-            );
+        if result.strict_profile.is_some() {
+            return crate::engine::strict_profiles::persist_route(store, repo, task_id, result)
+                .await;
         }
+        anyhow::ensure!(
+            !crate::engine::strict_profiles::configured()
+                && crate::engine::strict_profiles::stored_pin(store, repo, task_id)
+                    .await?
+                    .is_none(),
+            "strict route pin required"
+        );
         if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
             store
                 .set_fields(
@@ -1566,7 +1561,7 @@ pub async fn get_route_result(
         let pin = pin.ok_or_else(|| anyhow::anyhow!("strict route is missing immutable pin"))?;
         let (policy, host) = crate::engine::strict_profiles::load()?
             .ok_or_else(|| anyhow::anyhow!("strict policy missing for persisted pin"))?;
-        let external = crate::engine::tasks::store_task_to_external(&task);
+        let external = crate::engine::strict_profiles::cached_task_snapshot(&task);
         let current = policy
             .resolve(&external, repo, &host)
             .map_err(anyhow::Error::from)?;

@@ -135,6 +135,13 @@ pub async fn prepare_task(
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("strict pin required"))?;
         pin.check_selection(agent, model)?;
+        let backend = backend.ok_or(crate::engine::strict_profiles::GuardError::Missing(
+            "fresh authorization backend",
+        ))?;
+        let (policy, _) = crate::engine::strict_profiles::load()?.ok_or(
+            crate::engine::strict_profiles::GuardError::Missing("strict policy"),
+        )?;
+        crate::engine::strict_profiles::recheck_authorization(backend, &policy, pin).await?;
         crate::engine::strict_profiles::guard_spawn(Some(pin), agent.unwrap_or_default(), model)?;
     }
 
