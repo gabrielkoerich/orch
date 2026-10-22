@@ -53,9 +53,9 @@ IF required checks FAIL:
         not auto-fixable? → decision = request_changes
 
 IF required checks are NOT RUN or PENDING:
-  → run local checks as fallback: if shipcheck.toml exists, run `shipcheck run`
-    (exit 0 = PASS, 1 = FAIL, read `shipcheck logs`). Otherwise read .github/workflows/
-    to identify what CI runs and execute those commands (do NOT hardcode language-specific commands)
+  → run local checks as fallback: {{#if SHIPCHECK}}run `shipcheck run`
+    (exit 0 = PASS, 1 = FAIL, read `shipcheck logs`){{/if}}{{#if NO_SHIPCHECK}}read .github/workflows/
+    to identify what CI runs and execute those commands (do NOT hardcode language-specific commands){{/if}}
   → treat local results the same as "required checks PASS" or "FAIL" above
 ```
 

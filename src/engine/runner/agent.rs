@@ -17,6 +17,107 @@ const ALLOWED_TOOLS_TEMPLATE: &str = include_str!("../../../prompts/allowed_tool
 const REVIEW_PROMPT_TEMPLATE: &str = include_str!("../../../prompts/review_task.md");
 const REVIEW_SYSTEM_TEMPLATE: &str = include_str!("../../../prompts/review_system.md");
 
+/// Whether the agent tests through shipcheck: the repo opts in and the shipcheck on PATH
+/// has `commit`. An older shipcheck gets the plain workflow step
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shipcheck {
+    Absent,
+    NotInstalled,
+    Outdated,
+    Available,
+}
+
+impl Shipcheck {
+    pub async fn detect(work_dir: &std::path::Path) -> Self {
+        static SUPPORTS_COMMIT: tokio::sync::OnceCell<Option<bool>> =
+            tokio::sync::OnceCell::const_new();
+        let installed = SUPPORTS_COMMIT
+            .get_or_init(|| async {
+                let bin = which::which("shipcheck").ok()?;
+                Some(supports(&bin, "commit").await)
+            })
+            .await;
+        Self::classify(work_dir.join("shipcheck.toml").exists(), *installed)
+    }
+
+    fn classify(has_config: bool, supports_commit: Option<bool>) -> Self {
+        match (has_config, supports_commit) {
+            (false, _) => Shipcheck::Absent,
+            (true, None) => Shipcheck::NotInstalled,
+            (true, Some(false)) => Shipcheck::Outdated,
+            (true, Some(true)) => Shipcheck::Available,
+        }
+    }
+
+    fn insert_vars(self, vars: &mut HashMap<String, String>) {
+        let flags: &[&str] = match self {
+            Shipcheck::Available => &["SHIPCHECK"],
+            Shipcheck::NotInstalled => &["NO_SHIPCHECK", "SHIPCHECK_MISSING"],
+            Shipcheck::Absent | Shipcheck::Outdated => &["NO_SHIPCHECK"],
+        };
+        for flag in flags {
+            vars.insert(flag.to_string(), "1".to_string());
+        }
+    }
+}
+
+async fn run_shipcheck(
+    bin: &std::path::Path,
+    work_dir: &std::path::Path,
+    args: &[&str],
+) -> anyhow::Result<std::process::Output> {
+    let output = tokio::process::Command::new(bin)
+        .args(args)
+        .current_dir(work_dir)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    Ok(tokio::time::timeout(std::time::Duration::from_secs(30), output).await??)
+}
+
+// `<sub> --help` exits 0 for any word, so read the subcommands the usage line lists
+async fn supports(bin: &std::path::Path, subcommand: &str) -> bool {
+    let Ok(out) = run_shipcheck(bin, &std::env::temp_dir(), &["--help"]).await else {
+        return false;
+    };
+    out.status.success()
+        && String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .any(|word| word == subcommand)
+}
+
+/// Runs `shipcheck install` so every agent CLI gets shipcheck's hooks in this worktree.
+/// Returns whether install ran. It never fails the task
+pub async fn install_shipcheck_hooks(
+    work_dir: &std::path::Path,
+    shipcheck: Shipcheck,
+    bin: &std::path::Path,
+) -> bool {
+    if shipcheck != Shipcheck::Available {
+        return false;
+    }
+
+    // A shipcheck without `hook` only installs git hooks, and orch skips it
+    if !supports(bin, "hook").await {
+        return false;
+    }
+
+    match run_shipcheck(bin, work_dir, &["install"]).await {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => tracing::warn!(
+            work_dir = %work_dir.display(),
+            stderr = %String::from_utf8_lossy(&out.stderr),
+            "shipcheck install failed"
+        ),
+        Err(e) => tracing::warn!(
+            work_dir = %work_dir.display(),
+            error = %e,
+            "shipcheck install failed"
+        ),
+    }
+    true
+}
+
 const SHIPCHECK_RULE_PATH: &str = ".codex/rules/orch-shipcheck.rules";
 
 // Only the commands the agent prompt uses, never clean, post, login or daemon
@@ -282,7 +383,7 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
         }
         permissions.extra_writable_dirs.extend(extra_dirs);
 
-        if inv.work_dir.join("shipcheck.toml").exists() {
+        if Shipcheck::detect(&inv.work_dir).await == Shipcheck::Available {
             if let Err(e) = install_shipcheck_rule(&inv.work_dir).await {
                 tracing::warn!(
                     work_dir = %inv.work_dir.display(),
@@ -431,10 +532,12 @@ pub fn build_system_prompt(
     context: &super::context::TaskContext,
     route_result: Option<&crate::engine::router::RouteResult>,
     default_branch: &str,
+    shipcheck: Shipcheck,
 ) -> String {
     let mut vars = HashMap::new();
 
     vars.insert("DEFAULT_BRANCH".to_string(), default_branch.to_string());
+    shipcheck.insert_vars(&mut vars);
 
     if let Some(rr) = route_result {
         vars.insert("ROLE".to_string(), rr.profile.role.clone());
@@ -565,8 +668,10 @@ pub fn build_review_prompt(
     git_log: &str,
     default_branch: &str,
     pr_number: u64,
+    shipcheck: Shipcheck,
 ) -> String {
     let mut vars = HashMap::new();
+    shipcheck.insert_vars(&mut vars);
     vars.insert("TASK_ID".to_string(), task.id.0.clone());
     vars.insert("TASK_TITLE".to_string(), task.title.clone());
     vars.insert("TASK_BODY".to_string(), task.body.clone());
@@ -843,7 +948,7 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             url: "https://example.com/1".to_string(),
         };
-        let prompt = build_review_prompt(&task, "", "", "", "main", 1);
+        let prompt = build_review_prompt(&task, "", "", "", "main", 1, Shipcheck::Absent);
 
         assert!(
             prompt.contains("Pending CI is never a terminal review state"),
@@ -945,5 +1050,145 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
         let meta = std::fs::symlink_metadata(dir.path().join(SHIPCHECK_RULE_PATH)).unwrap();
         assert!(meta.is_file());
+    }
+
+    fn prompt_task() -> crate::backends::ExternalTask {
+        crate::backends::ExternalTask {
+            id: crate::backends::ExternalId("1".to_string()),
+            title: "t".to_string(),
+            body: "b".to_string(),
+            state: "open".to_string(),
+            labels: vec![],
+            author: "a".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: "https://example.com/1".to_string(),
+        }
+    }
+
+    #[test]
+    fn system_prompt_uses_shipcheck_only_when_available() {
+        let ctx = super::super::context::TaskContext::default();
+        let task = prompt_task();
+        let prompt = |s| build_system_prompt(&task, &ctx, None, "main", s);
+
+        let available = prompt(Shipcheck::Available);
+        assert!(available.contains("shipcheck run"));
+        assert!(available.contains("shipcheck commit"));
+        assert!(!available.contains(".github/workflows/"));
+        assert!(!available.contains("not installed"));
+
+        let outdated = prompt(Shipcheck::Outdated);
+        assert!(!outdated.contains("shipcheck"));
+        assert!(outdated.contains(".github/workflows/"));
+
+        let missing = prompt(Shipcheck::NotInstalled);
+        assert!(!missing.contains("shipcheck run"));
+        assert!(missing.contains(".github/workflows/"));
+        assert!(missing.contains("shipcheck is not installed"));
+
+        let absent = prompt(Shipcheck::Absent);
+        assert!(!absent.contains("shipcheck"));
+        assert!(absent.contains(".github/workflows/"));
+
+        for p in [&available, &outdated, &missing, &absent] {
+            assert!(!p.contains("{{"), "{p}");
+            assert!(!p.contains("install shipcheck"), "{p}");
+        }
+    }
+
+    #[test]
+    fn review_prompt_uses_shipcheck_only_when_available() {
+        let task = prompt_task();
+        let prompt = |s| build_review_prompt(&task, "", "", "", "main", 1, s);
+        assert!(prompt(Shipcheck::Available).contains("shipcheck run"));
+        for s in [
+            Shipcheck::Outdated,
+            Shipcheck::NotInstalled,
+            Shipcheck::Absent,
+        ] {
+            let p = prompt(s);
+            assert!(!p.contains("shipcheck"), "{p}");
+            assert!(p.contains(".github/workflows/"), "{p}");
+        }
+    }
+
+    #[test]
+    fn shipcheck_classify_needs_config_and_commit() {
+        assert_eq!(Shipcheck::classify(false, Some(true)), Shipcheck::Absent);
+        assert_eq!(Shipcheck::classify(false, None), Shipcheck::Absent);
+        assert_eq!(Shipcheck::classify(true, None), Shipcheck::NotInstalled);
+        assert_eq!(Shipcheck::classify(true, Some(false)), Shipcheck::Outdated);
+        assert_eq!(Shipcheck::classify(true, Some(true)), Shipcheck::Available);
+    }
+
+    #[tokio::test]
+    async fn supports_reads_the_usage_line() {
+        let new_dir = tempfile::tempdir().unwrap();
+        let new = fake_shipcheck(new_dir.path(), true, true);
+        assert!(supports(&new, "commit").await);
+        assert!(supports(&new, "hook").await);
+        let old_dir = tempfile::tempdir().unwrap();
+        let old = fake_shipcheck(old_dir.path(), false, false);
+        assert!(!supports(&old, "commit").await);
+        assert!(!supports(&old, "hook").await);
+        let missing = old_dir.path().join("missing");
+        assert!(!supports(&missing, "commit").await);
+    }
+
+    // Mimics shipcheck, whose `--help` prints usage and exits 0 after any subcommand
+    fn fake_shipcheck(dir: &std::path::Path, commit: bool, hook: bool) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let mut usage = "usage: shipcheck run [--sha <rev>] | status | logs".to_string();
+        if commit {
+            usage.push_str(" | commit -m <message>");
+        }
+        if hook {
+            usage.push_str(" | hook");
+        }
+        usage.push_str(" | install | doctor");
+        let bin = dir.join("shipcheck");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = --help ] && {{ echo '{usage}'; exit 0; }}; done\n[ \"$1\" = install ] && touch installed\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    #[tokio::test]
+    async fn install_shipcheck_hooks_runs_install_when_supported() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let bin = fake_shipcheck(bin_dir.path(), true, true);
+        assert!(install_shipcheck_hooks(work.path(), Shipcheck::Available, &bin).await);
+        assert!(work.path().join("installed").exists());
+    }
+
+    #[tokio::test]
+    async fn install_shipcheck_hooks_skips_a_shipcheck_without_hook() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let bin = fake_shipcheck(bin_dir.path(), true, false);
+        assert!(!install_shipcheck_hooks(work.path(), Shipcheck::Available, &bin).await);
+        assert!(!work.path().join("installed").exists());
+    }
+
+    #[tokio::test]
+    async fn install_shipcheck_hooks_skips_when_not_available() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let bin = fake_shipcheck(bin_dir.path(), true, true);
+        for s in [
+            Shipcheck::Outdated,
+            Shipcheck::NotInstalled,
+            Shipcheck::Absent,
+        ] {
+            assert!(!install_shipcheck_hooks(work.path(), s, &bin).await);
+        }
+        assert!(!work.path().join("installed").exists());
     }
 }

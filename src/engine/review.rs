@@ -582,6 +582,7 @@ async fn build_review_context(
         &git_log,
         &default_branch,
         pr_number,
+        runner::agent::Shipcheck::detect(&worktree_path).await,
     );
 
     let task_agent = stored_task
