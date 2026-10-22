@@ -17,6 +17,54 @@ const ALLOWED_TOOLS_TEMPLATE: &str = include_str!("../../../prompts/allowed_tool
 const REVIEW_PROMPT_TEMPLATE: &str = include_str!("../../../prompts/review_task.md");
 const REVIEW_SYSTEM_TEMPLATE: &str = include_str!("../../../prompts/review_system.md");
 
+const SHIPCHECK_RULE_PATH: &str = ".codex/rules/orch-shipcheck.rules";
+
+// Codex runs a command a rule allows outside its sandbox, so shipcheck reaches Docker and its
+// results dir while the agent's own commands still cannot write there
+async fn install_shipcheck_rule(work_dir: &std::path::Path) -> anyhow::Result<()> {
+    let rule = work_dir.join(SHIPCHECK_RULE_PATH);
+    if let Some(dir) = rule.parent() {
+        tokio::fs::create_dir_all(dir).await?;
+    }
+
+    tokio::fs::write(
+        &rule,
+        "prefix_rule(pattern=[\"shipcheck\"], decision=\"allow\")\n",
+    )
+    .await?;
+
+    // Keep the rule out of the agent's commits
+    let output = tokio::process::Command::new("git")
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .current_dir(work_dir)
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Ok(());
+    }
+
+    let exclude = work_dir.join(String::from_utf8_lossy(&output.stdout).trim());
+    let line = format!("/{SHIPCHECK_RULE_PATH}");
+    let current = tokio::fs::read_to_string(&exclude)
+        .await
+        .unwrap_or_default();
+    if current.lines().any(|l| l == line) {
+        return Ok(());
+    }
+
+    if let Some(dir) = exclude.parent() {
+        tokio::fs::create_dir_all(dir).await?;
+    }
+
+    let sep = if current.is_empty() || current.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    tokio::fs::write(&exclude, format!("{current}{sep}{line}\n")).await?;
+    Ok(())
+}
+
 /// Run `git rev-parse <arg>` from `work_dir` and canonicalize the
 /// result. Returns `Ok(None)` when git is not available or the command fails.
 async fn resolve_git_dir_arg(
@@ -208,6 +256,16 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
             }
         }
         permissions.extra_writable_dirs.extend(extra_dirs);
+
+        if inv.work_dir.join("shipcheck.toml").exists() {
+            if let Err(e) = install_shipcheck_rule(&inv.work_dir).await {
+                tracing::warn!(
+                    work_dir = %inv.work_dir.display(),
+                    error = %e,
+                    "failed to install the shipcheck codex rule"
+                );
+            }
+        }
     }
 
     let sys_content = if !permissions.allowed_tools.is_empty() {
@@ -782,5 +840,31 @@ mod tests {
         assert_eq!(shell_single_quote("`whoami`"), "'`whoami`'");
         assert_eq!(shell_single_quote("a\"b"), "'a\"b'");
         assert_eq!(shell_single_quote("$HOME"), "'$HOME'");
+    }
+
+    #[tokio::test]
+    async fn install_shipcheck_rule_writes_rule_and_keeps_tree_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+
+        install_shipcheck_rule(dir.path()).await.unwrap();
+        install_shipcheck_rule(dir.path()).await.unwrap();
+
+        let rule = std::fs::read_to_string(dir.path().join(SHIPCHECK_RULE_PATH)).unwrap();
+        assert_eq!(
+            rule,
+            "prefix_rule(pattern=[\"shipcheck\"], decision=\"allow\")\n"
+        );
+        let exclude = std::fs::read_to_string(dir.path().join(".git/info/exclude")).unwrap();
+        assert_eq!(exclude.matches("orch-shipcheck.rules").count(), 1);
+        let status = git(&["status", "--porcelain", "--untracked-files=all"]);
+        assert!(status.stdout.is_empty(), "{:?}", status);
     }
 }
