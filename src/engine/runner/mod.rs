@@ -336,7 +336,7 @@ fn parse_success_output(
                 // before classify_error. Requiring non-empty result here means the
                 // envelope fallback only fires when we have actual text to report.
                 if !agent_result.is_error
-                    && raw_stdout.contains("\"terminal_reason\":\"completed\"")
+                    && result_envelope_completed(raw_stdout)
                     && !agent_result.result_text.is_empty()
                 {
                     let summary_end =
@@ -394,14 +394,28 @@ fn parse_success_output(
     }
 }
 
-/// Parse session output, handling the kimi/minimax/glm exit-1-with-completed-edge case.
-///
-/// Tries `parse_success_output` first when stdout is non-empty. If that succeeds,
-/// returns success regardless of exit code. If it fails and `exit_code != 0`,
-/// checks for `"terminal_reason":"completed"` or cost-telemetry-only stdout
-/// (`"costUSD":`) in stdout before falling back to `classify_error` — so valid
-/// sessions that exit 1 produce `InvalidResponse` (soft error, re-route) instead
-/// of a garbled `Unknown`/`Auth` error (hard failure with spurious cooldown).
+/// Whether the last `type: result` line reports `subtype: success` or
+/// `terminal_reason: completed`. Grok omits `terminal_reason`.
+fn result_envelope_completed(raw_stdout: &str) -> bool {
+    raw_stdout
+        .lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+        .find(|v| v.get("type").and_then(|t| t.as_str()) == Some("result"))
+        .is_some_and(|v| {
+            v.get("subtype").and_then(|t| t.as_str()) == Some("success")
+                || v.get("terminal_reason").and_then(|t| t.as_str()) == Some("completed")
+        })
+}
+
+/**
+ * Tries `parse_success_output` first when stdout is non-empty. If that succeeds,
+ * returns success regardless of exit code. If it fails and `exit_code != 0`,
+ * checks for `"terminal_reason":"completed"` or cost-telemetry-only stdout
+ * (`"costUSD":`) before falling back to `classify_error`, so valid sessions that
+ * exit 1 produce `InvalidResponse` (soft error, re-route) instead of a garbled
+ * `Unknown`/`Auth` error (hard failure with spurious cooldown)
+ **/
 pub fn parse_session_output(
     task_id: &str,
     agent_name: &str,
@@ -2996,6 +3010,19 @@ mod tests {
         );
         assert_eq!(parsed.input_tokens, Some(3000));
         assert_eq!(parsed.output_tokens, Some(400));
+    }
+
+    /// Grok-style envelope: no terminal_reason, subtype=success.
+    #[test]
+    fn parse_success_output_envelope_fallback_without_terminal_reason() {
+        let receipt = r#"{"ok":true,"report":"notes.md","commit":"abc"}"#;
+        let ndjson = format!(
+            r#"{{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","result":{receipt:?},"usage":{{"input_tokens":3000,"output_tokens":400}}}}"#
+        );
+        let runner = agents::get_runner("grok");
+        let parsed = parse_success_output("1", "grok", &*runner, &ndjson).expect("done");
+        assert_eq!(parsed.response.status, "done");
+        assert_eq!(parsed.input_tokens, Some(3000));
     }
 
     /// Pattern B: agent emits plain prose as result, no completion keywords.
