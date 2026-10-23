@@ -691,6 +691,7 @@ impl LlmRouter {
         *last_agent = Some(agent.clone());
 
         Ok(RouteResult {
+            strict_profile: None,
             agent,
             model,
             complexity,
@@ -833,6 +834,7 @@ impl LlmRouter {
         timeout: Duration,
     ) -> anyhow::Result<String> {
         use crate::engine::runner::direct::{run_direct_command_raw, DirectCommandError};
+        crate::engine::strict_profiles::guard_unpinned_path()?;
 
         // Skip immediately if the agent itself is on cooldown (agent-level)
         if crate::engine::cooldown::is_agent_in_cooldown(agent) {

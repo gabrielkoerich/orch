@@ -125,6 +125,26 @@ pub async fn prepare_task(
     attempts: u32,
     store: &Option<Arc<TaskStore>>,
 ) -> anyhow::Result<TaskInitResult> {
+    if crate::engine::strict_profiles::task_is_strict(store, repo, task_id).await? {
+        let strict_store = store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("strict store required"))?;
+        let route = get_route_result(strict_store, repo, task_id).await?;
+        let pin = route
+            .strict_profile
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("strict pin required"))?;
+        pin.check_selection(agent, model)?;
+        let backend = backend.ok_or(crate::engine::strict_profiles::GuardError::Missing(
+            "fresh authorization backend",
+        ))?;
+        let (policy, _) = crate::engine::strict_profiles::load()?.ok_or(
+            crate::engine::strict_profiles::GuardError::Missing("strict policy"),
+        )?;
+        crate::engine::strict_profiles::recheck_authorization(backend, &policy, pin).await?;
+        crate::engine::strict_profiles::guard_spawn(Some(pin), agent.unwrap_or_default(), model)?;
+    }
+
     // Load title (and model fallback) from store.
     // `model` param and `route_result.model` can both be None when a prior
     // ModelUnavailable failover wrote the new model to tasks.model but did not
@@ -316,6 +336,7 @@ pub async fn prepare_task(
 
     // Build agent invocation
     let invocation = agent::AgentInvocation {
+        strict_profile: route_result.as_ref().and_then(|r| r.strict_profile.clone()),
         agent: agent_name.clone(),
         model: model_name.clone(),
         work_dir: wt.work_dir.clone(),

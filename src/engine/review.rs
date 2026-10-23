@@ -314,6 +314,14 @@ async fn build_review_context(
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<ReviewPhase<ReviewContext>> {
+    if crate::engine::strict_profiles::task_is_strict(&Some(Arc::clone(store)), repo, &task.id.0)
+        .await?
+    {
+        let pin = crate::engine::strict_profiles::review_pin(store, repo, &task.id.0, task).await?;
+        crate::engine::strict_profiles::guard_spawn(Some(&pin), &pin.cli, Some(&pin.model))?;
+        return Err(crate::engine::strict_profiles::GuardError::ProofOnly.into());
+    }
+
     let stored_task = store
         .get_by_external_id(repo, &task.id.0)
         .await
@@ -648,6 +656,7 @@ async fn build_review_context(
         .max(1800);
 
     let invocation = runner::agent::AgentInvocation {
+        strict_profile: None,
         agent: review_agent.clone(),
         model: review_model.clone(),
         work_dir: worktree_path.clone(),
@@ -2629,6 +2638,13 @@ pub(crate) async fn review_and_merge(
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<ReviewDecision> {
+    if crate::engine::strict_profiles::task_is_strict(&Some(Arc::clone(store)), repo, &task.id.0)
+        .await?
+    {
+        let pin = crate::engine::strict_profiles::review_pin(store, repo, &task.id.0, task).await?;
+        crate::engine::strict_profiles::guard_spawn(Some(&pin), &pin.cli, Some(&pin.model))?;
+        return Err(crate::engine::strict_profiles::GuardError::ProofOnly.into());
+    }
     set_review_session_expected(store, repo, &task.id.0, true).await;
 
     let ctx = match build_review_context(task, repo, router, task_manager, store).await? {
@@ -3519,6 +3535,7 @@ mod tests {
             review_attempt_dir: work_dir.to_path_buf(),
             output_file: work_dir.join("output.txt"),
             invocation: runner::agent::AgentInvocation {
+                strict_profile: None,
                 agent: agent.to_string(),
                 model: Some(model.to_string()),
                 work_dir: work_dir.to_path_buf(),

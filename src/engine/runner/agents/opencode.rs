@@ -441,42 +441,10 @@ fn opencode_error_text(event: &serde_json::Value) -> String {
     }
 }
 
-impl AgentRunner for OpenCodeRunner {
-    #[cfg(test)]
-    fn name(&self) -> &str {
-        "opencode"
-    }
-
-    fn stream_events(&self, event: &serde_json::Value) -> Vec<StreamEvent> {
-        stream_events(event)
-    }
-
-    fn router_transcript(&self) -> super::RouterTranscript {
-        super::RouterTranscript::OpenCode
-    }
-
-    fn extract_text(&self, raw: &str) -> Result<String, AgentError> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return Ok(String::new());
-        }
-
-        let events = super::parse_ndjson(trimmed);
-        if events.is_empty() {
-            return Ok(trimmed.to_string());
-        }
-
-        // Propagate terminal errors so the review pipeline records cooldowns.
-        if let Some(err) = self.detect_error(&events) {
-            return Err(err);
-        }
-
-        // Concatenate all text events; fall back to raw output if none found.
-        Ok(extract_ndjson_text(&events).unwrap_or_else(|| trimmed.to_string()))
-    }
-
-    fn build_command(
+impl OpenCodeRunner {
+    fn build_command_inner(
         &self,
+        profile: Option<&crate::engine::strict_profiles::ProfilePin>,
         model: Option<&str>,
         timeout_cmd: &str,
         sys_file: &str,
@@ -485,7 +453,20 @@ impl AgentRunner for OpenCodeRunner {
     ) -> String {
         // Support optional variant suffix on opencode model identifiers:
         // provider/model[@variant]
-        let (model_flag, variant_flag) = if let Some(m) = model {
+        let (model_flag, variant_flag) = if let Some(pin) = profile {
+            // Profile dimensions are already separate. Never reparse an effort
+            // string as part of the legacy provider/model@variant syntax.
+            (
+                format!(
+                    "--model {}",
+                    super::shell_single_quote(&format!("{}/{}", pin.cli_provider, pin.model))
+                ),
+                Some(format!(
+                    "--variant {}",
+                    super::shell_single_quote(&pin.effort)
+                )),
+            )
+        } else if let Some(m) = model {
             let (base, variant) = Self::split_model_variant(m);
             let mf = format!("--model {}", super::shell_single_quote(base));
             let vf = variant.map(|v| format!("--variant {}", super::shell_single_quote(v)));
@@ -528,6 +509,71 @@ impl AgentRunner for OpenCodeRunner {
             variant_part = variant_part,
             skip_perms = skip_perms,
         )
+    }
+}
+
+impl AgentRunner for OpenCodeRunner {
+    #[cfg(test)]
+    fn name(&self) -> &str {
+        "opencode"
+    }
+
+    fn stream_events(&self, event: &serde_json::Value) -> Vec<StreamEvent> {
+        stream_events(event)
+    }
+
+    fn router_transcript(&self) -> super::RouterTranscript {
+        super::RouterTranscript::OpenCode
+    }
+
+    fn extract_text(&self, raw: &str) -> Result<String, AgentError> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(String::new());
+        }
+
+        let events = super::parse_ndjson(trimmed);
+        if events.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+
+        // Propagate terminal errors so the review pipeline records cooldowns.
+        if let Some(err) = self.detect_error(&events) {
+            return Err(err);
+        }
+
+        // Concatenate all text events; fall back to raw output if none found.
+        Ok(extract_ndjson_text(&events).unwrap_or_else(|| trimmed.to_string()))
+    }
+
+    fn build_profile_command(
+        &self,
+        pin: &crate::engine::strict_profiles::ProfilePin,
+        timeout_cmd: &str,
+        sys_file: &str,
+        msg_file: &str,
+        permissions: &PermissionRules,
+    ) -> anyhow::Result<String> {
+        anyhow::ensure!(pin.cli == "opencode", "strict backend mismatch");
+        Ok(self.build_command_inner(
+            Some(pin),
+            Some(&pin.model),
+            timeout_cmd,
+            sys_file,
+            msg_file,
+            permissions,
+        ))
+    }
+
+    fn build_command(
+        &self,
+        model: Option<&str>,
+        timeout_cmd: &str,
+        sys_file: &str,
+        msg_file: &str,
+        permissions: &PermissionRules,
+    ) -> String {
+        self.build_command_inner(None, model, timeout_cmd, sys_file, msg_file, permissions)
     }
 
     fn parse_response(&self, raw: &str) -> Result<ParsedResponse, AgentError> {

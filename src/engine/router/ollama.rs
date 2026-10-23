@@ -173,6 +173,7 @@ impl OllamaRouter {
         }
 
         Ok(RouteResult {
+            strict_profile: None,
             agent,
             model,
             complexity,

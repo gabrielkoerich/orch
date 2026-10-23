@@ -86,6 +86,8 @@ use llm::{LlmRouter, TIMEOUT_PREFIX};
 /// Result of routing a task to an agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RouteResult {
+    #[serde(default)]
+    pub strict_profile: Option<crate::engine::strict_profiles::ProfilePin>,
     /// The selected agent: "claude", "codex", or "opencode"
     pub agent: String,
     /// Optional model suggestion, e.g., "claude-sonnet-4-6", "claude-opus-4-6", "o3"
@@ -143,6 +145,7 @@ impl RouteResult {
     ) -> Self {
         let model = config.model_for_complexity(&agent, &complexity, task_id);
         Self {
+            strict_profile: None,
             agent,
             model,
             complexity,
@@ -682,6 +685,63 @@ impl Router {
         store: &std::sync::Arc<TaskStore>,
         repo: &str,
     ) -> anyhow::Result<RouteResult> {
+        use crate::engine::strict_profiles as strict;
+        let existing_pin = strict::stored_pin(store, repo, &task.id.0).await?;
+        if let Some((policy, worker_host)) = strict::load()? {
+            let pin = policy.resolve(task, repo, &worker_host)?;
+            if existing_pin
+                .as_ref()
+                .is_some_and(|existing| existing != &pin)
+            {
+                return Err(strict::GuardError::PinMismatch.into());
+            }
+            if let Some(stored) = store.get_by_external_id(repo, &task.id.0).await? {
+                let cached = strict::cached_task_snapshot(&stored);
+                if policy.resolve(&cached, repo, &worker_host)? != pin {
+                    return Err(strict::GuardError::PinMismatch.into());
+                }
+                if existing_pin.is_some() {
+                    pin.check_selection(stored.agent.as_deref(), stored.model.as_deref())?;
+                }
+                // Existing generic failover routes cannot override a persona, even
+                // on first admission. Missing fields are allowed only before pinning.
+                if stored
+                    .agent
+                    .as_ref()
+                    .is_some_and(|a| !a.is_empty() && a != &pin.cli)
+                    || stored
+                        .model
+                        .as_ref()
+                        .is_some_and(|m| !m.is_empty() && m != &pin.model)
+                {
+                    return Err(strict::GuardError::PinMismatch.into());
+                }
+            }
+            anyhow::ensure!(
+                self.available_agents.contains(&pin.cli),
+                "strict CLI unavailable; no fallback"
+            );
+            anyhow::ensure!(
+                !is_agent_in_cooldown(&pin.cli) && !is_model_in_cooldown(&pin.cli, &pin.model),
+                "strict profile is cooling down; no fallback"
+            );
+            return Ok(RouteResult {
+                agent: pin.cli.clone(),
+                model: Some(pin.model.clone()),
+                complexity: strategies::extract_complexity_from_labels(&task.labels),
+                estimate: 0,
+                reason: format!("strict persona: {}", pin.persona),
+                profile: AgentProfile::default(),
+                selected_skills: vec![],
+                warning: None,
+                strict_profile: Some(pin),
+            });
+        }
+        anyhow::ensure!(
+            existing_pin.is_none(),
+            "strict pin exists but strict policy is absent"
+        );
+
         // NOTE: refresh_health() is called once per tick in tick_route_tasks()
         // before the routing loop, not per-task. Do not re-add it here.
 
@@ -938,6 +998,7 @@ impl Router {
 
                         self.set_route_attempts(&task.id.0, 0, store, repo).await;
                         let result = RouteResult {
+                            strict_profile: None,
                             agent: fallback_agent.clone(),
                             model: fallback_model,
                             complexity: result.complexity.clone(),
@@ -1026,6 +1087,7 @@ impl Router {
                         };
 
                         let result = RouteResult {
+                            strict_profile: None,
                             agent: fallback_agent.clone(),
                             model: fallback_model,
                             complexity: result.complexity.clone(),
@@ -1449,6 +1511,17 @@ impl Router {
         store: &std::sync::Arc<TaskStore>,
         repo: &str,
     ) -> anyhow::Result<()> {
+        if result.strict_profile.is_some() {
+            return crate::engine::strict_profiles::persist_route(store, repo, task_id, result)
+                .await;
+        }
+        anyhow::ensure!(
+            !crate::engine::strict_profiles::configured()
+                && crate::engine::strict_profiles::stored_pin(store, repo, task_id)
+                    .await?
+                    .is_none(),
+            "strict route pin required"
+        );
         if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
             store
                 .set_fields(
@@ -1483,6 +1556,34 @@ pub async fn get_route_result(
             RouteResultError::Other(anyhow::anyhow!("task {task_id} not found in store"))
         })?;
     let task = store.get(store_id).await.map_err(RouteResultError::Other)?;
+    let pin = crate::engine::strict_profiles::stored_pin(store, repo, task_id).await?;
+    if crate::engine::strict_profiles::configured() || pin.is_some() {
+        let pin = pin.ok_or_else(|| anyhow::anyhow!("strict route is missing immutable pin"))?;
+        let (policy, host) = crate::engine::strict_profiles::load()?
+            .ok_or_else(|| anyhow::anyhow!("strict policy missing for persisted pin"))?;
+        let external = crate::engine::strict_profiles::cached_task_snapshot(&task);
+        let current = policy
+            .resolve(&external, repo, &host)
+            .map_err(anyhow::Error::from)?;
+        if pin != current {
+            return Err(
+                anyhow::anyhow!("strict registry or labels differ from persisted pin").into(),
+            );
+        }
+        pin.check_selection(task.agent.as_deref(), task.model.as_deref())
+            .map_err(anyhow::Error::from)?;
+        return Ok(RouteResult {
+            agent: pin.cli.clone(),
+            model: Some(pin.model.clone()),
+            complexity: task.complexity.clone(),
+            estimate: 0,
+            reason: task.route_reason.clone(),
+            profile: AgentProfile::default(),
+            selected_skills: vec![],
+            warning: None,
+            strict_profile: Some(pin),
+        });
+    }
 
     let agent = task
         .agent
@@ -1551,6 +1652,7 @@ pub async fn get_route_result(
     }
 
     Ok(RouteResult {
+        strict_profile: None,
         agent,
         model,
         complexity,
@@ -1690,6 +1792,7 @@ mod tests {
     #[test]
     fn route_result_serialization() {
         let result = RouteResult {
+            strict_profile: None,
             agent: "claude".to_string(),
             model: Some("sonnet".to_string()),
             complexity: "medium".to_string(),

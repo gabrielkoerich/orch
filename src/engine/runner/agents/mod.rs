@@ -852,6 +852,19 @@ pub trait AgentRunner: Send + Sync {
         permissions: &PermissionRules,
     ) -> String;
 
+    /// Explicit persona command construction. Unsupported backends fail closed.
+    /// This pure builder does not authorize or start a process.
+    fn build_profile_command(
+        &self,
+        _pin: &crate::engine::strict_profiles::ProfilePin,
+        _timeout_cmd: &str,
+        _sys_file: &str,
+        _msg_file: &str,
+        _permissions: &PermissionRules,
+    ) -> anyhow::Result<String> {
+        anyhow::bail!("strict profile CLI unsupported")
+    }
+
     /// Parse raw stdout into a ParsedResponse.
     ///
     /// Returns `Ok(ParsedResponse)` on success, `Err(AgentError)` if the

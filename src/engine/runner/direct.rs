@@ -102,6 +102,7 @@ pub async fn run_direct_with_session(
     work_dir: &str,
     session: Option<SessionContinuation<'_>>,
 ) -> Result<DirectResult> {
+    crate::engine::strict_profiles::guard_unpinned_path()?;
     let sys_file = format!("{work_dir}/system.md");
     let msg_file = format!("{work_dir}/message.txt");
 
@@ -166,6 +167,11 @@ pub async fn run_direct_command_raw(
     cmd: &mut tokio::process::Command,
     timeout: Duration,
 ) -> std::result::Result<String, DirectCommandError> {
+    crate::engine::strict_profiles::guard_unpinned_path().map_err(|e| {
+        DirectCommandError::Spawn {
+            message: e.to_string(),
+        }
+    })?;
     cmd.kill_on_drop(true);
     let output = tokio::time::timeout(timeout + Duration::from_secs(5), cmd.output())
         .await
@@ -237,6 +243,7 @@ async fn run_shell_command(
     timeout: Duration,
     agent: &str,
 ) -> Result<DirectResult> {
+    crate::engine::strict_profiles::guard_unpinned_path()?;
     let mut cmd = tokio::process::Command::new("bash");
     cmd.arg("-c")
         .arg(shell_cmd)
