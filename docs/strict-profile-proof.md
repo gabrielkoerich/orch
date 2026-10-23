@@ -2,6 +2,14 @@
 
 This is experimental groundwork for an opt-in named-persona policy. It is **not a deployable worker mode**. The service refuses to start with the experimental option set, and strict task execution, direct calls, review and fallback all fail closed. `worker_execution_enabled: true` is rejected. Do not enable this option on a running installation.
 
+## Scope and review acceptance
+
+This change is independently reviewable as an **offline foundation**: immutable executor/reviewer assignments, native argument construction, local transactional persistence, revocation checks and unconditional process guards. Review acceptance covers those behaviors and compatibility with ordinary unpinned routing. It does not establish live worker safety or enable execution.
+
+The complete named-profile feature remains open in [the original request](https://github.com/gabrielkoerich/orch/issues/3720). [Runtime acceptance before enabling workers](https://github.com/gabrielkoerich/orch/issues/3730) tracks the remaining identity, spawn authorization, capability, fenced lease, reset and recovery work. Its shared-authority decision must align with [the existing cluster decision](https://github.com/gabrielkoerich/orch/issues/3728); this proof introduces no transport, service or new dependency to make that choice implicitly.
+
+Passing the offline checks or marking this patch ready for review leaves every strict execution guard in place. Runtime enablement requires a separate implementation and acceptance of the follow-up issue.
+
 A persona such as `agent:designer` identifies a complete route: worker host, CLI, source provider, explicit CLI-provider binding, model and reasoning effort. The profile must be enabled, current, allow the repository, and disable fallback. Admission requires an open task with exactly `execution:ready`; `execution:held` always wins. Control label namespaces and revocations are matched without ASCII case sensitivity, as GitHub label names are; persona identifiers retain their configured spelling. `no-agent`, done and archived labels block admission. Unknown policy fields are rejected instead of ignoring security-setting typos. Unknown personas, ambiguous labels, missing dimensions, unavailable capabilities and aliases absent from the supplied capability map are rejected.
 
 The capability map is an operator-supplied input in this proof. It does not authenticate a host, discover live CLI/account capabilities, or establish that a provider accepts a particular model or effort. No model inference is performed by the tests.
