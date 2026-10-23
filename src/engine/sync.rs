@@ -1973,6 +1973,12 @@ pub(crate) async fn sync_tick(
         if let Err(e) = ingest_external_tasks(backend, repo, store).await {
             tracing::debug!(err = %e, "external task ingest failed");
         }
+        // Reconcile existing board members too: labels can change without a
+        // local task transition, and a human/automation may move a card. The
+        // backend only writes drifted fields through the shared GitHub client.
+        if let Err(e) = backend.reconcile_project_statuses().await {
+            tracing::warn!(err = %e, "project status reconciliation failed");
+        }
     }
 
     // 1. Cleanup worktrees for done tasks (background — must not block routing/dispatch)
@@ -3500,6 +3506,7 @@ mod tests {
         comments: tokio::sync::Mutex<Vec<(String, String)>>,
         status_updates: tokio::sync::Mutex<Vec<(String, Status)>>,
         project_syncs: tokio::sync::Mutex<Vec<(String, Status)>>,
+        project_reconciliations: std::sync::atomic::AtomicUsize,
         /// Records the `since` argument of every `list_active_open_issues` call, so tests
         /// can assert whether a fetch was time-bounded or unbounded.
         since_calls: tokio::sync::Mutex<Vec<Option<String>>>,
@@ -3529,6 +3536,7 @@ mod tests {
                 comments: tokio::sync::Mutex::new(Vec::new()),
                 status_updates: tokio::sync::Mutex::new(Vec::new()),
                 project_syncs: tokio::sync::Mutex::new(Vec::new()),
+                project_reconciliations: std::sync::atomic::AtomicUsize::new(0),
                 since_calls: tokio::sync::Mutex::new(Vec::new()),
             })
         }
@@ -3623,6 +3631,12 @@ mod tests {
         ) -> anyhow::Result<Option<String>> {
             self.project_syncs.lock().await.push((id.0.clone(), status));
             Ok(None) // Mock doesn't have real node IDs.
+        }
+
+        async fn reconcile_project_statuses(&self) -> anyhow::Result<()> {
+            self.project_reconciliations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
         }
     }
 
@@ -4326,6 +4340,47 @@ mod tests {
              spawned review task panics — without DispatchGuard the key leaks and \
              the task gets stuck in a permanent review loop"
         );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn sync_tick_reconciles_board_without_ingesting_or_transitioning_tasks() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let mock = IngestMockBackend::with_tasks(vec![]);
+        let backend: Arc<dyn ExternalBackend> = mock.clone();
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let dispatching = Arc::new(DashMap::new());
+        sync_tick(
+            &backend,
+            &Arc::new(TmuxManager::new()),
+            "owner/repo",
+            &EngineConfig::default(),
+            &Arc::new(RwLock::new(crate::engine::router::Router::from_config())),
+            &task_manager,
+            &store,
+            &dispatching,
+            &Arc::new(DashSet::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mock.project_reconciliations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert!(mock.project_syncs.lock().await.is_empty());
+        assert!(mock.status_updates.lock().await.is_empty());
+        assert!(dispatching.is_empty());
+        assert!(store
+            .existing_external_ids("owner/repo")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// An InReview task with no tmux session should be reset to NeedsReview

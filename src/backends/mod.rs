@@ -324,6 +324,13 @@ pub trait ExternalBackend: Send + Sync {
         Ok(None)
     }
 
+    /// Repair project display state from authoritative external labels.
+    /// Called by periodic and webhook-triggered sync, independent of ingestion.
+    /// Does not transition tasks or dispatch agents. Default is a no-op.
+    async fn reconcile_project_statuses(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Sync a task's estimate to the project board Estimate field.
     ///
     /// Called after the router assigns an estimate to a task (via `store_route`).
@@ -611,6 +618,18 @@ mod tests {
             labels.contains(&"maintenance".to_string()),
             "other label preserved: {labels:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_transition_preserves_board_label_and_no_agent_hold() {
+        let backend = MockBackend::with_labels(vec!["status:new", "board:held", "no-agent"]);
+        backend
+            .update_status(&ExternalId("1".into()), Status::Routed)
+            .await
+            .unwrap();
+        let mut labels = backend.current_labels();
+        labels.sort();
+        assert_eq!(labels, vec!["board:held", "no-agent", "status:routed"]);
     }
 
     #[tokio::test]
