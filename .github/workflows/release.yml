@@ -259,6 +259,8 @@ jobs:
   build-macos:
     needs: [check-release]
     if: github.ref == 'refs/heads/main'
+    # The signing secrets live in this environment, which only main can use
+    environment: macos-signing
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
