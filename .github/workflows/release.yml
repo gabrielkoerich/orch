@@ -288,6 +288,49 @@ jobs:
           cp target/aarch64-apple-darwin/release/orch dist/orch-arm64
           chmod +x dist/orch-arm64
 
+      # One stable signature keeps the Keychain's trust in the binary across upgrades, and
+      # notarization lets Gatekeeper open it on any Mac. A bare binary cannot be stapled, so Gatekeeper checks online
+      - name: Sign and notarize
+        if: runner.os == 'macOS' && needs.check-release.outputs.skip == 'false'
+        env:
+          P12: ${{ secrets.MACOS_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_P12_PASSWORD }}
+          NOTARY_KEY: ${{ secrets.NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+          BIN: dist/orch-arm64
+        run: |
+          for name in P12 P12_PASSWORD NOTARY_KEY NOTARY_KEY_ID NOTARY_ISSUER_ID; do
+            if [ -z "$(printenv "$name")" ]; then
+              echo "::error::secret for $name is not set, a macOS release must be signed"
+              exit 1
+            fi
+          done
+
+          # Absolute paths, since an earlier step can prepend to PATH through $GITHUB_PATH
+          umask 077
+          dir="$(/usr/bin/mktemp -d)"
+          keychain="$dir/sign.keychain-db"
+          trap '/usr/bin/security delete-keychain "$keychain" 2>/dev/null; /bin/rm -rf "$dir"' EXIT
+          pass="$(/usr/bin/uuidgen)"
+          /usr/bin/security create-keychain -p "$pass" "$keychain"
+          /usr/bin/security set-keychain-settings -lut 900 "$keychain"
+          /usr/bin/security unlock-keychain -p "$pass" "$keychain"
+          printf '%s' "$P12" | /usr/bin/base64 --decode > "$dir/id.p12"
+          /usr/bin/security import "$dir/id.p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          /bin/rm -f "$dir/id.p12"
+          /usr/bin/security set-key-partition-list -S apple-tool:,apple: -s -k "$pass" "$keychain" > /dev/null
+          /usr/bin/security list-keychains -d user -s "$keychain"
+
+          /usr/bin/codesign --force --options runtime --timestamp --identifier com.gabrielkoerich.orch \
+            --sign "Developer ID Application: Gabriel Koerich (ZEY9Z684DK)" --keychain "$keychain" "$BIN"
+          /usr/bin/codesign --verify --strict --verbose=2 "$BIN"
+
+          printf '%s' "$NOTARY_KEY" > "$dir/notary.p8"
+          /usr/bin/ditto -c -k --keepParent "$BIN" "$dir/orch.zip"
+          /usr/bin/xcrun notarytool submit "$dir/orch.zip" --key "$dir/notary.p8" \
+            --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" --wait --timeout 30m
+
       - name: Upload arm64 binary
         if: needs.check-release.outputs.skip == 'false'
         uses: actions/upload-artifact@v4
