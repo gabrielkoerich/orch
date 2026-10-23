@@ -3,6 +3,7 @@ name: CI
 # Push only, never pull_request, read "CI does not run on PRs" in AGENTS.md before changing this
 on:
   push:
+    branches: [main]
   workflow_dispatch: {}
 
 permissions:

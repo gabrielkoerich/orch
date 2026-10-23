@@ -492,7 +492,7 @@ External-contributor PRs (forks, first-time contributors, anyone outside the tru
 
 Do not add `pull_request:` back, not even to get GitHub's "Approve and run" button for first-time contributors. Commit `4cb7b176` did that and was undone for these reasons:
 
-- Orch's PRs come from branches in this repo. The `push:` run on the branch already reports the required checks (`check`, `test`, `secrets`) on the head commit, so the PR shows them without a PR trigger.
+- Orch's PRs come from branches in this repo. `release.yml` runs on pushes to `main` only. On a branch, shipcheck runs its `check`, `test` and `secrets` jobs from `shipcheck.toml` on the author's machine and posts `shipcheck/check`, `shipcheck/test` and `shipcheck/secrets` on the head commit, so the PR shows them without a PR trigger.
 - With both triggers, every push to a PR branch starts two CI runs. They share one concurrency group with `cancel-in-progress`, so the PR run cancels the push run and the Actions list fills with cancelled runs.
 - The duplicate runs double the macOS jobs. GitHub limits concurrent macOS runners per account, so extra macOS jobs queue and get dropped.
 - Fork PRs are rare and go through `just review-pr`. The owner can merge them without the checks.
@@ -543,3 +543,14 @@ Agent invocations run one-shot via `bash -c` with a 45 s timeout, not in tmux.
 5. **Clean up** - Clear stashes, prune remote branches
 6. **Verify** - All changes committed
 7. **Hand off** - Provide context for next session
+
+<!-- shipcheck:start v2 -->
+## Tests and commits
+
+- Do not run the test commands (`pytest`, `cargo test`, `npm test`, `go test`, `just test` and the like). Run `shipcheck run`. It runs this repository's CI on your working copy, and its result is the PR's required check.
+- Commit with `shipcheck commit -m "<subject>"`, never `git commit`. It commits every file, exactly the tree that passed.
+- Work in small steps: one change, `shipcheck run`, `shipcheck commit`. Delete scratch files first, because every file is committed.
+- Exit 1: read `shipcheck logs`, fix, then `shipcheck run --job <id>` for the failed job as often as needed. A partial run is never the check, so finish with one full `shipcheck run`, then `shipcheck commit`. Exit 2: shipcheck could not run, so run `shipcheck doctor` and follow it.
+- If `shipcheck` is not on PATH, run the project's tests and commit with git.
+- Never edit `.github/workflows/` or `shipcheck.toml` to get a pass. Details: https://shipcheck.run/llms.txt
+<!-- shipcheck:end -->
