@@ -119,6 +119,11 @@ enum MergeFailureClass {
 
 fn classify_merge_failure(error: &str) -> MergeFailureClass {
     let err_msg = error.to_ascii_lowercase();
+    // Merge sent a head sha. GitHub says this when that commit is no longer
+    // the PR head. Rebasing and force-pushing would drop the new commits.
+    if err_msg.contains("head branch was modified") || err_msg.contains("sha does not match") {
+        return MergeFailureClass::Transient;
+    }
     let is_conflict = err_msg.contains("405")
         || err_msg.contains("not mergeable")
         || err_msg.contains("merge conflict")
@@ -156,6 +161,9 @@ async fn attempt_worktree_rebase_and_force_push(
     tracing::info!(task_id, worktree = %wt, "attempting automatic rebase recovery");
 
     let default_branch = worktree::detect_default_branch(&wt_path).await;
+    let branch = git_ops::get_current_branch(&wt_path).await;
+    // Lease the feature-branch tip before fetch moves the tracking ref
+    git_ops::record_push_lease(&wt_path, &branch).await;
     let git_timeout = std::time::Duration::from_secs(120);
     let fetch_result = tokio::time::timeout(
         git_timeout,
@@ -205,33 +213,20 @@ async fn attempt_worktree_rebase_and_force_push(
 
     match rebase_result {
         Ok(git_ops::RebaseOutcome::Succeeded) => {
-            let push_result = tokio::time::timeout(
-                git_timeout,
-                tokio::process::Command::new("git")
-                    // lfs.locksverify=false skips the auxiliary LFS locks/verify
-                    // roundtrip; a transient timeout there must not fail the push
-                    .args(["-c", "lfs.locksverify=false", "push", "--force-with-lease"])
-                    .current_dir(&wt_path)
-                    .kill_on_drop(true)
-                    .output(),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                tracing::warn!(
-                    task_id,
-                    "git push timed out in rebase recovery after {}s",
-                    git_timeout.as_secs()
-                );
-                Err(std::io::Error::other("git push timed out"))
-            });
+            let push_result =
+                tokio::time::timeout(git_timeout, git_ops::force_push_leased(&wt_path, &branch))
+                    .await
+                    .unwrap_or_else(|_| {
+                        tracing::warn!(
+                            task_id,
+                            "git push timed out in rebase recovery after {}s",
+                            git_timeout.as_secs()
+                        );
+                        Err(anyhow::anyhow!("git push timed out"))
+                    });
 
             match push_result {
-                Ok(push_out) if push_out.status.success() => {
-                    WorktreeRebaseOutcome::RebasedAndPushed
-                }
-                Ok(push_out) => WorktreeRebaseOutcome::PushFailed(
-                    String::from_utf8_lossy(&push_out.stderr).trim().to_string(),
-                ),
+                Ok(()) => WorktreeRebaseOutcome::RebasedAndPushed,
                 Err(push_err) => WorktreeRebaseOutcome::PushFailed(push_err.to_string()),
             }
         }
@@ -1558,7 +1553,7 @@ pub(crate) async fn auto_merge_pr(
     );
 
     // 6. Merge via gh CLI
-    if let Err(e) = gh.merge_pr(repo, pr_number, true).await {
+    if let Err(e) = gh.merge_pr(repo, pr_number, true, &head_sha).await {
         let merge_error = e.to_string();
         match classify_merge_failure(&merge_error) {
             MergeFailureClass::Transient => {
@@ -2722,6 +2717,16 @@ mod tests {
         assert_eq!(
             classify_merge_failure(error),
             MergeFailureClass::RecoverableConflict
+        );
+    }
+
+    #[test]
+    fn classify_merge_failure_treats_moved_head_as_transient() {
+        let error = r#"GitHub PR merge failed (409 Conflict): {"message":"Head branch was modified. Review and try the merge again."}"#;
+        assert_eq!(classify_merge_failure(error), MergeFailureClass::Transient);
+        assert_eq!(
+            classify_merge_failure("GitHub PR merge failed (409 Conflict): sha does not match"),
+            MergeFailureClass::Transient
         );
     }
 
