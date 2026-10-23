@@ -1,0 +1,11 @@
+# Checks run natively on this machine in an OS sandbox, each in its own clone of the tree
+# (https://shipcheck.run/docs/config/#modes). Detected from release.yml, then fixed by hand
+runner = "host"
+
+[host]
+versions = ["rustc +1.94.1 --version", "cargo +1.94.1 --version", "cargo nextest --version", "gitleaks version"]
+
+[host.checks]
+check = '''! grep -n 'SELECT \*' src/store/*.rs | grep -vE ':[0-9]+:\s*(//|///|//!|#|\*)' | grep -v 'COLUMN_COLS' && cargo +1.94.1 fmt -- --check && cargo +1.94.1 clippy --all-targets -- -D warnings'''
+test = "ORCH_COW_EXPECT_CLONE=1 cargo +1.94.1 nextest run"
+secrets = "gitleaks dir --config .gitleaks.toml --redact ."
