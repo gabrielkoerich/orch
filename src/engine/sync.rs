@@ -1975,7 +1975,7 @@ pub(crate) async fn sync_tick(
         }
         // Reconcile existing board members too: labels can change without a
         // local task transition, and a human/automation may move a card. The
-        // backend only writes drifted fields and bounds writes per sync.
+        // backend only writes drifted fields through the shared GitHub client.
         if let Err(e) = backend.reconcile_project_statuses().await {
             tracing::warn!(err = %e, "project status reconciliation failed");
         }

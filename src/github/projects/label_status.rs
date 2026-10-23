@@ -8,21 +8,19 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LabelSyncConfig {
     #[serde(default)]
     enabled: bool,
-    #[serde(default = "default_max_updates")]
-    max_updates_per_sync: usize,
     #[serde(default)]
     projects: Vec<BoardConfig>,
 }
 
-fn default_max_updates() -> usize {
-    5
+fn default_label_prefix() -> String {
+    "board:".into()
 }
 
 fn default_field_name() -> String {
@@ -36,7 +34,9 @@ struct BoardConfig {
     project_id: String,
     #[serde(default = "default_field_name")]
     field_name: String,
-    /// Exact status label -> exact single-select option name on this board.
+    #[serde(default = "default_label_prefix")]
+    label_prefix: String,
+    /// Exact board label -> exact single-select option name on this board.
     options: BTreeMap<String, String>,
 }
 
@@ -60,9 +60,6 @@ impl LabelSyncConfig {
         if !config.enabled {
             return Ok(config);
         }
-        if !(1..=100).contains(&config.max_updates_per_sync) {
-            bail!("project label sync max_updates_per_sync must be 1..=100");
-        }
         let mut boards = HashSet::new();
         for board in &config.projects {
             if board.repo.split('/').count() != 2
@@ -79,13 +76,23 @@ impl LabelSyncConfig {
             if !boards.insert((board.repo.to_lowercase(), board.project_id.clone())) {
                 bail!("duplicate project label sync configuration for the same repo and board");
             }
+            let prefix = board.label_prefix.to_ascii_lowercase();
+            if prefix.len() < 2
+                || !prefix.ends_with(':')
+                || prefix.chars().any(char::is_whitespace)
+                || ["status:", "source-status:", "execution:"]
+                    .iter()
+                    .any(|reserved| prefix.starts_with(reserved))
+            {
+                bail!("project label sync label_prefix must be a distinct namespace ending in ':' (default board:)");
+            }
             for (label, option) in &board.options {
-                if !label.starts_with("status:")
-                    || label.len() == "status:".len()
+                if !label.starts_with(&board.label_prefix)
+                    || label.len() == board.label_prefix.len()
                     || label.trim() != label
                     || option.trim().is_empty()
                 {
-                    bail!("project label sync options must map status:* labels to option names");
+                    bail!("project label sync options must map labels in label_prefix to option names");
                 }
             }
         }
@@ -110,12 +117,7 @@ impl LabelSyncConfig {
                 .any(|board| board.repo.eq_ignore_ascii_case(repo))
     }
 
-    pub(crate) async fn reconcile(
-        &self,
-        api: &impl ProjectApi,
-        repo: &str,
-        state: &mut LabelSyncState,
-    ) -> Result<usize> {
+    pub(crate) async fn reconcile(&self, api: &impl ProjectApi, repo: &str) -> Result<usize> {
         if !self.enabled {
             return Ok(0);
         }
@@ -125,52 +127,9 @@ impl LabelSyncConfig {
             .iter()
             .filter(|b| b.repo.eq_ignore_ascii_case(repo))
         {
-            updated +=
-                reconcile_board(api, board, self.max_updates_per_sync - updated, state).await?;
-            if updated == self.max_updates_per_sync {
-                break;
-            }
+            updated += reconcile_board(api, board).await?;
         }
         Ok(updated)
-    }
-
-    #[cfg(test)]
-    async fn reconcile_with(&self, api: &impl ProjectApi, repo: &str) -> Result<usize> {
-        self.reconcile(api, repo, &mut LabelSyncState::default())
-            .await
-    }
-}
-
-/// Per-backend safety state: stop repeatedly writing an unacknowledged update.
-/// Every attempt still requires a fresh board read. A different desired option
-/// or an observed matching value clears the item's consecutive failure streak.
-#[derive(Default)]
-pub(crate) struct LabelSyncState {
-    unknown: HashMap<(String, String), (String, usize)>,
-}
-
-impl LabelSyncState {
-    fn may_update(&mut self, project: &str, item: &str, option: &str) -> bool {
-        let entry = self
-            .unknown
-            .entry((project.into(), item.into()))
-            .or_insert_with(|| (option.into(), 0));
-        if entry.0 != option {
-            *entry = (option.into(), 0);
-        }
-        entry.1 < 3
-    }
-
-    fn record_unknown(&mut self, project: &str, item: &str, option: &str) {
-        let entry = self
-            .unknown
-            .entry((project.into(), item.into()))
-            .or_insert_with(|| (option.into(), 0));
-        entry.1 += 1;
-    }
-
-    fn clear(&mut self, project: &str, item: &str) {
-        self.unknown.remove(&(project.into(), item.into()));
     }
 }
 
@@ -182,11 +141,7 @@ pub(crate) trait ProjectApi: Sync {
 #[async_trait]
 impl ProjectApi for GhHttp {
     async fn query(&self, query: &str, variables: Value) -> Result<Value> {
-        let response = if query == UPDATE_STATUS {
-            self.graphql_with_vars_once(query, variables).await?
-        } else {
-            self.graphql_with_vars(query, variables).await?
-        };
+        let response = self.graphql_with_vars(query, variables).await?;
         // GhHttp permits partial GraphQL data. A projection must not interpret
         // partial label/field data as an authoritative snapshot.
         check_response(&response)?;
@@ -384,23 +339,17 @@ fn resolve_options(
     Ok((field_id.to_owned(), resolved))
 }
 
-/// Returns only necessary updates. Missing/multiple/unmapped status labels do
+/// Returns only necessary updates. Missing/multiple/unmapped board labels do
 /// not erase an existing field value. Archived items and other repositories
 /// are not mutated; closed issues remain eligible for a display-only update.
-enum ItemStatus<'a> {
-    Skipped,
-    Matching(&'a str),
-    Update(&'a str, &'a str),
-}
-
 fn desired_update<'a>(
     board: &BoardConfig,
     item: &'a Value,
     field_id: &str,
     options: &'a BTreeMap<String, String>,
-) -> Result<ItemStatus<'a>> {
+) -> Result<Option<(&'a str, &'a str)>> {
     if item.get("isArchived").and_then(Value::as_bool) != Some(false) {
-        return Ok(ItemStatus::Skipped);
+        return Ok(None);
     }
     let content = &item["content"];
     if content["__typename"].as_str() != Some("Issue")
@@ -408,7 +357,7 @@ fn desired_update<'a>(
             .as_str()
             .is_some_and(|repo| repo.eq_ignore_ascii_case(&board.repo))
     {
-        return Ok(ItemStatus::Skipped);
+        return Ok(None);
     }
     let item_id = item["id"]
         .as_str()
@@ -423,18 +372,18 @@ fn desired_update<'a>(
     let mut statuses = Vec::new();
     for label in labels {
         let name = label["name"].as_str().context("issue label missing name")?;
-        if name.starts_with("status:") {
+        if name.starts_with(&board.label_prefix) {
             statuses.push(name);
         }
     }
     if statuses.is_empty() {
-        return Ok(ItemStatus::Skipped);
+        return Ok(None);
     }
     if statuses.len() != 1 {
-        bail!("multiple status labels; leaving project item {item_id} unchanged");
+        bail!("multiple board labels; leaving project item {item_id} unchanged");
     }
     let desired = options.get(statuses[0]).with_context(|| {
-        format!("unmapped status label; leaving project item {item_id} unchanged")
+        format!("unmapped board label; leaving project item {item_id} unchanged")
     })?;
     let current = item
         .get("fieldValueByName")
@@ -447,18 +396,13 @@ fn desired_update<'a>(
             .as_str()
             .context("project field value missing option id")?;
         if option_id == desired {
-            return Ok(ItemStatus::Matching(item_id));
+            return Ok(None);
         }
     }
-    Ok(ItemStatus::Update(item_id, desired.as_str()))
+    Ok(Some((item_id, desired.as_str())))
 }
 
-async fn reconcile_board(
-    api: &impl ProjectApi,
-    board: &BoardConfig,
-    limit: usize,
-    state: &mut LabelSyncState,
-) -> Result<usize> {
+async fn reconcile_board(api: &impl ProjectApi, board: &BoardConfig) -> Result<usize> {
     let mut cursor: Option<String> = None;
     let mut seen_cursors = HashSet::new();
     let mut seen_items = HashSet::new();
@@ -521,61 +465,30 @@ async fn reconcile_board(
                     .await?;
             }
             let (item_id, option_id) = match desired_update(board, &item, &field_id, &options) {
-                Ok(ItemStatus::Update(item_id, option_id)) => (item_id, option_id),
-                Ok(ItemStatus::Matching(item_id)) => {
-                    state.clear(&board.project_id, item_id);
-                    continue;
-                }
-                Ok(ItemStatus::Skipped) => continue,
+                Ok(Some(update)) => update,
+                Ok(None) => continue,
                 Err(error) => {
-                    tracing::warn!(%error, "project label status skipped");
+                    tracing::debug!(%error, "project label status skipped");
                     continue;
                 }
             };
-            if !state.may_update(&board.project_id, item_id, option_id) {
-                tracing::warn!(item_id, "project status update suspended after three unknown outcomes; awaiting observed change or operator restart");
-                continue;
-            }
             if !seen_items.insert(item_id.to_owned()) {
                 continue;
             }
+            // Selecting the same option is idempotent. Use the shared client's
+            // normal retry, rate tracking, backoff and circuit breaker behavior.
             let result = api.query(UPDATE_STATUS, json!({
                 "project": board.project_id, "item": item_id, "field": field_id, "option": option_id,
-            })).await.and_then(|result| {
-                check_response(&result)?;
-                Ok(result)
-            });
-            let result = match result {
-                Ok(result) => result,
-                Err(error) => {
-                    // Timeouts, malformed JSON and GraphQL errors may arrive
-                    // after a write reached GitHub. Count every attempted but
-                    // unacknowledged mutation, never a failed read.
-                    if error
-                        .downcast_ref::<super::super::http::RequestNotSent>()
-                        .is_none()
-                    {
-                        state.record_unknown(&board.project_id, item_id, option_id);
-                    }
-                    return Err(error.context(
-                        "project status update not acknowledged; reconciliation required",
-                    ));
-                }
-            };
+            })).await?;
+            check_response(&result)?;
             if result
                 .pointer("/data/updateProjectV2ItemFieldValue/projectV2Item/id")
                 .and_then(Value::as_str)
                 != Some(item_id)
             {
-                // Unknown outcome: stop, then read fresh state on the next sync.
-                state.record_unknown(&board.project_id, item_id, option_id);
                 bail!("project status update was not acknowledged; reconciliation required");
             }
-            state.clear(&board.project_id, item_id);
             updated += 1;
-            if updated == limit {
-                return Ok(updated);
-            }
         }
         if !has_next {
             return Ok(updated);
@@ -638,14 +551,13 @@ mod tests {
         LabelSyncConfig::parse(
             r#"
 enabled: true
-max_updates_per_sync: 20
 projects:
   - repo: example/work
     project_id: PVT_A
     options:
-      status:todo: Todo
-      status:held: Held
-      status:done: Done
+      board:todo: Todo
+      board:held: Held
+      board:done: Done
 "#,
         )
         .unwrap()
@@ -685,10 +597,16 @@ projects:
                 vec![
                     item(
                         "ONE",
-                        &["status:todo", "execution:held", "source-status:done"],
+                        &[
+                            "board:todo",
+                            "status:new",
+                            "no-agent",
+                            "execution:held",
+                            "source-status:done",
+                        ],
                         None,
                     ),
-                    item("TWO", &["status:held"], Some("TODO_A")),
+                    item("TWO", &["board:held"], Some("TODO_A")),
                 ],
                 None,
             ),
@@ -696,21 +614,15 @@ projects:
             ack("TWO"),
             page(
                 vec![
-                    item("ONE", &["status:todo", "execution:held"], Some("TODO_A")),
-                    item("TWO", &["status:held"], Some("HELD_A")),
+                    item("ONE", &["board:todo", "execution:held"], Some("TODO_A")),
+                    item("TWO", &["board:held"], Some("HELD_A")),
                 ],
                 None,
             ),
         ]);
         let config = config();
-        assert_eq!(
-            config.reconcile_with(&api, "example/work").await.unwrap(),
-            2
-        );
-        assert_eq!(
-            config.reconcile_with(&api, "example/work").await.unwrap(),
-            0
-        );
+        assert_eq!(config.reconcile(&api, "example/work").await.unwrap(), 2);
+        assert_eq!(config.reconcile(&api, "example/work").await.unwrap(), 0);
         assert_eq!(
             api.mutations(),
             vec![
@@ -730,32 +642,23 @@ projects:
     #[tokio::test]
     async fn label_change_moves_existing_item_without_local_task_transition() {
         let api = FakeApi::new(vec![
-            page(vec![item("ONE", &["status:todo"], Some("TODO_A"))], None),
+            page(vec![item("ONE", &["board:todo"], Some("TODO_A"))], None),
             page(
                 vec![item(
                     "ONE",
-                    &["status:held", "execution:held"],
+                    &["board:held", "execution:held"],
                     Some("TODO_A"),
                 )],
                 None,
             ),
             ack("ONE"),
-            page(vec![item("ONE", &["status:done"], Some("HELD_A"))], None),
+            page(vec![item("ONE", &["board:done"], Some("HELD_A"))], None),
             ack("ONE"),
         ]);
         let config = config();
-        assert_eq!(
-            config.reconcile_with(&api, "example/work").await.unwrap(),
-            0
-        );
-        assert_eq!(
-            config.reconcile_with(&api, "example/work").await.unwrap(),
-            1
-        );
-        assert_eq!(
-            config.reconcile_with(&api, "example/work").await.unwrap(),
-            1
-        );
+        assert_eq!(config.reconcile(&api, "example/work").await.unwrap(), 0);
+        assert_eq!(config.reconcile(&api, "example/work").await.unwrap(), 1);
+        assert_eq!(config.reconcile(&api, "example/work").await.unwrap(), 1);
         assert_eq!(api.mutations()[0]["option"], "HELD_A");
         assert_eq!(api.mutations()[1]["option"], "DONE_A");
     }
@@ -763,21 +666,18 @@ projects:
     #[tokio::test]
     async fn traverses_pages_and_does_not_write_duplicate_item() {
         let api = FakeApi::new(vec![
-            page(vec![item("ONE", &["status:held"], None)], Some("PAGE2")),
+            page(vec![item("ONE", &["board:held"], None)], Some("PAGE2")),
             ack("ONE"),
             page(
                 vec![
-                    item("ONE", &["status:held"], None),
-                    item("TWO", &["status:todo"], None),
+                    item("ONE", &["board:held"], None),
+                    item("TWO", &["board:todo"], None),
                 ],
                 None,
             ),
             ack("TWO"),
         ]);
-        assert_eq!(
-            config().reconcile_with(&api, "example/work").await.unwrap(),
-            2
-        );
+        assert_eq!(config().reconcile(&api, "example/work").await.unwrap(), 2);
         let calls = api.calls.lock().unwrap();
         assert!(calls[0].1["cursor"].is_null());
         assert_eq!(calls[2].1["cursor"], "PAGE2");
@@ -789,28 +689,31 @@ projects:
             vec![
                 item(
                     "ONE",
-                    &["source-status:held", "execution:held", "agent:worker"],
+                    &[
+                        "status:new",
+                        "source-status:held",
+                        "execution:held",
+                        "no-agent",
+                        "agent:worker",
+                    ],
                     Some("TODO_A"),
                 ),
-                item("TWO", &["status:todo", "status:held"], Some("DONE_A")),
-                item("THREE", &["status:unknown"], None),
+                item("TWO", &["board:todo", "board:held"], Some("DONE_A")),
+                item("THREE", &["board:unknown"], None),
             ],
             None,
         )]);
-        assert_eq!(
-            config().reconcile_with(&api, "example/work").await.unwrap(),
-            0
-        );
+        assert_eq!(config().reconcile(&api, "example/work").await.unwrap(), 0);
         assert!(api.mutations().is_empty());
     }
 
     #[tokio::test]
     async fn scopes_items_to_repo_and_preserves_archived_items_and_prs() {
-        let mut foreign = item("FOREIGN", &["status:todo"], None);
+        let mut foreign = item("FOREIGN", &["board:todo"], None);
         foreign["content"]["repository"]["nameWithOwner"] = json!("another/repo");
-        let mut archived = item("ARCHIVED", &["status:todo"], None);
+        let mut archived = item("ARCHIVED", &["board:todo"], None);
         archived["isArchived"] = json!(true);
-        let mut pr = item("PR", &["status:todo"], None);
+        let mut pr = item("PR", &["board:todo"], None);
         pr["content"]["__typename"] = json!("PullRequest");
         let api = FakeApi::new(vec![page(
             vec![
@@ -821,24 +724,18 @@ projects:
             ],
             None,
         )]);
-        assert_eq!(
-            config().reconcile_with(&api, "example/work").await.unwrap(),
-            0
-        );
+        assert_eq!(config().reconcile(&api, "example/work").await.unwrap(), 0);
         assert!(api.mutations().is_empty());
     }
 
     #[tokio::test]
     async fn incomplete_labels_and_wrong_field_values_are_not_authoritative() {
-        let mut incomplete = item("ONE", &["status:todo"], None);
+        let mut incomplete = item("ONE", &["board:todo"], None);
         incomplete["content"]["labels"]["nodes"] = json!([{}]);
-        let mut wrong_field = item("TWO", &["status:todo"], Some("DONE_A"));
+        let mut wrong_field = item("TWO", &["board:todo"], Some("DONE_A"));
         wrong_field["fieldValueByName"]["field"]["id"] = json!("OTHER_FIELD");
         let api = FakeApi::new(vec![page(vec![incomplete, wrong_field], None)]);
-        assert_eq!(
-            config().reconcile_with(&api, "example/work").await.unwrap(),
-            0
-        );
+        assert_eq!(config().reconcile(&api, "example/work").await.unwrap(), 0);
         assert!(api.mutations().is_empty());
     }
 
@@ -851,20 +748,20 @@ projects:
                 {"id":"C","name":"Held"}, {"id":"D","name":"Done"}
             ]),
         ] {
-            let mut response = page(vec![item("ONE", &["status:todo"], None)], None);
+            let mut response = page(vec![item("ONE", &["board:todo"], None)], None);
             response["data"]["node"]["fields"]["nodes"][0]["options"] = options;
             let api = FakeApi::new(vec![response]);
-            assert!(config().reconcile_with(&api, "example/work").await.is_err());
+            assert!(config().reconcile(&api, "example/work").await.is_err());
             assert!(api.mutations().is_empty());
         }
     }
 
     #[tokio::test]
     async fn partial_graphql_error_prevents_writes() {
-        let mut response = page(vec![item("ONE", &["status:todo"], None)], None);
+        let mut response = page(vec![item("ONE", &["board:todo"], None)], None);
         response["errors"] = json!([{"message":"partial label permission failure"}]);
         let api = FakeApi::new(vec![response]);
-        assert!(config().reconcile_with(&api, "example/work").await.is_err());
+        assert!(config().reconcile(&api, "example/work").await.is_err());
         assert!(api.mutations().is_empty());
     }
 
@@ -872,7 +769,7 @@ projects:
     async fn incomplete_field_or_option_nodes_cannot_hide_ambiguity() {
         for incomplete in [Value::Null, json!({"id":"OTHER"}), json!({"name":"Status"})] {
             for connection in ["fields", "options"] {
-                let mut response = page(vec![item("ONE", &["status:todo"], None)], None);
+                let mut response = page(vec![item("ONE", &["board:todo"], None)], None);
                 let nodes = if connection == "fields" {
                     &mut response["data"]["node"]["fields"]["nodes"]
                 } else {
@@ -880,7 +777,7 @@ projects:
                 };
                 nodes.as_array_mut().unwrap().push(incomplete.clone());
                 let api = FakeApi::new(vec![response]);
-                assert!(config().reconcile_with(&api, "example/work").await.is_err());
+                assert!(config().reconcile(&api, "example/work").await.is_err());
                 assert!(api.mutations().is_empty());
             }
         }
@@ -891,62 +788,25 @@ projects:
         let api = FakeApi::new(vec![
             page(
                 vec![
-                    item("ONE", &["status:todo"], None),
-                    item("TWO", &["status:todo"], None),
+                    item("ONE", &["board:todo"], None),
+                    item("TWO", &["board:todo"], None),
                 ],
                 None,
             ),
             json!({"data":{"updateProjectV2ItemFieldValue":null}}),
             page(
                 vec![
-                    item("ONE", &["status:todo"], Some("TODO_A")),
-                    item("TWO", &["status:todo"], None),
+                    item("ONE", &["board:todo"], Some("TODO_A")),
+                    item("TWO", &["board:todo"], None),
                 ],
                 None,
             ),
             ack("TWO"),
         ]);
         let config = config();
-        assert!(config.reconcile_with(&api, "example/work").await.is_err());
+        assert!(config.reconcile(&api, "example/work").await.is_err());
         assert_eq!(api.mutations().len(), 1);
-        assert_eq!(
-            config.reconcile_with(&api, "example/work").await.unwrap(),
-            1
-        );
-        assert_eq!(api.mutations()[1]["item"], "TWO");
-    }
-
-    #[tokio::test]
-    async fn bounded_updates_resume_from_fresh_board_state() {
-        let mut config = config();
-        config.max_updates_per_sync = 1;
-        let api = FakeApi::new(vec![
-            page(
-                vec![
-                    item("ONE", &["status:todo"], None),
-                    item("TWO", &["status:todo"], None),
-                ],
-                None,
-            ),
-            ack("ONE"),
-            page(
-                vec![
-                    item("ONE", &["status:todo"], Some("TODO_A")),
-                    item("TWO", &["status:todo"], None),
-                ],
-                None,
-            ),
-            ack("TWO"),
-        ]);
-        assert_eq!(
-            config.reconcile_with(&api, "example/work").await.unwrap(),
-            1
-        );
-        assert_eq!(api.mutations().len(), 1);
-        assert_eq!(
-            config.reconcile_with(&api, "example/work").await.unwrap(),
-            1
-        );
+        assert_eq!(config.reconcile(&api, "example/work").await.unwrap(), 1);
         assert_eq!(api.mutations()[1]["item"], "TWO");
     }
 
@@ -957,106 +817,23 @@ projects:
             repo: "example/work".into(),
             project_id: "PVT_B".into(),
             field_name: "Status".into(),
-            options: BTreeMap::from([("status:todo".into(), "Todo".into())]),
+            label_prefix: default_label_prefix(),
+            options: BTreeMap::from([("board:todo".into(), "Todo".into())]),
         });
-        let mut second = page(vec![item("TWO", &["status:todo"], None)], None);
+        let mut second = page(vec![item("TWO", &["board:todo"], None)], None);
         second["data"]["node"]["id"] = json!("PVT_B");
         second["data"]["node"]["fields"]["nodes"][0]["id"] = json!("FIELD_B");
         second["data"]["node"]["fields"]["nodes"][0]["options"][0]["id"] = json!("TODO_B");
         let api = FakeApi::new(vec![
-            page(vec![item("ONE", &["status:todo"], None)], None),
+            page(vec![item("ONE", &["board:todo"], None)], None),
             ack("ONE"),
             second,
             ack("TWO"),
         ]);
-        assert_eq!(
-            config.reconcile_with(&api, "example/work").await.unwrap(),
-            2
-        );
+        assert_eq!(config.reconcile(&api, "example/work").await.unwrap(), 2);
         assert_eq!(
             api.mutations()[1],
             json!({"project":"PVT_B","item":"TWO","field":"FIELD_B","option":"TODO_B"})
-        );
-    }
-
-    #[tokio::test]
-    async fn default_five_update_limit_is_shared_across_boards() {
-        let mut config = config();
-        config.max_updates_per_sync = default_max_updates();
-        config.projects.push(BoardConfig {
-            repo: "example/work".into(),
-            project_id: "PVT_B".into(),
-            field_name: "Status".into(),
-            options: BTreeMap::from([("status:todo".into(), "Todo".into())]),
-        });
-        let mut second = page(
-            vec![
-                item("FOUR", &["status:todo"], None),
-                item("FIVE", &["status:todo"], None),
-                item("SIX", &["status:todo"], None),
-            ],
-            None,
-        );
-        second["data"]["node"]["id"] = json!("PVT_B");
-        let api = FakeApi::new(vec![
-            page(
-                vec![
-                    item("ONE", &["status:todo"], None),
-                    item("TWO", &["status:todo"], None),
-                    item("THREE", &["status:todo"], None),
-                ],
-                None,
-            ),
-            ack("ONE"),
-            ack("TWO"),
-            ack("THREE"),
-            second,
-            ack("FOUR"),
-            ack("FIVE"),
-        ]);
-        assert_eq!(
-            config.reconcile_with(&api, "example/work").await.unwrap(),
-            5
-        );
-        assert_eq!(api.mutations().len(), 5);
-        assert_eq!(api.mutations()[4]["item"], "FIVE");
-        assert!(api.replies.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn unsent_mutations_do_not_consume_unknown_outcome_limit() {
-        struct PreflightApi;
-        #[async_trait]
-        impl ProjectApi for PreflightApi {
-            async fn query(&self, query: &str, _variables: Value) -> Result<Value> {
-                if query == UPDATE_STATUS {
-                    return Err(super::super::super::http::RequestNotSent(anyhow::anyhow!(
-                        "shared backoff active"
-                    ))
-                    .into());
-                }
-                Ok(page(vec![item("ONE", &["status:todo"], None)], None))
-            }
-        }
-        let mut state = LabelSyncState::default();
-        let config = config();
-        for _ in 0..4 {
-            assert!(config
-                .reconcile(&PreflightApi, "example/work", &mut state)
-                .await
-                .is_err());
-            assert!(state.unknown.values().all(|(_, count)| *count == 0));
-        }
-        let recovered = FakeApi::new(vec![
-            page(vec![item("ONE", &["status:todo"], None)], None),
-            ack("ONE"),
-        ]);
-        assert_eq!(
-            config
-                .reconcile(&recovered, "example/work", &mut state)
-                .await
-                .unwrap(),
-            1
         );
     }
 
@@ -1066,35 +843,23 @@ projects:
         config.enabled = false;
         let no_calls = FakeApi::new(vec![]);
         assert_eq!(
-            config
-                .reconcile_with(&no_calls, "example/work")
-                .await
-                .unwrap(),
+            config.reconcile(&no_calls, "example/work").await.unwrap(),
             0
         );
         config.enabled = true;
-        assert_eq!(
-            config
-                .reconcile_with(&no_calls, "other/repo")
-                .await
-                .unwrap(),
-            0
-        );
+        assert_eq!(config.reconcile(&no_calls, "other/repo").await.unwrap(), 0);
         assert!(no_calls.calls.lock().unwrap().is_empty());
-        let mut closed = page(vec![item("ONE", &["status:todo"], None)], None);
+        let mut closed = page(vec![item("ONE", &["board:todo"], None)], None);
         closed["data"]["node"]["closed"] = json!(true);
         let api = FakeApi::new(vec![closed]);
-        assert_eq!(
-            config.reconcile_with(&api, "example/work").await.unwrap(),
-            0
-        );
+        assert_eq!(config.reconcile(&api, "example/work").await.unwrap(), 0);
         assert!(api.mutations().is_empty());
     }
 
     #[tokio::test]
     async fn invalid_cursor_stops_instead_of_looping() {
         let api = FakeApi::new(vec![page(vec![], Some("SAME")), page(vec![], Some("SAME"))]);
-        assert!(config().reconcile_with(&api, "example/work").await.is_err());
+        assert!(config().reconcile(&api, "example/work").await.is_err());
         assert_eq!(api.calls.lock().unwrap().len(), 2);
         assert!(api.mutations().is_empty());
     }
@@ -1110,13 +875,10 @@ projects:
         let api = FakeApi::new(vec![
             first,
             json!({"data":{"node":{"id":"PVT_A","fields":{"nodes":[field],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}),
-            json!({"data":{"node":{"id":"ISSUE_ONE","labels":{"nodes":[{"name":"status:held"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}),
+            json!({"data":{"node":{"id":"ISSUE_ONE","labels":{"nodes":[{"name":"board:held"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}),
             ack("ONE"),
         ]);
-        assert_eq!(
-            config().reconcile_with(&api, "example/work").await.unwrap(),
-            1
-        );
+        assert_eq!(config().reconcile(&api, "example/work").await.unwrap(), 1);
         assert_eq!(api.mutations()[0]["option"], "HELD_A");
         let calls = api.calls.lock().unwrap();
         assert_eq!(calls[1].1, json!({"node":"PVT_A","cursor":"FIELDS2"}));
@@ -1125,23 +887,20 @@ projects:
 
     #[tokio::test]
     async fn second_page_status_label_makes_ambiguous_issue_a_noop() {
-        let mut first = page(vec![item("ONE", &["status:todo"], None)], None);
+        let mut first = page(vec![item("ONE", &["board:todo"], None)], None);
         first["data"]["node"]["items"]["nodes"][0]["content"]["labels"]["pageInfo"] =
             json!({"hasNextPage":true,"endCursor":"LABELS2"});
         let api = FakeApi::new(vec![
             first,
-            json!({"data":{"node":{"id":"ISSUE_ONE","labels":{"nodes":[{"name":"status:held"}],"pageInfo":{"hasNextPage":false}}}}}),
+            json!({"data":{"node":{"id":"ISSUE_ONE","labels":{"nodes":[{"name":"board:held"}],"pageInfo":{"hasNextPage":false}}}}}),
         ]);
-        assert_eq!(
-            config().reconcile_with(&api, "example/work").await.unwrap(),
-            0
-        );
+        assert_eq!(config().reconcile(&api, "example/work").await.unwrap(), 0);
         assert!(api.mutations().is_empty());
     }
 
     #[tokio::test]
     async fn duplicate_field_names_across_pages_are_not_guessed() {
-        let mut first = page(vec![item("ONE", &["status:todo"], None)], None);
+        let mut first = page(vec![item("ONE", &["board:todo"], None)], None);
         let mut field = first["data"]["node"]["fields"]["nodes"][0].clone();
         field["id"] = json!("OTHER_FIELD");
         first["data"]["node"]["fields"]["pageInfo"] =
@@ -1150,7 +909,7 @@ projects:
             first,
             json!({"data":{"node":{"id":"PVT_A","fields":{"nodes":[field],"pageInfo":{"hasNextPage":false}}}}}),
         ]);
-        assert!(config().reconcile_with(&api, "example/work").await.is_err());
+        assert!(config().reconcile(&api, "example/work").await.is_err());
         assert!(api.mutations().is_empty());
     }
 
@@ -1161,178 +920,12 @@ projects:
             json!({"data":{"node":{"id":"OTHER_ISSUE","labels":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}),
             json!({"data":{"node":{"id":"ISSUE_ONE","labels":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"LABELS2"}}}}}),
         ] {
-            let mut first = page(vec![item("ONE", &["status:todo"], None)], None);
+            let mut first = page(vec![item("ONE", &["board:todo"], None)], None);
             first["data"]["node"]["items"]["nodes"][0]["content"]["labels"]["pageInfo"] =
                 json!({"hasNextPage":true,"endCursor":"LABELS2"});
             let api = FakeApi::new(vec![first, response]);
-            assert!(config().reconcile_with(&api, "example/work").await.is_err());
+            assert!(config().reconcile(&api, "example/work").await.is_err());
             assert!(api.mutations().is_empty());
-        }
-    }
-
-    #[tokio::test]
-    async fn repeated_unknown_updates_are_bounded_without_starving_later_items() {
-        let mut replies = Vec::new();
-        for _ in 0..3 {
-            replies.push(page(vec![item("ONE", &["status:todo"], None)], None));
-            replies.push(json!({"data":{"updateProjectV2ItemFieldValue":null}}));
-        }
-        replies.push(page(
-            vec![
-                item("ONE", &["status:todo"], None),
-                item("TWO", &["status:held"], None),
-            ],
-            None,
-        ));
-        replies.push(ack("TWO"));
-        // A new desired option explicitly resets the consecutive unknown result streak.
-        replies.push(page(vec![item("ONE", &["status:held"], None)], None));
-        replies.push(ack("ONE"));
-        let api = FakeApi::new(replies);
-        let mut state = LabelSyncState::default();
-        let config = config();
-        for _ in 0..3 {
-            assert!(config
-                .reconcile(&api, "example/work", &mut state)
-                .await
-                .is_err());
-        }
-        assert_eq!(api.mutations().len(), 3);
-        assert_eq!(
-            config
-                .reconcile(&api, "example/work", &mut state)
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(api.mutations()[3]["item"], "TWO");
-        assert_eq!(
-            config
-                .reconcile(&api, "example/work", &mut state)
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(api.mutations()[4]["item"], "ONE");
-        assert!(state.unknown.is_empty());
-    }
-
-    #[tokio::test]
-    async fn skipped_items_cannot_reset_unknown_outcome_suspension() {
-        let mut replies = Vec::new();
-        for _ in 0..3 {
-            replies.push(page(vec![item("ONE", &["status:todo"], None)], None));
-            replies.push(json!({"data":{"updateProjectV2ItemFieldValue":null}}));
-        }
-        replies.push(page(vec![item("ONE", &["execution:held"], None)], None));
-        let mut archived = item("ONE", &["status:todo"], None);
-        archived["isArchived"] = json!(true);
-        replies.push(page(vec![archived], None));
-        replies.push(page(
-            vec![
-                item("ONE", &["status:todo"], None),
-                item("TWO", &["status:held"], None),
-            ],
-            None,
-        ));
-        replies.push(ack("TWO"));
-        // Only observing the desired value permits the original option again.
-        replies.push(page(
-            vec![item("ONE", &["status:todo"], Some("TODO_A"))],
-            None,
-        ));
-        replies.push(page(vec![item("ONE", &["status:todo"], None)], None));
-        replies.push(ack("ONE"));
-        let api = FakeApi::new(replies);
-        let mut state = LabelSyncState::default();
-        let config = config();
-        for _ in 0..3 {
-            assert!(config
-                .reconcile(&api, "example/work", &mut state)
-                .await
-                .is_err());
-        }
-        for _ in 0..2 {
-            assert_eq!(
-                config
-                    .reconcile(&api, "example/work", &mut state)
-                    .await
-                    .unwrap(),
-                0
-            );
-            assert_eq!(state.unknown[&("PVT_A".into(), "ONE".into())].1, 3);
-        }
-        assert_eq!(
-            config
-                .reconcile(&api, "example/work", &mut state)
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(api.mutations()[3]["item"], "TWO");
-        assert_eq!(
-            config
-                .reconcile(&api, "example/work", &mut state)
-                .await
-                .unwrap(),
-            0
-        );
-        assert!(state.unknown.is_empty());
-        assert_eq!(
-            config
-                .reconcile(&api, "example/work", &mut state)
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(api.mutations()[4]["item"], "ONE");
-    }
-
-    #[tokio::test]
-    async fn failed_mutation_responses_are_bounded_but_read_failures_are_not_counted() {
-        for failure in [
-            Err("transport timeout after sending write".into()),
-            Err("malformed JSON in HTTP 200 response".into()),
-            Ok(
-                json!({"data":{"updateProjectV2ItemFieldValue":null},"errors":[{"message":"partial response"}]}),
-            ),
-        ] {
-            let mut replies = vec![Err("read failed".into())];
-            for _ in 0..3 {
-                replies.push(Ok(page(vec![item("ONE", &["status:todo"], None)], None)));
-                replies.push(failure.clone());
-            }
-            replies.push(Ok(page(
-                vec![
-                    item("ONE", &["status:todo"], None),
-                    item("TWO", &["status:held"], None),
-                ],
-                None,
-            )));
-            replies.push(Ok(ack("TWO")));
-            let api = FakeApi::with_errors(replies);
-            let mut state = LabelSyncState::default();
-            let config = config();
-            assert!(config
-                .reconcile(&api, "example/work", &mut state)
-                .await
-                .is_err());
-            assert!(state.unknown.is_empty());
-            for _ in 0..3 {
-                assert!(config
-                    .reconcile(&api, "example/work", &mut state)
-                    .await
-                    .is_err());
-            }
-            assert_eq!(api.mutations().len(), 3);
-            assert_eq!(
-                config
-                    .reconcile(&api, "example/work", &mut state)
-                    .await
-                    .unwrap(),
-                1
-            );
-            assert_eq!(api.mutations()[3]["item"], "TWO");
         }
     }
 
@@ -1340,7 +933,7 @@ projects:
     async fn board_reconcile_cli_uses_same_display_only_path_and_truthful_result() {
         let api = FakeApi::new(vec![
             page(
-                vec![item("ONE", &["status:held", "execution:held"], None)],
+                vec![item("ONE", &["board:held", "execution:held"], None)],
                 None,
             ),
             ack("ONE"),
@@ -1373,7 +966,7 @@ projects:
         );
         assert!(no_calls.calls.lock().unwrap().is_empty());
         let noop = FakeApi::new(vec![page(
-            vec![item("ONE", &["status:todo"], Some("TODO_A"))],
+            vec![item("ONE", &["board:todo"], Some("TODO_A"))],
             None,
         )]);
         assert_eq!(
@@ -1383,7 +976,7 @@ projects:
             0
         );
         let unknown = FakeApi::new(vec![
-            page(vec![item("ONE", &["status:held"], None)], None),
+            page(vec![item("ONE", &["board:held"], None)], None),
             json!({"data":null}),
         ]);
         assert!(
@@ -1393,10 +986,89 @@ projects:
         );
     }
 
+    #[tokio::test]
+    async fn custom_prefix_ignores_lifecycle_labels_and_updates_all_items() {
+        let mut config = config();
+        config.projects[0].label_prefix = "workflow:".into();
+        config.projects[0].options = BTreeMap::from([("workflow:held".into(), "Held".into())]);
+        let mut replies = vec![page(
+            (0..6)
+                .map(|id| {
+                    item(
+                        &id.to_string(),
+                        &["workflow:held", "board:todo", "status:new", "no-agent"],
+                        None,
+                    )
+                })
+                .collect(),
+            None,
+        )];
+        replies.extend((0..6).map(|id| ack(&id.to_string())));
+        let api = FakeApi::new(replies);
+        assert_eq!(config.reconcile(&api, "example/work").await.unwrap(), 6);
+        assert_eq!(api.mutations().len(), 6);
+        assert!(api
+            .mutations()
+            .iter()
+            .all(|vars| vars["option"] == "HELD_A"));
+    }
+
+    #[tokio::test]
+    async fn failed_update_can_converge_on_a_later_pass_without_suspension() {
+        let mut replies = Vec::new();
+        for _ in 0..4 {
+            replies.push(Ok(page(vec![item("ONE", &["board:todo"], None)], None)));
+            replies.push(Err("shared client request failed".into()));
+        }
+        replies.extend([
+            Ok(page(vec![item("ONE", &["board:todo"], None)], None)),
+            Ok(ack("ONE")),
+        ]);
+        let api = FakeApi::with_errors(replies);
+        for _ in 0..4 {
+            assert!(config().reconcile(&api, "example/work").await.is_err());
+        }
+        assert_eq!(config().reconcile(&api, "example/work").await.unwrap(), 1);
+        assert_eq!(api.mutations().len(), 5);
+    }
+
+    #[test]
+    fn configurable_prefix_rejects_reserved_namespaces_and_mismatched_labels() {
+        let raw = "enabled: true\nprojects:\n  - repo: example/work\n    project_id: PVT_A\n    label_prefix: PREFIX\n    options:\n      LABEL: Held\n";
+        for prefix in [
+            "status:",
+            "STATUS:",
+            "status:custom:",
+            "source-status:",
+            "execution:",
+            "",
+            ":",
+            "board",
+            "board :",
+        ] {
+            assert!(
+                LabelSyncConfig::parse(
+                    &raw.replace("PREFIX", &format!("'{prefix}'"))
+                        .replace("LABEL", &format!("'{prefix}held'"))
+                )
+                .is_err(),
+                "{prefix}"
+            );
+        }
+        assert!(LabelSyncConfig::parse(
+            &raw.replace("PREFIX", "'workflow:'")
+                .replace("LABEL", "board:held")
+        )
+        .is_err());
+        assert!(LabelSyncConfig::parse(
+            &raw.replace("PREFIX", "'workflow:'")
+                .replace("LABEL", "workflow:held")
+        )
+        .is_ok());
+    }
+
     #[test]
     fn invalid_configuration_is_rejected_without_legacy_fallback() {
-        assert!(LabelSyncConfig::parse("enabled: true\nmax_updates_per_sync: 0").is_err());
-        assert!(LabelSyncConfig::parse("enabled: true\nmax_updates_per_sync: 101").is_err());
         assert!(LabelSyncConfig::parse("enabled: true\nunknown: true").is_err());
         assert!(LabelSyncConfig::parse("enabled: true\nprojects:\n  - repo: example/work\n    project_id: PVT_A\n    options:\n      execution:held: Held").is_err());
         assert!(LabelSyncConfig::parse("enabled: true\nprojects:\n  - repo: example/work\n    project_id: PVT_A\n    options:\n      source-status:todo: Todo").is_err());

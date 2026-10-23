@@ -111,96 +111,65 @@ orch project board info          # show current project field/option IDs
 orch project board sync          # (re-)discover and persist to .orch.yml
 ```
 
-### Keep board Status aligned with status labels
+### Keep board Status aligned with board labels
 
-The default integration above projects Orch's internal lifecycle into four
-columns. For boards with their own workflow, an operator can instead enable
-label-authoritative reconciliation. For example, `status:held` maps to **Held**,
-and replacing it with `status:todo` moves the existing card to **Todo**.
+For a custom board workflow, enable label-authoritative reconciliation with a
+separate namespace. `board:held` selects **Held**; replacing it with `board:todo`
+selects **Todo**. Orch owns `status:*` for its task lifecycle and removes those
+labels on transitions, so this feature rejects that namespace.
 
 ```yaml
 gh:
   project_label_sync:
     enabled: true
-    max_updates_per_sync: 5
     projects:
       - repo: "owner/repo"
         project_id: "PVT_..."
         field_name: "Status"
+        label_prefix: "board:"
         options:
-          "status:backlog": "Backlog"
-          "status:todo": "Todo"
-          "status:in-progress": "In Progress"
-          "status:paused": "Paused"
-          "status:blocked": "Blocked"
-          "status:review": "Review"
-          "status:done": "Done"
-          "status:archived": "Archived"
-          "status:held": "Held"
+          "board:todo": "Todo"
+          "board:held": "Held"
+          "board:review": "Review"
+          "board:done": "Done"
 ```
 
-Each entry explicitly scopes one repository and one Project V2. Repeat entries
-for additional boards or repositories. All configured option names must already
-exist, match exactly and be unique in that board's named single-select field.
-Their IDs are discovered separately for each board; IDs are never copied between
-projects. The token needs Projects write permission (`project` for a classic PAT).
+Each entry scopes one repository and Project V2. `field_name` defaults to
+`Status`, and `label_prefix` defaults to `board:`. A custom prefix must end in
+`:` and cannot use `status:`, `source-status:` or `execution:`. All mapping keys
+must belong to that prefix. Option names must already exist and match exactly
+and uniquely; field and option IDs are resolved separately for each board.
+The token needs Projects write permission (`project` for a classic PAT).
 
-The first sync repairs existing cards, including blank Status values. Subsequent
-syncs read current labels and field values, so changes made outside Orch and
-manual board drift are also repaired. Normal polling is sufficient (the engine's
-`sync_interval`, normally 45 seconds); an already configured webhook can trigger
-the same sync sooner. No public endpoint is needed. Item, field and label
-connections are paginated, and matching values cause no mutation. The default
-cap is five changed fields per repository per sync, shared across its configured
-boards; larger backlogs converge over later syncs. This cap is not a separate API
-quota: reads and writes use the existing GitHub client's backoff/circuit handling,
-and other engine operations share the account's limits. Large portfolios may
-need a longer engine sync interval or a lower cap.
+Startup/periodic sync reads existing Issue cards and repairs blank or drifted
+fields, including external label changes. Fields, items and labels are paginated;
+matching values are no-ops. Exactly one label in the configured prefix is
+required. Missing board labels leave the card unchanged. Multiple or unmapped
+board labels also leave it unchanged and are logged at debug level. Incomplete or ambiguous schema responses and
+GraphQL errors cannot produce guessed updates. Reads and idempotent field
+updates use the normal shared GitHub client's retries, rate tracking, backoff
+and circuit breaker, without a separate write cap or suspension counter.
 
-Exactly one `status:*` label is authoritative. No status label leaves the card
-unchanged; multiple status labels, an unmapped label, ambiguous/missing options,
-incomplete pagination or partial GraphQL errors are reported rather than guessed.
-A missing mutation acknowledgement stops the pass; field mutations make a single
-HTTP attempt, so transport/5xx failures cannot resend a write before the next
-sync reads the board again. Shared rate tracking, backoff and circuit checks
-still apply. A preflight failure before sending does not consume the unknown
-outcome limit. After three consecutive unknown outcomes for the same
-item and option, that backend stops attempting the update until it observes a
-matching value, the desired option changes, or the operator restarts the process.
-Other items can still converge. This avoids unlimited writes after unknown results.
-
-To run one bounded reconciliation pass without starting the engine or agents:
+To reconcile once without starting ingestion, a TaskStore, routing or agents:
 
 ```bash
 orch project board reconcile --repo owner/repo
 ```
 
-The command reports the number of acknowledged field updates (zero can be a
-no-op), warns about skipped items, and exits unsuccessfully on configuration or
-API errors. It does not initialize task ingestion, routing, a TaskStore, or agent
-processes. It uses the same configured write cap; repeat intentionally to finish
-a larger backlog. Per-backend consecutive-error state lives in memory; this
-one-shot command makes only one attempt per item in its single pass.
+The command reports acknowledged field updates and exits unsuccessfully on
+configuration/API errors. Skipped items are visible with debug logging.
+Reconciliation only changes the configured field on existing, non-archived Issue
+items in open Projects. It never edits labels, issue state or memberships.
+Legacy ingestion can still add cards to `gh.project_id`; its lifecycle field
+writer defers only when that board is explicitly label-managed.
 
-This reconciler only writes the configured field of existing, non-archived
-Issue items in open Projects. It does not create issues, alter memberships,
-unarchive items or projects, close/reopen issues, or edit labels. Existing legacy
-ingestion can still add a task to its configured `gh.project_id`; when that board
-is label-managed, its internal-status column writer defers to this reconciler.
-To show a task in several boards, add it through GitHub's normal membership or
-auto-add workflow first. A board view grouped by this field shows the selected
-column; view filters and hidden columns remain user-controlled.
-
-**Board state is not execution permission.** Labels such as `execution:held` and
-historical `source-status:*` are unrelated and untouched. Custom `status:held`
-does not add a new Orch execution state or pause an agent: the standard engine
-can ingest custom-status open issues as new tasks. Configure execution admission
-separately before enabling a live engine on a held backlog. Orch's internal task
-transitions still own its standard lifecycle labels and `workflow.auto_close`;
-the board reconciler itself never transitions tasks or dispatches agents. When
-using standard lifecycle labels, map their exact names too, for example
-`status:new`/`status:routed` to Todo and `status:needs_review`/`status:in_review`
-to Review. Do not attach multiple status labels at once.
+**Use `no-agent` to hold execution.** For example, attach both `board:held` and
+`no-agent`: the former selects the column, while the latter makes Orch skip
+routing and dispatch. Replacing `board:held` with `board:todo` alone keeps that
+hold; removing `no-agent` releases it on the next sync. Board labels survive
+Orch's lifecycle transitions and do not themselves pause or resume work.
+Historical `source-status:*` and unrelated `execution:held` remain untouched;
+they gain no admission semantics from this feature.
 
 ## Owner Feedback
 

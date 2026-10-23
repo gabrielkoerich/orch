@@ -492,7 +492,7 @@ pub fn board_info() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One bounded display-only reconciliation pass. No engine, TaskStore, router,
+/// One display-only reconciliation pass. No engine, TaskStore, router,
 /// task ingestion, configuration write or agent process is initialized here.
 pub async fn board_reconcile(repo: Option<&str>) -> anyhow::Result<()> {
     let repo = match repo {
@@ -502,7 +502,7 @@ pub async fn board_reconcile(repo: Option<&str>) -> anyhow::Result<()> {
     let config = crate::github::projects::label_status::LabelSyncConfig::from_config()?;
     let gh = crate::github::http::GhHttp::new()?;
     let updated = board_reconcile_with(&config, &gh, &repo).await?;
-    println!("Updated {updated} project Status field(s) in this pass; skipped items are reported in warnings.");
+    println!("Updated {updated} project Status field(s) in this pass; skipped items are reported at debug level.");
     Ok(())
 }
 
@@ -514,13 +514,7 @@ pub(crate) async fn board_reconcile_with(
     if !config.configured_for_repo(repo) {
         anyhow::bail!("no enabled gh.project_label_sync board configured for this repository");
     }
-    config
-        .reconcile(
-            api,
-            repo,
-            &mut crate::github::projects::label_status::LabelSyncState::default(),
-        )
-        .await
+    config.reconcile(api, repo).await
 }
 
 /// Try to parse a GitHub slug (owner/repo) from the input.

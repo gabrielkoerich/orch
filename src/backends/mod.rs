@@ -621,6 +621,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_transition_preserves_board_label_and_no_agent_hold() {
+        let backend = MockBackend::with_labels(vec!["status:new", "board:held", "no-agent"]);
+        backend
+            .update_status(&ExternalId("1".into()), Status::Routed)
+            .await
+            .unwrap();
+        let mut labels = backend.current_labels();
+        labels.sort();
+        assert_eq!(labels, vec!["board:held", "no-agent", "status:routed"]);
+    }
+
+    #[tokio::test]
     async fn update_status_retries_on_transient_set_labels_failure() {
         let backend = MockBackend::with_labels(vec!["status:new"]);
         // set_labels fails once, then succeeds on retry

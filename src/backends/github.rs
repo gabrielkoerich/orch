@@ -5,7 +5,7 @@
 
 use super::{ExternalBackend, ExternalId, ExternalTask, Mention, Status};
 use crate::github::http::{status_label_color, GhHttp};
-use crate::github::projects::label_status::{LabelSyncConfig, LabelSyncState};
+use crate::github::projects::label_status::LabelSyncConfig;
 use crate::github::projects::ProjectSync;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
@@ -76,7 +76,6 @@ fn classify_active_open_issue(
 pub struct GitHubBackend {
     repo: String,
     gh: GhHttp,
-    project_label_state: tokio::sync::Mutex<LabelSyncState>,
 }
 
 /// Returns `true` if `id` is a valid GitHub issue number (positive integer).
@@ -93,7 +92,6 @@ impl GitHubBackend {
         Ok(Self {
             repo,
             gh: GhHttp::new()?,
-            project_label_state: tokio::sync::Mutex::new(LabelSyncState::default()),
         })
     }
 
@@ -199,9 +197,8 @@ impl ExternalBackend for GitHubBackend {
     }
 
     async fn reconcile_project_statuses(&self) -> anyhow::Result<()> {
-        let mut state = self.project_label_state.lock().await;
         LabelSyncConfig::from_config()?
-            .reconcile(&self.gh, &self.repo, &mut state)
+            .reconcile(&self.gh, &self.repo)
             .await
             .map(|_| ())
     }

@@ -31,20 +31,6 @@ const GITHUB_API: &str = "https://api.github.com";
 #[cfg(test)]
 const GITHUB_API: &str = "http://127.0.0.1:9";
 
-/// A single-attempt request failed before any HTTP send. A reconciliation
-/// caller must not count this as an unacknowledged mutation.
-#[derive(Debug, thiserror::Error)]
-#[error("GitHub request was not sent: {0}")]
-pub(crate) struct RequestNotSent(#[source] pub(crate) anyhow::Error);
-
-fn preflight_error(error: anyhow::Error, retry: bool) -> anyhow::Error {
-    if retry {
-        error
-    } else {
-        RequestNotSent(error).into()
-    }
-}
-
 fn parse_positive_issue_number(number: &str) -> anyhow::Result<i64> {
     let parsed = number
         .parse::<i64>()
@@ -405,19 +391,10 @@ impl GhHttp {
 
     /// Generic send wrapper that retries on 5xx server errors with exponential
     /// backoff and sets a short-lived circuit-breaker in KV when retries fail.
-    async fn send_with_retries<F>(&self, make_req: F, is_graphql: bool) -> anyhow::Result<Response>
-    where
-        F: FnMut() -> anyhow::Result<reqwest::RequestBuilder>,
-    {
-        self.send_with_retry_policy(make_req, is_graphql, true)
-            .await
-    }
-
-    async fn send_with_retry_policy<F>(
+    async fn send_with_retries<F>(
         &self,
         mut make_req: F,
         is_graphql: bool,
-        retry: bool,
     ) -> anyhow::Result<Response>
     where
         F: FnMut() -> anyhow::Result<reqwest::RequestBuilder>,
@@ -427,31 +404,20 @@ impl GhHttp {
             if let Some(until) = engine_cooldown::cooldown_until("github:5xx") {
                 let now = chrono::Utc::now().timestamp();
                 let remaining = if until > now { until - now } else { 0 };
-                return Err(preflight_error(
-                    anyhow::anyhow!(
-                        "GitHub API transient 5xx circuit-breaker active for {}s",
-                        remaining
-                    ),
-                    retry,
-                ));
+                anyhow::bail!(
+                    "GitHub API transient 5xx circuit-breaker active for {}s",
+                    remaining
+                );
             } else {
-                return Err(preflight_error(
-                    anyhow::anyhow!("GitHub API transient 5xx circuit-breaker active"),
-                    retry,
-                ));
+                anyhow::bail!("GitHub API transient 5xx circuit-breaker active");
             }
         }
 
         // Configurable retry params (defaults chosen conservatively)
-        let attempts = if retry {
-            crate::config::get("gh.5xx.retry_attempts")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(3)
-        } else {
-            // A mutation caller must reconcile an unknown outcome before resend.
-            1
-        };
+        let attempts = crate::config::get("gh.5xx.retry_attempts")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(3);
         let base_secs = crate::config::get("gh.5xx.base_backoff_seconds")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -471,7 +437,7 @@ impl GhHttp {
         let mut auth_override: Option<String> = None;
         let mut auth_retried = false;
         for attempt in 0..attempts {
-            let mut req = make_req().map_err(|error| preflight_error(error, retry))?;
+            let mut req = make_req()?;
             if let Some(auth) = &auth_override {
                 req = req.header(header::AUTHORIZATION, auth.clone());
             }
@@ -494,9 +460,6 @@ impl GhHttp {
                                 "GitHub API 401 Bad credentials — clearing cached token and re-resolving"
                             );
                             self.token_resolver.clear_cache().await;
-                            if !retry {
-                                anyhow::bail!("GitHub authentication failed ({status}); token cache cleared, request not resent");
-                            }
                             match self.auth_header().await {
                                 Ok(new_auth) => {
                                     auth_retried = true;
@@ -959,7 +922,6 @@ impl GhHttp {
             query,
             extra_headers,
             variables,
-            true,
         )
         .await
     }
@@ -970,19 +932,15 @@ impl GhHttp {
         query: &str,
         extra_headers: &[(&str, &str)],
         variables: Option<serde_json::Value>,
-        retry: bool,
     ) -> anyhow::Result<serde_json::Value> {
         Self::proactive_throttle_graphql().await;
-        Self::check_graphql_backoff().map_err(|error| preflight_error(error, retry))?;
+        Self::check_graphql_backoff()?;
         let body = if let Some(vars) = variables {
             serde_json::json!({ "query": query, "variables": vars })
         } else {
             serde_json::json!({ "query": query })
         };
-        let auth = self
-            .auth_header()
-            .await
-            .map_err(|error| preflight_error(error, retry))?;
+        let auth = self.auth_header().await?;
         let mut req = self
             .client
             .post(url)
@@ -995,12 +953,12 @@ impl GhHttp {
             req = req.header(*k, *v);
         }
 
-        // Both policies share rate tracking, backoff and the circuit breaker.
+        // Use send_with_retries wrapper for GraphQL (is_graphql = true)
         let make_req = || {
             req.try_clone()
                 .ok_or_else(|| anyhow::anyhow!("graphql request clone failed"))
         };
-        let resp = self.send_with_retry_policy(make_req, true, retry).await?;
+        let resp = self.send_with_retries(make_req, true).await?;
         let status = resp.status();
         let text_res = resp.text().await;
         if !status.is_success() {
@@ -1036,23 +994,6 @@ impl GhHttp {
         variables: serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
         self.graphql_request(query, &[], Some(variables)).await
-    }
-
-    /// Send a GraphQL mutation once. Transport and server failures can follow a
-    /// committed write; callers must read authoritative state before retrying.
-    pub(crate) async fn graphql_with_vars_once(
-        &self,
-        query: &str,
-        variables: serde_json::Value,
-    ) -> anyhow::Result<serde_json::Value> {
-        self.graphql_request_to_url(
-            &format!("{GITHUB_API}/graphql"),
-            query,
-            &[],
-            Some(variables),
-            false,
-        )
-        .await
     }
 
     pub async fn graphql_with_headers(
@@ -3727,7 +3668,6 @@ mod tests {
                 query,
                 &[],
                 Some(serde_json::json!({"k": "v"})),
-                true,
             )
             .await;
 
@@ -3750,80 +3690,6 @@ mod tests {
     }
 
     // ── get_all_pages integration tests (wiremock) ────────────────────────
-
-    #[serial_test::serial(cooldown_state)]
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn single_attempt_graphql_does_not_resend_after_server_or_transport_failure() {
-        use wiremock::matchers::method;
-        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-
-        let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
-        let previous = std::env::var_os("GH_TOKEN");
-        std::env::set_var("GH_TOKEN", "test_token");
-        for server_error in [true, false] {
-            crate::engine::cooldown::reset_global_state().await;
-            let server = MockServer::start().await;
-            let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let applied_on_server = applied.clone();
-            Mock::given(method("POST"))
-                .respond_with(move |request: &Request| {
-                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-                    if body["query"].as_str().unwrap().starts_with("mutation") {
-                        // The write committed, but its acknowledgement is lost.
-                        applied_on_server.store(true, Ordering::SeqCst);
-                        if server_error {
-                            ResponseTemplate::new(502)
-                        } else {
-                            ResponseTemplate::new(200)
-                                .set_body_json(serde_json::json!({"data": {"updated": true}}))
-                                .set_delay(Duration::from_millis(300))
-                        }
-                    } else {
-                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                            "data": {"applied": applied_on_server.load(Ordering::SeqCst)}
-                        }))
-                    }
-                })
-                .mount(&server)
-                .await;
-            let mut gh = test_client();
-            gh.client = Client::builder()
-                .timeout(Duration::from_millis(100))
-                .build()
-                .unwrap();
-            let url = format!("{}/graphql", server.uri());
-            let error = gh
-                .graphql_request_to_url(&url, "mutation { updateField }", &[], None, false)
-                .await
-                .unwrap_err();
-            assert!(error.downcast_ref::<RequestNotSent>().is_none());
-            assert!(applied.load(Ordering::SeqCst));
-            assert_eq!(server.received_requests().await.unwrap().len(), 1);
-
-            // A circuit/backoff preflight is distinct from a sent unknown write.
-            if server_error {
-                let error = gh
-                    .graphql_request_to_url(&url, "mutation { updateField }", &[], None, false)
-                    .await
-                    .unwrap_err();
-                assert!(error.downcast_ref::<RequestNotSent>().is_some());
-                assert_eq!(server.received_requests().await.unwrap().len(), 1);
-            }
-            crate::engine::cooldown::reset_global_state().await;
-            let observed = gh
-                .graphql_request_to_url(&url, "query { currentField }", &[], None, true)
-                .await
-                .unwrap();
-            assert_eq!(observed["data"]["applied"], true);
-            assert_eq!(server.received_requests().await.unwrap().len(), 2);
-        }
-        crate::engine::cooldown::reset_global_state().await;
-        match previous {
-            Some(value) => std::env::set_var("GH_TOKEN", value),
-            None => std::env::remove_var("GH_TOKEN"),
-        }
-    }
 
     #[cfg(test)]
     mod pagination {
