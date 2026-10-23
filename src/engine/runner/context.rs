@@ -19,6 +19,7 @@ use std::sync::Arc;
 use tokio::process::Command;
 
 /// All assembled context for a task execution.
+#[derive(Default)]
 pub struct TaskContext {
     /// Task-specific context from previous runs
     pub task_context: String,

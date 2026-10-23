@@ -527,6 +527,7 @@ const SUBSTANTIVE_RESPONSE_FIELDS: &[&str] = &[
     "delegations",
     "output",
     "pr_url",
+    "report",
 ];
 
 /// Infer a canonical completion status from known non-standard completion envelope shapes.
@@ -546,6 +547,10 @@ fn infer_completion_status(obj: &serde_json::Map<String, serde_json::Value>) -> 
     }
     // type: "task_complete"
     if obj.get("type").and_then(|v| v.as_str()) == Some("task_complete") {
+        return Some("done".to_string());
+    }
+    // ok: true
+    if obj.get("ok").and_then(|v| v.as_bool()) == Some(true) {
         return Some("done".to_string());
     }
     // tests_passed: true
