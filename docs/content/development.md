@@ -40,7 +40,7 @@ cargo fmt && cargo clippy --all-targets -- -D warnings && cargo nextest run
 
 1. Push to `main` → CI runs tests and linters
 2. CI auto-tags from conventional commits
-3. CI generates changelog and creates GitHub release
+3. CI signs and notarizes the macOS binary, generates changelog and creates GitHub release
 4. CI updates `gabrielkoerich/homebrew-tap` Formula and publishes the Homebrew package
 5. Users `brew upgrade orch` to install the new version
 
