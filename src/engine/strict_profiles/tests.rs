@@ -1206,3 +1206,90 @@ async fn direct_context_runner_returns_blocked_signal_for_persisted_pin_without_
     );
     assert_eq!(stored_pin(&store, REPO, "1").await.unwrap(), Some(pin));
 }
+
+#[tokio::test]
+#[serial]
+async fn internal_task_alias_preserves_pin_and_cached_revocations() {
+    let _env = TestEnv::new();
+    let (store, _, _, pin) = routed().await;
+    let id = store.resolve_task_id(REPO, "1").await.unwrap().unwrap();
+    let alias = format!("internal:{id}");
+    assert_eq!(
+        get_route_result(&store, REPO, &alias)
+            .await
+            .unwrap()
+            .strict_profile,
+        Some(pin.clone())
+    );
+    assert_eq!(stored_pin(&store, REPO, &alias).await.unwrap(), Some(pin));
+    // An internal row number from another repository cannot reveal this pin.
+    assert!(stored_pin(&store, "example/other", &alias)
+        .await
+        .unwrap()
+        .is_none());
+    store
+        .set_fields(
+            id,
+            &[("labels", json!(["execution:held", "agent:designer"]))],
+        )
+        .await
+        .unwrap();
+    assert!(get_route_result(&store, REPO, &alias).await.is_err());
+}
+
+#[tokio::test]
+#[serial]
+async fn internal_task_alias_cannot_escape_strict_runner_after_policy_removal() {
+    let _env = TestEnv::new();
+    let (store, _, mut t, pin) = routed().await;
+    let id = store.resolve_task_id(REPO, "1").await.unwrap().unwrap();
+    t.id = ExternalId(format!("internal:{id}"));
+    std::env::remove_var(REGISTRY_ENV);
+    assert!(task_is_strict(&Some(store.clone()), REPO, &t.id.0)
+        .await
+        .unwrap());
+    assert!(get_route_result(&store, REPO, &t.id.0).await.is_err());
+    assert!(block_no_fallback(&Some(store.clone()), REPO, &t.id.0)
+        .await
+        .unwrap());
+    let backend: Arc<dyn ExternalBackend> = Arc::new(SnapshotBackend::new(t.clone()));
+    let runner = crate::engine::runner::TaskRunner::new(REPO.into()).with_store(store.clone());
+    let signal = runner
+        .run_with_context(
+            &t,
+            &backend,
+            &Arc::new(crate::tmux::TmuxManager::new()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        signal,
+        crate::engine::runner::WeightSignal::Blocked
+    ));
+    let stored = store.get(id).await.unwrap();
+    assert_eq!(stored.status, crate::store::TaskStatus::Blocked);
+    assert_eq!(stored.agent.as_deref(), Some(pin.cli.as_str()));
+    assert_eq!(stored.model.as_deref(), Some(pin.model.as_str()));
+    assert_eq!(stored_pin(&store, REPO, "1").await.unwrap(), Some(pin));
+}
+
+#[tokio::test]
+#[serial]
+async fn conflicting_alias_pin_fails_closed_instead_of_selecting_a_route() {
+    let _env = TestEnv::new();
+    let (store, _, _, pin) = routed().await;
+    let id = store.resolve_task_id(REPO, "1").await.unwrap().unwrap();
+    let alias = format!("internal:{id}");
+    let mut other = pin;
+    other.issue_id = alias.clone();
+    other.effort = "medium".into();
+    store
+        .kv_set(&key(REPO, &alias), &serde_json::to_string(&other).unwrap())
+        .await
+        .unwrap();
+    std::env::remove_var(REGISTRY_ENV);
+    assert!(stored_pin(&store, REPO, &alias).await.is_err());
+    assert!(get_route_result(&store, REPO, &alias).await.is_err());
+    assert!(task_is_strict(&Some(store), REPO, &alias).await.is_err());
+}

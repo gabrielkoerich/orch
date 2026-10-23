@@ -32,6 +32,10 @@ The native review entry point validates this persisted assignment before recordi
 
 File-backed tests close and reopen SQLite, retrieve both pins, and reject changed registry bytes or missing policy. Database fault injection and independent connections exercise rollback and conflicting route commits. These are local storage guarantees, not a distributed lease or a live daemon restart proof.
 
+Native `internal:<row>` aliases resolve through the repository-scoped task resolver before a missing pin can permit ordinary routing. Looking up an external issue through this alias retains its immutable assignment, cached revocations and execution/fallback guards, including after policy removal. Conflicting alias records or pins bound to another key fail closed. This handles alternate identifiers for the same stored task; it does not authorize rebinding a task to a different external issue.
+
+Alias support is limited to pin reads and guards. New strict route admission and route persistence require the canonical task identifier; supplying an alias there is rejected rather than selecting another route.
+
 There is deliberately no pin deletion or reset command. Retrying a task preserves its executor and reviewer. A safe reset needs an authenticated operator decision against an expected old pin, a durable audit record, and proof that the old execution lease is fenced and its worker has stopped. Neither a local status change nor clearing retry counters proves that a remote worker stopped. Without a shared fencing authority, deleting/replacing a pin could allow a previous worker and a new assignment to overlap.
 
 ## Offline verification

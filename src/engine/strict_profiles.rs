@@ -374,11 +374,47 @@ pub async fn stored_pin(
     repo: &str,
     task_id: &str,
 ) -> anyhow::Result<Option<ProfilePin>> {
-    store
+    let direct = pin_at_key(store, repo, task_id).await?;
+    // The native resolver accepts internal:<row> for external tasks too. A
+    // caller's alternate spelling must not hide an existing strict assignment
+    // when the policy option has been removed, including at fallback/dispatch.
+    if !task_id.starts_with("internal:") {
+        return Ok(direct);
+    }
+    let Some(id) = store.resolve_task_id(repo, task_id).await? else {
+        return Ok(direct);
+    };
+    let task = store.get(id).await?;
+    let canonical = task.external_id.unwrap_or_else(|| format!("internal:{id}"));
+    if canonical == task_id {
+        return Ok(direct);
+    }
+    let resolved = pin_at_key(store, repo, &canonical).await?;
+    if direct.is_some() && resolved.is_some() && direct != resolved {
+        return Err(GuardError::PinMismatch.into());
+    }
+    // Preserve direct evidence as well: a malformed/conflicting alias cannot
+    // downgrade a task just because the canonical key is absent.
+    Ok(resolved.or(direct))
+}
+
+async fn pin_at_key(
+    store: &TaskStore,
+    repo: &str,
+    task_id: &str,
+) -> anyhow::Result<Option<ProfilePin>> {
+    let pin: Option<ProfilePin> = store
         .kv_get(&key(repo, task_id))
         .await?
-        .map(|s| serde_json::from_str(&s).map_err(Into::into))
-        .transpose()
+        .map(|s| serde_json::from_str(&s))
+        .transpose()?;
+    if pin
+        .as_ref()
+        .is_some_and(|pin| pin.repository != repo || pin.issue_id != task_id)
+    {
+        return Err(GuardError::PinMismatch.into());
+    }
+    Ok(pin)
 }
 
 pub async fn persist_pin(store: &TaskStore, pin: &ProfilePin) -> anyhow::Result<()> {
