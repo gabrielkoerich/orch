@@ -408,6 +408,55 @@ fn result_envelope_completed(raw_stdout: &str) -> bool {
         })
 }
 
+// A timeout kill has no result envelope. Salvage only the wrap-up shape: a successful
+// `git commit`, then only shell calls that all returned ok. Returns the last assistant text
+fn salvage_wrapup(raw: &str) -> Option<String> {
+    use serde_json::Value;
+    // (tool name, command, finished ok) in call order
+    let mut calls: Vec<(String, String, Option<bool>)> = Vec::new();
+    let mut last_text = String::new();
+    for v in raw
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
+    {
+        let blocks = v.pointer("/message/content").and_then(|c| c.as_array());
+        for b in blocks.into_iter().flatten() {
+            match b.get("type").and_then(|t| t.as_str()) {
+                Some("tool_use") => calls.push((
+                    b["name"].as_str().unwrap_or("").to_string(),
+                    b.pointer("/input/command")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    None,
+                )),
+                Some("text") if v["type"] == "assistant" => {
+                    last_text = b["text"].as_str().unwrap_or("").to_string();
+                }
+                Some("tool_result") => {
+                    let ok = b.get("is_error").and_then(|e| e.as_bool()) != Some(true);
+                    // results arrive in call order, fill the first unanswered call
+                    if let Some(c) = calls.iter_mut().find(|c| c.2.is_none()) {
+                        c.2 = Some(ok);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let commit = calls
+        .iter()
+        .rposition(|(_, cmd, ok)| cmd.contains("git commit") && *ok == Some(true))?;
+    let tail_ok = calls[commit..].iter().all(|(name, _, ok)| {
+        matches!(name.as_str(), "Bash" | "run_terminal_cmd") && *ok == Some(true)
+    });
+    let lower = last_text.to_lowercase();
+    if !tail_ok || lower.contains("still running") || lower.contains("in progress") {
+        return None;
+    }
+    Some(last_text.chars().take(500).collect())
+}
+
 /**
  * Tries `parse_success_output` first when stdout is non-empty. If that succeeds,
  * returns success regardless of exit code. If it fails and `exit_code != 0`,
@@ -431,6 +480,25 @@ pub fn parse_session_output(
         match parse_success_output(task_id, agent_name, agent_runner, &combined_output) {
             Ok(parsed) => return Ok(parsed),
             Err(err) => {
+                if session_output.exit_code == 124 {
+                    if let Some(summary) = salvage_wrapup(&combined_output) {
+                        tracing::warn!(
+                            task_id,
+                            agent = agent_name,
+                            "timed out after commit during wrap-up, salvaging as done"
+                        );
+                        return Ok(agents::ParsedResponse {
+                            response: crate::parser::AgentResponse {
+                                status: "done".to_string(),
+                                summary,
+                                ..Default::default()
+                            },
+                            input_tokens: None,
+                            output_tokens: None,
+                            duration_ms: None,
+                        });
+                    }
+                }
                 // If parse_success_output already returned a classified error
                 // (RateLimit, AgentFailed, Timeout, Auth, etc.), propagate it
                 // directly — only InvalidResponse (unparseable output) should
@@ -3056,6 +3124,32 @@ mod tests {
             .expect_err("is_error=true should return AgentFailed");
 
         assert!(matches!(err, agents::AgentError::AgentFailed { .. }));
+    }
+
+    fn tool_pair(id: &str, name: &str, cmd: &str, is_error: bool) -> String {
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":id,"name":name,"input":{"command":cmd}}]}}),
+            serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":id,"is_error":is_error,"content":"x"}]}}),
+        )
+    }
+
+    #[test]
+    fn salvage_wrapup_accepts_commit_then_cleanup() {
+        let raw = tool_pair("1", "run_terminal_cmd", "git commit -m x", false)
+            + &tool_pair("2", "run_terminal_cmd", "git status", false);
+        assert!(salvage_wrapup(&raw).is_some());
+    }
+
+    #[test]
+    fn salvage_wrapup_rejects_edit_after_commit_or_unanswered_call() {
+        let edit = tool_pair("1", "run_terminal_cmd", "git commit -m x", false)
+            + &tool_pair("2", "search_replace", "", false);
+        assert!(salvage_wrapup(&edit).is_none());
+        let pending = tool_pair("1", "run_terminal_cmd", "git commit -m x", false)
+            + &serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"2","name":"run_terminal_cmd","input":{"command":"cargo test"}}]}}).to_string();
+        assert!(salvage_wrapup(&pending).is_none());
+        assert!(salvage_wrapup(&tool_pair("1", "run_terminal_cmd", "ls", false)).is_none());
     }
 
     // ── terminal_reason:completed + exit 1 detection (issue #3087) ─────────────
