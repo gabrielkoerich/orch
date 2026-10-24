@@ -1030,6 +1030,9 @@ async fn parse_review_output(
 
     let raw_output =
         runner::response::read_output_file(&ctx.review_task_id, &ctx.output_file, repo).await;
+    let raw_output = runner::agents::claude::strip_tty_control_lines(&raw_output);
+    let has_result_envelope =
+        runner::agents::claude::find_ndjson_result_line(&raw_output).is_some();
     let agent_result = runner::agents::find_agent_result(&ctx.review_agent, &raw_output);
     let token_usage = RunTokenUsage {
         input_tokens: agent_result
@@ -1119,11 +1122,9 @@ async fn parse_review_output(
                 // that would otherwise be misclassified as HTTP 429 errors.
                 let ndjson_completed = ndjson_completed_no_error;
 
-                // When ndjson_completed is true, try to recover the review response
-                // from assistant messages first. This handles agents like kimi/minimax
-                // that exit with non-zero code but have valid responses embedded in
-                // earlier assistant messages (see PR #3130).
-                if ndjson_completed {
+                // Missing type:result (kimi/minimax) or terminal_reason:completed: recover
+                // from assistant text. Never MiniMax parse_response, which synthesizes status=done
+                if ndjson_completed || !has_result_envelope {
                     let assistant_text = runner::agents::collect_assistant_messages_text(
                         &ctx.review_agent,
                         &raw_output,
@@ -1309,6 +1310,33 @@ async fn parse_review_output(
                     return ReviewPhase::EarlyReturn(ReviewDecision::Failed(stored_error));
                 }
 
+                // No envelope and last content is thinking/tool_use: retry without
+                // the persistent format-failure cooldown (issue #3734)
+                if runner::agents::claude::review_session_exited_mid_thought(&raw_output) {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        agent = %ctx.review_agent,
+                        model = ?ctx.review_model,
+                        "review session exited mid-thought with no result envelope \
+                         — storing as incomplete and retrying without persistent cooldown"
+                    );
+                    let stored_error =
+                        "incomplete: review session exited before producing a decision".to_string();
+                    complete_review_run(
+                        store,
+                        run.run_id,
+                        Some(exit_code),
+                        &raw_output,
+                        &stderr,
+                        &text_for_review,
+                        "incomplete",
+                        &stored_error,
+                        token_usage,
+                    )
+                    .await;
+                    return ReviewPhase::EarlyReturn(ReviewDecision::Failed(stored_error));
+                }
+
                 tracing::error!(
                     task_id = task.id.0,
                     error = %e,
@@ -1318,11 +1346,8 @@ async fn parse_review_output(
                     "failed to parse review response"
                 );
                 if let Some(model) = ctx.review_model.as_deref() {
-                    // Structural format failure: the model ran and produced output but
-                    // couldn't format it as a parseable review response. Use persistent
-                    // backoff (4h base → 7d max) so the model isn't re-selected after
-                    // the short 5-min base backoff expires and another task's success
-                    // resets the failure counter via record_agent_success.
+                    // Finished output that is not a review decision: persistent backoff
+                    // (4h base → 7d max) so a later success cannot immediately re-select it
                     crate::engine::cooldown::record_persistent_model_failure(
                         &ctx.review_agent,
                         model,
@@ -3547,6 +3572,215 @@ mod tests {
             token_usage: RunTokenUsage::default(),
             review_notes_for_comment: String::new(),
             decision,
+        }
+    }
+
+    fn write_review_output(dir: &std::path::Path, stdout: &str, exit_code: i32) {
+        std::fs::write(dir.join("output.txt"), stdout).unwrap();
+        std::fs::write(dir.join("exit.txt"), exit_code.to_string()).unwrap();
+        std::fs::write(dir.join("stderr.txt"), "").unwrap();
+    }
+
+    /// A kimi review that exits mid-thought (no result envelope, last content is a
+    /// thinking block) must be stored as incomplete and must not apply the 4h
+    /// persistent model cooldown (issue #3734).
+    #[serial_test::serial(cooldown_state)]
+    #[tokio::test]
+    async fn parse_review_output_mid_thought_is_incomplete_without_persistent_cooldown() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let work_dir = TempDir::new().unwrap();
+        let agent = "kimi";
+        let model = "opus-3734-mid-thought";
+        let ctx = test_review_context(agent, model, work_dir.path());
+        let redraw = "^D\u{0008}".repeat(20);
+        let ndjson = format!(
+            "{}\n{}\n{}\n{}\n{}",
+            r#"{"type":"system","subtype":"thinking_tokens","tokens":1945}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"CI passes. Now verifying callers and the lease logic edge cases:"}],"stop_reason":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"checking lease edge cases"}],"stop_reason":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            "\x1b[?25h",
+            redraw,
+        );
+        write_review_output(work_dir.path(), &ndjson, 0);
+
+        let task = test_review_task("3734");
+        let phase = parse_review_output(
+            &task,
+            "owner/repo",
+            &ctx,
+            ReviewRun { run_id: None },
+            &store,
+        )
+        .await;
+
+        match phase {
+            ReviewPhase::EarlyReturn(ReviewDecision::Failed(reason)) => {
+                assert!(
+                    reason.contains("incomplete:"),
+                    "mid-thought review must be stored as incomplete, got {reason}"
+                );
+            }
+            ReviewPhase::EarlyReturn(_) => panic!("expected Failed(incomplete)"),
+            ReviewPhase::Ready(_) => panic!("expected Failed(incomplete), got Ready"),
+        }
+        assert!(
+            !crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            "mid-thought incomplete must not apply persistent model cooldown"
+        );
+    }
+
+    /// A tool_use as the last assistant content with no result envelope is the
+    /// same incomplete shape as a thinking block (issue #3734).
+    #[serial_test::serial(cooldown_state)]
+    #[tokio::test]
+    async fn parse_review_output_tool_use_without_envelope_is_incomplete() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let work_dir = TempDir::new().unwrap();
+        let agent = "kimi";
+        let model = "opus-3734-tool-use";
+        let ctx = test_review_context(agent, model, work_dir.path());
+        let ndjson = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"src/lib.rs"}}]}}"#;
+        write_review_output(work_dir.path(), ndjson, 0);
+
+        let task = test_review_task("3734-tool");
+        let phase = parse_review_output(
+            &task,
+            "owner/repo",
+            &ctx,
+            ReviewRun { run_id: None },
+            &store,
+        )
+        .await;
+
+        match phase {
+            ReviewPhase::EarlyReturn(ReviewDecision::Failed(reason)) => {
+                assert!(
+                    reason.contains("incomplete:"),
+                    "tool_use without envelope must be incomplete, got {reason}"
+                );
+            }
+            ReviewPhase::EarlyReturn(_) => panic!("expected Failed(incomplete)"),
+            ReviewPhase::Ready(_) => panic!("expected Failed(incomplete), got Ready"),
+        }
+        assert!(!crate::engine::cooldown::is_model_in_cooldown(agent, model));
+    }
+
+    /// A finished result envelope whose text is not a review decision still
+    /// gets the persistent format-failure cooldown.
+    #[serial_test::serial(cooldown_state)]
+    #[tokio::test]
+    async fn parse_review_output_unparseable_envelope_applies_persistent_cooldown() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let work_dir = TempDir::new().unwrap();
+        let agent = "kimi";
+        let model = "opus-3734-format";
+        let ctx = test_review_context(agent, model, work_dir.path());
+        let ndjson = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"I have finished looking at the code."}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"I have finished looking at the code."}"#,
+        );
+        write_review_output(work_dir.path(), ndjson, 0);
+
+        let task = test_review_task("3734-format");
+        let phase = parse_review_output(
+            &task,
+            "owner/repo",
+            &ctx,
+            ReviewRun { run_id: None },
+            &store,
+        )
+        .await;
+
+        match phase {
+            ReviewPhase::EarlyReturn(ReviewDecision::Failed(reason)) => {
+                assert!(
+                    reason.contains("parse error"),
+                    "finished unparseable envelope must stay a parse error, got {reason}"
+                );
+            }
+            ReviewPhase::EarlyReturn(_) => panic!("expected Failed(parse error)"),
+            ReviewPhase::Ready(_) => panic!("expected Failed(parse error), got Ready"),
+        }
+        assert!(
+            crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            "finished format failure must apply persistent model cooldown"
+        );
+    }
+
+    /// Missing result envelope with a review decision in assistant text uses
+    /// the assistant-text extractor, not MiniMax status=done synthesis.
+    #[serial_test::serial(cooldown_state)]
+    #[tokio::test]
+    async fn parse_review_output_missing_envelope_uses_assistant_decision() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let work_dir = TempDir::new().unwrap();
+        let agent = "kimi";
+        let model = "opus-3734-assistant";
+        let ctx = test_review_context(agent, model, work_dir.path());
+        let ndjson = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"{\"decision\":\"approve\",\"notes\":\"LGTM\",\"issues\":[]}"}]}}"#;
+        write_review_output(work_dir.path(), ndjson, 0);
+
+        let task = test_review_task("3734-asst");
+        let phase = parse_review_output(
+            &task,
+            "owner/repo",
+            &ctx,
+            ReviewRun { run_id: None },
+            &store,
+        )
+        .await;
+
+        match phase {
+            ReviewPhase::Ready(parsed) => {
+                assert!(matches!(parsed.decision, ReviewDecision::Approve));
+            }
+            ReviewPhase::EarlyReturn(_) => {
+                panic!("expected Ready(Approve) from assistant text, got EarlyReturn")
+            }
+        }
+        assert!(!crate::engine::cooldown::is_model_in_cooldown(agent, model));
+    }
+
+    /// MiniMax/Kimi parse_response synthesizes status=done from any assistant
+    /// text. That task-path fallback must not be treated as a review approval.
+    #[serial_test::serial(cooldown_state)]
+    #[tokio::test]
+    async fn parse_review_output_does_not_treat_task_done_synthesis_as_approval() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let work_dir = TempDir::new().unwrap();
+        let agent = "kimi";
+        let model = "opus-3734-done";
+        let ctx = test_review_context(agent, model, work_dir.path());
+        let ndjson = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"analyzing the diff"}]}}"#;
+        write_review_output(work_dir.path(), ndjson, 0);
+
+        let task = test_review_task("3734-done");
+        let phase = parse_review_output(
+            &task,
+            "owner/repo",
+            &ctx,
+            ReviewRun { run_id: None },
+            &store,
+        )
+        .await;
+
+        match phase {
+            ReviewPhase::EarlyReturn(ReviewDecision::Failed(reason)) => {
+                assert!(
+                    reason.contains("parse error"),
+                    "unfinished prose without a decision must not approve, got {reason}"
+                );
+            }
+            ReviewPhase::Ready(_) => {
+                panic!("task-path status=done synthesis must not become a review approval")
+            }
+            ReviewPhase::EarlyReturn(_) => panic!("expected Failed(parse error)"),
         }
     }
 
