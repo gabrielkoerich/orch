@@ -740,6 +740,82 @@ fn extract_usage(
     (None, None)
 }
 
+const SHOW_CURSOR: &str = "\x1b[?25h";
+const HIDE_CURSOR: &str = "\x1b[?25l";
+
+/// Drop `script` tty junk: show-cursor (`ESC[?25h`) and `^D`/backspace redraw lines
+pub fn strip_tty_control_lines(raw: &str) -> String {
+    raw.lines()
+        .filter(|line| !is_tty_control_line(line))
+        .map(strip_trailing_cursor)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn strip_trailing_cursor(line: &str) -> &str {
+    let mut s = line.trim_end();
+    loop {
+        if let Some(next) = s
+            .strip_suffix(SHOW_CURSOR)
+            .or_else(|| s.strip_suffix(HIDE_CURSOR))
+        {
+            s = next.trim_end();
+            continue;
+        }
+        return s;
+    }
+}
+
+fn is_tty_control_line(line: &str) -> bool {
+    let trimmed = strip_trailing_cursor(line).trim();
+    if trimmed.is_empty() {
+        return !line.trim().is_empty();
+    }
+    trimmed.chars().all(|c| matches!(c, '^' | 'D' | '\u{0008}'))
+}
+
+/// Type of the last content block on the last assistant NDJSON message
+fn last_assistant_content_type(ndjson: &str) -> Option<String> {
+    let mut last = None;
+    for line in ndjson.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if val.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(content) = val
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        else {
+            continue;
+        };
+        if let Some(item) = content.last() {
+            if let Some(t) = item.get("type").and_then(|v| v.as_str()) {
+                last = Some(t.to_string());
+            }
+        }
+    }
+    last
+}
+
+/// True when the stream has no result envelope and ended on a thinking block
+/// or a tool call, so the model never produced a finished review decision
+pub fn review_session_exited_mid_thought(ndjson: &str) -> bool {
+    if find_ndjson_result_line(ndjson).is_some() {
+        return false;
+    }
+    matches!(
+        last_assistant_content_type(ndjson).as_deref(),
+        Some("thinking" | "redacted_thinking" | "tool_use")
+    )
+}
+
 /// Extract a structured `AgentResult` from Claude/Kimi/MiniMax NDJSON output.
 ///
 /// Finds the last `"type":"result"` line whose `result` field contains valid JSON.
@@ -757,7 +833,8 @@ fn extract_usage(
 ///
 /// Returns `None` only if the input contains no recognizable NDJSON events.
 pub fn find_claude_result(ndjson: &str) -> Option<super::AgentResult> {
-    let trimmed = ndjson.trim();
+    let stripped = strip_tty_control_lines(ndjson);
+    let trimmed = stripped.trim();
     if trimmed.is_empty() {
         return None;
     }
@@ -1694,6 +1771,90 @@ mod tests {
     fn find_claude_result_plain_text_returns_none() {
         // Plain text (not NDJSON) should return None
         assert!(find_claude_result("just some plain text output").is_none());
+    }
+
+    #[test]
+    fn strip_tty_control_lines_drops_show_cursor_and_ctrl_d_redraw() {
+        let redraw = "^D\u{0008}".repeat(20);
+        let raw = format!(
+            "{}\n{}\n{}\n{}\n{}",
+            r#"{"type":"system","subtype":"init"}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hello"}]}}"#,
+            SHOW_CURSOR,
+            redraw,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"decision\":\"approve\",\"notes\":\"LGTM\",\"issues\":[]}"}"#,
+        );
+        let cleaned = strip_tty_control_lines(&raw);
+        assert!(
+            !cleaned.contains(SHOW_CURSOR),
+            "show-cursor sequence must be stripped"
+        );
+        assert!(
+            !cleaned.contains('\u{0008}'),
+            "backspace redraw line must be stripped"
+        );
+        assert!(cleaned.contains("\"type\":\"result\""));
+        assert!(cleaned.contains("hello"));
+    }
+
+    #[test]
+    fn strip_tty_control_lines_strips_trailing_cursor_on_json_line() {
+        let line = format!(
+            r#"{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}{SHOW_CURSOR}"#
+        );
+        let cleaned = strip_tty_control_lines(&line);
+        assert_eq!(
+            cleaned,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#
+        );
+    }
+
+    #[test]
+    fn find_claude_result_ignores_trailing_tty_junk() {
+        let ndjson = format!(
+            "{}\n{}\n{}",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"decision\":\"approve\",\"notes\":\"LGTM\",\"issues\":[]}","usage":{"input_tokens":10,"output_tokens":4}}"#,
+            SHOW_CURSOR,
+        );
+        let result = find_claude_result(&ndjson).expect("result envelope should still parse");
+        assert!(result.result_text.contains("approve"));
+        assert_eq!(result.input_tokens, Some(10));
+    }
+
+    #[test]
+    fn review_session_exited_mid_thought_detects_thinking_without_envelope() {
+        let ndjson = concat!(
+            r#"{"type":"system","subtype":"thinking_tokens","tokens":12}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"CI passes. Now verifying callers:"}],"stop_reason":null,"usage":{"output_tokens":0}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"checking lease edge cases"}],"stop_reason":null,"usage":{"output_tokens":0}}}"#,
+        );
+        assert!(review_session_exited_mid_thought(ndjson));
+        assert!(find_ndjson_result_line(ndjson).is_none());
+    }
+
+    #[test]
+    fn review_session_exited_mid_thought_detects_tool_use_without_envelope() {
+        let ndjson = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"src/lib.rs"}}]}}"#;
+        assert!(review_session_exited_mid_thought(ndjson));
+    }
+
+    #[test]
+    fn review_session_exited_mid_thought_false_when_envelope_present() {
+        let ndjson = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"done"}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"decision\":\"approve\",\"notes\":\"LGTM\",\"issues\":[]}"}"#,
+        );
+        assert!(!review_session_exited_mid_thought(ndjson));
+    }
+
+    #[test]
+    fn review_session_exited_mid_thought_false_for_finished_text() {
+        let ndjson = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"I have finished looking at the code."}]}}"#;
+        assert!(!review_session_exited_mid_thought(ndjson));
     }
 
     #[test]

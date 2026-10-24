@@ -662,6 +662,17 @@ async fn classify_review_failure(
         return ReviewOutcome::Reset;
     }
 
+    // Session exited mid-thought with no result envelope (issue #3734). Same
+    // treatment as a parse error: retry without counting toward the failure cap
+    if lower_reason.contains("incomplete:") {
+        tracing::warn!(
+            task_id,
+            reason,
+            "{context} session incomplete — re-routing for retry without counting as failure"
+        );
+        return ReviewOutcome::Reset;
+    }
+
     // The review output was cut off by the model's output/reasoning token
     // budget, not a genuine parse/format failure. Same treatment as a parse
     // error: re-route without counting toward MAX_REVIEW_AGENT_FAILURES.
@@ -833,6 +844,49 @@ async fn post_review_failure_comment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An incomplete mid-thought review (no result envelope) must reset for
+    /// retry without counting toward MAX_REVIEW_AGENT_FAILURES (issue #3734).
+    #[tokio::test]
+    async fn classify_review_failure_incomplete_resets_without_counting() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let repo = "owner/repo";
+        let store_id = store
+            .create_internal(
+                repo,
+                "Incomplete review test",
+                "",
+                "review",
+                "review-3734",
+                None,
+            )
+            .await
+            .unwrap();
+        let task_id = format!("internal:{store_id}");
+
+        for _ in 0..(MAX_REVIEW_AGENT_FAILURES + 1) {
+            let outcome = classify_review_failure(
+                &store,
+                repo,
+                &task_id,
+                "incomplete: review session exited before producing a decision",
+                "review agent",
+            )
+            .await;
+            assert!(
+                matches!(outcome, ReviewOutcome::Reset),
+                "incomplete review failure must reset for retry, not block"
+            );
+        }
+
+        let task = opt_store_get_task(&Some(store.clone()), repo, &task_id)
+            .await
+            .expect("task should exist");
+        assert_eq!(
+            task.review_agent_failures, 0,
+            "incomplete failures must not count toward review_agent_failures"
+        );
+    }
 
     /// A truncated review output (opencode step_finish reason=length) must be
     /// treated like a parse error: reset for retry without counting toward
