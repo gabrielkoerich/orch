@@ -1257,6 +1257,173 @@ fn sanitize_push_error(stderr: &str) -> String {
     crate::security::redact(&no_userinfo)
 }
 
+/// Drop sentences and list items about pushing or opening the PR
+/// Agents report they could not push, orch already pushed, so those lines read as false on GitHub
+fn strip_push_and_pr_creation(text: &str) -> String {
+    let mut kept_lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            if kept_lines.last().is_some_and(|l| !l.is_empty()) {
+                kept_lines.push(String::new());
+            }
+            continue;
+        }
+
+        let indent_len = line.len() - line.trim_start().len();
+        let indent = &line[..indent_len];
+        let trimmed = line.trim();
+        let (marker, rest) = match list_marker(trimmed) {
+            Some((m, r)) => (m, r),
+            None => ("", trimmed),
+        };
+
+        let kept: Vec<&str> = split_statements(rest)
+            .into_iter()
+            .filter(|s| !is_push_or_pr_creation_statement(s))
+            .collect();
+        if kept.is_empty() {
+            continue;
+        }
+        kept_lines.push(format!("{indent}{marker}{}", kept.join(" ")));
+    }
+    while kept_lines.last().is_some_and(String::is_empty) {
+        kept_lines.pop();
+    }
+    kept_lines.join("\n")
+}
+
+fn split_statements(text: &str) -> Vec<&str> {
+    static SEP: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(\.{2,}|(?:[.!?]))\s+").expect("valid statement separator"));
+    let mut statements = Vec::new();
+    let mut last = 0;
+    for cap in SEP.captures_iter(text) {
+        let full = cap.get(0).expect("full separator match");
+        let punct = cap.get(1).expect("punctuation capture");
+        let ellipsis = punct.as_str().len() >= 2 && punct.as_str().bytes().all(|b| b == b'.');
+        let end = if ellipsis { punct.start() } else { punct.end() };
+        let stmt = text[last..end].trim();
+        if !stmt.is_empty() {
+            statements.push(stmt);
+        }
+        last = full.end();
+    }
+    let rest = text[last..].trim();
+    if !rest.is_empty() {
+        statements.push(rest);
+    }
+    statements
+}
+
+fn list_marker(line: &str) -> Option<(&str, &str)> {
+    for prefix in ["- ", "* ", "+ "] {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            return Some((prefix, rest));
+        }
+    }
+    let dot = line.find(". ")?;
+    if !line[..dot].is_empty() && line[..dot].bytes().all(|b| b.is_ascii_digit()) {
+        Some((&line[..dot + 2], &line[dot + 2..]))
+    } else {
+        None
+    }
+}
+
+fn is_push_or_pr_creation_statement(text: &str) -> bool {
+    static PAT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(concat!(
+            r"(?i)",
+            r"\bgit\s+push\b",
+            r"|\bgh\s+pr\s+create\b",
+            r"|\bgh\s+pr\s+open\b",
+            r"|\bpush\s+(was\s+)?(denied|blocked|rejected)\b",
+            r"|\bpush\s+permission\b",
+            r"|\bcouldn['’]?t\s+push\b",
+            r"|\bcould\s+not\s+push\b",
+            r"|\bcan['’]?t\s+push\b",
+            r"|\bcannot\s+push\b",
+            r"|\bdidn['’]?t\s+push\b",
+            r"|\bdid\s+not\s+push\b",
+            r"|\bnothing\s+is\s+on\s+the\s+remote\b",
+            r"|\bnot\s+on\s+the\s+remote\b",
+            r"|\bopen(?:ing)?\s+(?:the|a)\s+pr\b",
+            r"|\bcreat(?:e|ing)\s+(?:the|a)\s+pr\b",
+            r"|\bopen(?:ing)?\s+(?:the|a)\s+pull\s+request\b",
+            r"|\bcreat(?:e|ing)\s+(?:the|a)\s+pull\s+request\b",
+        ))
+        .expect("valid push/pr-creation regex")
+    });
+    PAT.is_match(text)
+}
+
+fn cleaned_pr_items(items: &[String]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let cleaned = strip_push_and_pr_creation(item);
+            (!cleaned.is_empty()).then_some(cleaned)
+        })
+        .collect()
+}
+
+/// Format the GitHub PR description from the agent summary, stripping push and PR-creation statements
+#[allow(clippy::too_many_arguments)]
+fn build_pr_body(
+    title: &str,
+    summary: &str,
+    accomplished: &[String],
+    remaining: &[String],
+    files: &[String],
+    task_id: &str,
+    agent: &str,
+    model: Option<&str>,
+) -> String {
+    let cleaned_summary = strip_push_and_pr_creation(summary);
+    let summary_text = if cleaned_summary.is_empty() {
+        title
+    } else {
+        cleaned_summary.as_str()
+    };
+    let accomplished = cleaned_pr_items(accomplished);
+    let remaining = cleaned_pr_items(remaining);
+
+    let mut body = format!("## Summary\n\n{summary_text}");
+
+    if !accomplished.is_empty() {
+        body.push_str("\n\n### What was done\n\n");
+        for item in &accomplished {
+            body.push_str(&format!("- {item}\n"));
+        }
+    }
+
+    if !remaining.is_empty() {
+        body.push_str("\n\n### Remaining\n\n");
+        for item in &remaining {
+            body.push_str(&format!("- {item}\n"));
+        }
+    }
+
+    if !files.is_empty() {
+        body.push_str("\n\n### Files changed\n\n");
+        for file in files {
+            body.push_str(&format!("- `{file}`\n"));
+        }
+    }
+
+    if !task_id.starts_with("internal:") {
+        if let Ok(issue_num) = task_id.parse::<u64>() {
+            body.push_str(&format!("\n\nCloses #{issue_num}"));
+        }
+    }
+
+    let model_str = model.map(|m| format!(" using `{m}`")).unwrap_or_default();
+    let task_ref = format_task_ref(task_id);
+    body.push_str(&format!(
+        "\n\n---\n*Task {task_ref} · Created by {agent}[bot] via [Orch](https://github.com/gabrielkoerich/orch){model_str}*"
+    ));
+    body
+}
+
 /// Create a PR if one doesn't already exist.
 ///
 /// Uses [`GhHttp`] exclusively for GitHub API operations. No `gh` CLI
@@ -1307,26 +1474,6 @@ pub async fn create_pr_if_needed(
         }
     }
 
-    // Build PR body
-    let mut body = format!(
-        "## Summary\n\n{}",
-        if summary.is_empty() { title } else { summary }
-    );
-
-    if !accomplished.is_empty() {
-        body.push_str("\n\n### What was done\n\n");
-        for item in accomplished {
-            body.push_str(&format!("- {item}\n"));
-        }
-    }
-
-    if !remaining.is_empty() {
-        body.push_str("\n\n### Remaining\n\n");
-        for item in remaining {
-            body.push_str(&format!("- {item}\n"));
-        }
-    }
-
     // When the agent didn't self-report files, derive them from git.
     let git_files: Vec<String>;
     let effective_files: &[String] = if files.is_empty() {
@@ -1354,26 +1501,16 @@ pub async fn create_pr_if_needed(
         files
     };
 
-    if !effective_files.is_empty() {
-        body.push_str("\n\n### Files changed\n\n");
-        for file in effective_files {
-            body.push_str(&format!("- `{file}`\n"));
-        }
-    }
-
-    // Link PR to the issue so GitHub shows the connection in the sidebar.
-    // Only for external tasks (issue numbers), not internal ones.
-    if !task_id.starts_with("internal:") {
-        if let Ok(issue_num) = task_id.parse::<u64>() {
-            body.push_str(&format!("\n\nCloses #{issue_num}"));
-        }
-    }
-
-    let model_str = model.map(|m| format!(" using `{m}`")).unwrap_or_default();
-    let task_ref = format_task_ref(task_id);
-    body.push_str(&format!(
-        "\n\n---\n*Task {task_ref} · Created by {agent}[bot] via [Orch](https://github.com/gabrielkoerich/orch){model_str}*"
-    ));
+    let body = build_pr_body(
+        title,
+        summary,
+        accomplished,
+        remaining,
+        effective_files,
+        task_id,
+        agent,
+        model,
+    );
 
     // Always use the short task title for the PR title (summary goes in body)
     let pr_title = title;
@@ -2519,5 +2656,99 @@ mod tests {
         assert!(!is_invalid_base_error(
             "GitHub API POST .../pulls failed (404): Not Found"
         ));
+    }
+
+    fn pr_summary(body: &str) -> &str {
+        let rest = body
+            .strip_prefix("## Summary\n\n")
+            .expect("PR body starts with ## Summary");
+        rest.split("\n\n").next().unwrap()
+    }
+
+    fn assert_no_push_or_pr_creation(body: &str) {
+        let lower = body.to_ascii_lowercase();
+        for needle in [
+            "git push",
+            "gh pr create",
+            "did not push",
+            "couldn't push",
+            "could not push",
+            "push was denied",
+            "push was blocked",
+            "push permission",
+            "nothing is on the remote",
+            "open the pr",
+        ] {
+            assert!(
+                !lower.contains(needle),
+                "PR body still contains {needle:?}:\n{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_pr_body_strips_push_and_pr_creation_statements() {
+        let examples = [
+            (
+                concat!(
+                    "Added the lesson list page. ",
+                    "I did not push or open the PR, because the push was blocked on a permission prompt. ",
+                    "Run `git push -u origin HEAD`, then `gh pr create`.",
+                ),
+                "Added the lesson list page.",
+            ),
+            (
+                "It is committed locally ... The push was denied, so nothing is on the remote yet.",
+                "It is committed locally",
+            ),
+            (
+                concat!(
+                    "Fixed the quiz scoring. ",
+                    "I couldn't push it because the push permission was denied.",
+                ),
+                "Fixed the quiz scoring.",
+            ),
+        ];
+        for (summary, work) in examples {
+            let body = build_pr_body(
+                "Fix the widget",
+                summary,
+                &[
+                    "Wrote the lesson list".into(),
+                    "Could not push because the push permission was denied".into(),
+                ],
+                &["Run `git push -u origin HEAD`".into()],
+                &[],
+                "16",
+                "claude",
+                None,
+            );
+            assert_eq!(pr_summary(&body), work);
+            assert!(body.contains("Wrote the lesson list"));
+            assert!(!body.contains("### Remaining"));
+            assert_no_push_or_pr_creation(&body);
+        }
+    }
+
+    #[test]
+    fn build_pr_body_keeps_summary_without_push_text() {
+        let summary = "Added retry logic for GitHub 5xx errors.";
+        let accomplished = vec!["Extracted the PR body builder".into()];
+        let remaining = vec!["Watch CI after merge".into()];
+        let body = build_pr_body(
+            "Fix the widget",
+            summary,
+            &accomplished,
+            &remaining,
+            &["src/engine/runner/git_ops.rs".into()],
+            "16",
+            "claude",
+            Some("sonnet"),
+        );
+        assert_eq!(pr_summary(&body), summary);
+        assert!(body.contains("### What was done\n\n- Extracted the PR body builder\n"));
+        assert!(body.contains("### Remaining\n\n- Watch CI after merge\n"));
+        assert!(body.contains("- `src/engine/runner/git_ops.rs`"));
+        assert!(body.contains(" using `sonnet`"));
     }
 }
