@@ -647,6 +647,9 @@ enum TaskAction {
         /// Task source (e.g., manual, cron, mention)
         #[arg(short, long, default_value = "manual")]
         source: String,
+        /// Issue this task waits on. Repeat for more than one. A bare number uses the current repo. `owner/repo#N` names another repo
+        #[arg(long = "depends-on")]
+        depends_on: Vec<String>,
     },
     /// Get task details
     Get {
@@ -725,6 +728,14 @@ enum TaskAction {
     Tree {
         /// Task ID (if omitted, shows all root tasks)
         id: Option<i64>,
+        /// Show blocked-by edges instead of parent and child edges
+        #[arg(long)]
+        deps: bool,
+    },
+    /// Show what a task waits on, and what waits on it
+    Deps {
+        /// Task ID
+        id: String,
     },
     /// Show logs / post-mortem for a task (internal or external)
     Logs {
@@ -1164,8 +1175,9 @@ async fn async_main() -> anyhow::Result<()> {
                 body,
                 labels,
                 source,
+                depends_on,
             } => {
-                cli::task::add(title, body, labels, source).await?;
+                cli::task::add(title, body, labels, source, depends_on).await?;
             }
             TaskAction::Get { id } => {
                 cli::task::get(id).await?;
@@ -1203,8 +1215,11 @@ async fn async_main() -> anyhow::Result<()> {
             TaskAction::Cost { id } => {
                 cli::task::cost(&id).await?;
             }
-            TaskAction::Tree { id } => {
-                cli::task::tree(id).await?;
+            TaskAction::Tree { id, deps } => {
+                cli::task::tree(id, deps).await?;
+            }
+            TaskAction::Deps { id } => {
+                cli::task::deps(&id).await?;
             }
             TaskAction::Logs { id } => {
                 cli::task::logs(&id).await?;

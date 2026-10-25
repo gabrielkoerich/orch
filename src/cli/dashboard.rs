@@ -33,6 +33,7 @@ pub async fn dashboard(global: bool, project: Option<String>) -> anyhow::Result<
         Status::Done,
         Status::NeedsReview,
         Status::Blocked,
+        Status::Waiting,
     ];
 
     // Fetch all tasks from both backends
@@ -57,6 +58,7 @@ pub async fn dashboard(global: bool, project: Option<String>) -> anyhow::Result<
             Status::Blocked => TaskStatus::Blocked,
             Status::InReview => TaskStatus::InReview,
             Status::NeedsReview => TaskStatus::NeedsReview,
+            Status::Waiting => TaskStatus::Waiting,
         };
         let int_count = all_internal.iter().filter(|t| t.status == ts).count();
         total += ext_filtered.len() + int_count;

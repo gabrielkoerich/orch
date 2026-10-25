@@ -53,6 +53,7 @@ pub enum Status {
     Blocked,
     InReview,
     NeedsReview,
+    Waiting,
 }
 
 impl Status {
@@ -65,6 +66,7 @@ impl Status {
             Self::Blocked => "status:blocked",
             Self::InReview => "status:in_review",
             Self::NeedsReview => "status:needs_review",
+            Self::Waiting => "status:waiting",
         }
     }
 
@@ -77,8 +79,47 @@ impl Status {
             Self::Blocked => "blocked",
             Self::InReview => "in_review",
             Self::NeedsReview => "needs_review",
+            Self::Waiting => "waiting",
         }
     }
+}
+
+/// One issue that blocks another, from `GET .../dependencies/blocked_by`.
+///
+/// The REST endpoint is GA since 2025-08-21. No preview media type.
+/// Callers send `X-GitHub-Api-Version: 2026-03-10`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedByIssue {
+    pub github_id: i64,
+    pub repo: String,
+    pub number: i64,
+    pub state: String,
+    pub state_reason: Option<String>,
+}
+
+/// Merge and review state of one pull request, read from GitHub.
+///
+/// `approved` is the latest substantive review, `APPROVED` or
+/// `CHANGES_REQUESTED`. A comment or a dismissed review does not count
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestCompletion {
+    pub merged: bool,
+    pub base_ref: String,
+    pub default_branch: String,
+    pub approved: bool,
+    pub closed: bool,
+}
+
+/// Result of reading native blocked-by links.
+///
+/// `Native` is authoritative, including when the list is empty.
+/// `Unavailable` means the API is missing or forbidden, so the body is the fallback.
+/// `Failed` means the read did not succeed, so stored rows stay as they are
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockedByFetch {
+    Native(Vec<BlockedByIssue>),
+    Unavailable,
+    Failed(String),
 }
 
 /// The core trait for external task backends.
@@ -194,6 +235,7 @@ pub trait ExternalBackend: Send + Sync {
             Status::Blocked,
             Status::InReview,
             Status::NeedsReview,
+            Status::Waiting,
         ];
         let mut all_tasks = Vec::new();
         for status in statuses {
@@ -251,6 +293,7 @@ pub trait ExternalBackend: Send + Sync {
             Status::NeedsReview,
             Status::InReview,
             Status::Blocked,
+            Status::Waiting,
         ];
         for status in active_non_new {
             if let Ok(tasks) = self.list_by_status(status).await {
@@ -435,6 +478,62 @@ pub trait ExternalBackend: Send + Sync {
     /// Default is a no-op; GitHub backend adds an eyes emoji reaction to the comment.
     async fn acknowledge_mention(&self, _comment_id: &str) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Native blocked-by issues for `issue_number` in `repo`.
+    ///
+    /// Default is `Unavailable`, which keeps the body fallback. A 200 with an
+    /// empty list is `Native`, not this default
+    async fn blocked_by(&self, _repo: &str, _issue_number: i64) -> anyhow::Result<BlockedByFetch> {
+        Ok(BlockedByFetch::Unavailable)
+    }
+
+    /// Close state of an issue orch may not track.
+    ///
+    /// `Ok(None)` means unknown. Callers treat unknown as still open
+    async fn issue_close_state(
+        &self,
+        _repo: &str,
+        _issue_number: i64,
+    ) -> anyhow::Result<Option<(String, Option<String>)>> {
+        Ok(None)
+    }
+
+    /// Post a comment on an issue in `repo`, which may differ from this backend's repo.
+    ///
+    /// The default posts through `post_comment`, which uses the backend repo
+    async fn post_comment_in_repo(
+        &self,
+        _repo: &str,
+        id: &ExternalId,
+        body: &str,
+    ) -> anyhow::Result<()> {
+        self.post_comment(id, body).await
+    }
+
+    /// Review and merge state of pull request `pr_number` in `repo`.
+    ///
+    /// `Ok(None)` means the pull request does not exist. Callers that already
+    /// know a PR number treat that as not merged
+    async fn pull_request_completion(
+        &self,
+        _repo: &str,
+        _pr_number: i64,
+    ) -> anyhow::Result<Option<PullRequestCompletion>> {
+        Ok(None)
+    }
+
+    /// Record that `issue_number` in this backend's repo is blocked by another issue.
+    ///
+    /// The blocking issue is named by repository and number. The write uses that
+    /// issue's database id, which is valid across repositories
+    async fn add_dependency(
+        &self,
+        _issue_number: i64,
+        _blocking_repo: &str,
+        _blocking_number: i64,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("this backend cannot write issue dependencies")
     }
 }
 

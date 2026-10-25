@@ -1741,6 +1741,7 @@ fn task_status_to_backend_status(status: TaskStatus) -> crate::backends::Status 
         TaskStatus::Blocked => crate::backends::Status::Blocked,
         TaskStatus::InReview => crate::backends::Status::InReview,
         TaskStatus::NeedsReview => crate::backends::Status::NeedsReview,
+        TaskStatus::Waiting => crate::backends::Status::Waiting,
     }
 }
 

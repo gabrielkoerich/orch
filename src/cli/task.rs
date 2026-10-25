@@ -111,6 +111,38 @@ fn matches_project_filter(repo: &str, project: &str) -> bool {
     repo == project || repo_name == project || repo.ends_with(&format!("/{project}"))
 }
 
+fn waiting_title(title: &str, status: &str, blockers: &[String]) -> String {
+    if status == "waiting" && !blockers.is_empty() {
+        format!("{title} [waiting on {}]", blockers.join(", "))
+    } else {
+        title.to_string()
+    }
+}
+
+fn dep_label(task_repo: &str, dep_repo: &str, number: i64) -> String {
+    if task_repo == dep_repo {
+        format!("#{number}")
+    } else {
+        format!("{dep_repo}#{number}")
+    }
+}
+
+async fn refuse_external_claim(
+    store: &TaskStore,
+    repo: &str,
+    external_id: &str,
+) -> anyhow::Result<()> {
+    if let Some(id) = store.resolve_task_id(repo, external_id).await? {
+        crate::engine::dependencies::refuse_if_waiting(store, id).await?;
+    }
+    Ok(())
+}
+
+/// True when the task still has an open dependency and must stay `waiting`.
+async fn release_or_keep_waiting(store: &TaskStore, task_id: i64) -> anyhow::Result<bool> {
+    Ok(store.status_after_unblock(task_id).await? == crate::store::TaskStatus::Waiting)
+}
+
 /// List tasks with optional filters.
 pub async fn list(
     status: Option<String>,
@@ -156,6 +188,11 @@ pub async fn list(
         } else {
             std::collections::HashMap::new()
         };
+    let waiting_on = if let Some(ref s) = store {
+        s.unmet_labels_by_task().await.unwrap_or_default()
+    } else {
+        std::collections::HashMap::new()
+    };
 
     println!(
         "{:<15} {:<12} {:<20} {:<24} {:<10} {:<6} {:<5} TITLE",
@@ -188,9 +225,14 @@ pub async fn list(
                         }
                     })
                     .unwrap_or_default();
+                let blockers = store_task
+                    .and_then(|row| waiting_on.get(&row.id))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let title = waiting_title(&ext.title, &status, blockers);
                 println!(
                     "{:<15} {:<12} {:<20} {:<24} {:<10} {:<6} {:<5} {}",
-                    ext.id.0, "external", status, project, agent, age, tries, ext.title
+                    ext.id.0, "external", status, project, agent, age, tries, title
                 );
             }
             Task::Internal(int) => {
@@ -202,6 +244,7 @@ pub async fn list(
                 } else {
                     "-".to_string()
                 };
+                let blockers = waiting_on.get(&int.id).map(Vec::as_slice).unwrap_or(&[]);
                 let title = if int.status == crate::store::TaskStatus::Blocked {
                     if let Some(ref reason) = int.block_reason {
                         format!("{} [blocked: {}]", int.title, reason)
@@ -209,7 +252,7 @@ pub async fn list(
                         int.title.clone()
                     }
                 } else {
-                    int.title.clone()
+                    waiting_title(&int.title, int.status.as_str(), blockers)
                 };
                 println!(
                     "{:<15} {:<12} {:<20} {:<24} {:<10} {:<6} {:<5} {}",
@@ -253,7 +296,7 @@ async fn list_from_global_store(
         } else {
             let task_status = crate::store::TaskStatus::from_str(status_str)
                 .ok_or_else(|| anyhow::anyhow!(
-                    "invalid status: '{}'. allowed: new, routed, in_progress, needs_review, in_review, blocked, done, all",
+                    "invalid status: '{}'. allowed: new, routed, in_progress, needs_review, in_review, blocked, waiting, done, all",
                     status_str
                 ))?;
             store.list_all_by_status_global(task_status).await?
@@ -277,6 +320,8 @@ async fn list_from_global_store(
         println!("No tasks found.");
         return Ok(());
     }
+
+    let waiting_on = store.unmet_labels_by_task().await.unwrap_or_default();
 
     println!(
         "{:<15} {:<12} {:<20} {:<24} {:<10} {:<6} {:<5} TITLE",
@@ -305,6 +350,7 @@ async fn list_from_global_store(
         } else {
             "-".to_string()
         };
+        let blockers = waiting_on.get(&task.id).map(Vec::as_slice).unwrap_or(&[]);
         let title = if task.status == crate::store::TaskStatus::Blocked {
             if let Some(ref reason) = task.block_reason {
                 format!("{} [blocked: {}]", task.title, reason)
@@ -312,7 +358,7 @@ async fn list_from_global_store(
                 task.title.clone()
             }
         } else {
-            task.title.clone()
+            waiting_title(&task.title, task.status.as_str(), blockers)
         };
         println!(
             "{:<15} {:<12} {:<20} {:<24} {:<10} {:<6} {:<5} {}",
@@ -336,11 +382,12 @@ pub async fn add(
     body: Option<String>,
     labels: Vec<String>,
     source: String,
+    depends_on: Vec<String>,
 ) -> anyhow::Result<()> {
     let task_manager = init_task_manager().await?;
 
-    // If labels are provided, create as external (GitHub) task
-    let task_type = if !labels.is_empty() {
+    // Labels or dependencies create a GitHub issue. Dependencies need the native link
+    let task_type = if !labels.is_empty() || !depends_on.is_empty() {
         TaskType::External
     } else {
         TaskType::Internal
@@ -361,10 +408,70 @@ pub async fn add(
             println!("Created internal task #{}: {}", t.id, t.title);
         }
         Task::External(t) => {
+            if !depends_on.is_empty() {
+                link_created_dependencies(&t, &depends_on).await?;
+            }
             println!("Created external task #{}: {}", t.id.0, t.title);
         }
     }
 
+    Ok(())
+}
+
+async fn link_created_dependencies(
+    task: &crate::backends::ExternalTask,
+    depends_on: &[String],
+) -> anyhow::Result<()> {
+    use crate::backends::github::GitHubBackend;
+    use crate::engine::dependencies::parse_depends_on_token;
+    use crate::store::{DepSource, NewDependency, UpsertExternal};
+
+    let repo =
+        config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
+    let issue_number: i64 = task
+        .id
+        .0
+        .parse()
+        .with_context(|| format!("created issue id '{}' is not a number", task.id.0))?;
+    let backend = GitHubBackend::new(repo.clone())?;
+    let store = crate::cli::init_store().await?;
+    let store_id = store
+        .upsert_external(&UpsertExternal {
+            repo: &repo,
+            ext_id: &task.id.0,
+            title: &task.title,
+            body: &task.body,
+            author: &task.author,
+            url: &task.url,
+            labels: &task.labels,
+            origin: "github",
+        })
+        .await?;
+    let mut rows = Vec::new();
+    for token in depends_on {
+        let Some(dep) = parse_depends_on_token(token, &repo) else {
+            anyhow::bail!("invalid --depends-on value '{token}'");
+        };
+        let source = match backend
+            .add_dependency(issue_number, &dep.repo, dep.number)
+            .await
+        {
+            Ok(()) => DepSource::Github,
+            Err(err) => {
+                eprintln!(
+                    "warning: could not link {}#{} on GitHub ({err}). Stored the dependency locally.",
+                    dep.repo, dep.number
+                );
+                DepSource::Cli
+            }
+        };
+        rows.push(NewDependency {
+            repo: dep.repo,
+            number: dep.number,
+            source,
+        });
+    }
+    store.replace_dependencies(store_id, &rows).await?;
     Ok(())
 }
 
@@ -419,6 +526,12 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
                     if !t.last_error.is_empty() {
                         println!("Last error: {}", truncate_err(&t.last_error, 200));
                     }
+                    if t.status == crate::store::TaskStatus::Waiting {
+                        let blockers = s.unmet_blocker_labels(t.id).await.unwrap_or_default();
+                        if !blockers.is_empty() {
+                            println!("Waiting on: {}", blockers.join(", "));
+                        }
+                    }
                 }
             }
             // Cost summary (if any tokens recorded)
@@ -446,6 +559,14 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
             }
             if let Some(reason) = &int.block_reason {
                 println!("Block reason: {}", reason);
+            }
+            if int.status == crate::store::TaskStatus::Waiting {
+                if let Some(ref s) = store {
+                    let blockers = s.unmet_blocker_labels(int.id).await.unwrap_or_default();
+                    if !blockers.is_empty() {
+                        println!("Waiting on: {}", blockers.join(", "));
+                    }
+                }
             }
             // Routing & execution counters
             if int.route_attempts > 0 {
@@ -504,6 +625,7 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
         Status::Blocked,
         Status::InReview,
         Status::NeedsReview,
+        Status::Waiting,
     ];
 
     // Fetch all tasks from both backends
@@ -534,6 +656,7 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
                 Status::Blocked => TaskStatus::Blocked,
                 Status::InReview => TaskStatus::InReview,
                 Status::NeedsReview => TaskStatus::NeedsReview,
+                Status::Waiting => TaskStatus::Waiting,
             };
             all_internal.iter().filter(|t| t.status == ts).count()
         })
@@ -644,6 +767,7 @@ pub async fn route(id: i64) -> anyhow::Result<()> {
 
     let ext_id = ExternalId(id.to_string());
     let task = backend.get_task(&ext_id).await?;
+    refuse_external_claim(&store, &repo, &ext_id.0).await?;
 
     let mut router = Router::from_config();
     let result = router.route(&task, &store, &repo).await?;
@@ -711,6 +835,8 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
         model.as_deref().unwrap_or("default")
     );
 
+    refuse_external_claim(&store, &repo, &task_id).await?;
+
     // Mark in progress
     let ext_id = ExternalId(task_id.clone());
     let started_at = Utc::now();
@@ -755,6 +881,7 @@ pub async fn retry(id: i64, agent: Option<String>, model: Option<String>) -> any
     if let Some(ref s) = store {
         if let Ok(task) = s.get(id).await {
             if task.origin == "internal" {
+                crate::engine::dependencies::refuse_if_waiting(s, id).await?;
                 let internal_id = task
                     .external_id
                     .unwrap_or_else(|| format!("internal:{}", task.id));
@@ -825,6 +952,9 @@ pub async fn retry(id: i64, agent: Option<String>, model: Option<String>) -> any
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
 
     let ext_id = ExternalId(id.to_string());
+    if let Some(ref s) = store {
+        refuse_external_claim(s, &repo, &ext_id.0).await?;
+    }
 
     // Remove existing agent labels
     let task = backend.get_task(&ext_id).await?;
@@ -914,6 +1044,18 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
             let id = task.id.clone();
             async move {
                 store::store_reset_counters(&store, &repo, &id.0).await;
+                if let Some(ref s) = store {
+                    if let Ok(Some(store_id)) = s.resolve_task_id(&repo, &id.0).await {
+                        match s.status_after_unblock(store_id).await {
+                            Ok(TaskStatus::Waiting) => {
+                                let _ = backend.update_status(&id, Status::Waiting).await;
+                                return Ok(());
+                            }
+                            Ok(_) => {}
+                            Err(err) => return Err(err),
+                        }
+                    }
+                }
                 update_status_store_first(&store, &backend, &repo, &id, Status::New).await
             }
         });
@@ -947,7 +1089,10 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
                 let task_id = task.id;
                 async move {
                     store::store_reset_counters(&store, &repo, &ext_id).await;
-                    s.update_status(task_id, TaskStatus::New).await
+                    match s.status_after_unblock(task_id).await? {
+                        TaskStatus::Waiting => Ok(()),
+                        _ => s.update_status(task_id, TaskStatus::New).await,
+                    }
                 }
             });
             for result in join_all(int_futs).await {
@@ -971,11 +1116,15 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
                 .with_context(|| format!("internal task id '{}' is not numeric", stripped))?;
             if let Ok(Some(store_id)) = s.resolve_task_id(&repo, id).await {
                 reset_counters(store_id, &store, &repo).await;
-                s.update_status(store_id, TaskStatus::New).await?;
-                println!(
-                    "Unblocked internal task #{} (attempts reset, will be re-routed)",
-                    parsed
-                );
+                if release_or_keep_waiting(s, store_id).await? {
+                    println!("Task #{parsed} stays waiting on an open dependency");
+                } else {
+                    s.update_status(store_id, TaskStatus::New).await?;
+                    println!(
+                        "Unblocked internal task #{} (attempts reset, will be re-routed)",
+                        parsed
+                    );
+                }
                 return Ok(());
             }
         }
@@ -984,11 +1133,15 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
             if let Ok(task) = s.get(parsed).await {
                 if task.origin == "internal" {
                     reset_counters(parsed, &store, &repo).await;
-                    s.update_status(parsed, TaskStatus::New).await?;
-                    println!(
-                        "Unblocked internal task #{} (attempts reset, will be re-routed)",
-                        parsed
-                    );
+                    if release_or_keep_waiting(s, parsed).await? {
+                        println!("Task #{parsed} stays waiting on an open dependency");
+                    } else {
+                        s.update_status(parsed, TaskStatus::New).await?;
+                        println!(
+                            "Unblocked internal task #{} (attempts reset, will be re-routed)",
+                            parsed
+                        );
+                    }
                     return Ok(());
                 }
             }
@@ -997,6 +1150,15 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
 
     let ext_id = ExternalId(id.to_string());
     store::store_reset_counters(&store, &repo, &ext_id.0).await;
+    if let Some(ref s) = store {
+        if let Ok(Some(store_id)) = s.resolve_task_id(&repo, &ext_id.0).await {
+            if release_or_keep_waiting(s, store_id).await? {
+                let _ = backend.update_status(&ext_id, Status::Waiting).await;
+                println!("Task #{id} stays waiting on an open dependency");
+                return Ok(());
+            }
+        }
+    }
     update_status_store_first(&store, &backend, &repo, &ext_id, Status::New).await?;
     println!("Unblocked task #{} (attempts reset)", id);
 
@@ -1300,7 +1462,10 @@ pub async fn cost(id: &str) -> anyhow::Result<()> {
 }
 
 /// Show task tree view (parent-child relationships).
-pub async fn tree(id: Option<i64>) -> anyhow::Result<()> {
+pub async fn tree(id: Option<i64>, deps: bool) -> anyhow::Result<()> {
+    if deps {
+        return dependency_tree(id).await;
+    }
     use crate::cli::tree::{build_forest, render_forest, render_single_tree};
     use crate::engine::tasks::TaskFilter;
 
@@ -1366,6 +1531,112 @@ pub async fn tree(id: Option<i64>) -> anyhow::Result<()> {
     let output = render_forest(&forest);
     print!("{}", output);
 
+    Ok(())
+}
+
+async fn dependency_tree(focus: Option<i64>) -> anyhow::Result<()> {
+    use std::collections::HashMap;
+
+    let store = crate::cli::init_store().await?;
+    let focus_id = match focus {
+        Some(id) => Some(resolve_id(&store, &id.to_string()).await?),
+        None => None,
+    };
+    let edges = store.list_dependency_edges().await?;
+    let mut by_task: HashMap<i64, Vec<_>> = HashMap::new();
+    for edge in edges {
+        if let Some(focus_id) = focus_id {
+            if edge.task_id != focus_id {
+                continue;
+            }
+        }
+        by_task.entry(edge.task_id).or_default().push(edge);
+    }
+    if by_task.is_empty() {
+        println!("No dependency edges.");
+        return Ok(());
+    }
+    let mut ids: Vec<i64> = by_task.keys().copied().collect();
+    ids.sort_unstable();
+    for id in ids {
+        let group = &by_task[&id];
+        let head = &group[0];
+        let number = head
+            .task_external_id
+            .clone()
+            .unwrap_or_else(|| format!("task:{id}"));
+        let status = store
+            .get(id)
+            .await
+            .map(|task| task.status.as_str().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+        println!("{number} {} [{status}]", head.task_title);
+        for edge in group {
+            let label = dep_label(
+                &edge.task_repo,
+                &edge.depends_on_repo,
+                edge.depends_on_number,
+            );
+            let done = store
+                .blocker_snapshot(&edge.depends_on_repo, edge.depends_on_number)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|snap| snap.is_satisfied());
+            let state = if done { "done" } else { "open" };
+            println!("  blocked by {label} [{state}]");
+        }
+    }
+    Ok(())
+}
+
+/// List what a task waits on, and what waits on it.
+pub async fn deps(id: &str) -> anyhow::Result<()> {
+    let store = crate::cli::init_store().await?;
+    let task_id = resolve_id(&store, id).await?;
+    let task = store.get(task_id).await?;
+    let shown = task
+        .external_id
+        .clone()
+        .unwrap_or_else(|| format!("internal:{}", task.id));
+    println!("{shown} {} [{}]", task.title, task.status.as_str());
+    println!("Waiting on:");
+    let dependencies = store.list_dependencies(task_id).await?;
+    if dependencies.is_empty() {
+        println!("  (none)");
+    }
+    for dep in dependencies {
+        let label = dep_label(&task.repo, &dep.depends_on_repo, dep.depends_on_number);
+        let done = store
+            .blocker_snapshot(&dep.depends_on_repo, dep.depends_on_number)
+            .await?
+            .is_some_and(|snap| snap.is_satisfied());
+        let state = if done { "done" } else { "open" };
+        let local = dep.blocker_status.as_deref().unwrap_or("untracked");
+        println!("  {label}  {state}  local:{local}  source:{}", dep.source);
+    }
+    println!("Waiting on this:");
+    let number = task
+        .external_id
+        .as_deref()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    let dependents = if number > 0 {
+        store.list_dependents(&task.repo, number).await?
+    } else {
+        Vec::new()
+    };
+    if dependents.is_empty() {
+        println!("  (none)");
+    }
+    for dep in dependents {
+        let waiter = store.get(dep.task_id).await?;
+        let label = waiter
+            .external_id
+            .clone()
+            .unwrap_or_else(|| format!("internal:{}", waiter.id));
+        println!("  {label}  {}  {}", waiter.status.as_str(), waiter.title);
+    }
     Ok(())
 }
 
@@ -1841,6 +2112,15 @@ pub async fn inspect(id: &str) -> anyhow::Result<()> {
         task.id
     );
     println!("  Status  : {}", task.status.as_str());
+    if task.status == crate::store::TaskStatus::Waiting {
+        let blockers = store
+            .unmet_blocker_labels(task.id)
+            .await
+            .unwrap_or_default();
+        if !blockers.is_empty() {
+            println!("  Waiting : {}", blockers.join(", "));
+        }
+    }
     println!(
         "  Created : {} ({})",
         task.created_at,

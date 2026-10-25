@@ -685,6 +685,20 @@ impl Router {
         // NOTE: refresh_health() is called once per tick in tick_route_tasks()
         // before the routing loop, not per-task. Do not re-add it here.
 
+        // Hold the task before any classification, label override, or fallback.
+        // A waiting task must not increment route_attempts.
+        match store.resolve_id_by_external(repo, &task.id.0).await {
+            Ok(Some(id)) => match store.block_claim_if_waiting(id).await {
+                Ok(Some(blockers)) => {
+                    return Err(crate::store::WaitingOnDependency { blockers }.into());
+                }
+                Ok(None) => {}
+                Err(err) => return Err(err),
+            },
+            Ok(None) => {}
+            Err(err) => return Err(err),
+        }
+
         loop {
             // 1. Check store agent field first (set by failover, authoritative over labels)
             // Use a lightweight lookup to avoid deserializing the full Task row when

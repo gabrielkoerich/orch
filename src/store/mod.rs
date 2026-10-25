@@ -28,6 +28,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePo
 use std::path::Path;
 
 mod control;
+mod dependencies;
 mod helpers;
 mod jobs;
 mod kv;
@@ -37,6 +38,12 @@ mod tasks;
 
 #[allow(unused_imports)]
 pub use control::{parse_since_duration, ChatCostSummary, ControlMessage, MemoryEntry};
+#[allow(unused_imports)]
+pub use dependencies::{
+    blocker_failure_kind, blocker_is_satisfied, blocker_snapshot_key, dep_label,
+    worktree_refresh_key, BlockerSnapshot, DepSource, NewDependency, ObservedPullRequest,
+    TaskDependency, WaitingOnDependency,
+};
 #[allow(unused_imports)]
 pub use helpers::{
     get_cost_estimate, get_cost_estimate_result, get_recent_memory, get_recent_memory_result,
@@ -56,7 +63,6 @@ pub use metrics::{
 };
 #[allow(unused_imports)]
 pub use pricing::{pricing_for_model, CostEstimate, ModelPricing, TokenUsage};
-#[allow(unused_imports)]
 pub use tasks::{
     CompleteRun, NewTask, RunTokenUsage, StartRun, StoreRoute, Task, TaskActivity, TaskRun,
     TaskStatus, UpsertExternal,
