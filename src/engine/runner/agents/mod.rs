@@ -1262,7 +1262,9 @@ pub(crate) mod patterns {
                 Some((pattern, byte_pos))
             })
             .min_by_key(|(_, byte_pos)| *byte_pos);
-        let has_429 = lower.contains("429");
+        // "429" only when neither neighbor is a digit, so `"outputTokens":429` still
+        // matches and a UUID digit run like `4295` does not
+        let has_429 = contains_standalone_digits(&lower, "429");
         // HTTP 529 is used by Cloudflare for rate limiting. Only match in HTTP status
         // contexts (e.g. "HTTP 529", "status: 529") to avoid false positives from bare
         // numbers like line numbers, port numbers, or file sizes.
@@ -1305,6 +1307,30 @@ pub(crate) mod patterns {
             e += 1;
         }
         text[s..e].to_string()
+    }
+
+    /// True when `digits` appears in `lower` with a non-digit (or string edge) on both sides
+    fn contains_standalone_digits(lower: &str, digits: &str) -> bool {
+        let mut start = 0;
+        while let Some(rel) = lower[start..].find(digits) {
+            let pos = start + rel;
+            let before_ok = pos == 0
+                || !lower[..pos]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_digit());
+            let after = pos + digits.len();
+            let after_ok = after >= lower.len()
+                || !lower[after..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit());
+            if before_ok && after_ok {
+                return true;
+            }
+            start = pos + 1;
+        }
+        false
     }
 
     /// Returns true if `lower` contains the HTTP status `code` (e.g. "401") as a
@@ -3748,6 +3774,15 @@ world"}"#;
         assert!(
             patterns::detect_rate_limit(payload).is_some(),
             "detect_rate_limit must still fire on bare 429 so callers apply the guard"
+        );
+    }
+
+    #[test]
+    fn detect_rate_limit_ignores_429_inside_longer_number() {
+        let uuid = r#"{"type":"hook","uuid":"a1b2c3d4-4295-4e5f-8a9b-0c1d2e3f4a5b"}"#;
+        assert!(
+            patterns::detect_rate_limit(uuid).is_none(),
+            "429 inside a UUID digit run must not match"
         );
     }
 

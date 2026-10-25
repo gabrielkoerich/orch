@@ -490,6 +490,13 @@ impl AgentRunner for ClaudeRunner {
             (None, Some(s)) => format!("{s}\n{stdout}\n{stderr}"),
             (None, None) => format!("{stdout}\n{stderr}"),
         };
+        // Envelope billing text is prepended into the same 3000-byte head as hook
+        // UUIDs, so classify the envelope before the combined scan
+        if let Some(message) = &error_result {
+            if let Some(e) = super::patterns::detect_auth_error(message) {
+                return e;
+            }
+        }
         let classified = super::patterns::classify_from_text(exit_code, &combined);
 
         // `classify_from_text`'s generic catch-all truncates to the last 300
@@ -1149,6 +1156,32 @@ mod tests {
         assert!(
             msg.contains("session limit"),
             "error message should contain the rate limit reason, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn classify_error_402_envelope_not_masked_by_429_in_hook_uuid() {
+        // Regression for issue #3760: a 4295 hook UUID in the first 3000 bytes
+        // classified a 402 envelope as a rate limit whose message was hook prose
+        let hook = r#"{"type":"system","subtype":"init","hook":"SessionStart","uuid":"a1b2c3d4-4295-4e5f-8a9b-0c1d2e3f4a5b","outputTokens":429}"#;
+        let hook_prose = "on. The first lazy solution that works is the\nright one once you actually know what the change has to touch.\n\n**Build the smallest thing that can fail.**\n";
+        let padding = hook_prose.repeat(40);
+        let result_line = r#"{"type":"result","is_error":true,"terminal_reason":"api_error","api_error_status":402,"subtype":"success","result":"API Error: 402 insufficient balance (1008)"}"#;
+        let stdout = format!("{hook}\n{padding}\n{result_line}\n");
+        assert!(
+            stdout.len() > 3000,
+            "fixture must put the 4295 UUID inside the 3000-byte head, got {} bytes",
+            stdout.len()
+        );
+        let err = runner().classify_error(1, &stdout, "");
+        assert!(
+            matches!(err, AgentError::Auth { .. }),
+            "402 envelope must classify as Auth, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("insufficient balance"),
+            "stored error must keep the 402 text, got: {msg}"
         );
     }
 
