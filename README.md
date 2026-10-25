@@ -160,6 +160,16 @@ orch task close <id>          # Manually mark a task as done
 orch task close <id> --note "msg"  # Mark done with a comment
 ```
 
+### Plan import
+
+```bash
+orch plan import docs/ROADMAP.md --dry-run   # Print creates, updates and links
+orch plan import docs/ROADMAP.md             # Create or update one issue per task
+orch plan import docs/ROADMAP.md --milestone M1
+```
+
+`orch plan import` reads a roadmap and creates one GitHub issue per task. `Depends on` is stored as a blocked-by link. `Owner: human` adds the `owner:human` and `no-agent` labels, so orch skips that task. A second run edits an issue only when the title, body or labels changed. A task dropped from the file is listed and left open. An open blocked-by link does not hold a task.
+
 ### Project Management
 
 ```bash

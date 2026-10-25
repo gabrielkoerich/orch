@@ -12,7 +12,7 @@
 use super::token;
 use super::types::{
     GitHubAnnotation, GitHubCheckRun, GitHubComment, GitHubIssue, GitHubPullRequest, GitHubReview,
-    GitHubReviewComment,
+    GitHubReviewComment, IssueDependency,
 };
 use crate::engine::cooldown as engine_cooldown;
 use anyhow::Context;
@@ -1066,6 +1066,70 @@ impl GhHttp {
             "labels": labels,
         });
         self.post_json(&url, &payload).await
+    }
+
+    /// Replace an issue's title, body and labels.
+    ///
+    /// Labels replace the full set. Callers pass labels they want to keep
+    pub async fn update_issue(
+        &self,
+        repo: &str,
+        number: u64,
+        title: &str,
+        body: &str,
+        labels: &[String],
+    ) -> anyhow::Result<GitHubIssue> {
+        let url = format!("{GITHUB_API}/repos/{repo}/issues/{number}");
+        let payload = serde_json::json!({
+            "title": title,
+            "body": body,
+            "labels": labels,
+        });
+        let text = self.patch_json_raw(&url, &payload).await?;
+        serde_json::from_str(&text)
+            .with_context(|| format!("failed to parse issue update response: {text}"))
+    }
+
+    /// Issues that block `number`.
+    ///
+    /// `GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by`
+    pub async fn list_blocked_by(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> anyhow::Result<Vec<IssueDependency>> {
+        let url = format!("{GITHUB_API}/repos/{repo}/issues/{number}/dependencies/blocked_by");
+        self.get_all_pages(&url, &[("per_page", "100")]).await
+    }
+
+    /// Mark `number` as blocked by the issue with database id `blocking_issue_id`.
+    ///
+    /// `POST /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by`
+    /// with `{ "issue_id": blocking_issue_id }`. The id is the database id, not the issue number
+    pub async fn add_blocked_by(
+        &self,
+        repo: &str,
+        number: u64,
+        blocking_issue_id: u64,
+    ) -> anyhow::Result<()> {
+        let url = format!("{GITHUB_API}/repos/{repo}/issues/{number}/dependencies/blocked_by");
+        let payload = serde_json::json!({ "issue_id": blocking_issue_id });
+        self.post_json_raw(&url, &payload).await?;
+        Ok(())
+    }
+
+    /// Remove a blocked-by link. `issue_id` in the path is the blocking issue's database id
+    pub async fn remove_blocked_by(
+        &self,
+        repo: &str,
+        number: u64,
+        blocking_issue_id: u64,
+    ) -> anyhow::Result<()> {
+        let url = format!(
+            "{GITHUB_API}/repos/{repo}/issues/{number}/dependencies/blocked_by/{blocking_issue_id}"
+        );
+        self.delete(&url).await?;
+        Ok(())
     }
 
     /// Get a single issue.

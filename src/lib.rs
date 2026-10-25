@@ -25,6 +25,7 @@ pub mod engine;
 pub mod github;
 pub mod home;
 pub mod parser;
+pub mod plan;
 pub mod repo_context;
 pub mod security;
 pub mod status_heuristics;

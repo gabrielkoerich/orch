@@ -133,6 +133,7 @@ impl LabelSyncConfig {
     }
 }
 
+#[allow(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
 #[async_trait]
 pub(crate) trait ProjectApi: Sync {
     async fn query(&self, query: &str, variables: Value) -> Result<Value>;

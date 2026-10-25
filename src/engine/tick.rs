@@ -1611,7 +1611,7 @@ pub(crate) async fn tick_route_tasks(
     let new_tasks = task_manager.list_routable().await?;
     let routable: Vec<&ExternalTask> = new_tasks
         .iter()
-        .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
+        .filter(|t| !skips_agent(&t.labels))
         .collect();
 
     // Pre-emptive health check: refresh degraded-agent flags once per tick,
@@ -1845,7 +1845,7 @@ pub(crate) async fn route_new_tasks_global(
     let orphaned: Vec<&crate::store::Task> = all_new
         .iter()
         .filter(|t| !active_repos.contains(&t.repo))
-        .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
+        .filter(|t| !skips_agent(&t.labels))
         .collect();
 
     if orphaned.is_empty() {
@@ -1977,8 +1977,7 @@ pub(crate) async fn tick_dispatch_tasks(
     store: &Arc<TaskStore>,
     session_map: &std::collections::HashMap<String, bool>,
 ) -> anyhow::Result<()> {
-    // Note: Routed tasks should never have no-agent (filtered during Phase 3a routing),
-    // but we keep this filter as defense-in-depth.
+    // Phase 3a already drops no-agent and owner:human, this filter stays as defense in depth
     let mut routed_tasks = task_manager.list_external_by_status(Status::Routed).await?;
 
     // Also include internal tasks in Routed status.
@@ -1991,7 +1990,7 @@ pub(crate) async fn tick_dispatch_tasks(
     // Filter and collect owned tasks to avoid lifetime issues
     let dispatchable: Vec<ExternalTask> = routed_tasks
         .into_iter()
-        .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
+        .filter(|t| !skips_agent(&t.labels))
         .collect();
 
     dispatch_tasks_for_repo(
@@ -2374,8 +2373,14 @@ async fn dispatch_tasks_for_repo(
     Ok(())
 }
 
+fn skips_agent(labels: &[String]) -> bool {
+    labels
+        .iter()
+        .any(|label| label == "no-agent" || label == "owner:human")
+}
+
 /// Filter routed tasks down to those belonging to a repo outside `active_repos`,
-/// drop `no-agent` tasks, and group the rest by repo.
+/// drop `no-agent` and `owner:human` tasks, and group the rest by repo.
 ///
 /// Pure/side-effect-free so it can be unit tested without touching real tmux
 /// sessions or spawning a runner — see `dispatch_routed_tasks_global`, which is
@@ -2389,7 +2394,7 @@ fn group_orphaned_routed_tasks(
     for task in all_routed
         .into_iter()
         .filter(|t| !active_repos.contains(&t.repo))
-        .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
+        .filter(|t| !skips_agent(&t.labels))
     {
         by_repo.entry(task.repo.clone()).or_default().push(task);
     }
@@ -2786,6 +2791,13 @@ mod tests {
     use crate::tmux::{SessionGuard, TmuxManager};
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn skips_agent_for_human_and_no_agent_labels() {
+        assert!(skips_agent(&["owner:human".to_string()]));
+        assert!(skips_agent(&["no-agent".to_string()]));
+        assert!(!skips_agent(&["status:new".to_string()]));
+    }
 
     /// A router reporting one available agent with no healthy "review" model, so the
     /// global NeedsReview refire sweep inside `tick_recover_stuck_tasks` treats every
