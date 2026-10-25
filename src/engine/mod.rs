@@ -326,6 +326,66 @@ impl EngineConfig {
     }
 }
 
+/// KV key holding the epoch second the GitHub core window resets, so `orch task status`
+/// can show the limit from a separate process.
+pub const RATE_LIMITED_UNTIL_KEY: &str = "github:rate_limited_until";
+
+/// Format an epoch second as a local `HH:MM:SS` for operator-facing output.
+pub fn format_rate_limited_until(reset_at: i64) -> String {
+    chrono::DateTime::from_timestamp(reset_at, 0)
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%H:%M:%S %Z")
+                .to_string()
+        })
+        .unwrap_or_else(|| reset_at.to_string())
+}
+
+/// Announce a GitHub rate-limit window on every operator surface: the log (`orch log`),
+/// a KV flag (`orch task status`) and the channels (Telegram, Discord).
+async fn report_rate_limited(
+    reset_at: i64,
+    store: Option<&Arc<TaskStore>>,
+    transport: Option<&Arc<crate::channels::transport::Transport>>,
+) {
+    let m = rate_limit_metrics();
+    let until = format_rate_limited_until(reset_at);
+    tracing::warn!(
+        reset_at,
+        rate_limit_hits = m.hits,
+        skipped_calls = m.skipped_calls,
+        five_xx_hits = m.five_xx_hits,
+        rest_remaining = ?m.rest_remaining,
+        graphql_remaining = ?m.graphql_remaining,
+        "GitHub API rate limited until {until} — skipping GitHub calls, local work continues"
+    );
+
+    if let Some(store) = store {
+        if let Err(e) = store
+            .kv_set(RATE_LIMITED_UNTIL_KEY, &reset_at.to_string())
+            .await
+        {
+            tracing::warn!(err = %e, "failed to persist GitHub rate-limit flag");
+        }
+    }
+
+    if let Some(transport) = transport {
+        transport.push_notification(crate::channels::notification::TaskNotification {
+            task_id: "github".to_string(),
+            title: "GitHub rate limit".to_string(),
+            status: "blocked".to_string(),
+            agent: "orch".to_string(),
+            duration_seconds: 0.0,
+            summary: format!(
+                "rate limited until {until}. GitHub calls are skipped until then; running agents and local work continue."
+            ),
+            repo: None,
+            notify_target: None,
+            pr_number: None,
+        });
+    }
+}
+
 fn should_run_upgrade_check(
     last_upgrade_check: Option<std::time::Instant>,
     upgrade_check_interval: u64,
@@ -1802,6 +1862,10 @@ pub async fn serve() -> anyhow::Result<()> {
     // Track upgrade check interval
     let mut last_upgrade_check: Option<std::time::Instant> = None;
 
+    // Reset epoch of the GitHub rate-limit window already reported, so the log line,
+    // the KV flag and the channel notification fire once per window instead of per tick
+    let mut rate_limit_reported: Option<i64> = None;
+
     // Channel for weight signals from task runners back to the router
     let (weight_tx, mut weight_rx) = mpsc::channel::<WeightSignal>(64);
 
@@ -2067,132 +2131,139 @@ pub async fn serve() -> anyhow::Result<()> {
                     rw.tick_weight_recovery();
                 }
 
-                // Skip tick/sync entirely if GitHub API is rate-limited
+                // Report the GitHub rate limit once per window, then tick anyway. Calls
+                // into GitHub now fail fast instead of sleeping until the reset, so the
+                // local phases keep moving and the watchdog does not see a stalled loop.
                 if let Some(remaining) = GhHttp::is_rate_limited() {
-                    let m = rate_limit_metrics();
-                    tracing::warn!(
-                        remaining_secs = remaining.as_secs(),
-                        rate_limit_hits = m.hits,
-                        five_xx_hits = m.five_xx_hits,
-                        proactive_throttles = m.proactive_throttles,
-                        wait_secs_total = m.wait_secs,
-                        rest_remaining = ?m.rest_remaining,
-                        graphql_remaining = ?m.graphql_remaining,
-                        "GitHub API rate-limited, skipping tick"
+                    let reset_at = chrono::Utc::now()
+                        .timestamp()
+                        .saturating_add(i64::try_from(remaining.as_secs()).unwrap_or(i64::MAX));
+                    // Tolerate jitter in the header so one window reports once
+                    if rate_limit_reported.is_none_or(|prev| (reset_at - prev).abs() > 60) {
+                        rate_limit_reported = Some(reset_at);
+                        report_rate_limited(reset_at, project_engines.first().map(|e| &e.store), Some(&transport)).await;
+                    }
+                } else if let Some(prev) = rate_limit_reported.take() {
+                    tracing::info!(
+                        limited_until = prev,
+                        "GitHub API rate limit cleared"
                     );
-                } else {
-                    // Core tick: poll tasks for all projects
-                    let mut router_guard = router.write().await;
-                    let mut routing_quota = tick::RoutingTickQuota::new(
-                        crate::engine::router::config::max_tasks_per_routing_tick(),
-                    );
-                    for engine in &project_engines {
-                        let repo = engine.repo.clone();
-                        let project_jobs_path = engine.project_dir.join(".orch.yml");
-                        REPO_CONTEXT.scope(repo, async {
-                            if let Err(e) = tick::tick(
-                                &engine.backend,
-                                &tmux,
-                                &engine.repo,
-                                &engine.runner,
-                                &capture_for_tick,
-                                &semaphore,
-                                &config,
-                                &project_jobs_path,
-                                &mut router_guard,
-                                &engine.task_manager,
-                                &weight_tx,
-                                &dispatching,
-                                &engine.store,
-                                Some(&transport),
-                                &active_repos,
-                                &auto_merge_in_flight,
-                                &mut routing_quota,
-                            ).await {
-                                tracing::error!(repo = %engine.repo, ?e, "tick failed for project");
-                            }
-                        }).await;
+                    if let Some(engine) = project_engines.first() {
+                        let _ = engine.store.kv_delete(RATE_LIMITED_UNTIL_KEY).await;
                     }
-                    drop(router_guard);
+                }
 
-                    // Drain pending weight signals after tick processing so the router
-                    // learns from outcomes produced by this iteration's task dispatches.
-                    while let Ok(signal) = weight_rx.try_recv() {
-                        let mut rw = router.write().await;
-                        match signal {
-                            WeightSignal::RateLimited { ref agent } => {
-                                rw.record_rate_limit(agent);
-                            }
-                            WeightSignal::Success { ref agent } => {
-                                rw.record_success(agent);
-                            }
-                            WeightSignal::Rerouted | WeightSignal::Blocked | WeightSignal::None => {}
+                // Core tick: poll tasks for all projects
+                let mut router_guard = router.write().await;
+                let mut routing_quota = tick::RoutingTickQuota::new(
+                    crate::engine::router::config::max_tasks_per_routing_tick(),
+                );
+                for engine in &project_engines {
+                    let repo = engine.repo.clone();
+                    let project_jobs_path = engine.project_dir.join(".orch.yml");
+                    REPO_CONTEXT.scope(repo, async {
+                        if let Err(e) = tick::tick(
+                            &engine.backend,
+                            &tmux,
+                            &engine.repo,
+                            &engine.runner,
+                            &capture_for_tick,
+                            &semaphore,
+                            &config,
+                            &project_jobs_path,
+                            &mut router_guard,
+                            &engine.task_manager,
+                            &weight_tx,
+                            &dispatching,
+                            &engine.store,
+                            Some(&transport),
+                            &active_repos,
+                            &auto_merge_in_flight,
+                            &mut routing_quota,
+                        ).await {
+                            tracing::error!(repo = %engine.repo, ?e, "tick failed for project");
                         }
-                    }
+                    }).await;
+                }
+                drop(router_guard);
 
-                    // Periodic sync (less frequent) — spawned as a background task so it
-                    // cannot block the main tick loop. A stalled sync (hung HTTP call, slow
-                    // DB query, lock contention) previously parked all tokio workers for 12+
-                    // minutes because it ran inline. See issue #2574.
-                    if last_sync.elapsed() >= config.sync_interval {
-                        if sync_in_progress.compare_exchange(
-                            false,
-                            true,
-                            std::sync::atomic::Ordering::AcqRel,
-                            std::sync::atomic::Ordering::Relaxed,
-                        ).is_ok() {
-                            // Clone everything sync_tick needs — it runs in a spawned task.
-                            let sync_engines: Vec<_> = project_engines.iter().map(|e| {
-                                (e.backend.clone(), e.repo.clone(),
-                                 e.task_manager.clone(), e.store.clone())
-                            }).collect();
-                            let sync_tmux = Arc::clone(&tmux);
-                            let sync_config = config.clone();
-                            let sync_router = Arc::clone(&router);
-                            let sync_dispatching = Arc::clone(&dispatching);
-                            let sync_auto_merge = Arc::clone(&auto_merge_in_flight);
-                            let sync_guard = Arc::clone(&sync_in_progress);
-                            tokio::spawn(async move {
-                                let sync_start = std::time::Instant::now();
-                                for (backend, repo, task_manager, store) in &sync_engines {
-                                    let repo = repo.clone();
-                                    REPO_CONTEXT.scope(repo.clone(), async {
-                                        if let Err(e) = sync::sync_tick(
-                                            backend, &sync_tmux, &repo, &sync_config,
-                                            &sync_router, task_manager, store,
-                                            &sync_dispatching, &sync_auto_merge,
-                                        ).await {
-                                            tracing::error!(repo = %repo, ?e, "sync tick failed for project");
-                                        }
-                                    }).await;
-                                }
-                                // Emit degraded-agents metric/log once per sync cycle.
-                                // Clone the needed data before releasing the read guard so
-                                // the lock is not held across the async store writes.
-                                if let Some((_, _, _, store)) = sync_engines.first() {
-                                    let (available_agents, config) = {
-                                        let r = sync_router.read().await;
-                                        (r.available_agents.clone(), r.config.clone())
-                                    };
-                                    sync::emit_degraded_agents_if_needed(
-                                        &available_agents,
-                                        &config,
-                                        Some(store),
-                                    )
-                                    .await;
-                                }
-                                let elapsed = sync_start.elapsed();
-                                tracing::info!(elapsed_ms = elapsed.as_millis() as u64, "sync tick complete");
-                                sync_guard.store(false, std::sync::atomic::Ordering::Release);
-                            });
-                        } else {
-                            tracing::debug!("sync tick still in progress, skipping");
+                // Drain pending weight signals after tick processing so the router
+                // learns from outcomes produced by this iteration's task dispatches.
+                while let Ok(signal) = weight_rx.try_recv() {
+                    let mut rw = router.write().await;
+                    match signal {
+                        WeightSignal::RateLimited { ref agent } => {
+                            rw.record_rate_limit(agent);
                         }
-                        // Records sync *schedule* time (not completion). This prevents
-                        // re-entering the sync branch every tick while one is in flight.
-                        // The sync_in_progress guard handles actual concurrency control.
-                        last_sync = std::time::Instant::now();
+                        WeightSignal::Success { ref agent } => {
+                            rw.record_success(agent);
+                        }
+                        WeightSignal::Rerouted | WeightSignal::Blocked | WeightSignal::None => {}
                     }
+                }
+
+                // Periodic sync (less frequent) — spawned as a background task so it
+                // cannot block the main tick loop. A stalled sync (hung HTTP call, slow
+                // DB query, lock contention) previously parked all tokio workers for 12+
+                // minutes because it ran inline. See issue #2574.
+                if last_sync.elapsed() >= config.sync_interval {
+                    if sync_in_progress.compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Relaxed,
+                    ).is_ok() {
+                        // Clone everything sync_tick needs — it runs in a spawned task.
+                        let sync_engines: Vec<_> = project_engines.iter().map(|e| {
+                            (e.backend.clone(), e.repo.clone(),
+                             e.task_manager.clone(), e.store.clone())
+                        }).collect();
+                        let sync_tmux = Arc::clone(&tmux);
+                        let sync_config = config.clone();
+                        let sync_router = Arc::clone(&router);
+                        let sync_dispatching = Arc::clone(&dispatching);
+                        let sync_auto_merge = Arc::clone(&auto_merge_in_flight);
+                        let sync_guard = Arc::clone(&sync_in_progress);
+                        tokio::spawn(async move {
+                            let sync_start = std::time::Instant::now();
+                            for (backend, repo, task_manager, store) in &sync_engines {
+                                let repo = repo.clone();
+                                REPO_CONTEXT.scope(repo.clone(), async {
+                                    if let Err(e) = sync::sync_tick(
+                                        backend, &sync_tmux, &repo, &sync_config,
+                                        &sync_router, task_manager, store,
+                                        &sync_dispatching, &sync_auto_merge,
+                                    ).await {
+                                        tracing::error!(repo = %repo, ?e, "sync tick failed for project");
+                                    }
+                                }).await;
+                            }
+                            // Emit degraded-agents metric/log once per sync cycle.
+                            // Clone the needed data before releasing the read guard so
+                            // the lock is not held across the async store writes.
+                            if let Some((_, _, _, store)) = sync_engines.first() {
+                                let (available_agents, config) = {
+                                    let r = sync_router.read().await;
+                                    (r.available_agents.clone(), r.config.clone())
+                                };
+                                sync::emit_degraded_agents_if_needed(
+                                    &available_agents,
+                                    &config,
+                                    Some(store),
+                                )
+                                .await;
+                            }
+                            let elapsed = sync_start.elapsed();
+                            tracing::info!(elapsed_ms = elapsed.as_millis() as u64, "sync tick complete");
+                            sync_guard.store(false, std::sync::atomic::Ordering::Release);
+                        });
+                    } else {
+                        tracing::debug!("sync tick still in progress, skipping");
+                    }
+                    // Records sync *schedule* time (not completion). This prevents
+                    // re-entering the sync branch every tick while one is in flight.
+                    // The sync_in_progress guard handles actual concurrency control.
+                    last_sync = std::time::Instant::now();
                 }
 
                 // Periodic webhook health check

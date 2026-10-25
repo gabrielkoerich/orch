@@ -72,7 +72,8 @@ struct RateLimit {
     backoff_delay: Duration,
     backoff_base: Duration,
     backoff_max: Duration,
-    /// Proactively throttle when remaining drops below this threshold (default 10).
+    /// Stop making calls when remaining drops below this threshold (default 200). The
+    /// reserve is for the dispatched agents, which run `gh` against the same token.
     throttle_threshold: u32,
 }
 
@@ -89,7 +90,7 @@ impl RateLimit {
         let threshold = crate::config::get("gh.rate_limit.throttle_threshold")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(10);
+            .unwrap_or(200);
 
         Self {
             remaining: None,
@@ -174,7 +175,7 @@ impl RateLimit {
         None
     }
 
-    /// Returns how long to proactively wait when approaching the rate limit.
+    /// Returns how long until the window resets when the quota is under the reserve.
     ///
     /// Returns Some only when:
     /// - not already in hard backoff,
@@ -206,12 +207,6 @@ impl RateLimit {
         self.backoff_remaining()
             .or_else(|| self.proactive_wait_duration())
     }
-
-    /// Clear remaining/reset state after a proactive wait (values are now stale).
-    fn clear_proactive_state(&mut self) {
-        self.remaining = None;
-        self.reset_at = None;
-    }
 }
 
 // ── Global state ─────────────────────────────────────────────────────
@@ -227,52 +222,103 @@ static GRAPHQL_RATE_LIMIT: std::sync::LazyLock<Mutex<RateLimit>> =
 
 /// Total 403/429 rate-limit responses received (REST + GraphQL).
 static METRIC_RATE_LIMIT_HITS: AtomicU64 = AtomicU64::new(0);
-/// Times proactive throttling slept before sending a request.
+/// Calls skipped because the quota was under the reserve threshold or a backoff was active.
 static METRIC_PROACTIVE_THROTTLES: AtomicU64 = AtomicU64::new(0);
-/// Total seconds spent waiting due to proactive throttle or hard backoff.
-static METRIC_WAIT_SECS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Total 5xx server error responses received (REST + GraphQL).
 static METRIC_5XX_HITS: AtomicU64 = AtomicU64::new(0);
 
 // ── Rate-limit generic helpers ────────────────────────────────────────
 
-type RateLimitCell = std::sync::LazyLock<Mutex<RateLimit>>;
-
-/// Fail fast if the given rate limiter is in hard backoff (post-403/429).
-fn check_rate_limit_backoff(cell: &'static RateLimitCell, api: &str) -> anyhow::Result<()> {
-    if let Some(remaining) = cell.lock().ok().and_then(|rl| rl.backoff_remaining()) {
-        anyhow::bail!(
-            "GitHub {} API rate-limited, backoff active for {}s",
-            api,
-            remaining.as_secs()
-        );
-    }
-    Ok(())
+/**
+ * Fail fast when the limiter is in hard backoff (post-403/429) or the remaining quota is
+ * under the reserve threshold. This must never sleep: the engine runs every tick phase
+ * through these calls, so waiting out a reset here froze the whole tick loop for up to an
+ * hour and tripped the watchdog. Returning an error lets the phase give up and the tick
+ * finish, and the next tick retries once the window resets
+ **/
+fn check_rate_limit_backoff(cell: &Mutex<RateLimit>, api: &str) -> anyhow::Result<()> {
+    let Some(remaining) = cell.lock().ok().and_then(|rl| rl.is_active()) else {
+        return Ok(());
+    };
+    METRIC_PROACTIVE_THROTTLES.fetch_add(1, Ordering::Relaxed);
+    anyhow::bail!(
+        "GitHub {} API rate-limited, skipping call for {}s",
+        api,
+        remaining.as_secs()
+    );
 }
 
-/// Proactively sleep if the given rate limiter's quota is running low.
-/// Clears stale header state after sleeping so the next request gets fresh values.
-async fn proactive_throttle_limiter(cell: &'static RateLimitCell, api: &str) {
-    let wait = cell.lock().ok().and_then(|rl| rl.proactive_wait_duration());
-    if let Some(d) = wait {
-        let secs = d.as_secs().max(1);
-        METRIC_PROACTIVE_THROTTLES.fetch_add(1, Ordering::Relaxed);
-        METRIC_WAIT_SECS_TOTAL.fetch_add(secs, Ordering::Relaxed);
-        tracing::warn!(
-            wait_secs = secs,
-            "approaching GitHub {} rate limit, throttling until reset",
-            api
-        );
-        tokio::time::sleep(d).await;
-        if let Ok(mut rl) = cell.lock() {
-            rl.clear_proactive_state();
+// ── Conditional-request cache ─────────────────────────────────────────
+
+/// A stored 200 response, replayed when GitHub answers the next conditional GET with 304.
+struct CachedPage {
+    etag: String,
+    body: String,
+    /// `Link: rel="next"` from the cached response; a 304 does not repeat it.
+    next: Option<String>,
+}
+
+/**
+ * Keyed by the full request URL plus the decoded type, since the body is replayed through
+ * `serde_json` and two call sites can share a URL while wanting different shapes. GitHub
+ * answers a conditional GET with 304 and no body when nothing changed, and that response
+ * does not count against the core quota, so the listing endpoints orch polls every tick
+ * cost one request per hour of quiet instead of one per tick
+ **/
+static PAGE_CACHE: std::sync::LazyLock<Mutex<std::collections::HashMap<String, CachedPage>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Distinct cacheable list URLs are few (per repo, per query), so the cap only guards a
+/// leak. Each entry holds a full page body, so keep it small.
+const PAGE_CACHE_MAX: usize = 64;
+
+/// `None` when the request cannot produce a hit, so it is neither sent conditionally nor
+/// stored. A `since` filter is computed from the clock on every call, so its key never
+/// recurs and caching it would only grow the map with page-sized bodies.
+fn page_cache_key<T>(url: &str, query: Option<&[(&str, &str)]>) -> Option<String> {
+    let mut key = String::from(std::any::type_name::<T>());
+    key.push(' ');
+    key.push_str(url);
+    if let Some(q) = query {
+        for (i, (k, v)) in q.iter().enumerate() {
+            key.push(if i == 0 { '?' } else { '&' });
+            key.push_str(k);
+            key.push('=');
+            key.push_str(v);
         }
     }
+    if key.contains("since=") {
+        return None;
+    }
+    Some(key)
+}
+
+fn page_cache_etag(key: &str) -> Option<String> {
+    PAGE_CACHE.lock().ok()?.get(key).map(|c| c.etag.clone())
+}
+
+/// Returns the stored body and `next` link for a 304 reply.
+fn page_cache_hit(key: &str) -> Option<(String, Option<String>)> {
+    let cache = PAGE_CACHE.lock().ok()?;
+    let entry = cache.get(key)?;
+    Some((entry.body.clone(), entry.next.clone()))
+}
+
+fn page_cache_store(key: String, etag: String, body: String, next: Option<String>) {
+    let Ok(mut cache) = PAGE_CACHE.lock() else {
+        return;
+    };
+    // ponytail: clears everything at the cap instead of evicting one entry, switch to an
+    // LRU if the hit rate ever matters more than the bookkeeping
+    if cache.len() >= PAGE_CACHE_MAX && !cache.contains_key(&key) {
+        cache.clear();
+    }
+    cache.insert(key, CachedPage { etag, body, next });
 }
 
 /// Check response body for rate-limit signals on 403 responses.
 /// Not all 403s are rate limits — some are permission errors.
-fn maybe_record_body_rate_limit(cell: &'static RateLimitCell, status: StatusCode, body: &str) {
+fn maybe_record_body_rate_limit(cell: &Mutex<RateLimit>, status: StatusCode, body: &str) {
     if status == StatusCode::FORBIDDEN {
         let lower = body.to_lowercase();
         if lower.contains("rate limit")
@@ -287,14 +333,14 @@ fn maybe_record_body_rate_limit(cell: &'static RateLimitCell, status: StatusCode
 }
 
 /// Update rate-limit state from response headers/status and detect 5xx errors.
-fn record_response_for_limiter(cell: &'static RateLimitCell, resp: &Response) {
+fn record_response_for_limiter(cell: &Mutex<RateLimit>, resp: &Response) {
     if let Ok(mut rl) = cell.lock() {
         rl.update_from_headers(resp.headers());
         // Only backoff on 429 (always rate limit) — 403 requires body inspection
         // which is handled in maybe_record_body_rate_limit().
         if resp.status() == StatusCode::TOO_MANY_REQUESTS {
             rl.record_rate_limit();
-        } else if resp.status().is_success() {
+        } else if resp.status().is_success() || resp.status() == StatusCode::NOT_MODIFIED {
             rl.record_success();
         }
     }
@@ -362,16 +408,6 @@ impl GhHttp {
     /// Fail fast if the GraphQL API is in hard backoff (post-403/429).
     fn check_graphql_backoff() -> anyhow::Result<()> {
         check_rate_limit_backoff(&GRAPHQL_RATE_LIMIT, "GraphQL")
-    }
-
-    /// Proactively sleep if the REST API quota is running low (remaining < threshold).
-    async fn proactive_throttle_rest() {
-        proactive_throttle_limiter(&REST_RATE_LIMIT, "REST").await;
-    }
-
-    /// Proactively sleep if the GraphQL API quota is running low (remaining < threshold).
-    async fn proactive_throttle_graphql() {
-        proactive_throttle_limiter(&GRAPHQL_RATE_LIMIT, "GraphQL").await;
     }
 
     fn record_response(resp: &Response) {
@@ -594,7 +630,6 @@ impl GhHttp {
 
     /// GET request, returns deserialized JSON.
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> anyhow::Result<T> {
-        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let auth = self.auth_header().await?;
         // Use send_with_retries to handle transient 5xx/network failures
@@ -620,7 +655,6 @@ impl GhHttp {
 
     /// GET raw bytes (for endpoints that return non-JSON or we parse manually).
     async fn get_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
-        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let auth = self.auth_header().await?;
         let make_req = || {
@@ -647,7 +681,6 @@ impl GhHttp {
         url: &str,
         query: &[(&str, &str)],
     ) -> anyhow::Result<T> {
-        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let auth = self.auth_header().await?;
         let make_req = || {
@@ -673,7 +706,6 @@ impl GhHttp {
 
     /// POST with JSON body, returns raw response text.
     async fn post_json_raw(&self, url: &str, body: &serde_json::Value) -> anyhow::Result<String> {
-        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let auth = self.auth_header().await?;
         let make_req = || {
@@ -709,7 +741,6 @@ impl GhHttp {
 
     /// PATCH with JSON body, returns raw response.
     async fn patch_json_raw(&self, url: &str, body: &serde_json::Value) -> anyhow::Result<String> {
-        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let auth = self.auth_header().await?;
         let make_req = || {
@@ -735,7 +766,6 @@ impl GhHttp {
 
     /// DELETE request.
     async fn delete(&self, url: &str) -> anyhow::Result<StatusCode> {
-        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let auth = self.auth_header().await?;
         let make_req = || {
@@ -756,13 +786,15 @@ impl GhHttp {
         Ok(status)
     }
 
-    /// Paginated GET — follows Link: <next> headers.
+    /// Paginated GET — follows Link: <next> headers, with conditional requests.
+    ///
+    /// Each page is sent with `If-None-Match` when a prior ETag is known; GitHub's 304
+    /// reply is free of quota and the stored body is replayed.
     async fn get_all_pages<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
         query: &[(&str, &str)],
     ) -> anyhow::Result<Vec<T>> {
-        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let mut all: Vec<T> = Vec::new();
         let mut next_url: Option<String> = None;
@@ -779,6 +811,8 @@ impl GhHttp {
                 (u.as_str(), None)
             };
 
+            let cache_key = page_cache_key::<T>(request_url, request_query);
+            let mut cached_etag = cache_key.as_deref().and_then(page_cache_etag);
             let mut decode_attempt = 0;
             let (page, next) = loop {
                 let auth = self.auth_header().await?;
@@ -791,6 +825,9 @@ impl GhHttp {
                 if let Some(q) = request_query {
                     req = req.query(q);
                 }
+                if let Some(etag) = &cached_etag {
+                    req = req.header(header::IF_NONE_MATCH, etag.clone());
+                }
 
                 let make_req = || {
                     req.try_clone()
@@ -799,12 +836,31 @@ impl GhHttp {
                 let resp = self.send_with_retries(make_req, false).await?;
                 let status = resp.status();
                 let next_from_headers = parse_link_next(resp.headers());
+                let etag = resp
+                    .headers()
+                    .get(header::ETAG)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.to_string());
                 let content_type = resp
                     .headers()
                     .get(header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "<missing>".to_string());
+
+                if status == StatusCode::NOT_MODIFIED {
+                    match cache_key.as_deref().and_then(page_cache_hit) {
+                        Some((body, next)) => break (serde_json::from_str::<Vec<T>>(&body)?, next),
+                        None => {
+                            // The entry is normally there, since If-None-Match is only sent
+                            // when it is, but the size cap can clear the map in between.
+                            // Dropping the ETag makes the retry unconditional, so the loop
+                            // cannot see a second 304
+                            cached_etag = None;
+                            continue;
+                        }
+                    }
+                }
 
                 if !status.is_success() {
                     let body = resp.text().await.unwrap_or_default();
@@ -814,7 +870,12 @@ impl GhHttp {
 
                 let text = resp.text().await?;
                 match serde_json::from_str::<Vec<T>>(&text) {
-                    Ok(page) => break (page, next_from_headers),
+                    Ok(page) => {
+                        if let (Some(key), Some(etag)) = (cache_key.clone(), etag) {
+                            page_cache_store(key, etag, text, next_from_headers.clone());
+                        }
+                        break (page, next_from_headers);
+                    }
                     Err(err) => {
                         let snippet: String = text.chars().take(200).collect();
                         let decode_error = anyhow::anyhow!(
@@ -868,7 +929,6 @@ impl GhHttp {
         url: &str,
         array_field: &str,
     ) -> anyhow::Result<Vec<T>> {
-        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let mut all: Vec<T> = Vec::new();
         let mut current_url: String = url.to_string();
@@ -951,7 +1011,6 @@ impl GhHttp {
         extra_headers: &[(&str, &str)],
         variables: Option<serde_json::Value>,
     ) -> anyhow::Result<serde_json::Value> {
-        Self::proactive_throttle_graphql().await;
         Self::check_graphql_backoff()?;
         let body = if let Some(vars) = variables {
             serde_json::json!({ "query": query, "variables": vars })
@@ -1236,7 +1295,6 @@ impl GhHttp {
         method: reqwest::Method,
         body: Option<serde_json::Value>,
     ) -> anyhow::Result<Response> {
-        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let auth = self.auth_header().await?;
         let make_req = || {
@@ -1809,7 +1867,6 @@ impl GhHttp {
     ) -> anyhow::Result<String> {
         use reqwest::header;
 
-        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let url = format!("{GITHUB_API}/repos/{repo}/pulls");
 
@@ -2207,7 +2264,6 @@ impl GhHttp {
 
     /// Check if a user is a collaborator.
     pub async fn is_collaborator(&self, repo: &str, username: &str) -> anyhow::Result<bool> {
-        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let url = format!("{GITHUB_API}/repos/{repo}/collaborators/{username}");
         let auth = self.auth_header().await?;
@@ -2454,7 +2510,6 @@ impl GhHttp {
         pr_number: u64,
         delete_branch: bool,
     ) -> anyhow::Result<()> {
-        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let url = format!("{GITHUB_API}/repos/{repo}/pulls/{pr_number}/merge");
         let payload = serde_json::json!({ "merge_method": "squash" });
@@ -2506,7 +2561,6 @@ impl GhHttp {
     /// which re-triggers CI — used to give a PR a chance to pick up a fix
     /// that landed on the base branch after the PR's last CI run failed.
     pub async fn update_pr_branch(&self, repo: &str, pr_number: u64) -> anyhow::Result<()> {
-        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let url = format!("{GITHUB_API}/repos/{repo}/pulls/{pr_number}/update-branch");
         let auth = self.auth_header().await?;
@@ -3092,12 +3146,12 @@ fn sanitize_github_issue_numbers(issue_numbers: &[u64]) -> (Vec<u64>, Vec<u64>) 
 pub struct RateLimitMetrics {
     /// Total 403/429 rate-limit responses received (REST + GraphQL combined).
     pub hits: u64,
-    /// Times proactive throttling slept before sending a request.
-    pub proactive_throttles: u64,
-    /// Total seconds spent waiting due to proactive throttle or hard backoff.
-    pub wait_secs: u64,
+    /// Calls skipped because the quota was low or a backoff was active.
+    pub skipped_calls: u64,
     /// Current REST remaining quota (None if not yet observed).
     pub rest_remaining: Option<u32>,
+    /// UTC epoch second when the REST window resets (None if not yet observed).
+    pub rest_reset_at: Option<u64>,
     /// Current GraphQL remaining quota (None if not yet observed).
     pub graphql_remaining: Option<u32>,
     /// Total 5xx server error responses received (REST + GraphQL combined).
@@ -3106,13 +3160,17 @@ pub struct RateLimitMetrics {
 
 /// Return a snapshot of GitHub API rate-limit metrics.
 pub fn rate_limit_metrics() -> RateLimitMetrics {
-    let rest_remaining = REST_RATE_LIMIT.lock().ok().and_then(|rl| rl.remaining);
+    let (rest_remaining, rest_reset_at) = REST_RATE_LIMIT
+        .lock()
+        .ok()
+        .map(|rl| (rl.remaining, rl.reset_at))
+        .unwrap_or((None, None));
     let graphql_remaining = GRAPHQL_RATE_LIMIT.lock().ok().and_then(|rl| rl.remaining);
     RateLimitMetrics {
         hits: METRIC_RATE_LIMIT_HITS.load(Ordering::Relaxed),
-        proactive_throttles: METRIC_PROACTIVE_THROTTLES.load(Ordering::Relaxed),
-        wait_secs: METRIC_WAIT_SECS_TOTAL.load(Ordering::Relaxed),
+        skipped_calls: METRIC_PROACTIVE_THROTTLES.load(Ordering::Relaxed),
         rest_remaining,
+        rest_reset_at,
         graphql_remaining,
         five_xx_hits: METRIC_5XX_HITS.load(Ordering::Relaxed),
     }
@@ -3647,6 +3705,69 @@ mod tests {
     }
 
     #[test]
+    fn page_cache_key_separates_types_and_queries() {
+        let a = page_cache_key::<GitHubIssue>("/issues", Some(&[("state", "open")])).unwrap();
+        let b = page_cache_key::<GitHubIssue>("/issues", Some(&[("state", "closed")])).unwrap();
+        let c = page_cache_key::<serde_json::Value>("/issues", Some(&[("state", "open")])).unwrap();
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(
+            a,
+            page_cache_key::<GitHubIssue>("/issues", Some(&[("state", "open")])).unwrap()
+        );
+    }
+
+    /// `since` is derived from the clock, so the key would never recur.
+    #[test]
+    fn page_cache_key_skips_since_filtered_requests() {
+        assert!(page_cache_key::<GitHubIssue>(
+            "/issues",
+            Some(&[("state", "closed"), ("since", "2026-10-01T00:00:00Z")])
+        )
+        .is_none());
+        // Also when it arrives embedded in a Link: next URL.
+        assert!(
+            page_cache_key::<GitHubIssue>("/issues?since=2026-10-01T00:00:00Z&page=2", None)
+                .is_none()
+        );
+    }
+
+    /// A limiter with no quota left and a reset an hour out: the check must return an
+    /// error straight away. Sleeping here is what froze the tick loop for 504s.
+    #[test]
+    fn low_quota_fails_fast_instead_of_waiting_for_reset() {
+        let mut rl = make_rl(30, 900);
+        rl.remaining = Some(0);
+        rl.reset_at = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600,
+        );
+        let cell = Mutex::new(rl);
+
+        let start = Instant::now();
+        let err = check_rate_limit_backoff(&cell, "REST").unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "check blocked for {:?}",
+            start.elapsed()
+        );
+        assert!(err.to_string().contains("rate-limited"), "{err}");
+    }
+
+    /// Quota above the reserve is not a reason to skip the call.
+    #[test]
+    fn healthy_quota_passes_the_check() {
+        let mut rl = make_rl(30, 900);
+        rl.remaining = Some(4000);
+        rl.reset_at = Some(u64::MAX / 2);
+        let cell = Mutex::new(rl);
+        assert!(check_rate_limit_backoff(&cell, "REST").is_ok());
+    }
+
+    #[test]
     fn rate_limit_proactive_pause() {
         let mut rl = make_rl(30, 900);
         // Simulate: 0 remaining (below default threshold of 10), reset 60s in the future
@@ -3903,7 +4024,17 @@ mod tests {
         use std::ffi::OsString;
         use std::sync::Arc;
         use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{matchers, Match, Mock, MockServer, Request, ResponseTemplate};
+
+        /// wiremock has no negated matcher, and the first poll must be matched on the
+        /// absence of `If-None-Match` to tell it apart from the conditional one.
+        struct NotMatcher<M>(M);
+
+        impl<M: Match> Match for NotMatcher<M> {
+            fn matches(&self, request: &Request) -> bool {
+                !self.0.matches(request)
+            }
+        }
 
         struct EnvVarGuard {
             key: &'static str,
@@ -4088,6 +4219,115 @@ mod tests {
                 "error should mention JSON decode or serde error: {}",
                 err
             );
+        }
+
+        // ── conditional request / rate-limit tests ───────────────────────────
+
+        /// Restores the global REST limiter and the page cache, both of which these two
+        /// tests have to poison to exercise the real request path.
+        struct GlobalStateGuard;
+
+        impl Drop for GlobalStateGuard {
+            fn drop(&mut self) {
+                if let Ok(mut rl) = REST_RATE_LIMIT.lock() {
+                    *rl = RateLimit::new();
+                }
+                if let Ok(mut cache) = PAGE_CACHE.lock() {
+                    cache.clear();
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn get_all_pages_replays_body_on_304() {
+            let _reset = GlobalStateGuard;
+            let server = MockServer::start().await;
+
+            // First poll: 200 with an ETag.
+            Mock::given(method("GET"))
+                .and(path("/issues"))
+                .and(matchers::header_exists("authorization"))
+                .and(NotMatcher(matchers::header_exists("if-none-match")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!([{"number": 1}]))
+                        .insert_header("ETag", "\"abc123\""),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            // Second poll: orch sends If-None-Match, GitHub answers 304 with no body.
+            Mock::given(method("GET"))
+                .and(path("/issues"))
+                .and(matchers::header("if-none-match", "\"abc123\""))
+                .respond_with(ResponseTemplate::new(304))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let (gh, _guard) = make_client();
+            let url = format!("{}/issues", server.uri());
+
+            let first: Vec<serde_json::Value> = gh.get_all_pages(&url, &[]).await.unwrap();
+            let second: Vec<serde_json::Value> = gh.get_all_pages(&url, &[]).await.unwrap();
+
+            assert_eq!(first, second);
+            assert_eq!(second.len(), 1);
+            assert_eq!(second[0]["number"], 1);
+        }
+
+        #[tokio::test]
+        async fn exhausted_quota_skips_further_calls_until_reset() {
+            let _reset = GlobalStateGuard;
+            let server = MockServer::start().await;
+
+            let reset_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 600;
+
+            // One response, and only one: it reports an exhausted core quota, so every
+            // later call must be skipped locally rather than sent.
+            Mock::given(method("GET"))
+                .and(path("/issues"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!([{"number": 1}]))
+                        .insert_header("x-ratelimit-remaining", "0")
+                        .insert_header("x-ratelimit-reset", reset_at.to_string().as_str()),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let (gh, _guard) = make_client();
+            let url = format!("{}/issues", server.uri());
+
+            let first: Vec<serde_json::Value> = gh.get_all_pages(&url, &[]).await.unwrap();
+            assert_eq!(first.len(), 1);
+
+            // The next call returns immediately instead of waiting out the 600s window.
+            let start = Instant::now();
+            let err = gh
+                .get_all_pages::<serde_json::Value>(&url, &[("state", "open")])
+                .await
+                .unwrap_err();
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "call blocked for {:?} instead of failing fast",
+                start.elapsed()
+            );
+            assert!(err.to_string().contains("rate-limited"), "{err}");
+
+            // The engine reports the window from the same state the skip reads.
+            let m = rate_limit_metrics();
+            assert_eq!(m.rest_remaining, Some(0));
+            assert_eq!(m.rest_reset_at, Some(reset_at));
+            assert!(GhHttp::is_rate_limited().is_some());
+
+            // `.expect(1)` on the mock is verified on drop: no second request went out.
         }
 
         // ── get_all_pages_from_wrapper tests ─────────────────────────────────
