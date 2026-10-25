@@ -1284,12 +1284,12 @@ impl GhHttp {
         state: &str,
     ) -> anyhow::Result<Vec<GitHubIssue>> {
         let url = format!("{GITHUB_API}/repos/{repo}/issues");
-        let all: Vec<GitHubIssue> = self
-            .get_all_pages(
-                &url,
-                &[("labels", label), ("state", state), ("per_page", "100")],
-            )
-            .await?;
+        // An empty label lists every issue
+        let mut query = vec![("state", state), ("per_page", "100")];
+        if !label.is_empty() {
+            query.push(("labels", label));
+        }
+        let all: Vec<GitHubIssue> = self.get_all_pages(&url, &query).await?;
         // GitHub /issues API returns PRs too — filter them out
         Ok(all
             .into_iter()
