@@ -73,9 +73,16 @@ async fn load_existing(http: &GhHttp, repo: &str) -> anyhow::Result<Vec<Existing
 fn existing_from_issues(issues: Vec<GitHubIssue>) -> anyhow::Result<Vec<ExistingIssue>> {
     let mut existing = Vec::new();
     for issue in issues {
+        let labeled = issue.labels.iter().any(|label| label.name == PLAN_LABEL);
+        // Only a label or a repo writer vouches for an unlabeled marker, so a stranger cannot bind an issue
+        let trusted = labeled
+            || matches!(
+                issue.author_association.as_deref(),
+                Some("OWNER" | "MEMBER" | "COLLABORATOR")
+            );
         let body = issue.body.unwrap_or_default();
-        let Some(task_id) = marker_id(&body) else {
-            if issue.labels.iter().any(|label| label.name == PLAN_LABEL) {
+        let Some(task_id) = marker_id(&body).filter(|_| trusted) else {
+            if labeled {
                 eprintln!(
                     "warning: #{} has the {PLAN_LABEL} label and no plan marker",
                     issue.number
@@ -287,6 +294,10 @@ mod tests {
     use crate::github::types::{GitHubLabel, GitHubUser};
 
     fn issue(number: u64, body: &str, labels: &[&str]) -> GitHubIssue {
+        issue_by(number, body, labels, "OWNER")
+    }
+
+    fn issue_by(number: u64, body: &str, labels: &[&str], association: &str) -> GitHubIssue {
         GitHubIssue {
             number,
             id: number * 10,
@@ -308,7 +319,7 @@ mod tests {
             html_url: String::new(),
             node_id: None,
             pull_request: None,
-            author_association: None,
+            author_association: Some(association.to_string()),
             state_reason: None,
         }
     }
@@ -320,6 +331,7 @@ mod tests {
             issue(2, "<!-- orch-plan: M1-02 -->", &[PLAN_LABEL]),
             issue(3, "no marker", &[PLAN_LABEL]),
             issue(4, "no marker", &[]),
+            issue_by(5, "<!-- orch-plan: M1-03 -->", &[], "NONE"),
         ])
         .unwrap();
         let ids: Vec<&str> = found.iter().map(|item| item.task_id.as_str()).collect();
