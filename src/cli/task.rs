@@ -684,6 +684,19 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
         }
     }
 
+    // The engine process owns the live rate-limit state, so it leaves the reset epoch in
+    // KV for this one. Stale entries read as expired and are dropped.
+    let rate_limited_until = match store.as_ref() {
+        Some(s) => s
+            .kv_get(crate::engine::RATE_LIMITED_UNTIL_KEY)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|reset_at| *reset_at > chrono::Utc::now().timestamp()),
+        None => None,
+    };
+
     if json {
         let mut map = serde_json::Map::new();
         for (i, s) in statuses.iter().enumerate() {
@@ -719,8 +732,23 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
             serde_json::Value::Number((total_input_tokens + total_output_tokens).into()),
         );
 
+        if let Some(reset_at) = rate_limited_until {
+            map.insert(
+                "github_rate_limited_until".to_string(),
+                serde_json::Value::Number(reset_at.into()),
+            );
+        }
+
         println!("{}", serde_json::to_string_pretty(&map)?);
     } else {
+        if let Some(reset_at) = rate_limited_until {
+            println!(
+                "GitHub: rate limited until {}",
+                crate::engine::format_rate_limited_until(reset_at)
+            );
+            println!();
+        }
+
         println!("{:<20} {:>8}  {:>8}", "STATUS", "EXTERNAL", "INTERNAL");
         println!("{}", "-".repeat(42));
         let total_ext: usize = ext_counts.iter().sum();

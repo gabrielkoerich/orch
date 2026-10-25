@@ -2736,12 +2736,18 @@ pub(crate) async fn tick(
     // Run startup cleanup once to kill stale sessions from previous runs.
     startup_cleanup(tmux).await;
 
-    tick_check_session_completions(tmux, repo, capture, store).await?;
-    tick_detect_silent_agents(tmux, repo, capture, backend, task_manager, config, store).await?;
+    if let Err(e) = tick_check_session_completions(tmux, repo, capture, store).await {
+        tracing::warn!(err = %e, "session completion phase failed");
+    }
+    if let Err(e) =
+        tick_detect_silent_agents(tmux, repo, capture, backend, task_manager, config, store).await
+    {
+        tracing::warn!(err = %e, "silent-agent detection phase failed");
+    }
     // Fetch session map once and share between stuck-task recovery and dispatch to avoid
     // spawning two `tmux list-panes -a` subprocesses per tick.
     let session_map = tmux.batch_session_active().await;
-    tick_recover_stuck_tasks(
+    if let Err(e) = tick_recover_stuck_tasks(
         backend,
         tmux,
         repo,
@@ -2753,7 +2759,10 @@ pub(crate) async fn tick(
         dispatching,
         auto_merge_in_flight,
     )
-    .await?;
+    .await
+    {
+        tracing::warn!(err = %e, "stuck-task recovery phase failed");
+    }
     if let Err(err) = crate::engine::dependencies::reconcile_dependencies(
         backend.as_ref(),
         store,
@@ -2763,7 +2772,11 @@ pub(crate) async fn tick(
     {
         tracing::warn!(err = %err, "dependency reconcile failed");
     }
-    tick_route_tasks(backend, task_manager, router, store, repo, routing_quota).await?;
+    if let Err(e) =
+        tick_route_tasks(backend, task_manager, router, store, repo, routing_quota).await
+    {
+        tracing::warn!(err = %e, "routing phase failed");
+    }
     // Global routing sweep for tasks from inactive or removed repos.
     // tick_route_tasks is scoped to the active repo; tasks from projects no longer
     // in config are never returned by list_routable and would stay in 'new' indefinitely.
@@ -2771,7 +2784,7 @@ pub(crate) async fn tick(
         tracing::warn!(err = %e, "global new-task routing sweep failed");
     }
     let dispatch_mode = dispatch_mode_from_router(router);
-    tick_dispatch_tasks(
+    if let Err(e) = tick_dispatch_tasks(
         backend,
         tmux,
         repo,
@@ -2785,7 +2798,10 @@ pub(crate) async fn tick(
         store,
         &session_map,
     )
-    .await?;
+    .await
+    {
+        tracing::warn!(err = %e, "dispatch phase failed");
+    }
     // Global dispatch sweep for routed tasks from inactive or removed repos.
     // tick_dispatch_tasks is scoped to the active repo; tasks from projects no longer
     // in config are never returned by list_external_by_status and would stay in
@@ -2806,7 +2822,9 @@ pub(crate) async fn tick(
     {
         tracing::warn!(err = %e, "global routed-task dispatch sweep failed");
     }
-    tick_unblock_parents(backend, task_manager, store, repo).await?;
+    if let Err(e) = tick_unblock_parents(backend, task_manager, store, repo).await {
+        tracing::warn!(err = %e, "parent-unblock phase failed");
+    }
     if let Err(e) = tick_job_scheduler(jobs_path, backend, Some(store), repo, transport).await {
         tracing::error!(?e, "job scheduler tick failed");
     }
