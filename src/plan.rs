@@ -1293,6 +1293,20 @@ mod tests {
     }
 
     #[test]
+    fn marker_without_label_is_an_update_that_adds_the_label() {
+        let roadmap = roadmap();
+        let mut existing = existing_for(&roadmap);
+        existing[0].labels = vec!["status:new".to_string()];
+        let diff = diff_import(&roadmap, &existing, None, |task| {
+            issue_body(task, "acme/app", "main", "docs/ROADMAP.md")
+        })
+        .unwrap();
+        assert_eq!(diff.tasks[0].kind, ChangeKind::Update);
+        assert_eq!(diff.tasks[0].number, Some(1));
+        assert!(labels_for(&diff.tasks[0].existing_labels, false).contains(&PLAN_LABEL.to_string()));
+    }
+
+    #[test]
     fn milestone_filter_limits_tasks_and_removed() {
         let roadmap = roadmap();
         let mut existing = existing_for(&roadmap);

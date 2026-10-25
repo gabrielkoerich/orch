@@ -7,6 +7,7 @@ use anyhow::Context;
 
 use crate::config;
 use crate::github::http::GhHttp;
+use crate::github::types::GitHubIssue;
 use crate::plan::{
     diff_import, diff_links, issue_body, issue_title, labels_for, marker_id, missing_blockers,
     render, Binding, DepRef, ExistingIssue, LinkEdit, PlanDiff, Task, HUMAN_LABEL, NO_AGENT_LABEL,
@@ -60,19 +61,33 @@ pub async fn import(file: &str, dry_run: bool, milestone: Option<&str>) -> anyho
 }
 
 async fn load_existing(http: &GhHttp, repo: &str) -> anyhow::Result<Vec<ExistingIssue>> {
-    let issues = match http.list_issues_with_state(repo, PLAN_LABEL, "all").await {
+    // No label filter, so an issue with the marker and no label still matches
+    let issues = match http.list_issues_with_state(repo, "", "all").await {
         Ok(issues) => issues,
         Err(err) if err.to_string().contains("404") => Vec::new(),
         Err(err) => return Err(err),
     };
+    existing_from_issues(issues)
+}
+
+fn existing_from_issues(issues: Vec<GitHubIssue>) -> anyhow::Result<Vec<ExistingIssue>> {
     let mut existing = Vec::new();
     for issue in issues {
-        let body = issue.body.unwrap_or_default();
-        let Some(task_id) = marker_id(&body) else {
-            eprintln!(
-                "warning: #{} has the {PLAN_LABEL} label and no plan marker",
-                issue.number
+        let labeled = issue.labels.iter().any(|label| label.name == PLAN_LABEL);
+        // Only a label or a repo writer vouches for an unlabeled marker, so a stranger cannot bind an issue
+        let trusted = labeled
+            || matches!(
+                issue.author_association.as_deref(),
+                Some("OWNER" | "MEMBER" | "COLLABORATOR")
             );
+        let body = issue.body.unwrap_or_default();
+        let Some(task_id) = marker_id(&body).filter(|_| trusted) else {
+            if labeled {
+                eprintln!(
+                    "warning: #{} has the {PLAN_LABEL} label and no plan marker",
+                    issue.number
+                );
+            }
             continue;
         };
         if issue.id == 0 {
@@ -271,4 +286,55 @@ fn repo_relative(path: &Path) -> Option<String> {
             .collect::<Vec<_>>()
             .join("/"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github::types::{GitHubLabel, GitHubUser};
+
+    fn issue(number: u64, body: &str, labels: &[&str]) -> GitHubIssue {
+        issue_by(number, body, labels, "OWNER")
+    }
+
+    fn issue_by(number: u64, body: &str, labels: &[&str], association: &str) -> GitHubIssue {
+        GitHubIssue {
+            number,
+            id: number * 10,
+            title: format!("issue {number}"),
+            body: Some(body.to_string()),
+            state: "open".to_string(),
+            labels: labels
+                .iter()
+                .map(|name| GitHubLabel {
+                    name: name.to_string(),
+                    color: None,
+                })
+                .collect(),
+            user: GitHubUser {
+                login: "u".to_string(),
+            },
+            created_at: String::new(),
+            updated_at: String::new(),
+            html_url: String::new(),
+            node_id: None,
+            pull_request: None,
+            author_association: Some(association.to_string()),
+            state_reason: None,
+        }
+    }
+
+    #[test]
+    fn marker_matches_with_or_without_the_label_and_no_marker_is_skipped() {
+        let found = existing_from_issues(vec![
+            issue(1, "<!-- orch-plan: M1-01 -->", &[]),
+            issue(2, "<!-- orch-plan: M1-02 -->", &[PLAN_LABEL]),
+            issue(3, "no marker", &[PLAN_LABEL]),
+            issue(4, "no marker", &[]),
+            issue_by(5, "<!-- orch-plan: M1-03 -->", &[], "NONE"),
+        ])
+        .unwrap();
+        let ids: Vec<&str> = found.iter().map(|item| item.task_id.as_str()).collect();
+        assert_eq!(ids, ["M1-01", "M1-02"]);
+    }
 }
