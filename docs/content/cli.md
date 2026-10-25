@@ -144,15 +144,16 @@ Jobs can also be defined declaratively as markdown files under `prompts/jobs/*.m
 orch plan import docs/ROADMAP.md
 orch plan import docs/ROADMAP.md --dry-run
 orch plan import docs/ROADMAP.md --milestone M1
+orch plan import docs/ROADMAP.md --milestone M4 --skip-unmet
 ```
 
 `orch plan import` reads a roadmap file and creates one GitHub issue per task. The title is the task id and the task title. The body holds the goal, scope and acceptance, a link to the heading on the default branch, and a hidden marker (`<!-- orch-plan: M1-03 -->`). A later import edits an issue only when the title, body or labels changed.
 
 A milestone starts at `## M1. Milestone title`. A task starts at `### M1-03 Task title`. A later milestone can be a table whose header has Task and Depends on columns.
 
-`Depends on: M1-02, M1-05` is stored as GitHub blocked-by links. `Depends on: none` stores no link. An import drops a blocked-by link that the file no longer declares, and keeps a link to an issue outside the plan. `Owner: human` adds the `owner:human` and `no-agent` labels, so orch skips that issue. A task that leaves the file is listed and left open.
+`Depends on: M1-02, M1-05` is stored as GitHub blocked-by links. `Depends on: none` stores no link. An import drops a blocked-by link that the file no longer declares, and keeps a link to an issue outside the plan. An open blocked-by link holds the dependent task as waiting. `Owner: human` adds the `owner:human` and `no-agent` labels, so orch skips that issue. A task that leaves the file is listed and left open.
 
-`--dry-run` prints every selected task, the links that would change, and the removed tasks. `--milestone M1` imports that milestone only. Dispatch skips `no-agent` and `owner:human`. An open blocked-by link does not hold a task.
+`--dry-run` prints every selected task, the links that would change, and the removed tasks. `--milestone M1` imports that milestone only. A dependency outside the milestone links to the existing issue when one has the plan marker. When that issue does not exist yet, the import continues, the dependent issue body gets a `blocked-external` note, and orch holds the task as waiting. `--skip-unmet` skips creating those dependent issues. An id that is not in the roadmap is an error. Dispatch skips `no-agent` and `owner:human`.
 
 ## Version
 

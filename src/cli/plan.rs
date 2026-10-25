@@ -9,12 +9,17 @@ use crate::config;
 use crate::github::http::GhHttp;
 use crate::github::types::GitHubIssue;
 use crate::plan::{
-    diff_import, diff_links, issue_body, issue_title, labels_for, marker_id, missing_blockers,
-    render, Binding, DepRef, ExistingIssue, LinkEdit, PlanDiff, Task, HUMAN_LABEL, NO_AGENT_LABEL,
-    PLAN_LABEL,
+    diff_import, diff_links, issue_body_with, issue_title, labels_for, marker_id, render_report,
+    skip_unmet_ids, unmet_externals, Binding, DepRef, ExistingIssue, LinkEdit, PlanDiff, Task,
+    UnmetExternal, HUMAN_LABEL, NO_AGENT_LABEL, PLAN_LABEL,
 };
 
-pub async fn import(file: &str, dry_run: bool, milestone: Option<&str>) -> anyhow::Result<()> {
+pub async fn import(
+    file: &str,
+    dry_run: bool,
+    milestone: Option<&str>,
+    skip_unmet: bool,
+) -> anyhow::Result<()> {
     let path = Path::new(file);
     let markdown = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -36,28 +41,57 @@ pub async fn import(file: &str, dry_run: bool, milestone: Option<&str>) -> anyho
     let http = GhHttp::new()?;
     let branch = http.get_default_branch(&repo).await?;
     let existing = load_existing(&http, &repo).await?;
-    let body_for = |task: &Task| issue_body(task, &repo, &branch, &rel_path);
-    let diff = diff_import(&roadmap, &existing, milestone, body_for)?;
-
     let known: HashSet<String> = existing.iter().map(|issue| issue.task_id.clone()).collect();
-    let selected: Vec<Task> = diff.tasks.iter().map(|plan| plan.task.clone()).collect();
-    let missing = missing_blockers(&selected, &known);
-    if !missing.is_empty() {
-        print!("{}", crate::plan::render_tasks(&diff));
-        anyhow::bail!("{}", missing.join("\n"));
-    }
+    let selected_all: Vec<Task> = crate::plan::select(&roadmap, milestone)?
+        .into_iter()
+        .cloned()
+        .collect();
+    let unmet = unmet_externals(&selected_all, &roadmap, &known)?;
+    let extras = extras_by_task(&unmet);
+    let body_for = |task: &Task| {
+        let extra = extras.get(&task.id).map(Vec::as_slice).unwrap_or(&[]);
+        issue_body_with(task, &repo, &branch, &rel_path, extra)
+    };
+    let mut diff = diff_import(&roadmap, &existing, milestone, body_for)?;
+    let skipped = if skip_unmet {
+        let skip = skip_unmet_ids(&selected_all, &unmet);
+        let mut skipped = Vec::new();
+        diff.tasks.retain(|plan| {
+            if plan.kind == crate::plan::ChangeKind::Create && skip.contains(&plan.task.id) {
+                skipped.push(plan.task.id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        skipped
+    } else {
+        Vec::new()
+    };
 
+    let selected: Vec<Task> = diff.tasks.iter().map(|plan| plan.task.clone()).collect();
     let bindings = bindings_for(&diff, &existing);
     let current = load_blocked_by(&http, &repo, &diff).await?;
     let links = diff_links(&selected, &bindings, &current)?;
     if dry_run {
-        print!("{}", render(&diff, &links, true));
+        print!("{}", render_report(&diff, &links, &unmet, &skipped, true));
         return Ok(());
     }
 
-    apply(&http, &repo, &diff, &links, &rel_path, &branch).await?;
-    print!("{}", render(&diff, &links, false));
+    apply(&http, &repo, &diff, &links, &rel_path, &branch, &extras).await?;
+    print!("{}", render_report(&diff, &links, &unmet, &skipped, false));
     Ok(())
+}
+
+fn extras_by_task(unmet: &[UnmetExternal]) -> HashMap<String, Vec<String>> {
+    let mut extras: HashMap<String, Vec<String>> = HashMap::new();
+    for item in unmet {
+        extras
+            .entry(item.task_id.clone())
+            .or_default()
+            .push(item.blocking_task_id.clone());
+    }
+    extras
 }
 
 async fn load_existing(http: &GhHttp, repo: &str) -> anyhow::Result<Vec<ExistingIssue>> {
@@ -175,6 +209,7 @@ async fn apply(
     links: &[LinkEdit],
     rel_path: &str,
     branch: &str,
+    blocked_external: &HashMap<String, Vec<String>>,
 ) -> anyhow::Result<()> {
     http.ensure_label(repo, PLAN_LABEL, "6f42c1", "Imported from a roadmap file")
         .await?;
@@ -195,7 +230,11 @@ async fn apply(
             crate::plan::ChangeKind::Unchanged => {}
             crate::plan::ChangeKind::Create => {
                 let title = issue_title(&plan.task);
-                let body = issue_body(&plan.task, repo, branch, rel_path);
+                let extra = blocked_external
+                    .get(&plan.task.id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let body = issue_body_with(&plan.task, repo, branch, rel_path, extra);
                 let labels = labels_for(&[], plan.task.owner_human);
                 let issue = http.create_issue(repo, &title, &body, &labels).await?;
                 if issue.id == 0 {
@@ -209,7 +248,11 @@ async fn apply(
             crate::plan::ChangeKind::Update => {
                 let number = plan.number.context("update is missing an issue number")?;
                 let title = issue_title(&plan.task);
-                let body = issue_body(&plan.task, repo, branch, rel_path);
+                let extra = blocked_external
+                    .get(&plan.task.id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let body = issue_body_with(&plan.task, repo, branch, rel_path, extra);
                 let labels = labels_for(&plan.existing_labels, plan.task.owner_human);
                 let issue = http
                     .update_issue(repo, number, &title, &body, &labels)

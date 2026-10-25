@@ -8,6 +8,8 @@
 //! `not_planned` and `duplicate` are not done. `new`, `routed`, `waiting`,
 //! `blocked`, and `needs_review` move to `waiting` while a dependency is open.
 //! `in_progress` and `in_review` stay where they are.
+//! A `blocked-external` note in the issue body is an unmet blocker until a later
+//! import removes it
 
 use super::{TaskStatus, TaskStore};
 use anyhow::Context;
@@ -509,7 +511,7 @@ impl TaskStore {
             .execute(&mut *tx)
             .await
             .context("lock task for dependency claim")?;
-        let row = sqlx::query("SELECT status, agent, model, repo FROM tasks WHERE id = ?")
+        let row = sqlx::query("SELECT status, agent, model, repo, body FROM tasks WHERE id = ?")
             .bind(task_id)
             .fetch_optional(&mut *tx)
             .await?;
@@ -521,12 +523,18 @@ impl TaskStore {
         let agent: Option<String> = row.try_get("agent")?;
         let model: Option<String> = row.try_get("model")?;
         let repo: String = row.try_get("repo")?;
+        let body: String = row.try_get("body").unwrap_or_default();
         let views = load_blockers(&mut tx, task_id, &repo).await?;
-        let unmet: Vec<String> = views
+        let mut unmet: Vec<String> = views
             .iter()
             .filter(|view| !view.satisfied)
             .map(|view| view.label.clone())
             .collect();
+        for id in blocked_external_from_body(&body) {
+            if !unmet.iter().any(|have| have == &id) {
+                unmet.push(id);
+            }
+        }
 
         let holdable = matches!(
             status.as_str(),
@@ -603,6 +611,47 @@ impl TaskStore {
     }
 }
 
+/// Plan-import note that a blocker outside the milestone has no GitHub issue yet
+pub fn blocked_external_from_body(body: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut push = |token: &str| {
+        let token = token.trim();
+        if token.is_empty() {
+            return;
+        }
+        if !ids.iter().any(|have| have == token) {
+            ids.push(token.to_string());
+        }
+    };
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("<!--") {
+            let rest = rest.trim();
+            let Some(rest) = rest.strip_prefix("orch-blocked-external:") else {
+                continue;
+            };
+            let rest = rest.trim().trim_end_matches("-->").trim();
+            for token in rest.split(',') {
+                push(token);
+            }
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if !lower.starts_with("blocked-external") {
+            continue;
+        }
+        let rest = trimmed["blocked-external".len()..]
+            .trim_start()
+            .trim_start_matches(':')
+            .trim();
+        let rest = rest.strip_suffix("(no issue yet)").unwrap_or(rest).trim();
+        for token in rest.split(',') {
+            push(token);
+        }
+    }
+    ids
+}
+
 async fn load_blockers(
     conn: &mut SqliteConnection,
     task_id: i64,
@@ -641,13 +690,23 @@ mod tests {
     use crate::store::{NewTask, TaskStore};
 
     async fn task(store: &TaskStore, repo: &str, number: &str, title: &str) -> i64 {
+        task_with_body(store, repo, number, title, "").await
+    }
+
+    async fn task_with_body(
+        store: &TaskStore,
+        repo: &str,
+        number: &str,
+        title: &str,
+        body: &str,
+    ) -> i64 {
         store
             .create(&NewTask {
                 external_id: Some(number.to_string()),
                 repo: repo.to_string(),
                 origin: "github".to_string(),
                 title: title.to_string(),
-                body: String::new(),
+                body: body.to_string(),
                 source: "manual".to_string(),
                 source_id: String::new(),
                 author: String::new(),
@@ -976,6 +1035,50 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Waiting);
         assert!(task.branch.is_empty());
         assert!(task.worktree.is_empty());
+    }
+
+    #[test]
+    fn blocked_external_from_body_reads_the_note_and_the_marker() {
+        let body = concat!(
+            "blocked-external: M1-05, M1-01 (no issue yet)\n\n",
+            "<!-- orch-blocked-external: M1-05, M1-01 -->\n",
+            "<!-- orch-plan: M6-01 -->\n",
+        );
+        assert_eq!(
+            blocked_external_from_body(body),
+            vec!["M1-05".to_string(), "M1-01".to_string()]
+        );
+        assert!(blocked_external_from_body("<!-- orch-plan: M6-01 -->").is_empty());
+    }
+
+    #[tokio::test]
+    async fn blocked_external_note_holds_the_task_and_clears_when_removed() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let body = concat!(
+            "blocked-external: M3-01 (no issue yet)\n\n",
+            "<!-- orch-blocked-external: M3-01 -->\n",
+        );
+        let b = task_with_body(&store, "owner/repo", "4", "M4-01 API", body).await;
+        let held = store.block_claim_if_waiting(b).await.unwrap();
+        assert_eq!(held, Some(vec!["M3-01".to_string()]));
+        assert_eq!(store.get(b).await.unwrap().status, TaskStatus::Waiting);
+
+        store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "4",
+                title: "M4-01 API",
+                body: "<!-- orch-plan: M4-01 -->\n",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        let released = store.block_claim_if_waiting(b).await.unwrap();
+        assert_eq!(released, None);
+        assert_eq!(store.get(b).await.unwrap().status, TaskStatus::New);
     }
 
     #[tokio::test]

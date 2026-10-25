@@ -101,6 +101,13 @@ pub struct PlanDiff {
     pub removed: Vec<RemovedTask>,
 }
 
+/// A selected task depends on a roadmap id outside the import that has no issue yet
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmetExternal {
+    pub task_id: String,
+    pub blocking_task_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
     pub task_id: String,
@@ -285,6 +292,16 @@ pub fn task_anchor(task: &Task) -> String {
 }
 
 pub fn issue_body(task: &Task, repo: &str, branch: &str, rel_path: &str) -> String {
+    issue_body_with(task, repo, branch, rel_path, &[])
+}
+
+pub fn issue_body_with(
+    task: &Task,
+    repo: &str,
+    branch: &str,
+    rel_path: &str,
+    blocked_external: &[String],
+) -> String {
     let mut out = String::new();
     if !task.goal.is_empty() {
         out.push_str("## Goal\n\n");
@@ -310,6 +327,11 @@ pub fn issue_body(task: &Task, repo: &str, branch: &str, rel_path: &str) -> Stri
         }
         out.push('\n');
     }
+    if !blocked_external.is_empty() {
+        out.push_str("blocked-external: ");
+        out.push_str(&blocked_external.join(", "));
+        out.push_str(" (no issue yet)\n\n");
+    }
     let url = format!(
         "https://github.com/{repo}/blob/{branch}/{path}#{anchor}",
         branch = encode_git_path(branch),
@@ -317,6 +339,11 @@ pub fn issue_body(task: &Task, repo: &str, branch: &str, rel_path: &str) -> Stri
         anchor = urlencoding::encode(&task_anchor(task)),
     );
     out.push_str(&format!("[{rel_path}]({url})\n\n"));
+    if !blocked_external.is_empty() {
+        out.push_str("<!-- orch-blocked-external: ");
+        out.push_str(&blocked_external.join(", "));
+        out.push_str(" -->\n");
+    }
     out.push_str(&marker_for(&task.id));
     out.push('\n');
     out
@@ -428,21 +455,67 @@ pub fn diff_import(
     Ok(PlanDiff { tasks, removed })
 }
 
-pub fn missing_blockers(tasks: &[Task], known_ids: &HashSet<String>) -> Vec<String> {
+/// Dependencies outside the selected set that have no GitHub issue yet.
+///
+/// An id that is not in the roadmap is an error. An id in the roadmap is reported
+pub fn unmet_externals(
+    tasks: &[Task],
+    roadmap: &Roadmap,
+    known_ids: &HashSet<String>,
+) -> Result<Vec<UnmetExternal>, PlanError> {
     let selected: HashSet<&str> = tasks.iter().map(|task| task.id.as_str()).collect();
-    let mut missing = Vec::new();
+    let roadmap_ids: HashSet<&str> = roadmap.tasks.iter().map(|task| task.id.as_str()).collect();
+    let mut unmet = Vec::new();
+    let mut errors = Vec::new();
     for task in tasks {
         for dep in &task.depends_on {
             if selected.contains(dep.as_str()) || known_ids.contains(dep) {
                 continue;
             }
-            missing.push(format!(
-                "{} depends on {dep}, which has no issue yet",
-                task.id
-            ));
+            if roadmap_ids.contains(dep.as_str()) {
+                unmet.push(UnmetExternal {
+                    task_id: task.id.clone(),
+                    blocking_task_id: dep.clone(),
+                });
+            } else {
+                errors.push(format!("{} depends on unknown task {dep}", task.id));
+            }
         }
     }
-    missing
+    if errors.is_empty() {
+        Ok(unmet)
+    } else {
+        Err(PlanError::new(errors.join("\n")))
+    }
+}
+
+/// Task ids to omit when `--skip-unmet` is set, including tasks that depend on a skipped task
+pub fn skip_unmet_ids(tasks: &[Task], unmet: &[UnmetExternal]) -> HashSet<String> {
+    let mut skip: HashSet<String> = unmet.iter().map(|item| item.task_id.clone()).collect();
+    loop {
+        let mut added = false;
+        for task in tasks {
+            if skip.contains(&task.id) {
+                continue;
+            }
+            if task.depends_on.iter().any(|dep| skip.contains(dep)) {
+                skip.insert(task.id.clone());
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    skip
+}
+
+pub fn blocked_external_ids<'a>(unmet: &'a [UnmetExternal], task_id: &str) -> Vec<&'a str> {
+    unmet
+        .iter()
+        .filter(|item| item.task_id == task_id)
+        .map(|item| item.blocking_task_id.as_str())
+        .collect()
 }
 
 pub fn diff_links(
@@ -466,10 +539,6 @@ pub fn diff_links(
         let mut desired_numbers = Vec::new();
         for dep_id in &task.depends_on {
             let Some(dep) = bindings.iter().find(|item| item.task_id == dep_id.as_str()) else {
-                errors.push(format!(
-                    "{} depends on {dep_id}, which has no issue yet",
-                    task.id
-                ));
                 continue;
             };
             if let Some(number) = dep.number {
@@ -511,9 +580,49 @@ pub fn diff_links(
 }
 
 pub fn render(diff: &PlanDiff, links: &[LinkEdit], dry_run: bool) -> String {
+    render_report(diff, links, &[], &[], dry_run)
+}
+
+pub fn render_report(
+    diff: &PlanDiff,
+    links: &[LinkEdit],
+    unmet: &[UnmetExternal],
+    skipped: &[String],
+    dry_run: bool,
+) -> String {
     let mut out = render_tasks(diff);
+    out.push_str(&render_unmet(unmet, skipped));
     out.push_str(&render_links(links));
     out.push_str(&render_summary(diff, links, dry_run));
+    out
+}
+
+fn render_unmet(unmet: &[UnmetExternal], skipped: &[String]) -> String {
+    let skip: HashSet<&str> = skipped.iter().map(String::as_str).collect();
+    let mut out = String::new();
+    for id in skipped {
+        let deps = blocked_external_ids(unmet, id);
+        if deps.is_empty() {
+            out.push_str(&format!("skip {id}\n"));
+        } else {
+            out.push_str(&format!(
+                "skip {id} depends on {}, which has no issue yet\n",
+                deps.join(", ")
+            ));
+        }
+    }
+    let mut seen = HashSet::new();
+    for item in unmet {
+        if skip.contains(item.task_id.as_str()) || !seen.insert(item.task_id.as_str()) {
+            continue;
+        }
+        let deps = blocked_external_ids(unmet, &item.task_id);
+        out.push_str(&format!(
+            "blocked-external {} depends on {}, which has no issue yet\n",
+            item.task_id,
+            deps.join(", ")
+        ));
+    }
     out
 }
 
@@ -1336,24 +1445,160 @@ mod tests {
     }
 
     #[test]
-    fn milestone_import_reports_a_blocker_with_no_issue() {
+    fn milestone_import_links_an_existing_external_issue() {
+        let roadmap = roadmap();
+        let existing: Vec<ExistingIssue> = existing_for(&roadmap)
+            .into_iter()
+            .filter(|issue| issue.task_id.starts_with("M1-"))
+            .collect();
+        let known: HashSet<String> = existing.iter().map(|issue| issue.task_id.clone()).collect();
+        let selected: Vec<Task> = select(&roadmap, Some("M6"))
+            .unwrap()
+            .into_iter()
+            .cloned()
+            .collect();
+        assert!(unmet_externals(&selected, &roadmap, &known)
+            .unwrap()
+            .is_empty());
+        let diff = diff_import(&roadmap, &existing, Some("M6"), |task| {
+            issue_body(task, "acme/app", "main", "docs/ROADMAP.md")
+        })
+        .unwrap();
+        let links = diff_links(
+            &selected,
+            &bindings_with_existing(&diff, &existing),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert!(links.iter().any(|edit| matches!(
+            edit,
+            LinkEdit::Add { task_id, blocking_task_id, blocking_number: Some(5), .. }
+                if task_id == "M6-01" && blocking_task_id == "M1-05"
+        )));
+        assert!(links.iter().any(|edit| matches!(
+            edit,
+            LinkEdit::Add { task_id, blocking_task_id, .. }
+                if task_id == "M6-01" && blocking_task_id == "M1-01"
+        )));
+        assert!(links.iter().any(|edit| matches!(
+            edit,
+            LinkEdit::Add { task_id, blocking_task_id, .. }
+                if task_id == "M6-02" && blocking_task_id == "M6-01"
+        )));
+    }
+
+    #[test]
+    fn milestone_import_keeps_going_when_an_external_blocker_has_no_issue() {
         let roadmap = roadmap();
         let selected: Vec<Task> = select(&roadmap, Some("M6"))
             .unwrap()
             .into_iter()
             .cloned()
             .collect();
-        let missing = missing_blockers(&selected, &HashSet::new());
+        let unmet = unmet_externals(&selected, &roadmap, &HashSet::new()).unwrap();
         assert!(
-            missing
+            unmet
                 .iter()
-                .any(|line| line.contains("M6-01 depends on M1-05")),
-            "{missing:?}"
+                .any(|item| item.task_id == "M6-01" && item.blocking_task_id == "M1-05"),
+            "{unmet:?}"
+        );
+        assert!(
+            unmet
+                .iter()
+                .any(|item| item.task_id == "M6-01" && item.blocking_task_id == "M1-01"),
+            "{unmet:?}"
+        );
+        let extras: Vec<String> = blocked_external_ids(&unmet, "M6-01")
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let body = issue_body_with(
+            task(&roadmap, "M6-01"),
+            "acme/app",
+            "main",
+            "docs/ROADMAP.md",
+            &extras,
+        );
+        assert!(body.contains("blocked-external: M1-05, M1-01 (no issue yet)"));
+        assert!(body.contains("<!-- orch-blocked-external: M1-05, M1-01 -->"));
+        let diff = diff_import(&roadmap, &[], Some("M6"), |task| {
+            let extra: Vec<String> = blocked_external_ids(&unmet, &task.id)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            issue_body_with(task, "acme/app", "main", "docs/ROADMAP.md", &extra)
+        })
+        .unwrap();
+        assert_eq!(diff.tasks.len(), 2);
+        assert!(diff
+            .tasks
+            .iter()
+            .all(|plan| plan.kind == ChangeKind::Create));
+        let links = diff_links(&selected, &bindings_for(&diff), &HashMap::new()).unwrap();
+        assert!(
+            !links.iter().any(|edit| matches!(
+                edit,
+                LinkEdit::Add { blocking_task_id, .. }
+                    if blocking_task_id == "M1-05" || blocking_task_id == "M1-01"
+            )),
+            "an unmet external blocker must not be linked: {links:?}"
+        );
+        assert!(links.iter().any(|edit| matches!(
+            edit,
+            LinkEdit::Add { task_id, blocking_task_id, .. }
+                if task_id == "M6-02" && blocking_task_id == "M6-01"
+        )));
+        let text = render_report(&diff, &links, &unmet, &[], true);
+        assert!(
+            text.contains("blocked-external M6-01 depends on M1-05, M1-01, which has no issue yet")
         );
         let mut known = HashSet::new();
         known.insert("M1-05".to_string());
         known.insert("M1-01".to_string());
-        assert!(missing_blockers(&selected, &known).is_empty());
+        assert!(unmet_externals(&selected, &roadmap, &known)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn skip_unmet_omits_the_dependent_and_tasks_that_wait_on_it() {
+        let roadmap = roadmap();
+        let selected: Vec<Task> = select(&roadmap, Some("M6"))
+            .unwrap()
+            .into_iter()
+            .cloned()
+            .collect();
+        let unmet = unmet_externals(&selected, &roadmap, &HashSet::new()).unwrap();
+        let skip = skip_unmet_ids(&selected, &unmet);
+        assert!(skip.contains("M6-01"));
+        assert!(skip.contains("M6-02"));
+        let text = render_report(
+            &PlanDiff {
+                tasks: Vec::new(),
+                removed: Vec::new(),
+            },
+            &[],
+            &unmet,
+            &["M6-01".to_string(), "M6-02".to_string()],
+            true,
+        );
+        assert!(text.contains("skip M6-01 depends on M1-05, M1-01, which has no issue yet"));
+        assert!(text.contains("skip M6-02\n"));
+        assert!(!text.contains("blocked-external M6-01"));
+    }
+
+    #[test]
+    fn unmet_externals_rejects_an_unknown_id() {
+        let roadmap = roadmap();
+        let mut task = task(&roadmap, "M6-01").clone();
+        task.depends_on = vec!["M9-99".to_string()];
+        let err = unmet_externals(&[task], &roadmap, &HashSet::new()).unwrap_err();
+        assert!(
+            err.message.contains("unknown task M9-99"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("M6-01"), "{}", err.message);
     }
 
     #[test]
@@ -1444,6 +1689,24 @@ mod tests {
                 database_id: plan.database_id,
             })
             .collect()
+    }
+
+    fn bindings_with_existing(diff: &PlanDiff, existing: &[ExistingIssue]) -> Vec<Binding> {
+        let mut bindings = bindings_for(diff);
+        for issue in existing {
+            if bindings
+                .iter()
+                .any(|binding| binding.task_id == issue.task_id)
+            {
+                continue;
+            }
+            bindings.push(Binding {
+                task_id: issue.task_id.clone(),
+                number: Some(issue.number),
+                database_id: Some(issue.database_id),
+            });
+        }
+        bindings
     }
 
     fn bindings_from_existing(existing: &[ExistingIssue]) -> Vec<Binding> {
