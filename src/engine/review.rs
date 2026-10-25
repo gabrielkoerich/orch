@@ -175,6 +175,8 @@ struct ReviewContext {
     worktree_path: std::path::PathBuf,
     branch_name: String,
     pr_number: u64,
+    /// PR head SHA when the review started, the commit the decision applies to
+    head_sha: Option<String>,
     default_branch: String,
     review_agent: String,
     review_model: Option<String>,
@@ -663,6 +665,11 @@ async fn build_review_context(
         attempt: review_attempt,
     };
 
+    let head_sha = match GhHttp::new() {
+        Ok(gh) => gh.get_pr(repo, pr_number).await.ok().map(|pr| pr.head.sha),
+        Err(_) => None,
+    };
+
     Ok(ReviewPhase::Ready(ReviewContext {
         store_id,
         had_prev_push_failure,
@@ -670,6 +677,7 @@ async fn build_review_context(
         worktree_path,
         branch_name,
         pr_number,
+        head_sha,
         default_branch,
         review_agent,
         review_model,
@@ -776,7 +784,7 @@ async fn invoke_review_agent(
             post_review_status(
                 &gh,
                 repo,
-                ctx.pr_number,
+                ctx.head_sha.as_deref(),
                 "pending",
                 "Automated review running",
             )
@@ -1738,28 +1746,23 @@ fn review_status(decision: &ReviewDecision) -> Option<(&'static str, &'static st
     }
 }
 
-/// Post `orch/review` on the PR head SHA. A new push moves the head, so an old decision goes stale.
+/// Post `orch/review` on the SHA the review started from. A new push moves the PR head, so an
+/// old decision never covers a new commit.
 async fn post_review_status(
     gh: &GhHttp,
     repo: &str,
-    pr_number: u64,
+    sha: Option<&str>,
     state: &str,
     description: &str,
 ) {
-    let result = async {
-        let pr = gh.get_pr(repo, pr_number).await?;
-        gh.post_commit_status(
-            repo,
-            &pr.head.sha,
-            state,
-            REVIEW_STATUS_CONTEXT,
-            description,
-        )
+    let Some(sha) = sha else {
+        return;
+    };
+    if let Err(e) = gh
+        .post_commit_status(repo, sha, state, REVIEW_STATUS_CONTEXT, description)
         .await
-    }
-    .await;
-    if let Err(e) = result {
-        tracing::warn!(pr_number, error = %e, "failed to post orch/review commit status");
+    {
+        tracing::warn!(sha, error = %e, "failed to post orch/review commit status");
     }
 }
 
@@ -1789,7 +1792,7 @@ async fn post_review_comment(
     }
 
     if let Some((state, description)) = review_status(decision) {
-        post_review_status(&gh, repo, ctx.pr_number, state, description).await;
+        post_review_status(&gh, repo, ctx.head_sha.as_deref(), state, description).await;
     }
 
     if !pr_comment.is_empty() {
@@ -3601,6 +3604,7 @@ mod tests {
             worktree_path: work_dir.to_path_buf(),
             branch_name: "gh-issue-1-test".to_string(),
             pr_number: 1,
+            head_sha: None,
             default_branch: "main".to_string(),
             review_agent: agent.to_string(),
             review_model: Some(model.to_string()),

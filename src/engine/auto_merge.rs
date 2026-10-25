@@ -1130,9 +1130,10 @@ pub(crate) async fn auto_merge_pr(
 
         // A check that never started because of an Actions billing or spending limit
         // is "not run", not a failure. If every failed check is of that kind and the
-        // other checks passed, the PR is green.
+        // other checks passed, the PR is green. Only without required contexts, where
+        // `failing` counts exactly the failed check runs.
         let mut state = state;
-        if state == "failure" && passing > 0 {
+        if state == "failure" && passing > 0 && required_contexts.is_empty() {
             let unstarted =
                 billing_failed_runs(&gh, repo, &head_sha, prefetched_check_runs.clone()).await;
             if unstarted > 0 && unstarted == failing {
