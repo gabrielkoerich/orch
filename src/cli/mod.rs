@@ -97,6 +97,7 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
 
     // Install orch-review workflow
     install_review_workflow(&cwd)?;
+    set_reviewer_variable(&repo_value);
 
     // Guidance for board setup
     println!();
@@ -107,9 +108,44 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The orch review gate workflow template, loaded from the repo's own workflow file.
+/// The review gate template for other repositories. orch's own workflow adds docs jobs on top.
 /// Installed by `orch init` into `.github/workflows/orch-review.yml`.
-const ORCH_REVIEW_WORKFLOW: &str = include_str!("../../.github/workflows/orch-review.yml");
+const ORCH_REVIEW_WORKFLOW: &str = include_str!("orch-review.template.yml");
+
+/// Store the login of the `gh` account orch reviews with, so the gate trusts only its comments.
+fn set_reviewer_variable(repo: &str) {
+    let login = std::process::Command::new("gh")
+        .args(["api", "user", "--jq", ".login"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|l| !l.is_empty());
+    let Some(login) = login else {
+        eprintln!(
+            "Could not read the gh login. Set the ORCH_REVIEWER repository variable by hand."
+        );
+        return;
+    };
+    let ok = std::process::Command::new("gh")
+        .args([
+            "variable",
+            "set",
+            "ORCH_REVIEWER",
+            "--repo",
+            repo,
+            "--body",
+            &login,
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok {
+        println!("Set ORCH_REVIEWER={login}");
+    } else {
+        eprintln!("Could not set ORCH_REVIEWER. Set it by hand to {login}.");
+    }
+}
 
 /// Install the orch review gate workflow into the project.
 fn install_review_workflow(project_dir: &std::path::Path) -> anyhow::Result<()> {
@@ -836,6 +872,87 @@ pub async fn init_store() -> anyhow::Result<crate::store::TaskStore> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_template_has_gate_and_no_orch_only_steps() {
+        assert!(ORCH_REVIEW_WORKFLOW.contains("## Automated Review"));
+        assert!(ORCH_REVIEW_WORKFLOW.contains("ORCH_REVIEWER"));
+        let lower = ORCH_REVIEW_WORKFLOW.to_lowercase();
+        assert!(!lower.contains("zola"));
+        assert!(!lower.contains("lint-frontmatter"));
+    }
+
+    /// Run the template's gate script with a fake `gh` that serves `comments` as the PR comments.
+    fn run_gate(comments: &str, reviewer: &str, api_fails: bool) -> bool {
+        let dir = tempfile::tempdir().unwrap();
+        let script: String = ORCH_REVIEW_WORKFLOW
+            .split("        run: |\n")
+            .nth(1)
+            .unwrap()
+            .lines()
+            .map(|l| l.strip_prefix("          ").unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.path().join("comments.json"), comments).unwrap();
+        let gh = format!(
+            "#!/bin/sh\nif [ \"$1\" = pr ]; then echo 7; exit 0; fi\n{}cat \"{}/comments.json\"\n",
+            if api_fails { "exit 1\n" } else { "" },
+            dir.path().display()
+        );
+        let gh_path = dir.path().join("gh");
+        std::fs::write(&gh_path, gh).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap()
+        );
+        std::process::Command::new("bash")
+            .args(["-c", &script])
+            .env("PATH", path)
+            .env("GITHUB_REF", "refs/heads/feat")
+            .env("GITHUB_REPOSITORY", "o/r")
+            .env("ORCH_REVIEWER", reviewer)
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    fn comment(user: &str, body: &str) -> String {
+        serde_json::json!([{"user": {"login": user}, "body": body, "created_at": "2026-01-01T00:00:00Z"}])
+            .to_string()
+    }
+
+    #[test]
+    fn review_gate_accepts_approval_from_reviewer() {
+        let c = comment("bot", "## Automated Review \u{2014} Approve\n\nok");
+        assert!(run_gate(&c, "bot", false));
+    }
+
+    #[test]
+    fn review_gate_rejects_spoofed_approval() {
+        let c = comment("mallory", "## Automated Review \u{2014} Approve\n\nok");
+        assert!(!run_gate(&c, "bot", false));
+    }
+
+    #[test]
+    fn review_gate_fails_closed_on_missing_unknown_and_api_error() {
+        assert!(!run_gate("[]", "bot", false));
+        assert!(!run_gate(
+            &comment("bot", "## Automated Review \u{2014} Maybe\n"),
+            "bot",
+            false
+        ));
+        assert!(!run_gate("[]", "bot", true));
+        assert!(!run_gate(
+            &comment("bot", "## Automated Review \u{2014} Approve\n"),
+            "",
+            false
+        ));
+    }
 
     #[test]
     fn hours_to_label_prefers_days_for_full_day_windows() {
