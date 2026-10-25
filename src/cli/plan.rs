@@ -23,7 +23,10 @@ pub async fn import(
     let path = Path::new(file);
     let markdown = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    let roadmap = crate::plan::parse_roadmap(&markdown)?;
+    let (roadmap, warnings) = crate::plan::parse_roadmap_for(&markdown, milestone)?;
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
     if let Some(id) = milestone {
         crate::plan::select(&roadmap, Some(id))?;
     }
