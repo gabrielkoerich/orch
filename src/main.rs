@@ -229,14 +229,13 @@ mod tests {
         let help = String::from_utf8(output).unwrap();
 
         for command in [
-            "log", "commit", "stream", "notify", "chat", "task", "job", "service", "project",
-            "stats", "cooldown", "config",
+            "init", "log", "commit", "stream", "notify", "chat", "task", "job", "service",
+            "project", "stats", "cooldown", "config",
         ] {
             assert!(help.contains(&format!("  {command}")), "{command} missing");
         }
 
         for hidden in [
-            "init",
             "agents",
             "metrics",
             "cost",
@@ -317,7 +316,6 @@ enum Commands {
     #[command(hide = true)]
     Serve,
     /// Initialize orch for a project
-    #[command(hide = true)]
     Init {
         /// Repository in OWNER/REPO format
         #[arg(long)]
