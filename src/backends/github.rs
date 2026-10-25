@@ -799,12 +799,37 @@ impl ExternalBackend for GitHubBackend {
                 Vec::new()
             }
         };
+        let comments = match self.gh.list_comments(repo, &pr_number.to_string()).await {
+            Ok(comments) => comments,
+            Err(err) => {
+                tracing::warn!(repo, pr_number, err = %err, "pull request comments unreadable");
+                Vec::new()
+            }
+        };
+        let reviewer = match self.gh.get_whoami().await {
+            Ok(login) => Some(login),
+            Err(err) => {
+                tracing::warn!(repo, pr_number, err = %err, "reviewer login unreadable");
+                None
+            }
+        };
+        let comment_refs: Vec<AutomatedReviewComment<'_>> = comments
+            .iter()
+            .map(|comment| AutomatedReviewComment {
+                login: &comment.user.login,
+                body: &comment.body,
+                created_at: &comment.created_at,
+            })
+            .collect();
+        let comment_approved = reviewer
+            .as_deref()
+            .is_some_and(|login| latest_automated_review_approves(&comment_refs, login));
         let merged = pr.merged.unwrap_or(false);
         Ok(Some(crate::backends::PullRequestCompletion {
             merged,
             base_ref: pr.base.ref_,
             default_branch,
-            approved: latest_review_approves(&reviews),
+            approved: latest_review_approves(&reviews) || comment_approved,
             closed: pr.state.eq_ignore_ascii_case("closed"),
         }))
     }
@@ -853,6 +878,58 @@ pub(crate) fn latest_review_approves(reviews: &[crate::github::types::GitHubRevi
     latest.is_some_and(|(_, state)| state.eq_ignore_ascii_case("APPROVED"))
 }
 
+/// One issue comment considered for automated review approval.
+pub(crate) struct AutomatedReviewComment<'a> {
+    pub login: &'a str,
+    pub body: &'a str,
+    pub created_at: &'a str,
+}
+
+/// First-line verdict of a `## Automated Review` comment.
+///
+/// Orch writes an em dash. The review gate also accepts a hyphen
+pub(crate) fn automated_review_verdict(body: &str) -> Option<&'static str> {
+    let first = body.lines().next().unwrap_or("").trim().replace('\r', "");
+    if !first.starts_with("## Automated Review") {
+        return None;
+    }
+    let normalized = first.replace(['\u{2014}', '\u{2013}'], "-");
+    if normalized.contains("Automated Review - Approve") {
+        Some("approve")
+    } else if normalized.contains("Automated Review - Changes Requested") {
+        Some("changes_requested")
+    } else {
+        None
+    }
+}
+
+/// Latest `## Automated Review` comment from `reviewer` wins.
+///
+/// An empty reviewer matches nothing. A later changes-requested comment
+/// clears an earlier approve
+pub(crate) fn latest_automated_review_approves(
+    comments: &[AutomatedReviewComment<'_>],
+    reviewer: &str,
+) -> bool {
+    if reviewer.is_empty() {
+        return false;
+    }
+    let mut newest: Option<&AutomatedReviewComment<'_>> = None;
+    for comment in comments {
+        if automated_review_verdict(comment.body).is_none() {
+            continue;
+        }
+        if !comment.login.eq_ignore_ascii_case(reviewer) {
+            continue;
+        }
+        match newest {
+            Some(prev) if comment.created_at <= prev.created_at => {}
+            _ => newest = Some(comment),
+        }
+    }
+    newest.is_some_and(|comment| automated_review_verdict(comment.body) == Some("approve"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -885,6 +962,60 @@ mod tests {
             review("APPROVED", "2026-01-02T00:00:00Z"),
         ];
         assert!(latest_review_approves(&approved));
+    }
+
+    fn review_comment<'a>(
+        login: &'a str,
+        body: &'a str,
+        at: &'a str,
+    ) -> AutomatedReviewComment<'a> {
+        AutomatedReviewComment {
+            login,
+            body,
+            created_at: at,
+        }
+    }
+
+    #[test]
+    fn automated_review_comment_counts_as_approval_without_formal_reviews() {
+        assert!(!latest_review_approves(&[]));
+        let comments = [review_comment(
+            "orch-bot",
+            "## Automated Review \u{2014} Approve\n\nLooks good.",
+            "2026-01-02T00:00:00Z",
+        )];
+        assert!(latest_automated_review_approves(&comments, "orch-bot"));
+        assert!(latest_automated_review_approves(&comments, "Orch-Bot"));
+        assert!(!latest_automated_review_approves(&comments, "mallory"));
+        assert!(!latest_automated_review_approves(&comments, ""));
+        let hyphen = [review_comment(
+            "orch-bot",
+            "## Automated Review - Approve\n\nok",
+            "2026-01-02T00:00:00Z",
+        )];
+        assert!(latest_automated_review_approves(&hyphen, "orch-bot"));
+    }
+
+    #[test]
+    fn later_automated_changes_requested_clears_comment_approval() {
+        let comments = [
+            review_comment(
+                "orch-bot",
+                "## Automated Review \u{2014} Approve\n\nok",
+                "2026-01-01T00:00:00Z",
+            ),
+            review_comment(
+                "mallory",
+                "## Automated Review \u{2014} Changes Requested\n\nnope",
+                "2026-01-03T00:00:00Z",
+            ),
+            review_comment(
+                "orch-bot",
+                "## Automated Review \u{2014} Changes Requested\n\nfix",
+                "2026-01-02T00:00:00Z",
+            ),
+        ];
+        assert!(!latest_automated_review_approves(&comments, "orch-bot"));
     }
 
     // --- is_github_issue_id guard ---

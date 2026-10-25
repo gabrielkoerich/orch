@@ -2,7 +2,9 @@
 //!
 //! A dependency is done when its blocker snapshot says the blocking pull request
 //! was approved and merged into the default branch, or the issue has no pull
-//! request and was closed as completed. A local `done` row is not enough.
+//! request and was closed as completed. Approval includes an orch
+//! `## Automated Review` comment from the reviewer account. A local `done` row
+//! is not enough.
 //! `not_planned` and `duplicate` are not done. `new`, `routed`, `waiting`,
 //! `blocked`, and `needs_review` move to `waiting` while a dependency is open.
 //! `in_progress` and `in_review` stay where they are.

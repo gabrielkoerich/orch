@@ -12,7 +12,7 @@ How orch runs tasks end-to-end.
 Issue → Branch + Worktree → Agent works → Push → PR → Review Agent → Merge → Cleanup
 ```
 
-1. **Issue** — created via `orch task add` or a scheduled job (`orch job tick`). An issue that is blocked by another issue stays `waiting` until that pull request is approved and merged into the default branch
+1. **Issue** — created via `orch task add` or a scheduled job (`orch job tick`). An issue that is blocked by another issue stays `waiting` until that pull request is approved (formal review or an orch `## Automated Review` comment) and merged into the default branch
 2. **Branch + Worktree** — engine creates via `gh issue develop` + `git worktree add`
 3. **Agent works** — runs inside worktree, edits files, commits changes
 4. **Push** — engine pushes the branch after agent finishes

@@ -99,8 +99,9 @@ pub struct BlockedByIssue {
 
 /// Merge and review state of one pull request, read from GitHub.
 ///
-/// `approved` is the latest substantive review, `APPROVED` or
-/// `CHANGES_REQUESTED`. A comment or a dismissed review does not count
+/// `approved` is the latest substantive review (`APPROVED` or
+/// `CHANGES_REQUESTED`), or an approving `## Automated Review` comment from
+/// the orch reviewer account when GitHub's review list is empty
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequestCompletion {
     pub merged: bool,
