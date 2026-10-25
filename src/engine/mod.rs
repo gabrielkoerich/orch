@@ -27,6 +27,7 @@ pub mod runner;
 pub mod subscribers;
 pub mod suspend;
 pub mod sync;
+pub mod dependencies;
 pub mod tasks;
 pub mod tick;
 

@@ -279,7 +279,7 @@ impl ProjectSync {
     /// Map orch `Status` to a project board column key.
     pub fn status_to_column(status: &Status) -> &'static str {
         match status {
-            Status::New | Status::Routed => "backlog",
+            Status::New | Status::Routed | Status::Waiting => "backlog",
             Status::InProgress | Status::Blocked => "in_progress",
             Status::InReview | Status::NeedsReview => "review",
             Status::Done => "done",

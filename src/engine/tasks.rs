@@ -23,6 +23,7 @@ pub fn status_to_task_status(status: Status) -> TaskStatus {
         Status::Blocked => TaskStatus::Blocked,
         Status::InReview => TaskStatus::InReview,
         Status::NeedsReview => TaskStatus::NeedsReview,
+        Status::Waiting => TaskStatus::Waiting,
     }
 }
 
@@ -208,7 +209,7 @@ impl TaskManager {
             if !is_all {
                 let task_status = TaskStatus::from_str(status_str)
                     .ok_or_else(|| anyhow::anyhow!(
-                        "invalid status: '{}'. allowed: new, routed, in_progress, needs_review, in_review, blocked, done, all",
+                        "invalid status: '{}'. allowed: new, routed, in_progress, needs_review, in_review, blocked, waiting, done, all",
                         status_str
                     ))?;
                 let backend_status = match status_str.as_str() {
@@ -219,6 +220,7 @@ impl TaskManager {
                     "blocked" => Status::Blocked,
                     "in_review" => Status::InReview,
                     "needs_review" => Status::NeedsReview,
+                    "waiting" => Status::Waiting,
                     _ => unreachable!(),
                 };
 

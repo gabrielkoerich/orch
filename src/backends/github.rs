@@ -43,6 +43,7 @@ fn active_status_from_label(label: &str) -> Option<Status> {
         "status:needs_review" => Some(Status::NeedsReview),
         "status:in_review" => Some(Status::InReview),
         "status:blocked" => Some(Status::Blocked),
+        "status:waiting" => Some(Status::Waiting),
         _ => None,
     }
 }
@@ -793,6 +794,7 @@ mod tests {
             html_url: "".to_string(),
             node_id: None,
             pull_request: None,
+            state_reason: None,
             author_association: Some("OWNER".to_string()),
         };
         assert!(is_trusted_author(&issue));
@@ -815,6 +817,7 @@ mod tests {
             html_url: "".to_string(),
             node_id: None,
             pull_request: None,
+            state_reason: None,
             author_association: Some("COLLABORATOR".to_string()),
         };
         assert!(is_trusted_author(&issue));
@@ -837,6 +840,7 @@ mod tests {
             html_url: "".to_string(),
             node_id: None,
             pull_request: None,
+            state_reason: None,
             author_association: Some("CONTRIBUTOR".to_string()),
         };
         assert!(!is_trusted_author(&issue));
@@ -859,6 +863,7 @@ mod tests {
             html_url: "".to_string(),
             node_id: None,
             pull_request: None,
+            state_reason: None,
             author_association: Some("MEMBER".to_string()),
         };
         assert!(!is_trusted_author(&issue));
@@ -922,6 +927,7 @@ mod tests {
             html_url: "".to_string(),
             node_id: None,
             pull_request: None,
+            state_reason: None,
             author_association: Some("OWNER".to_string()),
         }
     }

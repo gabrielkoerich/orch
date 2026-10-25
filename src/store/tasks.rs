@@ -157,6 +157,7 @@ pub enum TaskStatus {
     Blocked,
     InReview,
     NeedsReview,
+    Waiting,
 }
 
 impl TaskStatus {
@@ -169,6 +170,7 @@ impl TaskStatus {
             Self::Blocked => "blocked",
             Self::InReview => "in_review",
             Self::NeedsReview => "needs_review",
+            Self::Waiting => "waiting",
         }
     }
 
@@ -181,6 +183,7 @@ impl TaskStatus {
             "blocked" => Some(Self::Blocked),
             "in_review" => Some(Self::InReview),
             "needs_review" => Some(Self::NeedsReview),
+            "waiting" => Some(Self::Waiting),
             _ => None,
         }
     }

@@ -130,14 +130,22 @@ async fn load_blocked_by(
         if current.contains_key(&number) {
             continue;
         }
-        let blocked = http.list_blocked_by(repo, number).await?;
+        let blocked = match http.list_blocked_by(repo, number).await? {
+            crate::backends::BlockedByFetch::Native(items) => items,
+            crate::backends::BlockedByFetch::Unavailable => {
+                anyhow::bail!("blocked-by API unavailable for #{number}");
+            }
+            crate::backends::BlockedByFetch::Failed(err) => {
+                anyhow::bail!("blocked-by API failed for #{number}: {err}");
+            }
+        };
         current.insert(
             number,
             blocked
                 .into_iter()
                 .map(|item| DepRef {
-                    number: item.number,
-                    database_id: item.id,
+                    number: item.number as u64,
+                    database_id: item.github_id as u64,
                 })
                 .collect(),
         );
@@ -223,7 +231,7 @@ async fn apply(
                 let Some(blocking_id) = blocking_id else {
                     anyhow::bail!("{task_id} depends on {blocking_task_id}, which has no issue id");
                 };
-                http.add_blocked_by(repo, *number, blocking_id).await?;
+                http.add_blocked_by(repo, *number, blocking_id as i64).await?;
             }
             LinkEdit::Remove {
                 issue_number,

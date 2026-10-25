@@ -12,7 +12,7 @@
 use super::token;
 use super::types::{
     GitHubAnnotation, GitHubCheckRun, GitHubComment, GitHubIssue, GitHubPullRequest, GitHubReview,
-    GitHubReviewComment, IssueDependency,
+    GitHubReviewComment,
 };
 use crate::engine::cooldown as engine_cooldown;
 use anyhow::Context;
@@ -30,6 +30,24 @@ const GITHUB_API: &str = "https://api.github.com";
 // Tests that reach a real GhHttp must fail fast here, never send the operator's token to GitHub
 #[cfg(test)]
 const GITHUB_API: &str = "http://127.0.0.1:9";
+
+#[derive(Debug, serde::Deserialize)]
+struct BlockedByPayload {
+    #[serde(default)]
+    id: i64,
+    number: i64,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    state_reason: Option<String>,
+    #[serde(default)]
+    repository: Option<BlockedByRepoPayload>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BlockedByRepoPayload {
+    full_name: String,
+}
 
 fn parse_positive_issue_number(number: &str) -> anyhow::Result<i64> {
     let parsed = number
@@ -1090,32 +1108,109 @@ impl GhHttp {
             .with_context(|| format!("failed to parse issue update response: {text}"))
     }
 
-    /// Issues that block `number`.
+    /// List issues that block `issue_number`.
     ///
-    /// `GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by`
+    /// `GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by`.
+    /// GA since 2025-08-21, no preview media type. This call sends
+    /// `X-GitHub-Api-Version: 2026-03-10` and `Accept: application/vnd.github+json`.
+    /// 404 and 403 (except rate limit) are `Unavailable`. Transport errors and
+    /// 5xx are `Failed`, so the caller does not drop stored links
     pub async fn list_blocked_by(
         &self,
         repo: &str,
-        number: u64,
-    ) -> anyhow::Result<Vec<IssueDependency>> {
-        let url = format!("{GITHUB_API}/repos/{repo}/issues/{number}/dependencies/blocked_by");
-        self.get_all_pages(&url, &[("per_page", "100")]).await
+        issue_number: u64,
+    ) -> anyhow::Result<crate::backends::BlockedByFetch> {
+        use crate::backends::{BlockedByFetch, BlockedByIssue};
+
+        let mut next = Some(format!(
+            "{GITHUB_API}/repos/{repo}/issues/{issue_number}/dependencies/blocked_by?per_page=100"
+        ));
+        let mut found = Vec::new();
+        while let Some(url) = next.take() {
+            let resp = match self.dependency_request(&url, reqwest::Method::GET, None).await {
+                Ok(resp) => resp,
+                Err(err) => return Ok(BlockedByFetch::Failed(err.to_string())),
+            };
+            let status = resp.status();
+            if status == StatusCode::NOT_FOUND || status == StatusCode::FORBIDDEN {
+                let body = resp.text().await.unwrap_or_default();
+                if status == StatusCode::FORBIDDEN
+                    && body.to_ascii_lowercase().contains("rate limit")
+                {
+                    Self::maybe_record_rate_limit_from_body(status, &body);
+                    return Ok(BlockedByFetch::Failed(body));
+                }
+                return Ok(BlockedByFetch::Unavailable);
+            }
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                Self::maybe_record_rate_limit_from_body(status, &body);
+                return Ok(BlockedByFetch::Failed(format!("{status}: {body}")));
+            }
+            Self::record_success();
+            let page_next = parse_link_next(resp.headers());
+            let body = resp.text().await.unwrap_or_default();
+            let page: Vec<BlockedByPayload> = match serde_json::from_str(&body) {
+                Ok(page) => page,
+                Err(err) => {
+                    return Ok(BlockedByFetch::Failed(format!(
+                        "blocked_by parse failed: {err}"
+                    )));
+                }
+            };
+            for item in page {
+                if item.number <= 0 {
+                    continue;
+                }
+                let item_repo = item
+                    .repository
+                    .as_ref()
+                    .map(|r| r.full_name.clone())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| repo.to_string());
+                found.push(BlockedByIssue {
+                    github_id: item.id,
+                    repo: item_repo,
+                    number: item.number,
+                    state: item.state,
+                    state_reason: item.state_reason,
+                });
+            }
+            next = page_next;
+        }
+        Ok(BlockedByFetch::Native(found))
     }
 
-    /// Mark `number` as blocked by the issue with database id `blocking_issue_id`.
-    ///
     /// `POST /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by`
-    /// with `{ "issue_id": blocking_issue_id }`. The id is the database id, not the issue number
+    /// with `{"issue_id": blocking_issue_id}`. Same API version as `list_blocked_by`.
+    /// 201 is success. A body that says the link already exists is also success
     pub async fn add_blocked_by(
         &self,
         repo: &str,
-        number: u64,
-        blocking_issue_id: u64,
+        issue_number: u64,
+        blocking_issue_id: i64,
     ) -> anyhow::Result<()> {
-        let url = format!("{GITHUB_API}/repos/{repo}/issues/{number}/dependencies/blocked_by");
-        let payload = serde_json::json!({ "issue_id": blocking_issue_id });
-        self.post_json_raw(&url, &payload).await?;
-        Ok(())
+        let url = format!(
+            "{GITHUB_API}/repos/{repo}/issues/{issue_number}/dependencies/blocked_by"
+        );
+        let resp = self
+            .dependency_request(
+                &url,
+                reqwest::Method::POST,
+                Some(serde_json::json!({ "issue_id": blocking_issue_id })),
+            )
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            Self::record_success();
+            return Ok(());
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if body.to_ascii_lowercase().contains("already") {
+            return Ok(());
+        }
+        Self::maybe_record_rate_limit_from_body(status, &body);
+        anyhow::bail!("add blocked_by failed ({status}): {body}")
     }
 
     /// Remove a blocked-by link. `issue_id` in the path is the blocking issue's database id
@@ -1130,6 +1225,31 @@ impl GhHttp {
         );
         self.delete(&url).await?;
         Ok(())
+    }
+
+    /// GET or POST an issue-dependency URL with API version 2026-03-10
+    async fn dependency_request(
+        &self,
+        url: &str,
+        method: reqwest::Method,
+        body: Option<serde_json::Value>,
+    ) -> anyhow::Result<Response> {
+        Self::proactive_throttle_rest().await;
+        Self::check_backoff()?;
+        let auth = self.auth_header().await?;
+        let make_req = || {
+            let mut req = self
+                .client
+                .request(method.clone(), url)
+                .header(header::AUTHORIZATION, auth.clone())
+                .header(header::ACCEPT, "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2026-03-10");
+            if let Some(ref payload) = body {
+                req = req.json(payload);
+            }
+            Ok(req)
+        };
+        self.send_with_retries(make_req, false).await
     }
 
     /// Get a single issue.
@@ -3007,6 +3127,7 @@ pub fn status_label_color(label: &str) -> &'static str {
         "status:blocked" => "d73a4a",
         "status:in_review" => "0075ca",
         "status:needs_review" => "e4e669",
+        "status:waiting" => "5319e7",
         _ => "c5def5",
     }
 }

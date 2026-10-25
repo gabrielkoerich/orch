@@ -28,6 +28,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePo
 use std::path::Path;
 
 mod control;
+mod dependencies;
 mod helpers;
 mod jobs;
 mod kv;
@@ -57,6 +58,7 @@ pub use metrics::{
 #[allow(unused_imports)]
 pub use pricing::{pricing_for_model, CostEstimate, ModelPricing, TokenUsage};
 #[allow(unused_imports)]
+pub use dependencies::{DepSource, NewDependency, TaskDependency, WaitingOnDependency};
 pub use tasks::{
     CompleteRun, NewTask, RunTokenUsage, StartRun, StoreRoute, Task, TaskActivity, TaskRun,
     TaskStatus, UpsertExternal,

@@ -253,7 +253,7 @@ async fn list_from_global_store(
         } else {
             let task_status = crate::store::TaskStatus::from_str(status_str)
                 .ok_or_else(|| anyhow::anyhow!(
-                    "invalid status: '{}'. allowed: new, routed, in_progress, needs_review, in_review, blocked, done, all",
+                    "invalid status: '{}'. allowed: new, routed, in_progress, needs_review, in_review, blocked, waiting, done, all",
                     status_str
                 ))?;
             store.list_all_by_status_global(task_status).await?
@@ -504,6 +504,7 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
         Status::Blocked,
         Status::InReview,
         Status::NeedsReview,
+        Status::Waiting,
     ];
 
     // Fetch all tasks from both backends
@@ -534,6 +535,7 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
                 Status::Blocked => TaskStatus::Blocked,
                 Status::InReview => TaskStatus::InReview,
                 Status::NeedsReview => TaskStatus::NeedsReview,
+                Status::Waiting => TaskStatus::Waiting,
             };
             all_internal.iter().filter(|t| t.status == ts).count()
         })
