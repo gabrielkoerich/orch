@@ -167,9 +167,12 @@ orch task close <id> --note "msg"  # Mark done with a comment
 orch plan import docs/ROADMAP.md --dry-run   # Print creates, updates and links
 orch plan import docs/ROADMAP.md             # Create or update one issue per task
 orch plan import docs/ROADMAP.md --milestone M1
+orch plan import docs/ROADMAP.md --milestone M4 --skip-unmet
 ```
 
-`orch plan import` reads a roadmap and creates one GitHub issue per task. `Depends on` is stored as a blocked-by link. `Owner: human` adds the `owner:human` and `no-agent` labels, so orch skips that task. A second run edits an issue only when the title, body or labels changed. A task dropped from the file is listed and left open. An open blocked-by link does not hold a task.
+`orch plan import` reads a roadmap and creates one GitHub issue per task. `Depends on` is stored as a blocked-by link. An open blocked-by link holds the dependent task as waiting. `Owner: human` adds the `owner:human` and `no-agent` labels, so orch skips that task. A second run edits an issue only when the title, body or labels changed. A task dropped from the file is listed and left open.
+
+`--milestone M1` imports that milestone only. A dependency outside the milestone links to the existing issue when one has the plan marker. When that issue does not exist yet, the import continues, the dependent issue body gets a `blocked-external` note, and orch holds the task as waiting. `--skip-unmet` skips creating those dependent issues. An id that is not in the roadmap is an error.
 
 ### Project Management
 

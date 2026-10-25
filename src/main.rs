@@ -872,6 +872,9 @@ enum PlanAction {
         /// Limit the import to one milestone id, such as M1
         #[arg(long)]
         milestone: Option<String>,
+        /// Do not create a task whose blocker outside the milestone has no issue yet
+        #[arg(long)]
+        skip_unmet: bool,
     },
 }
 
@@ -1306,8 +1309,9 @@ async fn async_main() -> anyhow::Result<()> {
                 file,
                 dry_run,
                 milestone,
+                skip_unmet,
             } => {
-                cli::plan::import(&file, dry_run, milestone.as_deref()).await?;
+                cli::plan::import(&file, dry_run, milestone.as_deref(), skip_unmet).await?;
             }
         },
         Commands::Service { action } => match action {
