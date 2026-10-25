@@ -231,7 +231,8 @@ async fn apply(
                 let Some(blocking_id) = blocking_id else {
                     anyhow::bail!("{task_id} depends on {blocking_task_id}, which has no issue id");
                 };
-                http.add_blocked_by(repo, *number, blocking_id as i64).await?;
+                http.add_blocked_by(repo, *number, blocking_id as i64)
+                    .await?;
             }
             LinkEdit::Remove {
                 issue_number,
