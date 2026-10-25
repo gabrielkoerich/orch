@@ -1476,6 +1476,25 @@ impl GhHttp {
         Ok(())
     }
 
+    /// Post a commit status. `state` is one of pending, success, failure, error.
+    pub async fn post_commit_status(
+        &self,
+        repo: &str,
+        sha: &str,
+        state: &str,
+        context: &str,
+        description: &str,
+    ) -> anyhow::Result<()> {
+        let url = format!("{GITHUB_API}/repos/{repo}/statuses/{sha}");
+        let payload = serde_json::json!({
+            "state": state,
+            "context": context,
+            "description": description,
+        });
+        self.post_json_raw(&url, &payload).await?;
+        Ok(())
+    }
+
     /// Add a reaction to an issue.
     ///
     /// Supported content values: "+1", "-1", "laugh", "confused", "heart", "hooray", "rocket", "eyes"

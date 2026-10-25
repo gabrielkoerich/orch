@@ -175,6 +175,8 @@ struct ReviewContext {
     worktree_path: std::path::PathBuf,
     branch_name: String,
     pr_number: u64,
+    /// PR head SHA when the review started, the commit the decision applies to
+    head_sha: Option<String>,
     default_branch: String,
     review_agent: String,
     review_model: Option<String>,
@@ -663,6 +665,11 @@ async fn build_review_context(
         attempt: review_attempt,
     };
 
+    let head_sha = match GhHttp::new() {
+        Ok(gh) => gh.get_pr(repo, pr_number).await.ok().map(|pr| pr.head.sha),
+        Err(_) => None,
+    };
+
     Ok(ReviewPhase::Ready(ReviewContext {
         store_id,
         had_prev_push_failure,
@@ -670,6 +677,7 @@ async fn build_review_context(
         worktree_path,
         branch_name,
         pr_number,
+        head_sha,
         default_branch,
         review_agent,
         review_model,
@@ -773,6 +781,14 @@ async fn invoke_review_agent(
     let start_comment = review_started_comment(&ctx.review_agent, ctx.review_model_str());
     match GhHttp::new() {
         Ok(gh) => {
+            post_review_status(
+                &gh,
+                repo,
+                ctx.head_sha.as_deref(),
+                "pending",
+                "Automated review running",
+            )
+            .await;
             if let Err(e) = gh
                 .add_comment(repo, &ctx.pr_number.to_string(), &start_comment)
                 .await
@@ -1717,6 +1733,39 @@ fn build_pr_review_comment(decision: &ReviewDecision, review_notes_for_comment: 
     }
 }
 
+const REVIEW_STATUS_CONTEXT: &str = "orch/review";
+
+/// Commit status state and description for a review decision. Other decisions post nothing.
+fn review_status(decision: &ReviewDecision) -> Option<(&'static str, &'static str)> {
+    match decision {
+        ReviewDecision::Approve => Some(("success", "Approved by automated review")),
+        ReviewDecision::RequestChanges { .. } => {
+            Some(("failure", "Automated review requested changes"))
+        }
+        _ => None,
+    }
+}
+
+/// Post `orch/review` on the SHA the review started from. A new push moves the PR head, so an
+/// old decision never covers a new commit.
+async fn post_review_status(
+    gh: &GhHttp,
+    repo: &str,
+    sha: Option<&str>,
+    state: &str,
+    description: &str,
+) {
+    let Some(sha) = sha else {
+        return;
+    };
+    if let Err(e) = gh
+        .post_commit_status(repo, sha, state, REVIEW_STATUS_CONTEXT, description)
+        .await
+    {
+        tracing::warn!(sha, error = %e, "failed to post orch/review commit status");
+    }
+}
+
 async fn post_review_comment(
     task: &ExternalTask,
     repo: &str,
@@ -1740,6 +1789,10 @@ async fn post_review_comment(
         pr_comment.push_str(
             "\n> Note: no other agent was available, so this PR was reviewed by the same agent that wrote the code.\n",
         );
+    }
+
+    if let Some((state, description)) = review_status(decision) {
+        post_review_status(&gh, repo, ctx.head_sha.as_deref(), state, description).await;
     }
 
     if !pr_comment.is_empty() {
@@ -3060,6 +3113,20 @@ mod tests {
     }
 
     #[test]
+    fn review_status_maps_decisions() {
+        assert_eq!(
+            review_status(&ReviewDecision::Approve).unwrap().0,
+            "success"
+        );
+        let changes = ReviewDecision::RequestChanges {
+            notes: String::new(),
+            issues: vec![],
+        };
+        assert_eq!(review_status(&changes).unwrap().0, "failure");
+        assert!(review_status(&ReviewDecision::Failed("x".into())).is_none());
+    }
+
+    #[test]
     fn review_started_comment_includes_agent_and_model() {
         let expected_footer = attribution_footer("Review started", "kimi", Some("opus"));
         let expected = format!("🔍 Automated review started{}", expected_footer);
@@ -3537,6 +3604,7 @@ mod tests {
             worktree_path: work_dir.to_path_buf(),
             branch_name: "gh-issue-1-test".to_string(),
             pr_number: 1,
+            head_sha: None,
             default_branch: "main".to_string(),
             review_agent: agent.to_string(),
             review_model: Some(model.to_string()),
