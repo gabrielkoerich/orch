@@ -165,6 +165,14 @@ struct TableCols {
 }
 
 pub fn parse_roadmap(markdown: &str) -> Result<Roadmap, PlanError> {
+    parse_roadmap_for(markdown, None).map(|(roadmap, _)| roadmap)
+}
+
+/// With a milestone, errors that belong to other milestones come back as warnings
+pub fn parse_roadmap_for(
+    markdown: &str,
+    milestone: Option<&str>,
+) -> Result<(Roadmap, Vec<String>), PlanError> {
     let mut milestones = Vec::new();
     let mut tasks = Vec::new();
     let mut errors = Vec::new();
@@ -172,8 +180,12 @@ pub fn parse_roadmap(markdown: &str) -> Result<Roadmap, PlanError> {
     let mut draft: Option<Draft> = None;
     let mut table: Option<TableCols> = None;
     let mut seen = HashSet::new();
+    let mut tags: Vec<Option<String>> = Vec::new();
+    let mut tag: Option<String> = None;
 
     for (idx, raw) in markdown.lines().enumerate() {
+        tags.resize(errors.len(), tag.clone());
+        tag = current.as_ref().map(|item| item.id.clone());
         let line = raw.trim_end_matches('\r');
         let line_no = idx + 1;
 
@@ -245,12 +257,32 @@ pub fn parse_roadmap(markdown: &str) -> Result<Roadmap, PlanError> {
     }
 
     flush_draft(&mut draft, &mut tasks, &mut seen, &mut errors);
+    tags.resize(errors.len(), tag);
     check_dependencies(&tasks, &mut errors);
+    for message in &errors[tags.len()..] {
+        let id = message
+            .split_whitespace()
+            .next()
+            .and_then(task_milestone_id);
+        tags.push(id.map(str::to_string));
+    }
 
-    if errors.is_empty() {
-        Ok(Roadmap { milestones, tasks })
+    let (mut fatal, mut warnings) = (Vec::new(), Vec::new());
+    for (message, tag) in errors.into_iter().zip(tags) {
+        let elsewhere = match (milestone, tag) {
+            (Some(wanted), Some(id)) => !id.eq_ignore_ascii_case(wanted),
+            _ => false,
+        };
+        if elsewhere {
+            warnings.push(message);
+        } else {
+            fatal.push(message);
+        }
+    }
+    if fatal.is_empty() {
+        Ok((Roadmap { milestones, tasks }, warnings))
     } else {
-        Err(PlanError::new(errors.join("\n")))
+        Err(PlanError::new(fatal.join("\n")))
     }
 }
 
@@ -952,7 +984,7 @@ fn is_milestone_id(token: &str) -> bool {
     for ch in chars {
         if ch.is_ascii_digit() {
             saw_digit = true;
-        } else if ch.is_ascii_alphabetic() && !saw_digit {
+        } else if ch.is_ascii_alphabetic() {
             continue;
         } else {
             return false;
@@ -1178,6 +1210,30 @@ mod tests {
 
     fn task<'a>(roadmap: &'a Roadmap, id: &str) -> &'a Task {
         roadmap.tasks.iter().find(|task| task.id == id).unwrap()
+    }
+
+    const SUFFIXED: &str = "## M2S. API security\n\n### M2S-01 Rate limits\n\n- Goal: limit.\n\n## M3. Billing\n\n### M3-01 Invoices\n\n- Goal: bill.\n- Depends on: M9-01\n";
+
+    #[test]
+    fn milestone_ids_may_end_in_letters() {
+        let (roadmap, _) =
+            parse_roadmap_for(&SUFFIXED.replace("M9-01", "M2S-01"), Some("M2S")).unwrap();
+        let selected = select(&roadmap, Some("M2S")).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "M2S-01");
+    }
+
+    #[test]
+    fn other_milestone_errors_are_warnings_when_one_is_selected() {
+        let err = parse_roadmap_for(SUFFIXED, Some("M3")).unwrap_err();
+        assert!(err.message.contains("M3-01 depends on unknown task M9-01"));
+        let broken = SUFFIXED
+            .replace("- Goal: limit.\n", "- Depends on: nothing\n")
+            .replace("- Depends on: M9-01\n", "");
+        assert!(parse_roadmap(&broken).is_err());
+        let (roadmap, warnings) = parse_roadmap_for(&broken, Some("M3")).unwrap();
+        assert_eq!(select(&roadmap, Some("M3")).unwrap().len(), 1);
+        assert_eq!(warnings.len(), 1);
     }
 
     #[test]
