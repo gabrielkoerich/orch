@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubIssue {
     pub number: u64,
+    /// GitHub database id, the value the dependencies API calls issue_id
+    #[serde(default)]
+    pub id: u64,
     pub title: String,
     pub body: Option<String>,
     pub state: String,
@@ -31,6 +34,15 @@ pub struct GitHubLabel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubUser {
     pub login: String,
+}
+
+/// One issue in a blocked-by or blocking dependency list.
+///
+/// `id` is the database id required by the write endpoints, `number` is the issue number
+#[derive(Debug, Clone, Deserialize)]
+pub struct IssueDependency {
+    pub id: u64,
+    pub number: u64,
 }
 
 /// Pull request details from the GitHub API.

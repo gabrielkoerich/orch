@@ -780,6 +780,7 @@ mod tests {
     fn is_trusted_author_owner() {
         let issue = GitHubIssue {
             number: 1,
+            id: 0,
             title: "t".to_string(),
             body: None,
             state: "open".to_string(),
@@ -801,6 +802,7 @@ mod tests {
     fn is_trusted_author_collaborator() {
         let issue = GitHubIssue {
             number: 1,
+            id: 0,
             title: "t".to_string(),
             body: None,
             state: "open".to_string(),
@@ -822,6 +824,7 @@ mod tests {
     fn is_not_trusted_author_contributor() {
         let issue = GitHubIssue {
             number: 1,
+            id: 0,
             title: "t".to_string(),
             body: None,
             state: "open".to_string(),
@@ -843,6 +846,7 @@ mod tests {
     fn is_not_trusted_author_member() {
         let issue = GitHubIssue {
             number: 1,
+            id: 0,
             title: "t".to_string(),
             body: None,
             state: "open".to_string(),
@@ -899,6 +903,7 @@ mod tests {
     fn make_test_issue(labels: &[&str]) -> GitHubIssue {
         GitHubIssue {
             number: 1,
+            id: 0,
             title: "t".to_string(),
             body: None,
             state: "open".to_string(),

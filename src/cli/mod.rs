@@ -8,6 +8,7 @@ pub mod events;
 pub mod job;
 pub mod ndjson;
 pub mod notify;
+pub mod plan;
 pub mod prune;
 pub mod service;
 pub mod session;

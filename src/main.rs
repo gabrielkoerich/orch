@@ -417,6 +417,11 @@ enum Commands {
         #[command(subcommand)]
         action: JobAction,
     },
+    /// Create GitHub issues from a roadmap file
+    Plan {
+        #[command(subcommand)]
+        action: PlanAction,
+    },
     /// Service management
     Service {
         #[command(subcommand)]
@@ -845,6 +850,21 @@ enum JobAction {
 }
 
 #[derive(Subcommand)]
+enum PlanAction {
+    /// Create or update one issue per roadmap task
+    Import {
+        /// Path to the roadmap file
+        file: String,
+        /// Print creates, updates and links without writing
+        #[arg(long)]
+        dry_run: bool,
+        /// Limit the import to one milestone id, such as M1
+        #[arg(long)]
+        milestone: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum BoardAction {
     /// List accessible GitHub Projects V2 boards
     List,
@@ -1264,6 +1284,15 @@ async fn async_main() -> anyhow::Result<()> {
             JobAction::Cron { expression, since } => {
                 let matches = cron::check(&expression, since.as_deref())?;
                 std::process::exit(if matches { 0 } else { 1 });
+            }
+        },
+        Commands::Plan { action } => match action {
+            PlanAction::Import {
+                file,
+                dry_run,
+                milestone,
+            } => {
+                cli::plan::import(&file, dry_run, milestone.as_deref()).await?;
             }
         },
         Commands::Service { action } => match action {

@@ -11,13 +11,14 @@ orch task     list|add|get|status|route|run|retry|reroute|unblock|attach|live|ki
               publish|cost|tree|logs|log|history|runs|close|watch|reopen|inspect
 orch service  start|stop|restart|status|doctor|prune
 orch job      list|add|remove|enable|disable|tick|run
+orch plan     import
 orch project  list|add|remove|board
 orch stats    overview|metrics|cost|dashboard
 orch cooldown list|clear
 orch chat     [message…] | history | stats
 ```
 
-Visible top-level commands: `log`, `commit`, `stream`, `notify`, `chat`, `task`, `job`, `service`, `project`, `stats`, `cooldown`, `config`.
+Visible top-level commands: `log`, `commit`, `stream`, `notify`, `chat`, `task`, `job`, `plan`, `service`, `project`, `stats`, `cooldown`, `config`.
 
 ## Task Commands
 
@@ -132,6 +133,22 @@ orch job run <id>                                          # run a job immediate
 ```
 
 Jobs can also be defined declaratively as markdown files under `prompts/jobs/*.md` (frontmatter: `id`, `schedule`, `title`, `type`, `enabled`, `external`, `agent`, `command`, `dir`). See [Jobs](@/jobs.md).
+
+## Plan
+
+```bash
+orch plan import docs/ROADMAP.md
+orch plan import docs/ROADMAP.md --dry-run
+orch plan import docs/ROADMAP.md --milestone M1
+```
+
+`orch plan import` reads a roadmap file and creates one GitHub issue per task. The title is the task id and the task title. The body holds the goal, scope and acceptance, a link to the heading on the default branch, and a hidden marker (`<!-- orch-plan: M1-03 -->`). A later import edits an issue only when the title, body or labels changed.
+
+A milestone starts at `## M1. Milestone title`. A task starts at `### M1-03 Task title`. A later milestone can be a table whose header has Task and Depends on columns.
+
+`Depends on: M1-02, M1-05` is stored as GitHub blocked-by links. `Depends on: none` stores no link. An import drops a blocked-by link that the file no longer declares, and keeps a link to an issue outside the plan. `Owner: human` adds the `owner:human` and `no-agent` labels, so orch skips that issue. A task that leaves the file is listed and left open.
+
+`--dry-run` prints every selected task, the links that would change, and the removed tasks. `--milestone M1` imports that milestone only. Dispatch skips `no-agent` and `owner:human`. An open blocked-by link does not hold a task.
 
 ## Version
 
