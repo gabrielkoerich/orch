@@ -186,6 +186,9 @@ pub async fn sync_issue_dependencies(
     match fetch {
         BlockedByFetch::Native(list) => {
             for item in &list {
+                if item.state.is_empty() {
+                    continue;
+                }
                 store
                     .note_blocker_issue_state(
                         &item.repo,
@@ -799,11 +802,20 @@ See #4 in the notes
         );
     }
 
+    #[derive(Clone)]
+    struct ScriptedReviewComment {
+        login: String,
+        body: String,
+        created_at: String,
+    }
+
     struct ScriptedBackend {
         blocked: Mutex<HashMap<i64, BlockedByFetch>>,
         comments: Mutex<Vec<(String, String)>>,
         close_state: Mutex<HashMap<i64, (String, Option<String>)>>,
         pulls: Mutex<HashMap<i64, Option<crate::backends::PullRequestCompletion>>>,
+        review_comments: Mutex<HashMap<i64, Vec<ScriptedReviewComment>>>,
+        reviewer: Mutex<Option<String>>,
     }
 
     impl ScriptedBackend {
@@ -813,6 +825,8 @@ See #4 in the notes
                 comments: Mutex::new(Vec::new()),
                 close_state: Mutex::new(HashMap::new()),
                 pulls: Mutex::new(HashMap::new()),
+                review_comments: Mutex::new(HashMap::new()),
+                reviewer: Mutex::new(None),
             }
         }
     }
@@ -901,13 +915,37 @@ See #4 in the notes
             _repo: &str,
             pr_number: i64,
         ) -> anyhow::Result<Option<crate::backends::PullRequestCompletion>> {
-            Ok(self
+            let mut completion = self
                 .pulls
                 .lock()
                 .unwrap()
                 .get(&pr_number)
                 .cloned()
-                .unwrap_or(None))
+                .unwrap_or(None);
+            if let Some(ref mut done) = completion {
+                if !done.approved {
+                    let comments = self
+                        .review_comments
+                        .lock()
+                        .unwrap()
+                        .get(&pr_number)
+                        .cloned()
+                        .unwrap_or_default();
+                    let reviewer = self.reviewer.lock().unwrap().clone().unwrap_or_default();
+                    let mapped: Vec<crate::backends::github::AutomatedReviewComment<'_>> = comments
+                        .iter()
+                        .map(|comment| crate::backends::github::AutomatedReviewComment {
+                            login: &comment.login,
+                            body: &comment.body,
+                            created_at: &comment.created_at,
+                        })
+                        .collect();
+                    done.approved = crate::backends::github::latest_automated_review_approves(
+                        &mapped, &reviewer,
+                    );
+                }
+            }
+            Ok(completion)
         }
     }
 
@@ -1370,6 +1408,97 @@ See #4 in the notes
         refresh_blocker_snapshots(&backend, &store).await.unwrap();
         assert_eq!(store.block_claim_if_waiting(b).await.unwrap(), None);
         assert_eq!(store.get(b).await.unwrap().status, TaskStatus::New);
+    }
+
+    #[tokio::test]
+    async fn comment_approval_from_reviewer_releases_a_merged_blocker() {
+        use crate::backends::PullRequestCompletion;
+
+        let store = TaskStore::open_memory().await.unwrap();
+        let a = insert(&store, "owner/repo", "1", "A", "").await;
+        let b = insert(&store, "owner/repo", "2", "B", "").await;
+        store
+            .set_fields(a, &[("pr_number", serde_json::json!(10))])
+            .await
+            .unwrap();
+        store
+            .replace_dependencies(
+                b,
+                &[NewDependency {
+                    repo: "owner/repo".into(),
+                    number: 1,
+                    source: DepSource::Github,
+                }],
+            )
+            .await
+            .unwrap();
+        let backend = ScriptedBackend::new(HashMap::new());
+        backend
+            .close_state
+            .lock()
+            .unwrap()
+            .insert(1, ("closed".into(), Some("completed".into())));
+        backend.pulls.lock().unwrap().insert(
+            10,
+            Some(PullRequestCompletion {
+                merged: true,
+                base_ref: "main".into(),
+                default_branch: "main".into(),
+                approved: false,
+                closed: true,
+            }),
+        );
+        *backend.reviewer.lock().unwrap() = Some("orch-bot".into());
+        backend.review_comments.lock().unwrap().insert(
+            10,
+            vec![ScriptedReviewComment {
+                login: "mallory".into(),
+                body: "## Automated Review \u{2014} Approve\n\nspoof".into(),
+                created_at: "2026-01-03T00:00:00Z".into(),
+            }],
+        );
+        refresh_blocker_snapshots(&backend, &store).await.unwrap();
+        assert!(store.block_claim_if_waiting(b).await.unwrap().is_some());
+
+        backend.review_comments.lock().unwrap().insert(
+            10,
+            vec![ScriptedReviewComment {
+                login: "orch-bot".into(),
+                body: "## Automated Review \u{2014} Approve\n\nLooks good.".into(),
+                created_at: "2026-01-02T00:00:00Z".into(),
+            }],
+        );
+        refresh_blocker_snapshots(&backend, &store).await.unwrap();
+        assert_eq!(store.block_claim_if_waiting(b).await.unwrap(), None);
+        assert_eq!(store.get(b).await.unwrap().status, TaskStatus::New);
+    }
+
+    #[tokio::test]
+    async fn blocker_closed_before_import_releases_on_refresh() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let waiter = insert(&store, "owner/repo", "24", "later", "").await;
+        let mut blocked = HashMap::new();
+        blocked.insert(
+            24,
+            BlockedByFetch::Native(vec![native("owner/repo", 14, "open", None)]),
+        );
+        let backend = ScriptedBackend::new(blocked);
+        backend
+            .close_state
+            .lock()
+            .unwrap()
+            .insert(14, ("closed".into(), Some("completed".into())));
+        reconcile_dependencies(&backend, &store, None)
+            .await
+            .unwrap();
+        assert_eq!(store.get(waiter).await.unwrap().status, TaskStatus::New);
+        let snap = store
+            .blocker_snapshot("owner/repo", 14)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(snap.is_satisfied());
+        assert_eq!(snap.issue_state, "closed");
     }
 
     #[test]

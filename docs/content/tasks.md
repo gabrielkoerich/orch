@@ -51,7 +51,7 @@ waiting
 
 A task can wait on other issues. GitHub blocked-by links are the source of truth. When that API is missing, orch reads `Depends on #12`, `Blocked by #12, #13`, and `owner/repo#12` from the issue body.
 
-A dependency is done only when the blocking pull request is approved and merged into the default branch. An issue with no pull request is done when it is closed as completed. A local `done` row, an approved pull request that is still open, a merge into another branch, a pull request closed without merge, and an issue closed as not planned do not count.
+A dependency is done when the blocking pull request is approved and merged into the default branch. Orch posts a `## Automated Review` comment from the reviewer account, and that comment counts as approval. An issue with no pull request is done when it is closed as completed. A local `done` row, an approved pull request that is still open, a merge into another branch, a pull request closed without merge, and an issue closed as not planned do not count. Refresh reads the blocker's issue state from GitHub on each tick, including blockers that were already closed when the waiting task was imported.
 
 `orch task add "title" --depends-on 12 --depends-on owner/other#4` creates the issue and writes the native links. `orch task deps <id>` lists both directions. `orch task tree --deps` shows blocked-by edges. `orch task list`, `get`, and `inspect` print the open blocker numbers on a waiting task.
 
