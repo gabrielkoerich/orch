@@ -738,8 +738,8 @@ pub(crate) fn any_changes_requested_in_reviews(reviews: &[GitHubReview]) -> bool
         .any(|r| r.state == "CHANGES_REQUESTED")
 }
 
-/// Returns `true` if any failed check run for `sha` carries a GitHub Actions
-/// billing failure annotation.
+/// Counts failed check runs for `sha` that carry a GitHub Actions billing
+/// failure annotation.
 ///
 /// When an account has unpaid invoices or has hit a spending limit, GitHub
 /// refuses to start jobs and records the reason ("The job was not started
@@ -748,23 +748,24 @@ pub(crate) fn any_changes_requested_in_reviews(reviews: &[GitHubReview]) -> bool
 /// the agent retry loop — but no code change can fix a billing problem.
 /// This function lets the caller short-circuit that loop and block the task
 /// immediately with a human-readable billing message instead.
-async fn is_billing_failure(
+async fn billing_failed_runs(
     gh: &GhHttp,
     repo: &str,
     sha: &str,
     prefetched: Option<Vec<GitHubCheckRun>>,
-) -> bool {
+) -> u64 {
     let check_runs = match prefetched {
         Some(runs) => runs,
         None => match gh.get_check_runs(repo, sha).await {
             Ok(runs) => runs,
             Err(e) => {
                 tracing::debug!(err = %e, "failed to fetch check runs for billing failure check");
-                return false;
+                return 0;
             }
         },
     };
 
+    let mut count = 0;
     for run in check_runs
         .iter()
         .filter(|r| r.conclusion.as_deref() == Some("failure"))
@@ -779,7 +780,8 @@ async fn is_billing_failure(
                         || title.contains("account payments have failed")
                         || title.contains("spending limit")
                     {
-                        return true;
+                        count += 1;
+                        break;
                     }
                 }
             }
@@ -793,7 +795,7 @@ async fn is_billing_failure(
         }
     }
 
-    false
+    count
 }
 
 /// Auto-merge a PR after review approval.
@@ -1126,6 +1128,25 @@ pub(crate) async fn auto_merge_pr(
             tracing::warn!(task_id = task.id.0, err = %e, "failed to record CI check timestamp");
         }
 
+        // A check that never started because of an Actions billing or spending limit
+        // is "not run", not a failure. If every failed check is of that kind and the
+        // other checks passed, the PR is green.
+        let mut state = state;
+        if state == "failure" && passing > 0 {
+            let unstarted =
+                billing_failed_runs(&gh, repo, &head_sha, prefetched_check_runs.clone()).await;
+            if unstarted > 0 && unstarted == failing {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    pr_number,
+                    unstarted,
+                    passing,
+                    "checks did not start because of a GitHub Actions billing limit — treating as not run"
+                );
+                state = "success".to_string();
+            }
+        }
+
         match state.as_str() {
             "success" => {
                 if let Err(e) = clear_ci_pending_since(store, &task.id.0, "ci_success").await {
@@ -1372,7 +1393,8 @@ pub(crate) async fn auto_merge_pr(
                 // failure counter.  Billing failures are infrastructure problems —
                 // no agent can fix them — so we block the task immediately and skip
                 // the re-route loop entirely.
-                if is_billing_failure(&gh, repo, &head_sha, prefetched_check_runs.take()).await {
+                if billing_failed_runs(&gh, repo, &head_sha, prefetched_check_runs.take()).await > 0
+                {
                     tracing::error!(
                         task_id = task.id.0,
                         pr_number,

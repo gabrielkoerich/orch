@@ -773,6 +773,14 @@ async fn invoke_review_agent(
     let start_comment = review_started_comment(&ctx.review_agent, ctx.review_model_str());
     match GhHttp::new() {
         Ok(gh) => {
+            post_review_status(
+                &gh,
+                repo,
+                ctx.pr_number,
+                "pending",
+                "Automated review running",
+            )
+            .await;
             if let Err(e) = gh
                 .add_comment(repo, &ctx.pr_number.to_string(), &start_comment)
                 .await
@@ -1717,6 +1725,44 @@ fn build_pr_review_comment(decision: &ReviewDecision, review_notes_for_comment: 
     }
 }
 
+const REVIEW_STATUS_CONTEXT: &str = "orch/review";
+
+/// Commit status state and description for a review decision. Other decisions post nothing.
+fn review_status(decision: &ReviewDecision) -> Option<(&'static str, &'static str)> {
+    match decision {
+        ReviewDecision::Approve => Some(("success", "Approved by automated review")),
+        ReviewDecision::RequestChanges { .. } => {
+            Some(("failure", "Automated review requested changes"))
+        }
+        _ => None,
+    }
+}
+
+/// Post `orch/review` on the PR head SHA. A new push moves the head, so an old decision goes stale.
+async fn post_review_status(
+    gh: &GhHttp,
+    repo: &str,
+    pr_number: u64,
+    state: &str,
+    description: &str,
+) {
+    let result = async {
+        let pr = gh.get_pr(repo, pr_number).await?;
+        gh.post_commit_status(
+            repo,
+            &pr.head.sha,
+            state,
+            REVIEW_STATUS_CONTEXT,
+            description,
+        )
+        .await
+    }
+    .await;
+    if let Err(e) = result {
+        tracing::warn!(pr_number, error = %e, "failed to post orch/review commit status");
+    }
+}
+
 async fn post_review_comment(
     task: &ExternalTask,
     repo: &str,
@@ -1740,6 +1786,10 @@ async fn post_review_comment(
         pr_comment.push_str(
             "\n> Note: no other agent was available, so this PR was reviewed by the same agent that wrote the code.\n",
         );
+    }
+
+    if let Some((state, description)) = review_status(decision) {
+        post_review_status(&gh, repo, ctx.pr_number, state, description).await;
     }
 
     if !pr_comment.is_empty() {
@@ -3057,6 +3107,20 @@ mod tests {
         assert!(cfg
             .model_for_complexity("unknown_agent_xyz", "simple", "")
             .is_none());
+    }
+
+    #[test]
+    fn review_status_maps_decisions() {
+        assert_eq!(
+            review_status(&ReviewDecision::Approve).unwrap().0,
+            "success"
+        );
+        let changes = ReviewDecision::RequestChanges {
+            notes: String::new(),
+            issues: vec![],
+        };
+        assert_eq!(review_status(&changes).unwrap().0, "failure");
+        assert!(review_status(&ReviewDecision::Failed("x".into())).is_none());
     }
 
     #[test]

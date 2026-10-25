@@ -21,7 +21,7 @@ The review agent automatically reviews pull requests after an agent completes a 
    - **request_changes** → posts a comment with `## Automated Review -- Changes Requested` header, task re-routes to `New` for the agent to fix
    - **reject** → posts review comment, closes the PR, task goes to `needs_review`
 
-   Review comments use a `## Automated Review` header as the protocol. A CI workflow (`.github/workflows/orch-review.yml`) reads PR comments with this header to determine approval status.
+   Review comments use a `## Automated Review` header as the protocol. orch also posts the decision as a commit status on the PR head SHA, context `orch/review`: `pending` while the review runs, `success` for approve, `failure` for changes requested. A new push moves the head SHA, so an old approval does not carry over. `orch init` no longer installs `.github/workflows/orch-review.yml`. A repository that has it can delete the file and the `ORCH_REVIEWER` variable.
 
 ## Agent Selection
 
