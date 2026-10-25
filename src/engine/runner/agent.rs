@@ -771,6 +771,13 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    #[test]
+    fn review_system_prompt_checks_stray_files_and_trust_boundaries() {
+        let p = review_system_prompt();
+        assert!(p.contains("**Files**"));
+        assert!(p.contains("**Trust boundaries**"));
+    }
+
     fn test_invocation(task_id: &str) -> AgentInvocation {
         AgentInvocation {
             agent: "claude".to_string(),
