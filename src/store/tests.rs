@@ -7083,3 +7083,63 @@ async fn helper_get_recent_memory_result_not_found_returns_err() {
         "get_recent_memory_result should return error for missing task, not Ok(None)"
     );
 }
+
+#[tokio::test]
+async fn move_repo_keeps_tasks_and_dependencies() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let mk = |n: &str| NewTask {
+        external_id: Some(n.to_string()),
+        repo: "a/x".to_string(),
+        origin: "github".to_string(),
+        title: format!("t{n}"),
+        ..Default::default()
+    };
+    let one = store.create(&mk("1")).await.unwrap();
+    let two = store.create(&mk("2")).await.unwrap();
+    store
+        .replace_dependencies(
+            two,
+            &[NewDependency {
+                repo: "a/x".to_string(),
+                number: 1,
+                source: DepSource::Cli,
+            }],
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE tasks SET branch = 'br' WHERE id = ?")
+        .bind(one)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+    assert_eq!(store.move_repo("a/x", "b/x").await.unwrap(), 2);
+    let t = store.get(one).await.unwrap();
+    assert_eq!((t.repo.as_str(), t.id), ("b/x", one));
+    assert_eq!(t.branch, "br");
+    let deps = store.list_dependencies(two).await.unwrap();
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0].depends_on_repo, "b/x");
+    assert_eq!(deps[0].depends_on_task_id, Some(one));
+}
+
+#[tokio::test]
+async fn move_repo_refuses_when_target_has_tasks() {
+    let store = TaskStore::open_memory().await.unwrap();
+    for repo in ["a/x", "b/x"] {
+        store
+            .create(&NewTask {
+                repo: repo.to_string(),
+                origin: "internal".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    assert!(store.move_repo("a/x", "b/x").await.is_err());
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE repo = 'a/x'")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+}

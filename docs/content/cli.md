@@ -117,6 +117,7 @@ orch project add https://github.com/o/r    # same, from a URL
 orch project add /path/to/repo             # register a local path
 orch project list                          # list registered projects
 orch project remove /path/to/repo          # remove a project from registry
+orch project move old/slug new/slug        # re-key stored tasks after a repo transfer or rename
 orch project board list                    # list GitHub Projects V2 boards
 orch project board link <id>               # link a board
 orch project board sync                    # discover field IDs

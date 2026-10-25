@@ -237,6 +237,40 @@ pub fn blocker_failure_kind(
 }
 
 impl TaskStore {
+    /// Rename a repo slug on every stored row in one transaction.
+    ///
+    /// Refuses when the new slug already has tasks. Returns the number of moved tasks
+    pub async fn move_repo(&self, old: &str, new: &str) -> anyhow::Result<u64> {
+        let mut tx = self.pool.begin().await.context("begin repo move")?;
+        let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE repo = ?")
+            .bind(new)
+            .fetch_one(&mut *tx)
+            .await?;
+        if existing > 0 {
+            anyhow::bail!("{new} already has {existing} task(s), refusing to move {old} onto it");
+        }
+        let moved = sqlx::query("UPDATE tasks SET repo = ? WHERE repo = ?")
+            .bind(new)
+            .bind(old)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        for sql in [
+            "UPDATE task_dependencies SET depends_on_repo = ? WHERE depends_on_repo = ?",
+            "UPDATE task_metrics SET repo = ? WHERE repo = ?",
+            "UPDATE job_state SET repo = ? WHERE repo = ?",
+            "UPDATE channel_subscriptions SET repo = ? WHERE repo = ?",
+        ] {
+            sqlx::query(sql)
+                .bind(new)
+                .bind(old)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(moved)
+    }
+
     /// Replace one task's dependency rows in a single transaction.
     pub async fn replace_dependencies(
         &self,
