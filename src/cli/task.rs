@@ -43,6 +43,30 @@ fn format_age(updated_at: &str) -> String {
 }
 
 /// Truncate an error message to a maximum length, appending an ellipsis when truncated.
+/// Format one `review_attempt_failed` activity row for `orch task inspect`.
+fn review_attempt_line(activity: &store::TaskActivity) -> String {
+    let field = |key: &str| {
+        activity
+            .details
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("-")
+            .to_string()
+    };
+    let external = activity
+        .details
+        .get("external")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    format!(
+        "{}  {}{}: {}",
+        activity.timestamp,
+        field("cause"),
+        if external { " (external)" } else { "" },
+        truncate_err(field("reason").trim(), 160)
+    )
+}
+
 fn truncate_err(err: &str, max: usize) -> String {
     if err.len() > max {
         let mut end = max;
@@ -2185,6 +2209,23 @@ pub async fn inspect(id: &str) -> anyhow::Result<()> {
         }
     }
 
+    // Each failed review attempt, so a rebroadcast escalation shows what kept failing
+    // instead of only the final "escalated after N retries"
+    let attempts: Vec<_> = store
+        .get_activity(task.id, None)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| a.event_type == "review_attempt_failed")
+        .collect();
+    if !attempts.is_empty() {
+        println!();
+        println!("Review attempts ({} failed):", attempts.len());
+        for activity in attempts.iter().rev().take(10).rev() {
+            println!("  {}", review_attempt_line(activity));
+        }
+    }
+
     // ── Block reason ─────────────────────────────────────────────────────────
     if let Some(ref reason) = task.block_reason {
         println!();
@@ -2340,6 +2381,30 @@ mod tests {
         assert_eq!(
             model_none.as_deref().unwrap_or("(router default)"),
             "(router default)"
+        );
+    }
+
+    #[test]
+    fn review_attempt_line_shows_cause_and_reason() {
+        let activity = store::TaskActivity {
+            id: 1,
+            task_id: 7,
+            timestamp: "2026-10-25T22:40:00Z".to_string(),
+            event_type: "review_attempt_failed".to_string(),
+            from_status: None,
+            to_status: None,
+            agent: None,
+            model: None,
+            details: serde_json::json!({
+                "cause": "rate_limit",
+                "external": true,
+                "reason": "claude failed: rate limit reached",
+            }),
+        };
+        let line = review_attempt_line(&activity);
+        assert_eq!(
+            line,
+            "2026-10-25T22:40:00Z  rate_limit (external): claude failed: rate limit reached"
         );
     }
 

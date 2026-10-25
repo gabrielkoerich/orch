@@ -632,6 +632,73 @@ pub fn spawn(
     });
 }
 
+/**
+ * Record a failed review attempt on the task's activity timeline and hand the outcome
+ * back to `classify_review_failure`, which returns it unchanged. Without this the only
+ * trace of a failed attempt was the final `last_error` written at escalation, so
+ * `orch task inspect` showed that a task gave up but never why each attempt failed.
+ *
+ * `external` marks a cause outside the review itself (agent rate limit, GitHub API
+ * limit, no review model). Those also clear `needs_review_refires`: the refire quota
+ * exists to catch a task the subscriber never picks up, and spending it on a cause the
+ * review agent cannot control escalated healthy tasks to Blocked during a rate-limit
+ * window. The retry itself is already handled by the `RateLimited` / `Reset` arms
+ **/
+async fn recorded(
+    store: &Arc<TaskStore>,
+    repo: &str,
+    task_id: &str,
+    reason: &str,
+    cause: &str,
+    external: bool,
+    outcome: ReviewOutcome,
+) -> ReviewOutcome {
+    let store_id = match store.resolve_task_id(repo, task_id).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            tracing::warn!(
+                task_id,
+                "review attempt not recorded — task not found in store"
+            );
+            return outcome;
+        }
+        Err(e) => {
+            tracing::warn!(task_id, err = %e, "review attempt not recorded — task id lookup failed");
+            return outcome;
+        }
+    };
+
+    if let Err(e) = store
+        .append_activity(
+            store_id,
+            "review_attempt_failed",
+            None,
+            None,
+            None,
+            None,
+            Some(&serde_json::json!({
+                "cause": cause,
+                "external": external,
+                "reason": reason,
+            })),
+        )
+        .await
+    {
+        tracing::warn!(task_id, err = %e, "failed to record review attempt failure");
+    }
+
+    if external {
+        if let Err(e) = store
+            .set_fields(store_id, &[("needs_review_refires", serde_json::json!(0))])
+            .await
+        {
+            tracing::warn!(task_id, err = %e, "failed to clear needs_review_refires after external review failure");
+        }
+    }
+
+    outcome
+}
+
 /// Classify a review failure and return the appropriate outcome.
 ///
 /// Both the `Ok(ReviewDecision::Failed)` and `Err(e)` arms share the same
@@ -659,7 +726,16 @@ async fn classify_review_failure(
             reason,
             "{context} hit parse error — re-routing for retry without counting as failure"
         );
-        return ReviewOutcome::Reset;
+        return recorded(
+            store,
+            repo,
+            task_id,
+            reason,
+            "parse_error",
+            false,
+            ReviewOutcome::Reset,
+        )
+        .await;
     }
 
     // Session exited mid-thought with no result envelope (issue #3734). Same
@@ -670,7 +746,16 @@ async fn classify_review_failure(
             reason,
             "{context} session incomplete — re-routing for retry without counting as failure"
         );
-        return ReviewOutcome::Reset;
+        return recorded(
+            store,
+            repo,
+            task_id,
+            reason,
+            "incomplete_session",
+            false,
+            ReviewOutcome::Reset,
+        )
+        .await;
     }
 
     // The review output was cut off by the model's output/reasoning token
@@ -682,7 +767,16 @@ async fn classify_review_failure(
             reason,
             "{context} output truncated by token budget — re-routing for retry without counting as failure"
         );
-        return ReviewOutcome::Reset;
+        return recorded(
+            store,
+            repo,
+            task_id,
+            reason,
+            "truncated_output",
+            false,
+            ReviewOutcome::Reset,
+        )
+        .await;
     }
 
     // Transient mergeability check: GitHub hasn't finished computing yet.
@@ -695,7 +789,16 @@ async fn classify_review_failure(
             reason,
             "{context} PR mergeability check still pending — will retry merge without re-reviewing"
         );
-        return ReviewOutcome::RetryMerge;
+        return recorded(
+            store,
+            repo,
+            task_id,
+            reason,
+            "mergeability_pending",
+            true,
+            ReviewOutcome::RetryMerge,
+        )
+        .await;
     }
 
     // Merge conflicts should be handled by handle_merge_conflict() in
@@ -711,7 +814,16 @@ async fn classify_review_failure(
             reason,
             "{context} hit merge conflict — routing to task agent to resolve"
         );
-        return ReviewOutcome::Reroute;
+        return recorded(
+            store,
+            repo,
+            task_id,
+            reason,
+            "merge_conflict",
+            false,
+            ReviewOutcome::Reroute,
+        )
+        .await;
     }
 
     // No configured review model for any available agent, or the selected agent
@@ -724,7 +836,16 @@ async fn classify_review_failure(
             reason,
             "{context}: no review model available — deferring retry until one is available"
         );
-        return ReviewOutcome::RateLimited;
+        return recorded(
+            store,
+            repo,
+            task_id,
+            reason,
+            "no_review_model",
+            true,
+            ReviewOutcome::RateLimited,
+        )
+        .await;
     }
 
     if lower_reason.contains("rate limit") || lower_reason.contains("auth error") {
@@ -733,7 +854,16 @@ async fn classify_review_failure(
             reason,
             "{context} hit rate limit or auth error — deferring retry until cooldown expires"
         );
-        return ReviewOutcome::RateLimited;
+        return recorded(
+            store,
+            repo,
+            task_id,
+            reason,
+            "rate_limit",
+            true,
+            ReviewOutcome::RateLimited,
+        )
+        .await;
     }
 
     if crate::engine::runner::git_ops::is_transient_github_api_error(reason) {
@@ -742,7 +872,16 @@ async fn classify_review_failure(
             reason,
             "{context} hit transient GitHub error — deferring retry without counting as failure"
         );
-        return ReviewOutcome::Reset;
+        return recorded(
+            store,
+            repo,
+            task_id,
+            reason,
+            "github_api_error",
+            true,
+            ReviewOutcome::Reset,
+        )
+        .await;
     }
 
     // Provider-side network errors (ConnectionRefused, timeouts, etc.) are
@@ -754,7 +893,16 @@ async fn classify_review_failure(
             reason,
             "{context} hit transient provider network error — re-routing for retry without counting as failure"
         );
-        return ReviewOutcome::Reset;
+        return recorded(
+            store,
+            repo,
+            task_id,
+            reason,
+            "provider_network_error",
+            true,
+            ReviewOutcome::Reset,
+        )
+        .await;
     }
 
     let failures = match crate::store::store_increment(
@@ -782,7 +930,16 @@ async fn classify_review_failure(
             failures,
             "{context} failed too many times — blocking task"
         );
-        ReviewOutcome::Block(format!("{context} failed {failures} times: {reason}"))
+        recorded(
+            store,
+            repo,
+            task_id,
+            reason,
+            "review_failure",
+            false,
+            ReviewOutcome::Block(format!("{context} failed {failures} times: {reason}")),
+        )
+        .await
     } else {
         tracing::error!(
             task_id,
@@ -790,7 +947,16 @@ async fn classify_review_failure(
             failures,
             "{context} failed — resetting to NeedsReview for retry"
         );
-        ReviewOutcome::Reset
+        recorded(
+            store,
+            repo,
+            task_id,
+            reason,
+            "review_failure",
+            false,
+            ReviewOutcome::Reset,
+        )
+        .await
     }
 }
 
@@ -1023,6 +1189,93 @@ mod tests {
         assert_eq!(
             task.review_agent_failures, 0,
             "missing review model errors must not count toward review_agent_failures"
+        );
+    }
+
+    /**
+     * A review that fails on a rate limit is retried once the cooldown clears, and must
+     * never spend the rebroadcast quota: `needs_review_refires` is cleared so the sync
+     * sweep cannot escalate the task to Blocked for a cause outside the review (#3767)
+     **/
+    #[tokio::test]
+    async fn classify_review_failure_rate_limit_clears_refire_quota() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let repo = "owner/repo";
+        let store_id = store
+            .create_internal(
+                repo,
+                "Rate limited review",
+                "",
+                "review",
+                "review-3767",
+                None,
+            )
+            .await
+            .unwrap();
+        let task_id = format!("internal:{store_id}");
+
+        let error_messages = [
+            "claude failed: rate limit reached for model sonnet",
+            "GitHub API GET https://api.github.com/repos/owner/repo/pulls/65 failed (403): API rate limit exceeded",
+        ];
+
+        // The sweep has already burned most of the quota before the rate-limit window
+        store
+            .set_fields(store_id, &[("needs_review_refires", serde_json::json!(5))])
+            .await
+            .unwrap();
+
+        for _ in 0..(MAX_REVIEW_AGENT_FAILURES + 1) {
+            for msg in &error_messages {
+                let outcome =
+                    classify_review_failure(&store, repo, &task_id, msg, "review agent").await;
+                assert!(
+                    matches!(outcome, ReviewOutcome::RateLimited | ReviewOutcome::Reset),
+                    "rate limit '{msg}' must defer for retry, not block"
+                );
+            }
+        }
+
+        let task = opt_store_get_task(&Some(store.clone()), repo, &task_id)
+            .await
+            .expect("task should exist");
+        assert_eq!(
+            task.needs_review_refires, 0,
+            "a rate limit must not consume the rebroadcast quota"
+        );
+        assert_eq!(
+            task.review_agent_failures, 0,
+            "rate limits must not count toward review_agent_failures"
+        );
+        assert_ne!(
+            task.status,
+            crate::store::TaskStatus::Blocked,
+            "a rate-limited review must leave the task retryable"
+        );
+
+        let attempts = store
+            .get_activity(store_id, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.event_type == "review_attempt_failed")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attempts.len(),
+            (MAX_REVIEW_AGENT_FAILURES as usize + 1) * error_messages.len(),
+            "every failed attempt must be recorded for `orch task inspect`"
+        );
+        assert!(
+            attempts
+                .iter()
+                .all(|a| a.details.get("external").and_then(|v| v.as_bool()) == Some(true)),
+            "rate limits must be recorded as an external cause"
+        );
+        assert!(
+            attempts.iter().any(
+                |a| a.details.get("reason").and_then(|v| v.as_str()) == Some(error_messages[0])
+            ),
+            "the recorded attempt must carry that attempt's error"
         );
     }
 }
