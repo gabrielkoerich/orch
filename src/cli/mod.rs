@@ -728,44 +728,15 @@ fn register_project_path(path_str: &str) -> anyhow::Result<()> {
         String::new()
     };
 
-    let mut doc: serde_norway::Value = if content.is_empty() {
-        serde_norway::Value::Mapping(serde_norway::Mapping::new())
-    } else {
-        serde_norway::from_str(&content)?
-    };
-
-    let root = doc
-        .as_mapping_mut()
-        .ok_or_else(|| anyhow::anyhow!("config is not a YAML mapping"))?;
-
-    // Get or create projects list
-    let projects_key = serde_norway::Value::String("projects".to_string());
-    if !root.contains_key(&projects_key) {
-        root.insert(
-            projects_key.clone(),
-            serde_norway::Value::Sequence(Vec::new()),
-        );
+    match config::projects_yaml::add_project(&content, path_str)? {
+        config::projects_yaml::ProjectsEdit::Unchanged => {
+            println!("Project already registered: {}", path_str);
+        }
+        config::projects_yaml::ProjectsEdit::Updated(updated) => {
+            std::fs::write(&config_path, updated)?;
+            println!("Added project: {}", path_str);
+        }
     }
-
-    let projects = root
-        .get_mut(&projects_key)
-        .and_then(|v| v.as_sequence_mut())
-        .ok_or_else(|| anyhow::anyhow!("projects is not a list"))?;
-
-    // Check for duplicates
-    let already_exists = projects
-        .iter()
-        .any(|p| p.as_str().map(|s| s == path_str).unwrap_or(false));
-
-    if already_exists {
-        println!("Project already registered: {}", path_str);
-        return Ok(());
-    }
-
-    projects.push(serde_norway::Value::String(path_str.to_string()));
-    std::fs::write(&config_path, serde_norway::to_string(&doc)?)?;
-
-    println!("Added project: {}", path_str);
 
     Ok(())
 }
@@ -783,32 +754,15 @@ pub fn project_remove(path: &str) -> anyhow::Result<()> {
     }
 
     let content = std::fs::read_to_string(&config_path)?;
-    let mut doc: serde_norway::Value = serde_norway::from_str(&content)?;
-
-    let root = doc
-        .as_mapping_mut()
-        .ok_or_else(|| anyhow::anyhow!("config is not a YAML mapping"))?;
-
-    let projects_key = serde_norway::Value::String("projects".to_string());
-    let projects = root
-        .get_mut(&projects_key)
-        .and_then(|v| v.as_sequence_mut())
-        .ok_or_else(|| anyhow::anyhow!("no projects list in config"))?;
-
-    let before_len = projects.len();
-    projects.retain(|p| {
-        p.as_str()
-            .map(|s| s != path_str && s != path)
-            .unwrap_or(true)
-    });
-
-    if projects.len() == before_len {
-        println!("Project not found: {}", path);
-        return Ok(());
+    match config::projects_yaml::remove_project(&content, &[&path_str, path])? {
+        config::projects_yaml::ProjectsEdit::Unchanged => {
+            println!("Project not found: {}", path);
+        }
+        config::projects_yaml::ProjectsEdit::Updated(updated) => {
+            std::fs::write(&config_path, updated)?;
+            println!("Removed project: {}", path_str);
+        }
     }
-
-    std::fs::write(&config_path, serde_norway::to_string(&doc)?)?;
-    println!("Removed project: {}", path_str);
 
     Ok(())
 }
