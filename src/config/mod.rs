@@ -9,6 +9,8 @@
 //! - Hot reload: cache is invalidated when config files change
 //! - Change notifications: subscribers receive events when config files change
 
+pub mod projects_yaml;
+
 use anyhow::Context;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
