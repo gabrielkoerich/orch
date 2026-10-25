@@ -1127,7 +1127,10 @@ impl GhHttp {
         ));
         let mut found = Vec::new();
         while let Some(url) = next.take() {
-            let resp = match self.dependency_request(&url, reqwest::Method::GET, None).await {
+            let resp = match self
+                .dependency_request(&url, reqwest::Method::GET, None)
+                .await
+            {
                 Ok(resp) => resp,
                 Err(err) => return Ok(BlockedByFetch::Failed(err.to_string())),
             };
@@ -1190,9 +1193,8 @@ impl GhHttp {
         issue_number: u64,
         blocking_issue_id: i64,
     ) -> anyhow::Result<()> {
-        let url = format!(
-            "{GITHUB_API}/repos/{repo}/issues/{issue_number}/dependencies/blocked_by"
-        );
+        let url =
+            format!("{GITHUB_API}/repos/{repo}/issues/{issue_number}/dependencies/blocked_by");
         let resp = self
             .dependency_request(
                 &url,

@@ -435,7 +435,32 @@ pub async fn setup_worktree(
         })
         .unwrap_or((None, None, None));
 
-    let (branch_name_str, worktree_dir) = if let Some(ref saved) = saved_branch {
+    let mut force_fresh = false;
+    if let (Some(store), Some(record)) = (store.as_ref(), task_record.as_ref()) {
+        let key = crate::store::worktree_refresh_key(record.id);
+        if matches!(store.kv_get(&key).await, Ok(Some(_))) {
+            let _ = store.kv_delete(&key).await;
+            force_fresh = true;
+            tracing::info!(
+                task_id,
+                "dependency merged, discarding the old worktree so the next run starts at the default branch"
+            );
+        }
+    }
+
+    let (branch_name_str, worktree_dir) = if force_fresh {
+        if let Some(existing_dir) = find_existing_worktree(&worktrees_base, task_id).await {
+            discard_worktree(&main_dir, &existing_dir).await;
+        }
+        if let Some(saved) = saved_worktree.as_ref().filter(|path| !path.is_empty()) {
+            let saved_path = PathBuf::from(saved);
+            if tokio::fs::metadata(&saved_path).await.is_ok() {
+                discard_worktree(&main_dir, &saved_path).await;
+            }
+        }
+        let bn = branch_name(task_id, title);
+        (bn.clone(), worktrees_base.join(&bn))
+    } else if let Some(ref saved) = saved_branch {
         if !saved.is_empty() {
             // Use spawn_blocking for blocking Path::exists call in async context
             let wt = match &saved_worktree {
@@ -780,6 +805,27 @@ pub async fn setup_worktree(
 }
 
 /// Find an existing worktree by task ID prefix.
+async fn discard_worktree(main_dir: &Path, worktree_dir: &Path) {
+    let _ = Command::new("git")
+        .args([
+            "-C",
+            &main_dir.to_string_lossy(),
+            "worktree",
+            "remove",
+            "--force",
+            &worktree_dir.to_string_lossy(),
+        ])
+        .output_with_context()
+        .await;
+    if tokio::fs::metadata(worktree_dir).await.is_ok() {
+        let _ = tokio::fs::remove_dir_all(worktree_dir).await;
+    }
+    let _ = Command::new("git")
+        .args(["-C", &main_dir.to_string_lossy(), "worktree", "prune"])
+        .output_with_context()
+        .await;
+}
+
 async fn find_existing_worktree(worktrees_base: &Path, task_id: &str) -> Option<PathBuf> {
     let (prefix_new, legacy_prefixes) = if let Some(num) = task_id.strip_prefix("internal:") {
         (

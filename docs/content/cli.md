@@ -24,16 +24,20 @@ Visible top-level commands: `log`, `commit`, `stream`, `notify`, `chat`, `task`,
 
 ```bash
 orch task add "title" -b "body" -l label1 -l label2   # create a task
+orch task add "title" --depends-on 12 --depends-on owner/other#4
+                                                       # create a GitHub issue blocked by those issues
 orch task list                                         # list tasks for current project
 orch task list -g                                      # list across all projects
 orch task tree [id]                                    # show parent-child tree
+orch task tree --deps                                  # show blocked-by edges
+orch task deps <id>                                    # what this task waits on, and what waits on it
 orch task get <id>                                     # task details
 orch task status                                       # status summary for current project
 orch task route <id>                                   # (re-)route a task
 orch task run [id]                                     # run a specific task (or next routed)
 orch task retry <id> [--agent X --model Y]             # reset to new, optionally forcing routing
 orch task reroute <id> --agent X --model Y             # force a new agent/model
-orch task unblock <id> | all                           # reset blocked tasks to new
+orch task unblock <id> | all                           # reset blocked tasks to new. A task that is only waiting stays waiting
 orch task attach <id>                                  # attach to the agent's tmux session
 orch task live                                         # list active agent tmux sessions
 orch task kill <id>                                    # kill a running agent tmux session

@@ -17,6 +17,7 @@ pub mod channel_handler;
 pub mod cleanup;
 pub mod commands;
 pub mod cooldown;
+pub mod dependencies;
 pub mod dispatch_guard;
 pub mod events;
 pub mod jobs;
@@ -27,7 +28,6 @@ pub mod runner;
 pub mod subscribers;
 pub mod suspend;
 pub mod sync;
-pub mod dependencies;
 pub mod tasks;
 pub mod tick;
 

@@ -4,12 +4,12 @@
 //! body is used only when that API is unavailable. A failed read leaves stored
 //! rows in place.
 
-use crate::backends::{BlockedByFetch, ExternalBackend, ExternalId};
+use crate::backends::{BlockedByFetch, ExternalBackend, ExternalId, PullRequestCompletion};
 use crate::channels::notification::TaskNotification;
 use crate::channels::transport::Transport;
 use crate::store::{
-    close_reason_key, blocker_failure_kind, blocker_is_satisfied, dep_label, normalize_close_reason,
-    DepSource, NewDependency, TaskStore,
+    blocker_failure_kind, blocker_is_satisfied, dep_label, BlockerSnapshot, DepSource,
+    NewDependency, ObservedPullRequest, TaskStore,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -75,12 +75,32 @@ fn dependency_line_rest(trimmed: &str) -> Option<&str> {
     } else {
         return None;
     };
-    let rest = trimmed[prefix..].trim_start().trim_start_matches(':').trim();
+    let rest = trimmed[prefix..]
+        .trim_start()
+        .trim_start_matches(':')
+        .trim();
     if rest.is_empty() {
         None
     } else {
         Some(rest)
     }
+}
+
+/// One `--depends-on` token: a bare issue number, `#12`, or `owner/repo#12`
+pub fn parse_depends_on_token(token: &str, default_repo: &str) -> Option<DepRef> {
+    let trimmed = token.trim().trim_matches(',');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(number) = trimmed.parse::<i64>() {
+        if number > 0 && !default_repo.is_empty() {
+            return Some(DepRef {
+                repo: default_repo.to_string(),
+                number,
+            });
+        }
+    }
+    extract_refs(trimmed, default_repo).into_iter().next()
 }
 
 fn extract_refs(text: &str, default_repo: &str) -> Vec<DepRef> {
@@ -166,9 +186,13 @@ pub async fn sync_issue_dependencies(
     match fetch {
         BlockedByFetch::Native(list) => {
             for item in &list {
-                let reason = normalize_close_reason(&item.state, item.state_reason.as_deref());
                 store
-                    .kv_set(&close_reason_key(&item.repo, item.number), reason)
+                    .note_blocker_issue_state(
+                        &item.repo,
+                        item.number,
+                        &item.state,
+                        item.state_reason.as_deref(),
+                    )
                     .await?;
             }
             let rows = list
@@ -198,9 +222,13 @@ pub async fn sync_issue_dependencies(
                     if let Ok(Some((state, reason))) =
                         backend.issue_close_state(&dep.repo, dep.number).await
                     {
-                        let normalized = normalize_close_reason(&state, reason.as_deref());
                         store
-                            .kv_set(&close_reason_key(&dep.repo, dep.number), normalized)
+                            .note_blocker_issue_state(
+                                &dep.repo,
+                                dep.number,
+                                &state,
+                                reason.as_deref(),
+                            )
                             .await?;
                     }
                 }
@@ -269,8 +297,15 @@ pub async fn reconcile_dependencies(
                 }
             }
         }
-        match sync_issue_dependencies(backend, store, task.id, &task.repo, Some(number), &task.body)
-            .await
+        match sync_issue_dependencies(
+            backend,
+            store,
+            task.id,
+            &task.repo,
+            Some(number),
+            &task.body,
+        )
+        .await
         {
             Ok(outcome) if outcome.cache => {
                 if let Err(err) = store.kv_set(&key, &now.to_string()).await {
@@ -283,9 +318,108 @@ pub async fn reconcile_dependencies(
             }
         }
     }
+    if let Err(err) = refresh_blocker_snapshots(backend, store).await {
+        tracing::warn!(err = %err, "blocker snapshot refresh failed");
+    }
     apply_claim_gates(store).await?;
     emit_dependency_notices(backend, store, transport).await?;
     Ok(())
+}
+
+/// Read each blocker's issue and pull request, then store the snapshot the claim gate reads.
+///
+/// A backend that returns no issue state and no pull request number leaves the
+/// stored snapshot in place. A known pull request that cannot be read is stored
+/// as open and unmerged
+pub async fn refresh_blocker_snapshots(
+    backend: &dyn ExternalBackend,
+    store: &TaskStore,
+) -> anyhow::Result<()> {
+    let edges = store.list_dependency_edges().await?;
+    let mut seen = HashSet::new();
+    for edge in edges {
+        if !seen.insert((edge.depends_on_repo.clone(), edge.depends_on_number)) {
+            continue;
+        }
+        if let Err(err) = refresh_one_blocker(
+            backend,
+            store,
+            &edge.depends_on_repo,
+            edge.depends_on_number,
+        )
+        .await
+        {
+            tracing::warn!(
+                repo = %edge.depends_on_repo,
+                number = edge.depends_on_number,
+                err = %err,
+                "blocker snapshot refresh failed"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn refresh_one_blocker(
+    backend: &dyn ExternalBackend,
+    store: &TaskStore,
+    repo: &str,
+    number: i64,
+) -> anyhow::Result<()> {
+    let close = match backend.issue_close_state(repo, number).await {
+        Ok(state) => state,
+        Err(err) => {
+            tracing::warn!(repo, number, err = %err, "issue close state read failed");
+            None
+        }
+    };
+    let task = store.get_by_external_id(repo, &number.to_string()).await?;
+    let pr_number = task
+        .as_ref()
+        .and_then(|row| row.pr_number)
+        .filter(|n| *n > 0);
+    if close.is_none() && pr_number.is_none() {
+        return Ok(());
+    }
+    let (issue_state, reason) = match close {
+        Some((state, reason)) => (state, reason),
+        None => match store.blocker_snapshot(repo, number).await? {
+            Some(snap) => (snap.issue_state, snap.state_reason),
+            None => ("open".to_string(), None),
+        },
+    };
+    let observed = if let Some(pr) = pr_number {
+        let completion = match backend.pull_request_completion(repo, i64::from(pr)).await {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(repo, number, pr, err = %err, "pull request completion read failed");
+                None
+            }
+        };
+        Some(observe_completion(completion))
+    } else {
+        None
+    };
+    let snap = BlockerSnapshot::observe(&issue_state, reason.as_deref(), observed.as_ref());
+    store.save_blocker_snapshot(repo, number, &snap).await
+}
+
+fn observe_completion(completion: Option<PullRequestCompletion>) -> ObservedPullRequest {
+    match completion {
+        Some(done) => ObservedPullRequest {
+            merged: done.merged,
+            base_is_default: !done.default_branch.is_empty()
+                && done.base_ref == done.default_branch,
+            approved: done.approved,
+            closed_unmerged: done.closed && !done.merged,
+        },
+        None => ObservedPullRequest {
+            merged: false,
+            base_is_default: false,
+            approved: false,
+            closed_unmerged: false,
+        },
+    }
 }
 
 /// True when dispatch must not start this task. A check error also skips dispatch
@@ -326,10 +460,7 @@ pub async fn dispatch_is_waiting(store: &TaskStore, repo: &str, external_id: &st
 /// Stop a manual route, run, or retry while dependencies are open.
 pub async fn refuse_if_waiting(store: &TaskStore, task_id: i64) -> anyhow::Result<()> {
     if let Some(blockers) = store.block_claim_if_waiting(task_id).await? {
-        anyhow::bail!(
-            "task {task_id} is waiting on {}",
-            blockers.join(", ")
-        );
+        anyhow::bail!("task {task_id} is waiting on {}", blockers.join(", "));
     }
     Ok(())
 }
@@ -382,13 +513,16 @@ pub async fn emit_dependency_notices(
 
 async fn cycle_notices(store: &TaskStore) -> anyhow::Result<Vec<DepNotice>> {
     let edges = store.list_dependency_edges().await?;
-    let reasons = store.close_reasons().await?;
-    let mut status_cache: HashMap<(String, i64), Option<String>> = HashMap::new();
+    let mut snap_cache: HashMap<(String, i64), Option<BlockerSnapshot>> = HashMap::new();
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     let mut issue_for_node: HashMap<String, (String, i64, i64, String)> = HashMap::new();
 
     for edge in &edges {
-        let waiter = match edge.task_external_id.as_deref().and_then(|id| id.parse::<i64>().ok()) {
+        let waiter = match edge
+            .task_external_id
+            .as_deref()
+            .and_then(|id| id.parse::<i64>().ok())
+        {
             Some(number) if number > 0 => format!("{}#{}", edge.task_repo, number),
             _ => format!("task:{}", edge.task_id),
         };
@@ -400,15 +534,23 @@ async fn cycle_notices(store: &TaskStore) -> anyhow::Result<Vec<DepNotice>> {
         {
             issue_for_node.insert(
                 waiter.clone(),
-                (edge.task_repo.clone(), number, edge.task_id, edge.task_title.clone()),
+                (
+                    edge.task_repo.clone(),
+                    number,
+                    edge.task_id,
+                    edge.task_title.clone(),
+                ),
             );
         }
         let blocker_node = format!("{}#{}", edge.depends_on_repo, edge.depends_on_number);
-        let status = blocker_status(store, &mut status_cache, &edge.depends_on_repo, edge.depends_on_number).await?;
-        let reason = reasons
-            .get(&close_reason_key(&edge.depends_on_repo, edge.depends_on_number))
-            .map(String::as_str);
-        if blocker_is_satisfied(status.as_deref(), reason) {
+        let snap = cached_snapshot(
+            store,
+            &mut snap_cache,
+            &edge.depends_on_repo,
+            edge.depends_on_number,
+        )
+        .await?;
+        if blocker_is_satisfied(snap.as_ref()) {
             continue;
         }
         adj.entry(waiter).or_default().push(blocker_node);
@@ -455,8 +597,8 @@ async fn cycle_notices(store: &TaskStore) -> anyhow::Result<Vec<DepNotice>> {
 
 async fn failure_notices(store: &TaskStore) -> anyhow::Result<Vec<DepNotice>> {
     let edges = store.list_dependency_edges().await?;
-    let reasons = store.close_reasons().await?;
     let mut status_cache: HashMap<(String, i64), Option<String>> = HashMap::new();
+    let mut snap_cache: HashMap<(String, i64), Option<BlockerSnapshot>> = HashMap::new();
     let mut notices = Vec::new();
     for edge in edges {
         let status = blocker_status(
@@ -466,10 +608,14 @@ async fn failure_notices(store: &TaskStore) -> anyhow::Result<Vec<DepNotice>> {
             edge.depends_on_number,
         )
         .await?;
-        let reason = reasons
-            .get(&close_reason_key(&edge.depends_on_repo, edge.depends_on_number))
-            .map(String::as_str);
-        let Some(kind) = blocker_failure_kind(status.as_deref(), reason) else {
+        let snap = cached_snapshot(
+            store,
+            &mut snap_cache,
+            &edge.depends_on_repo,
+            edge.depends_on_number,
+        )
+        .await?;
+        let Some(kind) = blocker_failure_kind(status.as_deref(), snap.as_ref()) else {
             continue;
         };
         let key = format!(
@@ -480,7 +626,11 @@ async fn failure_notices(store: &TaskStore) -> anyhow::Result<Vec<DepNotice>> {
             continue;
         }
         store.kv_set(&key, "1").await?;
-        let label = dep_label(&edge.task_repo, &edge.depends_on_repo, edge.depends_on_number);
+        let label = dep_label(
+            &edge.task_repo,
+            &edge.depends_on_repo,
+            edge.depends_on_number,
+        );
         let (comment, summary) = match kind {
             "not_planned" => {
                 let text = format!(
@@ -512,6 +662,20 @@ async fn failure_notices(store: &TaskStore) -> anyhow::Result<Vec<DepNotice>> {
         });
     }
     Ok(notices)
+}
+
+async fn cached_snapshot(
+    store: &TaskStore,
+    cache: &mut HashMap<(String, i64), Option<BlockerSnapshot>>,
+    repo: &str,
+    number: i64,
+) -> anyhow::Result<Option<BlockerSnapshot>> {
+    if let Some(found) = cache.get(&(repo.to_string(), number)) {
+        return Ok(found.clone());
+    }
+    let snap = store.blocker_snapshot(repo, number).await?;
+    cache.insert((repo.to_string(), number), snap.clone());
+    Ok(snap)
 }
 
 async fn blocker_status(
@@ -599,7 +763,7 @@ fn visit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::{BlockedByIssue, ExternalTask, Mention, Status};
+    use crate::backends::{BlockedByIssue, ExternalTask, Status};
     use crate::store::{NewTask, TaskStatus};
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
@@ -619,9 +783,18 @@ See #4 in the notes
         assert_eq!(
             deps,
             vec![
-                DepRef { repo: "acme/app".into(), number: 12 },
-                DepRef { repo: "acme/app".into(), number: 13 },
-                DepRef { repo: "owner/repo".into(), number: 12 },
+                DepRef {
+                    repo: "acme/app".into(),
+                    number: 12
+                },
+                DepRef {
+                    repo: "acme/app".into(),
+                    number: 13
+                },
+                DepRef {
+                    repo: "owner/repo".into(),
+                    number: 12
+                },
             ]
         );
     }
@@ -630,6 +803,7 @@ See #4 in the notes
         blocked: Mutex<HashMap<i64, BlockedByFetch>>,
         comments: Mutex<Vec<(String, String)>>,
         close_state: Mutex<HashMap<i64, (String, Option<String>)>>,
+        pulls: Mutex<HashMap<i64, Option<crate::backends::PullRequestCompletion>>>,
     }
 
     impl ScriptedBackend {
@@ -638,6 +812,7 @@ See #4 in the notes
                 blocked: Mutex::new(blocked),
                 comments: Mutex::new(Vec::new()),
                 close_state: Mutex::new(HashMap::new()),
+                pulls: Mutex::new(HashMap::new()),
             }
         }
     }
@@ -676,7 +851,10 @@ See #4 in the notes
         }
 
         async fn post_comment(&self, id: &ExternalId, body: &str) -> anyhow::Result<()> {
-            self.comments.lock().unwrap().push((id.0.clone(), body.to_string()));
+            self.comments
+                .lock()
+                .unwrap()
+                .push((id.0.clone(), body.to_string()));
             Ok(())
         }
 
@@ -696,7 +874,11 @@ See #4 in the notes
             Ok(())
         }
 
-        async fn blocked_by(&self, _repo: &str, issue_number: i64) -> anyhow::Result<BlockedByFetch> {
+        async fn blocked_by(
+            &self,
+            _repo: &str,
+            issue_number: i64,
+        ) -> anyhow::Result<BlockedByFetch> {
             Ok(self
                 .blocked
                 .lock()
@@ -712,6 +894,20 @@ See #4 in the notes
             issue_number: i64,
         ) -> anyhow::Result<Option<(String, Option<String>)>> {
             Ok(self.close_state.lock().unwrap().get(&issue_number).cloned())
+        }
+
+        async fn pull_request_completion(
+            &self,
+            _repo: &str,
+            pr_number: i64,
+        ) -> anyhow::Result<Option<crate::backends::PullRequestCompletion>> {
+            Ok(self
+                .pulls
+                .lock()
+                .unwrap()
+                .get(&pr_number)
+                .cloned()
+                .unwrap_or(None))
         }
     }
 
@@ -749,14 +945,21 @@ See #4 in the notes
         let store = TaskStore::open_memory().await.unwrap();
         let b = insert(&store, "owner/repo", "2", "B", "Depends on #1").await;
         let mut blocked = HashMap::new();
-        blocked.insert(2, BlockedByFetch::Native(vec![native("owner/repo", 1, "open", None)]));
+        blocked.insert(
+            2,
+            BlockedByFetch::Native(vec![native("owner/repo", 1, "open", None)]),
+        );
         let backend = ScriptedBackend::new(blocked);
         sync_issue_dependencies(&backend, &store, b, "owner/repo", Some(2), "Depends on #1")
             .await
             .unwrap();
         assert_eq!(store.list_dependencies(b).await.unwrap().len(), 1);
 
-        backend.blocked.lock().unwrap().insert(2, BlockedByFetch::Native(vec![]));
+        backend
+            .blocked
+            .lock()
+            .unwrap()
+            .insert(2, BlockedByFetch::Native(vec![]));
         sync_issue_dependencies(&backend, &store, b, "owner/repo", Some(2), "Depends on #1")
             .await
             .unwrap();
@@ -794,13 +997,23 @@ See #4 in the notes
         sync_issue_dependencies(&backend, &store, b, "owner/repo", Some(2), "Depends on #9")
             .await
             .unwrap();
-        assert_eq!(store.list_dependencies(b).await.unwrap()[0].number, 1);
+        assert_eq!(
+            store.list_dependencies(b).await.unwrap()[0].depends_on_number,
+            1
+        );
     }
 
     #[tokio::test]
     async fn unavailable_body_replaces_rows() {
         let store = TaskStore::open_memory().await.unwrap();
-        let b = insert(&store, "acme/app", "8", "B", "Blocked by #12, #13\nDepends on owner/repo#12").await;
+        let b = insert(
+            &store,
+            "acme/app",
+            "8",
+            "B",
+            "Blocked by #12, #13\nDepends on owner/repo#12",
+        )
+        .await;
         let backend = ScriptedBackend::new(HashMap::new());
         sync_issue_dependencies(
             &backend,
@@ -819,7 +1032,11 @@ See #4 in the notes
             .collect();
         assert_eq!(
             labels,
-            vec!["acme/app#12".to_string(), "acme/app#13".to_string(), "owner/repo#12".to_string()]
+            vec![
+                "acme/app#12".to_string(),
+                "acme/app#13".to_string(),
+                "owner/repo#12".to_string()
+            ]
         );
         assert!(deps.iter().all(|dep| dep.source == "body"));
     }
@@ -830,19 +1047,37 @@ See #4 in the notes
         let a = insert(&store, "owner/repo", "1", "A", "").await;
         let b = insert(&store, "owner/repo", "2", "B", "").await;
         let mut blocked = HashMap::new();
-        blocked.insert(1, BlockedByFetch::Native(vec![native("owner/repo", 2, "open", None)]));
-        blocked.insert(2, BlockedByFetch::Native(vec![native("owner/repo", 1, "open", None)]));
+        blocked.insert(
+            1,
+            BlockedByFetch::Native(vec![native("owner/repo", 2, "open", None)]),
+        );
+        blocked.insert(
+            2,
+            BlockedByFetch::Native(vec![native("owner/repo", 1, "open", None)]),
+        );
         let backend = ScriptedBackend::new(blocked);
-        sync_issue_dependencies(&backend, &store, a, "owner/repo", Some(1), "").await.unwrap();
-        sync_issue_dependencies(&backend, &store, b, "owner/repo", Some(2), "").await.unwrap();
+        sync_issue_dependencies(&backend, &store, a, "owner/repo", Some(1), "")
+            .await
+            .unwrap();
+        sync_issue_dependencies(&backend, &store, b, "owner/repo", Some(2), "")
+            .await
+            .unwrap();
         apply_claim_gates(&store).await.unwrap();
         assert_eq!(store.get(a).await.unwrap().status, TaskStatus::Waiting);
         assert_eq!(store.get(b).await.unwrap().status, TaskStatus::Waiting);
-        let first = emit_dependency_notices(&backend, &store, None).await.unwrap();
+        let first = emit_dependency_notices(&backend, &store, None)
+            .await
+            .unwrap();
         assert_eq!(first.len(), 2);
-        assert!(first.iter().all(|notice| notice.comment.contains("owner/repo#1")));
-        assert!(first.iter().all(|notice| notice.comment.contains("owner/repo#2")));
-        let second = emit_dependency_notices(&backend, &store, None).await.unwrap();
+        assert!(first
+            .iter()
+            .all(|notice| notice.comment.contains("owner/repo#1")));
+        assert!(first
+            .iter()
+            .all(|notice| notice.comment.contains("owner/repo#2")));
+        let second = emit_dependency_notices(&backend, &store, None)
+            .await
+            .unwrap();
         assert!(second.is_empty());
         assert_eq!(backend.comments.lock().unwrap().len(), 2);
     }
@@ -859,14 +1094,20 @@ See #4 in the notes
         let backend = ScriptedBackend::new(blocked);
         let transport = Transport::new();
         let mut rx = transport.subscribe_notifications();
-        sync_issue_dependencies(&backend, &store, b, "owner/repo", Some(2), "").await.unwrap();
+        sync_issue_dependencies(&backend, &store, b, "owner/repo", Some(2), "")
+            .await
+            .unwrap();
         apply_claim_gates(&store).await.unwrap();
         assert_eq!(store.get(b).await.unwrap().status, TaskStatus::Waiting);
-        let notices = emit_dependency_notices(&backend, &store, Some(&transport)).await.unwrap();
+        let notices = emit_dependency_notices(&backend, &store, Some(&transport))
+            .await
+            .unwrap();
         assert_eq!(notices.len(), 1);
         assert!(notices[0].notify);
         assert!(notices[0].summary.contains("not planned"));
-        let again = emit_dependency_notices(&backend, &store, Some(&transport)).await.unwrap();
+        let again = emit_dependency_notices(&backend, &store, Some(&transport))
+            .await
+            .unwrap();
         assert!(again.is_empty());
         let note = rx.try_recv().unwrap();
         assert_eq!(note.status, "failed");
@@ -896,7 +1137,8 @@ See #4 in the notes
             .await
             .unwrap();
 
-        let backend: Arc<dyn ExternalBackend> = Arc::new(crate::backends::test_helpers::NoopBackend);
+        let backend: Arc<dyn ExternalBackend> =
+            Arc::new(crate::backends::test_helpers::NoopBackend);
         let task_manager = Arc::new(TaskManager::with_store(
             backend.clone(),
             store.clone(),
@@ -916,9 +1158,16 @@ See #4 in the notes
         };
         let mut router = Router::new_for_test(round_robin, vec!["claude".into()]);
         let mut quota = RoutingTickQuota::new(10);
-        tick_route_tasks(&backend, &task_manager, &mut router, &store, "owner/repo", &mut quota)
-            .await
-            .unwrap();
+        tick_route_tasks(
+            &backend,
+            &task_manager,
+            &mut router,
+            &store,
+            "owner/repo",
+            &mut quota,
+        )
+        .await
+        .unwrap();
         let waiting = store.get(b).await.unwrap();
         assert_eq!(waiting.status, TaskStatus::Waiting);
         assert!(waiting.agent.is_none());
@@ -933,19 +1182,212 @@ See #4 in the notes
         let mut llm_router = Router::new_for_test(llm, vec!["claude".into()]);
         let ext = crate::engine::tasks::store_task_to_external(&store.get(b).await.unwrap());
         store.update_status(b, TaskStatus::New).await.unwrap();
-        let err = llm_router.route(&ext, &store, "owner/repo").await.unwrap_err();
-        assert!(err.downcast_ref::<crate::store::WaitingOnDependency>().is_some());
+        let err = llm_router
+            .route(&ext, &store, "owner/repo")
+            .await
+            .unwrap_err();
+        assert!(err
+            .downcast_ref::<crate::store::WaitingOnDependency>()
+            .is_some());
         assert_eq!(store.get(b).await.unwrap().status, TaskStatus::Waiting);
         assert_eq!(store.get(b).await.unwrap().route_attempts, 0);
 
         store.update_status(a, TaskStatus::Done).await.unwrap();
         let mut quota = RoutingTickQuota::new(10);
-        tick_route_tasks(&backend, &task_manager, &mut router, &store, "owner/repo", &mut quota)
+        tick_route_tasks(
+            &backend,
+            &task_manager,
+            &mut router,
+            &store,
+            "owner/repo",
+            &mut quota,
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.get(b).await.unwrap().status, TaskStatus::Waiting);
+
+        store
+            .save_blocker_snapshot(
+                "owner/repo",
+                1,
+                &BlockerSnapshot::observe(
+                    "closed",
+                    Some("completed"),
+                    Some(&ObservedPullRequest {
+                        merged: true,
+                        base_is_default: true,
+                        approved: true,
+                        closed_unmerged: false,
+                    }),
+                ),
+            )
             .await
             .unwrap();
+        let mut quota = RoutingTickQuota::new(10);
+        tick_route_tasks(
+            &backend,
+            &task_manager,
+            &mut router,
+            &store,
+            "owner/repo",
+            &mut quota,
+        )
+        .await
+        .unwrap();
         let routed = store.get(b).await.unwrap();
         assert_eq!(routed.status, TaskStatus::Routed);
         assert!(routed.agent.is_some());
+    }
+
+    #[tokio::test]
+    async fn round_robin_route_returns_waiting_on_dependency() {
+        use crate::engine::router::{Router, RouterConfig};
+        use crate::engine::tasks::store_task_to_external;
+
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let b = insert(&store, "owner/repo", "2", "B", "").await;
+        store
+            .replace_dependencies(
+                b,
+                &[NewDependency {
+                    repo: "owner/repo".into(),
+                    number: 1,
+                    source: DepSource::Github,
+                }],
+            )
+            .await
+            .unwrap();
+        let ext = store_task_to_external(&store.get(b).await.unwrap());
+        let mut tier = HashMap::new();
+        tier.insert("claude".to_string(), vec!["haiku".to_string()]);
+        let mut model_map = HashMap::new();
+        model_map.insert("medium".into(), tier);
+        let config = RouterConfig {
+            mode: "round_robin".into(),
+            agents: vec!["claude".into()],
+            model_map,
+            ..Default::default()
+        };
+        let mut router = Router::new_for_test(config, vec!["claude".into()]);
+        let err = router.route(&ext, &store, "owner/repo").await.unwrap_err();
+        assert!(err
+            .downcast_ref::<crate::store::WaitingOnDependency>()
+            .is_some());
+        assert_eq!(store.get(b).await.unwrap().status, TaskStatus::Waiting);
+        assert_eq!(store.get(b).await.unwrap().route_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_holds_until_the_pr_is_approved_and_merged_into_the_default_branch() {
+        use crate::backends::PullRequestCompletion;
+
+        let store = TaskStore::open_memory().await.unwrap();
+        let a = insert(&store, "owner/repo", "1", "A", "").await;
+        let b = insert(&store, "owner/repo", "2", "B", "").await;
+        store
+            .set_fields(a, &[("pr_number", serde_json::json!(10))])
+            .await
+            .unwrap();
+        store
+            .replace_dependencies(
+                b,
+                &[NewDependency {
+                    repo: "owner/repo".into(),
+                    number: 1,
+                    source: DepSource::Github,
+                }],
+            )
+            .await
+            .unwrap();
+        let backend = ScriptedBackend::new(HashMap::new());
+        backend
+            .close_state
+            .lock()
+            .unwrap()
+            .insert(1, ("closed".into(), Some("completed".into())));
+
+        let open_pr = PullRequestCompletion {
+            merged: false,
+            base_ref: "main".into(),
+            default_branch: "main".into(),
+            approved: false,
+            closed: false,
+        };
+        backend.pulls.lock().unwrap().insert(10, Some(open_pr));
+        refresh_blocker_snapshots(&backend, &store).await.unwrap();
+        assert!(store.block_claim_if_waiting(b).await.unwrap().is_some());
+
+        backend.pulls.lock().unwrap().insert(
+            10,
+            Some(PullRequestCompletion {
+                merged: false,
+                base_ref: "main".into(),
+                default_branch: "main".into(),
+                approved: true,
+                closed: false,
+            }),
+        );
+        refresh_blocker_snapshots(&backend, &store).await.unwrap();
+        assert!(store.block_claim_if_waiting(b).await.unwrap().is_some());
+
+        backend.pulls.lock().unwrap().insert(
+            10,
+            Some(PullRequestCompletion {
+                merged: true,
+                base_ref: "feature".into(),
+                default_branch: "main".into(),
+                approved: true,
+                closed: true,
+            }),
+        );
+        refresh_blocker_snapshots(&backend, &store).await.unwrap();
+        assert!(store.block_claim_if_waiting(b).await.unwrap().is_some());
+
+        backend.pulls.lock().unwrap().insert(
+            10,
+            Some(PullRequestCompletion {
+                merged: false,
+                base_ref: "main".into(),
+                default_branch: "main".into(),
+                approved: true,
+                closed: true,
+            }),
+        );
+        refresh_blocker_snapshots(&backend, &store).await.unwrap();
+        assert!(store.block_claim_if_waiting(b).await.unwrap().is_some());
+
+        backend.pulls.lock().unwrap().insert(
+            10,
+            Some(PullRequestCompletion {
+                merged: true,
+                base_ref: "main".into(),
+                default_branch: "main".into(),
+                approved: true,
+                closed: true,
+            }),
+        );
+        refresh_blocker_snapshots(&backend, &store).await.unwrap();
+        assert_eq!(store.block_claim_if_waiting(b).await.unwrap(), None);
+        assert_eq!(store.get(b).await.unwrap().status, TaskStatus::New);
+    }
+
+    #[test]
+    fn depends_on_token_accepts_a_bare_number_and_a_cross_repo_ref() {
+        assert_eq!(
+            parse_depends_on_token("12", "acme/app"),
+            Some(DepRef {
+                repo: "acme/app".into(),
+                number: 12
+            })
+        );
+        assert_eq!(
+            parse_depends_on_token("owner/repo#12", "acme/app"),
+            Some(DepRef {
+                repo: "owner/repo".into(),
+                number: 12
+            })
+        );
     }
 
     #[tokio::test]
@@ -982,12 +1424,13 @@ See #4 in the notes
         let right_store = store.clone();
         let left_task = ext.clone();
         let right_task = ext;
+        let right_config = config.clone();
         let left = tokio::spawn(async move {
-            let mut router = Router::new_for_test(config.clone(), vec!["claude".into()]);
+            let mut router = Router::new_for_test(config, vec!["claude".into()]);
             router.route(&left_task, &left_store, "owner/repo").await
         });
         let right = tokio::spawn(async move {
-            let mut router = Router::new_for_test(config, vec!["claude".into()]);
+            let mut router = Router::new_for_test(right_config, vec!["claude".into()]);
             router.route(&right_task, &right_store, "owner/repo").await
         });
         assert!(left.await.unwrap().is_err());

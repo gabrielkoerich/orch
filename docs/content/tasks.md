@@ -33,17 +33,33 @@ Key fields:
 
 ```
 new → routed → in_progress → needs_review → in_review → done (merged)
-                            → done (no PR)
-                            → blocked
+  ↑                         → done (no PR)
+  │                         → blocked
+waiting
 ```
 
 - **new** — task created (via `task add`, `gh pull`, or `jobs tick`)
+- **waiting** — at least one dependency is still open. The router, the dispatcher, `orch task route`, `orch task run`, and `orch task retry` leave the task alone. `orch task unblock all` does not select it. When the last dependency is done, the next tick moves it back to `new`
 - **routed** — LLM router assigned agent, model, profile, skills
 - **in_progress** — agent is running
 - **done** — PR merged (or agent completed with no code changes)
 - **in_review** — review agent is actively running on the PR
 - **blocked** — agent hit a blocker or crashed and requires human intervention (rare)
 - **needs_review** — agent needs human help, or review agent requested changes. After repeated failures the engine moves tasks to `needs_review` and removes any forced `agent:*` label so an owner can reassign.
+
+## Dependencies
+
+A task can wait on other issues. GitHub blocked-by links are the source of truth. When that API is missing, orch reads `Depends on #12`, `Blocked by #12, #13`, and `owner/repo#12` from the issue body.
+
+A dependency is done only when the blocking pull request is approved and merged into the default branch. An issue with no pull request is done when it is closed as completed. A local `done` row, an approved pull request that is still open, a merge into another branch, a pull request closed without merge, and an issue closed as not planned do not count.
+
+`orch task add "title" --depends-on 12 --depends-on owner/other#4` creates the issue and writes the native links. `orch task deps <id>` lists both directions. `orch task tree --deps` shows blocked-by edges. `orch task list`, `get`, and `inspect` print the open blocker numbers on a waiting task.
+
+A cycle runs no task in the cycle. Orch comments on each issue in the cycle once. If a blocker is blocked, or its issue closes as not planned, the waiting task stays waiting. Orch comments once and sends one notification.
+
+Parent and child tasks are a different link. A parent waits for its children. A dependency says this task does not start until the other task's pull request is merged. The two are stored separately.
+
+When a dependency's pull request merges, the waiting task's next worktree is created from the updated default branch.
 
 ## Delegation
 

@@ -1,12 +1,15 @@
 //! Issue dependency rows and the claim gate that keeps a waiting task from starting.
 //!
-//! A dependency is satisfied when the blocking task is `done`, or its issue is
-//! closed as completed. `not_planned` and `duplicate` are not done. `blocked`
-//! is not done. Only `new` and `routed` are moved to `waiting`. Other statuses
-//! stay where they are.
+//! A dependency is done when its blocker snapshot says the blocking pull request
+//! was approved and merged into the default branch, or the issue has no pull
+//! request and was closed as completed. A local `done` row is not enough.
+//! `not_planned` and `duplicate` are not done. `new`, `routed`, `waiting`,
+//! `blocked`, and `needs_review` move to `waiting` while a dependency is open.
+//! `in_progress` and `in_review` stay where they are.
 
 use super::{TaskStatus, TaskStore};
 use anyhow::Context;
+use sqlx::Row;
 use sqlx::SqliteConnection;
 use std::collections::HashMap;
 
@@ -86,7 +89,89 @@ pub struct DepEdge {
 struct BlockerView {
     label: String,
     satisfied: bool,
-    failure: Option<&'static str>,
+}
+
+/// Pull request fields the engine observed on GitHub.
+///
+/// The store does not talk to GitHub. The engine fills this and the snapshot
+/// decides whether the blocker is done
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ObservedPullRequest {
+    pub merged: bool,
+    pub base_is_default: bool,
+    pub approved: bool,
+    pub closed_unmerged: bool,
+}
+
+/// What orch last read about one blocking issue.
+///
+/// Missing JSON fails closed: the dependency stays open
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BlockerSnapshot {
+    pub issue_state: String,
+    pub state_reason: Option<String>,
+    pub has_pr: bool,
+    pub pr_merged: bool,
+    pub pr_merged_into_default: bool,
+    pub pr_approved: bool,
+    pub pr_closed: bool,
+}
+
+impl BlockerSnapshot {
+    pub fn observe(
+        issue_state: &str,
+        state_reason: Option<&str>,
+        pr: Option<&ObservedPullRequest>,
+    ) -> Self {
+        let normalized = normalize_close_reason(issue_state, state_reason);
+        let (has_pr, merged, into_default, approved, pr_closed) = match pr {
+            Some(pr) => (
+                true,
+                pr.merged,
+                pr.base_is_default,
+                pr.approved,
+                pr.closed_unmerged,
+            ),
+            None => (false, false, false, false, false),
+        };
+        Self {
+            issue_state: if issue_state.eq_ignore_ascii_case("closed") {
+                "closed".to_string()
+            } else {
+                "open".to_string()
+            },
+            state_reason: Some(normalized.to_string()),
+            has_pr,
+            pr_merged: merged,
+            pr_merged_into_default: into_default,
+            pr_approved: approved,
+            pr_closed,
+        }
+    }
+
+    /// Record a new issue state without clearing pull request fields.
+    ///
+    /// A later issue sync must not wipe a snapshot that already knows the PR
+    pub fn note_issue_state(&mut self, issue_state: &str, state_reason: Option<&str>) {
+        let normalized = normalize_close_reason(issue_state, state_reason);
+        self.issue_state = if issue_state.eq_ignore_ascii_case("closed") {
+            "closed".to_string()
+        } else {
+            "open".to_string()
+        };
+        self.state_reason = Some(normalized.to_string());
+    }
+
+    pub fn is_satisfied(&self) -> bool {
+        let reason = self.state_reason.as_deref().unwrap_or("");
+        if reason == "not_planned" || reason == "duplicate" {
+            return false;
+        }
+        if self.has_pr {
+            return self.pr_merged && self.pr_merged_into_default && self.pr_approved;
+        }
+        self.issue_state == "closed" && (reason.is_empty() || reason == "completed")
+    }
 }
 
 /// Map a GitHub issue `state` and `state_reason` onto the values stored in KV.
@@ -96,7 +181,12 @@ pub fn normalize_close_reason(state: &str, state_reason: Option<&str>) -> &'stat
     if !state.eq_ignore_ascii_case("closed") {
         return "open";
     }
-    match state_reason.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+    match state_reason
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "not_planned" => "not_planned",
         "duplicate" => "duplicate",
         "reopened" => "open",
@@ -104,8 +194,12 @@ pub fn normalize_close_reason(state: &str, state_reason: Option<&str>) -> &'stat
     }
 }
 
-pub fn close_reason_key(repo: &str, number: i64) -> String {
-    format!("issue_close_reason:{repo}#{number}")
+pub fn blocker_snapshot_key(repo: &str, number: i64) -> String {
+    format!("dep_blocker:{repo}#{number}")
+}
+
+pub fn worktree_refresh_key(task_id: i64) -> String {
+    format!("dep_worktree_refresh:{task_id}")
 }
 
 pub fn dep_label(task_repo: &str, dep_repo: &str, number: i64) -> String {
@@ -116,28 +210,23 @@ pub fn dep_label(task_repo: &str, dep_repo: &str, number: i64) -> String {
     }
 }
 
-/// `not_planned` and `duplicate` are never done. A completed close is done even
-/// when orch has no task row. A `done` task is done unless the close reason says otherwise
-pub fn blocker_is_satisfied(task_status: Option<&str>, close_reason: Option<&str>) -> bool {
-    let reason = close_reason.unwrap_or("");
-    if reason == "not_planned" || reason == "duplicate" {
-        return false;
-    }
-    if reason == "completed" {
-        return true;
-    }
-    task_status == Some("done")
+/// A missing snapshot is not done. Local task status is not an input
+pub fn blocker_is_satisfied(snapshot: Option<&BlockerSnapshot>) -> bool {
+    snapshot.is_some_and(BlockerSnapshot::is_satisfied)
 }
 
-/// `not_planned` and a `blocked` task each get one notice. `duplicate` does not
+/// `not_planned` and a still-open `blocked` task each get one notice.
+///
+/// `duplicate` does not. No snapshot means no notice
 pub fn blocker_failure_kind(
     task_status: Option<&str>,
-    close_reason: Option<&str>,
+    snapshot: Option<&BlockerSnapshot>,
 ) -> Option<&'static str> {
-    if close_reason == Some("not_planned") {
+    let snap = snapshot?;
+    if snap.state_reason.as_deref() == Some("not_planned") {
         return Some("not_planned");
     }
-    if task_status == Some("blocked") && !blocker_is_satisfied(task_status, close_reason) {
+    if task_status == Some("blocked") && !snap.is_satisfied() {
         return Some("blocked");
     }
     None
@@ -240,7 +329,11 @@ impl TaskStore {
         Ok(out)
     }
 
-    pub async fn list_dependents(&self, repo: &str, number: i64) -> anyhow::Result<Vec<TaskDependency>> {
+    pub async fn list_dependents(
+        &self,
+        repo: &str,
+        number: i64,
+    ) -> anyhow::Result<Vec<TaskDependency>> {
         let rows = sqlx::query(
             "SELECT d.task_id, d.depends_on_task_id, d.depends_on_repo, d.depends_on_number, d.source,
                     t.status AS blocker_status
@@ -313,21 +406,6 @@ impl TaskStore {
         Ok(out)
     }
 
-    pub async fn close_reasons(&self) -> anyhow::Result<HashMap<String, String>> {
-        let rows = sqlx::query(
-            "SELECT key, value FROM kv WHERE key LIKE 'issue_close_reason:%'",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        let mut out = HashMap::new();
-        for row in rows {
-            let key: String = row.try_get("key")?;
-            let value: String = row.try_get("value")?;
-            out.insert(key, value);
-        }
-        Ok(out)
-    }
-
     /// Labels of unmet blockers, keyed by the waiting task id.
     pub async fn unmet_labels_by_task(&self) -> anyhow::Result<HashMap<i64, Vec<String>>> {
         let mut conn = self.pool.acquire().await?;
@@ -374,21 +452,61 @@ impl TaskStore {
             .collect())
     }
 
+    pub async fn save_blocker_snapshot(
+        &self,
+        repo: &str,
+        number: i64,
+        snap: &BlockerSnapshot,
+    ) -> anyhow::Result<()> {
+        let raw = serde_json::to_string(snap).context("encode blocker snapshot")?;
+        self.kv_set(&blocker_snapshot_key(repo, number), &raw).await
+    }
+
+    pub async fn blocker_snapshot(
+        &self,
+        repo: &str,
+        number: i64,
+    ) -> anyhow::Result<Option<BlockerSnapshot>> {
+        let Some(raw) = self.kv_get(&blocker_snapshot_key(repo, number)).await? else {
+            return Ok(None);
+        };
+        Ok(serde_json::from_str(&raw).ok())
+    }
+
+    /// Merge an issue state into the stored snapshot. Pull request fields stay.
+    pub async fn note_blocker_issue_state(
+        &self,
+        repo: &str,
+        number: i64,
+        state: &str,
+        reason: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let mut snap = match self.blocker_snapshot(repo, number).await? {
+            Some(existing) => existing,
+            None => BlockerSnapshot::observe(state, reason, None),
+        };
+        snap.note_issue_state(state, reason);
+        self.save_blocker_snapshot(repo, number, &snap).await
+    }
+
     /// Hold the task when a dependency is open.
     ///
     /// `None` means the task may be claimed. `Some` means it is waiting, and the
     /// vec is the blocking issue labels. The check and the status write share one
     /// immediate transaction, so two ticks cannot both route the same waiting task.
-    /// Statuses other than `new`, `routed`, and `waiting` are not rewritten
+    /// `in_progress` and `in_review` are not rewritten
     pub async fn block_claim_if_waiting(
         &self,
         task_id: i64,
     ) -> anyhow::Result<Option<Vec<String>>> {
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
+        let mut tx = self.pool.begin().await.context("begin dependency claim")?;
+        // sqlx 0.8.1 starts a deferred transaction. This write takes the reserved
+        // lock before the read, so a second claim waits and then sees this one
+        sqlx::query("UPDATE tasks SET updated_at = updated_at WHERE id = ?")
+            .bind(task_id)
+            .execute(&mut *tx)
             .await
-            .context("begin dependency claim")?;
+            .context("lock task for dependency claim")?;
         let row = sqlx::query("SELECT status, agent, model, repo FROM tasks WHERE id = ?")
             .bind(task_id)
             .fetch_optional(&mut *tx)
@@ -408,16 +526,28 @@ impl TaskStore {
             .map(|view| view.label.clone())
             .collect();
 
-        let schedulable = matches!(status.as_str(), "new" | "routed" | "waiting");
+        let holdable = matches!(
+            status.as_str(),
+            "new" | "routed" | "waiting" | "blocked" | "needs_review"
+        );
         if unmet.is_empty() {
             if status == "waiting" {
                 sqlx::query(
                     "UPDATE tasks
-                     SET status = 'new', block_reason = NULL,
+                     SET status = 'new', block_reason = NULL, branch = '', worktree = '',
                          updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
                      WHERE id = ?",
                 )
                 .bind(task_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO kv (key, value, updated_at)
+                     VALUES (?, '1', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                     ON CONFLICT(key) DO UPDATE
+                       SET value = excluded.value, updated_at = excluded.updated_at",
+                )
+                .bind(worktree_refresh_key(task_id))
                 .execute(&mut *tx)
                 .await?;
                 Self::append_activity_tx(
@@ -436,7 +566,7 @@ impl TaskStore {
             return Ok(None);
         }
 
-        if schedulable && status != "waiting" {
+        if holdable && status != "waiting" {
             sqlx::query(
                 "UPDATE tasks
                  SET status = 'waiting', branch = '', worktree = '', block_reason = NULL,
@@ -489,25 +619,15 @@ async fn load_blockers(
     for row in rows {
         let dep_repo: String = row.try_get("depends_on_repo")?;
         let number: i64 = row.try_get("depends_on_number")?;
-        let status: Option<String> = sqlx::query(
-            "SELECT status FROM tasks WHERE repo = ? AND external_id = ?",
-        )
-        .bind(&dep_repo)
-        .bind(number.to_string())
-        .fetch_optional(&mut *conn)
-        .await?
-        .and_then(|found| found.try_get("status").ok());
-        let reason: Option<String> = sqlx::query("SELECT value FROM kv WHERE key = ?")
-            .bind(close_reason_key(&dep_repo, number))
+        let raw: Option<String> = sqlx::query("SELECT value FROM kv WHERE key = ?")
+            .bind(blocker_snapshot_key(&dep_repo, number))
             .fetch_optional(&mut *conn)
             .await?
             .and_then(|found| found.try_get("value").ok());
-        let status_ref = status.as_deref();
-        let reason_ref = reason.as_deref();
+        let snap = raw.and_then(|text| serde_json::from_str::<BlockerSnapshot>(&text).ok());
         views.push(BlockerView {
             label: dep_label(task_repo, &dep_repo, number),
-            satisfied: blocker_is_satisfied(status_ref, reason_ref),
-            failure: blocker_failure_kind(status_ref, reason_ref),
+            satisfied: snap.as_ref().is_some_and(BlockerSnapshot::is_satisfied),
         });
     }
     Ok(views)
@@ -537,11 +657,34 @@ mod tests {
             .unwrap()
     }
 
+    fn approved_merge(into_default: bool) -> BlockerSnapshot {
+        BlockerSnapshot::observe(
+            "closed",
+            Some("completed"),
+            Some(&ObservedPullRequest {
+                merged: true,
+                base_is_default: into_default,
+                approved: true,
+                closed_unmerged: false,
+            }),
+        )
+    }
+
     #[tokio::test]
-    async fn unmet_dependency_demotes_new_and_promotes_when_done() {
+    async fn unmet_dependency_demotes_new_and_promotes_when_the_pr_is_done() {
         let store = TaskStore::open_memory().await.unwrap();
         let a = task(&store, "owner/repo", "1", "A").await;
         let b = task(&store, "owner/repo", "2", "B").await;
+        store
+            .set_fields(
+                b,
+                &[
+                    ("branch", serde_json::json!("old-branch")),
+                    ("worktree", serde_json::json!("/tmp/old")),
+                ],
+            )
+            .await
+            .unwrap();
         store
             .replace_dependencies(
                 b,
@@ -559,19 +702,39 @@ mod tests {
         assert_eq!(store.get(b).await.unwrap().status, TaskStatus::Waiting);
 
         store.update_status(a, TaskStatus::Done).await.unwrap();
+        assert!(store.block_claim_if_waiting(b).await.unwrap().is_some());
+        assert_eq!(store.get(b).await.unwrap().status, TaskStatus::Waiting);
+
+        store
+            .save_blocker_snapshot("owner/repo", 1, &approved_merge(true))
+            .await
+            .unwrap();
         let released = store.block_claim_if_waiting(b).await.unwrap();
         assert_eq!(released, None);
-        assert_eq!(store.get(b).await.unwrap().status, TaskStatus::New);
+        let task = store.get(b).await.unwrap();
+        assert_eq!(task.status, TaskStatus::New);
+        assert!(task.branch.is_empty());
+        assert!(task.worktree.is_empty());
+        assert_eq!(
+            store
+                .kv_get(&worktree_refresh_key(b))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
     }
 
     #[tokio::test]
-    async fn not_planned_beats_done_and_completed_satisfies_untracked() {
+    async fn not_planned_beats_a_merged_pr_and_a_completed_issue_with_no_pr_is_done() {
         let store = TaskStore::open_memory().await.unwrap();
         let a = task(&store, "owner/repo", "1", "A").await;
         let b = task(&store, "owner/repo", "2", "B").await;
         store.update_status(a, TaskStatus::Done).await.unwrap();
+        let mut not_planned = approved_merge(true);
+        not_planned.state_reason = Some("not_planned".to_string());
         store
-            .kv_set(&close_reason_key("owner/repo", 1), "not_planned")
+            .save_blocker_snapshot("owner/repo", 1, &not_planned)
             .await
             .unwrap();
         store
@@ -589,7 +752,11 @@ mod tests {
 
         let c = task(&store, "owner/repo", "3", "C").await;
         store
-            .kv_set(&close_reason_key("other/repo", 9), "completed")
+            .save_blocker_snapshot(
+                "other/repo",
+                9,
+                &BlockerSnapshot::observe("closed", Some("completed"), None),
+            )
             .await
             .unwrap();
         store
@@ -604,6 +771,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.block_claim_if_waiting(c).await.unwrap(), None);
+    }
+
+    #[test]
+    fn pull_request_completion_cases() {
+        let open = BlockerSnapshot::observe("open", None, None);
+        assert!(!open.is_satisfied());
+
+        let pr_open = BlockerSnapshot::observe(
+            "open",
+            None,
+            Some(&ObservedPullRequest {
+                merged: false,
+                base_is_default: true,
+                approved: false,
+                closed_unmerged: false,
+            }),
+        );
+        assert!(!pr_open.is_satisfied());
+
+        let approved_open = BlockerSnapshot::observe(
+            "open",
+            None,
+            Some(&ObservedPullRequest {
+                merged: false,
+                base_is_default: true,
+                approved: true,
+                closed_unmerged: false,
+            }),
+        );
+        assert!(!approved_open.is_satisfied());
+
+        assert!(approved_merge(true).is_satisfied());
+        assert!(!approved_merge(false).is_satisfied());
+
+        let closed_unmerged = BlockerSnapshot::observe(
+            "closed",
+            Some("completed"),
+            Some(&ObservedPullRequest {
+                merged: false,
+                base_is_default: true,
+                approved: true,
+                closed_unmerged: true,
+            }),
+        );
+        assert!(!closed_unmerged.is_satisfied());
+
+        let merged_unapproved = BlockerSnapshot::observe(
+            "closed",
+            Some("completed"),
+            Some(&ObservedPullRequest {
+                merged: true,
+                base_is_default: true,
+                approved: false,
+                closed_unmerged: false,
+            }),
+        );
+        assert!(!merged_unapproved.is_satisfied());
+
+        assert!(BlockerSnapshot::observe("closed", None, None).is_satisfied());
+        assert!(BlockerSnapshot::observe("closed", Some("completed"), None).is_satisfied());
+        assert!(!BlockerSnapshot::observe("closed", Some("not_planned"), None).is_satisfied());
+        assert!(!BlockerSnapshot::observe("closed", Some("duplicate"), None).is_satisfied());
     }
 
     #[tokio::test]
@@ -631,11 +860,16 @@ mod tests {
         assert_eq!(store.get(b).await.unwrap().status, TaskStatus::InProgress);
 
         store
-            .kv_set(&close_reason_key("owner/repo", 1), "duplicate")
+            .save_blocker_snapshot(
+                "owner/repo",
+                1,
+                &BlockerSnapshot::observe("closed", Some("duplicate"), None),
+            )
             .await
             .unwrap();
         store.update_status(a, TaskStatus::Done).await.unwrap();
         assert!(store.block_claim_if_waiting(b).await.unwrap().is_some());
+        assert_eq!(store.get(b).await.unwrap().status, TaskStatus::InProgress);
     }
 
     #[tokio::test]
@@ -681,10 +915,7 @@ mod tests {
             )
             .await
             .unwrap();
-        store
-            .block_claim_if_waiting(b)
-            .await
-            .unwrap();
+        store.block_claim_if_waiting(b).await.unwrap();
         let blocked = store
             .list_by_status("owner/repo", TaskStatus::Blocked)
             .await
@@ -779,8 +1010,10 @@ mod tests {
             .unwrap();
         let sql = std::fs::read_to_string(dir.join("028_task_dependencies.sql")).unwrap();
         sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
-        let (id, title): (i64, String) =
-            sqlx::query_as("SELECT id, title FROM tasks").fetch_one(&pool).await.unwrap();
+        let (id, title): (i64, String) = sqlx::query_as("SELECT id, title FROM tasks")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(title, "existing");
         sqlx::query(
             "INSERT INTO task_dependencies (task_id, depends_on_repo, depends_on_number, source)

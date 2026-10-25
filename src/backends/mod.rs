@@ -97,6 +97,19 @@ pub struct BlockedByIssue {
     pub state_reason: Option<String>,
 }
 
+/// Merge and review state of one pull request, read from GitHub.
+///
+/// `approved` is the latest substantive review, `APPROVED` or
+/// `CHANGES_REQUESTED`. A comment or a dismissed review does not count
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestCompletion {
+    pub merged: bool,
+    pub base_ref: String,
+    pub default_branch: String,
+    pub approved: bool,
+    pub closed: bool,
+}
+
 /// Result of reading native blocked-by links.
 ///
 /// `Native` is authoritative, including when the list is empty.
@@ -496,6 +509,31 @@ pub trait ExternalBackend: Send + Sync {
         body: &str,
     ) -> anyhow::Result<()> {
         self.post_comment(id, body).await
+    }
+
+    /// Review and merge state of pull request `pr_number` in `repo`.
+    ///
+    /// `Ok(None)` means the pull request does not exist. Callers that already
+    /// know a PR number treat that as not merged
+    async fn pull_request_completion(
+        &self,
+        _repo: &str,
+        _pr_number: i64,
+    ) -> anyhow::Result<Option<PullRequestCompletion>> {
+        Ok(None)
+    }
+
+    /// Record that `issue_number` in this backend's repo is blocked by another issue.
+    ///
+    /// The blocking issue is named by repository and number. The write uses that
+    /// issue's database id, which is valid across repositories
+    async fn add_dependency(
+        &self,
+        _issue_number: i64,
+        _blocking_repo: &str,
+        _blocking_number: i64,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("this backend cannot write issue dependencies")
     }
 }
 

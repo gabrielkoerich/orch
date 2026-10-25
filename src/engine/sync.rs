@@ -3331,6 +3331,24 @@ pub(crate) async fn ingest_external_tasks(
 
         match store.ensure_external_task(repo, task).await {
             Ok(store_id) => {
+                if let Ok(number) = task.id.0.parse::<i64>() {
+                    if let Err(err) = crate::engine::dependencies::sync_issue_dependencies(
+                        backend.as_ref(),
+                        store,
+                        store_id,
+                        repo,
+                        Some(number),
+                        &task.body,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            task_id = task.id.0,
+                            err = %err,
+                            "ingest: dependency sync failed"
+                        );
+                    }
+                }
                 if let Some(s) = status {
                     id_status_pairs.push((store_id, *s));
                 }

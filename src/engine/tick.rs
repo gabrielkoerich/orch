@@ -1592,6 +1592,9 @@ pub(crate) async fn tick_route_tasks(
     routing_quota: &mut RoutingTickQuota,
 ) -> anyhow::Result<()> {
     let _span = tracing::info_span!("engine.tick.phase3a.route").entered();
+    if let Err(err) = crate::engine::dependencies::apply_claim_gates(store).await {
+        tracing::warn!(err = %err, "dependency claim gate failed");
+    }
     if routing_quota.is_exhausted() {
         tracing::debug!("routing quota exhausted for this tick — skipping repo routing phase");
         return Ok(());
@@ -1806,6 +1809,14 @@ pub(crate) async fn tick_route_tasks(
                     );
                     continue;
                 }
+                if let Some(waiting) = e.downcast_ref::<crate::store::WaitingOnDependency>() {
+                    tracing::info!(
+                        task_id = %task.id.0,
+                        blockers = %waiting.blockers.join(", "),
+                        "task is waiting on a dependency"
+                    );
+                    continue;
+                }
                 tracing::error!(task_id = task.id.0, ?e, "routing failed, skipping task");
             }
         }
@@ -1925,6 +1936,15 @@ pub(crate) async fn route_new_tasks_global(
                         scope = %cooled.scope(),
                         remaining_secs = ?cooled.remaining_secs(),
                         "global sweep: ALL AGENTS COOLED — task stays in 'new'"
+                    );
+                    continue;
+                }
+                if let Some(waiting) = e.downcast_ref::<crate::store::WaitingOnDependency>() {
+                    tracing::info!(
+                        task_id = %ext_task.id.0,
+                        repo = %task.repo,
+                        blockers = %waiting.blockers.join(", "),
+                        "global sweep: task is waiting on a dependency"
                     );
                     continue;
                 }
@@ -2053,6 +2073,9 @@ async fn dispatch_tasks_for_repo(
     };
 
     for (idx, task) in dispatchable.into_iter().enumerate() {
+        if crate::engine::dependencies::dispatch_is_waiting(store, repo, &task.id.0).await {
+            continue;
+        }
         // In degraded mode, add delay between dispatches to pace the system
         if idx > 0 && dispatch_mode.is_degraded {
             let delay_ms = sequential_delay;
@@ -2731,6 +2754,15 @@ pub(crate) async fn tick(
         auto_merge_in_flight,
     )
     .await?;
+    if let Err(err) = crate::engine::dependencies::reconcile_dependencies(
+        backend.as_ref(),
+        store,
+        transport.map(|arc| arc.as_ref()),
+    )
+    .await
+    {
+        tracing::warn!(err = %err, "dependency reconcile failed");
+    }
     tick_route_tasks(backend, task_manager, router, store, repo, routing_quota).await?;
     // Global routing sweep for tasks from inactive or removed repos.
     // tick_route_tasks is scoped to the active repo; tasks from projects no longer
@@ -4482,6 +4514,94 @@ mod tests {
             dispatching.is_empty(),
             "dispatch guard must be released when skipping a stale-cooldown task"
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_skips_a_task_with_an_open_dependency() {
+        use crate::store::{
+            DepSource, NewDependency, StoreRoute, TaskStatus as DbStatus, UpsertExternal,
+        };
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let mock = MockBackend::new();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(TmuxManager::new());
+        let runner = Arc::new(TaskRunner::new("owner/repo".to_string()));
+        let semaphore = Arc::new(Semaphore::new(4));
+        let (weight_tx, _weight_rx) = mpsc::channel(16);
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+        let transport = Arc::new(Transport::new());
+        let capture = Arc::new(CaptureService::new(transport));
+
+        let id = store
+            .upsert_external(&UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "42",
+                title: "Waiting routed task",
+                body: "",
+                author: "user",
+                url: "https://github.com/owner/repo/issues/42",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .replace_dependencies(
+                id,
+                &[NewDependency {
+                    repo: "owner/repo".into(),
+                    number: 7,
+                    source: DepSource::Github,
+                }],
+            )
+            .await
+            .unwrap();
+        store
+            .store_route(&StoreRoute {
+                id,
+                agent: "claude",
+                model: Some("haiku"),
+                complexity: "simple",
+                estimate: 0,
+                reason: "test",
+                profile: "{}",
+                skills: "[]",
+            })
+            .await
+            .unwrap();
+        store.update_status(id, DbStatus::Routed).await.unwrap();
+
+        let dispatch_mode = DispatchMode {
+            is_degraded: false,
+            healthy_agents: 1,
+            threshold: 1,
+        };
+        tick_dispatch_tasks(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &runner,
+            &capture,
+            &semaphore,
+            &task_manager,
+            &weight_tx,
+            dispatch_mode,
+            &dispatching,
+            &store,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.status, DbStatus::Waiting);
+        assert!(dispatching.is_empty());
     }
 
     /// Regression test for the completed-session -> stuck-task reclaim race.

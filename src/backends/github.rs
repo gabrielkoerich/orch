@@ -739,12 +739,153 @@ impl ExternalBackend for GitHubBackend {
             .add_comment_reaction(&self.repo, comment_id, "eyes")
             .await
     }
+
+    async fn blocked_by(
+        &self,
+        repo: &str,
+        issue_number: i64,
+    ) -> anyhow::Result<crate::backends::BlockedByFetch> {
+        if issue_number <= 0 {
+            return Ok(crate::backends::BlockedByFetch::Unavailable);
+        }
+        self.gh.list_blocked_by(repo, issue_number as u64).await
+    }
+
+    async fn issue_close_state(
+        &self,
+        repo: &str,
+        issue_number: i64,
+    ) -> anyhow::Result<Option<(String, Option<String>)>> {
+        if issue_number <= 0 {
+            return Ok(None);
+        }
+        match self.gh.get_issue(repo, &issue_number.to_string()).await {
+            Ok(issue) => Ok(Some((issue.state, issue.state_reason))),
+            Err(err) if is_missing_issue(&err) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn post_comment_in_repo(
+        &self,
+        repo: &str,
+        id: &ExternalId,
+        body: &str,
+    ) -> anyhow::Result<()> {
+        if !is_github_issue_id(id) {
+            return Ok(());
+        }
+        self.gh.add_comment(repo, &id.0, body).await
+    }
+
+    async fn pull_request_completion(
+        &self,
+        repo: &str,
+        pr_number: i64,
+    ) -> anyhow::Result<Option<crate::backends::PullRequestCompletion>> {
+        if pr_number <= 0 {
+            return Ok(None);
+        }
+        let pr = match self.gh.get_pr(repo, pr_number as u64).await {
+            Ok(pr) => pr,
+            Err(err) if is_missing_issue(&err) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let default_branch = self.gh.get_default_branch(repo).await.unwrap_or_default();
+        let reviews = match self.gh.get_pr_reviews(repo, pr_number as u64).await {
+            Ok(reviews) => reviews,
+            Err(err) => {
+                tracing::warn!(repo, pr_number, err = %err, "pull request reviews unreadable");
+                Vec::new()
+            }
+        };
+        let merged = pr.merged.unwrap_or(false);
+        Ok(Some(crate::backends::PullRequestCompletion {
+            merged,
+            base_ref: pr.base.ref_,
+            default_branch,
+            approved: latest_review_approves(&reviews),
+            closed: pr.state.eq_ignore_ascii_case("closed"),
+        }))
+    }
+
+    async fn add_dependency(
+        &self,
+        issue_number: i64,
+        blocking_repo: &str,
+        blocking_number: i64,
+    ) -> anyhow::Result<()> {
+        let blocker = self
+            .gh
+            .get_issue(blocking_repo, &blocking_number.to_string())
+            .await?;
+        if blocker.id == 0 {
+            anyhow::bail!("blocking issue {blocking_repo}#{blocking_number} has no database id");
+        }
+        self.gh
+            .add_blocked_by(&self.repo, issue_number as u64, blocker.id as i64)
+            .await
+    }
+}
+
+fn is_missing_issue(err: &anyhow::Error) -> bool {
+    let text = err.to_string().to_ascii_lowercase();
+    text.contains("404") || text.contains("not found")
+}
+
+/// Latest substantive review wins. Comments and dismissed reviews are ignored.
+///
+/// `CHANGES_REQUESTED` after `APPROVED` means the pull request is not approved
+pub(crate) fn latest_review_approves(reviews: &[crate::github::types::GitHubReview]) -> bool {
+    let mut latest: Option<(&str, &str)> = None;
+    for review in reviews {
+        let state = review.state.as_str();
+        let substantive = state.eq_ignore_ascii_case("APPROVED")
+            || state.eq_ignore_ascii_case("CHANGES_REQUESTED");
+        if !substantive {
+            continue;
+        }
+        match latest {
+            Some((at, _)) if review.submitted_at.as_str() < at => {}
+            _ => latest = Some((review.submitted_at.as_str(), state)),
+        }
+    }
+    latest.is_some_and(|(_, state)| state.eq_ignore_ascii_case("APPROVED"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::types::{GitHubIssue, GitHubUser};
+    use crate::github::types::{GitHubIssue, GitHubReview, GitHubUser};
+
+    fn review(state: &str, at: &str) -> GitHubReview {
+        GitHubReview {
+            id: 1,
+            user: GitHubUser {
+                login: "owner".into(),
+            },
+            body: None,
+            state: state.into(),
+            html_url: None,
+            submitted_at: at.into(),
+            commit_id: None,
+        }
+    }
+
+    #[test]
+    fn later_changes_requested_clears_an_earlier_approval() {
+        let reviews = vec![
+            review("APPROVED", "2026-01-01T00:00:00Z"),
+            review("COMMENTED", "2026-01-02T00:00:00Z"),
+            review("CHANGES_REQUESTED", "2026-01-03T00:00:00Z"),
+        ];
+        assert!(!latest_review_approves(&reviews));
+        let approved = vec![
+            review("CHANGES_REQUESTED", "2026-01-01T00:00:00Z"),
+            review("APPROVED", "2026-01-02T00:00:00Z"),
+        ];
+        assert!(latest_review_approves(&approved));
+    }
 
     // --- is_github_issue_id guard ---
 
