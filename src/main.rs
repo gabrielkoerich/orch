@@ -912,6 +912,13 @@ enum ProjectAction {
         /// Path to the project directory
         path: String,
     },
+    /// Re-key stored tasks after a repository transfer or rename
+    Move {
+        /// Old slug (owner/repo)
+        old: String,
+        /// New slug (owner/repo)
+        new: String,
+    },
     /// List all registered projects
     List,
     /// GitHub Projects V2 board management
@@ -1362,6 +1369,10 @@ async fn async_main() -> anyhow::Result<()> {
             }
             ProjectAction::Remove { path } => {
                 cli::project_remove(&path)?;
+            }
+            ProjectAction::Move { old, new } => {
+                let n = cli::init_store().await?.move_repo(&old, &new).await?;
+                println!("Moved {n} task(s) from {old} to {new}");
             }
             ProjectAction::List => {
                 cli::project_list()?;
