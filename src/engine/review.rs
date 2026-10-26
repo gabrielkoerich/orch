@@ -259,6 +259,32 @@ async fn clear_approved_sha(store: &Arc<TaskStore>, repo: &str, task_id: &str, p
     }
 }
 
+/// Records the earlier approval as this review round's decision. Without it the stale
+/// in_review check sees a round with no decision and resets the task every minute
+async fn record_carried_approval(
+    store: &Arc<TaskStore>,
+    repo: &str,
+    task_id: &str,
+    pr_number: u64,
+) {
+    store_log_activity(
+        &Some(Arc::clone(store)),
+        repo,
+        task_id,
+        "review_decision",
+        None,
+        None,
+        None::<&str>,
+        None::<&str>,
+        Some(&serde_json::json!({
+            "decision": "approve",
+            "pr_number": pr_number,
+            "reason": "head_already_approved",
+        })),
+    )
+    .await;
+}
+
 /**
  * True when the PR's current head is the commit a previous review approved.
  *
@@ -438,6 +464,7 @@ async fn build_review_context(
                 pr_number,
                 "PR head already approved — skipping review, merge retry continues"
             );
+            record_carried_approval(store, repo, &task.id.0, pr_number).await;
             return Ok(ReviewPhase::EarlyReturn(ReviewDecision::Approve));
         }
     }
@@ -3274,6 +3301,32 @@ mod tests {
     /// An approval only carries over while the PR head is still the commit that was
     /// approved. A force-push from another clone moves the head, and reviewing again is
     /// the safe answer in every other case (#3783)
+    #[tokio::test]
+    async fn carried_approval_counts_as_this_rounds_decision() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let id = store
+            .create_internal("owner/repo", "Approved head", "", "test", "carried", None)
+            .await
+            .unwrap();
+        let task_id = format!("internal:{id}");
+        store
+            .update_status(id, crate::store::TaskStatus::InReview)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.in_review_entry(id).await.unwrap().map(|e| e.1),
+            Some(false)
+        );
+
+        record_carried_approval(&store, "owner/repo", &task_id, 7).await;
+
+        assert_eq!(
+            store.in_review_entry(id).await.unwrap().map(|e| e.1),
+            Some(true),
+            "the stale in_review check must see this round as decided"
+        );
+    }
+
     #[test]
     fn approval_covers_head_only_for_the_exact_commit() {
         assert!(approval_covers_head(Some("abc123"), Some("abc123")));
