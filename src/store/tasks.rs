@@ -636,6 +636,23 @@ impl TaskStore {
         Ok(())
     }
 
+    /// When the task last entered in_review, and whether a review decision was recorded since
+    pub async fn in_review_entry(&self, task_id: i64) -> anyhow::Result<Option<(String, bool)>> {
+        let row: Option<(String, bool)> = sqlx::query_as(
+            "SELECT a.timestamp, EXISTS (
+                 SELECT 1 FROM task_activity d
+                 WHERE d.task_id = a.task_id AND d.event_type = 'review_decision' AND d.id > a.id
+             )
+             FROM task_activity a
+             WHERE a.task_id = ? AND a.event_type = 'status_change' AND a.to_status = 'in_review'
+             ORDER BY a.id DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     /// Get task activity timeline in chronological order.
     pub async fn get_activity(
         &self,
