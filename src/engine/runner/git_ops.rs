@@ -2835,6 +2835,9 @@ mod tests {
         std::fs::create_dir_all(&bare).unwrap();
         sh_git(&bare, &["init", "--bare", "-b", "main"]);
         sh_git(temp.path(), &["clone", bare.to_str().unwrap(), "a"]);
+        // push_branch's own rebase commits, and CI runners have no global identity
+        sh_git(&a, &["config", "user.name", "T"]);
+        sh_git(&a, &["config", "user.email", "t@t"]);
         commit_file(&a, "base.txt");
         sh_git(&a, &["push", "origin", "main"]);
         sh_git(&a, &["checkout", "-b", "feat"]);
