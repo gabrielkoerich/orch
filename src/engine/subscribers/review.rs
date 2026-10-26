@@ -19,8 +19,10 @@ use tokio::sync::{RwLock, Semaphore};
 enum ReviewOutcome {
     Reset,
     RateLimited,
-    /// PR was approved but mergeability not yet computed — retry the merge
-    /// without resetting to NeedsReview (avoids spawning a redundant review agent).
+    /// The PR was approved but the merge did not land for a reason outside the
+    /// review (mergeability not computed yet, rate limit, transient GitHub error).
+    /// Keep the task in InReview so `review_open_prs` retries the merge, instead of
+    /// resetting to NeedsReview (which spawns a redundant review agent)
     RetryMerge,
     /// Re-route to the task agent (e.g. merge conflicts that need the agent to fix).
     Reroute,
@@ -540,13 +542,13 @@ pub fn spawn(
                                 }
                             }
                             ReviewOutcome::RetryMerge => {
-                                // PR was already approved; GitHub just hasn't computed
-                                // mergeability yet.  Keep the task in InReview and wait
-                                // for review_poll to retry the merge — do NOT reset to
+                                // The PR is already approved and the merge is the only
+                                // step left.  Keep the task in InReview and wait for
+                                // review_poll to retry the merge — do NOT reset to
                                 // NeedsReview, which would spawn a redundant review agent.
                                 tracing::info!(
                                     task_id = tid,
-                                    "mergeability pending — task stays in InReview, review_poll will retry merge"
+                                    "merge pending — task stays in InReview, review_poll will retry merge"
                                 );
                                 // Brief pause so the next review_poll cycle fires soon.
                                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -805,10 +807,7 @@ async fn classify_review_failure(
     // auto_merge.rs (which routes to the task agent). If a conflict error
     // leaks here, route to the task agent instead of resetting to NeedsReview
     // (which would re-spawn the review agent in a loop).
-    if lower_reason.contains("merge conflict")
-        || lower_reason.contains("not mergeable")
-        || lower_reason.contains("merge failed")
-    {
+    if lower_reason.contains("merge conflict") || lower_reason.contains("not mergeable") {
         tracing::warn!(
             task_id,
             reason,
@@ -822,6 +821,28 @@ async fn classify_review_failure(
             "merge_conflict",
             false,
             ReviewOutcome::Reroute,
+        )
+        .await;
+    }
+
+    // Any other merge failure on approved work (rate limit, 5xx, stale lease, a check
+    // still pending) is orch's problem, not the agent's. Keep the task in InReview so
+    // review_open_prs retries the merge once the cause clears, and never re-dispatch the
+    // agent — that burned attempts until the task blocked on work that was already done
+    if lower_reason.contains("merge failed") {
+        tracing::warn!(
+            task_id,
+            reason,
+            "{context} merge failed without a conflict — retrying the merge, not re-dispatching the agent"
+        );
+        return recorded(
+            store,
+            repo,
+            task_id,
+            reason,
+            "merge_retry",
+            true,
+            ReviewOutcome::RetryMerge,
         )
         .await;
     }
@@ -1107,6 +1128,71 @@ mod tests {
             task.review_agent_failures, 0,
             "truncated failures must not count toward review_agent_failures"
         );
+    }
+
+    /**
+     * After an approved review, a merge that fails for anything other than a content
+     * conflict must retry the merge with the task still in InReview. Re-dispatching the
+     * agent re-ran finished work until the task hit the attempt limit (#3783)
+     **/
+    #[tokio::test]
+    async fn classify_review_failure_non_conflict_merge_failure_retries_merge() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let repo = "owner/repo";
+        let store_id = store
+            .create_internal(repo, "Merge retry", "", "review", "review-3783", None)
+            .await
+            .unwrap();
+        let task_id = format!("internal:{store_id}");
+
+        let error_messages = [
+            "merge failed: GitHub REST API rate-limited, skipping call for 187s",
+            "merge failed: GitHub PR merge failed (502 Bad Gateway)",
+            "merge failed: required status check still pending",
+        ];
+
+        for _ in 0..(MAX_REVIEW_AGENT_FAILURES + 1) {
+            for msg in &error_messages {
+                let outcome =
+                    classify_review_failure(&store, repo, &task_id, msg, "review agent").await;
+                assert!(
+                    matches!(outcome, ReviewOutcome::RetryMerge),
+                    "non-conflict merge failure '{msg}' must retry the merge, not re-dispatch the agent"
+                );
+            }
+        }
+
+        let task = opt_store_get_task(&Some(store.clone()), repo, &task_id)
+            .await
+            .expect("task should exist");
+        assert_eq!(
+            task.review_agent_failures, 0,
+            "a stuck merge is not a review failure"
+        );
+    }
+
+    /// A genuine content conflict is the one merge failure the agent has to fix
+    #[tokio::test]
+    async fn classify_review_failure_merge_conflict_still_reroutes() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let repo = "owner/repo";
+        let store_id = store
+            .create_internal(repo, "Merge conflict", "", "review", "review-3783b", None)
+            .await
+            .unwrap();
+        let task_id = format!("internal:{store_id}");
+
+        for msg in [
+            "merge failed: PR is not mergeable",
+            "merge conflict detected on PR #12",
+        ] {
+            let outcome =
+                classify_review_failure(&store, repo, &task_id, msg, "review agent").await;
+            assert!(
+                matches!(outcome, ReviewOutcome::Reroute),
+                "content conflict '{msg}' must go back to the task agent"
+            );
+        }
     }
 
     /// Transient provider network errors (ConnectionRefused, timeouts) must be

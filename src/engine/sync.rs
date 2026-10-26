@@ -201,6 +201,12 @@ enum FailureCategory {
 }
 
 impl FailureCategory {
+    /// Whether auto-unblock may put the task back in the queue on its own.
+    ///
+    /// `MaxAttempts` is deliberately absent: the task already ran the configured
+    /// number of times, so an automatic retry just restarts the loop that produced
+    /// the block. It stays blocked until `orch task unblock` or `orch task retry`
+    /// (#3783)
     fn is_recoverable(self) -> bool {
         matches!(
             self,
@@ -213,7 +219,6 @@ impl FailureCategory {
                 | FailureCategory::CliFlagError
                 | FailureCategory::AllAgentsExhausted
                 | FailureCategory::ParseError
-                | FailureCategory::MaxAttempts
                 | FailureCategory::ModelUnavailable
         )
     }
@@ -1637,10 +1642,6 @@ async fn auto_unblock_blocked_tasks(
             ("agent", serde_json::Value::Null),
             ("model", serde_json::Value::Null),
         ];
-        if failures.contains(&FailureCategory::MaxAttempts) {
-            fields.push(("attempts", serde_json::json!(0)));
-            fields.push(("route_attempts", serde_json::json!(0)));
-        }
         fields.push(("no_code_reroutes", serde_json::json!(0)));
         fields.push(("no_code_last_agent", serde_json::json!("")));
         if has_review_failure {
@@ -5686,7 +5687,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Add a run with a DIFFERENT failure: MaxAttempts
+        // Add a run with a DIFFERENT failure: RateLimit
         let run_id = store
             .start_run(&crate::store::StartRun {
                 task_id: id,
@@ -5707,7 +5708,7 @@ mod tests {
                 stderr: "",
                 parsed: "",
                 outcome: "error",
-                error: "exceeded max attempts",
+                error: "rate limit reached for model opus",
                 tokens: RunTokenUsage::default(),
             })
             .await
@@ -5732,8 +5733,92 @@ mod tests {
         // Count is reset to 0, then incremented to 1 for the new reason
         assert_eq!(task.auto_unblock_count, 1);
         assert_eq!(
-            task.auto_unblock_last_reason, "MaxAttempts",
+            task.auto_unblock_last_reason, "RateLimit",
             "reason must be updated to the new failure category"
+        );
+    }
+
+    /**
+     * A task blocked for "exceeded max attempts" has already run the configured number
+     * of times. Auto-unblock must leave it alone — flipping it back to new/needs_review
+     * on the next tick restarted the very loop that produced the block (#3783)
+     **/
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn auto_unblock_leaves_max_attempts_blocked_task_alone() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "3783",
+                title: "Approved work sent back to the agent",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::Blocked)
+            .await
+            .unwrap();
+
+        let run_id = store
+            .start_run(&crate::store::StartRun {
+                task_id: id,
+                attempt: 11,
+                run_type: "agent",
+                agent: "claude",
+                model: "opus",
+                command: "claude",
+                prompt: "fix the bug",
+            })
+            .await
+            .unwrap();
+        store
+            .complete_run(&crate::store::CompleteRun {
+                run_id,
+                exit_code: Some(1),
+                stdout: "",
+                stderr: "",
+                parsed: "",
+                outcome: "error",
+                error: "exceeded max attempts (11/10). Use `/retry` to reset.",
+                tokens: RunTokenUsage::default(),
+            })
+            .await
+            .unwrap();
+
+        auto_unblock_blocked_tasks(
+            "owner/repo",
+            &task_manager,
+            &store,
+            &dispatching,
+            &Arc::new(DashSet::new()),
+        )
+        .await
+        .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(
+            task.status,
+            TaskStatus::Blocked,
+            "max-attempts block must survive the next tick until a person acts"
+        );
+        assert_eq!(
+            task.auto_unblock_count, 0,
+            "no auto-unblock attempt should be recorded"
         );
     }
 

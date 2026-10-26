@@ -255,6 +255,9 @@ pub async fn prepare_task(
         "Bash(rm *)".to_string(),
         "Bash(rm -*)".to_string(),
         "Bash(git push*)".to_string(),
+        // Pushing and opening the PR are orch's steps. An agent that tries either hits a
+        // permission prompt or a rejection and reports it as its own failure (#3783)
+        "Bash(gh pr create*)".to_string(),
     ];
 
     // Sandbox: block access to main project dir
