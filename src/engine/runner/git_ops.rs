@@ -1218,6 +1218,42 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
             }
         }
 
+        // The remote branch moved since the last fetch (GitHub's "Update branch", another
+        // clone), so the lease no longer matches. Replay local commits on the new tip once
+        if is_stale_lease_error(&stderr) && rebase_on_branch(dir, branch_to_push).await? {
+            let output = Command::new("git")
+                .args([
+                    "-c",
+                    "lfs.locksverify=false",
+                    "push",
+                    "-u",
+                    "origin",
+                    branch_to_push,
+                ])
+                .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .current_dir(dir)
+                .output_with_context()
+                .await?;
+            if output.status.success() {
+                tracing::info!(
+                    branch = branch_to_push,
+                    "push succeeded after rebasing on the moved remote branch"
+                );
+                return Ok(true);
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            anyhow::bail!("push failed after rebasing on the moved remote branch: {stderr}");
+        }
+
+        if is_stale_lease_error(&stderr) {
+            tracing::info!(
+                branch = branch_to_push,
+                "remote branch already holds every local commit, nothing to push"
+            );
+            return Ok(true);
+        }
+
         anyhow::bail!("force push failed: {stderr}");
     }
 
@@ -1230,6 +1266,12 @@ fn push_needs_rebase(stderr: &str) -> bool {
         || lower.contains("rejected")
         || lower.contains("fetch first")
         || lower.contains("behind")
+}
+
+/// True when `--force-with-lease` refused because the remote ref is not the one last fetched
+fn is_stale_lease_error(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("stale info") || lower.contains("remote ref updated since checkout")
 }
 
 /// True when a push failure looks like a transient network error (dial
@@ -2750,5 +2792,93 @@ mod tests {
         assert!(body.contains("### Remaining\n\n- Watch CI after merge\n"));
         assert!(body.contains("- `src/engine/runner/git_ops.rs`"));
         assert!(body.contains(" using `sonnet`"));
+    }
+
+    fn sh_git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@t",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn commit_file(dir: &std::path::Path, name: &str) {
+        std::fs::write(dir.join(name), name).unwrap();
+        sh_git(dir, &["add", name]);
+        sh_git(dir, &["commit", "-m", name]);
+    }
+
+    /**
+     * The review rebases its branch on main and force-pushes with lease. When GitHub's
+     * "Update branch" moved the remote branch after the last fetch, the lease is stale and
+     * the push was rejected, which blocked approved work (#3783)
+     **/
+    #[tokio::test]
+    async fn push_branch_recovers_from_stale_lease_after_remote_moved() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let bare = temp.path().join("origin.git");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::fs::create_dir_all(&bare).unwrap();
+        sh_git(&bare, &["init", "--bare", "-b", "main"]);
+        sh_git(temp.path(), &["clone", bare.to_str().unwrap(), "a"]);
+        // push_branch's own rebase commits, and CI runners have no global identity
+        sh_git(&a, &["config", "user.name", "T"]);
+        sh_git(&a, &["config", "user.email", "t@t"]);
+        commit_file(&a, "base.txt");
+        sh_git(&a, &["push", "origin", "main"]);
+        sh_git(&a, &["checkout", "-b", "feat"]);
+        commit_file(&a, "feature.txt");
+        sh_git(&a, &["push", "-u", "origin", "feat"]);
+
+        sh_git(temp.path(), &["clone", bare.to_str().unwrap(), "b"]);
+        commit_file(&b, "main-change.txt");
+        sh_git(&b, &["push", "origin", "main"]);
+        sh_git(&b, &["checkout", "feat"]);
+        commit_file(&b, "update-branch.txt");
+        sh_git(&b, &["push", "origin", "feat"]);
+
+        // A only fetches main, so its view of origin/feat is stale when it rewrites feat
+        sh_git(&a, &["fetch", "origin", "main"]);
+        sh_git(&a, &["rebase", "origin/main"]);
+
+        assert!(push_branch(&a, "feat", "main").await.unwrap());
+
+        sh_git(&b, &["fetch", "origin", "feat"]);
+        sh_git(&b, &["checkout", "origin/feat"]);
+        for name in [
+            "base.txt",
+            "feature.txt",
+            "main-change.txt",
+            "update-branch.txt",
+        ] {
+            assert!(b.join(name).exists(), "remote feat lost {name}");
+        }
+    }
+
+    #[test]
+    fn stale_lease_error_matches_git_messages() {
+        assert!(is_stale_lease_error(
+            "! [rejected] feat -> feat (stale info)"
+        ));
+        assert!(is_stale_lease_error(
+            "! [rejected] feat -> feat (remote ref updated since checkout)"
+        ));
+        assert!(!is_stale_lease_error(
+            "! [rejected] feat -> feat (fetch first)"
+        ));
     }
 }

@@ -208,11 +208,116 @@ struct ParsedReview {
     decision: ReviewDecision,
 }
 
+/// KV key holding the commit an approving review was already written for
+fn approved_sha_key(repo: &str, task_id: &str, pr_number: u64) -> String {
+    format!("review_approved_sha:{repo}#{task_id}#{pr_number}")
+}
+
+/// Read `HEAD` of a worktree. `None` when the worktree is gone or not a repository
+async fn worktree_head_sha(dir: &std::path::Path) -> Option<String> {
+    let out = tokio::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
+/// Record that the commit just pushed to the PR carries an approving review, so a later
+/// NeedsReview event on the same commit skips the review agent
+async fn record_approved_sha(
+    store: &Arc<TaskStore>,
+    repo: &str,
+    task_id: &str,
+    pr_number: u64,
+    dir: &std::path::Path,
+) {
+    let Some(sha) = worktree_head_sha(dir).await else {
+        return;
+    };
+    if let Err(e) = store
+        .kv_set(&approved_sha_key(repo, task_id, pr_number), &sha)
+        .await
+    {
+        tracing::warn!(task_id, err = %e, "failed to record approved commit sha");
+    }
+}
+
+/// Drop a recorded approval so the next NeedsReview event runs a real review
+async fn clear_approved_sha(store: &Arc<TaskStore>, repo: &str, task_id: &str, pr_number: u64) {
+    if let Err(e) = store
+        .kv_delete(&approved_sha_key(repo, task_id, pr_number))
+        .await
+    {
+        tracing::warn!(task_id, err = %e, "failed to clear approved commit sha");
+    }
+}
+
+/**
+ * True when the PR's current head is the commit a previous review approved.
+ *
+ * Compared against the live PR head, not the worktree: a force-push from another clone
+ * moves the head while the worktree stays on the approved commit, and skipping the
+ * review there would merge code nobody reviewed. Any lookup failure returns false, so
+ * the fallback is to review again (#3783)
+ **/
+async fn pr_head_already_approved(
+    store: &Arc<TaskStore>,
+    repo: &str,
+    task_id: &str,
+    pr_number: u64,
+) -> bool {
+    let approved = match store
+        .kv_get(&approved_sha_key(repo, task_id, pr_number))
+        .await
+    {
+        Ok(sha) => sha,
+        Err(e) => {
+            tracing::warn!(task_id, err = %e, "failed to read approved commit sha");
+            return false;
+        }
+    };
+    if approved.is_none() {
+        return false;
+    }
+    let gh = match crate::github::http::GhHttp::new() {
+        Ok(gh) => gh,
+        Err(e) => {
+            tracing::warn!(task_id, err = %e, "cannot check PR head against recorded approval");
+            return false;
+        }
+    };
+    let pr_head = match gh.get_pr(repo, pr_number).await {
+        Ok(pr) => Some(pr.head.sha),
+        Err(e) => {
+            tracing::warn!(task_id, pr_number, err = %e, "failed to read PR head sha");
+            None
+        }
+    };
+    approval_covers_head(approved.as_deref(), pr_head.as_deref())
+}
+
+/// Whether a recorded approval still applies to the PR's current head commit
+fn approval_covers_head(approved: Option<&str>, pr_head: Option<&str>) -> bool {
+    match (approved, pr_head) {
+        (Some(approved), Some(head)) => !approved.is_empty() && approved == head,
+        _ => false,
+    }
+}
+
 fn build_review_disallowed_tools(worktree_path: &std::path::Path) -> Vec<String> {
     let mut tools = vec![
         "Bash(rm *)".to_string(),
         "Bash(rm -*)".to_string(),
         "Bash(git push*)".to_string(),
+        // Pushing and opening the PR are orch's steps, never the agent's (#3783)
+        "Bash(gh pr create*)".to_string(),
     ];
     let orch_yml = worktree_path.join(".orch.yml");
     let orch_yml_str = orch_yml.to_string_lossy();
@@ -322,6 +427,21 @@ async fn build_review_context(
         .with_context(|| format!("store lookup failed for task {}", task.id.0))?;
 
     let store_id: Option<i64> = stored_task.as_ref().map(|t| t.id);
+
+    // A commit that already has an approval must not be reviewed again. Checked before
+    // the review_invocations increment so a stuck merge cannot exhaust the review quota
+    if let Some(pr_number) = stored_task.as_ref().and_then(|t| t.pr_number) {
+        let pr_number = pr_number as u64;
+        if pr_head_already_approved(store, repo, &task.id.0, pr_number).await {
+            tracing::info!(
+                task_id = task.id.0,
+                pr_number,
+                "PR head already approved — skipping review, merge retry continues"
+            );
+            return Ok(ReviewPhase::EarlyReturn(ReviewDecision::Approve));
+        }
+    }
+
     let had_prev_push_failure = stored_task
         .as_ref()
         .is_some_and(|t| t.last_error.contains("push failed"));
@@ -1843,6 +1963,7 @@ async fn apply_review_decision(
 
     match &parsed.decision {
         ReviewDecision::Approve => {
+            record_approved_sha(store, repo, &task.id.0, ctx.pr_number, &ctx.worktree_path).await;
             // Always attempt auto-merge on approval. Tasks are only marked
             // Done when the PR is actually merged (detected by review_poll).
             // Never mark Done on approval alone — that closes the issue
@@ -1882,6 +2003,7 @@ async fn apply_review_decision(
             Ok(ReviewDecision::Approve)
         }
         ReviewDecision::RequestChanges { notes, issues } => {
+            clear_approved_sha(store, repo, &task.id.0, ctx.pr_number).await;
             handle_review_changes(
                 task,
                 notes,
@@ -3147,6 +3269,77 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             url: "https://example.com/issues/1".to_string(),
         }
+    }
+
+    /// An approval only carries over while the PR head is still the commit that was
+    /// approved. A force-push from another clone moves the head, and reviewing again is
+    /// the safe answer in every other case (#3783)
+    #[test]
+    fn approval_covers_head_only_for_the_exact_commit() {
+        assert!(approval_covers_head(Some("abc123"), Some("abc123")));
+        assert!(
+            !approval_covers_head(Some("abc123"), Some("def456")),
+            "a moved PR head must be reviewed"
+        );
+        assert!(
+            !approval_covers_head(None, Some("abc123")),
+            "no recorded approval means review"
+        );
+        assert!(
+            !approval_covers_head(Some("abc123"), None),
+            "an unreadable PR head must not skip the review"
+        );
+        assert!(!approval_covers_head(Some(""), Some("")));
+    }
+
+    /**
+     * The approval is recorded against the commit pushed to the PR and is dropped when a
+     * review asks for changes, so the next NeedsReview event reviews the new work (#3783)
+     **/
+    #[tokio::test]
+    async fn approved_sha_round_trips_through_the_kv_store() {
+        let temp = TempDir::new().unwrap();
+        let wt = temp.path();
+        git(wt, &["init", "-b", "main"]);
+        git(wt, &["config", "user.name", "Test"]);
+        git(wt, &["config", "user.email", "test@test.com"]);
+        std::fs::write(wt.join("fix.txt"), "the fix").unwrap();
+        git(wt, &["add", "."]);
+        git(wt, &["commit", "-m", "apply the fix"]);
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let repo = "owner/repo";
+        let task_id = "3783";
+
+        record_approved_sha(&store, repo, task_id, 77, wt).await;
+        let recorded = store
+            .kv_get(&approved_sha_key(repo, task_id, 77))
+            .await
+            .unwrap()
+            .expect("approval must be recorded");
+        assert_eq!(
+            recorded,
+            worktree_head_sha(wt).await.unwrap(),
+            "the recorded sha must be the commit that was pushed to the PR"
+        );
+        assert!(
+            store
+                .kv_get(&approved_sha_key(repo, task_id, 78))
+                .await
+                .unwrap()
+                .is_none(),
+            "an approval must not leak to another PR"
+        );
+
+        clear_approved_sha(&store, repo, task_id, 77).await;
+        assert!(
+            store
+                .kv_get(&approved_sha_key(repo, task_id, 77))
+                .await
+                .unwrap()
+                .is_none(),
+            "requesting changes must drop the approval"
+        );
     }
 
     #[tokio::test]
