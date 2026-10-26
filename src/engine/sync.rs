@@ -4561,7 +4561,7 @@ mod tests {
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
-        let router = Arc::new(RwLock::new(crate::engine::router::Router::from_config()));
+        let router = Arc::new(RwLock::new(reviewer_router()));
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let auto_merge_in_flight: Arc<DashSet<String>> = Arc::new(DashSet::new());
 

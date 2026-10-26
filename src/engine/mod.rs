@@ -399,20 +399,6 @@ fn should_run_upgrade_check(
         .unwrap_or(true)
 }
 
-/// Log a warning when the backend health check fails. Never skips the project.
-fn log_health_check(repo: &str, backend_name: &str, result: anyhow::Result<()>) -> bool {
-    match result {
-        Ok(()) => {
-            tracing::info!(repo = %repo, backend = backend_name, "backend connected");
-            true
-        }
-        Err(e) => {
-            tracing::warn!(repo = %repo, error = %e, "GitHub health check failed for {repo}, starting engine anyway (rate limited, offline or bad credentials?)");
-            false
-        }
-    }
-}
-
 /// Initialize all project engines from config.
 ///
 /// Returns a vector of ProjectEngine, one for each configured project.
@@ -451,7 +437,14 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
         // A failed health check (rate limit, network, auth) must not drop the project: it would
         // have no review subscriber until the next restart. Later ticks hit the API again and
         // retry on their own, so start the engine and warn while the check keeps failing.
-        log_health_check(&repo, backend.name(), backend.health_check().await);
+        match backend.health_check().await {
+            Ok(()) => tracing::info!(repo = %repo, backend = backend.name(), "backend connected"),
+            Err(e) => tracing::warn!(
+                repo = %repo,
+                error = %e,
+                "GitHub health check failed for {repo}, starting engine anyway (rate limited, offline or bad credentials?)"
+            ),
+        }
 
         // Initialize task manager (with unified store)
         let task_manager = Arc::new(TaskManager::with_store(
@@ -2680,13 +2673,6 @@ pub async fn serve() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rate_limited_health_check_does_not_skip_project() {
-        let err = anyhow::anyhow!("API rate limit exceeded (403)");
-        assert!(!log_health_check("o/r", "github", Err(err)));
-        assert!(log_health_check("o/r", "github", Ok(())));
-    }
 
     #[test]
     fn engine_config_defaults() {
