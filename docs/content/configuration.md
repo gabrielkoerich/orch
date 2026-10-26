@@ -87,8 +87,26 @@ router:
 ```
 
 - Project config is deep-merged with global config (project wins)
-- The server restarts automatically when `.orch.yml` changes
+- The engine reloads the file when it changes, without a restart (see [Hot reload](#hot-reload))
 - Use `orch project board sync` to (re-)discover project / status / estimate field IDs and persist them into the project's `.orch.yml`
+
+## Hot reload
+
+The engine watches `~/.orch/config.yml` and every project's `.orch.yml`. A change reloads the values in place, with no restart and no interruption to a running agent. Each changed key is logged with its old and new value, so `orch log` shows what an edit did.
+
+`engine.max_parallel` resizes the dispatch pool live. Raising it hands out the extra slots at once. Lowering it never cancels a running task: orch stops handing out slots and takes the permits back as tasks finish, so the limit in force settles at the new value. The `dispatch pool resized` log line reports `in_force` and `target` while a shrink is still settling.
+
+A file that does not parse is ignored: the last good values stay in force and one error is logged per breakage. Fix the file and the next save reloads normally.
+
+A project added to `projects:` is picked up on the next save — its backend connects, its subscribers start and its issues are ingested on the following sync tick. A failed GitHub health check does not hold the project back: it starts anyway and the next sync tick retries, so a project added while GitHub is rate limited or unreachable still runs.
+
+These settings still need `orch service restart`:
+
+| Setting | Why |
+|---------|-----|
+| `channels.*` | Telegram and Discord gateways hold long-lived websocket connections |
+| `webhook.*` | The HTTP listener binds its port at startup |
+| Removing a project from `projects:` | Its subscriber tasks and already-dispatched agents outlive the config read |
 
 ## Skills
 

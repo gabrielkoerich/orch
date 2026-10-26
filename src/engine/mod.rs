@@ -386,6 +386,52 @@ async fn report_rate_limited(
     }
 }
 
+/// Grow or shrink the dispatch pool toward `target` without cancelling running work.
+///
+/// Growing adds permits at once. Shrinking can only take back the permits that
+/// are free right now, so the return value is the limit actually in force; call
+/// again as running tasks release theirs
+fn resize_dispatch_pool(semaphore: &Semaphore, in_force: usize, target: usize) -> usize {
+    if target > in_force {
+        semaphore.add_permits(target - in_force);
+        return target;
+    }
+
+    if target < in_force {
+        return in_force - semaphore.forget_permits(in_force - target);
+    }
+
+    in_force
+}
+
+/// Log every engine setting whose value changed across a config reload, so
+/// `orch log` shows what the operator's edit actually did.
+fn log_engine_config_changes(old: &EngineConfig, new: &EngineConfig) {
+    macro_rules! log_changed {
+        ($($key:literal => $field:ident),+ $(,)?) => {
+            $(if old.$field != new.$field {
+                tracing::info!(key = $key, old = ?old.$field, new = ?new.$field, "config changed");
+            })+
+        };
+    }
+
+    log_changed!(
+        "engine.tick_interval" => tick_interval,
+        "engine.sync_interval" => sync_interval,
+        "engine.webhook_health_check_interval" => webhook_health_check_interval,
+        "engine.max_parallel" => max_parallel,
+        "engine.stuck_timeout" => stuck_timeout,
+        "engine.no_session_stuck_timeout" => no_session_stuck_timeout,
+        "engine.in_review_no_session_stuck_timeout" => in_review_no_session_stuck_timeout,
+        "engine.graceful_shutdown_timeout" => graceful_shutdown_timeout,
+        "engine.silence_grace_period" => silence_grace_period,
+        "engine.silence_cooldown" => silence_cooldown,
+        "engine.upgrade_check_interval" => upgrade_check_interval,
+        "engine.startup_failure_escalation_secs" => startup_failure_escalation_secs,
+        "workflow.auto_create_followup_on_changes" => auto_create_followup_on_changes,
+    );
+}
+
 fn should_run_upgrade_check(
     last_upgrade_check: Option<std::time::Instant>,
     upgrade_check_interval: u64,
@@ -397,6 +443,153 @@ fn should_run_upgrade_check(
     last_upgrade_check
         .map(|last| last.elapsed() >= std::time::Duration::from_secs(upgrade_check_interval))
         .unwrap_or(true)
+}
+
+/// Connect one project's backend and build its task manager and runner over
+/// the shared store.
+///
+/// `event_tx` wires status transitions into the event bus; pass `None` during
+/// startup, where the bus does not exist yet and task managers are rebuilt
+/// once it does
+async fn connect_project_engine(
+    repo: String,
+    project_dir: std::path::PathBuf,
+    store: Arc<TaskStore>,
+    event_tx: Option<tokio::sync::broadcast::Sender<events::TaskEvent>>,
+) -> anyhow::Result<ProjectEngine> {
+    let backend: Arc<dyn ExternalBackend> =
+        Arc::new(crate::backends::github::GitHubBackend::new(repo.clone())?);
+
+    // A failed health check (rate limit, network, auth) must not drop the project: it would have
+    // no review subscriber until the next restart. Later ticks hit the API again and retry on
+    // their own, so build the engine and warn while the check keeps failing.
+    match backend.health_check().await {
+        Ok(()) => tracing::info!(repo = %repo, backend = backend.name(), "backend connected"),
+        Err(e) => tracing::warn!(
+            repo = %repo,
+            error = %e,
+            "GitHub health check failed for {repo}, starting engine anyway (rate limited, offline or bad credentials?)"
+        ),
+    }
+
+    let task_manager = Arc::new(match event_tx {
+        Some(tx) => TaskManager::with_events(backend.clone(), store.clone(), repo.clone(), tx),
+        None => TaskManager::with_store(backend.clone(), store.clone(), repo.clone()),
+    });
+    let runner = Arc::new(runner::TaskRunner::new(repo.clone()).with_store(store.clone()));
+
+    Ok(ProjectEngine {
+        repo,
+        project_dir,
+        backend,
+        task_manager,
+        runner,
+        store,
+    })
+}
+
+/// Pick up projects added to `projects:` since startup, and report the ones
+/// that were removed.
+///
+/// A removed project keeps running until the next restart: its subscriber
+/// tasks and any agent it already dispatched outlive the config read
+#[allow(clippy::too_many_arguments)]
+async fn sync_project_engines(
+    project_engines: &mut Vec<ProjectEngine>,
+    active_repos: &mut std::collections::HashSet<String>,
+    event_bus: &events::EventBus,
+    tmux: &Arc<TmuxManager>,
+    capture: &Arc<CaptureService>,
+    semaphore: &Arc<Semaphore>,
+    weight_tx: &mpsc::Sender<WeightSignal>,
+    router: &Arc<RwLock<Router>>,
+    dispatching: &Arc<dashmap::DashMap<String, String>>,
+) {
+    let configured = match config::get_projects_with_paths() {
+        Ok(p) if !p.is_empty() => p,
+        Ok(_) => return,
+        Err(e) => {
+            tracing::warn!(err = %e, "could not re-read the project list, keeping the current one");
+            return;
+        }
+    };
+    let Some(store) = project_engines.first().map(|e| e.store.clone()) else {
+        return;
+    };
+
+    let configured_repos: std::collections::HashSet<String> =
+        configured.iter().map(|(r, _)| r.clone()).collect();
+    for repo in active_repos.difference(&configured_repos) {
+        tracing::info!(
+            repo = %repo,
+            "project removed from config, takes effect after restart"
+        );
+    }
+
+    for (repo, project_dir) in configured {
+        if active_repos.contains(&repo) {
+            continue;
+        }
+
+        config::watch(&project_dir.join(".orch.yml"));
+        let engine = match connect_project_engine(
+            repo.clone(),
+            project_dir,
+            store.clone(),
+            Some(event_bus.sender()),
+        )
+        .await
+        {
+            Ok(engine) => engine,
+            Err(e) => {
+                // A failed health check no longer lands here, so this is a backend that could
+                // not be built at all, such as a repo slug that is not `owner/name`
+                tracing::warn!(
+                    repo = %repo,
+                    err = %e,
+                    "project added to config but its backend could not be built, retrying on the next config change"
+                );
+                continue;
+            }
+        };
+
+        subscribers::dispatch::spawn(
+            event_bus.subscribe(),
+            engine.backend.clone(),
+            tmux.clone(),
+            engine.runner.clone(),
+            capture.clone(),
+            semaphore.clone(),
+            engine.task_manager.clone(),
+            weight_tx.clone(),
+            router.clone(),
+            dispatching.clone(),
+            engine.store.clone(),
+            engine.repo.clone(),
+        );
+        subscribers::review::spawn(
+            event_bus.subscribe(),
+            engine.backend.clone(),
+            tmux.clone(),
+            semaphore.clone(),
+            engine.task_manager.clone(),
+            router.clone(),
+            dispatching.clone(),
+            engine.store.clone(),
+            engine.repo.clone(),
+        );
+        subscribers::unblock::spawn(
+            event_bus.subscribe(),
+            engine.backend.clone(),
+            engine.task_manager.clone(),
+            engine.store.clone(),
+            engine.repo.clone(),
+        );
+
+        active_repos.insert(repo.clone());
+        project_engines.push(engine);
+        tracing::info!(repo = %repo, "project added from config, now syncing");
+    }
 }
 
 /// Initialize all project engines from config.
@@ -429,41 +622,9 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
 
     for (repo, project_dir) in projects {
         tracing::info!(repo = %repo, "initializing project engine");
+        config::watch(&project_dir.join(".orch.yml"));
 
-        // Initialize backend
-        let backend: Arc<dyn ExternalBackend> =
-            Arc::new(crate::backends::github::GitHubBackend::new(repo.clone())?);
-
-        // A failed health check (rate limit, network, auth) must not drop the project: it would
-        // have no review subscriber until the next restart. Later ticks hit the API again and
-        // retry on their own, so start the engine and warn while the check keeps failing.
-        match backend.health_check().await {
-            Ok(()) => tracing::info!(repo = %repo, backend = backend.name(), "backend connected"),
-            Err(e) => tracing::warn!(
-                repo = %repo,
-                error = %e,
-                "GitHub health check failed for {repo}, starting engine anyway (rate limited, offline or bad credentials?)"
-            ),
-        }
-
-        // Initialize task manager (with unified store)
-        let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
-            repo.clone(),
-        ));
-
-        // Task runner (with store for metrics)
-        let runner = Arc::new(runner::TaskRunner::new(repo.clone()).with_store(store.clone()));
-
-        engines.push(ProjectEngine {
-            repo,
-            project_dir,
-            backend,
-            task_manager,
-            runner,
-            store: store.clone(),
-        });
+        engines.push(connect_project_engine(repo, project_dir, store.clone(), None).await?);
     }
 
     Ok(engines)
@@ -1097,7 +1258,7 @@ pub async fn serve() -> anyhow::Result<()> {
     // Full set of currently-configured project repos, used by the per-tick global
     // sweeps (e.g. `dispatch_routed_tasks_global`) to distinguish "orphaned" tasks
     // (repo no longer in config) from tasks belonging to some other active project.
-    let active_repos: std::collections::HashSet<String> =
+    let mut active_repos: std::collections::HashSet<String> =
         project_engines.iter().map(|e| e.repo.clone()).collect();
 
     // Create the event bus for task status transitions
@@ -1797,8 +1958,11 @@ pub async fn serve() -> anyhow::Result<()> {
         );
     }
 
-    // Concurrency limiter (shared across all projects)
+    // Concurrency limiter (shared across all projects). `parallel_in_force` is the
+    // limit actually handed out, which lags `config.max_parallel` after a shrink
+    // until the running tasks give their permits back.
     let semaphore = Arc::new(Semaphore::new(config.max_parallel));
+    let mut parallel_in_force = config.max_parallel;
 
     // In-memory dispatch guard: tracks task IDs currently being dispatched.
     // Guards against GitHub API eventual consistency — after update_status(InProgress),
@@ -2083,6 +2247,22 @@ pub async fn serve() -> anyhow::Result<()> {
                         gap_secs = gap.num_seconds(),
                         "host suspend/resume gap detected, discounting from stuck-task age checks"
                     );
+                }
+
+                // Finish a pending shrink of the dispatch pool as running tasks
+                // release their permits. Only logs when a permit was actually
+                // taken back, so a long-running task does not log every tick.
+                if parallel_in_force != config.max_parallel {
+                    let resized =
+                        resize_dispatch_pool(&semaphore, parallel_in_force, config.max_parallel);
+                    if resized != parallel_in_force {
+                        parallel_in_force = resized;
+                        tracing::info!(
+                            in_force = parallel_in_force,
+                            target = config.max_parallel,
+                            "dispatch pool resized"
+                        );
+                    }
                 }
 
                 // Tick weight recovery for rate-limited agents
@@ -2417,47 +2597,77 @@ pub async fn serve() -> anyhow::Result<()> {
                 interval.reset();
             }
             result = config_rx.recv() => {
-                match result {
+                // A notification only arrives for a file that parsed, so there is no
+                // broken-config case to guard against here (see `config::reload_file`).
+                let reload = match result {
                     Ok(path) => {
                         tracing::info!(path = %path.display(), "config file changed, reloading");
-
-                        // Reload engine config
-                        let new_config = EngineConfig::from_config();
-                        let tick_changed = new_config.tick_interval != config.tick_interval;
-                        config = new_config;
-
-                        // Reset tick interval if it changed
-                        if tick_changed {
-                            interval = tokio::time::interval(config.tick_interval);
-                            tracing::info!(tick = ?config.tick_interval, "tick interval updated");
-                        }
-
-                        // Reload router config (async-safe: use reload_async to avoid blocking the runtime)
-                        {
-                            let mut router_guard = router.write().await;
-                            router_guard.reload_async().await;
-                        }
-
-                        tracing::info!(
-                            tick = ?config.tick_interval,
-                            sync = ?config.sync_interval,
-                            parallel = config.max_parallel,
-                            "config reloaded"
-                        );
+                        true
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(missed = n, "config change receiver lagged, reloading");
-                        // Reload everything since we missed events
-                        config = EngineConfig::from_config();
-                        interval = tokio::time::interval(config.tick_interval);
-                        {
-                            let mut router_guard = router.write().await;
-                            router_guard.reload_async().await;
-                        }
+                        true
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         tracing::warn!("config change channel closed");
+                        false
                     }
+                };
+
+                if reload {
+                    // Reload engine config
+                    let new_config = EngineConfig::from_config();
+                    log_engine_config_changes(&config, &new_config);
+                    let tick_changed = new_config.tick_interval != config.tick_interval;
+                    config = new_config;
+
+                    // Reset tick interval if it changed
+                    if tick_changed {
+                        interval = tokio::time::interval(config.tick_interval);
+                        tracing::info!(tick = ?config.tick_interval, "tick interval updated");
+                    }
+
+                    // Resize the dispatch pool. A shrink only takes the permits that are
+                    // free right now; the rest are taken as running tasks finish.
+                    if parallel_in_force != config.max_parallel {
+                        parallel_in_force = resize_dispatch_pool(
+                            &semaphore,
+                            parallel_in_force,
+                            config.max_parallel,
+                        );
+                        tracing::info!(
+                            in_force = parallel_in_force,
+                            target = config.max_parallel,
+                            "dispatch pool resized"
+                        );
+                    }
+
+                    // Reload router config (async-safe: use reload_async to avoid blocking the runtime)
+                    {
+                        let mut router_guard = router.write().await;
+                        router_guard.reload_async().await;
+                    }
+
+                    // Pick up projects added to `projects:`
+                    sync_project_engines(
+                        &mut project_engines,
+                        &mut active_repos,
+                        &event_bus,
+                        &tmux,
+                        &capture_for_tick,
+                        &semaphore,
+                        &weight_tx,
+                        &router,
+                        &dispatching,
+                    ).await;
+
+                    tracing::info!(
+                        tick = ?config.tick_interval,
+                        sync = ?config.sync_interval,
+                        parallel = config.max_parallel,
+                        projects = project_engines.len(),
+                        "config reloaded"
+                    );
                 }
             }
             signal_name = async {
@@ -2669,6 +2879,66 @@ pub async fn serve() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn growing_max_parallel_lets_more_tasks_run_without_a_restart() {
+        let semaphore = Arc::new(Semaphore::new(4));
+        let held: Vec<_> = (0..4)
+            .map(|_| semaphore.clone().try_acquire_owned().unwrap())
+            .collect();
+        assert!(
+            semaphore.clone().try_acquire_owned().is_err(),
+            "pool is full"
+        );
+
+        let in_force = resize_dispatch_pool(&semaphore, 4, 8);
+        assert_eq!(in_force, 8);
+
+        let grown: Vec<_> = (0..4)
+            .map(|_| semaphore.clone().try_acquire_owned().unwrap())
+            .collect();
+        assert_eq!(held.len() + grown.len(), 8, "8 tasks run at once");
+        assert!(
+            semaphore.clone().try_acquire_owned().is_err(),
+            "pool is full"
+        );
+    }
+
+    #[test]
+    fn shrinking_max_parallel_never_cancels_a_running_task() {
+        let semaphore = Arc::new(Semaphore::new(8));
+        let mut held: Vec<_> = (0..8)
+            .map(|_| semaphore.clone().try_acquire_owned().unwrap())
+            .collect();
+
+        // Nothing is free, so all 8 tasks keep their permits and keep running.
+        let mut in_force = resize_dispatch_pool(&semaphore, 8, 4);
+        assert_eq!(in_force, 8);
+        assert_eq!(held.len(), 8);
+
+        // Three finish. Their permits are taken back instead of handed out again.
+        held.truncate(5);
+        in_force = resize_dispatch_pool(&semaphore, in_force, 4);
+        assert_eq!(in_force, 5);
+        assert!(semaphore.clone().try_acquire_owned().is_err());
+
+        // One more finishes and the pool settles at the new limit.
+        held.truncate(4);
+        in_force = resize_dispatch_pool(&semaphore, in_force, 4);
+        assert_eq!(in_force, 4);
+        assert!(semaphore.clone().try_acquire_owned().is_err());
+
+        // A slot freed after that is handed out, since 4 is now the real limit.
+        held.truncate(3);
+        assert!(semaphore.clone().try_acquire_owned().is_ok());
+    }
+
+    #[test]
+    fn resize_dispatch_pool_is_a_noop_at_the_current_limit() {
+        let semaphore = Arc::new(Semaphore::new(4));
+        assert_eq!(resize_dispatch_pool(&semaphore, 4, 4), 4);
+        assert_eq!(semaphore.available_permits(), 4);
+    }
 
     #[test]
     fn engine_config_defaults() {
