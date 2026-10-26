@@ -736,7 +736,9 @@ pub async fn project_move(old: &str, new: &str) -> anyhow::Result<()> {
             anyhow::bail!("invalid slug {slug:?}, expected owner/repo");
         }
     }
-    let moved = init_store().await?.move_repo(old, new).await?;
+    let store = init_store().await?;
+    let moved = store.move_repo(old, new).await?;
+    crate::engine::sync::clear_issues_last_ingested(&store, new).await;
     println!("Moved {moved} task(s) from {old} to {new}");
     println!("Now set gh.repo: {new} in the project's .orch.yml");
     Ok(())

@@ -782,11 +782,6 @@ enum TaskAction {
         /// Task ID
         id: String,
     },
-    /// Reopen a done/blocked task (resets status, reopens GitHub issue, syncs labels)
-    Reopen {
-        /// Task ID (`58`, `owner/repo#58`, or `internal:58`)
-        id: String,
-    },
     /// Unified diagnostic view: status, agent, attempts, last error, PR, block reason
     Inspect {
         /// Task ID (`58`, `owner/repo#58`, or `internal:58`)
@@ -1251,9 +1246,6 @@ async fn async_main() -> anyhow::Result<()> {
             }
             TaskAction::Watch { id } => {
                 cli::stream::run(Some(&id), true).await?;
-            }
-            TaskAction::Reopen { id } => {
-                cli::task::reopen(&id).await?;
             }
             TaskAction::Inspect { id } => {
                 cli::task::inspect(&id).await?;

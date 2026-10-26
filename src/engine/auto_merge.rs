@@ -798,6 +798,15 @@ async fn billing_failed_runs(
     count
 }
 
+/// Whether a PR head may merge, given how many commits it is behind its base.
+///
+/// `None` means the comparison could not be read. Only a head that contains the
+/// base tip has run its checks against the code the merge would produce, so an
+/// unreadable comparison holds the merge too (#3780)
+fn may_merge_onto_base(behind_by: Option<u64>) -> bool {
+    behind_by == Some(0)
+}
+
 /// Auto-merge a PR after review approval.
 ///
 /// Checks that the automated review comment says "approve" and that CI checks
@@ -1573,6 +1582,29 @@ pub(crate) async fn auto_merge_pr(
         anyhow::bail!("a reviewer requested changes during CI wait — aborting merge");
     }
 
+    // 5b. Refuse to merge a head that does not contain the current base tip: its
+    // checks ran against older code, so two PRs that each pass can still break
+    // the base together (#3780). Merge the base in and re-check next tick.
+    let behind_by = gh
+        .compare_behind_by(repo, &base_branch, &head_sha)
+        .await
+        .ok();
+    if !may_merge_onto_base(behind_by) {
+        tracing::warn!(
+            task_id = task.id.0,
+            pr_number,
+            ?behind_by,
+            base_branch = %base_branch,
+            "PR head does not contain the base tip — updating branch and re-running checks before merge"
+        );
+        if behind_by.is_some() {
+            if let Err(e) = gh.update_pr_branch(repo, pr_number).await {
+                tracing::warn!(task_id = task.id.0, pr_number, err = %e, "update-branch failed; retrying next tick");
+            }
+        }
+        return Ok(());
+    }
+
     tracing::info!(
         task_id = task.id.0,
         pr_number,
@@ -2236,6 +2268,28 @@ mod tests {
     use crate::backends::test_helpers::NoopBackend;
     use crate::backends::{ExternalId, ExternalTask};
     use crate::github::types::{GitHubReview, GitHubUser};
+
+    /// Auto-merge refuses a PR whose head does not contain the current base
+    /// commit: its green checks ran against older code (#3780).
+    #[test]
+    fn may_merge_onto_base_refuses_a_head_behind_its_base() {
+        assert!(
+            may_merge_onto_base(Some(0)),
+            "a head that contains the base tip may merge"
+        );
+        assert!(
+            !may_merge_onto_base(Some(1)),
+            "a head one commit behind the base must not merge"
+        );
+        assert!(
+            !may_merge_onto_base(Some(12)),
+            "a head well behind the base must not merge"
+        );
+        assert!(
+            !may_merge_onto_base(None),
+            "an unreadable comparison must hold the merge, not permit it"
+        );
+    }
 
     fn make_review(login: &str, state: &str, submitted_at: &str) -> GitHubReview {
         GitHubReview {

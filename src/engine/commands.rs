@@ -6,6 +6,7 @@
 
 use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::github::http::GhHttp;
+use crate::store::TaskStatus;
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -23,6 +24,9 @@ pub trait CommandStoreOps: Send + Sync {
     /// Reset all per-attempt counters for a task. Fire-and-forget — failures are
     /// logged but not propagated (same semantics as `store::store_reset_counters`).
     async fn reset_counters(&self, id: i64) -> anyhow::Result<()>;
+
+    /// Current status of a task, or `None` when the store has no such task.
+    async fn status(&self, repo: &str, task_id: &str) -> anyhow::Result<Option<TaskStatus>>;
 }
 
 #[async_trait]
@@ -37,6 +41,13 @@ impl CommandStoreOps for crate::store::TaskStore {
 
     async fn reset_counters(&self, id: i64) -> anyhow::Result<()> {
         self.reset_counters(id).await
+    }
+
+    async fn status(&self, repo: &str, task_id: &str) -> anyhow::Result<Option<TaskStatus>> {
+        let Some(id) = self.resolve_task_id(repo, task_id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(self.get(id).await?.status))
     }
 }
 
@@ -155,6 +166,25 @@ async fn cmd_reset_counters(store: &Option<Arc<dyn CommandStoreOps>>, repo: &str
     }
 }
 
+/// Refuse a command that would move a done task back into the pipeline.
+///
+/// Done is terminal: a revived task re-runs the body it was created with, which
+/// may be months stale and duplicate work that already has its own task (#3780)
+async fn refuse_if_done(
+    store: &Option<Arc<dyn CommandStoreOps>>,
+    repo: &str,
+    task_id: &str,
+    command: &OwnerCommand,
+) -> anyhow::Result<()> {
+    let Some(ref s) = store else { return Ok(()) };
+    if s.status(repo, task_id).await? != Some(TaskStatus::Done) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "`{command}` — task is done and done is terminal; open a new issue for follow-up work"
+    )
+}
+
 /// Execute a single owner command against a task.
 pub async fn execute_command(
     backend: &Arc<dyn ExternalBackend>,
@@ -167,6 +197,7 @@ pub async fn execute_command(
 ) -> anyhow::Result<String> {
     match command {
         OwnerCommand::Retry => {
+            refuse_if_done(store, repo, &task_id.0, command).await?;
             // Remove agent labels, reset attempts and all failure counters, reset to new
             let task = backend.get_task(task_id).await?;
             for label in &task.labels {
@@ -183,6 +214,7 @@ pub async fn execute_command(
         }
 
         OwnerCommand::Reroute(agent) => {
+            refuse_if_done(store, repo, &task_id.0, command).await?;
             // Remove existing agent labels and reset attempts and all failure counters
             let task = backend.get_task(task_id).await?;
             for label in &task.labels {
@@ -235,6 +267,7 @@ pub async fn execute_command(
         }
 
         OwnerCommand::Unblock => {
+            refuse_if_done(store, repo, &task_id.0, command).await?;
             if let Some(ref store) = store {
                 let store_id = store.resolve_task_id(repo, &task_id.0).await?;
                 if let Some(store_id) = store_id {
@@ -503,6 +536,14 @@ mod tests {
         async fn reset_counters(&self, _id: i64) -> anyhow::Result<()> {
             Ok(())
         }
+
+        async fn status(
+            &self,
+            _repo: &str,
+            _task_id: &str,
+        ) -> anyhow::Result<Option<crate::store::TaskStatus>> {
+            Ok(None)
+        }
     }
 
     #[tokio::test]
@@ -568,6 +609,66 @@ mod tests {
         let task = store.get(store_id).await.unwrap();
         assert_eq!(task.status, crate::store::TaskStatus::New);
         assert!(task.block_reason.is_none());
+    }
+
+    /// Done is terminal: `/retry`, `/reroute` and `/unblock` must refuse a done
+    /// task instead of sending its stale body back to an agent (#3780).
+    #[tokio::test]
+    async fn done_task_refuses_retry_reroute_and_unblock() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let store_id = store
+            .create(&NewTask {
+                external_id: Some("58".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Task".to_string(),
+                body: "".to_string(),
+                source: "cron".to_string(),
+                source_id: "code-development".to_string(),
+                author: "bot".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+                parent_id: None,
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(store_id, crate::store::TaskStatus::Done)
+            .await
+            .unwrap();
+
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new("58"));
+        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let gh = crate::github::http::GhHttp::new().unwrap();
+        let task_id = ExternalId("58".to_string());
+
+        for command in [
+            OwnerCommand::Retry,
+            OwnerCommand::Reroute(None),
+            OwnerCommand::Unblock,
+        ] {
+            let err = execute_command(
+                &backend,
+                &gh,
+                "owner/repo",
+                &task_id,
+                &command,
+                &Some(Arc::clone(&store) as Arc<dyn CommandStoreOps>),
+                &task_manager,
+            )
+            .await
+            .expect_err("done task must not be revived");
+            assert!(err.to_string().contains("done is terminal"), "got: {err}");
+            assert_eq!(
+                store.get(store_id).await.unwrap().status,
+                crate::store::TaskStatus::Done,
+                "{command} must leave a done task done"
+            );
+        }
     }
 
     #[test]

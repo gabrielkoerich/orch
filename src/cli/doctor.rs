@@ -7,22 +7,16 @@ use crate::engine::cleanup::{
 use crate::github::http::GhHttp;
 use crate::store::{Task, TaskStatus, TaskStore};
 use crate::tmux::TmuxManager;
-use anyhow::Context;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// What kind of automatic repair can be applied to a finding.
+///
+/// Nothing here moves a done task out of done. Done is terminal, so a done task
+/// that looks wrong is reported and left alone (#3780)
 enum FixAction {
-    /// Commit dirty worktree, push, create PR, reopen issue, set needs_review.
-    CommitPushCreatePr { store_id: i64 },
-    /// Push unpushed commits, create PR, reopen issue, set needs_review.
-    PushCreatePr { store_id: i64 },
-    /// Branch is pushed but no PR — create PR, reopen issue, set needs_review.
-    CreatePr { store_id: i64 },
-    /// PR exists but not merged — link PR, reopen issue, set needs_review.
-    LinkPrAndReopen { store_id: i64, pr_number: u64 },
     /// PR exists but pr_number not recorded — link it in the store.
     LinkPr { store_id: i64, pr_number: u64 },
     /// GitHub issue is closed but task is not done — reopen issue, sync labels.
@@ -474,11 +468,11 @@ async fn check_done_no_merged_pr(
                 findings.push(Finding {
                     severity: Severity::Error,
                     task_id: task_label,
-                    message: format!("done but PR #{} is {} (not merged)", pr_num, state),
-                    fix: FixAction::LinkPrAndReopen {
-                        store_id,
-                        pr_number: pr_num as u64,
-                    },
+                    message: format!(
+                        "done but PR #{} is {} (not merged) — done is terminal, file a new task to finish the work",
+                        pr_num, state
+                    ),
+                    fix: FixAction::None,
                 });
             }
         }
@@ -513,24 +507,19 @@ async fn check_done_no_merged_pr(
                                 severity: Severity::Error,
                                 task_id: task_label,
                                 message: format!(
-                                    "done with no pr_number but branch has unmerged PR #{}",
+                                    "done with no pr_number but branch has unmerged PR #{} — done is terminal, file a new task to finish the work",
                                     pr_num
                                 ),
-                                fix: FixAction::LinkPrAndReopen {
-                                    store_id,
-                                    pr_number: pr_num,
-                                },
+                                fix: FixAction::None,
                             });
                         }
                     }
                     Ok(None) => {
-                        // No PR at all — classify based on worktree state
-                        let fix = classify_no_pr_fix(task, store_id).await;
                         findings.push(Finding {
                             severity: Severity::Error,
                             task_id: task_label,
-                            message: "done but no PR was ever created".to_string(),
-                            fix,
+                            message: describe_unrecovered_work(task).await,
+                            fix: FixAction::None,
                         });
                     }
                     Err(_) => {
@@ -555,15 +544,18 @@ async fn check_done_no_merged_pr(
     }
 }
 
-/// Classify the appropriate fix when a done task has no PR.
-async fn classify_no_pr_fix(task: &Task, store_id: i64) -> FixAction {
+/// Describe what a done task with no PR left behind in its worktree.
+///
+/// Report only: the status stays done, so the message tells the operator what
+/// work is sitting there and would otherwise be lost (#3780)
+async fn describe_unrecovered_work(task: &Task) -> String {
+    const HEAD: &str = "done but no PR was ever created";
     if task.worktree.is_empty() || task.worktree_cleaned {
-        // Work was lost — worktree already cleaned
-        return FixAction::None;
+        return format!("{HEAD} and the worktree is gone — any work is lost");
     }
     let wt = Path::new(&task.worktree);
     if !wt.exists() || !wt.join(".git").exists() {
-        return FixAction::None;
+        return format!("{HEAD} and the worktree is gone — any work is lost");
     }
 
     // Check for dirty files
@@ -576,7 +568,7 @@ async fn classify_no_pr_fix(task: &Task, store_id: i64) -> FixAction {
         .unwrap_or(false);
 
     if has_dirty {
-        return FixAction::CommitPushCreatePr { store_id };
+        return format!("{HEAD}; uncommitted changes left in {}", task.worktree);
     }
 
     // Check for unpushed commits
@@ -589,7 +581,7 @@ async fn classify_no_pr_fix(task: &Task, store_id: i64) -> FixAction {
         .unwrap_or(false);
 
     if has_unpushed {
-        return FixAction::PushCreatePr { store_id };
+        return format!("{HEAD}; unpushed commits left in {}", task.worktree);
     }
 
     // Branch pushed, no PR
@@ -602,10 +594,10 @@ async fn classify_no_pr_fix(task: &Task, store_id: i64) -> FixAction {
         .unwrap_or(false);
 
     if branch_on_remote {
-        return FixAction::CreatePr { store_id };
+        return format!("{HEAD}; branch '{}' is pushed with no PR", task.branch);
     }
 
-    FixAction::None
+    HEAD.to_string()
 }
 
 /// Check 2: Done task with dirty worktree (uncommitted changes).
@@ -628,10 +620,10 @@ async fn check_dirty_worktree(task: &Task, findings: &mut Vec<Finding>) {
                 severity: Severity::Error,
                 task_id: task_label(task),
                 message: format!(
-                    "done but worktree has uncommitted changes: {}",
+                    "done but worktree has uncommitted changes: {} — done is terminal, file a new task to land them",
                     task.worktree
                 ),
-                fix: FixAction::CommitPushCreatePr { store_id: task.id },
+                fix: FixAction::None,
             });
         }
     }
@@ -658,10 +650,10 @@ async fn check_unpushed_commits(task: &Task, findings: &mut Vec<Finding>) {
                 severity: Severity::Error,
                 task_id: task_label(task),
                 message: format!(
-                    "done but {} unpushed commit(s) in worktree: {}",
+                    "done but {} unpushed commit(s) in worktree: {} — done is terminal, file a new task to land them",
                     count, task.worktree
                 ),
-                fix: FixAction::PushCreatePr { store_id: task.id },
+                fix: FixAction::None,
             });
         }
     }
@@ -975,364 +967,6 @@ async fn apply_fixes(
                 skipped += 1;
                 continue;
             }
-            FixAction::CommitPushCreatePr { store_id } => {
-                let task = store.get(*store_id).await?;
-                let wt = Path::new(&task.worktree);
-                if !wt.exists() {
-                    eprintln!("  skip #{}: worktree no longer exists", f.task_id);
-                    skipped += 1;
-                    continue;
-                }
-
-                if dry_run {
-                    println!(
-                        "  {}would commit + push + create PR + reopen issue + set needs_review for #{}",
-                        prefix, f.task_id
-                    );
-                    fixed += 1;
-                    continue;
-                }
-
-                // Commit all changes
-                let commit_ok = git_cmd(wt, &["add", "-A"]).await
-                    && git_cmd(
-                        wt,
-                        &[
-                            "commit",
-                            "-m",
-                            &format!("fix: recover orphaned work for #{}", f.task_id),
-                        ],
-                    )
-                    .await;
-                if !commit_ok {
-                    eprintln!("  fix failed for #{}: git commit failed", f.task_id);
-                    skipped += 1;
-                    continue;
-                }
-
-                // Push
-                if !git_cmd(
-                    wt,
-                    &[
-                        "-c",
-                        "lfs.locksverify=false",
-                        "push",
-                        "-u",
-                        "origin",
-                        &task.branch,
-                    ],
-                )
-                .await
-                {
-                    eprintln!("  fix failed for #{}: git push failed", f.task_id);
-                    skipped += 1;
-                    continue;
-                }
-
-                // Create PR
-                match create_pr_for_task(gh, repo, &task).await {
-                    Ok(pr_num) => {
-                        let _ = store
-                            .set_fields(
-                                *store_id,
-                                &[("pr_number", serde_json::json!(pr_num as i64))],
-                            )
-                            .await;
-                        // Set needs_review + reopen issue + sync labels
-                        match reopen_and_set_needs_review(
-                            store, *store_id, &task, backend, gh, repo,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                println!(
-                                    "  fixed #{}: committed + pushed + created PR #{} + reopened + needs_review",
-                                    f.task_id, pr_num
-                                );
-                                fixed += 1;
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "  fix failed for #{}: PR #{} created but status/reopen failed: {e}",
-                                    f.task_id, pr_num
-                                );
-                                skipped += 1;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // PR creation failed — it may be a transient server error. Re-check GitHub
-                        // for an existing PR for the branch and link it if found.
-                        eprintln!(
-                            "  PR creation error for #{}: {}. Re-checking for existing PR...",
-                            f.task_id, e
-                        );
-                        match gh.get_pr_number(repo, &task.branch).await {
-                            Ok(Some(pr_num)) => {
-                                let _ = store
-                                    .set_fields(
-                                        *store_id,
-                                        &[("pr_number", serde_json::json!(pr_num as i64))],
-                                    )
-                                    .await;
-                                match reopen_and_set_needs_review(
-                                    store, *store_id, &task, backend, gh, repo,
-                                )
-                                .await
-                                {
-                                    Ok(()) => {
-                                        println!(
-                                            "  fixed #{}: PR was present on GitHub as #{} (linked) + reopened + needs_review",
-                                            f.task_id, pr_num
-                                        );
-                                        fixed += 1;
-                                    }
-                                    Err(e2) => {
-                                        eprintln!(
-                                            "  fix failed for #{}: PR #{} linked but status/reopen failed: {e2}",
-                                            f.task_id, pr_num
-                                        );
-                                        skipped += 1;
-                                    }
-                                }
-                            }
-                            Ok(None) => {
-                                eprintln!("  fix failed for #{}: PR creation failed and no PR found for branch", f.task_id);
-                                skipped += 1;
-                            }
-                            Err(err2) => {
-                                eprintln!("  fix failed for #{}: PR creation failed: {}; and PR lookup failed: {}", f.task_id, e, err2);
-                                skipped += 1;
-                            }
-                        }
-                    }
-                }
-            }
-            FixAction::PushCreatePr { store_id } => {
-                let task = store.get(*store_id).await?;
-                let wt = Path::new(&task.worktree);
-                if !wt.exists() {
-                    eprintln!("  skip #{}: worktree no longer exists", f.task_id);
-                    skipped += 1;
-                    continue;
-                }
-
-                if dry_run {
-                    println!(
-                        "  {}would push + create PR + reopen issue + set needs_review for #{}",
-                        prefix, f.task_id
-                    );
-                    fixed += 1;
-                    continue;
-                }
-
-                if !git_cmd(wt, &["push", "-u", "origin", &task.branch]).await {
-                    eprintln!("  fix failed for #{}: git push failed", f.task_id);
-                    skipped += 1;
-                    continue;
-                }
-
-                match create_pr_for_task(gh, repo, &task).await {
-                    Ok(pr_num) => {
-                        let _ = store
-                            .set_fields(
-                                *store_id,
-                                &[("pr_number", serde_json::json!(pr_num as i64))],
-                            )
-                            .await;
-                        match reopen_and_set_needs_review(
-                            store, *store_id, &task, backend, gh, repo,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                println!(
-                                    "  fixed #{}: pushed + created PR #{} + reopened + needs_review",
-                                    f.task_id, pr_num
-                                );
-                                fixed += 1;
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "  fix failed for #{}: PR #{} created but status/reopen failed: {e}",
-                                    f.task_id, pr_num
-                                );
-                                skipped += 1;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "  PR creation error for #{}: {}. Re-checking for existing PR...",
-                            f.task_id, e
-                        );
-                        match gh.get_pr_number(repo, &task.branch).await {
-                            Ok(Some(pr_num)) => {
-                                let _ = store
-                                    .set_fields(
-                                        *store_id,
-                                        &[("pr_number", serde_json::json!(pr_num as i64))],
-                                    )
-                                    .await;
-                                match reopen_and_set_needs_review(
-                                    store, *store_id, &task, backend, gh, repo,
-                                )
-                                .await
-                                {
-                                    Ok(()) => {
-                                        println!(
-                                            "  fixed #{}: PR was present on GitHub as #{} (linked) + reopened + needs_review",
-                                            f.task_id, pr_num
-                                        );
-                                        fixed += 1;
-                                    }
-                                    Err(e2) => {
-                                        eprintln!(
-                                            "  fix failed for #{}: PR #{} linked but status/reopen failed: {e2}",
-                                            f.task_id, pr_num
-                                        );
-                                        skipped += 1;
-                                    }
-                                }
-                            }
-                            Ok(None) => {
-                                eprintln!("  fix failed for #{}: PR creation failed and no PR found for branch", f.task_id);
-                                skipped += 1;
-                            }
-                            Err(err2) => {
-                                eprintln!("  fix failed for #{}: PR creation failed: {}; and PR lookup failed: {}", f.task_id, e, err2);
-                                skipped += 1;
-                            }
-                        }
-                    }
-                }
-            }
-            FixAction::CreatePr { store_id } => {
-                let task = store.get(*store_id).await?;
-
-                if dry_run {
-                    println!(
-                        "  {}would create PR + reopen issue + set needs_review for #{}",
-                        prefix, f.task_id
-                    );
-                    fixed += 1;
-                    continue;
-                }
-
-                match create_pr_for_task(gh, repo, &task).await {
-                    Ok(pr_num) => {
-                        let _ = store
-                            .set_fields(
-                                *store_id,
-                                &[("pr_number", serde_json::json!(pr_num as i64))],
-                            )
-                            .await;
-                        match reopen_and_set_needs_review(
-                            store, *store_id, &task, backend, gh, repo,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                println!(
-                                    "  fixed #{}: created PR #{} + reopened + needs_review",
-                                    f.task_id, pr_num
-                                );
-                                fixed += 1;
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "  fix failed for #{}: PR #{} created but status/reopen failed: {e}",
-                                    f.task_id, pr_num
-                                );
-                                skipped += 1;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "  PR creation error for #{}: {}. Re-checking for existing PR...",
-                            f.task_id, e
-                        );
-                        match gh.get_pr_number(repo, &task.branch).await {
-                            Ok(Some(pr_num)) => {
-                                let _ = store
-                                    .set_fields(
-                                        *store_id,
-                                        &[("pr_number", serde_json::json!(pr_num as i64))],
-                                    )
-                                    .await;
-                                match reopen_and_set_needs_review(
-                                    store, *store_id, &task, backend, gh, repo,
-                                )
-                                .await
-                                {
-                                    Ok(()) => {
-                                        println!(
-                                            "  fixed #{}: PR was present on GitHub as #{} (linked) + reopened + needs_review",
-                                            f.task_id, pr_num
-                                        );
-                                        fixed += 1;
-                                    }
-                                    Err(e2) => {
-                                        eprintln!(
-                                            "  fix failed for #{}: PR #{} linked but status/reopen failed: {e2}",
-                                            f.task_id, pr_num
-                                        );
-                                        skipped += 1;
-                                    }
-                                }
-                            }
-                            Ok(None) => {
-                                eprintln!("  fix failed for #{}: PR creation failed and no PR found for branch", f.task_id);
-                                skipped += 1;
-                            }
-                            Err(err2) => {
-                                eprintln!("  fix failed for #{}: PR creation failed: {}; and PR lookup failed: {}", f.task_id, e, err2);
-                                skipped += 1;
-                            }
-                        }
-                    }
-                }
-            }
-            FixAction::LinkPrAndReopen {
-                store_id,
-                pr_number,
-            } => {
-                let task = store.get(*store_id).await?;
-
-                if dry_run {
-                    println!(
-                        "  {}would link PR #{} + reopen issue + set needs_review for #{}",
-                        prefix, pr_number, f.task_id
-                    );
-                    fixed += 1;
-                    continue;
-                }
-
-                let _ = store
-                    .set_fields(
-                        *store_id,
-                        &[("pr_number", serde_json::json!(*pr_number as i64))],
-                    )
-                    .await;
-                match reopen_and_set_needs_review(store, *store_id, &task, backend, gh, repo).await
-                {
-                    Ok(()) => {
-                        println!(
-                            "  fixed #{}: linked PR #{} + reopened + needs_review",
-                            f.task_id, pr_number
-                        );
-                        fixed += 1;
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "  fix failed for #{}: PR #{} linked but status/reopen failed: {e}",
-                            f.task_id, pr_number
-                        );
-                        skipped += 1;
-                    }
-                }
-            }
             FixAction::LinkPr {
                 store_id,
                 pr_number,
@@ -1644,85 +1278,10 @@ async fn apply_fixes(
     println!("\n{} {}, skipped {}.", action, fixed, skipped);
 
     if !dry_run && skipped > 0 {
-        println!("Use `orch task reopen <id>` to manually recover skipped tasks.");
+        println!("Reported issues with no automatic fix need a new issue or task.");
     }
 
     Ok(())
-}
-
-/// Helper: reopen issue, set status to needs_review, sync labels.
-///
-/// Returns an error if the SQLite status update or the GitHub issue reopen
-/// fails. Backend label sync failures are logged as warnings but do not cause
-/// the function to fail, since they are secondary/cosmetic.
-async fn reopen_and_set_needs_review(
-    store: &Arc<TaskStore>,
-    store_id: i64,
-    task: &Task,
-    backend: &Arc<dyn ExternalBackend>,
-    gh: &GhHttp,
-    repo: &str,
-) -> anyhow::Result<()> {
-    // Update SQLite status — hard failure: without this the task remains in
-    // the wrong state and the next doctor run will attempt the same fix again.
-    store
-        .update_status(store_id, TaskStatus::NeedsReview)
-        .await
-        .context("failed to update task status to NeedsReview in database")?;
-
-    // Reopen issue + sync labels for external tasks
-    if let Some(ref ext_id) = task.external_id {
-        // Hard failure: if the issue stays closed the engine will never pick it up.
-        gh.reopen_issue(repo, ext_id)
-            .await
-            .with_context(|| format!("failed to reopen GitHub issue {ext_id}"))?;
-
-        // Soft failure: label sync is cosmetic; log a warning but don't block.
-        if let Err(e) = backend
-            .update_status(
-                &ExternalId(ext_id.clone()),
-                crate::backends::Status::NeedsReview,
-            )
-            .await
-        {
-            eprintln!(
-                "  warning: backend label sync failed for #{}: {e}",
-                task_label(task)
-            );
-        }
-    }
-
-    Ok(())
-}
-
-/// Create a PR for a task using `gh` CLI (more reliable for auth than API).
-async fn create_pr_for_task(gh: &GhHttp, repo: &str, task: &Task) -> anyhow::Result<u64> {
-    let title = format!("fix: recover work for #{}", task_label(task));
-    let body = format!(
-        "Recovered by `orch service doctor --fix`.\n\nOriginal task: #{}",
-        task_label(task)
-    );
-    let pr_url = gh
-        .create_pr(repo, &title, &body, &task.branch, "main")
-        .await?;
-    // Extract PR number from URL (e.g., ".../pull/123")
-    let pr_num = pr_url
-        .rsplit('/')
-        .next()
-        .and_then(|s| s.parse::<u64>().ok())
-        .context("could not parse PR number from URL")?;
-    Ok(pr_num)
-}
-
-/// Run a git command in a worktree directory, returning success/failure.
-async fn git_cmd(wt: &Path, args: &[&str]) -> bool {
-    tokio::process::Command::new("git")
-        .args(args)
-        .current_dir(wt)
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 fn task_label(task: &Task) -> String {
@@ -1869,5 +1428,101 @@ mod tests {
             collect_valid_external_issue_numbers(tasks.iter(), "owner/repo", "test");
 
         assert_eq!(issue_numbers, vec![42]);
+    }
+}
+
+#[cfg(test)]
+mod done_is_terminal_tests {
+    use super::*;
+    use crate::backends::test_helpers::NoopBackend;
+    use crate::store::{NewTask, TaskStore};
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("git runs")
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    /// `doctor --fix` must leave a done task done, even when its worktree still
+    /// holds uncommitted work. Follow-up work gets a new task (#3780).
+    #[tokio::test]
+    async fn fix_leaves_done_task_status_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path();
+        git(wt, &["init", "-b", "main"]);
+        std::fs::write(wt.join("a.txt"), "a").unwrap();
+        git(wt, &["add", "-A"]);
+        git(wt, &["commit", "-m", "init"]);
+        // Uncommitted change — the state that used to trigger commit + push + needs_review.
+        std::fs::write(wt.join("b.txt"), "b").unwrap();
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let store_id = store
+            .create(&NewTask {
+                external_id: Some("58".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Task".to_string(),
+                body: String::new(),
+                source: "cron".to_string(),
+                source_id: "code-development".to_string(),
+                author: "bot".to_string(),
+                url: String::new(),
+                labels: vec![],
+                parent_id: None,
+            })
+            .await
+            .unwrap();
+        store
+            .set_fields(
+                store_id,
+                &[
+                    ("worktree", serde_json::json!(wt.display().to_string())),
+                    ("branch", serde_json::json!("main")),
+                ],
+            )
+            .await
+            .unwrap();
+        store
+            .update_status(store_id, TaskStatus::Done)
+            .await
+            .unwrap();
+        let task = store.get(store_id).await.unwrap();
+
+        let mut findings = Vec::new();
+        check_dirty_worktree(&task, &mut findings).await;
+        check_unpushed_commits(&task, &mut findings).await;
+        assert!(
+            !findings.is_empty(),
+            "a done task with uncommitted work must still be reported"
+        );
+        for f in &findings {
+            assert!(
+                matches!(f.fix, FixAction::None),
+                "done-task finding must carry no automatic fix: {}",
+                f.message
+            );
+        }
+
+        let backend: Arc<dyn ExternalBackend> = Arc::new(NoopBackend);
+        let gh = GhHttp::new().unwrap();
+        apply_fixes(&findings, &store, "owner/repo", &backend, &gh, false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get(store_id).await.unwrap().status,
+            TaskStatus::Done,
+            "doctor --fix must not move a done task out of done"
+        );
     }
 }
