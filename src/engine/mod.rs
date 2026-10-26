@@ -418,8 +418,6 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
     }
 
     let mut engines = Vec::new();
-    let mut auth_failures = 0usize;
-    let mut network_failures = 0usize;
 
     // Initialize unified task store once — all project engines share the same SQLite file.
     // Creating one pool here avoids N separate connection pools for the same database.
@@ -436,31 +434,17 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
         let backend: Arc<dyn ExternalBackend> =
             Arc::new(crate::backends::github::GitHubBackend::new(repo.clone())?);
 
-        // Health check — verifies network and GitHub authentication
-        if let Err(e) = backend.health_check().await {
-            let err_str = e.to_string();
-            if err_str.contains("401")
-                || err_str.contains("Bad credentials")
-                || err_str.contains("authentication")
-                || err_str.contains("No GitHub token")
-            {
-                auth_failures += 1;
-                tracing::debug!(
-                    repo = %repo,
-                    error = %e,
-                    "GitHub auth failed for {repo} — run `gh auth login`"
-                );
-            } else {
-                network_failures += 1;
-                tracing::debug!(
-                    repo = %repo,
-                    error = %e,
-                    "GitHub unreachable for {repo} (network unavailable?)"
-                );
-            }
-            continue;
+        // A failed health check (rate limit, network, auth) must not drop the project: it would
+        // have no review subscriber until the next restart. Later ticks hit the API again and
+        // retry on their own, so start the engine and warn while the check keeps failing.
+        match backend.health_check().await {
+            Ok(()) => tracing::info!(repo = %repo, backend = backend.name(), "backend connected"),
+            Err(e) => tracing::warn!(
+                repo = %repo,
+                error = %e,
+                "GitHub health check failed for {repo}, starting engine anyway (rate limited, offline or bad credentials?)"
+            ),
         }
-        tracing::info!(repo = %repo, backend = backend.name(), "backend connected");
 
         // Initialize task manager (with unified store)
         let task_manager = Arc::new(TaskManager::with_store(
@@ -480,26 +464,6 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
             runner,
             store: store.clone(),
         });
-    }
-
-    if engines.is_empty() {
-        // Projects are configured but all health checks failed — this is a connectivity
-        // or auth issue, not a configuration problem.  The serve() retry loop will catch
-        // this error and retry with backoff; it must NOT propagate to main() or it would
-        // write "Error: ..." to brew's stderr (orch.error.log) on every restart attempt.
-        if auth_failures > 0 && network_failures == 0 {
-            anyhow::bail!(
-                "GitHub auth failed for all configured projects ({auth_failures} project(s)) — run `gh auth login`"
-            );
-        } else if network_failures > 0 && auth_failures == 0 {
-            anyhow::bail!(
-                "GitHub unreachable for all configured projects ({network_failures} project(s)) — check network connectivity"
-            );
-        } else {
-            anyhow::bail!(
-                "all configured project backends failed health checks ({auth_failures} auth failures, {network_failures} network failures)"
-            );
-        }
     }
 
     Ok(engines)

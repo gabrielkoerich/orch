@@ -1788,12 +1788,11 @@ pub(crate) async fn refire_and_escalate_stale_needs_review_global(
     // Mirrors the per-tick skip in `sync_tick`: if every review agent is currently
     // cooled, re-firing now would waste the refire counter (and risk escalating tasks
     // to Blocked) while the subscriber would only bail again.
-    let all_review_agents_cooled =
-        !router.available_agents.is_empty() && router.healthy_agent_count("review") == 0;
+    let all_review_agents_cooled = router.healthy_agent_count("review") == 0;
     if all_review_agents_cooled {
         tracing::info!(
             count = needs_review_tasks.len(),
-            "global NeedsReview refire sweep: all review agents currently cooled — skipping this pass"
+            "global NeedsReview refire sweep: no review agent available — skipping this pass"
         );
         return Ok(());
     }
@@ -2335,7 +2334,7 @@ pub(crate) async fn sync_tick(
         // any review agent recovers.
         let all_review_agents_cooled = {
             let r = router.read().await;
-            !r.available_agents.is_empty() && r.healthy_agent_count("review") == 0
+            r.healthy_agent_count("review") == 0
         };
         let skip_refires = all_review_agents_cooled && needs_review_count > 0;
         if skip_refires {
@@ -4563,7 +4562,7 @@ mod tests {
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
-        let router = Arc::new(RwLock::new(crate::engine::router::Router::from_config()));
+        let router = Arc::new(RwLock::new(reviewer_router()));
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let auto_merge_in_flight: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
@@ -4692,6 +4691,16 @@ mod tests {
         assert_eq!(after.status, crate::store::TaskStatus::NeedsReview);
     }
 
+    /// Router with one claude review model, so the refire sweeps see a reviewer.
+    fn reviewer_router() -> crate::engine::router::Router {
+        let mut config = crate::engine::router::RouterConfig::default();
+        config.model_map.insert(
+            "review".to_string(),
+            std::collections::HashMap::from([("claude".to_string(), vec!["sonnet".to_string()])]),
+        );
+        crate::engine::router::Router::new_for_test(config, vec!["claude".to_string()])
+    }
+
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn needs_review_escalates_to_blocked_after_max_refires() {
@@ -4704,7 +4713,7 @@ mod tests {
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
-        let router = Arc::new(RwLock::new(crate::engine::router::Router::from_config()));
+        let router = Arc::new(RwLock::new(reviewer_router()));
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let auto_merge_in_flight: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
@@ -4774,7 +4783,7 @@ mod tests {
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
-        let router = Arc::new(RwLock::new(crate::engine::router::Router::from_config()));
+        let router = Arc::new(RwLock::new(reviewer_router()));
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let auto_merge_in_flight: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
@@ -5012,6 +5021,61 @@ mod tests {
             "counter must not be touched while cooled"
         );
         assert_eq!(task.status, crate::store::TaskStatus::NeedsReview);
+    }
+
+    /// With no available review agent at all, the sweep must not count re-fires
+    /// or escalate to Blocked.
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn global_refire_sweep_skips_when_no_reviewer_available() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            store.clone(),
+            "active/repo".to_string(),
+        ));
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+        let router = crate::engine::router::Router::new_for_test(
+            crate::engine::router::RouterConfig::default(),
+            vec![],
+        );
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "some/repo",
+                ext_id: "495",
+                title: "needs_review with no reviewer",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::NeedsReview)
+            .await
+            .unwrap();
+        store
+            .set_fields(id, &[("needs_review_refires", serde_json::json!(5))])
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        refire_and_escalate_stale_needs_review_global(&task_manager, &store, &router, &dispatching)
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.status, crate::store::TaskStatus::NeedsReview);
+        assert_eq!(task.needs_review_refires, 5);
     }
 
     /// Regression test for #3499: a task blocked with the rebroadcast-escalation
