@@ -15,3 +15,6 @@ opencode.json
 tasks.yml
 tasks.yml.lock*
 .DS_Store
+
+# git cow keeps its warm checkout here
+.git-cow/
