@@ -2119,7 +2119,20 @@ pub(crate) async fn sync_tick(
             // review agent to start its tmux session before treating it as stale.
             // A task is only considered stale if it has been in InReview for > 1 minute.
             const MIN_STALE_MINUTES: i64 = 1;
-            match chrono::DateTime::parse_from_rfc3339(&task.external.updated_at) {
+            // review_poll rewrites the row on every pass, so updated_at never ages. Age from
+            // the in_review entry, and leave a task alone once its review has a decision
+            let entered_at = match store.in_review_entry(task.stored.id).await {
+                Ok(Some((_, true))) => {
+                    tracing::debug!(
+                        task_id = task.task_id(),
+                        "InReview task already has a review decision, waiting on merge"
+                    );
+                    continue;
+                }
+                Ok(Some((entered_at, false))) => entered_at,
+                Ok(None) | Err(_) => task.external.updated_at.clone(),
+            };
+            match chrono::DateTime::parse_from_rfc3339(&entered_at) {
                 Ok(updated_at) => {
                     let age = chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc);
                     if age.num_minutes() < MIN_STALE_MINUTES {
@@ -2134,9 +2147,9 @@ pub(crate) async fn sync_tick(
                 Err(e) => {
                     tracing::warn!(
                         task_id = task.task_id(),
-                        ts = %task.external.updated_at,
+                        ts = %entered_at,
                         err = %e,
-                        "invalid updated_at timestamp — treating task as potentially stale"
+                        "invalid in_review timestamp — treating task as potentially stale"
                     );
                 }
             }
@@ -4486,9 +4499,7 @@ mod tests {
 
     /// An InReview task with no tmux session should be reset to NeedsReview
     /// regardless of review_session_expected — the review agent is dead.
-    #[serial(cooldown_state)]
-    #[tokio::test]
-    async fn stale_in_review_recovery_resets_orphaned_task_without_session() {
+    async fn stale_in_review_status_after_sync(with_decision: bool) -> crate::store::TaskStatus {
         crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
@@ -4523,12 +4534,29 @@ mod tests {
             .set_fields(id, &[("branch", serde_json::json!("feature/55"))])
             .await
             .unwrap();
-        // Make it old enough to be considered stale (>2 min)
-        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
-            .bind(id)
-            .execute(store.pool())
-            .await
-            .unwrap();
+        // Entered in_review long ago. updated_at stays fresh, as review_poll rewrites it
+        sqlx::query(
+            "UPDATE task_activity SET timestamp = '2020-01-01T00:00:00Z'
+             WHERE task_id = ? AND to_status = 'in_review'",
+        )
+        .bind(id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        if with_decision {
+            crate::store::store_log_activity(
+                &Some(store.clone()),
+                "owner/repo",
+                "55",
+                "review_decision",
+                None,
+                None,
+                None::<&str>,
+                None::<&str>,
+                Some(&serde_json::json!({"decision": "approve"})),
+            )
+            .await;
+        }
 
         sync_tick(
             &backend,
@@ -4544,9 +4572,26 @@ mod tests {
         .await
         .unwrap();
 
-        // Should be reset to NeedsReview since no tmux session exists
-        let task = store.get(id).await.unwrap();
-        assert_eq!(task.status, crate::store::TaskStatus::NeedsReview);
+        store.get(id).await.unwrap().status
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn stale_in_review_recovery_resets_orphaned_task_without_session() {
+        // No reviewer session and no review decision since entering in_review
+        assert_eq!(
+            stale_in_review_status_after_sync(false).await,
+            crate::store::TaskStatus::NeedsReview
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn stale_in_review_recovery_leaves_decided_task_waiting_on_merge() {
+        assert_eq!(
+            stale_in_review_status_after_sync(true).await,
+            crate::store::TaskStatus::InReview
+        );
     }
 
     #[serial(cooldown_state)]
