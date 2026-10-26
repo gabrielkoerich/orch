@@ -4,9 +4,7 @@ use crate::cmd::SyncCommandErrorContext;
 use crate::config;
 use crate::engine::router::Router;
 use crate::engine::runner::TaskRunner;
-use crate::engine::tasks::{
-    parse_internal_id, status_to_task_status, CreateTaskRequest, Task, TaskFilter, TaskType,
-};
+use crate::engine::tasks::{status_to_task_status, CreateTaskRequest, Task, TaskFilter, TaskType};
 use crate::home;
 use crate::store;
 use crate::store::TaskStore;
@@ -160,6 +158,29 @@ async fn refuse_external_claim(
         crate::engine::dependencies::refuse_if_waiting(store, id).await?;
     }
     Ok(())
+}
+
+fn current_repo_opt() -> Option<String> {
+    config::get_current_repo()
+        .ok()
+        .filter(|repo| !repo.is_empty())
+}
+
+async fn resolve_cli_task(store: &TaskStore, id: &str) -> anyhow::Result<store::CliTaskRef> {
+    let current_repo = current_repo_opt();
+    if let Some(task) = store.resolve_cli_id(id, current_repo.as_deref()).await? {
+        return Ok(task);
+    }
+    match store::parse_cli_task_spec(id)? {
+        store::CliTaskSpec::Issue { repo, number } => {
+            Ok(store::CliTaskRef::unsynced_issue(repo, number))
+        }
+        store::CliTaskSpec::Bare(number) => {
+            let repo = current_repo.ok_or_else(|| anyhow::anyhow!("task not found: {id}"))?;
+            Ok(store::CliTaskRef::unsynced_issue(repo, number))
+        }
+        store::CliTaskSpec::Internal(_) => anyhow::bail!("internal task '{id}' not found"),
+    }
 }
 
 /// True when the task still has an open dependency and must stay `waiting`.
@@ -500,137 +521,141 @@ async fn link_created_dependencies(
 }
 
 /// Get task details by ID.
-pub async fn get(id: i64) -> anyhow::Result<()> {
-    let task_manager = init_task_manager().await?;
-    let task = task_manager.get_task(id).await?;
+pub async fn get(id: &str) -> anyhow::Result<()> {
+    use crate::backends::github::GitHubBackend;
+    use crate::engine::tasks::store_task_to_external;
 
-    let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
-    let repo = config::get_current_repo().unwrap_or_default();
+    let store = crate::cli::init_store().await?;
+    let resolved = resolve_cli_task(&store, id).await?;
+    let store_arc: Option<Arc<TaskStore>> = Some(Arc::new(store.clone()));
+    let repo = resolved.repo.clone();
 
-    match task {
-        Task::External(ext) => {
-            println!("ID: {} (external)", ext.id.0);
-            println!("Title: {}", ext.title);
-            println!("State: {}", ext.state);
-            println!("Labels: {}", ext.labels.join(", "));
-            println!("Author: {}", ext.author);
-            println!("URL: {}", ext.url);
-            println!("Created: {}", ext.created_at);
-            println!("Updated: {}", ext.updated_at);
-
-            // Load all store fields in a single DB round-trip.
-            if let Some(ref s) = store {
-                if let Ok(Some(t)) = s.get_by_external_id(&repo, &ext.id.0).await {
-                    if let Some(ref agent) = t.agent {
-                        println!("Agent: {}", agent);
-                    }
-                    if let Some(ref model) = t.model {
-                        println!("Model: {}", model);
-                    }
-                    if !t.complexity.is_empty() {
-                        println!("Complexity: {}", t.complexity);
-                    }
-                    if t.route_attempts > 0 {
-                        println!("Route attempts: {}", t.route_attempts);
-                    }
-                    if t.attempts > 0 {
-                        println!("Attempts: {}", t.attempts);
-                    }
-                    if t.review_cycles > 0 {
-                        println!("Review cycles: {}", t.review_cycles);
-                    }
-                    if let Some(pr) = t.pr_number {
-                        if pr > 0 {
-                            println!("PR: #{}", pr);
-                        }
-                    }
-                    if !t.branch.is_empty() {
-                        println!("Branch: {}", t.branch);
-                    }
-                    if !t.last_error.is_empty() {
-                        println!("Last error: {}", truncate_err(&t.last_error, 200));
-                    }
-                    if t.status == crate::store::TaskStatus::Waiting {
-                        let blockers = s.unmet_blocker_labels(t.id).await.unwrap_or_default();
-                        if !blockers.is_empty() {
-                            println!("Waiting on: {}", blockers.join(", "));
-                        }
-                    }
-                }
-            }
-            // Cost summary (if any tokens recorded)
-            let usage = store::get_token_usage(&store, &repo, &ext.id.0).await;
-            let cost = store::get_cost_estimate(&store, &repo, &ext.id.0).await;
-            if usage.total_tokens() > 0 || cost.total_cost_usd > 0.0 {
-                println!(
-                    "Tokens: {} in / {} out — ${:.6}",
-                    usage.input_tokens, usage.output_tokens, cost.total_cost_usd
-                );
-            }
-
-            println!("\n{}", ext.body);
+    if resolved.is_internal() {
+        let store_id = resolved
+            .store_id
+            .context("internal task missing store id")?;
+        let int = store.get(store_id).await?;
+        println!("ID: {} (internal)", int.id);
+        println!("Title: {}", int.title);
+        println!("Status: {}", int.status.as_str());
+        println!("Source: {}", int.source);
+        if let Some(model) = &int.model {
+            println!("Model: {}", model);
         }
-        Task::Internal(int) => {
-            println!("ID: {} (internal)", int.id);
-            println!("Title: {}", int.title);
-            println!("Status: {}", int.status.as_str());
-            println!("Source: {}", int.source);
-            if let Some(model) = &int.model {
+        if !int.complexity.is_empty() {
+            println!("Complexity: {}", int.complexity);
+        }
+        if let Some(reason) = &int.block_reason {
+            println!("Block reason: {}", reason);
+        }
+        if int.status == crate::store::TaskStatus::Waiting {
+            let blockers = store.unmet_blocker_labels(int.id).await.unwrap_or_default();
+            if !blockers.is_empty() {
+                println!("Waiting on: {}", blockers.join(", "));
+            }
+        }
+        if int.route_attempts > 0 {
+            println!("Route attempts: {}", int.route_attempts);
+        }
+        if int.attempts > 0 {
+            println!("Attempts: {}", int.attempts);
+        }
+        if int.review_cycles > 0 {
+            println!("Review cycles: {}", int.review_cycles);
+        }
+        if let Some(pr) = int.pr_number {
+            println!("PR: #{}", pr);
+        }
+        if !int.branch.is_empty() {
+            println!("Branch: {}", int.branch);
+        }
+        if !int.last_error.is_empty() {
+            let err = truncate_err(&int.last_error, 200);
+            println!("Last error: {}", err);
+        }
+        if let Some(parent) = int.parent_id {
+            println!("Parent: internal:{}", parent);
+        }
+        if int.input_tokens > 0 || int.output_tokens > 0 {
+            println!(
+                "Tokens: {} in / {} out — ${:.6}",
+                int.input_tokens, int.output_tokens, int.total_cost_usd
+            );
+        }
+        println!("Created: {}", int.created_at);
+        println!("Updated: {}", int.updated_at);
+        println!("\n{}", int.body);
+        return Ok(());
+    }
+
+    let ext_id = ExternalId(resolved.external_id.clone());
+    let backend = GitHubBackend::new(repo.clone())?;
+    let ext = match backend.get_task(&ext_id).await {
+        Ok(ext) => ext,
+        Err(err) => match resolved.store_id {
+            Some(store_id) => store_task_to_external(&store.get(store_id).await?),
+            None => return Err(err),
+        },
+    };
+
+    println!("ID: {} (external)", ext.id.0);
+    println!("Title: {}", ext.title);
+    println!("State: {}", ext.state);
+    println!("Labels: {}", ext.labels.join(", "));
+    println!("Author: {}", ext.author);
+    println!("URL: {}", ext.url);
+    println!("Created: {}", ext.created_at);
+    println!("Updated: {}", ext.updated_at);
+
+    if let Some(ref s) = store_arc {
+        if let Ok(Some(t)) = s.get_by_external_id(&repo, &ext.id.0).await {
+            if let Some(ref agent) = t.agent {
+                println!("Agent: {}", agent);
+            }
+            if let Some(ref model) = t.model {
                 println!("Model: {}", model);
             }
-            if !int.complexity.is_empty() {
-                println!("Complexity: {}", int.complexity);
+            if !t.complexity.is_empty() {
+                println!("Complexity: {}", t.complexity);
             }
-            if let Some(reason) = &int.block_reason {
-                println!("Block reason: {}", reason);
+            if t.route_attempts > 0 {
+                println!("Route attempts: {}", t.route_attempts);
             }
-            if int.status == crate::store::TaskStatus::Waiting {
-                if let Some(ref s) = store {
-                    let blockers = s.unmet_blocker_labels(int.id).await.unwrap_or_default();
-                    if !blockers.is_empty() {
-                        println!("Waiting on: {}", blockers.join(", "));
-                    }
+            if t.attempts > 0 {
+                println!("Attempts: {}", t.attempts);
+            }
+            if t.review_cycles > 0 {
+                println!("Review cycles: {}", t.review_cycles);
+            }
+            if let Some(pr) = t.pr_number {
+                if pr > 0 {
+                    println!("PR: #{}", pr);
                 }
             }
-            // Routing & execution counters
-            if int.route_attempts > 0 {
-                println!("Route attempts: {}", int.route_attempts);
+            if !t.branch.is_empty() {
+                println!("Branch: {}", t.branch);
             }
-            if int.attempts > 0 {
-                println!("Attempts: {}", int.attempts);
+            if !t.last_error.is_empty() {
+                println!("Last error: {}", truncate_err(&t.last_error, 200));
             }
-            if int.review_cycles > 0 {
-                println!("Review cycles: {}", int.review_cycles);
+            if t.status == crate::store::TaskStatus::Waiting {
+                let blockers = s.unmet_blocker_labels(t.id).await.unwrap_or_default();
+                if !blockers.is_empty() {
+                    println!("Waiting on: {}", blockers.join(", "));
+                }
             }
-            // PR info
-            if let Some(pr) = int.pr_number {
-                println!("PR: #{}", pr);
-            }
-            // Branch / worktree
-            if !int.branch.is_empty() {
-                println!("Branch: {}", int.branch);
-            }
-            // Last error (truncated to 200 chars)
-            if !int.last_error.is_empty() {
-                let err = truncate_err(&int.last_error, 200);
-                println!("Last error: {}", err);
-            }
-            // Parent
-            if let Some(parent) = int.parent_id {
-                println!("Parent: internal:{}", parent);
-            }
-            // Cost summary (if any tokens recorded)
-            if int.input_tokens > 0 || int.output_tokens > 0 {
-                println!(
-                    "Tokens: {} in / {} out — ${:.6}",
-                    int.input_tokens, int.output_tokens, int.total_cost_usd
-                );
-            }
-            println!("Created: {}", int.created_at);
-            println!("Updated: {}", int.updated_at);
-            println!("\n{}", int.body);
         }
     }
+    let usage = store::get_token_usage(&store_arc, &repo, &ext.id.0).await;
+    let cost = store::get_cost_estimate(&store_arc, &repo, &ext.id.0).await;
+    if usage.total_tokens() > 0 || cost.total_cost_usd > 0.0 {
+        println!(
+            "Tokens: {} in / {} out — ${:.6}",
+            usage.input_tokens, usage.output_tokens, cost.total_cost_usd
+        );
+    }
+
+    println!("\n{}", ext.body);
 
     Ok(())
 }
@@ -808,38 +833,56 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
 }
 
 /// Route a task to an agent.
-pub async fn route(id: i64) -> anyhow::Result<()> {
+pub async fn route(id: &str) -> anyhow::Result<()> {
     use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
+    use crate::engine::tasks::store_task_to_external;
+    use crate::store::TaskStatus;
 
-    let repo =
-        config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
-    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
     let store: Arc<TaskStore> = Arc::new(crate::cli::init_store().await?);
+    let resolved = resolve_cli_task(&store, id).await?;
+    let repo = resolved.repo.clone();
+    let ext_id = ExternalId(resolved.external_id.clone());
 
-    let ext_id = ExternalId(id.to_string());
-    let task = backend.get_task(&ext_id).await?;
-    refuse_external_claim(&store, &repo, &ext_id.0).await?;
+    let (task, backend) = if resolved.is_internal() {
+        let store_id = resolved
+            .store_id
+            .context("internal task missing store id")?;
+        crate::engine::dependencies::refuse_if_waiting(&store, store_id).await?;
+        (
+            store_task_to_external(&store.get(store_id).await?),
+            None::<Arc<dyn ExternalBackend>>,
+        )
+    } else {
+        let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
+        refuse_external_claim(&store, &repo, &ext_id.0).await?;
+        (backend.get_task(&ext_id).await?, Some(backend))
+    };
 
     let mut router = Router::from_config();
     let result = router.route(&task, &store, &repo).await?;
 
-    // Store route result
     router
         .store_route_result(&ext_id.0, &result, &store, &repo)
         .await?;
 
-    // Set labels
-    let labels = vec![
-        format!("agent:{}", result.agent),
-        format!("complexity:{}", result.complexity),
-    ];
-    backend.set_labels(&ext_id, &labels).await?;
-    update_status_store_first(&Some(store), &backend, &repo, &ext_id, Status::Routed).await?;
+    if let Some(backend) = backend {
+        let labels = vec![
+            format!("agent:{}", result.agent),
+            format!("complexity:{}", result.complexity),
+        ];
+        backend.set_labels(&ext_id, &labels).await?;
+        update_status_store_first(&Some(store), &backend, &repo, &ext_id, Status::Routed).await?;
+    } else if let Some(store_id) = resolved.store_id {
+        store.update_status(store_id, TaskStatus::Routed).await?;
+    }
 
     println!(
-        "Routed task #{} → {} (complexity: {}, reason: {})",
-        id, result.agent, result.complexity, result.reason
+        "Routed task {} → {} (complexity: {}, reason: {})",
+        resolved.display_spec(),
+        result.agent,
+        result.complexity,
+        result.reason
     );
 
     Ok(())
@@ -850,19 +893,26 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
     use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
     use crate::engine::router::get_route_result;
+    use crate::store::TaskStatus;
 
-    let repo =
-        config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
-    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
     let store: Arc<TaskStore> = Arc::new(crate::cli::init_store().await?);
 
-    // Resolve task ID
-    let task_id = match id {
-        Some(id) => id,
+    let (repo, task_id, backend) = match id {
+        Some(id) => {
+            let resolved = resolve_cli_task(&store, &id).await?;
+            let backend: Option<Arc<dyn ExternalBackend>> = if resolved.is_internal() {
+                None
+            } else {
+                Some(Arc::new(GitHubBackend::new(resolved.repo.clone())?))
+            };
+            (resolved.repo, resolved.external_id, backend)
+        }
         None => {
-            // Find next routed task
+            let repo = config::get_current_repo()
+                .context("'repo' not set — ensure .orch.yml has gh.repo")?;
+            let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
             let routed = backend.list_by_status(Status::Routed).await?;
-            if let Some(task) = routed.first() {
+            let task_id = if let Some(task) = routed.first() {
                 task.id.0.clone()
             } else {
                 let new = backend.list_by_status(Status::New).await?;
@@ -871,11 +921,11 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
                 } else {
                     anyhow::bail!("no runnable tasks found");
                 }
-            }
+            };
+            (repo, task_id, Some(backend))
         }
     };
 
-    // Get routing info
     let route_result = get_route_result(&store, &repo, &task_id).await.ok();
     let agent = route_result.as_ref().map(|r| r.agent.clone());
     let model = route_result.as_ref().and_then(|r| r.model.clone());
@@ -889,26 +939,30 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
 
     refuse_external_claim(&store, &repo, &task_id).await?;
 
-    // Mark in progress
     let ext_id = ExternalId(task_id.clone());
     let started_at = Utc::now();
-    update_status_store_first(
-        &Some(store.clone()),
-        &backend,
-        &repo,
-        &ext_id,
-        Status::InProgress,
-    )
-    .await?;
+    if let Some(ref backend) = backend {
+        update_status_store_first(
+            &Some(store.clone()),
+            backend,
+            &repo,
+            &ext_id,
+            Status::InProgress,
+        )
+        .await?;
+    } else if let Some(store_id) = store.resolve_task_id(&repo, &task_id).await? {
+        store
+            .update_status(store_id, TaskStatus::InProgress)
+            .await?;
+    }
 
-    // Run via TaskRunner (with store for audit trail + token tracking)
     let runner = TaskRunner::new(repo).with_store(store);
     runner
         .run(
             &task_id,
             agent.as_deref(),
             model.as_deref(),
-            Some(&*backend),
+            backend.as_deref(),
             &started_at,
         )
         .await?;
@@ -921,94 +975,43 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
 ///
 /// When `agent` is provided, the task is force-routed to that agent/model and
 /// set directly to `Routed` status, bypassing the router entirely.
-pub async fn retry(id: i64, agent: Option<String>, model: Option<String>) -> anyhow::Result<()> {
+pub async fn retry(id: &str, agent: Option<String>, model: Option<String>) -> anyhow::Result<()> {
     use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
     use crate::store::TaskStatus;
 
-    let store = crate::cli::init_store().await.ok().map(std::sync::Arc::new);
-    let mut repo = config::get_current_repo().unwrap_or_default();
+    let s = Arc::new(crate::cli::init_store().await?);
+    let resolved = resolve_cli_task(&s, id).await?;
+    let store = Some(s.clone());
+    let repo = resolved.repo.clone();
+    let shown = resolved.display_spec();
 
-    // Check if this is an internal task in the store.
-    if let Some(ref s) = store {
-        if let Ok(task) = s.get(id).await {
-            if task.origin == "internal" {
-                crate::engine::dependencies::refuse_if_waiting(s, id).await?;
-                let internal_id = task
-                    .external_id
-                    .unwrap_or_else(|| format!("internal:{}", task.id));
-                // Reset store counters
-                store::store_reset_counters(&store, &repo, &internal_id).await;
+    if resolved.is_internal() {
+        let store_id = resolved
+            .store_id
+            .context("internal task missing store id")?;
+        crate::engine::dependencies::refuse_if_waiting(&s, store_id).await?;
+        store::store_reset_counters(&store, &repo, &resolved.external_id).await;
 
-                if let Some(ref forced_agent) = agent {
-                    // Force-route: set agent/model and go straight to Routed.
-                    let fields: Vec<(&str, serde_json::Value)> = {
-                        let mut f = vec![
-                            ("agent", serde_json::json!(forced_agent)),
-                            (
-                                "route_reason",
-                                serde_json::json!(format!(
-                                    "forced via retry --agent {forced_agent}"
-                                )),
-                            ),
-                        ];
-                        if let Some(ref m) = model {
-                            f.push(("model", serde_json::json!(m)));
-                        }
-                        f
-                    };
-                    s.set_fields(id, &fields).await?;
-                    s.update_status(id, TaskStatus::Routed).await?;
-                    let model_hint = model.as_deref().unwrap_or("(router default)");
-                    println!(
-                        "Task #{} force-routed to {}:{} (set to routed, dispatches on next tick)",
-                        id, forced_agent, model_hint
-                    );
-                } else {
-                    // Reset status to New (re-routes normally)
-                    s.update_status(id, TaskStatus::New).await?;
-                    println!(
-                        "Task #{} reset to new (attempts reset, will be re-routed)",
-                        id
-                    );
-                }
-                return Ok(());
-            }
+        if let Some(ref forced_agent) = agent {
+            let fields = retry_force_fields(forced_agent, model.as_deref());
+            s.set_fields(store_id, &fields).await?;
+            s.update_status(store_id, TaskStatus::Routed).await?;
+            let model_hint = model.as_deref().unwrap_or("(router default)");
+            println!(
+                "Task {shown} force-routed to {forced_agent}:{model_hint} (set to routed, dispatches on next tick)"
+            );
+        } else {
+            s.update_status(store_id, TaskStatus::New).await?;
+            println!("Task {shown} reset to new (attempts reset, will be re-routed)");
         }
-    }
-
-    // If we still don't have a repo context, try to get the task from the store
-    // as an external task to determine its repo
-    if repo.is_empty() {
-        if let Some(ref s) = store {
-            // Get all tasks from the store and find the one matching our external ID
-            if let Ok(all_tasks) = s.list_all_active_global().await {
-                for task in all_tasks {
-                    if let Some(ref external_id) = task.external_id {
-                        if external_id == &id.to_string() {
-                            // We found the task in the store, use its repo
-                            repo = task.repo.clone();
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // If we still don't have a repo, we cannot proceed
-    if repo.is_empty() {
-        anyhow::bail!("cannot determine repository for task #{} - ensure .orch.yml is present or task exists in store", id);
+        return Ok(());
     }
 
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
+    let ext_id = ExternalId(resolved.external_id.clone());
+    refuse_external_claim(&s, &repo, &ext_id.0).await?;
 
-    let ext_id = ExternalId(id.to_string());
-    if let Some(ref s) = store {
-        refuse_external_claim(s, &repo, &ext_id.0).await?;
-    }
-
-    // Remove existing agent labels
     let task = backend.get_task(&ext_id).await?;
     for label in &task.labels {
         if label.starts_with("agent:") {
@@ -1016,60 +1019,46 @@ pub async fn retry(id: i64, agent: Option<String>, model: Option<String>) -> any
         }
     }
 
-    // Reset store state (attempts + all failure counters)
     store::store_reset_counters(&store, &repo, &ext_id.0).await;
 
     if let Some(ref forced_agent) = agent {
-        // Force-route: add agent label, store agent/model, set to Routed.
         backend
             .set_labels(&ext_id, &[format!("agent:{forced_agent}")])
             .await?;
 
-        if let Some(ref s) = store {
-            if let Ok(Some(store_id)) = s.resolve_task_id(&repo, &ext_id.0).await {
-                let fields: Vec<(&str, serde_json::Value)> = {
-                    let mut f = vec![
-                        ("agent", serde_json::json!(forced_agent)),
-                        (
-                            "route_reason",
-                            serde_json::json!(format!("forced via retry --agent {forced_agent}")),
-                        ),
-                    ];
-                    if let Some(ref m) = model {
-                        f.push(("model", serde_json::json!(m)));
-                    }
-                    f
-                };
-                s.set_fields(store_id, &fields).await?;
-            }
+        if let Some(store_id) = resolved.store_id {
+            let fields = retry_force_fields(forced_agent, model.as_deref());
+            s.set_fields(store_id, &fields).await?;
         }
 
         update_status_store_first(&store, &backend, &repo, &ext_id, Status::Routed).await?;
-
         let model_hint = model.as_deref().unwrap_or("(router default)");
         println!(
-            "Task #{} force-routed to {}:{} (set to routed, dispatches on next tick)",
-            id, forced_agent, model_hint
+            "Task {shown} force-routed to {forced_agent}:{model_hint} (set to routed, dispatches on next tick)"
         );
     } else {
-        // Reset to new (re-routes normally)
         update_status_store_first(&store, &backend, &repo, &ext_id, Status::New).await?;
-        println!(
-            "Task #{} reset to new (attempts reset, will be re-routed)",
-            id
-        );
+        println!("Task {shown} reset to new (attempts reset, will be re-routed)");
     }
 
     Ok(())
 }
 
-async fn reset_counters(
-    id: i64,
-    store: &Option<std::sync::Arc<crate::store::TaskStore>>,
-    repo: &str,
-) {
-    let internal_id = format!("internal:{}", id);
-    store::store_reset_counters(store, repo, &internal_id).await;
+fn retry_force_fields<'a>(
+    forced_agent: &'a str,
+    model: Option<&'a str>,
+) -> Vec<(&'a str, serde_json::Value)> {
+    let mut fields = vec![
+        ("agent", serde_json::json!(forced_agent)),
+        (
+            "route_reason",
+            serde_json::json!(format!("forced via retry --agent {forced_agent}")),
+        ),
+    ];
+    if let Some(model) = model {
+        fields.push(("model", serde_json::json!(model)));
+    }
+    fields
 }
 
 /// Unblock a task or all blocked tasks.
@@ -1078,12 +1067,11 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
     use crate::backends::ExternalBackend;
     use crate::store::TaskStatus;
 
-    let repo =
-        config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
-    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
-    let store = crate::cli::init_store().await.ok().map(std::sync::Arc::new);
-
     if id == "all" {
+        let repo =
+            config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
+        let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
+        let store = crate::cli::init_store().await.ok().map(std::sync::Arc::new);
         let blocked = backend.list_by_status(Status::Blocked).await?;
         let needs_review = backend.list_by_status(Status::NeedsReview).await?;
 
@@ -1160,59 +1148,38 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Try to resolve as a store task (internal or external)
-    if let Some(ref s) = store {
-        if let Some(stripped) = id.strip_prefix("internal:") {
-            let parsed = stripped
-                .parse::<i64>()
-                .with_context(|| format!("internal task id '{}' is not numeric", stripped))?;
-            if let Ok(Some(store_id)) = s.resolve_task_id(&repo, id).await {
-                reset_counters(store_id, &store, &repo).await;
-                if release_or_keep_waiting(s, store_id).await? {
-                    println!("Task #{parsed} stays waiting on an open dependency");
-                } else {
-                    s.update_status(store_id, TaskStatus::New).await?;
-                    println!(
-                        "Unblocked internal task #{} (attempts reset, will be re-routed)",
-                        parsed
-                    );
-                }
-                return Ok(());
-            }
-        }
+    let s = Arc::new(crate::cli::init_store().await?);
+    let resolved = resolve_cli_task(&s, id).await?;
+    let store = Some(s.clone());
+    let repo = resolved.repo.clone();
+    let shown = resolved.display_spec();
 
-        if let Ok(parsed) = id.parse::<i64>() {
-            if let Ok(task) = s.get(parsed).await {
-                if task.origin == "internal" {
-                    reset_counters(parsed, &store, &repo).await;
-                    if release_or_keep_waiting(s, parsed).await? {
-                        println!("Task #{parsed} stays waiting on an open dependency");
-                    } else {
-                        s.update_status(parsed, TaskStatus::New).await?;
-                        println!(
-                            "Unblocked internal task #{} (attempts reset, will be re-routed)",
-                            parsed
-                        );
-                    }
-                    return Ok(());
-                }
-            }
+    if resolved.is_internal() {
+        let store_id = resolved
+            .store_id
+            .context("internal task missing store id")?;
+        store::store_reset_counters(&store, &repo, &resolved.external_id).await;
+        if release_or_keep_waiting(&s, store_id).await? {
+            println!("Task {shown} stays waiting on an open dependency");
+        } else {
+            s.update_status(store_id, TaskStatus::New).await?;
+            println!("Unblocked {shown} (attempts reset, will be re-routed)");
         }
+        return Ok(());
     }
 
-    let ext_id = ExternalId(id.to_string());
+    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
+    let ext_id = ExternalId(resolved.external_id.clone());
     store::store_reset_counters(&store, &repo, &ext_id.0).await;
-    if let Some(ref s) = store {
-        if let Ok(Some(store_id)) = s.resolve_task_id(&repo, &ext_id.0).await {
-            if release_or_keep_waiting(s, store_id).await? {
-                let _ = backend.update_status(&ext_id, Status::Waiting).await;
-                println!("Task #{id} stays waiting on an open dependency");
-                return Ok(());
-            }
+    if let Some(store_id) = resolved.store_id {
+        if release_or_keep_waiting(&s, store_id).await? {
+            let _ = backend.update_status(&ext_id, Status::Waiting).await;
+            println!("Task {shown} stays waiting on an open dependency");
+            return Ok(());
         }
     }
     update_status_store_first(&store, &backend, &repo, &ext_id, Status::New).await?;
-    println!("Unblocked task #{} (attempts reset)", id);
+    println!("Unblocked {shown} (attempts reset)");
 
     Ok(())
 }
@@ -1278,53 +1245,32 @@ pub async fn close(id: &str, note: Option<&str>) -> anyhow::Result<()> {
     use crate::backends::ExternalBackend;
     use crate::store::TaskStatus;
 
-    let repo = config::get_current_repo().unwrap_or_default();
-    let store = crate::cli::init_store().await.ok().map(std::sync::Arc::new);
+    let s = crate::cli::init_store().await?;
+    let resolved = resolve_cli_task(&s, id).await?;
+    let store = Some(Arc::new(s.clone()));
+    let repo = resolved.repo.clone();
+    let shown = resolved.display_spec();
 
-    // Handle internal: prefix
-    if let Some(stripped) = id.strip_prefix("internal:") {
-        let parsed = stripped
-            .parse::<i64>()
-            .with_context(|| format!("internal task id '{}' is not numeric", stripped))?;
-        if let Some(ref s) = store {
-            if let Ok(Some(store_id)) = s.resolve_task_id(&repo, id).await {
-                s.update_status(store_id, TaskStatus::Done).await?;
-                println!("Closed internal task #{} (marked done)", parsed);
-                cleanup_sessions_and_worktree(id, &repo, &store).await;
-                return Ok(());
-            }
-        }
-        anyhow::bail!("internal task '{}' not found", id);
+    if resolved.is_internal() {
+        let store_id = resolved
+            .store_id
+            .context("internal task missing store id")?;
+        s.update_status(store_id, TaskStatus::Done).await?;
+        println!("Closed {shown} (marked done)");
+        cleanup_sessions_and_worktree(&resolved.external_id, &repo, &store).await;
+        return Ok(());
     }
 
-    // Try numeric: check store first (may be internal)
-    if let Ok(parsed) = id.parse::<i64>() {
-        if let Some(ref s) = store {
-            if let Ok(task) = s.get(parsed).await {
-                if task.origin == "internal" {
-                    s.update_status(parsed, TaskStatus::Done).await?;
-                    println!("Closed internal task #{} (marked done)", parsed);
-                    cleanup_sessions_and_worktree(id, &repo, &store).await;
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    // External (GitHub) task
-    let backend: Arc<dyn ExternalBackend> = Arc::new(
-        GitHubBackend::new(repo.clone())
-            .context("'repo' not set — ensure .orch.yml has gh.repo")?,
-    );
-    let ext_id = ExternalId(id.to_string());
+    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
+    let ext_id = ExternalId(resolved.external_id.clone());
 
     if let Some(text) = note {
         backend.post_comment(&ext_id, text).await?;
     }
 
     update_status_store_first(&store, &backend, &repo, &ext_id, Status::Done).await?;
-    println!("Closed task #{} (marked done)", id);
-    cleanup_sessions_and_worktree(id, &repo, &store).await;
+    println!("Closed {shown} (marked done)");
+    cleanup_sessions_and_worktree(&resolved.external_id, &repo, &store).await;
     Ok(())
 }
 
@@ -1340,81 +1286,37 @@ pub async fn reopen(id: &str) -> anyhow::Result<()> {
     use crate::github::http::GhHttp;
     use crate::store::TaskStatus;
 
-    let repo =
-        config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
-    let store = crate::cli::init_store().await.ok().map(std::sync::Arc::new);
+    let s = crate::cli::init_store().await?;
+    let resolved = resolve_cli_task(&s, id).await?;
+    let store_id = resolved
+        .store_id
+        .ok_or_else(|| anyhow::anyhow!("task '{id}' not found in store"))?;
+    let task = s.get(store_id).await?;
+    let store = Some(Arc::new(s.clone()));
+    let repo = resolved.repo.clone();
+    let shown = resolved.display_spec();
     let gh = GhHttp::new()?;
 
-    // Resolve the task in the store
-    let (store_id, task) = if let Some(ref s) = store {
-        if let Some(stripped) = id.strip_prefix("internal:") {
-            let parsed = stripped
-                .parse::<i64>()
-                .with_context(|| format!("internal task id '{}' is not numeric", stripped))?;
-            if let Ok(Some(sid)) = s.resolve_task_id(&repo, id).await {
-                let task = s.get(sid).await?;
-                (sid, task)
-            } else {
-                anyhow::bail!("internal task '{}' not found", parsed);
-            }
-        } else if let Ok(parsed) = id.parse::<i64>() {
-            if let Ok(task) = s.get(parsed).await {
-                if task.origin == "internal" {
-                    (parsed, task)
-                } else if let Ok(Some(sid)) = s.resolve_task_id(&repo, id).await {
-                    let task = s.get(sid).await?;
-                    (sid, task)
-                } else {
-                    anyhow::bail!("task '{}' not found in store", id);
-                }
-            } else if let Ok(Some(sid)) = s.resolve_task_id(&repo, id).await {
-                let task = s.get(sid).await?;
-                (sid, task)
-            } else {
-                anyhow::bail!("task '{}' not found", id);
-            }
-        } else {
-            anyhow::bail!("invalid task id: {}", id);
-        }
-    } else {
-        anyhow::bail!("could not open task store");
-    };
-
-    let s = match store.as_ref() {
-        Some(s) => s,
-        None => anyhow::bail!("task store unexpectedly None"),
-    };
-
-    // 1. Reset failure counters
-    let ext_id_str = task
-        .external_id
-        .clone()
-        .unwrap_or_else(|| format!("internal:{}", task.id));
-    crate::store::store_reset_counters(&store, &repo, &ext_id_str).await;
-
-    // 2. Update SQLite status → New
+    crate::store::store_reset_counters(&store, &repo, &resolved.external_id).await;
     s.update_status(store_id, TaskStatus::New).await?;
 
-    // 3 & 4. For external tasks: reopen issue + sync labels
-    if task.origin != "internal" {
-        if let Some(ref ext_id) = task.external_id {
-            // Reopen the GitHub issue
-            if let Err(e) = gh.reopen_issue(&repo, ext_id).await {
-                eprintln!("warning: failed to reopen GitHub issue: {}", e);
-            }
+    if !resolved.is_internal() {
+        if let Err(e) = gh.reopen_issue(&repo, &resolved.external_id).await {
+            eprintln!("warning: failed to reopen GitHub issue: {}", e);
+        }
 
-            // Sync labels to status:new
-            let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
-            if let Err(e) = backend
-                .update_status(&crate::backends::ExternalId(ext_id.clone()), Status::New)
-                .await
-            {
-                eprintln!("warning: failed to sync labels: {}", e);
-            }
+        let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
+        if let Err(e) = backend
+            .update_status(
+                &crate::backends::ExternalId(resolved.external_id.clone()),
+                Status::New,
+            )
+            .await
+        {
+            eprintln!("warning: failed to sync labels: {}", e);
         }
     }
 
-    // 5. Link PR number if branch has a PR and pr_number is not set
     if task.pr_number.is_none() && !task.branch.is_empty() {
         if let Ok(Some(pr_num)) = gh.get_pr_number(&repo, &task.branch).await {
             let _ = s
@@ -1424,10 +1326,7 @@ pub async fn reopen(id: &str) -> anyhow::Result<()> {
         }
     }
 
-    println!(
-        "Reopened task #{} (status → new, counters reset, will be re-routed)",
-        id
-    );
+    println!("Reopened {shown} (status → new, counters reset, will be re-routed)");
     Ok(())
 }
 
@@ -1694,69 +1593,39 @@ pub async fn deps(id: &str) -> anyhow::Result<()> {
 
 /// Show logs / post-mortem for a task (internal or external).
 pub async fn logs(id: &str) -> anyhow::Result<()> {
-    let task_manager = init_task_manager().await?;
-    let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
-    let repo = config::get_current_repo().unwrap_or_default();
+    let store_owned = crate::cli::init_store().await?;
+    let resolved = resolve_cli_task(&store_owned, id).await?;
+    let store: Option<Arc<TaskStore>> = Some(Arc::new(store_owned.clone()));
+    let repo = resolved.repo.clone();
+    let task_key = resolved.external_id.clone();
 
-    // Resolve task key for store lookups.
-    let mut task_key = id.to_string();
-
-    // If user passed `internal:N`, use `internal:{n}` format for store lookups.
-    if let Some(n) = parse_internal_id(id) {
-        task_key = format!("internal:{}", n);
-        // Fetch internal task metadata from store
-        if let Some(ref s) = store {
-            if let Ok(Some(store_id)) = s.resolve_task_id(&repo, id).await {
-                if let Ok(internal) = s.get(store_id).await {
-                    println!("ID: {} (internal)", internal.id);
-                    println!("Title: {}", internal.title);
-                    println!("Status: {}", internal.status.as_str());
-                    if let Some(agent) = &internal.agent {
-                        println!("Agent: {}", agent);
-                    }
-                    if let Some(reason) = &internal.block_reason {
-                        println!("Block reason: {}", reason);
-                    }
-                    println!("Created: {}", internal.created_at);
-                    println!("Updated: {}", internal.updated_at);
-                }
-            }
-        }
-    } else if let Ok(num) = id.parse::<i64>() {
-        // Numeric ID: try DB first (TaskManager::get_task will check both)
-        match task_manager.get_task(num).await {
-            Ok(Task::External(ext)) => {
-                println!("ID: {} (external)", ext.id.0);
-                println!("Title: {}", ext.title);
-                println!("State: {}", ext.state);
-                println!("Labels: {}", ext.labels.join(", "));
-                println!("Author: {}", ext.author);
-                println!("URL: {}", ext.url);
-                println!("Created: {}", ext.created_at);
-                println!("Updated: {}", ext.updated_at);
-                task_key = ext.id.0.clone();
-            }
-            Ok(Task::Internal(int)) => {
-                println!("ID: {} (internal)", int.id);
-                println!("Title: {}", int.title);
-                println!("Status: {}", int.status.as_str());
-                if let Some(agent) = &int.agent {
+    if let Some(store_id) = resolved.store_id {
+        if let Ok(task) = store_owned.get(store_id).await {
+            if resolved.is_internal() {
+                println!("ID: {} (internal)", task.id);
+                println!("Title: {}", task.title);
+                println!("Status: {}", task.status.as_str());
+                if let Some(agent) = &task.agent {
                     println!("Agent: {}", agent);
                 }
-                println!("Created: {}", int.created_at);
-                println!("Updated: {}", int.updated_at);
-                task_key = int
-                    .external_id
-                    .clone()
-                    .unwrap_or_else(|| format!("internal:{}", int.id));
-            }
-            Err(e) => {
-                println!("ID: {}", id);
-                println!("(could not resolve task metadata: {})", e);
+                if let Some(reason) = &task.block_reason {
+                    println!("Block reason: {}", reason);
+                }
+                println!("Created: {}", task.created_at);
+                println!("Updated: {}", task.updated_at);
+            } else {
+                println!("ID: {} (external)", task_key);
+                println!("Title: {}", task.title);
+                println!("State: {}", task.status.as_str());
+                println!("Labels: {}", task.labels.join(", "));
+                println!("Author: {}", task.author);
+                println!("URL: {}", task.url);
+                println!("Created: {}", task.created_at);
+                println!("Updated: {}", task.updated_at);
             }
         }
     } else {
-        println!("ID: {}", id);
+        println!("ID: {}", resolved.display_spec());
     }
 
     // Task store fields
@@ -1933,23 +1802,11 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve a task ID, falling back to a global (cross-repo) lookup if the
-/// current-repo-scoped lookup finds nothing.  Emits a note on stderr when the
-/// task is found in a different repo so the operator can tell at a glance.
+/// Resolve a CLI task id to a store row.
 async fn resolve_id(store: &TaskStore, id: &str) -> anyhow::Result<i64> {
-    let repo = config::get_current_repo().unwrap_or_default();
-    if let Some(task_id) = store.resolve_task_id(&repo, id).await? {
-        return Ok(task_id);
-    }
-    match store.resolve_task_id_globally(id).await? {
-        Some((task_id, found_repo)) => {
-            if found_repo != repo {
-                eprintln!("note: task {id} belongs to repo {found_repo:?}");
-            }
-            Ok(task_id)
-        }
-        None => anyhow::bail!("task not found: {id}"),
-    }
+    let task = resolve_cli_task(store, id).await?;
+    task.store_id
+        .ok_or_else(|| anyhow::anyhow!("task not found in store: {id}"))
 }
 
 /// Show run history for a task.
@@ -2379,21 +2236,7 @@ mod tests {
     /// Verify the forced-routing field construction for agent+model case.
     #[test]
     fn retry_force_route_fields_agent_and_model() {
-        let forced_agent = "claude";
-        let model: Option<String> = Some("opus".to_string());
-        let fields: Vec<(&str, serde_json::Value)> = {
-            let mut f = vec![
-                ("agent", serde_json::json!(forced_agent)),
-                (
-                    "route_reason",
-                    serde_json::json!(format!("forced via retry --agent {forced_agent}")),
-                ),
-            ];
-            if let Some(ref m) = model {
-                f.push(("model", serde_json::json!(m)));
-            }
-            f
-        };
+        let fields = retry_force_fields("claude", Some("opus"));
         assert_eq!(fields.len(), 3);
         assert_eq!(fields[0].1, serde_json::json!("claude"));
         assert_eq!(fields[2].0, "model");

@@ -64,8 +64,8 @@ pub use metrics::{
 #[allow(unused_imports)]
 pub use pricing::{pricing_for_model, CostEstimate, ModelPricing, TokenUsage};
 pub use tasks::{
-    CompleteRun, NewTask, RunTokenUsage, StartRun, StoreRoute, Task, TaskActivity, TaskRun,
-    TaskStatus, UpsertExternal,
+    parse_cli_task_spec, CliTaskRef, CliTaskSpec, CompleteRun, NewTask, RunTokenUsage, StartRun,
+    StoreRoute, Task, TaskActivity, TaskRun, TaskStatus, UpsertExternal,
 };
 
 /// Default database path: `~/.orch/orch.db`

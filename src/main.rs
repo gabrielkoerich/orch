@@ -295,6 +295,9 @@ mod tests {
         .is_ok());
         assert!(Cli::try_parse_from(["orch", "config", "agents"]).is_ok());
         assert!(Cli::try_parse_from(["orch", "log", "-f", "--task", "123"]).is_ok());
+        assert!(Cli::try_parse_from(["orch", "task", "unblock", "owner/repo#58"]).is_ok());
+        assert!(Cli::try_parse_from(["orch", "task", "retry", "internal:58"]).is_ok());
+        assert!(Cli::try_parse_from(["orch", "task", "get", "owner/other#58"]).is_ok());
     }
 }
 
@@ -653,8 +656,8 @@ enum TaskAction {
     },
     /// Get task details
     Get {
-        /// Task ID
-        id: i64,
+        /// Task ID (`58`, `owner/repo#58`, or `internal:58`)
+        id: String,
     },
     /// Show task status summary
     Status {
@@ -664,18 +667,18 @@ enum TaskAction {
     },
     /// Route a task to an agent
     Route {
-        /// Task ID
-        id: i64,
+        /// Task ID (`58`, `owner/repo#58`, or `internal:58`)
+        id: String,
     },
     /// Run a task (manual execution)
     Run {
-        /// Task ID (if omitted, picks next routed task)
+        /// Task ID (`58`, `owner/repo#58`, or `internal:58`). If omitted, picks next routed task
         id: Option<String>,
     },
     /// Retry a task (reset to new)
     Retry {
-        /// Task ID
-        id: i64,
+        /// Task ID (`58`, `owner/repo#58`, or `internal:58`)
+        id: String,
         /// Force routing to a specific agent (e.g. claude, codex, opencode)
         #[arg(long)]
         agent: Option<String>,
@@ -685,8 +688,8 @@ enum TaskAction {
     },
     /// Reroute a task to a different agent/model (alias for retry with forced routing)
     Reroute {
-        /// Task ID
-        id: i64,
+        /// Task ID (`58`, `owner/repo#58`, or `internal:58`)
+        id: String,
         /// Force routing to a specific agent (e.g. claude, codex, opencode)
         #[arg(long)]
         agent: Option<String>,
@@ -696,7 +699,7 @@ enum TaskAction {
     },
     /// Unblock a task or all blocked tasks
     Unblock {
-        /// Task ID or "all"
+        /// Task ID (`58`, `owner/repo#58`, `internal:58`) or "all"
         id: String,
     },
     /// Attach to a running agent's tmux session
@@ -734,7 +737,7 @@ enum TaskAction {
     },
     /// Show what a task waits on, and what waits on it
     Deps {
-        /// Task ID
+        /// Task ID (`58`, `owner/repo#58`, or `internal:58`)
         id: String,
     },
     /// Show logs / post-mortem for a task (internal or external)
@@ -744,7 +747,7 @@ enum TaskAction {
     },
     /// Show task activity timeline
     Log {
-        /// Task ID (e.g. "internal:8" or issue number)
+        /// Task ID (`58`, `owner/repo#58`, or `internal:58`)
         id: String,
         /// Max number of events to show
         #[arg(long)]
@@ -768,7 +771,7 @@ enum TaskAction {
     },
     /// Mark a task as done (without running an agent)
     Close {
-        /// Task ID (e.g. "internal:8" or issue number)
+        /// Task ID (`58`, `owner/repo#58`, or `internal:58`)
         id: String,
         /// Optional note to add as a comment on external tasks
         #[arg(short, long)]
@@ -781,12 +784,12 @@ enum TaskAction {
     },
     /// Reopen a done/blocked task (resets status, reopens GitHub issue, syncs labels)
     Reopen {
-        /// Task ID (e.g. "1234" or "internal:8")
+        /// Task ID (`58`, `owner/repo#58`, or `internal:58`)
         id: String,
     },
     /// Unified diagnostic view: status, agent, attempts, last error, PR, block reason
     Inspect {
-        /// Task ID (e.g. "internal:8" or issue number)
+        /// Task ID (`58`, `owner/repo#58`, or `internal:58`)
         id: String,
     },
     /// Stream task state-transition events in real-time
@@ -1190,22 +1193,22 @@ async fn async_main() -> anyhow::Result<()> {
                 cli::task::add(title, body, labels, source, depends_on).await?;
             }
             TaskAction::Get { id } => {
-                cli::task::get(id).await?;
+                cli::task::get(&id).await?;
             }
             TaskAction::Status { json } => {
                 cli::task::status(json).await?;
             }
             TaskAction::Route { id } => {
-                cli::task::route(id).await?;
+                cli::task::route(&id).await?;
             }
             TaskAction::Run { id } => {
                 cli::task::run(id).await?;
             }
             TaskAction::Retry { id, agent, model } => {
-                cli::task::retry(id, agent, model).await?;
+                cli::task::retry(&id, agent, model).await?;
             }
             TaskAction::Reroute { id, agent, model } => {
-                cli::task::retry(id, agent, model).await?;
+                cli::task::retry(&id, agent, model).await?;
             }
             TaskAction::Unblock { id } => {
                 cli::task::unblock(&id).await?;

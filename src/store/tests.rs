@@ -4289,6 +4289,234 @@ async fn resolve_task_id_globally_ambiguous_external_errors() {
     assert!(msg.contains("ambiguous"), "error should mention ambiguity");
 }
 
+// ── resolve_cli_id ──────────────────────────────────────────────────────
+
+fn issue_task(repo: &str, number: &str, title: &str) -> NewTask {
+    NewTask {
+        external_id: Some(number.to_string()),
+        repo: repo.to_string(),
+        origin: "github".to_string(),
+        title: title.to_string(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn parse_cli_task_spec_accepts_explicit_and_bare_forms() {
+    assert_eq!(
+        parse_cli_task_spec("internal:58").unwrap(),
+        CliTaskSpec::Internal(58)
+    );
+    assert_eq!(
+        parse_cli_task_spec("owner/repo#58").unwrap(),
+        CliTaskSpec::Issue {
+            repo: "owner/repo".to_string(),
+            number: 58,
+        }
+    );
+    assert_eq!(parse_cli_task_spec("58").unwrap(), CliTaskSpec::Bare(58));
+    assert_eq!(parse_cli_task_spec("#58").unwrap(), CliTaskSpec::Bare(58));
+    assert!(parse_cli_task_spec("").is_err());
+    assert!(parse_cli_task_spec("internal:").is_err());
+    assert!(parse_cli_task_spec("0").is_err());
+    assert!(parse_cli_task_spec("teach#58").is_err());
+}
+
+#[tokio::test]
+async fn resolve_cli_id_prefers_current_repo_issue_over_internal_store_id() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let internal_id = store
+        .create_internal(
+            "owner/project-a",
+            "Code development: orch",
+            "body",
+            "job",
+            "j:1",
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .update_status(internal_id, TaskStatus::Done)
+        .await
+        .unwrap();
+
+    let issue_id = store
+        .create(&issue_task(
+            "owner/project-b",
+            &internal_id.to_string(),
+            "Teach issue",
+        ))
+        .await
+        .unwrap();
+    store
+        .update_status(issue_id, TaskStatus::Blocked)
+        .await
+        .unwrap();
+
+    let resolved = store
+        .resolve_cli_id(&internal_id.to_string(), Some("owner/project-b"))
+        .await
+        .unwrap()
+        .expect("current-repo issue should resolve");
+    assert_eq!(resolved.store_id, Some(issue_id));
+    assert_eq!(resolved.repo, "owner/project-b");
+    assert_eq!(resolved.external_id, internal_id.to_string());
+    assert!(!resolved.is_internal());
+
+    store
+        .update_status(resolved.store_id.unwrap(), TaskStatus::New)
+        .await
+        .unwrap();
+    assert_eq!(store.get(issue_id).await.unwrap().status, TaskStatus::New);
+    assert_eq!(
+        store.get(internal_id).await.unwrap().status,
+        TaskStatus::Done
+    );
+}
+
+#[tokio::test]
+async fn resolve_cli_id_bare_number_outside_a_project_is_ambiguous() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let internal_id = store
+        .create_internal(
+            "owner/project-a",
+            "Code development: orch",
+            "body",
+            "job",
+            "j:1",
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .create(&issue_task(
+            "owner/project-b",
+            &internal_id.to_string(),
+            "Teach issue",
+        ))
+        .await
+        .unwrap();
+
+    let result = store.resolve_cli_id(&internal_id.to_string(), None).await;
+    assert!(result.is_err(), "two matches outside a project must refuse");
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("matches more than one task"), "{msg}");
+    assert!(msg.contains(&format!("internal:{internal_id}")), "{msg}");
+    assert!(
+        msg.contains(&format!("owner/project-b#{internal_id}")),
+        "{msg}"
+    );
+    assert!(msg.contains("internal:N"), "{msg}");
+}
+
+#[tokio::test]
+async fn resolve_cli_id_owner_repo_hash_works_from_any_directory() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let internal_id = store
+        .create_internal(
+            "owner/project-a",
+            "Code development: orch",
+            "body",
+            "job",
+            "j:1",
+            None,
+        )
+        .await
+        .unwrap();
+    let issue_id = store
+        .create(&issue_task(
+            "owner/project-b",
+            &internal_id.to_string(),
+            "Teach issue",
+        ))
+        .await
+        .unwrap();
+
+    let spec = format!("owner/project-b#{internal_id}");
+    let resolved = store
+        .resolve_cli_id(&spec, Some("owner/other"))
+        .await
+        .unwrap()
+        .expect("owner/repo#N should resolve from any directory");
+    assert_eq!(resolved.store_id, Some(issue_id));
+    assert_eq!(resolved.repo, "owner/project-b");
+
+    let internal = store
+        .resolve_cli_id(&format!("internal:{internal_id}"), Some("owner/project-b"))
+        .await
+        .unwrap()
+        .expect("internal:N should resolve from any directory");
+    assert_eq!(internal.store_id, Some(internal_id));
+    assert!(internal.is_internal());
+}
+
+#[tokio::test]
+async fn resolve_cli_id_current_repo_internal_when_no_issue() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let internal_id = store
+        .create_internal(
+            "owner/project-a",
+            "Internal only",
+            "body",
+            "job",
+            "j:1",
+            None,
+        )
+        .await
+        .unwrap();
+
+    let resolved = store
+        .resolve_cli_id(&internal_id.to_string(), Some("owner/project-a"))
+        .await
+        .unwrap()
+        .expect("bare number should hit the current project's internal task");
+    assert_eq!(resolved.store_id, Some(internal_id));
+    assert!(resolved.is_internal());
+}
+
+#[tokio::test]
+async fn resolve_cli_id_unique_global_match_outside_a_project() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let issue_id = store
+        .create(&issue_task("owner/project-b", "77", "Only issue 77"))
+        .await
+        .unwrap();
+
+    let resolved = store
+        .resolve_cli_id("77", None)
+        .await
+        .unwrap()
+        .expect("unique global match should resolve");
+    assert_eq!(resolved.store_id, Some(issue_id));
+    assert_eq!(resolved.display_spec(), "owner/project-b#77");
+}
+
+#[tokio::test]
+async fn resolve_cli_id_in_project_does_not_pick_other_repo_internal() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let internal_id = store
+        .create_internal(
+            "owner/project-a",
+            "Code development: orch",
+            "body",
+            "job",
+            "j:1",
+            None,
+        )
+        .await
+        .unwrap();
+
+    let resolved = store
+        .resolve_cli_id(&internal_id.to_string(), Some("owner/project-b"))
+        .await
+        .unwrap();
+    assert!(
+        resolved.is_none(),
+        "a bare number in another project must not pick this internal task"
+    );
+}
+
 #[tokio::test]
 async fn list_internal_by_status_filters_origin() {
     let store = TaskStore::open_memory().await.unwrap();
