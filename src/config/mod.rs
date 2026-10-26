@@ -6,14 +6,15 @@
 //! Features:
 //! - In-memory cache: parsed YAML is cached for the process lifetime
 //! - File watching: uses notify crate to watch for config file changes
-//! - Hot reload: cache is invalidated when config files change
+//! - Hot reload: a changed file is re-parsed into the cache; one that does not
+//!   parse leaves the last good values in place
 //! - Change notifications: subscribers receive events when config files change
 
 pub mod projects_yaml;
 
 use anyhow::Context;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -31,6 +32,12 @@ static WATCHER: std::sync::LazyLock<RwLock<HashMap<PathBuf, ()>>> =
 /// Global file watcher instance (started on first use).
 static FILE_WATCHER: std::sync::LazyLock<Arc<Mutex<Option<RecommendedWatcher>>>> =
     std::sync::LazyLock::new(|| Arc::new(Mutex::new(None)));
+
+/// Config files whose content on disk does not read or parse right now.
+/// Tracked so the parse error is logged once per breakage, not once per
+/// watcher event.
+static BAD_FILES: std::sync::LazyLock<RwLock<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashSet::new()));
 
 /// Broadcast sender for config change notifications.
 /// Sends the path of the changed config file.
@@ -99,15 +106,51 @@ pub fn clear_test_cache() {
     }
 }
 
-/// Invalidate the cache entry for a specific config file
-/// and notify subscribers of the change.
-fn invalidate_cache(path: &PathBuf) {
-    if let Ok(mut cache) = CACHE.write() {
-        cache.remove(path);
-        tracing::debug!("config cache invalidated for: {}", path.display());
+/// Re-read a changed config file and notify subscribers.
+///
+/// A file that cannot be read or parsed leaves the last good value in the
+/// cache and sends no notification, so a broken or half-written edit cannot
+/// reset the running config to defaults.
+///
+/// Returns true when this call logged a newly invalid file, so repeated
+/// watcher events for one breakage produce one error line
+fn reload_file(path: &PathBuf) -> bool {
+    let parsed = std::fs::read_to_string(path)
+        .map_err(|e| e.to_string())
+        .and_then(|content| {
+            serde_norway::from_str::<serde_norway::Value>(&content).map_err(|e| e.to_string())
+        });
+
+    match parsed {
+        Ok(value) => {
+            if let Ok(mut cache) = CACHE.write() {
+                cache.insert(path.clone(), value);
+            }
+            if let Ok(mut bad) = BAD_FILES.write() {
+                if bad.remove(path) {
+                    tracing::info!(path = %path.display(), "config file parses again, reloaded");
+                }
+            }
+            tracing::debug!("config cache refreshed for: {}", path.display());
+            // Notify subscribers (ignore error if no active receivers)
+            let _ = CHANGE_TX.send(path.clone());
+            false
+        }
+        Err(err) => {
+            let first_failure = BAD_FILES
+                .write()
+                .map(|mut bad| bad.insert(path.clone()))
+                .unwrap_or(false);
+            if first_failure {
+                tracing::error!(
+                    path = %path.display(),
+                    %err,
+                    "config file is invalid, keeping the last good values"
+                );
+            }
+            first_failure
+        }
     }
-    // Notify subscribers (ignore error if no active receivers)
-    let _ = CHANGE_TX.send(path.clone());
 }
 
 /// Start the file watcher if not already running.
@@ -121,12 +164,15 @@ fn ensure_watcher() {
     let watcher = RecommendedWatcher::new(
         move |res: Result<notify::Event, notify::Error>| {
             if let Ok(event) = res {
+                if !is_content_change(&event.kind) {
+                    return;
+                }
                 for path in event.paths {
                     // Check if it's a config file we care about
                     let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
                     if filename == "config.yml" || filename == ".orch.yml" {
-                        invalidate_cache(&path);
+                        let _ = reload_file(&path);
                     }
                 }
             }
@@ -137,6 +183,27 @@ fn ensure_watcher() {
     if let Ok(w) = watcher {
         *watcher_guard = Some(w);
     }
+}
+
+// inotify reports every read as an access event, and reload_file reads the file, so reacting to
+// access events reloads forever on Linux
+fn is_content_change(kind: &notify::EventKind) -> bool {
+    kind.is_create() || kind.is_modify() || kind.is_remove()
+}
+
+/**
+ * Register a config file for change watching. `get` / `get_list` watch the files they read, but a
+ * project's `.orch.yml` is read directly by `get_projects_with_paths`, so the caller that knows the
+ * project list registers it here. A missing path is skipped: notify cannot watch one, and a project
+ * may be configured through the legacy `.orchestrator.yml` name or the global `gh.repo` fallback,
+ * which has no project directory at all
+ **/
+pub fn watch(path: &Path) {
+    if !path.exists() {
+        tracing::debug!(path = %path.display(), "no config file to watch here");
+        return;
+    }
+    watch_file(&path.to_path_buf());
 }
 
 /// Watch a config file for changes.
@@ -703,11 +770,11 @@ mod tests {
     #[test]
     fn subscribe_receives_change_notifications() {
         let mut rx = subscribe();
-        // Use a unique path to avoid interference from parallel tests
-        let path = PathBuf::from(format!("/tmp/test-config-{}.yml", std::process::id()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_yaml(dir.path(), "config.yml", "repo: owner/repo\n");
 
-        // Manually call invalidate_cache to simulate a file change
-        invalidate_cache(&path);
+        // Simulate the watcher firing on a file change
+        assert!(!reload_file(&path));
 
         // Drain until we find our path (other tests may send on the shared channel)
         loop {
@@ -723,10 +790,10 @@ mod tests {
     fn subscribe_multiple_receivers() {
         let mut rx1 = subscribe();
         let mut rx2 = subscribe();
-        // Use a unique path to avoid interference from parallel tests
-        let path = PathBuf::from(format!("/tmp/test-config-multi-{}.yml", std::process::id()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_yaml(dir.path(), "config.yml", "repo: owner/repo\n");
 
-        invalidate_cache(&path);
+        assert!(!reload_file(&path));
 
         // Drain until we find our path on both receivers
         let find_path = |rx: &mut tokio::sync::broadcast::Receiver<PathBuf>, expected: &PathBuf| loop {
@@ -792,6 +859,79 @@ mod tests {
         let skills = extract_skills_list(&yaml).unwrap();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].repo, "owner/skills");
+    }
+
+    /**
+     * Read a key straight out of the cache. The reload tests must not call `resolve_key` or
+     * `resolve_projects_list`: those register the file with the real notify watcher, whose thread
+     * then races the test for the first `reload_file` call on a broken edit
+     **/
+    fn cached_value(path: &PathBuf, key: &str) -> String {
+        extract_value(&load_cached_root(path).unwrap(), key).unwrap()
+    }
+
+    fn cached_projects(path: &PathBuf) -> Vec<String> {
+        extract_projects_list(&load_cached_root(path).unwrap(), "projects").unwrap()
+    }
+
+    #[test]
+    fn reading_a_config_file_does_not_trigger_a_reload() {
+        use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, ModifyKind};
+        assert!(!is_content_change(&notify::EventKind::Access(
+            AccessKind::Open(AccessMode::Read)
+        )));
+        assert!(!is_content_change(&notify::EventKind::Access(
+            AccessKind::Close(AccessMode::Read)
+        )));
+        assert!(is_content_change(&notify::EventKind::Modify(
+            ModifyKind::Data(DataChange::Content)
+        )));
+        assert!(is_content_change(&notify::EventKind::Create(
+            CreateKind::File
+        )));
+    }
+
+    #[test]
+    fn invalid_edit_keeps_last_good_values_and_sends_no_notification() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_yaml(dir.path(), "config.yml", "engine:\n  max_parallel: 8\n");
+        assert!(!reload_file(&path));
+        assert_eq!(cached_value(&path, "engine.max_parallel"), "8");
+
+        let mut rx = subscribe();
+        std::fs::write(&path, "engine:\n  max_parallel: [unclosed\n").unwrap();
+        assert!(reload_file(&path));
+
+        assert_eq!(cached_value(&path, "engine.max_parallel"), "8");
+        assert!(rx.try_recv().is_err(), "a broken edit must not notify");
+
+        // A later good edit is picked up again
+        std::fs::write(&path, "engine:\n  max_parallel: 12\n").unwrap();
+        assert!(!reload_file(&path));
+        assert_eq!(cached_value(&path, "engine.max_parallel"), "12");
+    }
+
+    #[test]
+    fn adding_a_project_is_visible_after_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_yaml(dir.path(), "config.yml", "projects:\n  - /srv/one\n");
+        assert_eq!(cached_projects(&path), vec!["/srv/one"]);
+
+        std::fs::write(&path, "projects:\n  - /srv/one\n  - /srv/two\n").unwrap();
+        assert!(!reload_file(&path));
+
+        assert_eq!(cached_projects(&path), vec!["/srv/one", "/srv/two"]);
+    }
+
+    #[test]
+    fn repeated_watcher_events_for_one_breakage_log_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_yaml(dir.path(), "config.yml", "engine:\n  max_parallel: 4\n");
+        reload_file(&path);
+
+        std::fs::write(&path, "engine: [broken\n").unwrap();
+        assert!(reload_file(&path), "first bad read logs");
+        assert!(!reload_file(&path), "same breakage does not log again");
     }
 
     #[test]
