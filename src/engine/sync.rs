@@ -3223,8 +3223,26 @@ pub(crate) async fn ingest_external_tasks(
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
     let stored = store.kv_get(&kv_key).await.ok().flatten();
+    // `since` keys on updated_at, so an old open issue with no task is skipped forever, scan unbounded hourly
+    let full_scan_key = format!("issues_last_full_scan:{repo}");
+    let now_secs = chrono::Utc::now().timestamp();
+    let full_scan_due = store
+        .kv_get(&full_scan_key)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<i64>().ok())
+        .is_none_or(|last| now_secs - last >= FULL_SCAN_INTERVAL_SECS);
+    let mut full_scan = false;
     let since_for_fetch: Option<String> = match stored.as_deref() {
-        Some(STARTUP_RESCAN_SENTINEL) => None,
+        Some(STARTUP_RESCAN_SENTINEL) => {
+            full_scan = true;
+            None
+        }
+        Some(_) if full_scan_due => {
+            full_scan = true;
+            None
+        }
         Some(ts) => Some(ts.to_string()),
         None => Some(fallback),
     };
@@ -3247,8 +3265,13 @@ pub(crate) async fn ingest_external_tasks(
             return Ok(());
         }
     };
+    if full_scan {
+        if let Err(e) = store.kv_set(&full_scan_key, &now_secs.to_string()).await {
+            tracing::warn!(key = full_scan_key, err = %e, "ingest: failed to record full scan time");
+        }
+    }
 
-    // Upsert into the store, collecting store IDs for batch status check.
+    // Upsert into the store, collecting store IDs for batch status check
     // Also acknowledge newly detected issues (eyes reaction).
     let mut id_status_pairs: Vec<(i64, crate::backends::Status)> = Vec::new();
     // Collect (store_id, node_id) for newly ingested tasks so we can batch-fetch
@@ -3481,6 +3504,9 @@ pub(crate) async fn ingest_external_tasks(
 /// unbounded (`since = None`) rescan on the next ingest, as opposed to a genuinely
 /// missing key (first run ever), which still gets the cheaper 24h fallback.
 const STARTUP_RESCAN_SENTINEL: &str = "__startup_full_rescan__";
+
+/// Minimum gap between unbounded issue fetches in steady state
+const FULL_SCAN_INTERVAL_SECS: i64 = 3600;
 
 /// Mark `issues_last_ingested:{repo}` for an unbounded full re-scan on the next ingest,
 /// for all repos, on engine startup.
@@ -3761,6 +3787,64 @@ mod tests {
             [None],
             "startup rescan marker must produce an unbounded fetch (since = None)"
         );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn ingest_fetches_unbounded_hourly_so_old_untracked_issue_is_ingested() {
+        crate::engine::cooldown::reset_global_state().await;
+        let backend = IngestMockBackend::with_tasks(vec![(Status::New, make_ext_task("73", "x"))]);
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        store
+            .kv_set("issues_last_ingested:owner/repo", "2026-10-26T00:00:00Z")
+            .await
+            .unwrap();
+
+        let backend_dyn: Arc<dyn ExternalBackend> = backend.clone();
+        ingest_external_tasks(&backend_dyn, "owner/repo", &store)
+            .await
+            .unwrap();
+        ingest_external_tasks(&backend_dyn, "owner/repo", &store)
+            .await
+            .unwrap();
+
+        let calls = backend.since_calls.lock().await;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], None);
+        assert!(calls[1].is_some());
+        assert!(store
+            .get_by_external_id("owner/repo", "73")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn ingest_after_project_move_marker_fetches_unbounded() {
+        crate::engine::cooldown::reset_global_state().await;
+        let backend = IngestMockBackend::with_tasks(vec![(Status::New, make_ext_task("73", "x"))]);
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        store
+            .kv_set(
+                "issues_last_full_scan:new/repo",
+                &chrono::Utc::now().timestamp().to_string(),
+            )
+            .await
+            .unwrap();
+        clear_issues_last_ingested(&store, "new/repo").await;
+
+        let backend_dyn: Arc<dyn ExternalBackend> = backend.clone();
+        ingest_external_tasks(&backend_dyn, "new/repo", &store)
+            .await
+            .unwrap();
+
+        assert_eq!(backend.since_calls.lock().await.as_slice(), [None]);
+        assert!(store
+            .get_by_external_id("new/repo", "73")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[serial(cooldown_state)]
