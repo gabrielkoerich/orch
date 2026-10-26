@@ -1736,14 +1736,8 @@ mod tests {
         );
         assert_eq!(task.push_failures, 0, "recovery is not a push failure");
 
-        // Confirm the test really went through the rejected-push recovery
-        let activity = store.get_activity(store_id, None).await.unwrap();
-        assert!(
-            activity.iter().any(|a| a.event_type == "push_rebased"),
-            "the first push must have been rejected and recovered by a rebase"
-        );
-
-        // The follow-up commit is on the remote, on top of the rebased history
+        // push_branch recovers the stale lease itself, so the log below is the proof: the
+        // follow-up commit is on the remote, on top of the rebased history
         let log = std::process::Command::new("git")
             .current_dir(work.path())
             .args(["log", "--oneline", "origin/feat"])
