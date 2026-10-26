@@ -2733,6 +2733,19 @@ pub(crate) async fn tick(
 ) -> anyhow::Result<()> {
     let _tick_span = tracing::info_span!("engine.tick").entered();
 
+    // Calls made since the previous tick, so hourly quota exhaustion can be traced
+    for (project, call_type, calls) in crate::github::http::drain_call_counts()
+        .into_iter()
+        .take(10)
+    {
+        tracing::debug!(
+            project,
+            call_type,
+            calls,
+            "github api calls since last tick"
+        );
+    }
+
     // Run startup cleanup once to kill stale sessions from previous runs.
     startup_cleanup(tmux).await;
 

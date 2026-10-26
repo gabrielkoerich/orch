@@ -248,6 +248,42 @@ fn check_rate_limit_backoff(cell: &Mutex<RateLimit>, api: &str) -> anyhow::Resul
     );
 }
 
+/// API calls since the last drain, keyed by (project, call type), for the per-tick debug report.
+static CALL_COUNTS: std::sync::LazyLock<Mutex<std::collections::HashMap<(String, String), u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Project is `owner/repo` from a `/repos/` URL and call type is the path segment after it
+/// (`pulls`, `issues`, `check-runs`), so non-repo endpoints land under `-`.
+fn count_api_call(url: &str) {
+    let path = url.split('?').next().unwrap_or(url);
+    let key = match path.split_once("/repos/") {
+        Some((_, rest)) => {
+            let mut parts = rest.split('/');
+            let project = format!(
+                "{}/{}",
+                parts.next().unwrap_or(""),
+                parts.next().unwrap_or("")
+            );
+            (project, parts.next().unwrap_or("repo").to_string())
+        }
+        None if path.ends_with("/graphql") => ("-".to_string(), "graphql".to_string()),
+        None => ("-".to_string(), "other".to_string()),
+    };
+    if let Ok(mut counts) = CALL_COUNTS.lock() {
+        *counts.entry(key).or_insert(0) += 1;
+    }
+}
+
+/// Take the call counts accumulated since the last drain, largest first.
+pub fn drain_call_counts() -> Vec<(String, String, u64)> {
+    let mut rows: Vec<_> = CALL_COUNTS
+        .lock()
+        .map(|mut c| c.drain().map(|((p, k), n)| (p, k, n)).collect())
+        .unwrap_or_default();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.2));
+    rows
+}
+
 // ── Conditional-request cache ─────────────────────────────────────────
 
 /// A stored 200 response, replayed when GitHub answers the next conditional GET with 304.
@@ -401,12 +437,14 @@ impl GhHttp {
     }
 
     /// Fail fast if the REST API is in hard backoff (post-403/429).
-    fn check_backoff() -> anyhow::Result<()> {
+    fn check_backoff(url: &str) -> anyhow::Result<()> {
+        count_api_call(url);
         check_rate_limit_backoff(&REST_RATE_LIMIT, "REST")
     }
 
     /// Fail fast if the GraphQL API is in hard backoff (post-403/429).
-    fn check_graphql_backoff() -> anyhow::Result<()> {
+    fn check_graphql_backoff(url: &str) -> anyhow::Result<()> {
+        count_api_call(url);
         check_rate_limit_backoff(&GRAPHQL_RATE_LIMIT, "GraphQL")
     }
 
@@ -630,7 +668,7 @@ impl GhHttp {
 
     /// GET request, returns deserialized JSON.
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> anyhow::Result<T> {
-        Self::check_backoff()?;
+        Self::check_backoff(url)?;
         let auth = self.auth_header().await?;
         // Use send_with_retries to handle transient 5xx/network failures
         let make_req = || {
@@ -655,7 +693,7 @@ impl GhHttp {
 
     /// GET raw bytes (for endpoints that return non-JSON or we parse manually).
     async fn get_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
-        Self::check_backoff()?;
+        Self::check_backoff(url)?;
         let auth = self.auth_header().await?;
         let make_req = || {
             Ok(self
@@ -681,7 +719,7 @@ impl GhHttp {
         url: &str,
         query: &[(&str, &str)],
     ) -> anyhow::Result<T> {
-        Self::check_backoff()?;
+        Self::check_backoff(url)?;
         let auth = self.auth_header().await?;
         let make_req = || {
             Ok(self
@@ -706,7 +744,7 @@ impl GhHttp {
 
     /// POST with JSON body, returns raw response text.
     async fn post_json_raw(&self, url: &str, body: &serde_json::Value) -> anyhow::Result<String> {
-        Self::check_backoff()?;
+        Self::check_backoff(url)?;
         let auth = self.auth_header().await?;
         let make_req = || {
             Ok(self
@@ -741,7 +779,7 @@ impl GhHttp {
 
     /// PATCH with JSON body, returns raw response.
     async fn patch_json_raw(&self, url: &str, body: &serde_json::Value) -> anyhow::Result<String> {
-        Self::check_backoff()?;
+        Self::check_backoff(url)?;
         let auth = self.auth_header().await?;
         let make_req = || {
             Ok(self
@@ -766,7 +804,7 @@ impl GhHttp {
 
     /// DELETE request.
     async fn delete(&self, url: &str) -> anyhow::Result<StatusCode> {
-        Self::check_backoff()?;
+        Self::check_backoff(url)?;
         let auth = self.auth_header().await?;
         let make_req = || {
             Ok(self
@@ -795,7 +833,7 @@ impl GhHttp {
         url: &str,
         query: &[(&str, &str)],
     ) -> anyhow::Result<Vec<T>> {
-        Self::check_backoff()?;
+        Self::check_backoff(url)?;
         let mut all: Vec<T> = Vec::new();
         let mut next_url: Option<String> = None;
         let mut is_first = true;
@@ -929,7 +967,7 @@ impl GhHttp {
         url: &str,
         array_field: &str,
     ) -> anyhow::Result<Vec<T>> {
-        Self::check_backoff()?;
+        Self::check_backoff(url)?;
         let mut all: Vec<T> = Vec::new();
         let mut current_url: String = url.to_string();
 
@@ -1011,7 +1049,7 @@ impl GhHttp {
         extra_headers: &[(&str, &str)],
         variables: Option<serde_json::Value>,
     ) -> anyhow::Result<serde_json::Value> {
-        Self::check_graphql_backoff()?;
+        Self::check_graphql_backoff(url)?;
         let body = if let Some(vars) = variables {
             serde_json::json!({ "query": query, "variables": vars })
         } else {
@@ -1295,7 +1333,7 @@ impl GhHttp {
         method: reqwest::Method,
         body: Option<serde_json::Value>,
     ) -> anyhow::Result<Response> {
-        Self::check_backoff()?;
+        Self::check_backoff(url)?;
         let auth = self.auth_header().await?;
         let make_req = || {
             let mut req = self
@@ -1867,8 +1905,8 @@ impl GhHttp {
     ) -> anyhow::Result<String> {
         use reqwest::header;
 
-        Self::check_backoff()?;
         let url = format!("{GITHUB_API}/repos/{repo}/pulls");
+        Self::check_backoff(&url)?;
 
         #[derive(Serialize)]
         struct CreatePullRequest<'a> {
@@ -2264,8 +2302,8 @@ impl GhHttp {
 
     /// Check if a user is a collaborator.
     pub async fn is_collaborator(&self, repo: &str, username: &str) -> anyhow::Result<bool> {
-        Self::check_backoff()?;
         let url = format!("{GITHUB_API}/repos/{repo}/collaborators/{username}");
+        Self::check_backoff(&url)?;
         let auth = self.auth_header().await?;
         let make_req = || {
             Ok(self
@@ -2510,8 +2548,8 @@ impl GhHttp {
         pr_number: u64,
         delete_branch: bool,
     ) -> anyhow::Result<()> {
-        Self::check_backoff()?;
         let url = format!("{GITHUB_API}/repos/{repo}/pulls/{pr_number}/merge");
+        Self::check_backoff(&url)?;
         let payload = serde_json::json!({ "merge_method": "squash" });
         let auth = self.auth_header().await?;
         let make_req = || {
@@ -2561,8 +2599,8 @@ impl GhHttp {
     /// which re-triggers CI — used to give a PR a chance to pick up a fix
     /// that landed on the base branch after the PR's last CI run failed.
     pub async fn update_pr_branch(&self, repo: &str, pr_number: u64) -> anyhow::Result<()> {
-        Self::check_backoff()?;
         let url = format!("{GITHUB_API}/repos/{repo}/pulls/{pr_number}/update-branch");
+        Self::check_backoff(&url)?;
         let auth = self.auth_header().await?;
         let make_req = || {
             Ok(self
