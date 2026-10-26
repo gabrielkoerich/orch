@@ -56,7 +56,7 @@ IF required checks are NOT RUN or PENDING:
   → run local checks as fallback: {{#if SHIPCHECK}}run `shipcheck run`
     (exit 0 = PASS, 1 = FAIL, read `shipcheck logs`){{/if}}{{#if NO_SHIPCHECK}}read .github/workflows/
     to identify what CI runs and execute those commands (do NOT hardcode language-specific commands){{/if}}
-  → treat local results the same as "required checks PASS" or "FAIL" above
+  → run the whole command CI runs, never a filtered subset of tests. A local FAIL counts as FAIL. A local PASS counts as PASS only when it is the full suite on the same OS as CI (read `runs-on` in the workflow): CI runs on Linux, and on macOS file watchers, paths and signals behave differently. If you cannot run that, do not approve, because a required check that never finished is not a pass
 ```
 
 Pending CI is never a terminal review state. Do not end your turn reporting that CI is still running or that you'll wait for a notification — the `--watch` command in this step already blocks in the foreground until CI settles or the timeout is hit. If it's still PENDING or NOT RUN after that, immediately run the local-checks fallback above and finish the review in this same turn.
