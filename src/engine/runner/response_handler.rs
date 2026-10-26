@@ -360,18 +360,15 @@ async fn check_commits_and_clear_stale_errors(
 
 /// Push the branch to the remote and log the activity.
 ///
-/// On push failure due to diverged history (non-fast-forward), attempts to
-/// fetch the remote branch and rebase local commits on top. If rebase succeeds,
-/// the task will be re-routed to a new agent who can push the rebased commits.
-/// If rebase fails (conflicts), the task is blocked for human intervention.
+/// On push failure due to diverged history (non-fast-forward), fetches the remote
+/// branch and rebases local commits on top, then pushes again. If rebase fails
+/// (conflicts), the task is blocked for human intervention.
 ///
-/// Returns `PushResult::Success` on success, `PushResult::Rebased` if rebase
-/// succeeded and the task should be re-routed, `PushResult::Failed` if push
-/// failed and recovery was not possible, or `PushResult::NoCommits` if the
-/// branch has no commits ahead of the default branch.
+/// Returns `PushResult::Success` on success, `PushResult::Failed` if push failed
+/// and recovery was not possible, or `PushResult::NoCommits` if the branch has no
+/// commits ahead of the default branch
 enum PushResult {
     Success,
-    Rebased,
     Failed,
     NoCommits,       // agent made no code changes
     WorktreeMissing, // retry after rebuilding missing worktree
@@ -442,6 +439,69 @@ async fn recover_missing_worktree_for_push(
     .await;
 
     Ok(recovered)
+}
+
+/// Push a branch that was just rebased onto its moved remote counterpart.
+///
+/// Separate from the first push attempt so a failure here is reported as orch's own
+/// push failure rather than re-entering the diverged-branch recovery
+async fn push_after_rebase(
+    ctx: &StoreCtx<'_>,
+    work_dir: &Path,
+    branch: &str,
+    default_branch: &str,
+    agent_name: &str,
+    model_name: Option<&str>,
+) -> PushResult {
+    match git_ops::push_branch(work_dir, branch, default_branch).await {
+        Ok(_) => {
+            ctx.append_activity(
+                "push",
+                Some(agent_name),
+                model_name,
+                Some(&serde_json::json!({
+                    "status": "ok",
+                    "branch": branch,
+                    "default_branch": default_branch,
+                    "reason": "pushed_after_rebase",
+                })),
+            )
+            .await;
+            ctx.set(&[
+                ("last_error", serde_json::json!("")),
+                ("push_failures", serde_json::json!(0)),
+            ])
+            .await;
+            PushResult::Success
+        }
+        Err(e) => {
+            tracing::error!(
+                task_id = ctx.task_id,
+                branch = branch,
+                error = ?e,
+                "push failed again after rebasing on the remote branch"
+            );
+            ctx.append_activity(
+                "push",
+                Some(agent_name),
+                model_name,
+                Some(&serde_json::json!({
+                    "status": "error",
+                    "branch": branch,
+                    "default_branch": default_branch,
+                    "reason": "pushed_after_rebase",
+                    "error": e.to_string(),
+                })),
+            )
+            .await;
+            ctx.set(&[(
+                "last_error",
+                serde_json::json!(format!("push failed after rebase on remote branch: {e}")),
+            )])
+            .await;
+            PushResult::Failed
+        }
+    }
 }
 
 async fn push_branch_with_log(
@@ -516,11 +576,13 @@ async fn push_branch_with_log(
                 // Attempt to fetch and rebase on origin/{branch}.
                 match git_ops::rebase_on_branch(work_dir, branch).await {
                     Ok(true) => {
-                        // Rebase succeeded with commits replayed.
+                        // Pushing is orch's step, not the agent's: the commits are already
+                        // written, so push them onto the moved remote branch here. Re-routing
+                        // instead re-ran a finished task until it hit the attempt limit (#3783)
                         tracing::info!(
                             task_id = ctx.task_id,
                             branch = branch,
-                            "rebase succeeded — task will be re-routed to new agent"
+                            "rebase succeeded — retrying the push"
                         );
                         ctx.append_activity(
                             "push_rebased",
@@ -533,17 +595,18 @@ async fn push_branch_with_log(
                             })),
                         )
                         .await;
-                        ctx.set(&[(
-                            "last_error",
-                            serde_json::json!(
-                                "push failed: branch diverged from remote — rebased successfully, will retry with new agent"
-                            ),
-                        )])
+                        return push_after_rebase(
+                            ctx,
+                            work_dir,
+                            branch,
+                            default_branch,
+                            agent_name,
+                            model_name,
+                        )
                         .await;
-                        return PushResult::Rebased;
                     }
                     Ok(false) => {
-                        // No local commits to rebase — nothing to push.
+                        // The remote branch already holds every local commit, nothing to push
                         tracing::info!(
                             task_id = ctx.task_id,
                             branch = branch,
@@ -857,13 +920,6 @@ async fn run_git_ops(
             task_id = ctx.task_id,
             "skipping PR creation due to push failure"
         );
-    } else if matches!(push_result, PushResult::Rebased) {
-        // Rebase succeeded — don't create PR now, task will be re-routed to new agent.
-        // The new agent will push the rebased commits.
-        tracing::info!(
-            task_id = ctx.task_id,
-            "skipping PR creation after successful rebase — task will be re-routed"
-        );
     } else if matches!(push_result, PushResult::NoCommits) {
         tracing::info!(
             task_id = ctx.task_id,
@@ -924,10 +980,6 @@ async fn detect_push_failure_state(
             || (stored_last_error.contains("refusing to allow")
                 && stored_last_error.contains("workflow")));
 
-    // Detect successful rebase after push failure — this is a recovery case,
-    // not a true failure. The task will be re-routed to a new agent who can
-    // push the rebased commits. Don't increment push_failures counter in this case.
-    let is_rebased_recovery = push_failed && stored_last_error.contains("rebased successfully");
     let is_rebase_conflict_failure =
         push_failed && stored_last_error.contains("push failed and rebase failed:");
 
@@ -935,11 +987,7 @@ async fn detect_push_failure_state(
     // Workflow-scope failures are non-retryable and blocked immediately; do not
     // increment this retry counter for them so that later normal push failures
     // are not prematurely blocked.
-    // Also skip incrementing when rebase succeeded — this is recovery, not failure.
-    let push_failures = if push_failed
-        && !is_workflow_scope_failure
-        && !is_rebased_recovery
-        && !is_rebase_conflict_failure
+    let push_failures = if push_failed && !is_workflow_scope_failure && !is_rebase_conflict_failure
     {
         match ctx.increment("push_failures").await {
             Ok(v) => v,
@@ -1131,10 +1179,6 @@ async fn apply_post_decision_effects(
         ])
         .await;
     } else if push_state.push_failed {
-        // Check if this is a rebase recovery case (rebase succeeded after push failure).
-        let is_rebased_recovery = push_state
-            .stored_last_error
-            .contains("rebased successfully");
         // Clear agent and model so router picks a different one on reroute (#1604)
         ctx.set(&[
             ("agent", serde_json::json!(null)),
@@ -1142,13 +1186,7 @@ async fn apply_post_decision_effects(
         ])
         .await;
         let push_failures = push_state.push_failures;
-        if is_rebased_recovery {
-            // Rebase succeeded — next agent will have up-to-date history.
-            tracing::info!(
-                task_id = ctx.task_id,
-                "push failed but rebase succeeded — rerouting to different agent with up-to-date history"
-            );
-        } else if push_failures >= 3 {
+        if push_failures >= 3 {
             tracing::error!(
                 task_id = ctx.task_id,
                 push_failures,
@@ -1538,6 +1576,125 @@ pub async fn handle_success(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Helper: run git in `dir`, panicking on failure
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?} failed to start: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_clone(remote: &Path, dir: &Path) {
+        git(dir, &["clone", remote.to_str().unwrap(), "."]);
+        git(dir, &["config", "user.email", "t@t.com"]);
+        git(dir, &["config", "user.name", "T"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+    }
+
+    /**
+     * Someone rebased the PR branch from another clone and force-pushed it, so orch's
+     * push is rejected with a stale lease. Pushing is orch's own step: it must rebase
+     * onto the moved branch and push again, never hand finished work back to the agent
+     * as a fresh attempt (#3783)
+     **/
+    #[tokio::test]
+    async fn push_rejected_after_remote_rebase_is_pushed_not_rerouted() {
+        let remote = tempfile::tempdir().unwrap();
+        git(remote.path(), &["init", "--bare", "-b", "main"]);
+
+        // orch's worktree: main, then a feature branch with the task's commit
+        let work = tempfile::tempdir().unwrap();
+        init_clone(remote.path(), work.path());
+        std::fs::write(work.path().join("README.md"), "base").unwrap();
+        git(work.path(), &["add", "."]);
+        git(work.path(), &["commit", "-m", "init"]);
+        git(work.path(), &["push", "origin", "HEAD:main"]);
+        git(work.path(), &["checkout", "-b", "feat"]);
+        std::fs::write(work.path().join("fix.txt"), "the fix").unwrap();
+        git(work.path(), &["add", "."]);
+        git(work.path(), &["commit", "-m", "apply the fix"]);
+        git(work.path(), &["push", "-u", "origin", "feat"]);
+
+        // Another clone rewrites the same change and force-pushes it
+        let other = tempfile::tempdir().unwrap();
+        init_clone(remote.path(), other.path());
+        git(other.path(), &["checkout", "feat"]);
+        git(
+            other.path(),
+            &["commit", "--amend", "-m", "apply the fix (rebased)"],
+        );
+        git(other.path(), &["push", "--force", "origin", "feat"]);
+
+        // orch now has an unpushed commit of its own on top of the stale branch
+        std::fs::write(work.path().join("more.txt"), "follow-up").unwrap();
+        git(work.path(), &["add", "."]);
+        git(work.path(), &["commit", "-m", "follow-up"]);
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let store_id = store
+            .create_internal("owner/repo", "Push recovery", "", "task", "3783", None)
+            .await
+            .unwrap();
+        let task_id = format!("internal:{store_id}");
+        let store_opt = Some(Arc::clone(&store));
+        let ctx = StoreCtx {
+            store: &store_opt,
+            store_id_opt: Some(store_id),
+            repo: "owner/repo",
+            task_id: &task_id,
+        };
+
+        let result =
+            push_branch_with_log(&ctx, work.path(), "feat", "main", "claude", Some("opus")).await;
+
+        assert!(
+            matches!(result, PushResult::Success),
+            "orch must land the push itself after adopting the moved remote branch"
+        );
+
+        let task = store.get(store_id).await.unwrap();
+        assert!(
+            task.last_error.is_empty(),
+            "a recovered push must leave no error behind, got: {}",
+            task.last_error
+        );
+        assert_eq!(task.push_failures, 0, "recovery is not a push failure");
+
+        // Confirm the test really went through the rejected-push recovery
+        let activity = store.get_activity(store_id, None).await.unwrap();
+        assert!(
+            activity.iter().any(|a| a.event_type == "push_rebased"),
+            "the first push must have been rejected and recovered by a rebase"
+        );
+
+        // The follow-up commit is on the remote, on top of the rebased history
+        let log = std::process::Command::new("git")
+            .current_dir(work.path())
+            .args(["log", "--oneline", "origin/feat"])
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&log.stdout);
+        assert!(
+            log.contains("follow-up"),
+            "remote must carry the task's commit: {log}"
+        );
+        assert!(
+            log.contains("apply the fix (rebased)"),
+            "orch must adopt the rebased remote history, not re-push its own: {log}"
+        );
+        assert!(
+            !log.contains("apply the fix\n"),
+            "the superseded commit must not come back: {log}"
+        );
+    }
 
     #[test]
     fn missing_path_error_detects_io_not_found() {

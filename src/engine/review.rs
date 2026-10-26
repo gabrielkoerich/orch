@@ -208,11 +208,77 @@ struct ParsedReview {
     decision: ReviewDecision,
 }
 
+/// KV key holding the commit an approving review was already written for
+fn approved_sha_key(repo: &str, task_id: &str) -> String {
+    format!("review_approved_sha:{repo}#{task_id}")
+}
+
+/// Read `HEAD` of a worktree. `None` when the worktree is gone or not a repository
+async fn worktree_head_sha(dir: &std::path::Path) -> Option<String> {
+    let out = tokio::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
+/// Record that the commit now at the worktree's `HEAD` carries an approving review,
+/// so a later NeedsReview event on the same commit skips the review agent
+async fn record_approved_sha(
+    store: &Arc<TaskStore>,
+    repo: &str,
+    task_id: &str,
+    dir: &std::path::Path,
+) {
+    let Some(sha) = worktree_head_sha(dir).await else {
+        return;
+    };
+    if let Err(e) = store.kv_set(&approved_sha_key(repo, task_id), &sha).await {
+        tracing::warn!(task_id, err = %e, "failed to record approved commit sha");
+    }
+}
+
+/// True when the worktree still sits on the commit a previous review approved.
+///
+/// The merge is then the only step left, so the task must go back to the merge retry
+/// rather than through a second review of the same diff (#3783)
+async fn commit_already_approved(
+    store: &Arc<TaskStore>,
+    repo: &str,
+    task_id: &str,
+    worktree: &str,
+) -> bool {
+    if worktree.trim().is_empty() {
+        return false;
+    }
+    let approved = match store.kv_get(&approved_sha_key(repo, task_id)).await {
+        Ok(Some(sha)) => sha,
+        Ok(None) => return false,
+        Err(e) => {
+            tracing::warn!(task_id, err = %e, "failed to read approved commit sha");
+            return false;
+        }
+    };
+    worktree_head_sha(std::path::Path::new(worktree))
+        .await
+        .as_deref()
+        == Some(approved.as_str())
+}
+
 fn build_review_disallowed_tools(worktree_path: &std::path::Path) -> Vec<String> {
     let mut tools = vec![
         "Bash(rm *)".to_string(),
         "Bash(rm -*)".to_string(),
         "Bash(git push*)".to_string(),
+        // Pushing and opening the PR are orch's steps, never the agent's (#3783)
+        "Bash(gh pr create*)".to_string(),
     ];
     let orch_yml = worktree_path.join(".orch.yml");
     let orch_yml_str = orch_yml.to_string_lossy();
@@ -322,6 +388,22 @@ async fn build_review_context(
         .with_context(|| format!("store lookup failed for task {}", task.id.0))?;
 
     let store_id: Option<i64> = stored_task.as_ref().map(|t| t.id);
+
+    // A commit that already has an approval must not be reviewed again. Checked before
+    // the review_invocations increment so a stuck merge cannot exhaust the review quota
+    if let Some(stored) = stored_task.as_ref() {
+        if stored.pr_number.is_some()
+            && commit_already_approved(store, repo, &task.id.0, &stored.worktree).await
+        {
+            tracing::info!(
+                task_id = task.id.0,
+                pr_number = stored.pr_number,
+                "commit already approved — skipping review, merge retry continues"
+            );
+            return Ok(ReviewPhase::EarlyReturn(ReviewDecision::Approve));
+        }
+    }
+
     let had_prev_push_failure = stored_task
         .as_ref()
         .is_some_and(|t| t.last_error.contains("push failed"));
@@ -1843,6 +1925,7 @@ async fn apply_review_decision(
 
     match &parsed.decision {
         ReviewDecision::Approve => {
+            record_approved_sha(store, repo, &task.id.0, &ctx.worktree_path).await;
             // Always attempt auto-merge on approval. Tasks are only marked
             // Done when the PR is actually merged (detected by review_poll).
             // Never mark Done on approval alone — that closes the issue
@@ -3147,6 +3230,79 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             url: "https://example.com/issues/1".to_string(),
         }
+    }
+
+    /**
+     * A commit that already carries an approving review must not be reviewed a second
+     * time. The merge is the only step left, so the task goes back to the merge retry
+     * with the same approval instead of burning another review round (#3783)
+     **/
+    #[tokio::test]
+    async fn build_review_context_skips_review_of_an_already_approved_commit() {
+        let temp = TempDir::new().unwrap();
+        let wt = temp.path();
+        git(wt, &["init", "-b", "main"]);
+        git(wt, &["config", "user.name", "Test"]);
+        git(wt, &["config", "user.email", "test@test.com"]);
+        std::fs::write(wt.join("fix.txt"), "the fix").unwrap();
+        git(wt, &["add", "."]);
+        git(wt, &["commit", "-m", "apply the fix"]);
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let repo = "owner/repo";
+        let ext = no_code_review_task("3783");
+        store.ensure_external_task(repo, &ext).await.unwrap();
+        let store_id = store
+            .resolve_task_id(repo, &ext.id.0)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .set_fields(
+                store_id,
+                &[
+                    ("worktree", serde_json::json!(wt.to_str().unwrap())),
+                    ("branch", serde_json::json!("gh-issue-3783-fix")),
+                    ("pr_number", serde_json::json!(77)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // A previous review approved exactly this commit
+        record_approved_sha(&store, repo, &ext.id.0, wt).await;
+
+        let backend = Arc::new(crate::backends::test_helpers::NoopBackend);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            Arc::clone(&store),
+            repo.to_string(),
+        ));
+        let router = Arc::new(RwLock::new(Router::new(RouterConfig::default())));
+
+        let phase = build_review_context(&ext, repo, &router, &task_manager, &store)
+            .await
+            .unwrap();
+        assert!(
+            matches!(phase, ReviewPhase::EarlyReturn(ReviewDecision::Approve)),
+            "an already-approved commit must keep its approval, not be reviewed again"
+        );
+
+        let stored = store.get(store_id).await.unwrap();
+        assert_eq!(
+            stored.review_invocations, 0,
+            "the skipped review must not spend a review invocation"
+        );
+
+        // A new commit on the same branch is reviewed normally
+        std::fs::write(wt.join("more.txt"), "follow-up").unwrap();
+        git(wt, &["add", "."]);
+        git(wt, &["commit", "-m", "follow-up"]);
+        let phase = build_review_context(&ext, repo, &router, &task_manager, &store).await;
+        assert!(
+            !matches!(phase, Ok(ReviewPhase::EarlyReturn(ReviewDecision::Approve))),
+            "a commit added after the approval must be reviewed"
+        );
     }
 
     #[tokio::test]
