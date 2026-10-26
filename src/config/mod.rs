@@ -164,6 +164,9 @@ fn ensure_watcher() {
     let watcher = RecommendedWatcher::new(
         move |res: Result<notify::Event, notify::Error>| {
             if let Ok(event) = res {
+                if !is_content_change(&event.kind) {
+                    return;
+                }
                 for path in event.paths {
                     // Check if it's a config file we care about
                     let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -180,6 +183,12 @@ fn ensure_watcher() {
     if let Ok(w) = watcher {
         *watcher_guard = Some(w);
     }
+}
+
+// inotify reports every read as an access event, and reload_file reads the file, so reacting to
+// access events reloads forever on Linux
+fn is_content_change(kind: &notify::EventKind) -> bool {
+    kind.is_create() || kind.is_modify() || kind.is_remove()
 }
 
 /**
@@ -863,6 +872,23 @@ mod tests {
 
     fn cached_projects(path: &PathBuf) -> Vec<String> {
         extract_projects_list(&load_cached_root(path).unwrap(), "projects").unwrap()
+    }
+
+    #[test]
+    fn reading_a_config_file_does_not_trigger_a_reload() {
+        use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, ModifyKind};
+        assert!(!is_content_change(&notify::EventKind::Access(
+            AccessKind::Open(AccessMode::Read)
+        )));
+        assert!(!is_content_change(&notify::EventKind::Access(
+            AccessKind::Close(AccessMode::Read)
+        )));
+        assert!(is_content_change(&notify::EventKind::Modify(
+            ModifyKind::Data(DataChange::Content)
+        )));
+        assert!(is_content_change(&notify::EventKind::Create(
+            CreateKind::File
+        )));
     }
 
     #[test]
