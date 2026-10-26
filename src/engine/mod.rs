@@ -399,6 +399,20 @@ fn should_run_upgrade_check(
         .unwrap_or(true)
 }
 
+/// Log a warning when the backend health check fails. Never skips the project.
+fn log_health_check(repo: &str, backend_name: &str, result: anyhow::Result<()>) -> bool {
+    match result {
+        Ok(()) => {
+            tracing::info!(repo = %repo, backend = backend_name, "backend connected");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(repo = %repo, error = %e, "GitHub health check failed for {repo}, starting engine anyway (rate limited, offline or bad credentials?)");
+            false
+        }
+    }
+}
+
 /// Initialize all project engines from config.
 ///
 /// Returns a vector of ProjectEngine, one for each configured project.
@@ -418,8 +432,6 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
     }
 
     let mut engines = Vec::new();
-    let mut auth_failures = 0usize;
-    let mut network_failures = 0usize;
 
     // Initialize unified task store once — all project engines share the same SQLite file.
     // Creating one pool here avoids N separate connection pools for the same database.
@@ -436,31 +448,10 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
         let backend: Arc<dyn ExternalBackend> =
             Arc::new(crate::backends::github::GitHubBackend::new(repo.clone())?);
 
-        // Health check — verifies network and GitHub authentication
-        if let Err(e) = backend.health_check().await {
-            let err_str = e.to_string();
-            if err_str.contains("401")
-                || err_str.contains("Bad credentials")
-                || err_str.contains("authentication")
-                || err_str.contains("No GitHub token")
-            {
-                auth_failures += 1;
-                tracing::debug!(
-                    repo = %repo,
-                    error = %e,
-                    "GitHub auth failed for {repo} — run `gh auth login`"
-                );
-            } else {
-                network_failures += 1;
-                tracing::debug!(
-                    repo = %repo,
-                    error = %e,
-                    "GitHub unreachable for {repo} (network unavailable?)"
-                );
-            }
-            continue;
-        }
-        tracing::info!(repo = %repo, backend = backend.name(), "backend connected");
+        // A failed health check (rate limit, network, auth) must not drop the project: it would
+        // have no review subscriber until the next restart. Later ticks hit the API again and
+        // retry on their own, so start the engine and warn while the check keeps failing.
+        log_health_check(&repo, backend.name(), backend.health_check().await);
 
         // Initialize task manager (with unified store)
         let task_manager = Arc::new(TaskManager::with_store(
@@ -480,26 +471,6 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
             runner,
             store: store.clone(),
         });
-    }
-
-    if engines.is_empty() {
-        // Projects are configured but all health checks failed — this is a connectivity
-        // or auth issue, not a configuration problem.  The serve() retry loop will catch
-        // this error and retry with backoff; it must NOT propagate to main() or it would
-        // write "Error: ..." to brew's stderr (orch.error.log) on every restart attempt.
-        if auth_failures > 0 && network_failures == 0 {
-            anyhow::bail!(
-                "GitHub auth failed for all configured projects ({auth_failures} project(s)) — run `gh auth login`"
-            );
-        } else if network_failures > 0 && auth_failures == 0 {
-            anyhow::bail!(
-                "GitHub unreachable for all configured projects ({network_failures} project(s)) — check network connectivity"
-            );
-        } else {
-            anyhow::bail!(
-                "all configured project backends failed health checks ({auth_failures} auth failures, {network_failures} network failures)"
-            );
-        }
     }
 
     Ok(engines)
@@ -2709,6 +2680,13 @@ pub async fn serve() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_limited_health_check_does_not_skip_project() {
+        let err = anyhow::anyhow!("API rate limit exceeded (403)");
+        assert!(!log_health_check("o/r", "github", Err(err)));
+        assert!(log_health_check("o/r", "github", Ok(())));
+    }
 
     #[test]
     fn engine_config_defaults() {
