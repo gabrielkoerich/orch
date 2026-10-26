@@ -182,12 +182,18 @@ fn ensure_watcher() {
     }
 }
 
-/// Register a config file for change watching.
-///
-/// `get` / `get_list` watch the files they read, but a project's `.orch.yml`
-/// is read directly by [`get_projects_with_paths`] and needs registering by
-/// the caller that knows the project list
+/**
+ * Register a config file for change watching. `get` / `get_list` watch the files they read, but a
+ * project's `.orch.yml` is read directly by `get_projects_with_paths`, so the caller that knows the
+ * project list registers it here. A missing path is skipped: notify cannot watch one, and a project
+ * may be configured through the legacy `.orchestrator.yml` name or the global `gh.repo` fallback,
+ * which has no project directory at all
+ **/
 pub fn watch(path: &Path) {
+    if !path.exists() {
+        tracing::debug!(path = %path.display(), "no config file to watch here");
+        return;
+    }
     watch_file(&path.to_path_buf());
 }
 

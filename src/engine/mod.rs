@@ -404,6 +404,36 @@ fn resize_dispatch_pool(semaphore: &Semaphore, in_force: usize, target: usize) -
     in_force
 }
 
+/// Config subtrees the engine only reads at startup: the channel gateways hold
+/// long-lived websockets and the webhook listener binds its port once.
+const RESTART_ONLY_KEYS: [&str; 2] = ["channels", "webhook"];
+
+/// Read the restart-only subtrees so a later reload can tell they changed.
+fn restart_only_snapshot() -> Vec<Option<String>> {
+    RESTART_ONLY_KEYS
+        .iter()
+        .map(|key| crate::config::get(key).ok())
+        .collect()
+}
+
+/// Report the restart-only keys an edit changed. Only the key is logged, never
+/// the value, because `channels.*` holds bot tokens
+fn log_restart_only_changes(old: &[Option<String>], new: &[Option<String>]) -> Vec<&'static str> {
+    let changed: Vec<&'static str> = RESTART_ONLY_KEYS
+        .iter()
+        .zip(old)
+        .zip(new)
+        .filter(|((_, old), new)| old != new)
+        .map(|((key, _), _)| *key)
+        .collect();
+
+    for key in &changed {
+        tracing::info!(key = key, "config changed, takes effect after restart");
+    }
+
+    changed
+}
+
 /// Log every engine setting whose value changed across a config reload, so
 /// `orch log` shows what the operator's edit actually did.
 fn log_engine_config_changes(old: &EngineConfig, new: &EngineConfig) {
@@ -488,6 +518,33 @@ async fn connect_project_engine(
     })
 }
 
+/**
+ * Split the configured project list into the ones not running yet and the names of the ones that
+ * went away. Kept separate from `sync_project_engines` so the comparison can be tested without a
+ * GitHub backend: getting it wrong either spawns a second set of subscribers for a project already
+ * running, or silently never picks a new one up
+ **/
+fn diff_configured_projects(
+    configured: &[(String, std::path::PathBuf)],
+    active_repos: &std::collections::HashSet<String>,
+) -> (Vec<(String, std::path::PathBuf)>, Vec<String>) {
+    let configured_repos: std::collections::HashSet<&str> =
+        configured.iter().map(|(r, _)| r.as_str()).collect();
+
+    let added = configured
+        .iter()
+        .filter(|(repo, _)| !active_repos.contains(repo))
+        .cloned()
+        .collect();
+    let removed = active_repos
+        .iter()
+        .filter(|repo| !configured_repos.contains(repo.as_str()))
+        .cloned()
+        .collect();
+
+    (added, removed)
+}
+
 /// Pick up projects added to `projects:` since startup, and report the ones
 /// that were removed.
 ///
@@ -517,20 +574,15 @@ async fn sync_project_engines(
         return;
     };
 
-    let configured_repos: std::collections::HashSet<String> =
-        configured.iter().map(|(r, _)| r.clone()).collect();
-    for repo in active_repos.difference(&configured_repos) {
+    let (added, removed) = diff_configured_projects(&configured, active_repos);
+    for repo in removed {
         tracing::info!(
             repo = %repo,
             "project removed from config, takes effect after restart"
         );
     }
 
-    for (repo, project_dir) in configured {
-        if active_repos.contains(&repo) {
-            continue;
-        }
-
+    for (repo, project_dir) in added {
         config::watch(&project_dir.join(".orch.yml"));
         let engine = match connect_project_engine(
             repo.clone(),
@@ -2145,6 +2197,10 @@ pub async fn serve() -> anyhow::Result<()> {
         parallel = config.max_parallel,
         "entering main loop"
     );
+    // Values of the settings that only take effect at startup, so a reload can
+    // tell the operator their edit needs a restart.
+    let mut restart_only = restart_only_snapshot();
+
     let mut interval = tokio::time::interval(config.tick_interval);
 
     // Signal handlers (launchd/systemd send SIGTERM to stop services, SIGHUP for reload/restart)
@@ -2618,6 +2674,11 @@ pub async fn serve() -> anyhow::Result<()> {
                     // Reload engine config
                     let new_config = EngineConfig::from_config();
                     log_engine_config_changes(&config, &new_config);
+
+                    let new_restart_only = restart_only_snapshot();
+                    log_restart_only_changes(&restart_only, &new_restart_only);
+                    restart_only = new_restart_only;
+
                     let tick_changed = new_config.tick_interval != config.tick_interval;
                     config = new_config;
 
@@ -2931,6 +2992,95 @@ mod tests {
         // A slot freed after that is handed out, since 4 is now the real limit.
         held.truncate(3);
         assert!(semaphore.clone().try_acquire_owned().is_ok());
+    }
+
+    #[test]
+    fn a_project_added_to_the_config_is_picked_up_and_running_ones_are_not_respawned() {
+        let configured = vec![
+            (
+                "owner/one".to_string(),
+                std::path::PathBuf::from("/srv/one"),
+            ),
+            (
+                "owner/two".to_string(),
+                std::path::PathBuf::from("/srv/two"),
+            ),
+        ];
+        let active: std::collections::HashSet<String> =
+            ["owner/one".to_string()].into_iter().collect();
+
+        let (added, removed) = diff_configured_projects(&configured, &active);
+        assert_eq!(
+            added,
+            vec![(
+                "owner/two".to_string(),
+                std::path::PathBuf::from("/srv/two")
+            )],
+            "only the new project is started, so owner/one keeps its single set of subscribers"
+        );
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn a_project_dropped_from_the_config_is_reported_and_not_restarted() {
+        let configured = vec![(
+            "owner/one".to_string(),
+            std::path::PathBuf::from("/srv/one"),
+        )];
+        let active: std::collections::HashSet<String> =
+            ["owner/one".to_string(), "owner/gone".to_string()]
+                .into_iter()
+                .collect();
+
+        let (added, removed) = diff_configured_projects(&configured, &active);
+        assert!(added.is_empty(), "nothing new to start");
+        assert_eq!(removed, vec!["owner/gone".to_string()]);
+    }
+
+    #[test]
+    fn an_unchanged_project_list_starts_nothing() {
+        let configured = vec![(
+            "owner/one".to_string(),
+            std::path::PathBuf::from("/srv/one"),
+        )];
+        let active: std::collections::HashSet<String> =
+            ["owner/one".to_string()].into_iter().collect();
+
+        assert_eq!(
+            diff_configured_projects(&configured, &active),
+            (vec![], vec![])
+        );
+    }
+
+    #[test]
+    fn restart_only_keys_are_the_settings_read_once_at_startup() {
+        // Guards the docs table: every key listed here is documented as needing
+        // `orch service restart`, and nothing reloadable may be added to it.
+        assert_eq!(RESTART_ONLY_KEYS, ["channels", "webhook"]);
+    }
+
+    #[test]
+    fn a_changed_restart_only_key_is_reported_and_an_unchanged_one_is_not() {
+        let before = vec![Some("bot_token: a\n".to_string()), None];
+
+        assert!(
+            log_restart_only_changes(&before, &before.clone()).is_empty(),
+            "a reload that did not touch these keys must stay quiet"
+        );
+
+        // An edited token and a newly added webhook block are both changes
+        let after = vec![
+            Some("bot_token: b\n".to_string()),
+            Some("port: 8080\n".to_string()),
+        ];
+        assert_eq!(
+            log_restart_only_changes(&before, &after),
+            ["channels", "webhook"]
+        );
+
+        // Only the edited key is reported when the other is untouched
+        let token_only = vec![Some("bot_token: b\n".to_string()), None];
+        assert_eq!(log_restart_only_changes(&before, &token_only), ["channels"]);
     }
 
     #[test]

@@ -100,7 +100,7 @@ A file that does not parse is ignored: the last good values stay in force and on
 
 A project added to `projects:` is picked up on the next save — its backend connects, its subscribers start and its issues are ingested on the following sync tick. A failed GitHub health check does not hold the project back: it starts anyway and the next sync tick retries, so a project added while GitHub is rate limited or unreachable still runs.
 
-These settings still need `orch service restart`:
+These settings still need `orch service restart`. Editing one logs `config changed, takes effect after restart` with the key, so the reload never looks like it applied. The value is not logged, because `channels.*` holds bot tokens.
 
 | Setting | Why |
 |---------|-----|
