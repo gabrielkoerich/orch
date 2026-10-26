@@ -15,7 +15,9 @@ use chrono::{Duration, Utc};
 /// ingestion. Other associations (members, collaborators, first-time
 /// contributors, etc.) are ignored per the new sync policy.
 /// Available values: COLLABORATOR, CONTRIBUTOR, FIRST_TIMER, FIRST_TIME_CONTRIBUTOR, MANNEQUIN, MEMBER, NONE, OWNER
-const ALLOWED_ASSOCIATIONS: &[&str] = &["OWNER", "COLLABORATOR"];
+// MEMBER is a member of the organization that owns the repo, as the operator is after a
+// transfer to an org. Without it every new issue and comment there was dropped
+const ALLOWED_ASSOCIATIONS: &[&str] = &["OWNER", "MEMBER", "COLLABORATOR"];
 
 /// Check if an issue author is trusted
 fn is_trusted_author(issue: &crate::github::types::GitHubIssue) -> bool {
@@ -1043,8 +1045,8 @@ mod tests {
     // ---
 
     #[test]
-    fn allowed_associations_are_owner_and_contributor() {
-        assert_eq!(ALLOWED_ASSOCIATIONS, &["OWNER", "COLLABORATOR"]);
+    fn allowed_associations_are_owner_member_and_collaborator() {
+        assert_eq!(ALLOWED_ASSOCIATIONS, &["OWNER", "MEMBER", "COLLABORATOR"]);
     }
 
     #[test]
@@ -1117,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn is_not_trusted_author_member() {
+    fn is_trusted_author_member() {
         let issue = GitHubIssue {
             number: 1,
             id: 0,
@@ -1136,7 +1138,7 @@ mod tests {
             state_reason: None,
             author_association: Some("MEMBER".to_string()),
         };
-        assert!(!is_trusted_author(&issue));
+        assert!(is_trusted_author(&issue));
     }
 
     #[test]
@@ -1158,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn is_not_trusted_comment_author_direct() {
+    fn is_trusted_comment_author_member() {
         use crate::github::types::GitHubComment;
         let c = GitHubComment {
             id: 1,
@@ -1172,7 +1174,7 @@ mod tests {
             issue_url: None,
             author_association: Some("MEMBER".to_string()),
         };
-        assert!(!is_trusted_comment_author(&c));
+        assert!(is_trusted_comment_author(&c));
     }
 
     fn make_test_issue(labels: &[&str]) -> GitHubIssue {
