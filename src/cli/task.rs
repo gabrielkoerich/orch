@@ -183,6 +183,20 @@ async fn resolve_cli_task(store: &TaskStore, id: &str) -> anyhow::Result<store::
     }
 }
 
+/// Refuse to move a done task back into the pipeline.
+///
+/// A done task keeps the body it was created with, so reviving one re-runs a
+/// prompt that may be months stale. `reopen` is the only way back (#3780)
+fn refuse_if_done(resolved: &store::CliTaskRef, action: &str) -> anyhow::Result<()> {
+    if resolved.status != crate::store::TaskStatus::Done.as_str() {
+        return Ok(());
+    }
+    let shown = resolved.display_spec();
+    anyhow::bail!(
+        "{shown} is done — {action} does not revive done tasks; use `orch task reopen {shown}`"
+    )
+}
+
 /// True when the task still has an open dependency and must stay `waiting`.
 async fn release_or_keep_waiting(store: &TaskStore, task_id: i64) -> anyhow::Result<bool> {
     Ok(store.status_after_unblock(task_id).await? == crate::store::TaskStatus::Waiting)
@@ -982,6 +996,7 @@ pub async fn retry(id: &str, agent: Option<String>, model: Option<String>) -> an
 
     let s = Arc::new(crate::cli::init_store().await?);
     let resolved = resolve_cli_task(&s, id).await?;
+    refuse_if_done(&resolved, "retry")?;
     let store = Some(s.clone());
     let repo = resolved.repo.clone();
     let shown = resolved.display_spec();
@@ -1150,6 +1165,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
 
     let s = Arc::new(crate::cli::init_store().await?);
     let resolved = resolve_cli_task(&s, id).await?;
+    refuse_if_done(&resolved, "unblock")?;
     let store = Some(s.clone());
     let repo = resolved.repo.clone();
     let shown = resolved.display_spec();
@@ -1296,6 +1312,15 @@ pub async fn reopen(id: &str) -> anyhow::Result<()> {
     let repo = resolved.repo.clone();
     let shown = resolved.display_spec();
     let gh = GhHttp::new()?;
+
+    // A job task keeps the prompt it was created with. Reviving one runs that
+    // old prompt again; the job creates a fresh task with its current one (#3780)
+    if task.source == "cron" {
+        anyhow::bail!(
+            "{shown} was created by job '{}' — reopening would re-run its original prompt; let the job create a fresh task",
+            task.source_id
+        );
+    }
 
     crate::store::store_reset_counters(&store, &repo, &resolved.external_id).await;
     s.update_status(store_id, TaskStatus::New).await?;
@@ -2187,6 +2212,35 @@ mod tests {
     fn format_age_invalid_returns_dash() {
         let age = format_age("not-a-timestamp");
         assert_eq!(age, "-");
+    }
+
+    fn task_ref(status: &str) -> store::CliTaskRef {
+        store::CliTaskRef {
+            store_id: Some(7),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "t".to_string(),
+            external_id: "58".to_string(),
+            status: status.to_string(),
+        }
+    }
+
+    #[test]
+    fn refuse_if_done_rejects_done_tasks_and_names_reopen() {
+        for action in ["retry", "unblock"] {
+            let err = refuse_if_done(&task_ref("done"), action)
+                .expect_err("done task must not be revived");
+            let msg = err.to_string();
+            assert!(msg.contains("orch task reopen"), "got: {msg}");
+            assert!(msg.contains(action), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn refuse_if_done_allows_other_statuses() {
+        for status in ["blocked", "needs_review", "new", "in_review", ""] {
+            assert!(refuse_if_done(&task_ref(status), "unblock").is_ok());
+        }
     }
 
     #[test]

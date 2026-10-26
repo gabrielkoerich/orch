@@ -2284,6 +2284,29 @@ impl GhHttp {
         Ok(())
     }
 
+    /// Close a pull request without merging it.
+    pub async fn close_pr(&self, repo: &str, pr_number: u64) -> anyhow::Result<()> {
+        let url = format!("{GITHUB_API}/repos/{repo}/pulls/{pr_number}");
+        let payload = serde_json::json!({ "state": "closed" });
+        self.patch_json_raw(&url, &payload).await?;
+        Ok(())
+    }
+
+    /// How many commits the head is missing from `base` (GitHub's `behind_by`).
+    ///
+    /// Zero means the head already contains the current base tip, so its checks
+    /// ran against the code the merge would produce.
+    pub async fn compare_behind_by(
+        &self,
+        repo: &str,
+        base: &str,
+        head_sha: &str,
+    ) -> anyhow::Result<u64> {
+        let url = format!("{GITHUB_API}/repos/{repo}/compare/{base}...{head_sha}");
+        let body: serde_json::Value = self.get_json(&url).await?;
+        parse_behind_by(&body)
+    }
+
     /// Close a GitHub issue.
     pub async fn close_issue(&self, repo: &str, number: &str) -> anyhow::Result<()> {
         let url = format!("{GITHUB_API}/repos/{repo}/issues/{number}");
@@ -3164,6 +3187,16 @@ impl GhHttp {
     }
 }
 
+/// Read `behind_by` out of a compare response.
+///
+/// A missing field is an error, not zero: treating an unreadable response as
+/// "head is up to date" would let a stale PR merge
+fn parse_behind_by(body: &serde_json::Value) -> anyhow::Result<u64> {
+    body.get("behind_by")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("compare response has no numeric behind_by field"))
+}
+
 fn sanitize_github_issue_numbers(issue_numbers: &[u64]) -> (Vec<u64>, Vec<u64>) {
     let mut valid = Vec::with_capacity(issue_numbers.len());
     let mut invalid = Vec::new();
@@ -3482,6 +3515,19 @@ fn parse_graphql_issue_comment(node: &serde_json::Value) -> Option<GitHubComment
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_behind_by_reads_compare_status() {
+        // A head behind the base must not merge: its checks ran against old code.
+        let behind = serde_json::json!({"status": "behind", "behind_by": 3, "ahead_by": 0});
+        assert_eq!(parse_behind_by(&behind).unwrap(), 3);
+        let diverged = serde_json::json!({"status": "diverged", "behind_by": 1, "ahead_by": 2});
+        assert_eq!(parse_behind_by(&diverged).unwrap(), 1);
+        let ahead = serde_json::json!({"status": "ahead", "behind_by": 0, "ahead_by": 2});
+        assert_eq!(parse_behind_by(&ahead).unwrap(), 0);
+        // An unreadable response is an error, never a permissive zero.
+        assert!(parse_behind_by(&serde_json::json!({"status": "ahead"})).is_err());
+    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 

@@ -37,9 +37,9 @@ orch task get <id>                                     # task details
 orch task status                                       # status summary for current project
 orch task route <id>                                   # (re-)route a task
 orch task run [id]                                     # run a specific task (or next routed)
-orch task retry <id> [--agent X --model Y]             # reset to new, optionally forcing routing
+orch task retry <id> [--agent X --model Y]             # reset to new, optionally forcing routing. Refuses a done task
 orch task reroute <id> --agent X --model Y             # force a new agent/model
-orch task unblock <id> | all                           # reset blocked tasks to new. A task that is only waiting stays waiting
+orch task unblock <id> | all                           # reset blocked tasks to new. A task that is only waiting stays waiting, a done task is refused
 orch task attach <id>                                  # attach to the agent's tmux session
 orch task live                                         # list active agent tmux sessions
 orch task kill <id>                                    # kill a running agent tmux session
@@ -51,7 +51,7 @@ orch task history <id>                                 # routing history / attem
 orch task runs <id> [--verbose]                        # full run audit (stdout/stderr/response)
 orch task close <id> [-n "note"]                       # mark done without running an agent
 orch task watch <id>                                   # follow status changes live
-orch task reopen <id>                                  # reopen a done/blocked task
+orch task reopen <id>                                  # reopen a done/blocked task. The only way back from done, and refuses job-created tasks
 orch task inspect <id>                                 # unified diagnostic view
 orch stream [id]                                       # stream live output (all sessions if no id)
 orch log -f --task <id>                                # stream one task through log

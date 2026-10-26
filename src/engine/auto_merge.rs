@@ -1573,6 +1573,24 @@ pub(crate) async fn auto_merge_pr(
         anyhow::bail!("a reviewer requested changes during CI wait — aborting merge");
     }
 
+    // 5b. Refuse to merge a head that does not contain the current base tip: its
+    // checks ran against older code, so two PRs that each pass can still break
+    // the base together (#3780). Merge the base in and re-check next tick.
+    let behind_by = gh.compare_behind_by(repo, &base_branch, &head_sha).await?;
+    if behind_by > 0 {
+        tracing::warn!(
+            task_id = task.id.0,
+            pr_number,
+            behind_by,
+            base_branch = %base_branch,
+            "PR head is behind the base — updating branch and re-running checks before merge"
+        );
+        if let Err(e) = gh.update_pr_branch(repo, pr_number).await {
+            tracing::warn!(task_id = task.id.0, pr_number, err = %e, "update-branch failed; retrying next tick");
+        }
+        return Ok(());
+    }
+
     tracing::info!(
         task_id = task.id.0,
         pr_number,
