@@ -4690,6 +4690,16 @@ mod tests {
         assert_eq!(after.status, crate::store::TaskStatus::NeedsReview);
     }
 
+    /// Router with one claude review model, so the refire sweeps see a reviewer.
+    fn reviewer_router() -> crate::engine::router::Router {
+        let mut config = crate::engine::router::RouterConfig::default();
+        config.model_map.insert(
+            "review".to_string(),
+            std::collections::HashMap::from([("claude".to_string(), vec!["sonnet".to_string()])]),
+        );
+        crate::engine::router::Router::new_for_test(config, vec!["claude".to_string()])
+    }
+
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn needs_review_escalates_to_blocked_after_max_refires() {
@@ -4702,7 +4712,7 @@ mod tests {
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
-        let router = Arc::new(RwLock::new(crate::engine::router::Router::from_config()));
+        let router = Arc::new(RwLock::new(reviewer_router()));
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let auto_merge_in_flight: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
@@ -4772,7 +4782,7 @@ mod tests {
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
-        let router = Arc::new(RwLock::new(crate::engine::router::Router::from_config()));
+        let router = Arc::new(RwLock::new(reviewer_router()));
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let auto_merge_in_flight: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
