@@ -1634,6 +1634,128 @@ mod tests {
         assert_eq!(superseded_conflict_pr(1, None, false), None);
     }
 
+    /// End-to-end: a conflict reroute that comes back with zero commits ahead of
+    /// the default branch closes the superseded PR and marks the task done,
+    /// instead of blocking it as a same-agent no-code loop (#3780).
+    #[tokio::test]
+    async fn conflict_reroute_with_no_commits_closes_pr_and_marks_done() {
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .expect("git runs")
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        }
+
+        // A worktree whose branch has nothing ahead of origin/main — the state
+        // the agent leaves behind when the fix already landed on the base.
+        let dir = tempfile::tempdir().unwrap();
+        let origin = dir.path().join("origin.git");
+        std::fs::create_dir(&origin).unwrap();
+        git(&origin, &["init", "--bare", "-b", "main"]);
+        let work_dir = dir.path().join("work");
+        std::fs::create_dir(&work_dir).unwrap();
+        git(&work_dir, &["init", "-b", "main"]);
+        git(
+            &work_dir,
+            &["remote", "add", "origin", &origin.display().to_string()],
+        );
+        std::fs::write(work_dir.join("a.txt"), "a").unwrap();
+        git(&work_dir, &["add", "-A"]);
+        git(&work_dir, &["commit", "-m", "init"]);
+        git(&work_dir, &["push", "-u", "origin", "main"]);
+        git(&work_dir, &["checkout", "-b", "fix-branch"]);
+
+        let wt = worktree::WorktreeSetup {
+            work_dir: work_dir.clone(),
+            branch: "fix-branch".to_string(),
+            default_branch: "main".to_string(),
+            main_project_dir: work_dir.clone(),
+        };
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let store_id = store
+            .create(&crate::store::NewTask {
+                external_id: Some("3772".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Fix the thing".to_string(),
+                body: String::new(),
+                source: "manual".to_string(),
+                source_id: String::new(),
+                author: "bot".to_string(),
+                url: String::new(),
+                labels: vec![],
+                parent_id: None,
+            })
+            .await
+            .unwrap();
+        store
+            .set_fields(store_id, &[("pr_number", serde_json::json!(42))])
+            .await
+            .unwrap();
+        // review_poll rerouted this task to resolve a merge conflict.
+        store
+            .increment(store_id, "merge_conflict_retries")
+            .await
+            .unwrap();
+        // A previous no-code run by the same agent — without the superseded
+        // check this run would block the task as a same-agent loop.
+        store
+            .set_fields(
+                store_id,
+                &[("no_code_last_agent", serde_json::json!("claude"))],
+            )
+            .await
+            .unwrap();
+
+        let parsed = agents::ParsedResponse {
+            response: AgentResponse {
+                status: "done".to_string(),
+                summary: "the fix is already on main".to_string(),
+                ..Default::default()
+            },
+            input_tokens: None,
+            output_tokens: None,
+            duration_ms: None,
+        };
+
+        let (final_status, push_failed) = handle_success(
+            "3772",
+            parsed,
+            &wt,
+            "Fix the thing",
+            "claude",
+            Some("sonnet"),
+            1,
+            "owner/repo",
+            &Some(Arc::clone(&store)),
+            "",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            final_status, "done",
+            "a superseded conflict reroute must end done, not blocked"
+        );
+        assert!(!push_failed);
+
+        let task = store.get(store_id).await.unwrap();
+        assert!(
+            task.last_error.contains("superseded"),
+            "the close attempt must be recorded on the task: {}",
+            task.last_error
+        );
+    }
+
     /// A conflict reroute with zero commits ahead marks the task done instead of
     /// blocking it as a same-agent no-code loop (#3780).
     #[test]

@@ -8,7 +8,7 @@ weight = 6
 
 ```bash
 orch task     list|add|get|status|route|run|retry|reroute|unblock|attach|live|kill
-              publish|cost|tree|logs|log|history|runs|close|watch|reopen|inspect
+              publish|cost|tree|logs|log|history|runs|close|watch|inspect
 orch service  start|stop|restart|status|doctor|prune
 orch job      list|add|remove|enable|disable|tick|run
 orch plan     import
@@ -37,7 +37,7 @@ orch task get <id>                                     # task details
 orch task status                                       # status summary for current project
 orch task route <id>                                   # (re-)route a task
 orch task run [id]                                     # run a specific task (or next routed)
-orch task retry <id> [--agent X --model Y]             # reset to new, optionally forcing routing. Refuses a done task
+orch task retry <id> [--agent X --model Y]             # reset to new, optionally forcing routing. Done is terminal: a done task is refused
 orch task reroute <id> --agent X --model Y             # force a new agent/model
 orch task unblock <id> | all                           # reset blocked tasks to new. A task that is only waiting stays waiting, a done task is refused
 orch task attach <id>                                  # attach to the agent's tmux session
@@ -51,7 +51,6 @@ orch task history <id>                                 # routing history / attem
 orch task runs <id> [--verbose]                        # full run audit (stdout/stderr/response)
 orch task close <id> [-n "note"]                       # mark done without running an agent
 orch task watch <id>                                   # follow status changes live
-orch task reopen <id>                                  # reopen a done/blocked task. The only way back from done, and refuses job-created tasks
 orch task inspect <id>                                 # unified diagnostic view
 orch stream [id]                                       # stream live output (all sessions if no id)
 orch log -f --task <id>                                # stream one task through log
@@ -95,7 +94,7 @@ orch stats overview [--all] # explicit overview subcommand
 orch task events [--repo X] # tail task events live
 orch log [N]                # tail server logs (last N lines)
 orch log -f                 # follow service logs
-orch service doctor [--fix] # diagnose SQLite ↔ GitHub drift
+orch service doctor [--fix] # diagnose SQLite ↔ GitHub drift. A done task is reported, never moved out of done
 orch service prune [--dry-run] # remove orphaned worktrees
 orch cooldown list          # show active agent/model cooldowns
 orch cooldown clear <key>   # clear a specific cooldown (e.g. claude, claude:sonnet)

@@ -3515,6 +3515,8 @@ fn parse_graphql_issue_comment(node: &serde_json::Value) -> Option<GitHubComment
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn parse_behind_by_reads_compare_status() {
@@ -3528,8 +3530,6 @@ mod tests {
         // An unreadable response is an error, never a permissive zero.
         assert!(parse_behind_by(&serde_json::json!({"status": "ahead"})).is_err());
     }
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
 
     async fn spawn_truncated_body_server(body_prefix: &'static str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

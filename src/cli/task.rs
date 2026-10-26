@@ -185,15 +185,15 @@ async fn resolve_cli_task(store: &TaskStore, id: &str) -> anyhow::Result<store::
 
 /// Refuse to move a done task back into the pipeline.
 ///
-/// A done task keeps the body it was created with, so reviving one re-runs a
-/// prompt that may be months stale. `reopen` is the only way back (#3780)
+/// Done is terminal: a done task keeps the body it was created with, so
+/// reviving one re-runs a prompt that may be months stale (#3780)
 fn refuse_if_done(resolved: &store::CliTaskRef, action: &str) -> anyhow::Result<()> {
     if resolved.status != crate::store::TaskStatus::Done.as_str() {
         return Ok(());
     }
-    let shown = resolved.display_spec();
     anyhow::bail!(
-        "{shown} is done — {action} does not revive done tasks; use `orch task reopen {shown}`"
+        "{} is done — {action} does not revive done tasks; file a new issue or task for follow-up work",
+        resolved.display_spec()
     )
 }
 
@@ -1290,71 +1290,6 @@ pub async fn close(id: &str, note: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reopen a done/blocked task atomically:
-/// 1. Update SQLite status → New
-/// 2. Reset failure counters
-/// 3. Reopen GitHub issue (if external)
-/// 4. Sync GitHub labels to status:new
-/// 5. Link PR number if branch has a PR
-pub async fn reopen(id: &str) -> anyhow::Result<()> {
-    use crate::backends::github::GitHubBackend;
-    use crate::backends::ExternalBackend;
-    use crate::github::http::GhHttp;
-    use crate::store::TaskStatus;
-
-    let s = crate::cli::init_store().await?;
-    let resolved = resolve_cli_task(&s, id).await?;
-    let store_id = resolved
-        .store_id
-        .ok_or_else(|| anyhow::anyhow!("task '{id}' not found in store"))?;
-    let task = s.get(store_id).await?;
-    let store = Some(Arc::new(s.clone()));
-    let repo = resolved.repo.clone();
-    let shown = resolved.display_spec();
-    let gh = GhHttp::new()?;
-
-    // A job task keeps the prompt it was created with. Reviving one runs that
-    // old prompt again; the job creates a fresh task with its current one (#3780)
-    if task.source == "cron" {
-        anyhow::bail!(
-            "{shown} was created by job '{}' — reopening would re-run its original prompt; let the job create a fresh task",
-            task.source_id
-        );
-    }
-
-    crate::store::store_reset_counters(&store, &repo, &resolved.external_id).await;
-    s.update_status(store_id, TaskStatus::New).await?;
-
-    if !resolved.is_internal() {
-        if let Err(e) = gh.reopen_issue(&repo, &resolved.external_id).await {
-            eprintln!("warning: failed to reopen GitHub issue: {}", e);
-        }
-
-        let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
-        if let Err(e) = backend
-            .update_status(
-                &crate::backends::ExternalId(resolved.external_id.clone()),
-                Status::New,
-            )
-            .await
-        {
-            eprintln!("warning: failed to sync labels: {}", e);
-        }
-    }
-
-    if task.pr_number.is_none() && !task.branch.is_empty() {
-        if let Ok(Some(pr_num)) = gh.get_pr_number(&repo, &task.branch).await {
-            let _ = s
-                .set_fields(store_id, &[("pr_number", serde_json::json!(pr_num as i64))])
-                .await;
-            println!("Linked PR #{} from branch '{}'", pr_num, task.branch);
-        }
-    }
-
-    println!("Reopened {shown} (status → new, counters reset, will be re-routed)");
-    Ok(())
-}
-
 /// Attach to a running agent's tmux session.
 pub fn attach(id: &str) -> anyhow::Result<()> {
     let tmux = TmuxManager::new();
@@ -2226,12 +2161,12 @@ mod tests {
     }
 
     #[test]
-    fn refuse_if_done_rejects_done_tasks_and_names_reopen() {
+    fn refuse_if_done_rejects_done_tasks() {
         for action in ["retry", "unblock"] {
             let err = refuse_if_done(&task_ref("done"), action)
                 .expect_err("done task must not be revived");
             let msg = err.to_string();
-            assert!(msg.contains("orch task reopen"), "got: {msg}");
+            assert!(msg.contains("is done"), "got: {msg}");
             assert!(msg.contains(action), "got: {msg}");
         }
     }
