@@ -449,6 +449,24 @@ If a comment says "retry budget" / "escalation budget", it refers to a **count o
 
 The `high_confidence` flag exists only to let `scan()` / `redact()` distinguish severity for display purposes — it has no effect on whether posting is blocked.
 
+### Never delete the only copy of a commit
+
+`delete_branches()` in `src/engine/cleanup.rs` is the one place that deletes task branches, and it refuses to destroy work. The remote branch goes only when the default branch already contains every commit on it. The local branch goes only when origin or the default branch holds every commit on it. A squash-merged branch stays, and GitHub's "automatically delete head branches" removes it.
+
+Do not add a `git push origin --delete`, a `git branch -D` or a forced `git worktree remove` anywhere else, and do not weaken that check. Cleanup runs from many callers (startup reconciliation, closed-issue reconciliation, orphan sweeps, re-dispatch after store errors). Any of them can hold unmerged work, and the caller's view of the task status is not enough to know. On 2026-10-26, startup cleanup treated a blocked task as finished and deleted its remote branch, the only copy of pushed work (#3781). The tests `delete_branches_keeps_an_unmerged_remote_branch` and `delete_branches_keeps_a_local_branch_with_unpushed_commits` guard this rule.
+
+### Blocked and waiting are not terminal
+
+`blocked` means a person has to look, and `waiting` means a dependency is open. Both resume from their worktree and branch. Only `done` is terminal. Cleanup must never treat `Blocked` or `Waiting` as finished: startup reconciliation keeps their worktrees, and periodic cleanup collects only done tasks (#3793). `cleanup_skips_blocked_internal_tasks_and_cleans_done_ones` guards this.
+
+### Age stuck tasks from their status entry, not `updated_at`
+
+Many writes touch `updated_at` without changing the status. `review_open_prs` writes `pr_number` on every pass, so an `in_review` task with a PR never looked older than a minute, and a task with no reviewer sat for 10 hours (#3791). Stuck and stale checks must age a task from the `task_activity` row where it entered its current status. Do not move them back to `updated_at`. `stale_in_review_recovery_resets_orphaned_task_without_session` guards this.
+
+### Tests do not read the operator's config
+
+A test must not depend on `~/.orch/config.yml`. CI has no config, so a test that passes locally through `Router::from_config()` or `config::get()` fails in CI, and the PR loops through review cycles until it blocks (#3790). Build what the test needs, for example `Router::new_for_test(...)`, or point `ORCH_HOME` at a temp dir. Before pushing, run the suite with an empty home: `HOME=$(mktemp -d) ORCH_HOME=$(mktemp -d) GIT_CONFIG_GLOBAL=/dev/null cargo nextest run`.
+
 ## Preferred tools
 
 - Use `rg` instead of `grep` — faster, installed as a brew dependency

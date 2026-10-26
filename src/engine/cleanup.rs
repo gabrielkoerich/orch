@@ -930,29 +930,7 @@ pub(crate) async fn remove_worktree_and_branch(
     // so any linked PR remains open for human review.
     if let Some(br) = branch {
         if keep_remote_branch {
-            // Only delete local branch
-            let branch_delete_result = Command::new("git")
-                .args(["-C", repo_root_str.as_ref(), "branch", "-D", br])
-                .output_with_context()
-                .await;
-            match branch_delete_result {
-                Ok(output) if output.status.success() => {
-                    tracing::info!(
-                        task_id,
-                        branch = br,
-                        "local branch deleted (keeping remote for open PR)"
-                    );
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    if !stderr.contains("not found") {
-                        tracing::debug!(task_id, branch = br, err = %stderr, "local branch delete failed (may already be gone)");
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(task_id, branch = br, err = %e, "local branch delete failed");
-                }
-            }
+            delete_local_branch(task_id, br, repo_root).await;
         } else {
             delete_branches(task_id, br, repo_root).await;
         }
@@ -969,38 +947,130 @@ pub(crate) async fn remove_worktree_and_branch(
     }
 }
 
-/// Delete local and remote branches for a task.
-pub(crate) async fn delete_branches(task_id: &str, br: &str, repo_root: &std::path::Path) {
-    let repo_root_str = repo_root.to_string_lossy();
-    let branch_delete_result = Command::new("git")
-        .args(["-C", repo_root_str.as_ref(), "branch", "-D", br])
+/// Commits reachable from `rev` and from none of `others`. `None` when git cannot answer
+async fn commits_outside(repo_root: &std::path::Path, rev: &str, others: &[&str]) -> Option<u64> {
+    let mut args = vec![
+        "rev-list".to_string(),
+        "--count".to_string(),
+        rev.to_string(),
+    ];
+    for other in others {
+        let exists = Command::new("git")
+            .args([
+                "-C",
+                &repo_root.to_string_lossy(),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                other,
+            ])
+            .output_with_context()
+            .await
+            .is_ok_and(|o| o.status.success());
+        if exists {
+            args.push("--not".to_string());
+            args.push(other.to_string());
+        }
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(&args)
+        .output_with_context()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+/// Delete the local branch only when origin or the default branch holds every commit on it
+async fn delete_local_branch(task_id: &str, br: &str, repo_root: &std::path::Path) {
+    let default_branch = crate::engine::runner::worktree::detect_default_branch(repo_root).await;
+    let remote_ref = format!("refs/remotes/origin/{br}");
+    let default_ref = format!("refs/remotes/origin/{default_branch}");
+    let local_ref = format!("refs/heads/{br}");
+    let local_default_ref = format!("refs/heads/{default_branch}");
+    match commits_outside(
+        repo_root,
+        &local_ref,
+        &[&remote_ref, &default_ref, &local_default_ref],
+    )
+    .await
+    {
+        Some(0) => {}
+        Some(n) => {
+            tracing::warn!(task_id, branch = %br, unpushed = n, "local branch holds commits origin does not have, keeping it");
+            return;
+        }
+        None => {
+            tracing::debug!(task_id, branch = %br, "local branch missing or unreadable, nothing to delete");
+            return;
+        }
+    }
+    let output = Command::new("git")
+        .args(["-C", &repo_root.to_string_lossy(), "branch", "-D", br])
         .output_with_context()
         .await;
-
-    match branch_delete_result {
-        Ok(output) if output.status.success() => {
+    match output {
+        Ok(o) if o.status.success() => {
             tracing::info!(task_id, branch = %br, "local branch deleted");
         }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::debug!(
-                task_id,
-                err = %stderr,
-                "local branch delete skipped (may not exist)"
-            );
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            tracing::debug!(task_id, err = %stderr, "local branch delete skipped (may not exist)");
         }
         Err(e) => {
             tracing::warn!(task_id, err = %e, "failed to delete local branch");
         }
     }
+}
 
-    // Delete remote branch
+/**
+ * Delete local and remote branches for a task, but never the only copy of a commit.
+ * The remote branch goes only when the default branch already contains all of it, which
+ * covers fast-forward and merge-commit merges. A squash-merged branch stays, and GitHub's
+ * "automatically delete head branches" removes it. Every other caller (startup rebase
+ * failure, closed-issue reconciliation, orphan sweeps) may hold unmerged work (#3781)
+ **/
+pub(crate) async fn delete_branches(task_id: &str, br: &str, repo_root: &std::path::Path) {
+    let default_branch = crate::engine::runner::worktree::detect_default_branch(repo_root).await;
     let auth_env = crate::engine::runner::git_ops::build_git_auth_env();
+    let _ = Command::new("git")
+        .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .args([
+            "-C",
+            &repo_root.to_string_lossy(),
+            "fetch",
+            "origin",
+            &default_branch,
+            br,
+        ])
+        .output_with_context()
+        .await;
+
+    delete_local_branch(task_id, br, repo_root).await;
+
+    let remote_ref = format!("refs/remotes/origin/{br}");
+    let default_ref = format!("refs/remotes/origin/{default_branch}");
+    match commits_outside(repo_root, &remote_ref, &[&default_ref]).await {
+        Some(0) => {}
+        Some(n) => {
+            tracing::info!(task_id, branch = %br, unmerged = n, "remote branch has commits the default branch lacks, keeping it");
+            return;
+        }
+        None => {
+            tracing::debug!(task_id, branch = %br, "remote branch missing or unreadable, nothing to delete");
+            return;
+        }
+    }
+
     let remote_delete = Command::new("git")
         .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .args([
             "-C",
-            repo_root_str.as_ref(),
+            &repo_root.to_string_lossy(),
             "-c",
             "lfs.locksverify=false",
             "push",
@@ -2235,5 +2305,111 @@ mod tests {
             "done task is cleaned, which proves the pass ran"
         );
         RECONCILIATION_LAST_RUN.remove(repo);
+    }
+
+    fn git_ok(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@t",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    /// A clone of a bare origin with main pushed and branch `feat` one commit ahead
+    fn origin_and_clone_with_feat() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join("origin.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        git_ok(&bare, &["init", "--bare", "-b", "main"]);
+        git_ok(tmp.path(), &["clone", bare.to_str().unwrap(), "clone"]);
+        let clone = tmp.path().join("clone");
+        std::fs::write(clone.join("base.txt"), "base").unwrap();
+        git_ok(&clone, &["add", "."]);
+        git_ok(&clone, &["commit", "-m", "base"]);
+        git_ok(&clone, &["push", "origin", "main"]);
+        git_ok(&clone, &["checkout", "-b", "feat"]);
+        std::fs::write(clone.join("work.txt"), "work").unwrap();
+        git_ok(&clone, &["add", "."]);
+        git_ok(&clone, &["commit", "-m", "work"]);
+        git_ok(&clone, &["checkout", "main"]);
+        (tmp, clone)
+    }
+
+    fn remote_has(clone: &std::path::Path, branch: &str) -> bool {
+        !git_ok(clone, &["ls-remote", "--heads", "origin", branch])
+            .trim()
+            .is_empty()
+    }
+
+    fn local_has(clone: &std::path::Path, branch: &str) -> bool {
+        std::process::Command::new("git")
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
+            .current_dir(clone)
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    /// Deleting a pushed branch whose commits main lacks would destroy the only copy of the
+    /// work, as startup cleanup did to a blocked task (#3781)
+    #[tokio::test]
+    async fn delete_branches_keeps_an_unmerged_remote_branch() {
+        let (_tmp, clone) = origin_and_clone_with_feat();
+        git_ok(&clone, &["push", "origin", "feat"]);
+
+        delete_branches("1", "feat", &clone).await;
+
+        assert!(
+            remote_has(&clone, "feat"),
+            "unmerged remote branch must survive"
+        );
+        assert!(
+            !local_has(&clone, "feat"),
+            "local copy is on origin, so it can go"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_branches_removes_a_branch_main_already_contains() {
+        let (_tmp, clone) = origin_and_clone_with_feat();
+        git_ok(&clone, &["push", "origin", "feat"]);
+        git_ok(&clone, &["merge", "--ff-only", "feat"]);
+        git_ok(&clone, &["push", "origin", "main"]);
+
+        delete_branches("1", "feat", &clone).await;
+
+        assert!(!remote_has(&clone, "feat"));
+        assert!(!local_has(&clone, "feat"));
+    }
+
+    #[tokio::test]
+    async fn delete_branches_keeps_a_local_branch_with_unpushed_commits() {
+        let (_tmp, clone) = origin_and_clone_with_feat();
+
+        delete_branches("1", "feat", &clone).await;
+
+        assert!(
+            local_has(&clone, "feat"),
+            "unpushed commits must not be deleted"
+        );
     }
 }
