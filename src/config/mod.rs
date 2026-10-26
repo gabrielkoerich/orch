@@ -852,42 +852,49 @@ mod tests {
         assert_eq!(skills[0].repo, "owner/skills");
     }
 
+    /**
+     * Read a key straight out of the cache. The reload tests must not call `resolve_key` or
+     * `resolve_projects_list`: those register the file with the real notify watcher, whose thread
+     * then races the test for the first `reload_file` call on a broken edit
+     **/
+    fn cached_value(path: &PathBuf, key: &str) -> String {
+        extract_value(&load_cached_root(path).unwrap(), key).unwrap()
+    }
+
+    fn cached_projects(path: &PathBuf) -> Vec<String> {
+        extract_projects_list(&load_cached_root(path).unwrap(), "projects").unwrap()
+    }
+
     #[test]
     fn invalid_edit_keeps_last_good_values_and_sends_no_notification() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_yaml(dir.path(), "config.yml", "engine:\n  max_parallel: 8\n");
         assert!(!reload_file(&path));
-        assert_eq!(resolve_key(&path, "engine.max_parallel").unwrap(), "8");
+        assert_eq!(cached_value(&path, "engine.max_parallel"), "8");
 
         let mut rx = subscribe();
         std::fs::write(&path, "engine:\n  max_parallel: [unclosed\n").unwrap();
         assert!(reload_file(&path));
 
-        assert_eq!(resolve_key(&path, "engine.max_parallel").unwrap(), "8");
+        assert_eq!(cached_value(&path, "engine.max_parallel"), "8");
         assert!(rx.try_recv().is_err(), "a broken edit must not notify");
 
         // A later good edit is picked up again
         std::fs::write(&path, "engine:\n  max_parallel: 12\n").unwrap();
         assert!(!reload_file(&path));
-        assert_eq!(resolve_key(&path, "engine.max_parallel").unwrap(), "12");
+        assert_eq!(cached_value(&path, "engine.max_parallel"), "12");
     }
 
     #[test]
     fn adding_a_project_is_visible_after_reload() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_yaml(dir.path(), "config.yml", "projects:\n  - /srv/one\n");
-        assert_eq!(
-            resolve_projects_list(&path, "projects").unwrap(),
-            vec!["/srv/one"]
-        );
+        assert_eq!(cached_projects(&path), vec!["/srv/one"]);
 
         std::fs::write(&path, "projects:\n  - /srv/one\n  - /srv/two\n").unwrap();
         assert!(!reload_file(&path));
 
-        assert_eq!(
-            resolve_projects_list(&path, "projects").unwrap(),
-            vec!["/srv/one", "/srv/two"]
-        );
+        assert_eq!(cached_projects(&path), vec!["/srv/one", "/srv/two"]);
     }
 
     #[test]
