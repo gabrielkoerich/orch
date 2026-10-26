@@ -72,8 +72,8 @@ jobs:
   # Uses cargo-llvm-cov for line/branch coverage — cheaper than tarpaulin.
   test:
     runs-on: ubuntu-latest
-    # The suite takes about 2 minutes, nextest kills a single hung test at 5
-    timeout-minutes: 30
+    # The whole job usually takes 2 to 4 minutes, nextest kills a single hung test at 2
+    timeout-minutes: 5
     permissions:
       contents: read
       pull-requests: write
