@@ -283,14 +283,6 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
         task_ids.extend(internal_done.iter().map(|t| t.id.0.clone()));
     }
 
-    // Also include internal blocked tasks (terminal state, worktree is useless).
-    if let Ok(internal_blocked) = task_manager
-        .list_internal_by_status(TaskStatus::Blocked)
-        .await
-    {
-        task_ids.extend(internal_blocked.iter().map(|t| t.id.0.clone()));
-    }
-
     tracing::debug!(
         count = task_ids.len(),
         "checking all terminal tasks for cleanup"
@@ -2184,6 +2176,64 @@ mod tests {
             "cleanup should not re-list reconciliation candidates on every sync pass"
         );
 
+        RECONCILIATION_LAST_RUN.remove(repo);
+    }
+
+    /// Cleanup only collects done tasks. A blocked task waits on a person and resumes from its
+    /// worktree and branch, so it must not even be considered (#3781)
+    #[tokio::test]
+    async fn cleanup_skips_blocked_internal_tasks_and_cleans_done_ones() {
+        let repo = "owner/repo-cleanup-blocked";
+        RECONCILIATION_LAST_RUN.remove(repo);
+        let backend_dyn: Arc<dyn ExternalBackend> = Arc::new(ReconciliationMockBackend {
+            reconciliation_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend_dyn.clone(),
+            store.clone(),
+            repo.to_string(),
+        ));
+
+        let mut ids = Vec::new();
+        for (title, status) in [("blocked", TaskStatus::Blocked), ("done", TaskStatus::Done)] {
+            let id = store
+                .create_internal(repo, title, "", "test", title, None)
+                .await
+                .unwrap();
+            store
+                .set_fields(
+                    id,
+                    &[
+                        (
+                            "worktree",
+                            serde_json::json!(format!("/nonexistent/{title}")),
+                        ),
+                        ("branch", serde_json::json!("")),
+                    ],
+                )
+                .await
+                .unwrap();
+            store.update_status(id, status).await.unwrap();
+            ids.push(id);
+        }
+
+        let opts = JanitorOptions {
+            ttl_hours: 0,
+            dry_run: false,
+        };
+        cleanup_done_worktrees_with_opts(&backend_dyn, repo, &task_manager, &store, &opts)
+            .await
+            .unwrap();
+
+        assert!(
+            !store.get(ids[0]).await.unwrap().worktree_cleaned,
+            "blocked task must not be considered for cleanup"
+        );
+        assert!(
+            store.get(ids[1]).await.unwrap().worktree_cleaned,
+            "done task is cleaned, which proves the pass ran"
+        );
         RECONCILIATION_LAST_RUN.remove(repo);
     }
 }

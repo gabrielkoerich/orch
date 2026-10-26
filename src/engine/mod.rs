@@ -593,16 +593,19 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
                         valid_kept += 1;
                     }
                 }
-                _ => {
-                    let keep_remote =
-                        task.status == TaskStatus::Blocked && task.pr_number.is_some();
+                // A blocked or waiting task resumes from this work, and without a PR the branch
+                // may hold the only copy of it
+                TaskStatus::Blocked | TaskStatus::Waiting => {
+                    valid_kept += 1;
+                }
+                TaskStatus::Done => {
                     tracing::info!(repo = %engine.repo, task_id = %task_id, worktree = %worktree_dir.display(), status = ?task.status, "terminal task worktree, removing");
                     remove_worktree_and_branch(
                         &task_id,
                         &worktree_dir,
                         Some(branch_name),
                         &repo_root_path,
-                        keep_remote,
+                        false,
                     )
                     .await;
                     cleaned += 1;
