@@ -183,6 +183,20 @@ async fn resolve_cli_task(store: &TaskStore, id: &str) -> anyhow::Result<store::
     }
 }
 
+/// Refuse to move a done task back into the pipeline.
+///
+/// Done is terminal: a done task keeps the body it was created with, so
+/// reviving one re-runs a prompt that may be months stale (#3780)
+fn refuse_if_done(resolved: &store::CliTaskRef, action: &str) -> anyhow::Result<()> {
+    if resolved.status != crate::store::TaskStatus::Done.as_str() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{} is done — {action} does not revive done tasks; file a new issue or task for follow-up work",
+        resolved.display_spec()
+    )
+}
+
 /// True when the task still has an open dependency and must stay `waiting`.
 async fn release_or_keep_waiting(store: &TaskStore, task_id: i64) -> anyhow::Result<bool> {
     Ok(store.status_after_unblock(task_id).await? == crate::store::TaskStatus::Waiting)
@@ -982,6 +996,7 @@ pub async fn retry(id: &str, agent: Option<String>, model: Option<String>) -> an
 
     let s = Arc::new(crate::cli::init_store().await?);
     let resolved = resolve_cli_task(&s, id).await?;
+    refuse_if_done(&resolved, "retry")?;
     let store = Some(s.clone());
     let repo = resolved.repo.clone();
     let shown = resolved.display_spec();
@@ -1150,6 +1165,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
 
     let s = Arc::new(crate::cli::init_store().await?);
     let resolved = resolve_cli_task(&s, id).await?;
+    refuse_if_done(&resolved, "unblock")?;
     let store = Some(s.clone());
     let repo = resolved.repo.clone();
     let shown = resolved.display_spec();
@@ -1271,62 +1287,6 @@ pub async fn close(id: &str, note: Option<&str>) -> anyhow::Result<()> {
     update_status_store_first(&store, &backend, &repo, &ext_id, Status::Done).await?;
     println!("Closed {shown} (marked done)");
     cleanup_sessions_and_worktree(&resolved.external_id, &repo, &store).await;
-    Ok(())
-}
-
-/// Reopen a done/blocked task atomically:
-/// 1. Update SQLite status → New
-/// 2. Reset failure counters
-/// 3. Reopen GitHub issue (if external)
-/// 4. Sync GitHub labels to status:new
-/// 5. Link PR number if branch has a PR
-pub async fn reopen(id: &str) -> anyhow::Result<()> {
-    use crate::backends::github::GitHubBackend;
-    use crate::backends::ExternalBackend;
-    use crate::github::http::GhHttp;
-    use crate::store::TaskStatus;
-
-    let s = crate::cli::init_store().await?;
-    let resolved = resolve_cli_task(&s, id).await?;
-    let store_id = resolved
-        .store_id
-        .ok_or_else(|| anyhow::anyhow!("task '{id}' not found in store"))?;
-    let task = s.get(store_id).await?;
-    let store = Some(Arc::new(s.clone()));
-    let repo = resolved.repo.clone();
-    let shown = resolved.display_spec();
-    let gh = GhHttp::new()?;
-
-    crate::store::store_reset_counters(&store, &repo, &resolved.external_id).await;
-    s.update_status(store_id, TaskStatus::New).await?;
-
-    if !resolved.is_internal() {
-        if let Err(e) = gh.reopen_issue(&repo, &resolved.external_id).await {
-            eprintln!("warning: failed to reopen GitHub issue: {}", e);
-        }
-
-        let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
-        if let Err(e) = backend
-            .update_status(
-                &crate::backends::ExternalId(resolved.external_id.clone()),
-                Status::New,
-            )
-            .await
-        {
-            eprintln!("warning: failed to sync labels: {}", e);
-        }
-    }
-
-    if task.pr_number.is_none() && !task.branch.is_empty() {
-        if let Ok(Some(pr_num)) = gh.get_pr_number(&repo, &task.branch).await {
-            let _ = s
-                .set_fields(store_id, &[("pr_number", serde_json::json!(pr_num as i64))])
-                .await;
-            println!("Linked PR #{} from branch '{}'", pr_num, task.branch);
-        }
-    }
-
-    println!("Reopened {shown} (status → new, counters reset, will be re-routed)");
     Ok(())
 }
 
@@ -2187,6 +2147,35 @@ mod tests {
     fn format_age_invalid_returns_dash() {
         let age = format_age("not-a-timestamp");
         assert_eq!(age, "-");
+    }
+
+    fn task_ref(status: &str) -> store::CliTaskRef {
+        store::CliTaskRef {
+            store_id: Some(7),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "t".to_string(),
+            external_id: "58".to_string(),
+            status: status.to_string(),
+        }
+    }
+
+    #[test]
+    fn refuse_if_done_rejects_done_tasks() {
+        for action in ["retry", "unblock"] {
+            let err = refuse_if_done(&task_ref("done"), action)
+                .expect_err("done task must not be revived");
+            let msg = err.to_string();
+            assert!(msg.contains("is done"), "got: {msg}");
+            assert!(msg.contains(action), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn refuse_if_done_allows_other_statuses() {
+        for status in ["blocked", "needs_review", "new", "in_review", ""] {
+            assert!(refuse_if_done(&task_ref(status), "unblock").is_ok());
+        }
     }
 
     #[test]

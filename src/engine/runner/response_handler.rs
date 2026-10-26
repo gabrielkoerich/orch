@@ -121,6 +121,10 @@ struct DecisionInput<'a> {
     is_completed_status: bool,
     /// Agent explicitly returned blocked, but reason appears transient and retryable.
     is_retryable_blocked: bool,
+    /// The task was re-dispatched to resolve a merge conflict and came back with
+    /// nothing ahead of the default branch, meaning the fix already landed and
+    /// the open PR is superseded. Mark done instead of counting a no-code run.
+    is_superseded_conflict: bool,
 }
 
 /// Determine the final task status from pre-computed state.
@@ -153,6 +157,8 @@ fn classify_final_status(input: &DecisionInput<'_>) -> String {
         "blocked".to_string()
     } else if input.agent_status == "done" && !input.has_pr && input.has_pushed {
         "routed".to_string()
+    } else if input.is_superseded_conflict {
+        "done".to_string()
     } else if input.agent_status == "done" && input.requires_pr {
         // Same-agent loop detection: if this agent is the same as the one that
         // produced the previous no-code result, block immediately (#2410, #2686).
@@ -901,6 +907,48 @@ async fn run_git_ops(
 
 // ── Private status-computation helpers ───────────────────────────────────────
 
+/// Comment on and close a PR whose change already landed elsewhere.
+async fn close_superseded_pr(ctx: &StoreCtx<'_>, pr_number: u64) {
+    if ctx.repo.is_empty() {
+        return;
+    }
+    let gh = match crate::github::http::GhHttp::new() {
+        Ok(gh) => gh,
+        Err(e) => {
+            tracing::warn!(task_id = ctx.task_id, err = %e, "cannot close superseded PR");
+            return;
+        }
+    };
+    let note = "Closing as superseded: the change is already on the default branch, so this branch has no commits ahead of it.";
+    if let Err(e) = gh.add_comment(ctx.repo, &pr_number.to_string(), note).await {
+        tracing::warn!(task_id = ctx.task_id, pr_number, err = %e, "failed to comment on superseded PR");
+    }
+    if let Err(e) = gh.close_pr(ctx.repo, pr_number).await {
+        tracing::warn!(task_id = ctx.task_id, pr_number, err = %e, "failed to close superseded PR");
+    }
+    ctx.set(&[(
+        "last_error",
+        serde_json::json!("PR closed as superseded: the fix already landed on the default branch"),
+    )])
+    .await;
+}
+
+/// The PR to close when a merge-conflict reroute produced no commits.
+///
+/// `merge_conflict_retries > 0` means review_poll sent the task back to resolve a
+/// conflict. Coming back with nothing ahead of the default branch means another
+/// PR already landed the same fix, so the open PR is superseded (#3780)
+fn superseded_conflict_pr(
+    merge_conflict_retries: i32,
+    pr_number: Option<i32>,
+    has_commits: bool,
+) -> Option<u64> {
+    if has_commits || merge_conflict_retries <= 0 {
+        return None;
+    }
+    pr_number.filter(|n| *n > 0).map(|n| n as u64)
+}
+
 /// Read push-failure state from the store and increment `push_failures` if needed.
 async fn detect_push_failure_state(
     ctx: &StoreCtx<'_>,
@@ -1400,6 +1448,16 @@ pub async fn handle_success(
         && !git.has_pushed
         && requires_pr;
 
+    // A conflict reroute with nothing ahead of the default branch is a landed
+    // fix, not a no-code run: close the superseded PR and mark the task done.
+    let superseded_pr = match (is_no_code_reroute, ctx.get_task().await) {
+        (true, Some(task)) => {
+            superseded_conflict_pr(task.merge_conflict_retries, task.pr_number, git.has_commits)
+        }
+        _ => None,
+    };
+    let is_no_code_reroute = is_no_code_reroute && superseded_pr.is_none();
+
     let no_code_reroutes =
         detect_no_code_reroutes(&ctx, is_no_code_reroute, new_attempts, max_reroutes).await;
 
@@ -1446,6 +1504,7 @@ pub async fn handle_success(
         is_same_agent,
         is_completed_status: resp.status == "completed",
         is_retryable_blocked,
+        is_superseded_conflict: superseded_pr.is_some(),
     });
     let final_status = final_status_owned.as_str();
 
@@ -1503,6 +1562,15 @@ pub async fn handle_success(
         }
     }
 
+    if let Some(pr_number) = superseded_pr {
+        tracing::info!(
+            task_id = ctx.task_id,
+            pr_number,
+            "conflict reroute found the fix already on the default branch — closing superseded PR"
+        );
+        close_superseded_pr(&ctx, pr_number).await;
+    }
+
     ctx.set(&[("summary", serde_json::json!(resp.summary))])
         .await;
 
@@ -1552,6 +1620,154 @@ mod tests {
     fn missing_path_error_detects_message_fallback() {
         let err = anyhow::anyhow!("push failed: No such file or directory (os error 2)");
         assert!(is_missing_path_error(&err));
+    }
+
+    #[test]
+    fn superseded_conflict_pr_requires_conflict_reroute_and_no_commits() {
+        // Conflict reroute, nothing ahead of the default branch → close the PR.
+        assert_eq!(superseded_conflict_pr(1, Some(42), false), Some(42));
+        // Commits exist → the agent did work, keep the PR.
+        assert_eq!(superseded_conflict_pr(1, Some(42), true), None);
+        // No conflict reroute → an ordinary no-code run.
+        assert_eq!(superseded_conflict_pr(0, Some(42), false), None);
+        // No PR to close.
+        assert_eq!(superseded_conflict_pr(1, None, false), None);
+    }
+
+    /// End-to-end: a conflict reroute that comes back with zero commits ahead of
+    /// the default branch closes the superseded PR and marks the task done,
+    /// instead of blocking it as a same-agent no-code loop (#3780).
+    #[tokio::test]
+    async fn conflict_reroute_with_no_commits_closes_pr_and_marks_done() {
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .expect("git runs")
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        }
+
+        // A worktree whose branch has nothing ahead of origin/main — the state
+        // the agent leaves behind when the fix already landed on the base.
+        let dir = tempfile::tempdir().unwrap();
+        let origin = dir.path().join("origin.git");
+        std::fs::create_dir(&origin).unwrap();
+        git(&origin, &["init", "--bare", "-b", "main"]);
+        let work_dir = dir.path().join("work");
+        std::fs::create_dir(&work_dir).unwrap();
+        git(&work_dir, &["init", "-b", "main"]);
+        git(
+            &work_dir,
+            &["remote", "add", "origin", &origin.display().to_string()],
+        );
+        std::fs::write(work_dir.join("a.txt"), "a").unwrap();
+        git(&work_dir, &["add", "-A"]);
+        git(&work_dir, &["commit", "-m", "init"]);
+        git(&work_dir, &["push", "-u", "origin", "main"]);
+        git(&work_dir, &["checkout", "-b", "fix-branch"]);
+
+        let wt = worktree::WorktreeSetup {
+            work_dir: work_dir.clone(),
+            branch: "fix-branch".to_string(),
+            default_branch: "main".to_string(),
+            main_project_dir: work_dir.clone(),
+        };
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let store_id = store
+            .create(&crate::store::NewTask {
+                external_id: Some("3772".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Fix the thing".to_string(),
+                body: String::new(),
+                source: "manual".to_string(),
+                source_id: String::new(),
+                author: "bot".to_string(),
+                url: String::new(),
+                labels: vec![],
+                parent_id: None,
+            })
+            .await
+            .unwrap();
+        store
+            .set_fields(store_id, &[("pr_number", serde_json::json!(42))])
+            .await
+            .unwrap();
+        // review_poll rerouted this task to resolve a merge conflict.
+        store
+            .increment(store_id, "merge_conflict_retries")
+            .await
+            .unwrap();
+        // A previous no-code run by the same agent — without the superseded
+        // check this run would block the task as a same-agent loop.
+        store
+            .set_fields(
+                store_id,
+                &[("no_code_last_agent", serde_json::json!("claude"))],
+            )
+            .await
+            .unwrap();
+
+        let parsed = agents::ParsedResponse {
+            response: AgentResponse {
+                status: "done".to_string(),
+                summary: "the fix is already on main".to_string(),
+                ..Default::default()
+            },
+            input_tokens: None,
+            output_tokens: None,
+            duration_ms: None,
+        };
+
+        let (final_status, push_failed) = handle_success(
+            "3772",
+            parsed,
+            &wt,
+            "Fix the thing",
+            "claude",
+            Some("sonnet"),
+            1,
+            "owner/repo",
+            &Some(Arc::clone(&store)),
+            "",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            final_status, "done",
+            "a superseded conflict reroute must end done, not blocked"
+        );
+        assert!(!push_failed);
+
+        let task = store.get(store_id).await.unwrap();
+        assert!(
+            task.last_error.contains("superseded"),
+            "the close attempt must be recorded on the task: {}",
+            task.last_error
+        );
+    }
+
+    /// A conflict reroute with zero commits ahead marks the task done instead of
+    /// blocking it as a same-agent no-code loop (#3780).
+    #[test]
+    fn classify_superseded_conflict_marks_done() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "done",
+            requires_pr: true,
+            is_same_agent: true,
+            is_superseded_conflict: true,
+            ..Default::default()
+        });
+        assert_eq!(status, "done");
     }
 
     // ── classify_final_status — one test per decision branch ─────────────────
