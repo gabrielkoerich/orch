@@ -34,6 +34,7 @@ mod jobs;
 mod kv;
 mod metrics;
 mod pricing;
+mod repo_move;
 mod tasks;
 
 #[allow(unused_imports)]
