@@ -2333,7 +2333,7 @@ pub(crate) async fn sync_tick(
         // any review agent recovers.
         let all_review_agents_cooled = {
             let r = router.read().await;
-            !r.available_agents.is_empty() && r.healthy_agent_count("review") == 0
+            r.healthy_agent_count("review") == 0
         };
         let skip_refires = all_review_agents_cooled && needs_review_count > 0;
         if skip_refires {
