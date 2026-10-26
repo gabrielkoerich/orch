@@ -729,6 +729,19 @@ pub fn project_list() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Re-key every stored task, dependency and job row from `old` to `new`.
+pub async fn project_move(old: &str, new: &str) -> anyhow::Result<()> {
+    for slug in [old, new] {
+        if parse_github_slug(slug).is_none() {
+            anyhow::bail!("invalid slug {slug:?}, expected owner/repo");
+        }
+    }
+    let moved = init_store().await?.move_repo(old, new).await?;
+    println!("Moved {moved} task(s) from {old} to {new}");
+    println!("Now set gh.repo: {new} in the project's .orch.yml");
+    Ok(())
+}
+
 /// Read gh.repo from a project's .orch.yml.
 fn read_project_repo(project_path: &std::path::Path) -> Option<String> {
     let orch_yml = project_path.join(".orch.yml");

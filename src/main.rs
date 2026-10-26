@@ -914,6 +914,13 @@ enum ProjectAction {
     },
     /// List all registered projects
     List,
+    /// Re-key stored tasks after a repository transfer or rename
+    Move {
+        /// Old slug (owner/repo)
+        old: String,
+        /// New slug (owner/repo)
+        new: String,
+    },
     /// GitHub Projects V2 board management
     Board {
         #[command(subcommand)]
@@ -1365,6 +1372,9 @@ async fn async_main() -> anyhow::Result<()> {
             }
             ProjectAction::List => {
                 cli::project_list()?;
+            }
+            ProjectAction::Move { old, new } => {
+                cli::project_move(&old, &new).await?;
             }
             ProjectAction::Board { action } => {
                 run_board_action(action).await?;
