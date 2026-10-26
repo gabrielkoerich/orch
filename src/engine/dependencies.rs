@@ -369,6 +369,18 @@ async fn refresh_one_blocker(
     repo: &str,
     number: i64,
 ) -> anyhow::Result<()> {
+    // A satisfied blocker is terminal: the issue closed as completed, or its pull request
+    // merged into the default branch. Re-reading it cost four REST calls per tick for an
+    // answer that cannot change, and once the hourly quota dropped under the reserve the
+    // throttle refused the issue ingest with it. A reopen still lands here through
+    // `note_blocker_issue_state`, which `sync_issue_dependencies` calls with live state
+    if store
+        .blocker_snapshot(repo, number)
+        .await?
+        .is_some_and(|snap| snap.is_satisfied())
+    {
+        return Ok(());
+    }
     let close = match backend.issue_close_state(repo, number).await {
         Ok(state) => state,
         Err(err) => {
@@ -816,6 +828,8 @@ See #4 in the notes
         pulls: Mutex<HashMap<i64, Option<crate::backends::PullRequestCompletion>>>,
         review_comments: Mutex<HashMap<i64, Vec<ScriptedReviewComment>>>,
         reviewer: Mutex<Option<String>>,
+        /// Counts the blocker reads that cost a GitHub call.
+        reads: std::sync::atomic::AtomicUsize,
     }
 
     impl ScriptedBackend {
@@ -826,6 +840,7 @@ See #4 in the notes
                 close_state: Mutex::new(HashMap::new()),
                 pulls: Mutex::new(HashMap::new()),
                 review_comments: Mutex::new(HashMap::new()),
+                reads: std::sync::atomic::AtomicUsize::new(0),
                 reviewer: Mutex::new(None),
             }
         }
@@ -907,6 +922,8 @@ See #4 in the notes
             _repo: &str,
             issue_number: i64,
         ) -> anyhow::Result<Option<(String, Option<String>)>> {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(self.close_state.lock().unwrap().get(&issue_number).cloned())
         }
 
@@ -915,6 +932,8 @@ See #4 in the notes
             _repo: &str,
             pr_number: i64,
         ) -> anyhow::Result<Option<crate::backends::PullRequestCompletion>> {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut completion = self
                 .pulls
                 .lock()
@@ -1314,6 +1333,43 @@ See #4 in the notes
             .is_some());
         assert_eq!(store.get(b).await.unwrap().status, TaskStatus::Waiting);
         assert_eq!(store.get(b).await.unwrap().route_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn a_blocker_already_known_done_costs_no_github_call() {
+        let store = TaskStore::open_memory().await.unwrap();
+        insert(&store, "owner/repo", "1", "A", "").await;
+        let b = insert(&store, "owner/repo", "2", "B", "").await;
+        store
+            .replace_dependencies(
+                b,
+                &[NewDependency {
+                    repo: "owner/repo".into(),
+                    number: 1,
+                    source: DepSource::Github,
+                }],
+            )
+            .await
+            .unwrap();
+        let backend = ScriptedBackend::new(HashMap::new());
+        backend
+            .close_state
+            .lock()
+            .unwrap()
+            .insert(1, ("closed".into(), Some("completed".into())));
+
+        refresh_blocker_snapshots(&backend, &store).await.unwrap();
+        let first = backend.reads.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(first > 0, "the first refresh has to read the blocker");
+        assert!(store.block_claim_if_waiting(b).await.unwrap().is_none());
+
+        refresh_blocker_snapshots(&backend, &store).await.unwrap();
+        refresh_blocker_snapshots(&backend, &store).await.unwrap();
+        assert_eq!(
+            backend.reads.load(std::sync::atomic::Ordering::Relaxed),
+            first,
+            "a blocker closed as completed must not be read again"
+        );
     }
 
     #[tokio::test]
