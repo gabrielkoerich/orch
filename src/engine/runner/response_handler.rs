@@ -1124,6 +1124,15 @@ fn agent_blocked_reason(resp: &crate::parser::AgentResponse) -> String {
     }
 }
 
+/// True when a blocked response names a denied `git push` and nothing else as the blocker.
+fn is_denied_push_block(resp: &crate::parser::AgentResponse) -> bool {
+    let r = agent_blocked_reason(resp).to_lowercase();
+    r.contains("push")
+        && ["denied", "not allowed", "permission", "disallowed"]
+            .iter()
+            .any(|p| r.contains(p))
+}
+
 /// Heuristic classifier for agent-returned blocked reasons.
 ///
 /// Returns true when the reason looks transient/retryable (network/provider/
@@ -1397,7 +1406,7 @@ pub async fn handle_success(
     // Extract token counts before consuming parsed.
     let input_tokens = parsed.input_tokens;
     let output_tokens = parsed.output_tokens;
-    let resp = parsed.response;
+    let mut resp = parsed.response;
 
     tracing::info!(
         task_id,
@@ -1405,6 +1414,8 @@ pub async fn handle_success(
         summary = resp.summary,
         "agent completed successfully"
     );
+
+    let push_denied = resp.status == "blocked" && is_denied_push_block(&resp);
 
     // Resolve numeric store_id once so we can reuse it for multiple store ops
     // in this hot path and avoid repeated external_id -> store_id SQL lookups.
@@ -1423,6 +1434,7 @@ pub async fn handle_success(
         || resp.status == "completed"
         || resp.status == "in_progress"
         || resp.status == "needs_review"
+        || push_denied
     {
         run_git_ops(
             &ctx,
@@ -1437,6 +1449,16 @@ pub async fn handle_success(
     } else {
         GitOpsResult::default()
     };
+
+    // The agent's only blocker was the denied push and orch pushed for it, so
+    // the task continues as if the agent had returned done
+    if push_denied && (git.has_pr || git.has_pushed) {
+        tracing::info!(
+            task_id,
+            "agent blocked on denied push, orch pushed the branch"
+        );
+        resp.status = "done".to_string();
+    }
 
     // Store delegations in store if present (processed by run_with_context)
     if !resp.delegations.is_empty() {
@@ -1955,6 +1977,19 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(status, "new");
+    }
+
+    #[test]
+    fn denied_push_block_detected() {
+        let resp = |s: &str| crate::parser::AgentResponse {
+            status: "blocked".to_string(),
+            summary: s.to_string(),
+            ..Default::default()
+        };
+        assert!(is_denied_push_block(&resp(
+            "Work committed, but `git push -u origin HEAD` was denied"
+        )));
+        assert!(!is_denied_push_block(&resp("Missing API key")));
     }
 
     /// Branch 2b: push failed >= 3 times → block for human intervention.
