@@ -2127,8 +2127,7 @@ impl GhHttp {
                 })
                 .unwrap_or_default()),
             Err(e) => {
-                let err = e.to_string();
-                if err.contains("404") {
+                if is_no_branch_protection_error(&e.to_string()) {
                     Ok(vec![])
                 } else {
                     Err(e)
@@ -3197,6 +3196,14 @@ fn parse_behind_by(body: &serde_json::Value) -> anyhow::Result<u64> {
         .ok_or_else(|| anyhow::anyhow!("compare response has no numeric behind_by field"))
 }
 
+/// A branch protection read that means "no protection": 404 "Branch not protected", or the 403
+/// GitHub returns for private repos on the Free plan
+fn is_no_branch_protection_error(err: &str) -> bool {
+    err.contains("404")
+        || (err.contains("403")
+            && err.contains("Upgrade to GitHub Pro or make this repository public"))
+}
+
 fn sanitize_github_issue_numbers(issue_numbers: &[u64]) -> (Vec<u64>, Vec<u64>) {
     let mut valid = Vec::with_capacity(issue_numbers.len());
     let mut invalid = Vec::new();
@@ -3517,6 +3524,18 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn no_branch_protection_errors() {
+        let free_plan = "GitHub API GET https://api.github.com/repos/o/r/branches/main/protection failed (403 Forbidden): {\"message\":\"Upgrade to GitHub Pro or make this repository public to enable this feature.\"}";
+        assert!(is_no_branch_protection_error(free_plan));
+        assert!(is_no_branch_protection_error(
+            "failed (404 Not Found): {\"message\":\"Branch not protected\"}"
+        ));
+        assert!(!is_no_branch_protection_error(
+            "failed (403 Forbidden): {\"message\":\"Resource not accessible\"}"
+        ));
+    }
 
     #[test]
     fn parse_behind_by_reads_compare_status() {
