@@ -848,7 +848,16 @@ async fn classify_review_failure(
         .await;
     }
 
-    if lower_reason.contains("rate limit") || lower_reason.contains("auth error") {
+    // GhHttp's own throttle says "rate-limited", and GitHub answers 429 or abuse detection
+    // without the words "rate limit"
+    if lower_reason.contains("rate limit")
+        || lower_reason.contains("rate-limited")
+        || lower_reason.contains("rate limited")
+        || lower_reason.contains("too many requests")
+        || lower_reason.contains("abuse detection")
+        || lower_reason.contains("failed (429)")
+        || lower_reason.contains("auth error")
+    {
         tracing::warn!(
             task_id,
             reason,
@@ -1217,6 +1226,8 @@ mod tests {
         let error_messages = [
             "claude failed: rate limit reached for model sonnet",
             "GitHub API GET https://api.github.com/repos/owner/repo/pulls/65 failed (403): API rate limit exceeded",
+            "GitHub core API rate-limited, skipping call for 1800s",
+            "GitHub API GET https://api.github.com/repos/owner/repo/pulls/65 failed (429): Too Many Requests",
         ];
 
         // The sweep has already burned most of the quota before the rate-limit window
