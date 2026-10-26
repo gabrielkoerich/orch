@@ -687,6 +687,11 @@ async fn push_branch_with_log(
     }
 }
 
+/// True when the GitHub client refused the call locally because its rate-limit window is active.
+fn is_local_rate_limit_skip(err_str: &str) -> bool {
+    err_str.contains("rate-limited, skipping call")
+}
+
 /// Create (or find an existing) PR and log the activity.
 ///
 /// Returns `(has_pr, has_pushed, pr_base_invalid)`. `has_pushed` may be set to
@@ -787,6 +792,15 @@ async fn create_pr_with_log(
             //   classifier blocks the task instead of re-dispatching forever.
             // A GitHub auth error is terminal too: the commits are pushed, so only a token fix helps
             let mut pr_base_invalid = false;
+            if is_local_rate_limit_skip(&err_str) {
+                // No request was sent and the branch is pushed. Re-running the agent cannot help,
+                // so report the PR as pending and let the review gate create it once calls resume
+                tracing::warn!(
+                    task_id = ctx.task_id,
+                    "PR creation skipped by local GitHub rate limit — review gate will create the PR"
+                );
+                return (true, has_pushed, false);
+            }
             if agents::patterns::detect_auth_error(&err_str).is_some() {
                 tracing::error!(
                     task_id = ctx.task_id,
@@ -1666,6 +1680,16 @@ pub async fn handle_success(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_rate_limit_skip_is_detected() {
+        assert!(is_local_rate_limit_skip(
+            "GitHub API error: GitHub REST API rate-limited, skipping call for 236s"
+        ));
+        assert!(!is_local_rate_limit_skip(
+            "GitHub API POST failed (502): Bad Gateway"
+        ));
+    }
 
     /// Helper: run git in `dir`, panicking on failure
     fn git(dir: &Path, args: &[&str]) {
