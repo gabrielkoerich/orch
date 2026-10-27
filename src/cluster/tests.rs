@@ -761,7 +761,14 @@ async fn probe_never_sends_the_secret_and_rejects_a_peer_without_proof() {
     let addr = listener.local_addr().unwrap().to_string();
     tokio::spawn(async move { axum::serve(listener, fake).await.ok() });
 
-    assert!(network::probe(&addr, "s3cret").await.is_none());
+    // The probe gives up after 1 s, which a loaded test run can exceed, so it tries a few times
+    for _ in 0..5 {
+        assert!(network::probe(&addr, "s3cret").await.is_none());
+        if !seen.lock().unwrap().is_empty() {
+            break;
+        }
+    }
+
     let seen = seen.lock().unwrap();
     assert!(!seen.is_empty(), "the fake peer was probed");
     assert!(
@@ -872,4 +879,50 @@ async fn progress_commits_what_is_left_pushes_and_keeps_the_last_five() {
         ..report
     };
     assert!(progress::handle(&store, "m4", elsewhere).await.is_err());
+}
+
+#[tokio::test]
+async fn a_store_leads_alone_and_one_node_of_three_leads() {
+    assert!(TaskStore::open_memory().await.unwrap().is_leader());
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path()).await;
+    let node = start_single(&store, &dir.path().join("raft.db"))
+        .await
+        .unwrap();
+    assert!(store.is_leader());
+    node.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exactly_one_of_three_nodes_leads() {
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let voters = voters(3);
+    let mut members = BTreeMap::new();
+    for id in 1..=3 {
+        let m = start_member(dirs[id as usize - 1].path(), id, &voters, "s3cret", true).await;
+        members.insert(id, m);
+    }
+
+    let leader = leader_of(&members).await;
+    for _ in 0..40 {
+        let leading: Vec<NodeId> = members
+            .iter()
+            .filter(|(_, m)| m.store.is_leader())
+            .map(|(id, _)| *id)
+            .collect();
+        if leading == [leader] {
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    for (id, m) in &members {
+        assert_eq!(m.store.is_leader(), *id == leader, "node {id}");
+    }
+
+    for (_, m) in members {
+        m.node.stop().await;
+    }
 }

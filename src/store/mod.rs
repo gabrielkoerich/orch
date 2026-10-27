@@ -175,6 +175,12 @@ impl TaskStore {
         }
     }
 
+    /// True on the node that decides: the Raft leader, or a store with no Raft, as in the CLI and tests.
+    /// A single node always leads, so one machine runs every phase as before
+    pub fn is_leader(&self) -> bool {
+        self.raft.get().is_none_or(|node| node.is_leader())
+    }
+
     pub fn attach_daemon(&self, endpoint: crate::cluster::local::Endpoint) {
         let _ = self.daemon.set(endpoint);
     }

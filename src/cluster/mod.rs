@@ -96,6 +96,12 @@ impl Node {
         anyhow::bail!("no leader to send the write to")
     }
 
+    pub fn is_leader(&self) -> bool {
+        let m = self.raft.metrics();
+        let m = m.borrow();
+        m.current_leader == Some(m.id)
+    }
+
     pub async fn stop(self) {
         if let Some(server) = self.server {
             server.notify_one();

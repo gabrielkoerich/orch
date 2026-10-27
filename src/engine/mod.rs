@@ -1353,11 +1353,15 @@ pub async fn serve() -> anyhow::Result<()> {
         ));
     }
 
-    if let Err(e) = reconcile_startup_worktrees(&project_engines).await {
-        tracing::warn!(err = %e, "startup worktree reconciliation failed");
+    // Startup reconciliation decides task status, so only the leader runs it
+    let leads = project_engines.first().is_none_or(|e| e.store.is_leader());
+    if leads {
+        if let Err(e) = reconcile_startup_worktrees(&project_engines).await {
+            tracing::warn!(err = %e, "startup worktree reconciliation failed");
+        }
     }
 
-    {
+    if leads {
         // Run estimate reconciliation in the background so it never blocks startup.
         // Each GraphQL mutation takes ~0.8 s; with hundreds of tasks this would
         // otherwise delay the engine reaching its main loop by several minutes.
@@ -2053,7 +2057,7 @@ pub async fn serve() -> anyhow::Result<()> {
     // 2. It has been in InReview for >10 minutes (catches cases where the flag
     //    was never set due to crash-loops or lost events).
     // Tasks with a recent review comment on their PR are left alone.
-    for engine in &project_engines {
+    for engine in project_engines.iter().filter(|_| leads) {
         // Read from SQLite (source of truth) — GitHub labels may be out of sync.
         let in_review_from_store = engine
             .store

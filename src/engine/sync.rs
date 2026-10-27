@@ -1955,6 +1955,11 @@ pub(crate) async fn sync_tick(
     dispatching: &Arc<DashMap<String, String>>,
     auto_merge_in_flight: &Arc<DashSet<String>>,
 ) -> anyhow::Result<()> {
+    // One node polls GitHub and decides for the whole cluster
+    if !store.is_leader() {
+        return Ok(());
+    }
+
     tracing::debug!("sync tick");
 
     // Global GitHub 5xx circuit breaker — skip non-critical background work
