@@ -5,7 +5,7 @@ description: "Use when monitoring orch operations from this repository: weekly r
 
 # Orch Operations Skill
 
-Use this skill for operational monitoring and triage in the `orch` repository. It is the repo-tracked source of truth for monitoring guidance used by the scheduled review/debug jobs.
+Use this skill for operational monitoring and triage in the `orch` repository. This file, at the repository root, is the source of truth for monitoring guidance used by the scheduled review/debug jobs.
 
 ## Non-negotiable policy
 

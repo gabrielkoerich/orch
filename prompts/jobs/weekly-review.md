@@ -13,7 +13,7 @@ End-of-week review covering the last 7 days. Your ONLY output is a summary post 
 3. `gh issue list --state open` — what's still pending
 4. `gh issue list --state closed --limit 100` — what was resolved in the last 7 days
 5. `orch task list` — stuck, blocked, or failing tasks
-6. Read `./prompts/skills/orch/SKILL.md` — repo-tracked monitoring guidance and settled operational policy
+6. Read `./SKILL.md` — repo-tracked monitoring guidance and settled operational policy
 
 ## Check operational health (last 7 days)
 
@@ -25,7 +25,7 @@ End-of-week review covering the last 7 days. Your ONLY output is a summary post 
 6. Is routing accurate? Any models failing silently? Any agents repeatedly cooled?
 7. Are agent prompts effective or do they need tuning?
 8. Performance bottlenecks (slow syncs, lock contention, API rate limits, dead models)?
-9. Does current operational behavior still match `./prompts/skills/orch/SKILL.md` and the settled repo policy?
+9. Does current operational behavior still match `./SKILL.md` and the settled repo policy?
 
 ## Write the summary
 

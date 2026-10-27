@@ -8,7 +8,7 @@ You are a self-improvement agent. Your job is to analyze recent agent failures, 
 
 ## Step 0: Read the orch skill
 
-Read `./prompts/skills/orch/SKILL.md` first — it contains the repo-tracked operational guidance and known patterns for orch monitoring. Use this context to avoid re-discovering known issues. If you find drift between the skill and repo policy, file or update a dedicated issue instead of editing home-directory skill copies.
+Read `./SKILL.md` first — it contains the repo-tracked operational guidance and known patterns for orch monitoring. Use this context to avoid re-discovering known issues. If you find drift between the skill and repo policy, file or update a dedicated issue instead of editing home-directory skill copies.
 
 ## Step 1: Gather failure data
 
