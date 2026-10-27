@@ -523,23 +523,6 @@ impl TmuxManager {
         Ok(())
     }
 
-    /// Unset (remove) an environment variable from a tmux session.
-    #[allow(dead_code)]
-    pub async fn unset_env(&self, session: &str, key: &str) -> anyhow::Result<()> {
-        let output = Command::new("tmux")
-            .args(["set-environment", "-t", session, "-u", key])
-            .output_with_context()
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("tmux unset-environment failed for {session}: {stderr}");
-        }
-
-        tracing::debug!(session, key, "unset tmux environment variable");
-        Ok(())
-    }
-
     /// Unset (remove) an environment variable from the tmux **global** environment.
     ///
     /// Uses: `tmux set-environment -gu <key>`
@@ -729,57 +712,6 @@ mod tests {
             "Expected TEST_VAR=test_value, got: {}",
             stdout
         );
-    }
-
-    /// Verify unset_env runs the correct tmux set-environment -u command.
-    /// This test verifies the function can be called without error.
-    /// Note: Full verification of tmux behavior depends on the environment.
-    #[tokio::test]
-    async fn test_unset_env() {
-        let tmux = TmuxManager::new();
-        let session = test_session_name();
-
-        // Create a temporary detached session for testing
-        let create_result = tokio::process::Command::new("tmux")
-            .args(["new-session", "-d", "-s", &session, "-c", "/tmp"])
-            .output()
-            .await;
-
-        match create_result {
-            Ok(o) if o.status.success() => {}
-            _ => {
-                eprintln!("Skipping test: tmux not available or failed to create test session");
-                return;
-            }
-        }
-        let _guard = SessionGuard(session.clone());
-
-        // First set a variable
-        let set_result = tmux.set_env(&session, "TO_DELETE", "temporary").await;
-        assert!(set_result.is_ok(), "set_env should succeed");
-
-        // Verify it exists
-        let check_before = tokio::process::Command::new("tmux")
-            .args(["show-environment", "-t", &session, "TO_DELETE"])
-            .output()
-            .await;
-
-        let check_before = match check_before {
-            Ok(o) => o,
-            Err(_) => {
-                eprintln!("Skipping test: unable to check tmux environment");
-                return;
-            }
-        };
-
-        assert!(
-            String::from_utf8_lossy(&check_before.stdout).contains("TO_DELETE"),
-            "Variable should exist before unset"
-        );
-
-        // Call unset_session_env - verify it runs without error
-        let unset_result = tmux.unset_env(&session, "TO_DELETE").await;
-        assert!(unset_result.is_ok(), "unset_env should succeed");
     }
 
     #[tokio::test]
