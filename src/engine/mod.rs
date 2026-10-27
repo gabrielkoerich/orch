@@ -668,7 +668,7 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
     // Creating one pool here avoids N separate connection pools for the same database.
     let store = Arc::new(TaskStore::open(&crate::store::default_db_path().await?).await?);
     if crate::cluster::enabled() {
-        crate::cluster::start_single(&store, &crate::home::orch_home()?.join("raft.db")).await?;
+        crate::cluster::start(&store, &crate::home::orch_home()?.join("raft.db")).await?;
         crate::cluster::local::serve((*store).clone()).await?;
     }
 

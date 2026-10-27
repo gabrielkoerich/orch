@@ -342,6 +342,8 @@ enum Commands {
         /// Path to JSON file (or - for stdin)
         path: String,
     },
+    /// List the cluster's machines, their roles and the leader
+    Nodes,
     /// Record what a task finished and what is left. Commits, and the service pushes
     Progress {
         /// What this step finished
@@ -1117,6 +1119,9 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Commands::Parse { path } => {
             parser::parse_and_print(&path)?;
+        }
+        Commands::Nodes => {
+            cli::nodes::run().await?;
         }
         Commands::Progress { done, left, state } => {
             cli::progress::run(&done, &left, &state).await?;

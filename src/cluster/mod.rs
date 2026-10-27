@@ -2,6 +2,7 @@
 //! `docs/specs/2026-10-26-multi-machine-cluster-design.md`.
 
 mod command;
+pub mod config;
 pub mod discovery;
 pub mod local;
 pub mod network;
@@ -41,6 +42,104 @@ pub type Raft = openraft::Raft<TypeConfig>;
 /// A `cluster:` section turns the cluster on. Without one, orch writes straight to SQLite as it always has
 pub fn enabled() -> bool {
     crate::config::get("cluster.secret").is_ok_and(|s| !s.is_empty())
+}
+
+/// Start this machine's node from the `cluster:` section and the tailnet. A learner keeps asking
+/// the cluster to add it until a member proves the secret and takes it
+pub async fn start(store: &TaskStore, raft_db: &Path) -> anyhow::Result<Node> {
+    let cfg = config::ClusterConfig::load()?
+        .ok_or_else(|| anyhow::anyhow!("no cluster.secret in the config"))?;
+    let tailnet = discovery::status().await?;
+    let plan = config::plan(&cfg, &tailnet)?;
+    tracing::info!(
+        name = %plan.name,
+        addr = %plan.addr,
+        elect = plan.elect,
+        learner = plan.learner,
+        "starting cluster node"
+    );
+    let node = start_node(
+        store,
+        raft_db,
+        NodeConfig {
+            name: plan.name.clone(),
+            id: plan.id,
+            addr: plan.addr.clone(),
+            secret: cfg.secret.clone(),
+            voters: plan.voters.clone(),
+            elect: plan.elect,
+        },
+    )
+    .await?;
+    if plan.learner {
+        tokio::spawn(join_loop(node.clone(), plan, cfg));
+    }
+
+    Ok(node)
+}
+
+async fn join_loop(node: Node, plan: config::Plan, cfg: config::ClusterConfig) {
+    loop {
+        let member = node
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .nodes()
+            .any(|(id, _)| *id == plan.id);
+        if member {
+            return;
+        }
+
+        if let Ok(tailnet) = discovery::status().await {
+            for peer in tailnet.peers.iter().filter(|p| p.online) {
+                let addr = format!("{}:{}", peer.ip, cfg.port);
+                if network::probe(&addr, &cfg.secret).await.is_none() {
+                    continue;
+                }
+
+                let join = network::Join {
+                    id: plan.id,
+                    addr: plan.addr.clone(),
+                };
+                match network::send_join(&addr, &cfg.secret, &join).await {
+                    Ok(()) => tracing::info!(via = %peer.name, "joined the cluster as a learner"),
+                    Err(e) => tracing::warn!(via = %peer.name, err = %e, "join refused"),
+                }
+
+                break;
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+}
+
+/// One member as the leader sees it, for `orch nodes`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Member {
+    pub id: NodeId,
+    pub addr: String,
+    pub voter: bool,
+    pub leader: bool,
+    pub me: bool,
+}
+
+pub fn members(node: &Node) -> Vec<Member> {
+    let m = node.raft.metrics().borrow().clone();
+    let membership = m.membership_config.membership();
+    let voters: std::collections::BTreeSet<NodeId> = membership.voter_ids().collect();
+    membership
+        .nodes()
+        .map(|(id, n)| Member {
+            id: *id,
+            addr: n.addr.clone(),
+            voter: voters.contains(id),
+            leader: m.current_leader == Some(*id),
+            me: *id == m.id,
+        })
+        .collect()
 }
 
 /// Id of the node when orch runs alone

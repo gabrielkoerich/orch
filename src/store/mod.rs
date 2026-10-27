@@ -181,6 +181,10 @@ impl TaskStore {
         self.raft.get().is_none_or(|node| node.is_leader())
     }
 
+    pub fn node(&self) -> Option<&crate::cluster::Node> {
+        self.raft.get()
+    }
+
     pub fn attach_daemon(&self, endpoint: crate::cluster::local::Endpoint) {
         let _ = self.daemon.set(endpoint);
     }

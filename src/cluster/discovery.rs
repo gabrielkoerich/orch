@@ -31,13 +31,24 @@ struct Peer {
 pub struct Host {
     pub name: String,
     pub ip: String,
+    pub online: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tailnet {
     pub me: Host,
-    /// Online peers only, sorted by name
+    /// Every peer, online or not, sorted by name. A voter that is down still has an address
     pub peers: Vec<Host>,
+}
+
+impl Tailnet {
+    /// The address of a machine by node name, this one included
+    pub fn ip_of(&self, name: &str) -> Option<&str> {
+        std::iter::once(&self.me)
+            .chain(&self.peers)
+            .find(|h| h.name == name)
+            .map(|h| h.ip.as_str())
+    }
 }
 
 /// The first label of the MagicDNS name. `HostName` can hold spaces, like "m1 max"
@@ -52,19 +63,18 @@ fn node_name(dns_name: &str) -> String {
 fn host(peer: &Peer) -> Option<Host> {
     let name = node_name(&peer.dns_name);
     let ip = peer.ips.iter().find(|ip| ip.contains('.'))?.clone();
-    (!name.is_empty()).then_some(Host { name, ip })
+    (!name.is_empty()).then_some(Host {
+        name,
+        ip,
+        online: peer.online,
+    })
 }
 
 pub fn parse(json: &str) -> anyhow::Result<Tailnet> {
     let status: Status = serde_json::from_str(json)?;
     let me = host(&status.me)
         .ok_or_else(|| anyhow::anyhow!("tailscale reports no name or IPv4 for this machine"))?;
-    let mut peers: Vec<Host> = status
-        .peers
-        .values()
-        .filter(|p| p.online)
-        .filter_map(host)
-        .collect();
+    let mut peers: Vec<Host> = status.peers.values().filter_map(host).collect();
     peers.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Tailnet { me, peers })
 }
@@ -109,21 +119,32 @@ mod tests {
     }"#;
 
     #[test]
-    fn parse_names_hosts_by_dns_label_and_keeps_online_ipv4_peers() {
+    fn parse_names_hosts_by_dns_label_and_keeps_ipv4_peers_with_their_state() {
         let t = parse(STATUS).unwrap();
         assert_eq!(
             t.me,
             Host {
                 name: "m4".into(),
-                ip: "100.1.1.4".into()
+                ip: "100.1.1.4".into(),
+                online: true,
             }
         );
-        let names: Vec<(&str, &str)> = t
+        let names: Vec<(&str, &str, bool)> = t
             .peers
             .iter()
-            .map(|h| (h.name.as_str(), h.ip.as_str()))
+            .map(|h| (h.name.as_str(), h.ip.as_str(), h.online))
             .collect();
-        assert_eq!(names, [("legion", "100.1.1.2"), ("m1-max", "100.1.1.1")]);
+        assert_eq!(
+            names,
+            [
+                ("legion", "100.1.1.2", true),
+                ("m1-max", "100.1.1.1", true),
+                ("phone", "100.1.1.9", false)
+            ]
+        );
+        assert_eq!(t.ip_of("m4"), Some("100.1.1.4"));
+        assert_eq!(t.ip_of("phone"), Some("100.1.1.9"));
+        assert_eq!(t.ip_of("nowhere"), None);
     }
 
     #[test]

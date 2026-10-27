@@ -7,6 +7,7 @@ pub mod doctor;
 pub mod events;
 pub mod job;
 pub mod ndjson;
+pub mod nodes;
 pub mod notify;
 pub mod plan;
 pub mod progress;

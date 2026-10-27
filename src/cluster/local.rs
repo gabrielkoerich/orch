@@ -7,7 +7,7 @@ use std::time::Duration;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use subtle::ConstantTimeEq;
 
@@ -61,6 +61,7 @@ pub async fn serve(store: TaskStore) -> anyhow::Result<Endpoint> {
     let app = Router::new()
         .route("/write", post(write))
         .route("/progress", post(progress))
+        .route("/nodes", get(nodes))
         .with_state(App {
             store,
             token: Arc::new(token.clone()),
@@ -141,6 +142,21 @@ async fn progress(
         Ok(record) => Json(record).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
     }
+}
+
+async fn nodes(State(app): State<App>, headers: HeaderMap) -> Response {
+    if !authorized(&app, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let members = app.store.node().map(super::members).unwrap_or_default();
+    Json(members).into_response()
+}
+
+pub async fn fetch_nodes(endpoint: &Endpoint) -> anyhow::Result<Vec<super::Member>> {
+    let url = endpoint.url.replace("/write", "/nodes");
+    let res = CLIENT.get(url).bearer_auth(&endpoint.token).send().await?;
+    Ok(res.error_for_status()?.json().await?)
 }
 
 /// Send an `orch progress` report to the daemon, which commits, pushes and records it
