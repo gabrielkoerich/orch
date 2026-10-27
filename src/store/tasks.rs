@@ -22,10 +22,11 @@ pub(crate) const TASK_COLS: &str = "id, external_id, repo, origin, title, body, 
     model_reroute_chain, limit_reroute_chain, \
     memory, delegations, created_at, updated_at, review_session_expected, \
      review_invocations, needs_review_refires, push_failures, auto_unblock_count, auto_unblock_last_at, \
-     ci_recovery_count, auto_unblock_last_reason, no_code_reroutes, network_retries, no_code_last_agent";
+     ci_recovery_count, auto_unblock_last_reason, no_code_reroutes, network_retries, no_code_last_agent, \
+     owner_node";
 
 /// Number of columns in TASK_COLS (used for diagnostic verification).
-pub(crate) const TASK_COLS_COUNT: usize = 60;
+pub(crate) const TASK_COLS_COUNT: usize = 61;
 
 /// Explicit column list for `SELECT` queries on the `task_runs` table.
 const TASK_RUN_COLS: &str =
@@ -50,6 +51,7 @@ const ALLOWED_FIELDS: &[&str] = &[
     "branch",
     "worktree",
     "worktree_cleaned",
+    "owner_node",
     "summary",
     "last_error",
     "parent_id",
@@ -223,6 +225,9 @@ pub struct Task {
     pub branch: String,
     pub worktree: String,
     pub worktree_cleaned: bool,
+    /// The node that runs the task, None until one starts it
+    #[serde(default)]
+    pub owner_node: Option<String>,
     pub summary: String,
     pub last_error: String,
     pub parent_id: Option<i64>,
@@ -2163,6 +2168,7 @@ impl TaskStore {
             branch: row.try_get("branch").unwrap_or_default(),
             worktree: row.try_get("worktree").unwrap_or_default(),
             worktree_cleaned: row.try_get::<i32, _>("worktree_cleaned").unwrap_or(0) != 0,
+            owner_node: row.try_get("owner_node").unwrap_or(None),
             summary: row.try_get("summary").unwrap_or_default(),
             last_error: row.try_get("last_error").unwrap_or_default(),
             parent_id: row.try_get("parent_id").unwrap_or(None),

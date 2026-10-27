@@ -6374,6 +6374,7 @@ mod tests {
             branch: String::new(),
             worktree: String::new(),
             worktree_cleaned: false,
+            owner_node: None,
             summary: String::new(),
             last_error: String::new(),
             parent_id: None,
