@@ -667,9 +667,10 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
     // Initialize unified task store once — all project engines share the same SQLite file.
     // Creating one pool here avoids N separate connection pools for the same database.
     let store = Arc::new(TaskStore::open(&crate::store::default_db_path().await?).await?);
-    // One node when alone, the same log a cluster replicates
-    crate::cluster::start_single(&store, &crate::home::orch_home()?.join("raft.db")).await?;
-    crate::cluster::local::serve((*store).clone()).await?;
+    if crate::cluster::enabled() {
+        crate::cluster::start_single(&store, &crate::home::orch_home()?.join("raft.db")).await?;
+        crate::cluster::local::serve((*store).clone()).await?;
+    }
 
     // Load persisted model cooldowns and register store for future writes.
     // Runs once here so the global cooldown store is not overwritten per project.

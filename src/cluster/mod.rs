@@ -38,6 +38,11 @@ openraft::declare_raft_types!(
 
 pub type Raft = openraft::Raft<TypeConfig>;
 
+/// A `cluster:` section turns the cluster on. Without one, orch writes straight to SQLite as it always has
+pub fn enabled() -> bool {
+    crate::config::get("cluster.secret").is_ok_and(|s| !s.is_empty())
+}
+
 /// Id of the node when orch runs alone
 pub const SINGLE_NODE_ID: NodeId = 1;
 
