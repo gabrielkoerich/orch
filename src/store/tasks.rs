@@ -2564,17 +2564,18 @@ pub struct StoreRouteCmd {
     pub skills: String,
 }
 
-/// Heavy text a done task's tombstone leaves out. Nodes that had the task keep their copy
-const TOMBSTONE_DROPS: &[&str] = &[
-    "body",
-    "summary",
-    "last_error",
-    "pr_review_context",
-    "memory",
-    "delegations",
-    "model_reroute_chain",
-    "limit_reroute_chain",
-    "review_ts_map",
+/// The columns a done task's tombstone keeps. Nodes that had the task keep the rest locally
+const TOMBSTONE_COLUMNS: &[&str] = &[
+    "id",
+    "external_id",
+    "repo",
+    "origin",
+    "title",
+    "status",
+    "pr_number",
+    "parent_id",
+    "created_at",
+    "updated_at",
 ];
 
 async fn replicated_columns(conn: &mut sqlx::SqliteConnection) -> anyhow::Result<Vec<String>> {
@@ -2595,7 +2596,7 @@ pub(crate) async fn replicated_rows(pool: &SqlitePool) -> anyhow::Result<Vec<ser
     let full: Vec<&String> = cols.iter().collect();
     let tomb: Vec<&String> = cols
         .iter()
-        .filter(|c| !TOMBSTONE_DROPS.contains(&c.as_str()))
+        .filter(|c| TOMBSTONE_COLUMNS.contains(&c.as_str()))
         .collect();
     let sql = format!(
         "SELECT CASE WHEN status = 'done' THEN {} ELSE {} END FROM tasks ORDER BY id",
