@@ -1353,7 +1353,18 @@ pub async fn kill(id: &str) -> anyhow::Result<()> {
     let tmux = TmuxManager::new();
     let repo = crate::config::get_current_repo().unwrap_or_default();
     let session = tmux.session_name(&repo, id);
-    tmux.kill_session(&session).await?;
+    let killed = tmux.kill_session(&session).await;
+
+    // Close the open run now so a following retry does not wait for silence detection
+    let store = crate::cli::init_store().await.ok().map(Arc::new);
+    if let Some(s) = &store {
+        if let Ok(Some(store_id)) = s.resolve_task_id(&repo, id).await {
+            s.finalize_incomplete_runs(store_id, "killed", "killed by orch task kill")
+                .await?;
+        }
+    }
+
+    killed?;
     println!("Killed session for task #{}", id);
     Ok(())
 }
