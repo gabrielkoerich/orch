@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::cluster::{local, progress};
+use crate::engine::runner::git_ops;
 
 async fn git(dir: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> {
     Ok(tokio::process::Command::new("git")
@@ -22,17 +23,13 @@ pub async fn run(done: &str, left: &str, state: &str) -> anyhow::Result<()> {
     let worktree = String::from_utf8_lossy(&top.stdout).trim().to_string();
     let dir = Path::new(&worktree);
 
-    let mut cli_error = None;
-    let _ = git(dir, &["add", "-A"]).await?;
-    let staged = git(dir, &["diff", "--cached", "--quiet"]).await?;
-    let mut cli_committed = false;
-    if !staged.status.success() {
-        let out = git(dir, &["commit", "-m", done]).await?;
-        cli_committed = out.status.success();
-        if !cli_committed {
-            cli_error = Some(String::from_utf8_lossy(&out.stderr).trim().to_string());
-        }
-    }
+    let task_id = std::env::var("TASK_ID").unwrap_or_default();
+    let agent = std::env::var("ORCH_AGENT").unwrap_or_else(|_| "agent".to_string());
+    let (cli_committed, cli_error) =
+        match git_ops::auto_commit(dir, &task_id, done, &agent, 0).await {
+            Ok(committed) => (committed, None),
+            Err(e) => (false, Some(format!("{e:#}"))),
+        };
 
     let report = progress::Report {
         worktree,

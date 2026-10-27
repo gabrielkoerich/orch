@@ -373,15 +373,7 @@ async fn restore_stash_by_hash(dir: &Path, stash_hash: Option<&str>) {
     }
 }
 
-/// Resolve the git author identity from config, falling back to `{agent}[bot]`.
-fn git_identity(agent: &str) -> (String, String) {
-    let name = crate::config::get("git.name").unwrap_or_else(|_| format!("{agent}[bot]"));
-    let email = crate::config::get("git.email")
-        .unwrap_or_else(|_| format!("{agent}[bot]@users.noreply.github.com"));
-    (name, email)
-}
-
-/// Auto-commit any uncommitted changes.
+/// Commit what the agent left, with the tool the repository uses (see `commit`).
 pub async fn auto_commit(
     dir: &Path,
     task_id: &str,
@@ -389,100 +381,23 @@ pub async fn auto_commit(
     agent: &str,
     attempt: u32,
 ) -> anyhow::Result<bool> {
-    // Check for changes first (before creating span to avoid Send issues)
-    if !has_changes(dir).await {
-        return Ok(false);
-    }
-
-    tracing::info!(task_id, "auto-committing uncommitted changes");
-
     let task_ref = format_task_ref(task_id);
-    let commit_msg = format!("{title}\n\nTask {task_ref}\nAgent: {agent}\nAttempt: {attempt}");
-
-    // git add -A
-    let add = Command::new("git")
-        .args(["add", "-A"])
-        .current_dir(dir)
-        .output_with_context()
-        .await?;
-
-    if !add.status.success() {
-        tracing::warn!(task_id, "git add -A failed");
-        return Ok(false);
-    }
-
-    // git commit — override author/committer to match the agent identity
-    let (git_name, git_email) = git_identity(agent);
-    let commit = Command::new("git")
-        // Same policy as the rebase path: never depend on the operator's signing agent
-        .args(["-c", "commit.gpgsign=false", "commit", "-m", &commit_msg])
-        .env("GIT_AUTHOR_NAME", &git_name)
-        .env("GIT_COMMITTER_NAME", &git_name)
-        .env("GIT_AUTHOR_EMAIL", &git_email)
-        .env("GIT_COMMITTER_EMAIL", &git_email)
-        .current_dir(dir)
-        .output_with_context()
-        .await?;
-
-    if !commit.status.success() {
-        let stderr = String::from_utf8_lossy(&commit.stderr);
-        tracing::warn!(task_id, err = %stderr, "git commit failed");
-        // Unstage files so has_changes() sees them as unstaged on the next
-        // check and the workflow can retry the commit cleanly.
-        let restore = Command::new("git")
-            .args(["restore", "--staged", "."])
-            .current_dir(dir)
-            .output_with_context()
-            .await;
-        match restore {
-            Ok(o) if o.status.success() => {}
-            Ok(o) => {
-                let restore_stderr = String::from_utf8_lossy(&o.stderr).to_string();
-                tracing::warn!(
-                    task_id,
-                    stderr = %restore_stderr,
-                    "git restore --staged failed after commit failure; falling back to git reset HEAD -- ."
-                );
-                let reset = Command::new("git")
-                    .args(["reset", "HEAD", "--", "."])
-                    .current_dir(dir)
-                    .output_with_context()
-                    .await?;
-                if !reset.status.success() {
-                    anyhow::bail!(
-                        "git commit failed and cleanup failed (git restore --staged + git reset HEAD -- .): commit stderr: {}; restore stderr: {}; reset stderr: {}",
-                        stderr.trim(),
-                        restore_stderr.trim(),
-                        String::from_utf8_lossy(&reset.stderr).trim()
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    task_id,
-                    error = %e,
-                    "git restore --staged command failed after commit failure; falling back to git reset HEAD -- ."
-                );
-                let reset = Command::new("git")
-                    .args(["reset", "HEAD", "--", "."])
-                    .current_dir(dir)
-                    .output_with_context()
-                    .await?;
-                if !reset.status.success() {
-                    anyhow::bail!(
-                        "git commit failed and cleanup failed (git restore --staged command error + git reset HEAD -- .): commit stderr: {}; restore error: {}; reset stderr: {}",
-                        stderr.trim(),
-                        e,
-                        String::from_utf8_lossy(&reset.stderr).trim()
-                    );
-                }
-            }
+    let message = format!("{title}\n\nTask {task_ref}\nAgent: {agent}\nAttempt: {attempt}");
+    match super::commit::commit_all(dir, &message, agent).await? {
+        super::commit::Outcome::Committed => {
+            tracing::info!(task_id, "auto-commit succeeded");
+            Ok(true)
         }
-        return Ok(false);
+        super::commit::Outcome::Nothing => Ok(false),
+        super::commit::Outcome::Refused {
+            by: super::commit::Tool::Git,
+            reason,
+        } => {
+            tracing::warn!(task_id, err = %reason, "git commit failed");
+            Ok(false)
+        }
+        super::commit::Outcome::Refused { reason, .. } => anyhow::bail!(reason),
     }
-
-    tracing::info!(task_id, "auto-commit succeeded");
-    Ok(true)
 }
 
 /// Maximum number of commits to replay during a rebase.
@@ -909,17 +824,8 @@ async fn strip_workflow_files(dir: &Path, default_branch: &str) -> anyhow::Resul
         combined
     };
 
-    let (git_name, git_email) = git_identity("orchestrator");
-    let commit = Command::new("git")
-        // Same policy as the rebase path: never depend on the operator's signing agent
-        .args(["-c", "commit.gpgsign=false", "commit", "-m", &commit_msg])
-        .env("GIT_AUTHOR_NAME", &git_name)
-        .env("GIT_COMMITTER_NAME", &git_name)
-        .env("GIT_AUTHOR_EMAIL", &git_email)
-        .env("GIT_COMMITTER_EMAIL", &git_email)
-        .current_dir(dir)
-        .output_with_context()
-        .await?;
+    // A repair of commits already made, so it lands through git even where shipcheck commits
+    let commit = super::commit::git_commit(dir, &commit_msg, "orchestrator").await?;
 
     if !commit.status.success() {
         let stderr = String::from_utf8_lossy(&commit.stderr);

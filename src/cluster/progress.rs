@@ -85,13 +85,11 @@ pub async fn handle(store: &TaskStore, node: &str, report: Report) -> anyhow::Re
         .await
         .unwrap_or_default();
     let mut committed_by = if report.cli_committed { "cli" } else { "none" };
-    if git_ops::has_changes(dir).await {
-        let ext = task.external_id.clone().unwrap_or_default();
-        match git_ops::auto_commit(dir, &ext, &report.done, "orch", task.attempts as u32).await {
-            Ok(true) => committed_by = "orch",
-            Ok(false) => {}
-            Err(e) => errors.push(format!("commit: {e:#}")),
-        }
+    let ext = task.external_id.clone().unwrap_or_default();
+    match git_ops::auto_commit(dir, &ext, &report.done, "orch", task.attempts as u32).await {
+        Ok(true) => committed_by = "orch",
+        Ok(false) => {}
+        Err(e) => errors.push(format!("commit: {e:#}")),
     }
 
     if committed_by == "none"
