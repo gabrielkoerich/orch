@@ -44,10 +44,15 @@ pub struct Tailnet {
 impl Tailnet {
     /// The address of a machine by node name, this one included
     pub fn ip_of(&self, name: &str) -> Option<&str> {
+        self.all_named(name).first().map(|h| h.ip.as_str())
+    }
+
+    /// Every machine with this node name, this one included
+    pub fn all_named(&self, name: &str) -> Vec<&Host> {
         std::iter::once(&self.me)
             .chain(&self.peers)
-            .find(|h| h.name == name)
-            .map(|h| h.ip.as_str())
+            .filter(|h| h.name == name)
+            .collect()
     }
 }
 
@@ -70,11 +75,26 @@ fn host(peer: &Peer) -> Option<Host> {
     })
 }
 
+/// The MagicDNS suffix after the first label, which names the tailnet
+fn tailnet_suffix(dns_name: &str) -> &str {
+    dns_name
+        .split_once('.')
+        .map(|(_, rest)| rest)
+        .unwrap_or_default()
+}
+
+/// Only machines of this tailnet. A device shared in from another tailnet has another suffix
 pub fn parse(json: &str) -> anyhow::Result<Tailnet> {
     let status: Status = serde_json::from_str(json)?;
     let me = host(&status.me)
         .ok_or_else(|| anyhow::anyhow!("tailscale reports no name or IPv4 for this machine"))?;
-    let mut peers: Vec<Host> = status.peers.values().filter_map(host).collect();
+    let suffix = tailnet_suffix(&status.me.dns_name).to_ascii_lowercase();
+    let mut peers: Vec<Host> = status
+        .peers
+        .values()
+        .filter(|p| tailnet_suffix(&p.dns_name).eq_ignore_ascii_case(&suffix))
+        .filter_map(host)
+        .collect();
     peers.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Tailnet { me, peers })
 }
@@ -114,7 +134,8 @@ mod tests {
             "a": {"HostName": "m1 max", "DNSName": "m1-max.tail0.ts.net.", "TailscaleIPs": ["100.1.1.1"], "Online": true},
             "b": {"HostName": "legion", "DNSName": "Legion.tail0.ts.net.", "TailscaleIPs": ["fd7a::2", "100.1.1.2"], "Online": true},
             "c": {"HostName": "localhost", "DNSName": "phone.tail0.ts.net.", "TailscaleIPs": ["100.1.1.9"], "Online": false},
-            "d": {"HostName": "odd", "DNSName": "", "TailscaleIPs": ["100.1.1.8"], "Online": true}
+            "d": {"HostName": "odd", "DNSName": "", "TailscaleIPs": ["100.1.1.8"], "Online": true},
+            "e": {"HostName": "legion", "DNSName": "legion.other.ts.net.", "TailscaleIPs": ["100.9.9.9"], "Online": true}
         }
     }"#;
 

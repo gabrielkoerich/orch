@@ -43,6 +43,8 @@ struct App {
     raft: Raft,
     secret: Arc<String>,
     me: Arc<Hello>,
+    /// The address peers dial, bound into every proof so a proof relayed through another host fails
+    addr: Arc<String>,
 }
 
 /// What a node says about itself to a peer that found it on the tailnet
@@ -92,7 +94,7 @@ fn authorized(app: &App, headers: &HeaderMap) -> bool {
     given.ct_eq(app.secret.as_bytes()).into()
 }
 
-pub(crate) fn router(raft: Raft, secret: Arc<String>, me: Hello) -> Router {
+pub(crate) fn router(raft: Raft, secret: Arc<String>, me: Hello, addr: String) -> Router {
     Router::new()
         .route("/raft/append", post(append))
         .route("/raft/snapshot", post(snapshot))
@@ -104,6 +106,7 @@ pub(crate) fn router(raft: Raft, secret: Arc<String>, me: Hello) -> Router {
             raft,
             secret,
             me: Arc::new(me),
+            addr: Arc::new(addr),
         })
 }
 
@@ -117,7 +120,7 @@ async fn hello(State(a): State<App>, headers: HeaderMap) -> Response {
             .to_string()
     };
     let nonce = header(NONCE_HEADER);
-    let expected = mac(&a.secret, &["probe", &nonce]);
+    let expected = mac(&a.secret, &["probe", &nonce, &a.addr]);
     let proven: bool = header(PROOF_HEADER)
         .as_bytes()
         .ct_eq(expected.as_bytes())
@@ -130,7 +133,7 @@ async fn hello(State(a): State<App>, headers: HeaderMap) -> Response {
     Json(Hello {
         leader: m.current_leader,
         term: m.current_term,
-        proof: mac(&a.secret, &["hello", &nonce, &a.me.name]),
+        proof: mac(&a.secret, &["hello", &nonce, &a.me.name, &a.addr]),
         ..(*a.me).clone()
     })
     .into_response()
@@ -174,20 +177,25 @@ pub async fn send_join(addr: &str, secret: &str, req: &Join) -> anyhow::Result<(
     Ok(())
 }
 
-/// Ask a host found on the tailnet who it is. The secret never leaves this node, and a host that
-/// cannot prove it holds the secret answers nothing
-pub async fn probe(addr: &str, secret: &str) -> Option<Hello> {
+/// Ask a host found on the tailnet who it is. The secret never leaves this node. Both proofs cover
+/// the address dialed, and the answer must carry the name Tailscale gives that address, so a host
+/// that relays a real member's answer is rejected
+pub async fn probe(addr: &str, secret: &str, expect_name: Option<&str>) -> Option<Hello> {
     let nonce = uuid::Uuid::new_v4().simple().to_string();
     let res = CLIENT
         .get(format!("http://{addr}/cluster/hello"))
         .header(NONCE_HEADER, &nonce)
-        .header(PROOF_HEADER, mac(secret, &["probe", &nonce]))
+        .header(PROOF_HEADER, mac(secret, &["probe", &nonce, addr]))
         .timeout(Duration::from_secs(1))
         .send()
         .await
         .ok()?;
     let hello: Hello = res.error_for_status().ok()?.json().await.ok()?;
-    let expected = mac(secret, &["hello", &nonce, &hello.name]);
+    if expect_name.is_some_and(|name| name != hello.name) {
+        return None;
+    }
+
+    let expected = mac(secret, &["hello", &nonce, &hello.name, addr]);
     let proven: bool = hello.proof.as_bytes().ct_eq(expected.as_bytes()).into();
     proven.then_some(hello)
 }

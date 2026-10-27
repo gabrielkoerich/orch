@@ -701,12 +701,25 @@ async fn a_learner_joins_through_any_node_and_catches_up() {
     .unwrap();
 
     let follower = *members.keys().find(|id| **id != leader).unwrap();
-    let hello = network::probe(&voters[&follower], "s3cret").await.unwrap();
+    let hello = network::probe(
+        &voters[&follower],
+        "s3cret",
+        Some(&format!("node{follower}")),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         (hello.name.as_str(), hello.leader),
         (format!("node{follower}").as_str(), Some(leader))
     );
-    assert!(network::probe(&voters[&follower], "wrong").await.is_none());
+    assert!(network::probe(&voters[&follower], "wrong", None)
+        .await
+        .is_none());
+    assert!(
+        network::probe(&voters[&follower], "s3cret", Some("impostor"))
+            .await
+            .is_none()
+    );
 
     network::send_join(&voters[&follower], "s3cret", &network::Join { id: 4, addr })
         .await
@@ -763,7 +776,7 @@ async fn probe_never_sends_the_secret_and_rejects_a_peer_without_proof() {
 
     // The probe gives up after 1 s, which a loaded test run can exceed, so it tries a few times
     for _ in 0..5 {
-        assert!(network::probe(&addr, "s3cret").await.is_none());
+        assert!(network::probe(&addr, "s3cret", None).await.is_none());
         if !seen.lock().unwrap().is_empty() {
             break;
         }
@@ -922,6 +935,51 @@ async fn exactly_one_of_three_nodes_leads() {
         assert_eq!(m.store.is_leader(), *id == leader, "node {id}");
     }
 
+    for (_, m) in members {
+        m.node.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relayed_proof_is_rejected() {
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let voters = voters(3);
+    let mut members = BTreeMap::new();
+    for id in 1..=3 {
+        let m = start_member(dirs[id as usize - 1].path(), id, &voters, "s3cret", true).await;
+        members.insert(id, m);
+    }
+
+    leader_of(&members).await;
+    let real = voters[&1].clone();
+    // A host that forwards the probe to a real member and hands back its genuine answer
+    let relay = axum::Router::new().route(
+        "/cluster/hello",
+        axum::routing::get(move |headers: axum::http::HeaderMap| {
+            let real = real.clone();
+            async move {
+                let mut req = reqwest::Client::new().get(format!("http://{real}/cluster/hello"));
+                for (k, v) in headers.iter() {
+                    if k.as_str().starts_with("x-orch") {
+                        req = req.header(k.as_str(), v.as_bytes());
+                    }
+                }
+                let body = req.send().await.unwrap().text().await.unwrap();
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move { axum::serve(listener, relay).await.ok() });
+
+    assert!(network::probe(&voters[&1], "s3cret", Some("node1"))
+        .await
+        .is_some());
+    assert!(network::probe(&relay_addr, "s3cret", None).await.is_none());
     for (_, m) in members {
         m.node.stop().await;
     }

@@ -95,7 +95,10 @@ async fn join_loop(node: Node, plan: config::Plan, cfg: config::ClusterConfig) {
         if let Ok(tailnet) = discovery::status().await {
             for peer in tailnet.peers.iter().filter(|p| p.online) {
                 let addr = format!("{}:{}", peer.ip, cfg.port);
-                if network::probe(&addr, &cfg.secret).await.is_none() {
+                if network::probe(&addr, &cfg.secret, Some(&peer.name))
+                    .await
+                    .is_none()
+                {
                     continue;
                 }
 
@@ -278,7 +281,7 @@ pub async fn start_node(
         term: 0,
         proof: String::new(),
     };
-    let app = network::router(raft.clone(), secret.clone(), me);
+    let app = network::router(raft.clone(), secret.clone(), me, cfg.addr.clone());
     let stop = Arc::new(tokio::sync::Notify::new());
     let stopped = stop.clone();
     tokio::spawn(async move {

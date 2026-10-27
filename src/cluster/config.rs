@@ -61,9 +61,18 @@ pub fn plan(cfg: &ClusterConfig, tailnet: &Tailnet) -> anyhow::Result<Plan> {
     let mut voters = BTreeMap::new();
     let mut missing = Vec::new();
     for voter in &cfg.voters {
-        match tailnet.ip_of(voter) {
-            Some(ip) => {
-                voters.insert(discovery::node_id(voter), format!("{ip}:{}", cfg.port));
+        let found = tailnet.all_named(voter);
+        anyhow::ensure!(
+            found.len() <= 1,
+            "cluster.voters names {voter}, and {} machines on the tailnet have that name",
+            found.len()
+        );
+        match found.first() {
+            Some(host) => {
+                voters.insert(
+                    discovery::node_id(voter),
+                    format!("{}:{}", host.ip, cfg.port),
+                );
             }
             None => missing.push(voter.as_str()),
         }
@@ -155,5 +164,13 @@ mod tests {
         let err = plan(&c, &tailnet("m1-max")).unwrap_err().to_string();
         assert!(err.contains("ghost"), "{err}");
         assert!(plan(&cfg(true), &tailnet("m4")).is_err());
+    }
+
+    #[test]
+    fn plan_rejects_a_voter_name_two_machines_share() {
+        let mut t = tailnet("m1-max");
+        t.peers.push(host("legion", "100.1.1.9", true));
+        let err = plan(&cfg(false), &t).unwrap_err().to_string();
+        assert!(err.contains("2 machines"), "{err}");
     }
 }
