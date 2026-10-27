@@ -44,7 +44,7 @@ async fn single_node_applies_kv_writes_through_the_log() {
     assert_eq!(store.kv_get("cooldown:claude").await.unwrap(), None);
     assert_eq!(log_len(dir.path()).await, before + 6);
 
-    raft.shutdown().await.unwrap();
+    raft.stop().await;
 }
 
 #[tokio::test]
@@ -60,7 +60,7 @@ async fn local_keys_skip_the_log() {
     assert_eq!(store.kv_increment("metrics:ticks").await.unwrap(), 2);
     assert_eq!(log_len(dir.path()).await, before);
 
-    raft.shutdown().await.unwrap();
+    raft.stop().await;
 }
 
 #[tokio::test]
@@ -73,7 +73,7 @@ async fn restart_does_not_apply_an_entry_twice() {
             .unwrap();
         store.kv_increment("failure_count:codex").await.unwrap();
         store.kv_increment("failure_count:codex").await.unwrap();
-        raft.shutdown().await.unwrap();
+        raft.stop().await;
     }
 
     let store = open(dir.path()).await;
@@ -81,7 +81,7 @@ async fn restart_does_not_apply_an_entry_twice() {
         .await
         .unwrap();
     assert_eq!(store.kv_increment("failure_count:codex").await.unwrap(), 3);
-    raft.shutdown().await.unwrap();
+    raft.stop().await;
 }
 
 #[tokio::test]
@@ -212,7 +212,7 @@ async fn task_writes_go_through_the_log() {
         ("/here", "gh-issue-1")
     );
 
-    raft.shutdown().await.unwrap();
+    raft.stop().await;
 }
 
 #[tokio::test]
@@ -225,7 +225,7 @@ async fn restart_does_not_increment_a_task_counter_twice() {
             .unwrap();
         let id = store.create(&new_task("a", "")).await.unwrap();
         store.increment(id, "push_failures").await.unwrap();
-        raft.shutdown().await.unwrap();
+        raft.stop().await;
         id
     };
 
@@ -234,7 +234,7 @@ async fn restart_does_not_increment_a_task_counter_twice() {
         .await
         .unwrap();
     assert_eq!(store.increment(id, "push_failures").await.unwrap(), 2);
-    raft.shutdown().await.unwrap();
+    raft.stop().await;
 }
 
 #[tokio::test]
@@ -356,9 +356,9 @@ async fn dependency_job_and_channel_writes_go_through_the_log_and_the_snapshot()
     assert_eq!(log_len(a_dir.path()).await, before + 4);
 
     a.kv_set("cooldown:x", "1").await.unwrap();
-    let snap = raft.trigger().snapshot().await;
+    let snap = raft.raft.trigger().snapshot().await;
     assert!(snap.is_ok());
-    raft.shutdown().await.unwrap();
+    raft.stop().await;
     let mut a_raft = RaftStore::open(&a_dir.path().join("raft.db"), a.clone())
         .await
         .unwrap();
@@ -418,7 +418,7 @@ async fn cli_writes_go_through_the_daemon_log() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("allowlist"), "{err:#}");
-    raft.shutdown().await.unwrap();
+    raft.stop().await;
 }
 
 #[tokio::test]
@@ -486,5 +486,179 @@ async fn daemon_endpoint_refuses_a_wrong_token_and_a_foreign_host() {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+}
+
+fn free_addr() -> String {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .to_string()
+}
+
+struct Member {
+    store: TaskStore,
+    node: Node,
+}
+
+async fn start_member(
+    dir: &Path,
+    id: NodeId,
+    voters: &BTreeMap<NodeId, String>,
+    secret: &str,
+    elect: bool,
+) -> Member {
+    let store = open(dir).await;
+    let node = start_node(
+        &store,
+        &dir.join("raft.db"),
+        NodeConfig {
+            id,
+            addr: voters[&id].clone(),
+            secret: secret.into(),
+            voters: voters.clone(),
+            elect,
+        },
+    )
+    .await
+    .unwrap();
+    Member { store, node }
+}
+
+async fn leader_of(members: &BTreeMap<NodeId, Member>) -> NodeId {
+    for _ in 0..200 {
+        for (id, m) in members {
+            if m.node.raft.metrics().borrow().current_leader == Some(*id) {
+                return *id;
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    panic!("no leader elected");
+}
+
+async fn wait_for_task(store: &TaskStore, id: i64) -> crate::store::Task {
+    for _ in 0..200 {
+        if let Ok(t) = store.get(id).await {
+            return t;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    panic!("task {id} never arrived");
+}
+
+fn voters(n: u64) -> BTreeMap<NodeId, String> {
+    (1..=n).map(|id| (id, free_addr())).collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn three_voters_fail_over_and_catch_up() {
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let voters = voters(3);
+    let mut members = BTreeMap::new();
+    for id in 1..=3 {
+        let m = start_member(dirs[id as usize - 1].path(), id, &voters, "s3cret", true).await;
+        members.insert(id, m);
+    }
+
+    let first = leader_of(&members).await;
+    let follower = *members.keys().find(|id| **id != first).unwrap();
+    let a = members[&follower]
+        .store
+        .create(&new_task("a", "body a"))
+        .await
+        .unwrap();
+    for m in members.values() {
+        assert_eq!(wait_for_task(&m.store, a).await.title, "a");
+    }
+
+    members.remove(&first).unwrap().node.stop().await;
+    let second = leader_of(&members).await;
+    assert_ne!(first, second);
+    let any = members.values().next().unwrap();
+    let b = any.store.create(&new_task("b", "")).await.unwrap();
+    assert_eq!(b, a + 1);
+
+    let back = start_member(
+        dirs[first as usize - 1].path(),
+        first,
+        &voters,
+        "s3cret",
+        true,
+    )
+    .await;
+    assert_eq!(wait_for_task(&back.store, b).await.title, "b");
+    back.node.stop().await;
+    for (_, m) in members {
+        m.node.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_witness_votes_but_never_leads() {
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let voters = voters(3);
+    let mut members = BTreeMap::new();
+    for id in 1..=3 {
+        let witness = id == 3;
+        let m = start_member(
+            dirs[id as usize - 1].path(),
+            id,
+            &voters,
+            "s3cret",
+            !witness,
+        )
+        .await;
+        members.insert(id, m);
+    }
+
+    let first = leader_of(&members).await;
+    assert_ne!(first, 3);
+    members.remove(&first).unwrap().node.stop().await;
+    let second = leader_of(&members).await;
+    assert_ne!(second, 3, "the witness took the lead");
+    assert_ne!(second, first);
+    let id = members[&3]
+        .store
+        .create(&new_task("via witness", ""))
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_for_task(&members[&second].store, id).await.title,
+        "via witness"
+    );
+    for (_, m) in members {
+        m.node.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_with_the_wrong_secret_gets_nothing() {
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let voters = voters(3);
+    let mut members = BTreeMap::new();
+    for id in 1..=3 {
+        let secret = if id == 3 { "other" } else { "s3cret" };
+        let m = start_member(dirs[id as usize - 1].path(), id, &voters, secret, id != 3).await;
+        members.insert(id, m);
+    }
+
+    let leader = leader_of(&members).await;
+    let id = members[&leader]
+        .store
+        .create(&new_task("a", ""))
+        .await
+        .unwrap();
+    let other = if leader == 1 { 2 } else { 1 };
+    wait_for_task(&members[&other].store, id).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(members[&3].store.get(id).await.is_err());
+    for (_, m) in members {
+        m.node.stop().await;
     }
 }

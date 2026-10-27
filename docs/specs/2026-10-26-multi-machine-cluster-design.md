@@ -209,7 +209,7 @@ Membership:
 
 - Voters are fixed by name in config, the same list on every voter: `cluster.voters`. When a voter has found an address for every name, it calls `initialize` with that membership. openraft accepts the same `initialize` from every voter, so no voter is special. Rejected: voters found by discovery, where two voters that start apart can each initialize a cluster of their own.
 - Every other node with the secret is a learner. It sends `POST /cluster/join` to any peer, the peer forwards it to the leader, and the leader calls `add_learner`. An offline learner stays in the membership.
-- A node with `cluster.witness: true` runs with `enable_elect: false` and runs no agents.
+- A node with `cluster.witness: true` runs with `enable_elect: false` and runs no agents. It does not call `initialize`, because openraft's `initialize` starts an election whatever `enable_elect` says. It learns the membership from the leader.
 - With no `cluster` section, orch runs a one-node cluster with no listener and no call to `tailscale`. It behaves like orch today.
 
 ```yaml

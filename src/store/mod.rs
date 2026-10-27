@@ -79,7 +79,7 @@ pub async fn default_db_path() -> anyhow::Result<std::path::PathBuf> {
 pub struct TaskStore {
     pool: SqlitePool,
     /// Set once on the daemon. Without it, replicated writes apply directly, as in tests and the CLI
-    raft: Arc<OnceLock<crate::cluster::Raft>>,
+    raft: Arc<OnceLock<crate::cluster::Node>>,
     /// Set on the CLI when a daemon runs, so its writes go through the daemon's log
     daemon: Arc<OnceLock<crate::cluster::local::Endpoint>>,
 }
@@ -169,8 +169,8 @@ impl TaskStore {
         Ok(())
     }
 
-    pub fn attach_raft(&self, raft: crate::cluster::Raft) {
-        if self.raft.set(raft).is_err() {
+    pub fn attach_node(&self, node: crate::cluster::Node) {
+        if self.raft.set(node).is_err() {
             tracing::warn!("raft already attached to the task store");
         }
     }
@@ -184,7 +184,7 @@ impl TaskStore {
         &self,
         cmd: crate::cluster::Command,
     ) -> anyhow::Result<crate::cluster::Reply> {
-        let Some(raft) = self.raft.get() else {
+        let Some(node) = self.raft.get() else {
             if let Some(endpoint) = self.daemon.get() {
                 match crate::cluster::local::send(endpoint, &cmd).await {
                     Ok(reply) => return reply_result(reply),
@@ -202,8 +202,7 @@ impl TaskStore {
             now: crate::cluster::now_stamp(),
             cmd,
         };
-        let reply = raft.client_write(req).await?.data;
-        reply_result(reply)
+        reply_result(node.write(req).await?)
     }
 
     pub(crate) async fn write_int(&self, cmd: crate::cluster::Command) -> anyhow::Result<i64> {
