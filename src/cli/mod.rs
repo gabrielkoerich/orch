@@ -769,8 +769,8 @@ pub async fn init_task_manager() -> anyhow::Result<TaskManager> {
 /// Initialize the unified task store for CLI commands.
 pub async fn init_store() -> anyhow::Result<crate::store::TaskStore> {
     let store = crate::store::TaskStore::open(&crate::store::default_db_path().await?).await?;
-    if let Some(url) = crate::cluster::local::daemon_url().await {
-        store.attach_daemon(url);
+    if let Some(endpoint) = crate::cluster::local::daemon_endpoint().await {
+        store.attach_daemon(endpoint);
     }
 
     Ok(store)

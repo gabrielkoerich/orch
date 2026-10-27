@@ -399,10 +399,10 @@ async fn cli_writes_go_through_the_daemon_log() {
     let raft = start_single(&daemon, &dir.path().join("raft.db"))
         .await
         .unwrap();
-    let port = local::serve(daemon.clone()).await.unwrap();
+    let endpoint = local::serve(daemon.clone()).await.unwrap();
 
     let cli = open(dir.path()).await;
-    cli.attach_daemon(format!("http://127.0.0.1:{port}/write"));
+    cli.attach_daemon(endpoint.clone());
     let before = log_len(dir.path()).await;
     cli.kv_set("cooldown:claude", "9").await.unwrap();
     let id = cli.create(&new_task("from cli", "")).await.unwrap();
@@ -430,10 +430,61 @@ async fn cli_writes_directly_when_no_daemon_listens() {
         .local_addr()
         .unwrap()
         .port();
-    cli.attach_daemon(format!("http://127.0.0.1:{port}/write"));
+    cli.attach_daemon(local::Endpoint {
+        url: format!("http://127.0.0.1:{port}/write"),
+        token: "t".into(),
+    });
     cli.kv_set("cooldown:claude", "1").await.unwrap();
     assert_eq!(
         cli.kv_get("cooldown:claude").await.unwrap().as_deref(),
         Some("1")
     );
+}
+
+#[tokio::test]
+async fn daemon_endpoint_refuses_a_wrong_token_and_a_foreign_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = open(dir.path()).await;
+    let endpoint = local::serve(daemon.clone()).await.unwrap();
+    let cmd = Command::KvSet {
+        key: "cooldown:claude".into(),
+        value: "1".into(),
+    };
+
+    let cli = open(dir.path()).await;
+    cli.attach_daemon(local::Endpoint {
+        url: endpoint.url.clone(),
+        token: "wrong".into(),
+    });
+    let err = cli.kv_set("cooldown:claude", "1").await.unwrap_err();
+    assert!(err.to_string().contains("401"), "{err:#}");
+    assert_eq!(daemon.kv_get("cooldown:claude").await.unwrap(), None);
+
+    let port = endpoint
+        .url
+        .split(':')
+        .nth(2)
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap();
+    let res = reqwest::Client::new()
+        .post(format!("http://localhost:{port}/write"))
+        .bearer_auth(&endpoint.token)
+        .json(&cmd)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401, "a Host other than 127.0.0.1 is refused");
+
+    let body = std::fs::read_to_string(std::env::temp_dir().join("orch-test-state/cluster.port"))
+        .unwrap_or_default();
+    if body.contains(&endpoint.token) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(std::env::temp_dir().join("orch-test-state/cluster.port"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
 }

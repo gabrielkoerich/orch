@@ -81,7 +81,7 @@ pub struct TaskStore {
     /// Set once on the daemon. Without it, replicated writes apply directly, as in tests and the CLI
     raft: Arc<OnceLock<crate::cluster::Raft>>,
     /// Set on the CLI when a daemon runs, so its writes go through the daemon's log
-    daemon: Arc<OnceLock<String>>,
+    daemon: Arc<OnceLock<crate::cluster::local::Endpoint>>,
 }
 
 impl TaskStore {
@@ -175,8 +175,8 @@ impl TaskStore {
         }
     }
 
-    pub fn attach_daemon(&self, url: String) {
-        let _ = self.daemon.set(url);
+    pub fn attach_daemon(&self, endpoint: crate::cluster::local::Endpoint) {
+        let _ = self.daemon.set(endpoint);
     }
 
     /// Propose a replicated write through Raft, or apply it directly when no Raft is attached
@@ -185,8 +185,8 @@ impl TaskStore {
         cmd: crate::cluster::Command,
     ) -> anyhow::Result<crate::cluster::Reply> {
         let Some(raft) = self.raft.get() else {
-            if let Some(url) = self.daemon.get() {
-                match crate::cluster::local::send(url, &cmd).await {
+            if let Some(endpoint) = self.daemon.get() {
+                match crate::cluster::local::send(endpoint, &cmd).await {
                     Ok(reply) => return reply_result(reply),
                     // Nothing was sent, so applying here cannot apply the command twice
                     Err(e) if e.is_connect() => {
