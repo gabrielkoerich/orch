@@ -86,7 +86,16 @@ pub async fn handle(store: &TaskStore, node: &str, report: Report) -> anyhow::Re
         .unwrap_or_default();
     let mut committed_by = if report.cli_committed { "cli" } else { "none" };
     let ext = task.external_id.clone().unwrap_or_default();
-    match git_ops::auto_commit(dir, &ext, &report.done, "orch", task.attempts as u32).await {
+    match git_ops::auto_commit(
+        dir,
+        &ext,
+        &report.done,
+        "orch",
+        task.attempts as u32,
+        crate::engine::runner::commit::When::Tested,
+    )
+    .await
+    {
         Ok(true) => committed_by = "orch",
         Ok(false) => {}
         Err(e) => errors.push(format!("commit: {e:#}")),

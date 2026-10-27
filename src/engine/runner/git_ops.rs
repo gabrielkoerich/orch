@@ -380,10 +380,11 @@ pub async fn auto_commit(
     title: &str,
     agent: &str,
     attempt: u32,
+    when: super::commit::When,
 ) -> anyhow::Result<bool> {
     let task_ref = format_task_ref(task_id);
     let message = format!("{title}\n\nTask {task_ref}\nAgent: {agent}\nAttempt: {attempt}");
-    match super::commit::commit_all(dir, &message, agent).await? {
+    match super::commit::commit_all(dir, &message, agent, when).await? {
         super::commit::Outcome::Committed => {
             tracing::info!(task_id, "auto-commit succeeded");
             Ok(true)
@@ -2358,7 +2359,15 @@ mod tests {
         // test repo would cause commit to fail if we hadn't set it, but we did —
         // so this test verifies the happy path too).
         // For this test, the commit should succeed since we set user.email/name.
-        let result = auto_commit(&dir, "1", "Test title", "test", 1).await;
+        let result = auto_commit(
+            &dir,
+            "1",
+            "Test title",
+            "test",
+            1,
+            super::super::commit::When::Always,
+        )
+        .await;
         assert!(result.unwrap());
 
         // Verify no changes remain
@@ -2405,7 +2414,15 @@ mod tests {
         std::fs::write(dir.join("signed_off.txt"), "content").unwrap();
         assert!(has_changes(&dir).await);
 
-        let result = auto_commit(&dir, "3", "Test title", "test", 1).await;
+        let result = auto_commit(
+            &dir,
+            "3",
+            "Test title",
+            "test",
+            1,
+            super::super::commit::When::Always,
+        )
+        .await;
         assert!(result.unwrap());
         assert!(!has_changes(&dir).await);
 
@@ -2470,7 +2487,15 @@ mod tests {
         assert!(has_changes(&dir).await);
 
         // auto_commit should return false (pre-commit hook blocks it)
-        let result = auto_commit(&dir, "2", "Test title", "test", 1).await;
+        let result = auto_commit(
+            &dir,
+            "2",
+            "Test title",
+            "test",
+            1,
+            super::super::commit::When::Always,
+        )
+        .await;
         assert!(!result.unwrap());
 
         // After commit failure, files should be unstaged — has_changes should

@@ -25,11 +25,19 @@ pub async fn run(done: &str, left: &str, state: &str) -> anyhow::Result<()> {
 
     let task_id = std::env::var("TASK_ID").unwrap_or_default();
     let agent = std::env::var("ORCH_AGENT").unwrap_or_else(|_| "agent".to_string());
-    let (cli_committed, cli_error) =
-        match git_ops::auto_commit(dir, &task_id, done, &agent, 0).await {
-            Ok(committed) => (committed, None),
-            Err(e) => (false, Some(format!("{e:#}"))),
-        };
+    let (cli_committed, cli_error) = match git_ops::auto_commit(
+        dir,
+        &task_id,
+        done,
+        &agent,
+        0,
+        crate::engine::runner::commit::When::Tested,
+    )
+    .await
+    {
+        Ok(committed) => (committed, None),
+        Err(e) => (false, Some(format!("{e:#}"))),
+    };
 
     let report = progress::Report {
         worktree,

@@ -27,6 +27,16 @@ impl Tool {
     }
 }
 
+/// Whether a commit may skip shipcheck's gate
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum When {
+    /// Only a tree shipcheck already passed, for steps during a session
+    Tested,
+    /// Commit anyway, for the end of a session, so the agent's work is never left uncommitted.
+    /// shipcheck's hooks run the checks when the branch is pushed
+    Always,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     Committed,
@@ -87,10 +97,15 @@ async fn shipcheck_commit(
 }
 
 /// Commit every change in `dir` with the tool the repository uses
-pub async fn commit_all(dir: &Path, message: &str, agent: &str) -> anyhow::Result<Outcome> {
+pub async fn commit_all(
+    dir: &Path,
+    message: &str,
+    agent: &str,
+    when: When,
+) -> anyhow::Result<Outcome> {
     let tool = Tool::detect(dir).await;
     let bin = which::which("shipcheck").unwrap_or_else(|_| "shipcheck".into());
-    commit_with(dir, tool, &bin, message, agent).await
+    commit_with(dir, tool, &bin, message, agent, when).await
 }
 
 async fn commit_with(
@@ -99,13 +114,22 @@ async fn commit_with(
     shipcheck: &Path,
     message: &str,
     agent: &str,
+    when: When,
 ) -> anyhow::Result<Outcome> {
     if !git_ops::has_changes(dir).await {
         return Ok(Outcome::Nothing);
     }
 
     if tool == Tool::Shipcheck {
-        return shipcheck_commit(dir, shipcheck, message, agent).await;
+        let outcome = shipcheck_commit(dir, shipcheck, message, agent).await?;
+        let Outcome::Refused { reason, .. } = &outcome else {
+            return Ok(outcome);
+        };
+        if when == When::Tested {
+            return Ok(outcome);
+        }
+
+        tracing::info!(reason = %reason, "committing untested work through git at the end of the session");
     }
 
     let add = Command::new("git")
@@ -215,16 +239,30 @@ mod tests {
         let dir = repo();
         let missing = Path::new("/nonexistent/shipcheck");
         std::fs::write(dir.path().join("a.txt"), "a").unwrap();
-        let out = commit_with(dir.path(), Tool::Git, missing, "step", "claude")
-            .await
-            .unwrap();
+        let out = commit_with(
+            dir.path(),
+            Tool::Git,
+            missing,
+            "step",
+            "claude",
+            When::Tested,
+        )
+        .await
+        .unwrap();
         assert_eq!(out, Outcome::Committed);
         assert!(
             git(dir.path(), &["log", "-1", "--format=%s%n%an"]).starts_with("step\nclaude[bot]")
         );
-        let out = commit_with(dir.path(), Tool::Git, missing, "again", "claude")
-            .await
-            .unwrap();
+        let out = commit_with(
+            dir.path(),
+            Tool::Git,
+            missing,
+            "again",
+            "claude",
+            When::Tested,
+        )
+        .await
+        .unwrap();
         assert_eq!(out, Outcome::Nothing);
     }
 
@@ -235,9 +273,16 @@ mod tests {
         let bin = fake_shipcheck(bins.path(), false);
         let head = git(dir.path(), &["rev-parse", "HEAD"]);
         std::fs::write(dir.path().join("untested.txt"), "x").unwrap();
-        let out = commit_with(dir.path(), Tool::Shipcheck, &bin, "step", "claude")
-            .await
-            .unwrap();
+        let out = commit_with(
+            dir.path(),
+            Tool::Shipcheck,
+            &bin,
+            "step",
+            "claude",
+            When::Tested,
+        )
+        .await
+        .unwrap();
         match out {
             Outcome::Refused { by, reason } => {
                 assert_eq!(by, Tool::Shipcheck);
@@ -258,13 +303,44 @@ mod tests {
         let bins = tempfile::tempdir().unwrap();
         let bin = fake_shipcheck(bins.path(), true);
         std::fs::write(dir.path().join("tested.txt"), "x").unwrap();
-        let out = commit_with(dir.path(), Tool::Shipcheck, &bin, "tested step", "claude")
-            .await
-            .unwrap();
+        let out = commit_with(
+            dir.path(),
+            Tool::Shipcheck,
+            &bin,
+            "tested step",
+            "claude",
+            When::Tested,
+        )
+        .await
+        .unwrap();
         assert_eq!(out, Outcome::Committed);
         assert_eq!(
             git(dir.path(), &["log", "-1", "--format=%s"]).trim(),
             "tested step"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_end_of_a_session_commits_untested_work_through_git() {
+        let dir = repo();
+        let bins = tempfile::tempdir().unwrap();
+        let bin = fake_shipcheck(bins.path(), false);
+        std::fs::write(dir.path().join("untested.txt"), "x").unwrap();
+        let out = commit_with(
+            dir.path(),
+            Tool::Shipcheck,
+            &bin,
+            "final",
+            "claude",
+            When::Always,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, Outcome::Committed);
+        assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+        assert_eq!(
+            git(dir.path(), &["log", "-1", "--format=%s"]).trim(),
+            "final"
         );
     }
 }

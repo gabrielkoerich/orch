@@ -319,7 +319,7 @@ async fn execute(plans: &[CommitPlan]) -> anyhow::Result<()> {
         .map(|p| p.message.as_str())
         .collect::<Vec<_>>()
         .join("\n\n");
-    match commit::commit_all(&dir, &message, "orch").await? {
+    match commit::commit_all(&dir, &message, "orch", commit::When::Tested).await? {
         commit::Outcome::Committed => {
             println!("committed through shipcheck");
             Ok(())

@@ -324,8 +324,15 @@ async fn auto_commit_changes(
     agent_name: &str,
     new_attempts: u32,
 ) {
-    if let Err(e) =
-        git_ops::auto_commit(work_dir, ctx.task_id, task_title, agent_name, new_attempts).await
+    if let Err(e) = git_ops::auto_commit(
+        work_dir,
+        ctx.task_id,
+        task_title,
+        agent_name,
+        new_attempts,
+        super::commit::When::Always,
+    )
+    .await
     {
         tracing::error!(task_id = ctx.task_id, error = ?e, "auto commit failed");
         ctx.set(&[(
