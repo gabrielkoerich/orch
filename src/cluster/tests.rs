@@ -726,3 +726,47 @@ async fn a_learner_joins_through_any_node_and_catches_up() {
         m.node.stop().await;
     }
 }
+
+#[tokio::test]
+async fn probe_never_sends_the_secret_and_rejects_a_peer_without_proof() {
+    use axum::http::HeaderMap;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let record = seen.clone();
+    let fake = axum::Router::new().route(
+        "/cluster/hello",
+        axum::routing::get(move |headers: HeaderMap| {
+            let record = record.clone();
+            async move {
+                let names = headers.keys().map(|k| k.to_string()).collect::<Vec<_>>();
+                let values = headers
+                    .values()
+                    .filter_map(|v| v.to_str().ok().map(str::to_string))
+                    .collect::<Vec<_>>();
+                record
+                    .lock()
+                    .unwrap()
+                    .extend(names.into_iter().chain(values));
+                axum::Json(network::Hello {
+                    name: "impostor".into(),
+                    id: 9,
+                    witness: false,
+                    leader: None,
+                    term: 0,
+                    proof: "00".into(),
+                })
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move { axum::serve(listener, fake).await.ok() });
+
+    assert!(network::probe(&addr, "s3cret").await.is_none());
+    let seen = seen.lock().unwrap();
+    assert!(!seen.is_empty(), "the fake peer was probed");
+    assert!(
+        !seen.iter().any(|v| v.contains("s3cret")),
+        "the secret reached the peer: {seen:?}"
+    );
+    assert!(!seen.iter().any(|v| v == "x-orch-cluster-secret"));
+}

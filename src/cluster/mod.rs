@@ -165,6 +165,7 @@ pub async fn start_node(
         witness: !cfg.elect,
         leader: None,
         term: 0,
+        proof: String::new(),
     };
     let app = network::router(raft.clone(), secret.clone(), me);
     let stop = Arc::new(tokio::sync::Notify::new());

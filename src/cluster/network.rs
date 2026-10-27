@@ -28,6 +28,8 @@ use subtle::ConstantTimeEq;
 use super::{NodeId, Raft, Reply, Request, TypeConfig};
 
 const SECRET_HEADER: &str = "x-orch-cluster-secret";
+const NONCE_HEADER: &str = "x-orch-nonce";
+const PROOF_HEADER: &str = "x-orch-proof";
 
 static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -53,6 +55,26 @@ pub struct Hello {
     pub leader: Option<NodeId>,
     #[serde(default)]
     pub term: u64,
+    /// HMAC of the prober's nonce and this name, so the prober knows the peer holds the secret
+    #[serde(default)]
+    pub proof: String,
+}
+
+/// HMAC-SHA256 under the cluster secret, in hex. Proves the secret without sending it
+fn mac(secret: &str, parts: &[&str]) -> String {
+    use hmac::{Hmac, Mac};
+    let mut m =
+        Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key");
+    for part in parts {
+        m.update(part.as_bytes());
+        m.update(b"\0");
+    }
+
+    m.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// A node asking the leader to add it as a learner
@@ -85,8 +107,22 @@ pub(crate) fn router(raft: Raft, secret: Arc<String>, me: Hello) -> Router {
         })
 }
 
+/// Answers only a prober that proves the secret, and proves it back, so neither side sends it
 async fn hello(State(a): State<App>, headers: HeaderMap) -> Response {
-    if !authorized(&a, &headers) {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let nonce = header(NONCE_HEADER);
+    let expected = mac(&a.secret, &["probe", &nonce]);
+    let proven: bool = header(PROOF_HEADER)
+        .as_bytes()
+        .ct_eq(expected.as_bytes())
+        .into();
+    if nonce.len() < 16 || !proven {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -94,6 +130,7 @@ async fn hello(State(a): State<App>, headers: HeaderMap) -> Response {
     Json(Hello {
         leader: m.current_leader,
         term: m.current_term,
+        proof: mac(&a.secret, &["hello", &nonce, &a.me.name]),
         ..(*a.me).clone()
     })
     .into_response()
@@ -137,16 +174,22 @@ pub async fn send_join(addr: &str, secret: &str, req: &Join) -> anyhow::Result<(
     Ok(())
 }
 
-/// Ask a host found on the tailnet who it is. Hosts without orch, or with another secret, answer nothing
+/// Ask a host found on the tailnet who it is. The secret never leaves this node, and a host that
+/// cannot prove it holds the secret answers nothing
 pub async fn probe(addr: &str, secret: &str) -> Option<Hello> {
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
     let res = CLIENT
         .get(format!("http://{addr}/cluster/hello"))
-        .header(SECRET_HEADER, secret)
+        .header(NONCE_HEADER, &nonce)
+        .header(PROOF_HEADER, mac(secret, &["probe", &nonce]))
         .timeout(Duration::from_secs(1))
         .send()
         .await
         .ok()?;
-    res.error_for_status().ok()?.json().await.ok()
+    let hello: Hello = res.error_for_status().ok()?.json().await.ok()?;
+    let expected = mac(secret, &["hello", &nonce, &hello.name]);
+    let proven: bool = hello.proof.as_bytes().ct_eq(expected.as_bytes()).into();
+    proven.then_some(hello)
 }
 
 async fn append(
