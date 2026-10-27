@@ -28,14 +28,14 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePo
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-mod control;
+pub(crate) mod control;
 mod dependencies;
 mod helpers;
 mod jobs;
 pub(crate) mod kv;
 mod metrics;
 mod pricing;
-mod tasks;
+pub(crate) mod tasks;
 
 #[allow(unused_imports)]
 pub use control::{parse_since_duration, ChatCostSummary, ControlMessage, MemoryEntry};
@@ -183,6 +183,20 @@ impl TaskStore {
         };
         let reply = raft.client_write(req).await?.data;
         reply_result(reply)
+    }
+
+    pub(crate) async fn write_int(&self, cmd: crate::cluster::Command) -> anyhow::Result<i64> {
+        match self.write(cmd).await? {
+            crate::cluster::Reply::Int(n) => Ok(n),
+            other => anyhow::bail!("expected an integer reply, got {other:?}"),
+        }
+    }
+
+    pub(crate) async fn write_bool(&self, cmd: crate::cluster::Command) -> anyhow::Result<bool> {
+        match self.write(cmd).await? {
+            crate::cluster::Reply::Bool(b) => Ok(b),
+            other => anyhow::bail!("expected a boolean reply, got {other:?}"),
+        }
     }
 
     /// The same SQL apply runs, in one transaction on this node only

@@ -17,7 +17,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::{Acquire, SqliteConnection};
 
 use super::{NodeId, Reply, TypeConfig};
-use crate::store::{kv, TaskStore};
+use crate::store::{kv, tasks, TaskStore};
 
 type Err = StorageError<NodeId>;
 
@@ -37,6 +37,7 @@ fn io_any(e: anyhow::Error) -> Err {
 struct SnapshotData {
     last_applied: Option<LogId<NodeId>>,
     membership: StoredMembership<NodeId, BasicNode>,
+    tasks: Vec<serde_json::Value>,
     kv: Vec<kv::Row>,
 }
 
@@ -147,6 +148,9 @@ impl RaftSnapshotBuilder<TypeConfig> for RaftStore {
         let snap = SnapshotData {
             last_applied: self.state_get(APPLIED_KEY).await?,
             membership: self.state_get(MEMBERSHIP_KEY).await?.unwrap_or_default(),
+            tasks: tasks::replicated_rows(self.store.pool())
+                .await
+                .map_err(io_any)?,
             kv: kv::replicated_rows(self.store.pool())
                 .await
                 .map_err(io_any)?,
@@ -330,6 +334,9 @@ impl RaftStorage<TypeConfig> for RaftStore {
         let data = snapshot.into_inner();
         let snap: SnapshotData = serde_json::from_slice(&data).map_err(io)?;
         let mut tx = self.store.pool().begin().await.map_err(io)?;
+        tasks::replace_replicated(&mut tx, &snap.tasks)
+            .await
+            .map_err(io_any)?;
         kv::replace_replicated(&mut tx, &snap.kv)
             .await
             .map_err(io_any)?;
