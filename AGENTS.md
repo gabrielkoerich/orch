@@ -52,6 +52,10 @@ Filing an issue triggered by something you observed in a downstream project is *
 
 Cautionary tale — issue #3339 named a specific downstream project throughout the body and SQL output while describing behavior that was actually working as intended per the settled architecture (per-task block at merge time on GitHub Actions billing failure). It was deleted.
 
+## Commit only the change
+
+Never commit a report, notes or summary file about your own work: no `REVIEW.md`, `CHANGES.md`, `NOTES.md`, `SUMMARY.md` or the like, at the root or anywhere else. The summary of a change goes in the PR body, and lasting decisions go in `docs/`. Two such files sat at the repository root for months after the tasks that wrote them were done. Before committing, check `git status` for files you created only to describe your work, and delete them.
+
 ## Manual issue closure cleanup
 
 **IMPORTANT:** When you manually close a GitHub issue, agents may still be working on it — tmux sessions and worktrees must be cleaned up or they'll interfere with future work.
