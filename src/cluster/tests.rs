@@ -514,6 +514,7 @@ async fn start_member(
         &store,
         &dir.join("raft.db"),
         NodeConfig {
+            name: format!("node{id}"),
             id,
             addr: voters[&id].clone(),
             secret: secret.into(),
@@ -658,6 +659,69 @@ async fn a_node_with_the_wrong_secret_gets_nothing() {
     wait_for_task(&members[&other].store, id).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(members[&3].store.get(id).await.is_err());
+    for (_, m) in members {
+        m.node.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_learner_joins_through_any_node_and_catches_up() {
+    let dirs: Vec<_> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+    let voters = voters(3);
+    let mut members = BTreeMap::new();
+    for id in 1..=3 {
+        let m = start_member(dirs[id as usize - 1].path(), id, &voters, "s3cret", true).await;
+        members.insert(id, m);
+    }
+
+    let leader = leader_of(&members).await;
+    let before = members[&leader]
+        .store
+        .create(&new_task("before", ""))
+        .await
+        .unwrap();
+
+    let addr = free_addr();
+    let mut all = voters.clone();
+    all.insert(4, addr.clone());
+    let learner_store = open(dirs[3].path()).await;
+    let learner = start_node(
+        &learner_store,
+        &dirs[3].path().join("raft.db"),
+        NodeConfig {
+            name: "m4".into(),
+            id: 4,
+            addr: addr.clone(),
+            secret: "s3cret".into(),
+            voters: BTreeMap::new(),
+            elect: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    let follower = *members.keys().find(|id| **id != leader).unwrap();
+    let hello = network::probe(&voters[&follower], "s3cret").await.unwrap();
+    assert_eq!(
+        (hello.name.as_str(), hello.leader),
+        (format!("node{follower}").as_str(), Some(leader))
+    );
+    assert!(network::probe(&voters[&follower], "wrong").await.is_none());
+
+    network::send_join(&voters[&follower], "s3cret", &network::Join { id: 4, addr })
+        .await
+        .unwrap();
+    assert_eq!(wait_for_task(&learner_store, before).await.title, "before");
+    let after = learner_store
+        .create(&new_task("from learner", ""))
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_for_task(&members[&leader].store, after).await.title,
+        "from learner"
+    );
+
+    learner.stop().await;
     for (_, m) in members {
         m.node.stop().await;
     }

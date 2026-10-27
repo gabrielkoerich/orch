@@ -2,8 +2,9 @@
 //! `docs/specs/2026-10-26-multi-machine-cluster-design.md`.
 
 mod command;
+pub mod discovery;
 pub mod local;
-mod network;
+pub mod network;
 mod storage;
 
 use std::collections::BTreeMap;
@@ -106,6 +107,7 @@ impl Node {
 /// How one node of a cluster starts: its id, the address it listens on, the shared secret, the
 /// voters to initialize with, and whether it may lead (a witness may not)
 pub struct NodeConfig {
+    pub name: String,
     pub id: NodeId,
     pub addr: String,
     pub secret: String,
@@ -157,7 +159,14 @@ pub async fn start_node(
     };
     let raft = Raft::new(cfg.id, Arc::new(config), network, log, sm).await?;
     let listener = tokio::net::TcpListener::bind(&cfg.addr).await?;
-    let app = network::router(raft.clone(), secret.clone());
+    let me = network::Hello {
+        name: cfg.name,
+        id: cfg.id,
+        witness: !cfg.elect,
+        leader: None,
+        term: 0,
+    };
+    let app = network::router(raft.clone(), secret.clone(), me);
     let stop = Arc::new(tokio::sync::Notify::new());
     let stopped = stop.clone();
     tokio::spawn(async move {

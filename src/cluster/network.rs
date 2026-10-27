@@ -10,7 +10,7 @@ use std::time::Duration;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use openraft::error::{
     InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Unreachable,
@@ -40,6 +40,26 @@ static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 struct App {
     raft: Raft,
     secret: Arc<String>,
+    me: Arc<Hello>,
+}
+
+/// What a node says about itself to a peer that found it on the tailnet
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+pub struct Hello {
+    pub name: String,
+    pub id: NodeId,
+    pub witness: bool,
+    #[serde(default)]
+    pub leader: Option<NodeId>,
+    #[serde(default)]
+    pub term: u64,
+}
+
+/// A node asking the leader to add it as a learner
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct Join {
+    pub id: NodeId,
+    pub addr: String,
 }
 
 fn authorized(app: &App, headers: &HeaderMap) -> bool {
@@ -50,13 +70,83 @@ fn authorized(app: &App, headers: &HeaderMap) -> bool {
     given.ct_eq(app.secret.as_bytes()).into()
 }
 
-pub(crate) fn router(raft: Raft, secret: Arc<String>) -> Router {
+pub(crate) fn router(raft: Raft, secret: Arc<String>, me: Hello) -> Router {
     Router::new()
         .route("/raft/append", post(append))
         .route("/raft/snapshot", post(snapshot))
         .route("/raft/vote", post(vote))
         .route("/cluster/write", post(write))
-        .with_state(App { raft, secret })
+        .route("/cluster/hello", get(hello))
+        .route("/cluster/join", post(join))
+        .with_state(App {
+            raft,
+            secret,
+            me: Arc::new(me),
+        })
+}
+
+async fn hello(State(a): State<App>, headers: HeaderMap) -> Response {
+    if !authorized(&a, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let m = a.raft.metrics().borrow().clone();
+    Json(Hello {
+        leader: m.current_leader,
+        term: m.current_term,
+        ..(*a.me).clone()
+    })
+    .into_response()
+}
+
+/// Adds the caller as a learner on the leader, or sends it on to the leader
+async fn join(State(a): State<App>, headers: HeaderMap, Json(req): Json<Join>) -> Response {
+    if !authorized(&a, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let node = BasicNode::new(&req.addr);
+    match a.raft.add_learner(req.id, node, false).await {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(RaftError::APIError(openraft::error::ClientWriteError::ForwardToLeader(f))) => {
+            match f.leader_node {
+                Some(leader) => match send_join(&leader.addr, &a.secret, &req).await {
+                    Ok(()) => StatusCode::OK.into_response(),
+                    Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+                },
+                None => (StatusCode::SERVICE_UNAVAILABLE, "no leader yet").into_response(),
+            }
+        }
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+    }
+}
+
+pub async fn send_join(addr: &str, secret: &str, req: &Join) -> anyhow::Result<()> {
+    let res = CLIENT
+        .post(format!("http://{addr}/cluster/join"))
+        .header(SECRET_HEADER, secret)
+        .json(req)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        res.status().is_success(),
+        "join refused by {addr} ({}): {}",
+        res.status(),
+        res.text().await?
+    );
+    Ok(())
+}
+
+/// Ask a host found on the tailnet who it is. Hosts without orch, or with another secret, answer nothing
+pub async fn probe(addr: &str, secret: &str) -> Option<Hello> {
+    let res = CLIENT
+        .get(format!("http://{addr}/cluster/hello"))
+        .header(SECRET_HEADER, secret)
+        .timeout(Duration::from_secs(1))
+        .send()
+        .await
+        .ok()?;
+    res.error_for_status().ok()?.json().await.ok()
 }
 
 async fn append(
