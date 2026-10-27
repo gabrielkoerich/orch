@@ -669,6 +669,7 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
     let store = Arc::new(TaskStore::open(&crate::store::default_db_path().await?).await?);
     // One node when alone, the same log a cluster replicates
     crate::cluster::start_single(&store, &crate::home::orch_home()?.join("raft.db")).await?;
+    crate::cluster::local::serve((*store).clone()).await?;
 
     // Load persisted model cooldowns and register store for future writes.
     // Runs once here so the global cooldown store is not overwritten per project.
@@ -2931,6 +2932,7 @@ pub async fn serve() -> anyhow::Result<()> {
 
     // Clean up event bus port file and service version file
     events::cleanup_port_file().await;
+    crate::cluster::local::cleanup().await;
     events::cleanup_version_file();
 
     // transport and channels drop here at end of scope

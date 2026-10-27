@@ -2,6 +2,7 @@
 //! `docs/specs/2026-10-26-multi-machine-cluster-design.md`.
 
 mod command;
+pub mod local;
 mod storage;
 
 use std::collections::BTreeMap;

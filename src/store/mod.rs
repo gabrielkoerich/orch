@@ -80,6 +80,8 @@ pub struct TaskStore {
     pool: SqlitePool,
     /// Set once on the daemon. Without it, replicated writes apply directly, as in tests and the CLI
     raft: Arc<OnceLock<crate::cluster::Raft>>,
+    /// Set on the CLI when a daemon runs, so its writes go through the daemon's log
+    daemon: Arc<OnceLock<String>>,
 }
 
 impl TaskStore {
@@ -103,6 +105,7 @@ impl TaskStore {
         let store = Self {
             pool,
             raft: Arc::default(),
+            daemon: Arc::default(),
         };
         store.migrate().await?;
         Ok(store)
@@ -131,6 +134,7 @@ impl TaskStore {
         let store = Self {
             pool,
             raft: Arc::default(),
+            daemon: Arc::default(),
         };
         store.migrate().await?;
         Ok(store)
@@ -150,6 +154,7 @@ impl TaskStore {
         let store = Self {
             pool,
             raft: Arc::default(),
+            daemon: Arc::default(),
         };
         store.migrate().await?;
         Ok(store)
@@ -170,12 +175,27 @@ impl TaskStore {
         }
     }
 
+    pub fn attach_daemon(&self, url: String) {
+        let _ = self.daemon.set(url);
+    }
+
     /// Propose a replicated write through Raft, or apply it directly when no Raft is attached
     pub(crate) async fn write(
         &self,
         cmd: crate::cluster::Command,
     ) -> anyhow::Result<crate::cluster::Reply> {
         let Some(raft) = self.raft.get() else {
+            if let Some(url) = self.daemon.get() {
+                match crate::cluster::local::send(url, &cmd).await {
+                    Ok(reply) => return reply_result(reply),
+                    // Nothing was sent, so applying here cannot apply the command twice
+                    Err(e) if e.is_connect() => {
+                        tracing::debug!(err = %e, "daemon not listening, writing directly");
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+
             return self.apply_direct(cmd).await;
         };
         let req = crate::cluster::Request {

@@ -391,3 +391,49 @@ async fn dependency_job_and_channel_writes_go_through_the_log_and_the_snapshot()
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test]
+async fn cli_writes_go_through_the_daemon_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = open(dir.path()).await;
+    let raft = start_single(&daemon, &dir.path().join("raft.db"))
+        .await
+        .unwrap();
+    let port = local::serve(daemon.clone()).await.unwrap();
+
+    let cli = open(dir.path()).await;
+    cli.attach_daemon(format!("http://127.0.0.1:{port}/write"));
+    let before = log_len(dir.path()).await;
+    cli.kv_set("cooldown:claude", "9").await.unwrap();
+    let id = cli.create(&new_task("from cli", "")).await.unwrap();
+    assert_eq!(log_len(dir.path()).await, before + 2);
+    assert_eq!(
+        daemon.kv_get("cooldown:claude").await.unwrap().as_deref(),
+        Some("9")
+    );
+    assert_eq!(daemon.get(id).await.unwrap().title, "from cli");
+
+    let err = cli
+        .set_fields(id, &[("no_such_column", serde_json::json!(1))])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("allowlist"), "{err:#}");
+    raft.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cli_writes_directly_when_no_daemon_listens() {
+    let dir = tempfile::tempdir().unwrap();
+    let cli = open(dir.path()).await;
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    cli.attach_daemon(format!("http://127.0.0.1:{port}/write"));
+    cli.kv_set("cooldown:claude", "1").await.unwrap();
+    assert_eq!(
+        cli.kv_get("cooldown:claude").await.unwrap().as_deref(),
+        Some("1")
+    );
+}
