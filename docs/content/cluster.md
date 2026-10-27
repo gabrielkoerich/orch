@@ -143,7 +143,8 @@ A witness shows as a voter. `orch nodes` prints the members of the cluster as th
 ## Security
 
 - Every request between machines carries the secret, and the listener binds only to the Tailscale address.
-- When a machine looks for members, it proves it knows the secret with an HMAC and checks the same proof in the answer, so it never sends the secret to a machine that has not proven it.
+- When a machine looks for members, it proves it knows the secret with an HMAC and checks the same proof in the answer, so it never sends the secret to a machine that has not proven it. Both proofs cover the address dialed, and the answer must carry the name Tailscale gives that address, so a host that relays a real member's answer is rejected.
+- Only machines of your own tailnet count. A device shared in from another tailnet is ignored, and a voter name that two machines share stops startup with an error.
 - The CLI reaches its local service on `127.0.0.1` with a token from `~/.orch/state/cluster.port`, a file only your user can read.
 
 ## Files
