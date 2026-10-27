@@ -210,7 +210,7 @@ Membership:
 - Voters are fixed by name in config, the same list on every voter: `cluster.voters`. When a voter has found an address for every name, it calls `initialize` with that membership. openraft accepts the same `initialize` from every voter, so no voter is special. Rejected: voters found by discovery, where two voters that start apart can each initialize a cluster of their own.
 - Every other node with the secret is a learner. It sends `POST /cluster/join` to any peer, the peer forwards it to the leader, and the leader calls `add_learner`. An offline learner stays in the membership.
 - A node with `cluster.witness: true` runs with `enable_elect: false` and runs no agents. It does not call `initialize`, because openraft's `initialize` starts an election whatever `enable_elect` says. It learns the membership from the leader.
-- With no `cluster` section, orch runs a one-node cluster with no listener and no call to `tailscale`. It behaves like orch today.
+- With no `cluster` section, orch starts no Raft, no listener and no local write endpoint, and calls no `tailscale`. Writes run the same SQL straight against SQLite, and agents get no `orch progress` step. Orch behaves exactly as before. Rejected: a one-node Raft by default, which adds a log write per change and an election at startup for no gain on one machine.
 
 ```yaml
 cluster:
@@ -232,6 +232,16 @@ cluster:
 Any one of the three voters can fail and the cluster keeps deciding. m1 and legion trade the leader between them. While m4 sleeps, the leader keeps ingesting and routing. Tasks for projects only m4 hosts wait for it, and tasks for projects also on m1 or legion run there. Projects that need failover also need a checkout on m1 or legion.
 
 Rejected: m4 as the third voter. When m4 sleeps and m1 or legion fails, no majority is left. A fourth voter adds no fault tolerance.
+
+## Rollout
+
+Today only m4 has orch, the agents and the projects, so it keeps running with no `cluster` section. Setup, in order:
+
+1. Install orch on m1 and legion, with the agent CLIs, the GitHub token, and checkouts of the projects that need failover.
+2. Install orch on vpsbr. As the witness it needs no token, agents or checkouts.
+3. Allow `cluster.port` between the four machines in the tailnet ACL.
+4. Add the same `cluster` section to all four configs: the secret and `voters: [m1-max, legion, vpsbr-16153223]`, with `witness: true` on vpsbr only.
+5. Restart m1, legion and vpsbr first, so the voters form the cluster, then m4, which joins as a learner.
 
 ## Single-instance guards
 
