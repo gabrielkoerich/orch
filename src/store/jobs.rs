@@ -1,5 +1,7 @@
 use super::*;
+use crate::cluster::Command;
 use serde::{Deserialize, Serialize};
+use sqlx::SqliteConnection;
 
 /// Explicit column list for `SELECT` queries on the `job_state` table.
 ///
@@ -10,7 +12,7 @@ use serde::{Deserialize, Serialize};
 const JOB_STATE_COLS: &str = "repo, job_id, last_run, last_task_status, active_task_id";
 
 /// Runtime state for a scheduled job, stored in SQLite (not in .orch.yml).
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct JobState {
     pub repo: String,
     pub job_id: String,
@@ -39,22 +41,9 @@ impl TaskStore {
 
     /// Upsert runtime state for a job.
     pub async fn upsert_job_state(&self, state: &JobState) -> anyhow::Result<()> {
-        sqlx::query(
-            "INSERT INTO job_state (repo, job_id, last_run, last_task_status, active_task_id)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(repo, job_id) DO UPDATE SET
-           last_run = excluded.last_run,
-           last_task_status = excluded.last_task_status,
-           active_task_id = excluded.active_task_id",
-        )
-        .bind(&state.repo)
-        .bind(&state.job_id)
-        .bind(&state.last_run)
-        .bind(&state.last_task_status)
-        .bind(&state.active_task_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.write(Command::JobStateUpsert(state.clone()))
+            .await
+            .map(|_| ())
     }
 
     /// List all job states for a repo.
@@ -79,17 +68,13 @@ impl TaskStore {
         repo: &str,
         topic_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        let topic = topic_id.unwrap_or("");
-        sqlx::query(
-        "INSERT OR IGNORE INTO channel_subscriptions (channel, thread_id, repo, topic_id) VALUES (?, ?, ?, ?)",
-    )
-        .bind(channel)
-        .bind(thread_id)
-        .bind(repo)
-        .bind(topic)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        let cmd = Command::ChannelSubscribe {
+            channel: channel.to_string(),
+            thread_id: thread_id.to_string(),
+            repo: repo.to_string(),
+            topic_id: topic_id.unwrap_or("").to_string(),
+        };
+        self.write(cmd).await.map(|_| ())
     }
 
     /// Unsubscribe a channel/thread from a project's notifications.
@@ -99,15 +84,12 @@ impl TaskStore {
         thread_id: &str,
         repo: &str,
     ) -> anyhow::Result<()> {
-        sqlx::query(
-            "DELETE FROM channel_subscriptions WHERE channel = ? AND thread_id = ? AND repo = ?",
-        )
-        .bind(channel)
-        .bind(thread_id)
-        .bind(repo)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        let cmd = Command::ChannelUnsubscribe {
+            channel: channel.to_string(),
+            thread_id: thread_id.to_string(),
+            repo: repo.to_string(),
+        };
+        self.write(cmd).await.map(|_| ())
     }
 
     /// List repos that a channel/thread is subscribed to.
@@ -139,5 +121,68 @@ impl TaskStore {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+}
+
+/// The SQL behind each replicated job and channel write
+pub(crate) mod apply {
+    use super::*;
+
+    pub(crate) async fn upsert_job_state(
+        conn: &mut SqliteConnection,
+        state: &JobState,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO job_state (repo, job_id, last_run, last_task_status, active_task_id)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(repo, job_id) DO UPDATE SET
+               last_run = excluded.last_run,
+               last_task_status = excluded.last_task_status,
+               active_task_id = excluded.active_task_id",
+        )
+        .bind(&state.repo)
+        .bind(&state.job_id)
+        .bind(&state.last_run)
+        .bind(&state.last_task_status)
+        .bind(&state.active_task_id)
+        .execute(conn)
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn subscribe(
+        conn: &mut SqliteConnection,
+        channel: &str,
+        thread_id: &str,
+        repo: &str,
+        topic_id: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO channel_subscriptions (channel, thread_id, repo, topic_id) VALUES (?, ?, ?, ?)",
+        )
+        .bind(channel)
+        .bind(thread_id)
+        .bind(repo)
+        .bind(topic_id)
+        .execute(conn)
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn unsubscribe(
+        conn: &mut SqliteConnection,
+        channel: &str,
+        thread_id: &str,
+        repo: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "DELETE FROM channel_subscriptions WHERE channel = ? AND thread_id = ? AND repo = ?",
+        )
+        .bind(channel)
+        .bind(thread_id)
+        .bind(repo)
+        .execute(conn)
+        .await?;
+        Ok(())
     }
 }

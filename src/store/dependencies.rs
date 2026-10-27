@@ -12,6 +12,7 @@
 //! import removes it
 
 use super::{TaskStatus, TaskStore};
+use crate::cluster::Command;
 use anyhow::Context;
 use sqlx::Row;
 use sqlx::SqliteConnection;
@@ -26,7 +27,7 @@ pub struct WaitingOnDependency {
     pub blockers: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DepSource {
     Github,
     Body,
@@ -52,7 +53,7 @@ impl DepSource {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct NewDependency {
     pub repo: String,
     pub number: i64,
@@ -241,34 +242,11 @@ impl TaskStore {
     ///
     /// Refuses when the new slug already has tasks. Returns the number of moved tasks
     pub async fn move_repo(&self, old: &str, new: &str) -> anyhow::Result<u64> {
-        let mut tx = self.pool.begin().await.context("begin repo move")?;
-        let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE repo = ?")
-            .bind(new)
-            .fetch_one(&mut *tx)
-            .await?;
-        if existing > 0 {
-            anyhow::bail!("{new} already has {existing} task(s), refusing to move {old} onto it");
-        }
-        let moved = sqlx::query("UPDATE tasks SET repo = ? WHERE repo = ?")
-            .bind(new)
-            .bind(old)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        for sql in [
-            "UPDATE task_dependencies SET depends_on_repo = ? WHERE depends_on_repo = ?",
-            "UPDATE task_metrics SET repo = ? WHERE repo = ?",
-            "UPDATE job_state SET repo = ? WHERE repo = ?",
-            "UPDATE channel_subscriptions SET repo = ? WHERE repo = ?",
-        ] {
-            sqlx::query(sql)
-                .bind(new)
-                .bind(old)
-                .execute(&mut *tx)
-                .await?;
-        }
-        tx.commit().await?;
-        Ok(moved)
+        let cmd = Command::MoveRepo {
+            old: old.to_string(),
+            new: new.to_string(),
+        };
+        Ok(u64::try_from(self.write_int(cmd).await?)?)
     }
 
     /// Replace one task's dependency rows in a single transaction.
@@ -277,46 +255,11 @@ impl TaskStore {
         task_id: i64,
         rows: &[NewDependency],
     ) -> anyhow::Result<()> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .context("begin dependency replace")?;
-        sqlx::query("DELETE FROM task_dependencies WHERE task_id = ?")
-            .bind(task_id)
-            .execute(&mut *tx)
-            .await?;
-        for row in rows {
-            if row.number <= 0 || row.repo.is_empty() {
-                continue;
-            }
-            sqlx::query(
-                "INSERT INTO task_dependencies
-                 (task_id, depends_on_repo, depends_on_number, source)
-                 VALUES (?, ?, ?, ?)",
-            )
-            .bind(task_id)
-            .bind(&row.repo)
-            .bind(row.number)
-            .bind(row.source.as_str())
-            .execute(&mut *tx)
-            .await?;
-        }
-        sqlx::query(
-            "UPDATE task_dependencies
-             SET depends_on_task_id = (
-                 SELECT id FROM tasks
-                 WHERE tasks.repo = task_dependencies.depends_on_repo
-                   AND tasks.external_id = CAST(task_dependencies.depends_on_number AS TEXT)
-                 LIMIT 1
-             )
-             WHERE task_id = ?",
-        )
-        .bind(task_id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
+        let cmd = Command::DepReplace {
+            task_id,
+            rows: rows.to_vec(),
+        };
+        self.write(cmd).await.map(|_| ())
     }
 
     /// Point dependency rows at a task orch now knows.
@@ -326,17 +269,12 @@ impl TaskStore {
         repo: &str,
         number: i64,
     ) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE task_dependencies
-             SET depends_on_task_id = ?
-             WHERE depends_on_repo = ? AND depends_on_number = ?",
-        )
-        .bind(task_id)
-        .bind(repo)
-        .bind(number)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        let cmd = Command::DepLinkKnown {
+            task_id,
+            repo: repo.to_string(),
+            number,
+        };
+        self.write(cmd).await.map(|_| ())
     }
 
     pub async fn list_dependencies(&self, task_id: i64) -> anyhow::Result<Vec<TaskDependency>> {
@@ -537,103 +475,10 @@ impl TaskStore {
         &self,
         task_id: i64,
     ) -> anyhow::Result<Option<Vec<String>>> {
-        let mut tx = self.pool.begin().await.context("begin dependency claim")?;
-        // sqlx 0.8.1 starts a deferred transaction. This write takes the reserved
-        // lock before the read, so a second claim waits and then sees this one
-        sqlx::query("UPDATE tasks SET updated_at = updated_at WHERE id = ?")
-            .bind(task_id)
-            .execute(&mut *tx)
-            .await
-            .context("lock task for dependency claim")?;
-        let row = sqlx::query("SELECT status, agent, model, repo, body FROM tasks WHERE id = ?")
-            .bind(task_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-        let Some(row) = row else {
-            tx.commit().await?;
-            return Ok(None);
-        };
-        let status: String = row.try_get("status")?;
-        let agent: Option<String> = row.try_get("agent")?;
-        let model: Option<String> = row.try_get("model")?;
-        let repo: String = row.try_get("repo")?;
-        let body: String = row.try_get("body").unwrap_or_default();
-        let views = load_blockers(&mut tx, task_id, &repo).await?;
-        let mut unmet: Vec<String> = views
-            .iter()
-            .filter(|view| !view.satisfied)
-            .map(|view| view.label.clone())
-            .collect();
-        for id in blocked_external_from_body(&body) {
-            if !unmet.iter().any(|have| have == &id) {
-                unmet.push(id);
-            }
+        match self.write(Command::DepBlockClaim { task_id }).await? {
+            crate::cluster::Reply::Unmet(unmet) => Ok(unmet),
+            other => anyhow::bail!("block_claim_if_waiting got {other:?}"),
         }
-
-        let holdable = matches!(
-            status.as_str(),
-            "new" | "routed" | "waiting" | "blocked" | "needs_review"
-        );
-        if unmet.is_empty() {
-            if status == "waiting" {
-                sqlx::query(
-                    "UPDATE tasks
-                     SET status = 'new', block_reason = NULL, branch = '', worktree = '',
-                         updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-                     WHERE id = ?",
-                )
-                .bind(task_id)
-                .execute(&mut *tx)
-                .await?;
-                sqlx::query(
-                    "INSERT INTO kv (key, value, updated_at)
-                     VALUES (?, '1', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-                     ON CONFLICT(key) DO UPDATE
-                       SET value = excluded.value, updated_at = excluded.updated_at",
-                )
-                .bind(worktree_refresh_key(task_id))
-                .execute(&mut *tx)
-                .await?;
-                Self::append_activity_tx(
-                    &mut tx,
-                    task_id,
-                    "status_change",
-                    Some("waiting"),
-                    Some("new"),
-                    agent.as_deref(),
-                    model.as_deref(),
-                    None,
-                )
-                .await?;
-            }
-            tx.commit().await?;
-            return Ok(None);
-        }
-
-        if holdable && status != "waiting" {
-            sqlx::query(
-                "UPDATE tasks
-                 SET status = 'waiting', branch = '', worktree = '', block_reason = NULL,
-                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-                 WHERE id = ?",
-            )
-            .bind(task_id)
-            .execute(&mut *tx)
-            .await?;
-            Self::append_activity_tx(
-                &mut tx,
-                task_id,
-                "status_change",
-                Some(&status),
-                Some("waiting"),
-                agent.as_deref(),
-                model.as_deref(),
-                None,
-            )
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(Some(unmet))
     }
 
     /// Where `unblock` should leave a task. Waiting when any dependency is still open
@@ -1167,5 +1012,206 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+    }
+}
+
+/// The SQL behind each replicated dependency write
+pub(crate) mod apply {
+    use super::*;
+
+    pub(crate) async fn move_repo(
+        conn: &mut SqliteConnection,
+        old: &str,
+        new: &str,
+    ) -> anyhow::Result<u64> {
+        let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE repo = ?")
+            .bind(new)
+            .fetch_one(&mut *conn)
+            .await?;
+        if existing > 0 {
+            anyhow::bail!("{new} already has {existing} task(s), refusing to move {old} onto it");
+        }
+        let moved = sqlx::query("UPDATE tasks SET repo = ? WHERE repo = ?")
+            .bind(new)
+            .bind(old)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
+        for sql in [
+            "UPDATE task_dependencies SET depends_on_repo = ? WHERE depends_on_repo = ?",
+            "UPDATE task_metrics SET repo = ? WHERE repo = ?",
+            "UPDATE job_state SET repo = ? WHERE repo = ?",
+            "UPDATE channel_subscriptions SET repo = ? WHERE repo = ?",
+        ] {
+            sqlx::query(sql)
+                .bind(new)
+                .bind(old)
+                .execute(&mut *conn)
+                .await?;
+        }
+        Ok(moved)
+    }
+
+    pub(crate) async fn replace_dependencies(
+        conn: &mut SqliteConnection,
+        task_id: i64,
+        rows: &[NewDependency],
+    ) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM task_dependencies WHERE task_id = ?")
+            .bind(task_id)
+            .execute(&mut *conn)
+            .await?;
+        for row in rows {
+            if row.number <= 0 || row.repo.is_empty() {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO task_dependencies
+                 (task_id, depends_on_repo, depends_on_number, source)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(task_id)
+            .bind(&row.repo)
+            .bind(row.number)
+            .bind(row.source.as_str())
+            .execute(&mut *conn)
+            .await?;
+        }
+        sqlx::query(
+            "UPDATE task_dependencies
+             SET depends_on_task_id = (
+                 SELECT id FROM tasks
+                 WHERE tasks.repo = task_dependencies.depends_on_repo
+                   AND tasks.external_id = CAST(task_dependencies.depends_on_number AS TEXT)
+                 LIMIT 1
+             )
+             WHERE task_id = ?",
+        )
+        .bind(task_id)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn link_known_task(
+        conn: &mut SqliteConnection,
+        task_id: i64,
+        repo: &str,
+        number: i64,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE task_dependencies
+             SET depends_on_task_id = ?
+             WHERE depends_on_repo = ? AND depends_on_number = ?",
+        )
+        .bind(task_id)
+        .bind(repo)
+        .bind(number)
+        .execute(conn)
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn block_claim(
+        conn: &mut SqliteConnection,
+        now: &str,
+        task_id: i64,
+    ) -> anyhow::Result<Option<Vec<String>>> {
+        // sqlx 0.8.1 starts a deferred transaction. This write takes the reserved
+        // lock before the read, so a second claim waits and then sees this one
+        sqlx::query("UPDATE tasks SET updated_at = updated_at WHERE id = ?")
+            .bind(task_id)
+            .execute(&mut *conn)
+            .await
+            .context("lock task for dependency claim")?;
+        let row = sqlx::query("SELECT status, agent, model, repo, body FROM tasks WHERE id = ?")
+            .bind(task_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let status: String = row.try_get("status")?;
+        let agent: Option<String> = row.try_get("agent")?;
+        let model: Option<String> = row.try_get("model")?;
+        let repo: String = row.try_get("repo")?;
+        let body: String = row.try_get("body").unwrap_or_default();
+        let views = load_blockers(conn, task_id, &repo).await?;
+        let mut unmet: Vec<String> = views
+            .iter()
+            .filter(|view| !view.satisfied)
+            .map(|view| view.label.clone())
+            .collect();
+        for id in blocked_external_from_body(&body) {
+            if !unmet.iter().any(|have| have == &id) {
+                unmet.push(id);
+            }
+        }
+
+        let holdable = matches!(
+            status.as_str(),
+            "new" | "routed" | "waiting" | "blocked" | "needs_review"
+        );
+        if unmet.is_empty() {
+            if status == "waiting" {
+                sqlx::query(
+                    "UPDATE tasks
+                     SET status = 'new', block_reason = NULL, branch = '', worktree = '',
+                         updated_at = ?
+                     WHERE id = ?",
+                )
+                .bind(now)
+                .bind(task_id)
+                .execute(&mut *conn)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO kv (key, value, updated_at)
+                     VALUES (?, '1', ?)
+                     ON CONFLICT(key) DO UPDATE
+                       SET value = excluded.value, updated_at = excluded.updated_at",
+                )
+                .bind(worktree_refresh_key(task_id))
+                .bind(now)
+                .execute(&mut *conn)
+                .await?;
+                crate::store::tasks::apply::activity(
+                    conn,
+                    task_id,
+                    "status_change",
+                    Some("waiting"),
+                    Some("new"),
+                    agent.as_deref(),
+                    model.as_deref(),
+                    None,
+                )
+                .await?;
+            }
+            return Ok(None);
+        }
+
+        if holdable && status != "waiting" {
+            sqlx::query(
+                "UPDATE tasks
+                 SET status = 'waiting', branch = '', worktree = '', block_reason = NULL,
+                     updated_at = ?
+                 WHERE id = ?",
+            )
+            .bind(now)
+            .bind(task_id)
+            .execute(&mut *conn)
+            .await?;
+            crate::store::tasks::apply::activity(
+                conn,
+                task_id,
+                "status_change",
+                Some(&status),
+                Some("waiting"),
+                agent.as_deref(),
+                model.as_deref(),
+                None,
+            )
+            .await?;
+        }
+        Ok(Some(unmet))
     }
 }

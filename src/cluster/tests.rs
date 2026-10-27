@@ -318,3 +318,76 @@ async fn snapshot_inserts_a_done_task_as_a_tombstone() {
     );
     assert_eq!(b.create(&new_task("next", "")).await.unwrap(), done + 1);
 }
+
+#[tokio::test]
+async fn dependency_job_and_channel_writes_go_through_the_log_and_the_snapshot() {
+    use crate::store::{DepSource, JobState, NewDependency};
+    let a_dir = tempfile::tempdir().unwrap();
+    let a = open(a_dir.path()).await;
+    let raft = start_single(&a, &a_dir.path().join("raft.db"))
+        .await
+        .unwrap();
+    let task = a.create(&new_task("a", "")).await.unwrap();
+    let before = log_len(a_dir.path()).await;
+    let dep = NewDependency {
+        repo: "owner/repo".into(),
+        number: 7,
+        source: DepSource::Cli,
+    };
+    a.replace_dependencies(task, std::slice::from_ref(&dep))
+        .await
+        .unwrap();
+    assert_eq!(
+        a.block_claim_if_waiting(task).await.unwrap(),
+        Some(vec!["#7".to_string()])
+    );
+    a.upsert_job_state(&JobState {
+        repo: "owner/repo".into(),
+        job_id: "nightly".into(),
+        last_run: Some("2026-01-01T00:00:00Z".into()),
+        last_task_status: None,
+        active_task_id: None,
+    })
+    .await
+    .unwrap();
+    a.subscribe_channel("telegram", "1", "owner/repo", None)
+        .await
+        .unwrap();
+    assert_eq!(log_len(a_dir.path()).await, before + 4);
+
+    a.kv_set("cooldown:x", "1").await.unwrap();
+    let snap = raft.trigger().snapshot().await;
+    assert!(snap.is_ok());
+    raft.shutdown().await.unwrap();
+    let mut a_raft = RaftStore::open(&a_dir.path().join("raft.db"), a.clone())
+        .await
+        .unwrap();
+    let snap = a_raft.build_snapshot().await.unwrap();
+
+    let b_dir = tempfile::tempdir().unwrap();
+    let b = open(b_dir.path()).await;
+    b.subscribe_channel("discord", "9", "other/repo", None)
+        .await
+        .unwrap();
+    let mut b_raft = RaftStore::open(&b_dir.path().join("raft.db"), b.clone())
+        .await
+        .unwrap();
+    b_raft
+        .install_snapshot(&snap.meta, snap.snapshot)
+        .await
+        .unwrap();
+    assert_eq!(b.list_dependencies(task).await.unwrap().len(), 1);
+    assert_eq!(b.list_job_states("owner/repo").await.unwrap().len(), 1);
+    assert_eq!(
+        b.list_subscribers_for_repo("owner/repo")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(b
+        .list_subscribers_for_repo("other/repo")
+        .await
+        .unwrap()
+        .is_empty());
+}

@@ -29,12 +29,13 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 pub(crate) mod control;
-mod dependencies;
+pub(crate) mod dependencies;
 mod helpers;
-mod jobs;
+pub(crate) mod jobs;
 pub(crate) mod kv;
 mod metrics;
 mod pricing;
+pub(crate) mod replica;
 pub(crate) mod tasks;
 
 #[allow(unused_imports)]

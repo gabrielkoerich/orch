@@ -2588,17 +2588,6 @@ async fn replicated_columns(conn: &mut sqlx::SqliteConnection) -> anyhow::Result
         .collect())
 }
 
-/// `json_object` per chunk merged with `json_patch`, so the column count never hits SQLite's argument limit
-fn json_row_sql(cols: &[&String]) -> String {
-    cols.chunks(40)
-        .map(|chunk| {
-            let pairs: Vec<String> = chunk.iter().map(|c| format!("'{c}', {c}")).collect();
-            format!("json_object({})", pairs.join(", "))
-        })
-        .reduce(|a, b| format!("json_patch({a}, {b})"))
-        .unwrap_or_else(|| "json_object()".to_string())
-}
-
 /// Every task row as JSON with its replicated columns, done tasks as tombstones
 pub(crate) async fn replicated_rows(pool: &SqlitePool) -> anyhow::Result<Vec<serde_json::Value>> {
     let mut conn = pool.acquire().await?;
@@ -2610,8 +2599,8 @@ pub(crate) async fn replicated_rows(pool: &SqlitePool) -> anyhow::Result<Vec<ser
         .collect();
     let sql = format!(
         "SELECT CASE WHEN status = 'done' THEN {} ELSE {} END FROM tasks ORDER BY id",
-        json_row_sql(&tomb),
-        json_row_sql(&full)
+        super::replica::json_row_sql(&tomb),
+        super::replica::json_row_sql(&full)
     );
     let rows: Vec<(String,)> = sqlx::query_as(&sql).fetch_all(&mut *conn).await?;
     rows.into_iter()

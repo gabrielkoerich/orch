@@ -17,7 +17,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::{Acquire, SqliteConnection};
 
 use super::{NodeId, Reply, TypeConfig};
-use crate::store::{kv, tasks, TaskStore};
+use crate::store::{kv, replica, tasks, TaskStore};
 
 type Err = StorageError<NodeId>;
 
@@ -38,6 +38,7 @@ struct SnapshotData {
     last_applied: Option<LogId<NodeId>>,
     membership: StoredMembership<NodeId, BasicNode>,
     tasks: Vec<serde_json::Value>,
+    tables: std::collections::BTreeMap<String, Vec<serde_json::Value>>,
     kv: Vec<kv::Row>,
 }
 
@@ -145,7 +146,16 @@ impl RaftLogReader<TypeConfig> for RaftStore {
 
 impl RaftSnapshotBuilder<TypeConfig> for RaftStore {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, Err> {
+        let mut tables = std::collections::BTreeMap::new();
+        for table in replica::TABLES {
+            let rows = replica::table_rows(self.store.pool(), table)
+                .await
+                .map_err(io_any)?;
+            tables.insert(table.to_string(), rows);
+        }
+
         let snap = SnapshotData {
+            tables,
             last_applied: self.state_get(APPLIED_KEY).await?,
             membership: self.state_get(MEMBERSHIP_KEY).await?.unwrap_or_default(),
             tasks: tasks::replicated_rows(self.store.pool())
@@ -337,6 +347,16 @@ impl RaftStorage<TypeConfig> for RaftStore {
         tasks::replace_replicated(&mut tx, &snap.tasks)
             .await
             .map_err(io_any)?;
+        for table in replica::TABLES {
+            let rows = snap
+                .tables
+                .get(table)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            replica::replace_table(&mut tx, table, rows)
+                .await
+                .map_err(io_any)?;
+        }
         kv::replace_replicated(&mut tx, &snap.kv)
             .await
             .map_err(io_any)?;

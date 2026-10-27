@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqliteConnection;
 
 use crate::store::control::MemoryEntry;
+use crate::store::dependencies::{self, NewDependency};
+use crate::store::jobs::{self, JobState};
 use crate::store::kv;
 use crate::store::tasks::{apply, NewTask, StoreRouteCmd, TaskStatus, UpsertExternalCmd};
 
@@ -81,6 +83,34 @@ pub enum Command {
     TaskMarkCleaned {
         id: i64,
     },
+    MoveRepo {
+        old: String,
+        new: String,
+    },
+    DepReplace {
+        task_id: i64,
+        rows: Vec<NewDependency>,
+    },
+    DepLinkKnown {
+        task_id: i64,
+        repo: String,
+        number: i64,
+    },
+    DepBlockClaim {
+        task_id: i64,
+    },
+    JobStateUpsert(JobState),
+    ChannelSubscribe {
+        channel: String,
+        thread_id: String,
+        repo: String,
+        topic_id: String,
+    },
+    ChannelUnsubscribe {
+        channel: String,
+        thread_id: String,
+        repo: String,
+    },
 }
 
 /// A failed command is `Err` on every node, so one bad command cannot stop the state machine
@@ -91,6 +121,7 @@ pub enum Reply {
     Int(i64),
     Count(u64),
     Value(String),
+    Unmet(Option<Vec<String>>),
     Err(String),
 }
 
@@ -172,6 +203,46 @@ impl Command {
             }
             Command::TaskMarkCleaned { id } => {
                 apply::mark_cleaned(conn, now, id).await?;
+                Reply::Done
+            }
+            Command::MoveRepo { old, new } => {
+                let moved = dependencies::apply::move_repo(conn, &old, &new).await?;
+                Reply::Int(i64::try_from(moved)?)
+            }
+            Command::DepReplace { task_id, rows } => {
+                dependencies::apply::replace_dependencies(conn, task_id, &rows).await?;
+                Reply::Done
+            }
+            Command::DepLinkKnown {
+                task_id,
+                repo,
+                number,
+            } => {
+                dependencies::apply::link_known_task(conn, task_id, &repo, number).await?;
+                Reply::Done
+            }
+            Command::DepBlockClaim { task_id } => {
+                Reply::Unmet(dependencies::apply::block_claim(conn, now, task_id).await?)
+            }
+            Command::JobStateUpsert(state) => {
+                jobs::apply::upsert_job_state(conn, &state).await?;
+                Reply::Done
+            }
+            Command::ChannelSubscribe {
+                channel,
+                thread_id,
+                repo,
+                topic_id,
+            } => {
+                jobs::apply::subscribe(conn, &channel, &thread_id, &repo, &topic_id).await?;
+                Reply::Done
+            }
+            Command::ChannelUnsubscribe {
+                channel,
+                thread_id,
+                repo,
+            } => {
+                jobs::apply::unsubscribe(conn, &channel, &thread_id, &repo).await?;
                 Reply::Done
             }
         })
