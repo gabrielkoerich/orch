@@ -248,6 +248,20 @@ Rejected: m4 as the third voter. When m4 sleeps and m1 or legion fails, no major
 7. Listener on the tailnet address, cluster secret, tailnet discovery, voter bootstrap, learner join, `orch nodes`, and `orch stream` reading output from the node that runs the task.
 8. `orch progress` and progress records.
 
+## Dependency vetting
+
+openraft 0.9.25 with the `serde` feature, released 2026-07-28.
+
+| Check | Result |
+|---|---|
+| License | MIT OR Apache-2.0. Its new dependencies are MIT, Apache-2.0, or both |
+| Advisories | `cargo audit` reports the same 7 advisories with and without it (`rsa`, `h2`, `rustls`, `rustls-webpki`). It adds none |
+| New compiled crates | `openraft`, `openraft-macros` (proc macro), `anyerror`, `byte-unit`, `utf8-width`, `derive_more` and `derive_more-impl` (proc macro), `maplit`, `tracing-futures`, `validit`. `Cargo.lock` lists 32 new entries, and the rest belong to optional features that are not compiled |
+| Already in orch | `tokio`, `serde`, `futures`, `tracing`, `thiserror`, `chrono`, `clap`, `rand` |
+| API used | `initialize`, `add_learner`, `change_membership`, `ensure_linearizable`, `client_write`, `Config::enable_elect`, `trigger().elect()`. No `transfer_leader` in 0.9 |
+
+Rejected: 0.10, which is still alpha (0.10.0-alpha.37).
+
 ## To verify before building
 
 - Whether `tailscale status --json` reports the same `DNSName` on macOS (the App Store build and the standalone build) and on Linux.
