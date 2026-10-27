@@ -1,4 +1,113 @@
 use super::*;
+use crate::cluster::{Command, Reply};
+use sqlx::SqliteConnection;
+
+/// Key prefixes that stay on this node: metrics and the node's own Raft position
+const LOCAL_PREFIXES: [&str; 2] = ["metrics:", "raft:"];
+
+pub(crate) fn is_local(key: &str) -> bool {
+    LOCAL_PREFIXES.iter().any(|p| key.starts_with(p))
+}
+
+/// One replicated kv row: key, value and `updated_at`
+pub(crate) type Row = (String, String, String);
+
+pub(crate) async fn set(
+    conn: &mut SqliteConnection,
+    now: &str,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+    )
+    .bind(key)
+    .bind(value)
+    .bind(now)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// A single statement, so the read-modify-write cannot race
+pub(crate) async fn increment(
+    conn: &mut SqliteConnection,
+    now: &str,
+    key: &str,
+) -> anyhow::Result<u64> {
+    let row: (i64,) = sqlx::query_as(
+        "INSERT INTO kv (key, value, updated_at) VALUES (?1, '1', ?2)
+         ON CONFLICT(key) DO UPDATE
+           SET value = CAST(value AS INTEGER) + 1,
+               updated_at = ?2
+         RETURNING CAST(value AS INTEGER)",
+    )
+    .bind(key)
+    .bind(now)
+    .fetch_one(conn)
+    .await?;
+    debug_assert!(
+        row.0 >= 1,
+        "kv_increment returned unexpected value {}",
+        row.0
+    );
+    Ok(row.0 as u64)
+}
+
+/// Whoever lands first wins, and every caller reads back the stored winner
+pub(crate) async fn insert_if_absent(
+    conn: &mut SqliteConnection,
+    now: &str,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<String> {
+    sqlx::query("INSERT OR IGNORE INTO kv (key, value, updated_at) VALUES (?, ?, ?)")
+        .bind(key)
+        .bind(value)
+        .bind(now)
+        .execute(&mut *conn)
+        .await?;
+    let (stored,): (String,) = sqlx::query_as("SELECT value FROM kv WHERE key = ?")
+        .bind(key)
+        .fetch_one(conn)
+        .await?;
+    Ok(stored)
+}
+
+pub(crate) async fn delete(conn: &mut SqliteConnection, key: &str) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM kv WHERE key = ?")
+        .bind(key)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn replicated_rows(pool: &SqlitePool) -> anyhow::Result<Vec<Row>> {
+    let rows: Vec<Row> = sqlx::query_as("SELECT key, value, updated_at FROM kv ORDER BY key")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().filter(|r| !is_local(&r.0)).collect())
+}
+
+/// Swap every replicated row for `rows`, leaving local keys alone
+pub(crate) async fn replace_replicated(
+    conn: &mut SqliteConnection,
+    rows: &[Row],
+) -> anyhow::Result<()> {
+    let keys: Vec<(String,)> = sqlx::query_as("SELECT key FROM kv")
+        .fetch_all(&mut *conn)
+        .await?;
+    for (key,) in keys.iter().filter(|(k,)| !is_local(k)) {
+        delete(conn, key).await?;
+    }
+
+    for (key, value, updated_at) in rows {
+        set(conn, updated_at, key, value).await?;
+    }
+
+    Ok(())
+}
 
 impl TaskStore {
     pub async fn kv_get(&self, key: &str) -> anyhow::Result<Option<String>> {
@@ -11,75 +120,52 @@ impl TaskStore {
 
     /// Set a value in the KV store (upsert).
     pub async fn kv_set(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        sqlx::query(
-        "INSERT INTO kv (key, value, updated_at) VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-    )
-    .bind(key)
-    .bind(value)
-    .execute(&self.pool)
-    .await?;
-        Ok(())
+        let cmd = Command::KvSet {
+            key: key.to_string(),
+            value: value.to_string(),
+        };
+        self.write_kv(key, cmd).await.map(|_| ())
     }
 
     /// Atomically increment an integer counter in the KV store, inserting it as 1 if absent.
-    ///
-    /// Executes a single SQL statement (`INSERT … ON CONFLICT … DO UPDATE`) so concurrent
-    /// callers cannot race — SQLite's serialised write lock ensures the read-modify-write is
-    /// indivisible.  Returns the new value after the increment.
+    /// Returns the new value after the increment.
     pub async fn kv_increment(&self, key: &str) -> anyhow::Result<u64> {
-        let row: (i64,) = sqlx::query_as(
-            "INSERT INTO kv (key, value, updated_at) VALUES (?1, '1', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-             ON CONFLICT(key) DO UPDATE
-               SET value = CAST(value AS INTEGER) + 1,
-                   updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-             RETURNING CAST(value AS INTEGER)",
-        )
-        .bind(key)
-        .fetch_one(&self.pool)
-        .await?;
-        // The SQL always returns a value >= 1 (insert path returns 1, update adds 1 to
-        // the previous integer value). Previously this was clamped with `.max(1)`,
-        // which silently masked database corruption or unexpected negative values.
-        // Use a debug assertion to loudly detect unexpected values in debug builds
-        // while returning the actual stored value in release builds.
-        debug_assert!(
-            row.0 >= 1,
-            "kv_increment returned unexpected value {}",
-            row.0
-        );
-        Ok(row.0 as u64)
+        let cmd = Command::KvIncrement {
+            key: key.to_string(),
+        };
+        match self.write_kv(key, cmd).await? {
+            Reply::Count(n) => Ok(n),
+            other => anyhow::bail!("kv_increment got {other:?}"),
+        }
     }
 
     /// Insert a value only if the key is absent, then return the stored winner.
-    ///
-    /// Uses `INSERT OR IGNORE` so concurrent callers racing to create the same key
-    /// both converge on the same stored value — whoever lands first wins, and the
-    /// loser's value is silently discarded.  The unconditional `SELECT` afterwards
-    /// always reads back whichever value is actually in the store.
     pub async fn kv_insert_if_absent(&self, key: &str, value: &str) -> anyhow::Result<String> {
-        sqlx::query(
-            "INSERT OR IGNORE INTO kv (key, value, updated_at)
-             VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
-        )
-        .bind(key)
-        .bind(value)
-        .execute(&self.pool)
-        .await?;
-        let (stored,): (String,) = sqlx::query_as("SELECT value FROM kv WHERE key = ?")
-            .bind(key)
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(stored)
+        let cmd = Command::KvInsertIfAbsent {
+            key: key.to_string(),
+            value: value.to_string(),
+        };
+        match self.write_kv(key, cmd).await? {
+            Reply::Value(v) => Ok(v),
+            other => anyhow::bail!("kv_insert_if_absent got {other:?}"),
+        }
     }
 
     /// Delete a key from the KV store.
     pub async fn kv_delete(&self, key: &str) -> anyhow::Result<()> {
-        sqlx::query("DELETE FROM kv WHERE key = ?")
-            .bind(key)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+        let cmd = Command::KvDelete {
+            key: key.to_string(),
+        };
+        self.write_kv(key, cmd).await.map(|_| ())
+    }
+
+    /// Keys local to this node skip the Raft log
+    async fn write_kv(&self, key: &str, cmd: Command) -> anyhow::Result<Reply> {
+        if is_local(key) {
+            return self.apply_direct(cmd).await;
+        }
+
+        self.write(cmd).await
     }
 
     /// List all (key, value) pairs where the key starts with `prefix`.
