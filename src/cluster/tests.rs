@@ -770,3 +770,106 @@ async fn probe_never_sends_the_secret_and_rejects_a_peer_without_proof() {
     );
     assert!(!seen.iter().any(|v| v == "x-orch-cluster-secret"));
 }
+
+fn git_ok(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn git_head(dir: &Path, rev: &str) -> String {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", rev])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[tokio::test]
+async fn progress_commits_what_is_left_pushes_and_keeps_the_last_five() {
+    let root = tempfile::tempdir().unwrap();
+    let bare = root.path().join("origin.git");
+    let wt = root.path().join("wt");
+    git_ok(
+        root.path(),
+        &["init", "--bare", "-b", "main", bare.to_str().unwrap()],
+    );
+    git_ok(
+        root.path(),
+        &["clone", bare.to_str().unwrap(), wt.to_str().unwrap()],
+    );
+    git_ok(&wt, &["config", "user.name", "T"]);
+    git_ok(&wt, &["config", "user.email", "t@t"]);
+    git_ok(&wt, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(wt.join("a.txt"), "a").unwrap();
+    git_ok(&wt, &["add", "a.txt"]);
+    git_ok(&wt, &["commit", "-m", "base"]);
+    git_ok(&wt, &["push", "origin", "main"]);
+    git_ok(&wt, &["checkout", "-b", "gh-issue-1"]);
+
+    let store = TaskStore::open_memory().await.unwrap();
+    let id = store.create(&new_task("t", "")).await.unwrap();
+    let path = wt.display().to_string();
+    store
+        .set_fields(id, &[("worktree", serde_json::json!(path))])
+        .await
+        .unwrap();
+
+    std::fs::write(wt.join("b.txt"), "left by the agent").unwrap();
+    let report = progress::Report {
+        worktree: path.clone(),
+        done: "step one".into(),
+        left: "step two".into(),
+        state: "green".into(),
+        cli_committed: false,
+        cli_error: None,
+    };
+    let record = progress::handle(&store, "m4", report.clone())
+        .await
+        .unwrap();
+    assert_eq!(record.committed_by, "orch");
+    assert_eq!(record.pushed_by, "orch");
+    assert_eq!(record.branch, "gh-issue-1");
+    assert_eq!(git_head(&bare, "refs/heads/gh-issue-1"), record.commit);
+
+    for n in 0..6 {
+        progress::handle(
+            &store,
+            "m4",
+            progress::Report {
+                done: format!("step {n}"),
+                ..report.clone()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let records = progress::list(&store, id).await.unwrap();
+    assert_eq!(records.len(), 5);
+    assert_eq!(records.last().unwrap().done, "step 5");
+    assert_eq!(records.last().unwrap().committed_by, "none");
+    assert_eq!(records.last().unwrap().pushed_by, "agent");
+
+    let elsewhere = progress::Report {
+        worktree: root.path().display().to_string(),
+        ..report
+    };
+    assert!(progress::handle(&store, "m4", elsewhere).await.is_err());
+}

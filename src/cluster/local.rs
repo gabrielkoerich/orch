@@ -58,11 +58,14 @@ pub async fn serve(store: TaskStore) -> anyhow::Result<Endpoint> {
         &port_path()?,
         &format!("{port} {token} {}", std::process::id()),
     )?;
-    let app = Router::new().route("/write", post(write)).with_state(App {
-        store,
-        token: Arc::new(token.clone()),
-        host: Arc::new(format!("127.0.0.1:{port}")),
-    });
+    let app = Router::new()
+        .route("/write", post(write))
+        .route("/progress", post(progress))
+        .with_state(App {
+            store,
+            token: Arc::new(token.clone()),
+            host: Arc::new(format!("127.0.0.1:{port}")),
+        });
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
             tracing::warn!(err = %e, "cluster write endpoint stopped");
@@ -119,6 +122,48 @@ async fn write(State(app): State<App>, headers: HeaderMap, Json(cmd): Json<Comma
         Err(e) => Reply::Err(format!("{e:#}")),
     })
     .into_response()
+}
+
+async fn progress(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(report): Json<super::progress::Report>,
+) -> Response {
+    if !authorized(&app, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let node = crate::cluster::discovery::status()
+        .await
+        .map(|t| t.me.name)
+        .unwrap_or_else(|_| "local".to_string());
+    match super::progress::handle(&app.store, &node, report).await {
+        Ok(record) => Json(record).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+/// Send an `orch progress` report to the daemon, which commits, pushes and records it
+pub async fn send_progress(
+    endpoint: &Endpoint,
+    report: &super::progress::Report,
+) -> anyhow::Result<super::progress::Record> {
+    let url = endpoint.url.replace("/write", "/progress");
+    let res = CLIENT
+        .post(url)
+        .bearer_auth(&endpoint.token)
+        .json(report)
+        .send()
+        .await?;
+    let status = res.status();
+    if !status.is_success() {
+        anyhow::bail!(
+            "orch service refused the report ({status}): {}",
+            res.text().await?
+        );
+    }
+
+    Ok(res.json().await?)
 }
 
 pub async fn cleanup() {

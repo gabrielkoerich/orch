@@ -787,6 +787,19 @@ impl TaskStore {
         Ok(id)
     }
 
+    /// The task whose worktree on this node is `path`
+    pub async fn resolve_id_by_worktree(&self, path: &str) -> anyhow::Result<Option<i64>> {
+        if path.is_empty() {
+            return Ok(None);
+        }
+
+        let row = sqlx::query("SELECT id FROM tasks WHERE worktree = ? LIMIT 1")
+            .bind(path)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.try_get::<i64, _>("id")).transpose()?)
+    }
+
     /// Resolve the parent task ID by PR number.
     ///
     /// When a mention arrives on a PR, we need to find the issue task that owns

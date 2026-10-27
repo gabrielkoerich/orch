@@ -342,6 +342,18 @@ enum Commands {
         /// Path to JSON file (or - for stdin)
         path: String,
     },
+    /// Record what a task finished and what is left. Commits, and the service pushes
+    Progress {
+        /// What this step finished
+        #[arg(long)]
+        done: String,
+        /// What is left to do
+        #[arg(long, default_value = "")]
+        left: String,
+        /// Where things stand: failing tests, open questions
+        #[arg(long, default_value = "")]
+        state: String,
+    },
     /// Create smart logical commits from current git changes
     Commit {
         /// Show proposed commit plan without creating commits
@@ -1105,6 +1117,9 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Commands::Parse { path } => {
             parser::parse_and_print(&path)?;
+        }
+        Commands::Progress { done, left, state } => {
+            cli::progress::run(&done, &left, &state).await?;
         }
         Commands::Commit {
             dry_run,

@@ -5,6 +5,7 @@ mod command;
 pub mod discovery;
 pub mod local;
 pub mod network;
+pub mod progress;
 mod storage;
 
 use std::collections::BTreeMap;
