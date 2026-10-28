@@ -285,7 +285,7 @@ The operator sees the version themselves and upgrades on their own schedule. `br
 
 The auth flow is: `GH_TOKEN` env → `GITHUB_TOKEN` env → `gh.auth.token` config → `gh auth token` CLI.
 
-- `try_gh_command()` uses `std::process::Command` (blocking). **This is intentional.** The result is cached for 1 hour — this runs at most once at startup. It is not a Tokio antipattern in this context.
+- `try_gh_command()` uses `std::process::Command` (blocking). **This is intentional.** The result is cached until a 401 clears it, so this runs once at startup and again after each 401. It is not a Tokio antipattern in this context.
 - `TokenResolver` is a process-wide singleton via `shared()`. Do not add a second resolver, re-export the token, or set env vars.
 - Do not add `spawn_blocking`, `tokio::process::Command`, or `orch auth check` wiring here.
 - Issues #418 and #421 were filed by agents making this exact mistake and were closed as invalid.

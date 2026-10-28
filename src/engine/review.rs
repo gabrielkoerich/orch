@@ -2204,7 +2204,7 @@ async fn ensure_pr_exists(
                     )
                 })?;
                 // Push first in case agent forgot (use token auth like git_ops::push_branch)
-                let auth_env = runner::git_ops::build_git_auth_env();
+                let auth_env = runner::git_ops::build_git_auth_env().await;
 
                 // Run a credentialed push and log any errors so failures are
                 // visible in logs instead of being silently discarded.

@@ -686,9 +686,10 @@ async fn rebase_in_progress(dir: &Path) -> bool {
 /// - `GIT_CONFIG_COUNT` — number of config entries
 /// - `GIT_CONFIG_KEY_N` — config key for entry N
 /// - `GIT_CONFIG_VALUE_N` — config value for entry N
-pub(crate) fn build_git_auth_env() -> Vec<(String, String)> {
-    let token = crate::github::token::TokenResolver::default_env()
-        .get_token_sync()
+pub(crate) async fn build_git_auth_env() -> Vec<(String, String)> {
+    let token = crate::github::token::shared()
+        .get_token()
+        .await
         .ok()
         .flatten();
     build_git_auth_env_for_token(token)
@@ -983,7 +984,7 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
 
     tracing::info!(branch = branch_to_push, "pushing branch");
 
-    let auth_env = build_git_auth_env();
+    let auth_env = build_git_auth_env().await;
 
     // First attempt: normal push (no force).
     // lfs.locksverify=false skips the auxiliary LFS locks/verify roundtrip in
