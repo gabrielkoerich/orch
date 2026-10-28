@@ -20,6 +20,11 @@ impl Tool {
     /// The same rule the agent prompt follows: shipcheck when the repository opts in and the
     /// installed shipcheck has `commit`, git otherwise
     pub async fn detect(dir: &Path) -> Self {
+        // Without the file there is nothing to ask, and asking runs `shipcheck --help`
+        if !dir.join("shipcheck.toml").exists() {
+            return Tool::Git;
+        }
+
         match Shipcheck::detect(dir).await {
             Shipcheck::Available => Tool::Shipcheck,
             Shipcheck::Absent | Shipcheck::NotInstalled | Shipcheck::Outdated => Tool::Git,
@@ -138,6 +143,7 @@ async fn commit_with(
         .output_with_context()
         .await?;
     if !add.status.success() {
+        tracing::warn!("git add -A failed");
         return Ok(Outcome::Refused {
             by: Tool::Git,
             reason: String::from_utf8_lossy(&add.stderr).trim().to_string(),

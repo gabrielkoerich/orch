@@ -128,7 +128,7 @@ async fn apply_stamps_the_proposer_time() {
         key: "cooldown:claude".into(),
         value: "1".into(),
     }
-    .apply(&mut conn, "2026-01-02T03:04:05Z")
+    .apply(&mut conn, "2026-01-02T03:04:05Z", true)
     .await
     .unwrap();
     let (at,): (String,) = sqlx::query_as("SELECT updated_at FROM kv WHERE key = ?")
@@ -983,4 +983,28 @@ async fn a_relayed_proof_is_rejected() {
     for (_, m) in members {
         m.node.stop().await;
     }
+}
+
+#[tokio::test]
+async fn one_machine_keeps_autoincrement_ids_and_task_json() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let labels: Vec<String> = vec![];
+    let ext = crate::store::UpsertExternal {
+        repo: "owner/repo",
+        ext_id: "1",
+        title: "t",
+        body: "",
+        author: "",
+        url: "",
+        labels: &labels,
+        origin: "github",
+    };
+    let first = store.upsert_external(&ext).await.unwrap();
+    // A conflicting upsert still moves AUTOINCREMENT's counter, as on main
+    assert_eq!(store.upsert_external(&ext).await.unwrap(), first);
+    let next = store.create(&new_task("next", "")).await.unwrap();
+    assert_eq!(next, first + 2, "AUTOINCREMENT, not MAX(id)+1");
+
+    let json = serde_json::to_value(store.get(next).await.unwrap()).unwrap();
+    assert!(json.get("owner_node").is_none());
 }

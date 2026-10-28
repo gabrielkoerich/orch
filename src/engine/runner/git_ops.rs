@@ -382,6 +382,11 @@ pub async fn auto_commit(
     attempt: u32,
     when: super::commit::When,
 ) -> anyhow::Result<bool> {
+    if !has_changes(dir).await {
+        return Ok(false);
+    }
+
+    tracing::info!(task_id, "auto-committing uncommitted changes");
     let task_ref = format_task_ref(task_id);
     let message = format!("{title}\n\nTask {task_ref}\nAgent: {agent}\nAttempt: {attempt}");
     match super::commit::commit_all(dir, &message, agent, when).await? {

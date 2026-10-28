@@ -181,6 +181,11 @@ impl TaskStore {
         self.raft.get().is_none_or(|node| node.is_leader())
     }
 
+    /// Writes go through Raft or a daemon that runs it, so they reach the other machines
+    pub(crate) fn replicates(&self) -> bool {
+        self.raft.get().is_some() || self.daemon.get().is_some()
+    }
+
     pub fn node(&self) -> Option<&crate::cluster::Node> {
         self.raft.get()
     }
@@ -235,7 +240,9 @@ impl TaskStore {
         cmd: crate::cluster::Command,
     ) -> anyhow::Result<crate::cluster::Reply> {
         let mut tx = self.pool.begin().await?;
-        let reply = cmd.apply(&mut tx, &crate::cluster::now_stamp()).await?;
+        let reply = cmd
+            .apply(&mut tx, &crate::cluster::now_stamp(), false)
+            .await?;
         tx.commit().await?;
         Ok(reply)
     }

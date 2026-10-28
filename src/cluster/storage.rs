@@ -303,7 +303,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
                 EntryPayload::Normal(req) => {
                     // A savepoint per entry, so a failed command rolls back alone
                     let mut sp = tx.begin().await.map_err(io)?;
-                    match req.cmd.clone().apply(&mut sp, &req.now).await {
+                    match req.cmd.clone().apply(&mut sp, &req.now, true).await {
                         Ok(reply) => {
                             sp.commit().await.map_err(io)?;
                             reply

@@ -226,7 +226,7 @@ pub struct Task {
     pub worktree: String,
     pub worktree_cleaned: bool,
     /// The node that runs the task, None until one starts it
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_node: Option<String>,
     pub summary: String,
     pub last_error: String,
@@ -1238,9 +1238,17 @@ impl TaskStore {
         updates: &[(&str, serde_json::Value)],
         silent: bool,
     ) -> anyhow::Result<()> {
-        let (local, replicated): (Vec<_>, Vec<_>) = owned_updates(updates)?
-            .into_iter()
-            .partition(|(col, _)| is_local_column(col));
+        let all = owned_updates(updates)?;
+        // On one machine nothing is replicated, so the whole update stays one statement
+        if !self.replicates() {
+            let mut tx = self.pool.begin().await?;
+            apply::set_fields(&mut tx, &crate::cluster::now_stamp(), id, &all, silent).await?;
+            tx.commit().await?;
+            return Ok(());
+        }
+
+        let (local, replicated): (Vec<_>, Vec<_>) =
+            all.into_iter().partition(|(col, _)| is_local_column(col));
         if !local.is_empty() {
             let mut tx = self.pool.begin().await?;
             apply::set_fields(&mut tx, &crate::cluster::now_stamp(), id, &local, silent).await?;
@@ -2779,19 +2787,22 @@ pub(crate) mod apply {
         .await
     }
 
-    /// Ids come from the replicated rows, so every node assigns the same one
+    /// Through Raft, ids come from the replicated rows so every node assigns the same one.
+    /// Otherwise NULL lets SQLite's AUTOINCREMENT pick it, as before
     pub(crate) async fn create(
         conn: &mut SqliteConnection,
         now: &str,
         new: &NewTask,
         internal: bool,
+        replicated: bool,
     ) -> anyhow::Result<i64> {
         let labels_json = serde_json::to_string(&new.labels)?;
         let row = sqlx::query(
             "INSERT INTO tasks (id, external_id, repo, origin, title, body, source, source_id, author, url, labels, parent_id, created_at, updated_at)
-             VALUES ((SELECT COALESCE(MAX(id), 0) + 1 FROM tasks), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES ((SELECT CASE WHEN ? THEN COALESCE(MAX(id), 0) + 1 END FROM tasks), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              RETURNING id",
         )
+        .bind(replicated)
         .bind(&new.external_id)
         .bind(&new.repo)
         .bind(&new.origin)
@@ -2826,11 +2837,12 @@ pub(crate) mod apply {
         conn: &mut SqliteConnection,
         now: &str,
         ext: &UpsertExternalCmd,
+        replicated: bool,
     ) -> anyhow::Result<i64> {
         let labels_json = serde_json::to_string(&ext.labels)?;
         let row = sqlx::query(
             "INSERT INTO tasks (id, external_id, repo, origin, title, body, author, url, labels, parent_id, created_at, updated_at)
-             VALUES ((SELECT COALESCE(MAX(id), 0) + 1 FROM tasks), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES ((SELECT CASE WHEN ? THEN COALESCE(MAX(id), 0) + 1 END FROM tasks), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(repo, external_id) DO UPDATE SET
                 title = excluded.title,
                 body = excluded.body,
@@ -2839,6 +2851,7 @@ pub(crate) mod apply {
                 parent_id = COALESCE(excluded.parent_id, tasks.parent_id)
              RETURNING id",
         )
+        .bind(replicated)
         .bind(&ext.ext_id)
         .bind(&ext.repo)
         .bind(&ext.origin)

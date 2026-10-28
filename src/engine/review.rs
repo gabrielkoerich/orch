@@ -1711,13 +1711,17 @@ async fn restore_review_config_if_needed(
         .unwrap_or(false);
 
     if staged {
-        // A revert orch must land, so it goes through git even where shipcheck commits
-        let _ = crate::engine::runner::commit::git_commit(
-            worktree_path,
-            "revert: restore .orch.yml (review agent must not modify project config)",
-            "orchestrator",
-        )
-        .await;
+        let _ = Command::new("git")
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "revert: restore .orch.yml (review agent must not modify project config)",
+            ])
+            .current_dir(worktree_path)
+            .status()
+            .await;
     }
 }
 

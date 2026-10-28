@@ -126,10 +126,13 @@ pub enum Reply {
 }
 
 impl Command {
+    /// `replicated` is true when Raft applies the command, so new ids come from the replicated
+    /// rows. A direct write keeps SQLite's AUTOINCREMENT, as orch on one machine always has
     pub(crate) async fn apply(
         self,
         conn: &mut SqliteConnection,
         now: &str,
+        replicated: bool,
     ) -> anyhow::Result<Reply> {
         Ok(match self {
             Command::KvSet { key, value } => {
@@ -145,10 +148,10 @@ impl Command {
                 Reply::Done
             }
             Command::TaskCreate { new, internal } => {
-                Reply::Int(apply::create(conn, now, &new, internal).await?)
+                Reply::Int(apply::create(conn, now, &new, internal, replicated).await?)
             }
             Command::TaskUpsertExternal(ext) => {
-                Reply::Int(apply::upsert_external(conn, now, &ext).await?)
+                Reply::Int(apply::upsert_external(conn, now, &ext, replicated).await?)
             }
             Command::TaskUpdateStatusAndFields {
                 id,

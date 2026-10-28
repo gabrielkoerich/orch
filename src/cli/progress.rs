@@ -47,6 +47,11 @@ pub async fn run(done: &str, left: &str, state: &str) -> anyhow::Result<()> {
         cli_committed,
         cli_error,
     };
+    if !crate::cluster::enabled() {
+        eprintln!("committed locally. Recording progress needs a cluster section in the config");
+        return Ok(());
+    }
+
     let Some(endpoint) = local::daemon_endpoint().await else {
         eprintln!("orch service is not running: committed locally, nothing recorded or pushed");
         return Ok(());
