@@ -56,11 +56,7 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `gh` | `project_status_map` | Mapping for `backlog/in_progress/review/done` option IDs | `{}` |
 | `gh.backoff` | `base_seconds` | Initial backoff duration in seconds | `30` |
 | `gh.backoff` | `max_seconds` | Max backoff duration in seconds | `900` |
-| `gh` | `allow_gh_fallback` | Allow `gh auth token` CLI fallback when no token is set | `true` |
 | `gh` | `auth.token` | Explicit Personal Access Token | `""` |
-| `github` | `token_mode` | Token resolution mode: `env` or `github_app` | `"env"` |
-| `github` | `app_id` | GitHub App ID (for `token_mode: github_app`) | `""` |
-| `github` | `private_key_path` | Path to GitHub App private key (.pem) | `""` |
 | `channels.discord` | `bot_token` | Discord bot token | `""` |
 | `channels.telegram` | `bot_token` / `chat_id` | Telegram bot credentials | `""` |
 | `notifications` | `level` | Minimum notification level (`info` / `warn` / `error`) | `info` |
@@ -135,7 +131,7 @@ Orch resolves GitHub tokens in this order — the first match wins:
 1. `GH_TOKEN` environment variable
 2. `GITHUB_TOKEN` environment variable
 3. `gh.auth.token` config value
-4. `gh auth token` CLI (enabled by default via `gh.allow_gh_fallback: true`)
+4. `gh auth token` CLI
 
 The simplest setup is just `gh auth login`. No extra config needed.
 
@@ -152,30 +148,6 @@ export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
 gh:
   auth:
     token: "ghp_xxxxxxxxxxxxxxxxxxxx"
-```
-
-### GitHub App Authentication
-
-For GitHub App authentication, configure the App ID and private key path:
-
-```yaml
-# ~/.orch/config.yml
-github:
-  token_mode: github_app
-  app_id: "123456"
-  private_key_path: "/path/to/app.pem"
-```
-
-The resolver automatically generates a JWT from the private key (valid for 9 minutes) and caches it until expiration.
-
-### Disable gh CLI fallback
-
-The `gh auth token` fallback is enabled by default. To enforce explicit token configuration:
-
-```yaml
-# ~/.orch/config.yml
-gh:
-  allow_gh_fallback: false
 ```
 
 ### Agent Session Tokens

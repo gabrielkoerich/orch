@@ -89,19 +89,7 @@ Tokens are resolved in this order (first match wins):
 1. `GH_TOKEN` environment variable
 2. `GITHUB_TOKEN` environment variable
 3. `gh.auth.token` in `~/.orch/config.yml`
-4. `gh auth token` CLI (enabled by default via `gh.allow_gh_fallback: true`)
-
-For organizations, GitHub App auth is supported:
-
-```yaml
-# ~/.orch/config.yml
-github:
-  token_mode: github_app
-  app_id: "123456"
-  private_key_path: "/path/to/app-private-key.pem"
-```
-
-Orch generates JWTs from the private key (valid for 9 minutes) and caches the installation token until expiry.
+4. `gh auth token` CLI
 
 ### Security: Service Deployments (Homebrew / launchd)
 
@@ -121,8 +109,6 @@ export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
   <string>ghp_xxxxxxxxxxxxxxxxxxxx</string>
 </dict>
 ```
-
-**Option C — GitHub App** (recommended for teams): no long-lived token needed; the service exchanges a short-lived JWT for an installation token automatically.
 
 > **Important:** Orch never writes `GH_TOKEN` into runner scripts on disk. Tokens are injected into the tmux session environment at spawn time and exist only in process memory.
 
@@ -454,7 +440,7 @@ src/
 ├── github/              # GitHub API helpers
 │   ├── cli_wrapper.rs   # gh CLI wrapper
 │   ├── http.rs          # Native HTTP client (reqwest, connection pooling)
-│   ├── token.rs         # Token resolution (env, config, gh CLI, GitHub App)
+│   ├── token.rs         # Token resolution (env, config, gh CLI)
 │   ├── types.rs         # Issue, Comment, Label, PR review types
 │   └── projects.rs      # Projects V2 GraphQL operations
 └── engine/              # Core orchestration

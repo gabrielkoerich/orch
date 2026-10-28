@@ -13,8 +13,6 @@ Tasks are stored in a unified SQLite database (`~/.orch/orch.db`) and synced to 
 ```bash
 # Recommended: set a Personal Access Token (non-interactive)
 export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
-
-# Or: configure GitHub App credentials in ~/.orch/config.yml
 ```
 
 Optional legacy interactive flow:

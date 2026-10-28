@@ -478,7 +478,7 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
         }
         Ok(None) => {
             tracing::warn!(
-                "No GitHub token available; set GH_TOKEN, GITHUB_TOKEN, or configure github.token_mode"
+                "No GitHub token available; set GH_TOKEN, GITHUB_TOKEN, or gh.auth.token, or run gh auth login"
             );
             None
         }
