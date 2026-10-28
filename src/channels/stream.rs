@@ -362,6 +362,14 @@ mod tests {
     }
 
     #[test]
+    fn platform_rate_known_and_default_channels() {
+        assert_eq!(platform_rate("telegram"), Duration::from_millis(100));
+        assert_eq!(platform_rate("discord"), Duration::from_millis(500));
+        assert_eq!(platform_rate("slack"), Duration::from_millis(200));
+        assert_eq!(platform_rate("unknown"), Duration::from_millis(500));
+    }
+
+    #[test]
     fn split_multibyte_char_at_boundary_does_not_panic() {
         // 4-byte emoji: each "😀" is 4 bytes. With max=3, the first chunk boundary
         // falls in the middle of the character — the old code would panic here.
