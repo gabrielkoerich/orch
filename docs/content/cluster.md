@@ -17,6 +17,7 @@ The design and its trade-offs are in `docs/specs/2026-10-26-multi-machine-cluste
 - Assigning tasks to machines. In a cluster today only the leader dispatches agents. A learner or a follower tends its own sessions and nothing else. Keep the machine that runs your agents as a voter that can lead, and do not make it a learner yet.
 - Sending GitHub writes from a non-leader to the leader.
 - Recovery and shutdown limited to the tasks a machine owns.
+- Channels on the leader only. Every machine with a `channels` section polls its bots, and Telegram lets one client poll a bot at a time, so two machines would split the messages between them. Keep `channels` in the config of one machine.
 
 ## Requirements
 
