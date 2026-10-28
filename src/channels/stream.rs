@@ -21,7 +21,6 @@ const SLACK_MAX_BYTES: usize = 4000;
 
 fn platform_max_bytes(channel_name: &str) -> usize {
     match channel_name {
-        "telegram" => TELEGRAM_MAX_BYTES,
         "discord" => DISCORD_MAX_BYTES,
         "slack" => SLACK_MAX_BYTES,
         _ => TELEGRAM_MAX_BYTES,
@@ -31,7 +30,6 @@ fn platform_max_bytes(channel_name: &str) -> usize {
 fn platform_rate(channel_name: &str) -> Duration {
     match channel_name {
         "telegram" => Duration::from_millis(100),
-        "discord" => Duration::from_millis(500),
         "slack" => Duration::from_millis(200),
         _ => Duration::from_millis(500),
     }
@@ -359,6 +357,14 @@ mod tests {
         assert_eq!(platform_max_bytes("discord"), 2000);
         assert_eq!(platform_max_bytes("slack"), 4000);
         assert_eq!(platform_max_bytes("unknown"), 4096);
+    }
+
+    #[test]
+    fn platform_rate_known_and_default_channels() {
+        assert_eq!(platform_rate("telegram"), Duration::from_millis(100));
+        assert_eq!(platform_rate("discord"), Duration::from_millis(500));
+        assert_eq!(platform_rate("slack"), Duration::from_millis(200));
+        assert_eq!(platform_rate("unknown"), Duration::from_millis(500));
     }
 
     #[test]
