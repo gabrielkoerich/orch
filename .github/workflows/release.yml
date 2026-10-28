@@ -442,26 +442,30 @@ jobs:
 
       - name: Create tag
         env:
-          # Optional admin token, main requires checks that a bump commit has not run
-          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          # The owner's token, main requires checks that the bump commit has not run
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.check-release.outputs.version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if [ -z "$RELEASE_TOKEN" ]; then
-            # The tag must sit on main, check-release finds the last version with git describe
-            echo "::notice::RELEASE_TOKEN is not set, main keeps its version and only the tag is pushed"
+          if [ -n "$TAP_TOKEN" ]; then
+            git add Cargo.toml Cargo.lock
+            git commit -m "chore: bump version to ${VERSION}"
             git tag -a "$VERSION" -m "$VERSION"
-            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$VERSION"
-            exit 0
+            # Atomic, so main and the tag land together or a newer main push fails both
+            if git push --atomic "https://x-access-token:${TAP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main "$VERSION"; then
+              exit 0
+            fi
+
+            echo "::warning::could not push the version bump to main, only the tag is pushed"
+            git tag -d "$VERSION"
+            git reset --soft HEAD~1
           fi
 
-          git add Cargo.toml Cargo.lock
-          git commit -m "chore: bump version to ${VERSION}"
+          # The tag must sit on main, check-release finds the last version with git describe
           git tag -a "$VERSION" -m "$VERSION"
-          # Atomic, so main and the tag land together or a newer main push fails both
-          git push --atomic "https://x-access-token:${RELEASE_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main "$VERSION"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$VERSION"
 
       - name: Build changelog
         id: changelog
