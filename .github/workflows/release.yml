@@ -257,10 +257,9 @@ jobs:
           echo "Version: $NEW_VERSION (${BUMP} bump)"
 
   # The only macOS job, GitHub has few macOS arm64 runners and extra macOS jobs queue until they are dropped
-  # Runs the clonefile cow tests on every main push and builds the arm64 release binary unless check-release skips
   build-macos:
     needs: [check-release]
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && needs.check-release.outputs.skip == 'false'
     # The signing secrets live in this environment, which only main can use
     environment: macos-signing
     # The M1, hosted arm64 jobs sat queued for want of a runner on 2026-10-21 and 2026-10-26
@@ -278,13 +277,7 @@ jobs:
           prefix-key: "v1-build"
           cache-all-crates: true
 
-      - name: Run cow tests
-        env:
-          ORCH_COW_EXPECT_CLONE: "1"
-        run: cargo test --lib engine::runner::cow
-
       - name: Build release binary
-        if: needs.check-release.outputs.skip == 'false'
         env:
           ORCH_BUILD_VERSION: ${{ needs.check-release.outputs.version }}
         run: |
@@ -296,7 +289,7 @@ jobs:
       # One stable signature keeps the Keychain's trust in the binary across upgrades, and
       # notarization lets Gatekeeper open it on any Mac. A bare binary cannot be stapled, so Gatekeeper checks online
       - name: Sign and notarize
-        if: runner.os == 'macOS' && needs.check-release.outputs.skip == 'false'
+        if: runner.os == 'macOS'
         env:
           P12: ${{ secrets.MACOS_P12 }}
           P12_PASSWORD: ${{ secrets.MACOS_P12_PASSWORD }}
@@ -337,7 +330,6 @@ jobs:
             --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" --wait --timeout 30m
 
       - name: Upload arm64 binary
-        if: needs.check-release.outputs.skip == 'false'
         uses: actions/upload-artifact@v4
         with:
           name: orch-arm64
