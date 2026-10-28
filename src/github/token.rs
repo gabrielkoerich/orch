@@ -67,11 +67,6 @@ impl TokenResolver {
         Ok(token)
     }
 
-    /// Get token synchronously (for contexts where async is not available).
-    pub fn get_token_sync(&self) -> anyhow::Result<Option<String>> {
-        self.resolve_fresh()
-    }
-
     /// Clear the cached token (useful when token is known to be invalid).
     pub async fn clear_cache(&self) {
         let mut cached = self.cached.write().await;
@@ -147,9 +142,9 @@ impl TokenResolver {
     /// # Why `std::process::Command` (blocking) is intentional here
     ///
     /// This looks like a "blocking call in async context" antipattern, but it is not a problem:
-    /// - `resolve_fresh()` is only called from `get_token()` under a write-lock
-    /// - The result is immediately cached: env tokens forever, gh CLI tokens for 1 hour
-    /// - This executes AT MOST once per hour, typically once at startup
+    /// - `resolve_fresh()` is only called from `get_token()` on a cache miss
+    /// - The result is cached until a 401 clears it, so this runs once at startup
+    ///   and again after each 401
     /// - A one-time ~100ms call does not meaningfully block the Tokio runtime
     ///
     /// DO NOT replace this with `spawn_blocking` or `tokio::process::Command` —
@@ -306,23 +301,6 @@ mod tests {
 
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
-    }
-
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn get_token_sync_env_mode() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
-        let resolver = TokenResolver::default_env().with_gh_fallback(false);
-        resolver.clear_cache().await;
-
-        env::set_var("GH_TOKEN", "sync_test_token");
-
-        let token = resolver.get_token_sync().unwrap();
-        assert_eq!(token, Some("sync_test_token".to_string()));
-
-        env::remove_var("GH_TOKEN");
     }
 
     #[allow(clippy::await_holding_lock)]

@@ -1036,7 +1036,7 @@ async fn delete_local_branch(task_id: &str, br: &str, repo_root: &std::path::Pat
  **/
 pub(crate) async fn delete_branches(task_id: &str, br: &str, repo_root: &std::path::Path) {
     let default_branch = crate::engine::runner::worktree::detect_default_branch(repo_root).await;
-    let auth_env = crate::engine::runner::git_ops::build_git_auth_env();
+    let auth_env = crate::engine::runner::git_ops::build_git_auth_env().await;
     let _ = Command::new("git")
         .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .args([
