@@ -1,0 +1,12 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    ignore:
+      # Its refs are Rust versions, the toolchain input sets the version and a bump is a deliberate change
+      - dependency-name: dtolnay/rust-toolchain
