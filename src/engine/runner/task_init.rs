@@ -218,6 +218,7 @@ pub async fn prepare_task(
     )
     .await;
 
+    let sandboxed = super::sandbox::enabled(&wt.main_project_dir);
     let shipcheck = agent::Shipcheck::detect(&wt.work_dir).await;
     agent::install_shipcheck_hooks(&wt.work_dir, shipcheck, std::path::Path::new("shipcheck"))
         .await;
@@ -228,7 +229,7 @@ pub async fn prepare_task(
         &ctx,
         route_result.as_ref(),
         &wt.default_branch,
-        shipcheck,
+        shipcheck.for_prompt(sandboxed),
     );
     let agent_message = agent::build_agent_message(&pseudo_task, &ctx, attempts);
 
@@ -332,6 +333,8 @@ pub async fn prepare_task(
         timeout_seconds,
         repo: repo.to_string(),
         attempt: next_attempt,
+        sandbox: sandboxed,
+        main_project_dir: wt.main_project_dir.clone(),
     };
 
     // Increment attempts counter — must succeed so max_attempts guard cannot be bypassed

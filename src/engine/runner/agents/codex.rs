@@ -252,7 +252,7 @@ impl AgentRunner for CodexRunner {
         // reliably honour --add-dir entries under the new seatbelt policy.
         let permission_flags = if permissions.autonomous {
             match permissions.sandbox {
-                SandboxLevel::FullAccess => {
+                SandboxLevel::FullAccess | SandboxLevel::Os => {
                     "--dangerously-bypass-approvals-and-sandbox".to_string()
                 }
                 _ => r#"--sandbox workspace-write -c 'approval_policy="never"'"#.to_string(),
@@ -260,7 +260,7 @@ impl AgentRunner for CodexRunner {
         } else {
             let sandbox = match permissions.sandbox {
                 SandboxLevel::WorkspaceWrite | SandboxLevel::None => "workspace-write",
-                SandboxLevel::FullAccess => "danger-full-access",
+                SandboxLevel::FullAccess | SandboxLevel::Os => "danger-full-access",
             };
             format!(r#"-c 'approval_policy="on-request"' --sandbox {sandbox}"#)
         };
@@ -627,6 +627,24 @@ mod tests {
         assert!(
             cmd.contains("--dangerously-bypass-approvals-and-sandbox"),
             "full access codex should use dangerously-bypass, got: {cmd}"
+        );
+    }
+
+    #[test]
+    fn build_command_codex_in_the_os_sandbox_turns_its_own_off() {
+        let perms = PermissionRules {
+            autonomous: true,
+            sandbox: SandboxLevel::Os,
+            disallowed_tools: vec![],
+            allowed_tools: vec![],
+            allowed_edit_paths: vec![],
+            deny_read_only: false,
+            extra_writable_dirs: vec![],
+        };
+        let cmd = runner().build_command(None, "", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
+        assert!(
+            cmd.contains("--dangerously-bypass-approvals-and-sandbox"),
+            "codex cannot nest its Seatbelt in the OS sandbox, got: {cmd}"
         );
     }
 

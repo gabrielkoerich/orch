@@ -75,6 +75,21 @@ Agents are constrained by rules in the system prompt and by runner-enforced tool
 - **GitHub issue linking**: if a task has a linked issue, the agent receives the issue reference for branch naming and PR linking
 - **Cost-conscious sub-agents**: agents are instructed to use cheap models for routine sub-agent work
 
+## OS Sandbox
+
+With `workflow.sandbox: os`, task and review agents run inside Seatbelt on macOS or bubblewrap on Linux, through the [sandbox-jail](https://github.com/gabrielkoerich/sandbox-jail) crate. A project sets `workflow.sandbox: false` in its `.orch.yml` to run its agents without it.
+
+| The agent | Paths |
+|-----------|-------|
+| May write | Its worktree, its git dirs, the temp dirs and the home |
+| May not write | The git dir's `hooks` and `config`, the worktree's `.orch.yml`, every main checkout but its `.git`, `~/.orch` but the task's own worktree (and `orch.db` for job tasks), shell and git startup files, `~/.local/bin`, `~/bin`, `~/Library/LaunchAgents` |
+| May not read | Credentials (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.docker/config.json`, `.netrc`, `.npmrc` and the like) and `~/Library/Keychains`. Keychain access through `securityd` still works |
+| May not run (macOS) | `launchctl` and setuid binaries such as `sudo` |
+
+The network stays open. Codex runs with its own sandbox off, since Seatbelt cannot nest. shipcheck cannot start its own sandbox inside this one either, so a sandboxed agent's prompt has it run the project's checks itself, and the push hook runs shipcheck outside.
+
+When the sandbox cannot start, the task blocks with the reason and no agent runs. A path the agent needs and cannot write shows up as `Operation not permitted` in its output.
+
 ## Worktrees
 
 Orch creates worktrees before launching agents. Agents do NOT create worktrees themselves.

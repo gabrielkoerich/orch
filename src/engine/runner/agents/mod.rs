@@ -60,6 +60,8 @@ pub enum SandboxLevel {
     FullAccess,
     /// No sandboxing (orch manages isolation externally).
     None,
+    /// The OS sandbox from `workflow.sandbox: os` runs the agent, so the agent's own sandbox is off
+    Os,
 }
 
 impl Default for PermissionRules {

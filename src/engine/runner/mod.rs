@@ -26,6 +26,7 @@ pub mod fallback;
 pub mod git_ops;
 pub mod response;
 pub mod response_handler;
+pub mod sandbox;
 pub mod session;
 pub mod task_init;
 pub mod worktree;
@@ -775,6 +776,43 @@ impl TaskRunner {
             &self.store,
         )
         .await?;
+
+        // A sandbox that cannot start blocks the task, which never runs without it. It is the
+        // operator's setup that fails, so no agent or model is cooled down
+        if init.invocation.sandbox {
+            if let Err(e) = sandbox::argv(&init.invocation).await {
+                let reason = format!("the OS sandbox cannot start: {e:#}");
+                tracing::error!(task_id, error = %reason, "blocking task");
+                if let Err(e) = store::store_set_result(
+                    &self.store,
+                    &self.repo,
+                    task_id,
+                    &[
+                        ("last_error", serde_json::json!(reason)),
+                        ("block_reason", serde_json::json!(reason)),
+                    ],
+                )
+                .await
+                {
+                    tracing::warn!(task_id, err = %e, "failed to write the sandbox block_reason");
+                }
+                return Ok(Some(RunExecution {
+                    status: "blocked".to_string(),
+                    exit_code: None,
+                    audit: RunAudit {
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        parsed_response: String::new(),
+                        outcome: "failed".to_string(),
+                        error: reason,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        total_cost_usd: 0.0,
+                        duration_secs: 0.0,
+                    },
+                }));
+            }
+        }
 
         // Run agent session: spawn in tmux, wait for completion, collect output
         let (tmux, tmux_session, session_output) = session::run_agent_session(

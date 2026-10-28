@@ -111,8 +111,8 @@ Recommendation: A first, then B for `os` mode.
 
 ## Changes in orch
 
-1. `sandbox-jail` in `Cargo.toml`, at the release that has lume. It has no runtime dependencies.
-2. `SandboxLevel::Os` and `SandboxLevel::Vm`, set by `workflow.permissions.sandbox: os | vm`, and `workflow.permissions.vm_image: tart:<image> | lume:<image>` for the image, as `sandbox-jail exec --vm` takes it. Opt-in. The operator sets them in `config.yml`.
+1. `sandbox-jail = "0.4"` in `Cargo.toml`. It has no runtime dependencies.
+2. `SandboxLevel::Os`, set by `workflow.sandbox: os`, read per project so a project's `.orch.yml` can set `false`. Phase 3 adds `tart:<image>` and `lume:<image>` to the same key, as `sandbox-jail exec --vm` takes them. Opt-in. The operator sets it in `config.yml`. `workflow.permissions.sandbox` stays what it is, codex's own sandbox.
 3. `spawn_in_tmux` builds the `Policy`. The git dir lookup runs for codex only today and moves out of that `if`.
 4. `build_tmux_runner_scripts` writes the sandbox in front of the agent command: `Sandbox::argv()` for `os`, `Vm::command` for `vm`. A `vm` clone boots with `Vm::tart` or `Vm::lume`.
 5. Codex maps `SandboxLevel::Os` and `Vm` to `--dangerously-bypass-approvals-and-sandbox`.
