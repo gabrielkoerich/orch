@@ -27,7 +27,7 @@
 //!                  └───────────┘
 
 use super::notification::TaskNotification;
-use super::{IncomingMessage, OutputChunk};
+use super::{split_utf8, IncomingMessage, OutputChunk};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -194,7 +194,7 @@ impl Transport {
             return;
         }
 
-        let parts = split_chunks(&chunk.content, MAX_OUTPUT_CHUNK_BYTES);
+        let parts = split_utf8(&chunk.content, MAX_OUTPUT_CHUNK_BYTES);
         let last_index = parts.len().saturating_sub(1);
 
         for (idx, part) in parts.into_iter().enumerate() {
@@ -282,35 +282,6 @@ impl Transport {
     }
 }
 
-fn split_chunks(content: &str, max_bytes: usize) -> Vec<String> {
-    if content.len() <= max_bytes {
-        return vec![content.to_string()];
-    }
-
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    let total = content.len();
-
-    while start < total {
-        let mut end = (start + max_bytes).min(total);
-        while end > start && !content.is_char_boundary(end) {
-            end -= 1;
-        }
-        if end == start {
-            // Single char exceeds limit — advance past the full character
-            if let Some(ch) = content[start..].chars().next() {
-                end = start + ch.len_utf8();
-            } else {
-                break;
-            }
-        }
-        chunks.push(content[start..end].to_string());
-        start = end;
-    }
-
-    chunks
-}
-
 /// How an incoming message should be handled.
 #[derive(Debug)]
 pub enum MessageRoute {
@@ -384,7 +355,7 @@ mod tests {
         // 4-byte emoji at the chunk boundary: the old code set end = start + 1
         // and then sliced content[start..end], which panics on multi-byte chars.
         let content = "x".repeat(97) + "😀"; // 101 bytes; with max=100 the cut is at byte 100 (mid-emoji)
-        let chunks = split_chunks(&content, 100);
+        let chunks = split_utf8(&content, 100);
         assert_eq!(chunks.join(""), content);
         for c in &chunks {
             assert!(std::str::from_utf8(c.as_bytes()).is_ok());
@@ -395,7 +366,7 @@ mod tests {
     fn split_chunks_only_emojis() {
         // Every boundary falls inside a 4-byte character.
         let content = "😀".repeat(50); // 200 bytes
-        let chunks = split_chunks(&content, 10); // 10 bytes per chunk, emoji is 4 bytes
+        let chunks = split_utf8(&content, 10); // 10 bytes per chunk, emoji is 4 bytes
         assert_eq!(chunks.join(""), content);
         for c in &chunks {
             assert!(std::str::from_utf8(c.as_bytes()).is_ok());

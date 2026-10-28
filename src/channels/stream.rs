@@ -10,7 +10,7 @@
 //! - Slack:    4 KB per message, 200 ms between sends
 
 use crate::channels::transport::{parse_conversation_key, Transport};
-use crate::channels::{ChannelRegistry, OutgoingMessage};
+use crate::channels::{html_escape, split_utf8, ChannelRegistry, OutgoingMessage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::{Duration, Instant};
@@ -37,41 +37,7 @@ fn platform_rate(channel_name: &str) -> Duration {
 
 /// Split content into chunks that fit within the platform's message size limit.
 fn split_for_platform(content: &str, channel_name: &str) -> Vec<String> {
-    let max = platform_max_bytes(channel_name);
-    if content.len() <= max {
-        return vec![content.to_string()];
-    }
-
-    let mut parts = Vec::new();
-    let mut start = 0;
-    while start < content.len() {
-        let mut end = (start + max).min(content.len());
-        // Walk back to a UTF-8 char boundary
-        while end > start && !content.is_char_boundary(end) {
-            end -= 1;
-        }
-        if end == start {
-            // Single char exceeds limit — advance past the full character
-            if let Some(ch) = content[start..].chars().next() {
-                end = start + ch.len_utf8();
-            } else {
-                break;
-            }
-        }
-        parts.push(content[start..end].to_string());
-        start = end;
-    }
-    parts
-}
-
-/// Escape text for Telegram HTML parse_mode.
-///
-/// Telegram's HTML parser is strict: bare `<`, `>`, or `&` cause
-/// "can't parse entities" errors. This function escapes those characters.
-fn telegram_html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    split_utf8(content, platform_max_bytes(channel_name))
 }
 
 /// Send a message to a specific channel thread, finding the channel by name.
@@ -182,7 +148,7 @@ pub async fn fanout_output(
                                     // Escape HTML for Telegram before splitting so chunk
                                     // boundaries are computed on the actual API payload size.
                                     let to_send = if ch_name == "telegram" {
-                                        telegram_html_escape(&buffered)
+                                        html_escape(&buffered)
                                     } else {
                                         buffered
                                     };
@@ -215,7 +181,7 @@ pub async fn fanout_output(
                                 };
                             // Escape HTML for Telegram before splitting (same as above).
                             let to_send = if ch_name == "telegram" {
-                                telegram_html_escape(&buffered)
+                                html_escape(&buffered)
                             } else {
                                 buffered
                             };
@@ -296,7 +262,7 @@ pub async fn fanout_output(
                             if can_send {
                                 // Escape HTML for Telegram before splitting (same as above).
                                 let to_send = if ch_name == "telegram" {
-                                    telegram_html_escape(&buffered)
+                                    html_escape(&buffered)
                                 } else {
                                     buffered
                                 };
@@ -407,7 +373,7 @@ mod tests {
         // After escaping, each chunk (computed on escaped content) must be ≤ 4096.
         let raw = "a".repeat(4096) + "<code>123</code>"; // 4096 + 16 = 4112 bytes raw
         assert_eq!(raw.len(), 4112);
-        let escaped = telegram_html_escape(&raw);
+        let escaped = html_escape(&raw);
         // 2 `<` + 2 `>` each gain 3 bytes when escaped (4 vs 1)
         assert_eq!(escaped.len(), 4112 + 12); // 4124 bytes
         assert!(escaped.len() > raw.len());
@@ -452,7 +418,7 @@ mod tests {
         // Old buggy approach: split raw, then escape each
         let buggy_parts: Vec<String> = split_for_platform(&raw, "telegram")
             .into_iter()
-            .map(|p| telegram_html_escape(&p))
+            .map(|p| html_escape(&p))
             .collect();
 
         // At least one chunk exceeds the limit after escaping
@@ -463,7 +429,7 @@ mod tests {
         );
 
         // Fixed approach: escape first, then split on escaped content
-        let escaped = telegram_html_escape(&raw);
+        let escaped = html_escape(&raw);
         let fixed_parts = split_for_platform(&escaped, "telegram");
         for (i, p) in fixed_parts.iter().enumerate() {
             assert!(
@@ -479,9 +445,9 @@ mod tests {
 
     #[test]
     fn telegram_html_escape_produces_valid_html_entities() {
-        assert_eq!(telegram_html_escape("<test>"), "&lt;test&gt;");
-        assert_eq!(telegram_html_escape("a & b"), "a &amp; b");
-        assert_eq!(telegram_html_escape("<>&"), "&lt;&gt;&amp;");
+        assert_eq!(html_escape("<test>"), "&lt;test&gt;");
+        assert_eq!(html_escape("a & b"), "a &amp; b");
+        assert_eq!(html_escape("<>&"), "&lt;&gt;&amp;");
     }
 
     // A lightweight test channel implementation used to assert that

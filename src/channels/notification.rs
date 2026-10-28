@@ -7,6 +7,7 @@
 //! The notification level (`all`, `errors_only`, `none`) controls which
 //! events are broadcast. Configured via `notifications.level` in config.
 
+use super::html_escape;
 use serde::{Deserialize, Serialize};
 
 /// Notification level — controls which task events are broadcast.
@@ -224,13 +225,6 @@ fn status_emoji(status: &str) -> &'static str {
         "failed" => "❌",
         _ => "📋",
     }
-}
-
-/// Escape text for HTML to be sent in Telegram HTML parse_mode.
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 /// Format seconds into human-readable duration.

@@ -24,6 +24,43 @@ pub mod transport;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// Escape `&`, `<` and `>` for Telegram's HTML parse_mode, which rejects bare ones
+pub(crate) fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Split content into chunks of at most `max_bytes`, never inside a UTF-8 character
+pub(crate) fn split_utf8(content: &str, max_bytes: usize) -> Vec<String> {
+    if content.len() <= max_bytes {
+        return vec![content.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let total = content.len();
+
+    while start < total {
+        let mut end = (start + max_bytes).min(total);
+        while end > start && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            // A single char over the limit still goes out whole
+            if let Some(ch) = content[start..].chars().next() {
+                end = start + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        chunks.push(content[start..end].to_string());
+        start = end;
+    }
+
+    chunks
+}
+
 /// A message received from any channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncomingMessage {
