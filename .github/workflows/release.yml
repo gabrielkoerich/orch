@@ -263,8 +263,8 @@ jobs:
     if: github.ref == 'refs/heads/main'
     # The signing secrets live in this environment, which only main can use
     environment: macos-signing
-    # Pinned arm64 image, macos-latest jobs sat queued for want of a runner on 2026-10-26
-    runs-on: macos-15
+    # The M1, hosted arm64 jobs sat queued for want of a runner on 2026-10-21 and 2026-10-26
+    runs-on: [self-hosted, macOS, ARM64, m1]
     steps:
       - uses: actions/checkout@v6
 
