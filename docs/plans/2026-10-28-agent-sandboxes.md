@@ -1,6 +1,6 @@
 # Agent sandboxes — Plan
 
-Status: plan, 2026-10-28. Builds on the `sandbox-jail` crate ([repository](https://github.com/gabrielkoerich/sandbox-jail), 0.2.0 on crates.io), and replaces the earlier research note on Lume VMs (`docs/research/lume-macos-vm-sandboxing.md`) as the plan of record.
+Status: plan, 2026-10-28. Builds on the `sandbox-jail` crate ([repository](https://github.com/gabrielkoerich/sandbox-jail), 0.3.0 on crates.io, lume VMs in review), and replaces the earlier research note on Lume VMs (`docs/research/lume-macos-vm-sandboxing.md`) as the plan of record.
 
 ## What it is
 
@@ -9,7 +9,7 @@ Orch runs each task and review agent inside a sandbox the kernel enforces. Two m
 | Mode | What runs the agent | What it isolates |
 |------|---------------------|------------------|
 | `os` | Seatbelt (`sandbox-exec`) on macOS, bubblewrap on Linux, around the agent process on the host | Files: the agent writes its worktree, its git dirs and `$HOME` minus a denylist, and cannot read keys |
-| `vm` | A throwaway tart clone of an operator-built image | Everything: own kernel, sees only the worktree, its git dirs and the attempt dir |
+| `vm` | A throwaway tart or lume clone of an operator-built image | Everything: own kernel, sees only the worktree, its git dirs and the attempt dir |
 
 Orch builds a `sandbox_jail::Policy` for each run, and the crate enforces it or refuses it before the agent starts.
 
@@ -40,7 +40,7 @@ Every task and review agent starts in `build_tmux_runner_scripts()` (`src/engine
 {argv...} /bin/bash -c {agent_cmd} 2>{stderr_file}
 ```
 
-`vm` mode runs it through the clone instead: `tart exec -i <clone> /bin/sh -c 'cd <worktree> && exec "$@"' /bin/bash -c {agent_cmd}`.
+`vm` mode runs it through the clone instead, with `Vm::command`: `tart exec` or `lume ssh` into the guest, from the worktree. lume passes no stdin, which the agent command does not need, since it reads its prompt with a `<` redirect that runs in the guest.
 
 The redirect, `script`, `tee` and tmux stay outside the sandbox in both modes, so `output.json`, `stderr.txt` and `exit.txt` need no rule. `review.rs` uses `spawn_in_tmux` too and gets the sandbox with no extra work. The control session and the router (`direct.rs`, `control.rs`) stay outside it until phase 4.
 
@@ -81,17 +81,17 @@ Allowing only `~/.cargo`, `~/.npm`, `~/.bun` and so on is tighter, but it puts p
 
 ## `vm` mode
 
-The agent runs in a tart clone of an image the operator builds. The clone shares the worktree and its git dirs read-write, and the attempt dir read-only for the prompt files, each at its host path. Nothing else of the host exists in the guest.
+The agent runs in a tart or lume clone of an image the operator builds. The clone shares the worktree and its git dirs read-write, and the attempt dir read-only for the prompt files, each at its host path. Nothing else of the host exists in the guest.
 
 What the operator's image needs, since the guest sees no host toolchain and no host login:
 
-- The Tart Guest Agent and passwordless sudo, as `ghcr.io/cirruslabs/ubuntu` and the `macos-*-base` images have.
+- For tart, the Tart Guest Agent and passwordless sudo, as `ghcr.io/cirruslabs/ubuntu` and the `macos-*-base` images have. For lume, SSH and the `lume` user, as `ubuntu-noble-vanilla` and the `macos-*-vanilla` images have.
 - Every agent CLI orch routes to, and the project toolchains.
 - A login per agent that works without the host's keychain or home. Claude Code takes `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. Codex reads `~/.codex/auth.json`. Orch passes these into the clone through the runner's environment, never into the image.
 
 Lifecycle: orch boots the clone in `spawn_in_tmux`, keeps the `sandbox_jail::vm::Vm` handle for the task's run, and drops it when the run ends, which deletes the clone. A crash or a restart can leave clones behind, so startup reconciliation deletes every `sandbox-jail-*` clone that no live run owns.
 
-Cost and limits: a Linux clone answers in about 3 s and a macOS clone in about 20 s on an M4 Max. Apple allows two macOS VMs at once per Mac, so macOS `vm` tasks run two at a time. The crate refuses `network = false` for a VM, so agents in a VM keep the network.
+Cost and limits: on an M4 Max a tart Linux clone answers in about 3 s and a macOS clone in about 20 s, a lume macOS clone in about 11 s and its Ubuntu image in about 2 minutes. Apple allows two macOS VMs at once per Mac, so macOS `vm` tasks run two at a time. The crate refuses `network = false` for a VM, so agents in a VM keep the network.
 
 ### Rejected: Docker
 
@@ -111,21 +111,21 @@ Recommendation: A first, then B for `os` mode.
 
 ## Changes in orch
 
-1. `sandbox-jail = "0.2"` in `Cargo.toml`. It has no runtime dependencies.
-2. `SandboxLevel::Os` and `SandboxLevel::Vm`, set by `workflow.permissions.sandbox: os | vm`, and `workflow.permissions.vm_image` for the image. Opt-in. The operator sets them in `config.yml`.
+1. `sandbox-jail` in `Cargo.toml`, at the release that has lume. It has no runtime dependencies.
+2. `SandboxLevel::Os` and `SandboxLevel::Vm`, set by `workflow.permissions.sandbox: os | vm`, and `workflow.permissions.vm_image: tart:<image> | lume:<image>` for the image, as `sandbox-jail exec --vm` takes it. Opt-in. The operator sets them in `config.yml`.
 3. `spawn_in_tmux` builds the `Policy`. The git dir lookup runs for codex only today and moves out of that `if`.
-4. `build_tmux_runner_scripts` writes the sandbox in front of the agent command: `Sandbox::argv()` for `os`, `Vm::command` for `vm`.
+4. `build_tmux_runner_scripts` writes the sandbox in front of the agent command: `Sandbox::argv()` for `os`, `Vm::command` for `vm`. A `vm` clone boots with `Vm::tart` or `Vm::lume`.
 5. Codex maps `SandboxLevel::Os` and `Vm` to `--dangerously-bypass-approvals-and-sandbox`.
-6. When the sandbox cannot start (`Backend::detect()` or `Vm::tart` fails, or the crate refuses the policy), the task blocks with the error. It never falls back to running unsandboxed.
+6. When the sandbox cannot start (`Backend::detect()` or `Vm::tart` or `Vm::lume` fails, or the crate refuses the policy), the task blocks with the error. It never falls back to running unsandboxed.
 7. A sandbox denial blocks the task with the denied path in `block_reason`. It is a gap in the policy, so it must not cool down the agent or the model. `detect_permission_denied` already matches `operation not permitted`. The path comes from the agent's stderr or the Seatbelt log (`log show --predicate 'sender == "Sandbox"'`).
-8. Startup reconciliation deletes orphaned `sandbox-jail-*` tart clones.
+8. Startup reconciliation deletes orphaned `sandbox-jail-*` tart and lume clones.
 9. Docs: `docs/content/agents.md` and `configuration.md` get both modes, the policy and how to read a denial.
 
 ## Phases
 
 1. `os` mode for task and review agents: steps 1 to 6, with shipcheck option A.
 2. Denial reporting (step 7). Run it on the operator's projects and widen the policy where real tasks hit it.
-3. `vm` mode: steps 2, 4, 5 and 8 for `vm`, with one Linux image that carries claude and codex.
+3. `vm` mode: steps 2, 4, 5 and 8 for `vm`, with one tart Linux image that carries claude and codex. lume works through the same config.
 4. The control session and the router (`direct.rs`), with `orch.db` writable.
 5. Shipcheck option B, once shipcheck has the daemon socket.
 
