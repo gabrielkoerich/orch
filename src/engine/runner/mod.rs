@@ -17,6 +17,7 @@
 
 pub mod agent;
 pub mod agents;
+pub mod commit;
 pub mod context;
 pub mod cow;
 pub mod diff;

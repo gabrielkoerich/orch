@@ -2752,6 +2752,11 @@ pub(crate) async fn tick(
     if let Err(e) = tick_check_session_completions(tmux, repo, capture, store).await {
         tracing::warn!(err = %e, "session completion phase failed");
     }
+    // Every node tends its own sessions, only the leader decides. Followers dispatch once tasks are assigned to nodes
+    if !store.is_leader() {
+        return Ok(());
+    }
+
     if let Err(e) =
         tick_detect_silent_agents(tmux, repo, capture, backend, task_manager, config, store).await
     {

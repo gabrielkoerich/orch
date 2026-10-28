@@ -106,6 +106,7 @@ dashmap = "6"
 
 # Scope guard for cleanup on task completion
 scopeguard = "1"
+openraft = { version = "0.9.25", features = ["serde"] }
 
 [dev-dependencies]
 tempfile = "3"

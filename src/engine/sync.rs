@@ -1049,7 +1049,7 @@ async fn poll_and_merge_recovered_pr(
                     pr_number,
                     "CI green after recovery — attempting direct merge"
                 );
-                match gh.merge_pr(repo, pr_number, true).await {
+                match gh.merge_pr(repo, pr_number, true, &head_sha).await {
                     Ok(()) => {
                         tracing::info!(
                             task_id = task_id,
@@ -1073,6 +1073,19 @@ async fn poll_and_merge_recovered_pr(
                             || err.contains("pull request already merged")
                         {
                             return Ok(true);
+                        }
+                        // The head moved after we read it, and updating the branch would skip CI on the new commit
+                        if err.contains("head branch was modified")
+                            || err.contains("sha does not match")
+                        {
+                            tracing::info!(
+                                task_id = task_id,
+                                pr_number,
+                                outcome = "poll_exited_without_merge",
+                                reason = "head_moved",
+                                "merge rejected because the head sha changed"
+                            );
+                            return Ok(false);
                         }
                         // GitHub may reject the merge because the branch fell behind
                         // again while CI was finishing. Retry the branch update inside
@@ -1942,6 +1955,11 @@ pub(crate) async fn sync_tick(
     dispatching: &Arc<DashMap<String, String>>,
     auto_merge_in_flight: &Arc<DashSet<String>>,
 ) -> anyhow::Result<()> {
+    // One node polls GitHub and decides for the whole cluster
+    if !store.is_leader() {
+        return Ok(());
+    }
+
     tracing::debug!("sync tick");
 
     // Global GitHub 5xx circuit breaker — skip non-critical background work
@@ -6356,6 +6374,7 @@ mod tests {
             branch: String::new(),
             worktree: String::new(),
             worktree_cleaned: false,
+            owner_node: None,
             summary: String::new(),
             last_error: String::new(),
             parent_id: None,

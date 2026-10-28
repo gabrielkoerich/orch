@@ -1,4 +1,5 @@
 use super::*;
+use crate::cluster::Command;
 use crate::security;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -21,10 +22,11 @@ pub(crate) const TASK_COLS: &str = "id, external_id, repo, origin, title, body, 
     model_reroute_chain, limit_reroute_chain, \
     memory, delegations, created_at, updated_at, review_session_expected, \
      review_invocations, needs_review_refires, push_failures, auto_unblock_count, auto_unblock_last_at, \
-     ci_recovery_count, auto_unblock_last_reason, no_code_reroutes, network_retries, no_code_last_agent";
+     ci_recovery_count, auto_unblock_last_reason, no_code_reroutes, network_retries, no_code_last_agent, \
+     owner_node";
 
 /// Number of columns in TASK_COLS (used for diagnostic verification).
-pub(crate) const TASK_COLS_COUNT: usize = 60;
+pub(crate) const TASK_COLS_COUNT: usize = 61;
 
 /// Explicit column list for `SELECT` queries on the `task_runs` table.
 const TASK_RUN_COLS: &str =
@@ -49,6 +51,7 @@ const ALLOWED_FIELDS: &[&str] = &[
     "branch",
     "worktree",
     "worktree_cleaned",
+    "owner_node",
     "summary",
     "last_error",
     "parent_id",
@@ -222,6 +225,9 @@ pub struct Task {
     pub branch: String,
     pub worktree: String,
     pub worktree_cleaned: bool,
+    /// The node that runs the task, None until one starts it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_node: Option<String>,
     pub summary: String,
     pub last_error: String,
     pub parent_id: Option<i64>,
@@ -279,7 +285,7 @@ pub struct Task {
 }
 
 /// Parameters for creating a new task.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NewTask {
     pub external_id: Option<String>,
     pub repo: String,
@@ -568,6 +574,21 @@ fn parent_external_id_from_labels(labels: &[String]) -> Option<&str> {
         .filter(|parent| !parent.is_empty())
 }
 
+fn owned_updates(
+    updates: &[(&str, serde_json::Value)],
+) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+    updates
+        .iter()
+        .map(|(col, val)| {
+            anyhow::ensure!(
+                ALLOWED_FIELDS.contains(col),
+                "column {col} is not in the update allowlist"
+            );
+            Ok((col.to_string(), val.clone()))
+        })
+        .collect()
+}
+
 impl TaskStore {
     /// Append a lifecycle activity event for a task.
     #[allow(clippy::too_many_arguments)]
@@ -681,28 +702,11 @@ impl TaskStore {
     }
 
     pub async fn create(&self, new: &NewTask) -> anyhow::Result<i64> {
-        let labels_json = serde_json::to_string(&new.labels)?;
-        let row = sqlx::query(
-        "INSERT INTO tasks (external_id, repo, origin, title, body, source, source_id, author, url, labels, parent_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         RETURNING id",
-    )
-    .bind(&new.external_id)
-    .bind(&new.repo)
-    .bind(&new.origin)
-    .bind(&new.title)
-    .bind(&new.body)
-    .bind(&new.source)
-    .bind(&new.source_id)
-    .bind(&new.author)
-    .bind(&new.url)
-    .bind(&labels_json)
-    .bind(new.parent_id)
-    .fetch_one(&self.pool)
-    .await?;
-
-        row.try_get("id")
-            .map_err(|e| anyhow::anyhow!("INSERT RETURNING id returned NULL or invalid: {e}"))
+        self.write_int(Command::TaskCreate {
+            new: new.clone(),
+            internal: false,
+        })
+        .await
     }
 
     /// Create an internal task, returning its auto-generated ID.
@@ -718,28 +722,24 @@ impl TaskStore {
         source_id: &str,
         parent_id: Option<i64>,
     ) -> anyhow::Result<i64> {
-        let id = self
-            .create(&NewTask {
-                external_id: None,
-                repo: repo.to_string(),
-                origin: "internal".to_string(),
-                title: title.to_string(),
-                body: body.to_string(),
-                source: source.to_string(),
-                source_id: source_id.to_string(),
-                author: String::new(),
-                url: String::new(),
-                labels: vec![],
-                parent_id,
-            })
-            .await?;
-        // Set external_id to "internal:{id}" so resolve_task_id can find it
-        sqlx::query("UPDATE tasks SET external_id = ? WHERE id = ?")
-            .bind(format!("internal:{id}"))
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(id)
+        let new = NewTask {
+            external_id: None,
+            repo: repo.to_string(),
+            origin: "internal".to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+            source: source.to_string(),
+            source_id: source_id.to_string(),
+            author: String::new(),
+            url: String::new(),
+            labels: vec![],
+            parent_id,
+        };
+        self.write_int(Command::TaskCreate {
+            new,
+            internal: true,
+        })
+        .await
     }
 
     /// Get a task by its internal ID.
@@ -792,6 +792,19 @@ impl TaskStore {
         Ok(id)
     }
 
+    /// The task whose worktree on this node is `path`
+    pub async fn resolve_id_by_worktree(&self, path: &str) -> anyhow::Result<Option<i64>> {
+        if path.is_empty() {
+            return Ok(None);
+        }
+
+        let row = sqlx::query("SELECT id FROM tasks WHERE worktree = ? LIMIT 1")
+            .bind(path)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.try_get::<i64, _>("id")).transpose()?)
+    }
+
     /// Resolve the parent task ID by PR number.
     ///
     /// When a mention arrives on a PR, we need to find the issue task that owns
@@ -832,36 +845,22 @@ impl TaskStore {
 
     /// Upsert an external task — insert if new, update title/body/labels if exists.
     pub async fn upsert_external(&self, ext: &UpsertExternal<'_>) -> anyhow::Result<i64> {
-        let labels_json = serde_json::to_string(ext.labels)?;
         let parent_id = match parent_external_id_from_labels(ext.labels) {
             Some(parent_external_id) => self.resolve_task_id(ext.repo, parent_external_id).await?,
             None => None,
         };
-        let row = sqlx::query(
-            "INSERT INTO tasks (external_id, repo, origin, title, body, author, url, labels, parent_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(repo, external_id) DO UPDATE SET
-            title = excluded.title,
-            body = excluded.body,
-            labels = excluded.labels,
-            url = excluded.url,
-            parent_id = COALESCE(excluded.parent_id, tasks.parent_id)
-         RETURNING id",
-        )
-        .bind(ext.ext_id)
-        .bind(ext.repo)
-        .bind(ext.origin)
-        .bind(ext.title)
-        .bind(ext.body)
-        .bind(ext.author)
-        .bind(ext.url)
-        .bind(&labels_json)
-        .bind(parent_id)
-        .fetch_one(&self.pool)
-        .await?;
-
-        row.try_get("id")
-            .map_err(|e| anyhow::anyhow!("INSERT RETURNING id returned NULL or invalid: {e}"))
+        self.write_int(Command::TaskUpsertExternal(UpsertExternalCmd {
+            repo: ext.repo.to_string(),
+            ext_id: ext.ext_id.to_string(),
+            title: ext.title.to_string(),
+            body: ext.body.to_string(),
+            author: ext.author.to_string(),
+            url: ext.url.to_string(),
+            labels: ext.labels.to_vec(),
+            origin: ext.origin.to_string(),
+            parent_id,
+        }))
+        .await
     }
 
     // ---------------------------------------------------------------
@@ -874,132 +873,35 @@ impl TaskStore {
         status: TaskStatus,
         updates: &[(&str, serde_json::Value)],
     ) -> anyhow::Result<()> {
-        for (col, _) in updates {
-            anyhow::ensure!(
-                ALLOWED_FIELDS.contains(col),
-                "column {col} is not in the update allowlist"
-            );
-        }
-
-        let mut tx = self.pool.begin().await?;
-        let previous = sqlx::query("SELECT status, agent, model FROM tasks WHERE id = ?")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
-        let from_status: String = previous
-            .try_get("status")
-            .map_err(|e| anyhow::anyhow!("failed to read status column before update: {e}"))?;
-        let agent: Option<String> = previous
-            .try_get("agent")
-            .map_err(|e| anyhow::anyhow!("failed to read agent column before update: {e}"))?;
-        let model: Option<String> = previous
-            .try_get("model")
-            .map_err(|e| anyhow::anyhow!("failed to read model column before update: {e}"))?;
-
-        let mut set_parts = Vec::new();
-        let mut values: Vec<Option<String>> = Vec::new();
-
-        set_parts.push("status = ?".to_string());
-        values.push(Some(status.as_str().to_string()));
-
-        let mut block_reason_in_updates = false;
-        for (col, val) in updates {
-            if *col == "block_reason" {
-                block_reason_in_updates = true;
-            }
-            set_parts.push(format!("{col} = ?"));
-            match val {
-                serde_json::Value::String(s) => values.push(Some(s.clone())),
-                serde_json::Value::Number(n) => values.push(Some(n.to_string())),
-                serde_json::Value::Bool(b) => {
-                    values.push(Some(if *b { "1" } else { "0" }.to_string()));
-                }
-                serde_json::Value::Null => values.push(None),
-                other => values.push(Some(serde_json::to_string(other)?)),
-            }
-        }
-
-        if !block_reason_in_updates && status != TaskStatus::Blocked {
-            set_parts.push("block_reason = NULL".to_string());
-        }
-
-        set_parts.push("updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')".to_string());
-        let sql = format!("UPDATE tasks SET {} WHERE id = ?", set_parts.join(", "));
-
-        let mut query = sqlx::query(&sql);
-        for v in &values {
-            query = query.bind(v.as_deref());
-        }
-        query = query.bind(id);
-        query.execute(&mut *tx).await?;
-
-        Self::append_activity_tx(
-            &mut tx,
+        let updates = owned_updates(updates)?;
+        self.write(Command::TaskUpdateStatusAndFields {
             id,
-            "status_change",
-            Some(from_status.as_str()),
-            Some(status.as_str()),
-            agent.as_deref(),
-            model.as_deref(),
-            None,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(())
+            status,
+            updates,
+        })
+        .await
+        .map(|_| ())
     }
 
     /// Update the status of a task.
     pub async fn update_status(&self, id: i64, status: TaskStatus) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
-        let previous = sqlx::query("SELECT status, agent, model FROM tasks WHERE id = ?")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
-        let from_status: String = previous
-            .try_get("status")
-            .map_err(|e| anyhow::anyhow!("failed to read status column before update: {e}"))?;
-        let agent: Option<String> = previous
-            .try_get("agent")
-            .map_err(|e| anyhow::anyhow!("failed to read agent column before update: {e}"))?;
-        let model: Option<String> = previous
-            .try_get("model")
-            .map_err(|e| anyhow::anyhow!("failed to read model column before update: {e}"))?;
-        let sql = if status == TaskStatus::Blocked {
-            "UPDATE tasks SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?"
-        } else {
-            "UPDATE tasks SET status = ?, block_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?"
-        };
-        sqlx::query(sql)
-            .bind(status.as_str())
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-
-        Self::append_activity_tx(
-            &mut tx,
+        self.write_bool(Command::TaskUpdateStatus {
             id,
-            "status_change",
-            Some(from_status.as_str()),
-            Some(status.as_str()),
-            agent.as_deref(),
-            model.as_deref(),
-            None,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(())
+            status,
+            expected: None,
+        })
+        .await
+        .map(|_| ())
     }
 
     /// Persist the external_id (e.g. a newly-created GitHub issue number) onto an existing task row.
     pub async fn update_external_id(&self, id: i64, external_id: &str) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE tasks SET external_id = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
-        )
-        .bind(external_id)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.write(Command::TaskUpdateExternalId {
+            id,
+            external_id: external_id.to_string(),
+        })
+        .await
+        .map(|_| ())
     }
 
     /// Conditionally update the status of a task only if it currently has `expected` status.
@@ -1012,47 +914,12 @@ impl TaskStore {
         status: TaskStatus,
         expected: TaskStatus,
     ) -> anyhow::Result<bool> {
-        let mut tx = self.pool.begin().await?;
-        let previous = sqlx::query("SELECT status, agent, model FROM tasks WHERE id = ?")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
-        let from_status: String = previous
-            .try_get("status")
-            .map_err(|e| anyhow::anyhow!("failed to read status column before update: {e}"))?;
-        let agent: Option<String> = previous
-            .try_get("agent")
-            .map_err(|e| anyhow::anyhow!("failed to read agent column before update: {e}"))?;
-        let model: Option<String> = previous
-            .try_get("model")
-            .map_err(|e| anyhow::anyhow!("failed to read model column before update: {e}"))?;
-        let sql = if status == TaskStatus::Blocked {
-            "UPDATE tasks SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ? AND status = ?"
-        } else {
-            "UPDATE tasks SET status = ?, block_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ? AND status = ?"
-        };
-        let result = sqlx::query(sql)
-            .bind(status.as_str())
-            .bind(id)
-            .bind(expected.as_str())
-            .execute(&mut *tx)
-            .await?;
-        if result.rows_affected() == 0 {
-            return Ok(false);
-        }
-        Self::append_activity_tx(
-            &mut tx,
+        self.write_bool(Command::TaskUpdateStatus {
             id,
-            "status_change",
-            Some(from_status.as_str()),
-            Some(status.as_str()),
-            agent.as_deref(),
-            model.as_deref(),
-            None,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(true)
+            status,
+            expected: Some(expected),
+        })
+        .await
     }
 
     /// Touch `updated_at` to now without changing any other field.
@@ -1063,51 +930,12 @@ impl TaskStore {
     /// that ran longer than `no_session_stuck_timeout` (default 10 min) would be
     /// re-dispatched by the tick while the runner is still writing results.
     pub async fn touch_updated_at(&self, id: i64) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
-        )
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.write(Command::TaskTouch { id }).await.map(|_| ())
     }
 
     /// Reset a task back to `new`.
     pub async fn reset_to_new(&self, id: i64) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
-        let previous = sqlx::query("SELECT status, agent, model FROM tasks WHERE id = ?")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
-        let from_status: String = previous
-            .try_get("status")
-            .map_err(|e| anyhow::anyhow!("failed to read status column before update: {e}"))?;
-        let agent: Option<String> = previous
-            .try_get("agent")
-            .map_err(|e| anyhow::anyhow!("failed to read agent column before update: {e}"))?;
-        let model: Option<String> = previous
-            .try_get("model")
-            .map_err(|e| anyhow::anyhow!("failed to read model column before update: {e}"))?;
-        sqlx::query(
-            "UPDATE tasks SET status = 'new', branch = '', worktree = '', worktree_cleaned = 0, block_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-        let details = serde_json::json!({ "op": "reset_to_new" });
-        Self::append_activity_tx(
-            &mut tx,
-            id,
-            "status_change",
-            Some(from_status.as_str()),
-            Some(TaskStatus::New.as_str()),
-            agent.as_deref(),
-            model.as_deref(),
-            Some(&details),
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(())
+        self.write(Command::TaskResetToNew { id }).await.map(|_| ())
     }
 
     /// Update the block reason for a task.
@@ -1388,37 +1216,7 @@ impl TaskStore {
         id: i64,
         updates: &[(&str, serde_json::Value)],
     ) -> anyhow::Result<()> {
-        if updates.is_empty() {
-            return Ok(());
-        }
-
-        for (col, _) in updates {
-            anyhow::ensure!(
-                ALLOWED_FIELDS.contains(col),
-                "column {col} is not in the update allowlist"
-            );
-        }
-
-        // Build SET clause dynamically
-        let mut set_parts = Vec::new();
-        let mut values: Vec<Option<String>> = Vec::new();
-
-        for (col, val) in updates {
-            set_parts.push(format!("{col} = ?"));
-            values.push(sql_value_for_task_field(col, val)?);
-        }
-
-        set_parts.push("updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')".to_string());
-        let sql = format!("UPDATE tasks SET {} WHERE id = ?", set_parts.join(", "));
-
-        let mut query = sqlx::query(&sql);
-        for v in &values {
-            query = query.bind(v.as_deref());
-        }
-        query = query.bind(id);
-        query.execute(&self.pool).await?;
-
-        Ok(())
+        self.set_fields_split(id, updates, false).await
     }
 
     /// Like `set_fields` but does NOT touch `updated_at`.
@@ -1430,35 +1228,44 @@ impl TaskStore {
         id: i64,
         updates: &[(&str, serde_json::Value)],
     ) -> anyhow::Result<()> {
-        if updates.is_empty() {
+        self.set_fields_split(id, updates, true).await
+    }
+
+    /// Local columns are written on this node only, the rest go through the log
+    async fn set_fields_split(
+        &self,
+        id: i64,
+        updates: &[(&str, serde_json::Value)],
+        silent: bool,
+    ) -> anyhow::Result<()> {
+        let all = owned_updates(updates)?;
+        // On one machine nothing is replicated, so the whole update stays one statement
+        if !self.replicates() {
+            let mut tx = self.pool.begin().await?;
+            apply::set_fields(&mut tx, &crate::cluster::now_stamp(), id, &all, silent).await?;
+            tx.commit().await?;
             return Ok(());
         }
 
-        for (col, _) in updates {
-            anyhow::ensure!(
-                ALLOWED_FIELDS.contains(col),
-                "column {col} is not in the update allowlist"
-            );
+        let (local, replicated): (Vec<_>, Vec<_>) =
+            all.into_iter().partition(|(col, _)| is_local_column(col));
+        if !local.is_empty() {
+            let mut tx = self.pool.begin().await?;
+            apply::set_fields(&mut tx, &crate::cluster::now_stamp(), id, &local, silent).await?;
+            tx.commit().await?;
         }
 
-        let mut set_parts = Vec::new();
-        let mut values: Vec<Option<String>> = Vec::new();
-
-        for (col, val) in updates {
-            set_parts.push(format!("{col} = ?"));
-            values.push(sql_value_for_task_field(col, val)?);
+        if replicated.is_empty() {
+            return Ok(());
         }
 
-        let sql = format!("UPDATE tasks SET {} WHERE id = ?", set_parts.join(", "));
-
-        let mut query = sqlx::query(&sql);
-        for v in &values {
-            query = query.bind(v.as_deref());
-        }
-        query = query.bind(id);
-        query.execute(&self.pool).await?;
-
-        Ok(())
+        self.write(Command::TaskSetFields {
+            id,
+            updates: replicated,
+            silent,
+        })
+        .await
+        .map(|_| ())
     }
 
     /// Increment an integer field by 1, returning the new value.
@@ -1467,45 +1274,23 @@ impl TaskStore {
             INCREMENTABLE_FIELDS.contains(&field),
             "field {field} is not incrementable"
         );
-
-        let sql = format!(
-        "UPDATE tasks SET {field} = {field} + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ? RETURNING {field} AS val"
-    );
-
-        let row = sqlx::query(&sql).bind(id).fetch_one(&self.pool).await?;
-
-        Ok(row.try_get("val")?)
+        let n = self
+            .write_int(Command::TaskIncrement {
+                id,
+                field: field.to_string(),
+            })
+            .await?;
+        Ok(i32::try_from(n)?)
     }
 
     /// Reset all failure/retry counters to zero.
     pub async fn reset_counters(&self, id: i64) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE tasks SET
-            attempts = 0,
-            route_attempts = 0,
-            review_agent_failures = 0,
-            merge_conflict_retries = 0,
-            pr_create_failures = 0,
-            push_failures = 0,
-            network_retries = 0,
-            ci_merge_failures = 0,
-            review_cycles = 0,
-            review_invocations = 0,
-            review_session_expected = 0,
-            auto_unblock_count = 0,
-            auto_unblock_last_at = '',
-            auto_unblock_last_reason = '',
-            ci_recovery_count = 0,
-            no_code_reroutes = 0,
-            no_code_last_agent = '',
-            needs_review_refires = 0,
-            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-         WHERE id = ?",
-        )
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.write(Command::TaskResetCounters {
+            id,
+            failure_only: false,
+        })
+        .await
+        .map(|_| ())
     }
 
     /// Reset transient failure/retry counters to zero, preserving
@@ -1523,28 +1308,12 @@ impl TaskStore {
     /// either causes subsequent retries to overwrite earlier audit trail records via
     /// the ON CONFLICT UPSERT in `start_run()`.
     pub async fn reset_failure_counters(&self, id: i64) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE tasks SET
-            route_attempts = 0,
-            review_agent_failures = 0,
-            pr_create_failures = 0,
-            push_failures = 0,
-            network_retries = 0,
-            review_session_expected = 0,
-            auto_unblock_count = 0,
-            auto_unblock_last_at = '',
-            auto_unblock_last_reason = '',
-            ci_recovery_count = 0,
-            no_code_reroutes = 0,
-            no_code_last_agent = '',
-            needs_review_refires = 0,
-            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-         WHERE id = ?",
-        )
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.write(Command::TaskResetCounters {
+            id,
+            failure_only: true,
+        })
+        .await
+        .map(|_| ())
     }
 
     // ---------------------------------------------------------------
@@ -1553,40 +1322,18 @@ impl TaskStore {
 
     /// Store routing results for a task.
     pub async fn store_route(&self, route: &StoreRoute<'_>) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE tasks SET
-            agent = ?, model = ?, complexity = ?, estimate = ?, route_reason = ?,
-            agent_profile = ?, selected_skills = ?,
-            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-         WHERE id = ?",
-        )
-        .bind(route.agent)
-        .bind(route.model)
-        .bind(route.complexity)
-        .bind(route.estimate as i64)
-        .bind(route.reason)
-        .bind(route.profile)
-        .bind(route.skills)
-        .bind(route.id)
-        .execute(&self.pool)
-        .await?;
-        let details = serde_json::json!({
-            "complexity": route.complexity,
-            "estimate": route.estimate,
-            "reason": route.reason,
-            "skills": route.skills,
-        });
-        self.append_activity(
-            route.id,
-            "dispatch",
-            None,
-            None,
-            Some(route.agent),
-            route.model,
-            Some(&details),
-        )
-        .await?;
-        Ok(())
+        self.write(Command::TaskStoreRoute(StoreRouteCmd {
+            id: route.id,
+            agent: route.agent.to_string(),
+            model: route.model.map(str::to_string),
+            complexity: route.complexity.to_string(),
+            estimate: route.estimate,
+            reason: route.reason.to_string(),
+            profile: route.profile.to_string(),
+            skills: route.skills.to_string(),
+        }))
+        .await
+        .map(|_| ())
     }
 
     /// Return `(external_id, estimate)` for all non-internal tasks that have a
@@ -1622,13 +1369,8 @@ impl TaskStore {
     /// when the orch estimate is still 0. This avoids overwriting estimates
     /// already set by the router.
     pub async fn set_estimate_if_zero(&self, id: i64, estimate: u8) -> anyhow::Result<bool> {
-        let result = sqlx::query("UPDATE tasks SET estimate = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ? AND estimate = 0")
-            .bind(estimate as i64)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-
-        Ok(result.rows_affected() > 0)
+        self.write_bool(Command::TaskSetEstimateIfZero { id, estimate })
+            .await
     }
 
     // ---------------------------------------------------------------
@@ -1640,41 +1382,12 @@ impl TaskStore {
     /// Uses a transaction to prevent lost-update races when concurrent
     /// callers append simultaneously.
     pub async fn append_memory(&self, id: i64, entry: &MemoryEntry) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
-
-        let row = sqlx::query("SELECT memory FROM tasks WHERE id = ?")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
-
-        // Propagate decode errors from the DB (e.g. invalid BLOB/UTF-8). We
-        // intentionally do not treat decode/parse failures as an empty memory
-        // because that would allow append_memory to overwrite a corrupt value
-        // with a new array containing only the new entry (data loss).
-        let memory_opt: Option<String> = row
-            .try_get::<Option<String>, _>("memory")
-            .map_err(|e| anyhow::anyhow!("failed to read memory column for task {id}: {e}"))?;
-        let memory_str = memory_opt.unwrap_or_default();
-
-        let mut memory: Vec<MemoryEntry> = if memory_str.trim().is_empty() {
-            Vec::new()
-        } else {
-            serde_json::from_str(&memory_str)
-                .map_err(|e| anyhow::anyhow!("failed to parse memory JSON for task {id}: {e}"))?
-        };
-        memory.push(entry.clone());
-        let new_json = serde_json::to_string(&memory)?;
-
-        sqlx::query(
-        "UPDATE tasks SET memory = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
-    )
-    .bind(&new_json)
-    .bind(id)
-    .execute(&mut *tx)
-    .await?;
-
-        tx.commit().await?;
-        Ok(())
+        self.write(Command::TaskAppendMemory {
+            id,
+            entry: entry.clone(),
+        })
+        .await
+        .map(|_| ())
     }
 
     /// Get the N most recent memory entries for a task.
@@ -1756,23 +1469,9 @@ impl TaskStore {
 
     /// Mark a task's worktree as cleaned.
     pub async fn mark_cleaned(&self, id: i64) -> anyhow::Result<()> {
-        sqlx::query(
-        "UPDATE tasks SET worktree_cleaned = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
-    )
-    .bind(id)
-    .execute(&self.pool)
-    .await?;
-        self.append_activity(
-            id,
-            "branch_delete",
-            None,
-            None,
-            None,
-            None,
-            Some(&serde_json::json!({ "worktree_cleaned": true })),
-        )
-        .await?;
-        Ok(())
+        self.write(Command::TaskMarkCleaned { id })
+            .await
+            .map(|_| ())
     }
 
     /// Batch-update fields for multiple tasks in a single transaction.
@@ -2477,6 +2176,7 @@ impl TaskStore {
             branch: row.try_get("branch").unwrap_or_default(),
             worktree: row.try_get("worktree").unwrap_or_default(),
             worktree_cleaned: row.try_get::<i32, _>("worktree_cleaned").unwrap_or(0) != 0,
+            owner_node: row.try_get("owner_node").unwrap_or(None),
             summary: row.try_get("summary").unwrap_or_default(),
             last_error: row.try_get("last_error").unwrap_or_default(),
             parent_id: row.try_get("parent_id").unwrap_or(None),
@@ -2846,6 +2546,662 @@ impl TaskStore {
                 .map_err(|e| anyhow::anyhow!("activity row decode error for model: {e}"))?,
             details,
         })
+    }
+}
+
+/// Columns that describe this node's own copy of a task, never sent through the log
+const LOCAL_TASK_COLUMNS: &[&str] = &[
+    "worktree",
+    "review_session_expected",
+    "input_tokens",
+    "output_tokens",
+    "input_cost_usd",
+    "output_cost_usd",
+    "total_cost_usd",
+];
+
+pub(crate) fn is_local_column(col: &str) -> bool {
+    LOCAL_TASK_COLUMNS.contains(&col)
+}
+
+/// Owned copy of [`UpsertExternal`], so it can travel in a Raft entry
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpsertExternalCmd {
+    pub repo: String,
+    pub ext_id: String,
+    pub title: String,
+    pub body: String,
+    pub author: String,
+    pub url: String,
+    pub labels: Vec<String>,
+    pub origin: String,
+    pub parent_id: Option<i64>,
+}
+
+/// Owned copy of [`StoreRoute`], so it can travel in a Raft entry
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoreRouteCmd {
+    pub id: i64,
+    pub agent: String,
+    pub model: Option<String>,
+    pub complexity: String,
+    pub estimate: u8,
+    pub reason: String,
+    pub profile: String,
+    pub skills: String,
+}
+
+/// The columns a done task's tombstone keeps. Nodes that had the task keep the rest locally
+const TOMBSTONE_COLUMNS: &[&str] = &[
+    "id",
+    "external_id",
+    "repo",
+    "origin",
+    "title",
+    "status",
+    "pr_number",
+    "parent_id",
+    "created_at",
+    "updated_at",
+];
+
+async fn replicated_columns(conn: &mut sqlx::SqliteConnection) -> anyhow::Result<Vec<String>> {
+    let cols: Vec<(String,)> = sqlx::query_as("SELECT name FROM pragma_table_info('tasks')")
+        .fetch_all(conn)
+        .await?;
+    Ok(cols
+        .into_iter()
+        .map(|(c,)| c)
+        .filter(|c| !is_local_column(c))
+        .collect())
+}
+
+/// Every task row as JSON with its replicated columns, done tasks as tombstones
+pub(crate) async fn replicated_rows(pool: &SqlitePool) -> anyhow::Result<Vec<serde_json::Value>> {
+    let mut conn = pool.acquire().await?;
+    let cols = replicated_columns(&mut conn).await?;
+    let full: Vec<&String> = cols.iter().collect();
+    let tomb: Vec<&String> = cols
+        .iter()
+        .filter(|c| TOMBSTONE_COLUMNS.contains(&c.as_str()))
+        .collect();
+    let sql = format!(
+        "SELECT CASE WHEN status = 'done' THEN {} ELSE {} END FROM tasks ORDER BY id",
+        super::replica::json_row_sql(&tomb),
+        super::replica::json_row_sql(&full)
+    );
+    let rows: Vec<(String,)> = sqlx::query_as(&sql).fetch_all(&mut *conn).await?;
+    rows.into_iter()
+        .map(|(r,)| Ok(serde_json::from_str(&r)?))
+        .collect()
+}
+
+/// Make the task rows match `rows`. Local columns, and a tombstone's missing columns, keep the local
+/// value. Tasks missing from `rows` go, with this node's runs and activity for them
+pub(crate) async fn replace_replicated(
+    conn: &mut sqlx::SqliteConnection,
+    rows: &[serde_json::Value],
+) -> anyhow::Result<()> {
+    let allowed = replicated_columns(conn).await?;
+    sqlx::query("PRAGMA defer_foreign_keys = ON")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("CREATE TEMP TABLE IF NOT EXISTS snapshot_ids (id INTEGER PRIMARY KEY)")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("DELETE FROM snapshot_ids")
+        .execute(&mut *conn)
+        .await?;
+    for row in rows {
+        let id = row["id"]
+            .as_i64()
+            .context("snapshot task row without an id")?;
+        sqlx::query("INSERT INTO snapshot_ids (id) VALUES (?)")
+            .bind(id)
+            .execute(&mut *conn)
+            .await?;
+    }
+
+    for table in ["task_runs", "task_activity"] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE task_id NOT IN (SELECT id FROM snapshot_ids)"
+        ))
+        .execute(&mut *conn)
+        .await?;
+    }
+
+    sqlx::query("DELETE FROM tasks WHERE id NOT IN (SELECT id FROM snapshot_ids)")
+        .execute(&mut *conn)
+        .await?;
+
+    for row in rows {
+        let obj = row
+            .as_object()
+            .context("snapshot task row is not an object")?;
+        let cols: Vec<&String> = obj.keys().collect();
+        for c in &cols {
+            anyhow::ensure!(
+                allowed.contains(c),
+                "snapshot names unknown task column {c}"
+            );
+        }
+
+        let values: Vec<String> = cols
+            .iter()
+            .map(|c| format!("json_extract(?1, '$.\"{c}\"')"))
+            .collect();
+        let updates: Vec<String> = cols.iter().map(|c| format!("{c} = excluded.{c}")).collect();
+        let names: Vec<&str> = cols.iter().map(|c| c.as_str()).collect();
+        let sql = format!(
+            "INSERT INTO tasks ({}) VALUES ({}) ON CONFLICT(id) DO UPDATE SET {}",
+            names.join(", "),
+            values.join(", "),
+            updates.join(", ")
+        );
+        sqlx::query(&sql)
+            .bind(serde_json::to_string(row)?)
+            .execute(&mut *conn)
+            .await?;
+    }
+
+    sqlx::query("DROP TABLE snapshot_ids")
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// The SQL behind each replicated task write, run with the proposer's time
+pub(crate) mod apply {
+    use super::*;
+    use sqlx::SqliteConnection;
+
+    async fn previous(
+        conn: &mut SqliteConnection,
+        id: i64,
+    ) -> anyhow::Result<(String, Option<String>, Option<String>)> {
+        let row = sqlx::query("SELECT status, agent, model FROM tasks WHERE id = ?")
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await?;
+        let status: String = row
+            .try_get("status")
+            .map_err(|e| anyhow::anyhow!("failed to read status column before update: {e}"))?;
+        let agent: Option<String> = row
+            .try_get("agent")
+            .map_err(|e| anyhow::anyhow!("failed to read agent column before update: {e}"))?;
+        let model: Option<String> = row
+            .try_get("model")
+            .map_err(|e| anyhow::anyhow!("failed to read model column before update: {e}"))?;
+        Ok((status, agent, model))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn activity(
+        conn: &mut SqliteConnection,
+        task_id: i64,
+        event_type: &str,
+        from_status: Option<&str>,
+        to_status: Option<&str>,
+        agent: Option<&str>,
+        model: Option<&str>,
+        details: Option<&serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        let details_json = match details {
+            Some(v) => serde_json::to_string(&sanitize_activity_details(v))?,
+            None => "{}".to_string(),
+        };
+        sqlx::query(
+            "INSERT INTO task_activity
+             (task_id, event_type, from_status, to_status, agent, model, details)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(task_id)
+        .bind(event_type)
+        .bind(from_status)
+        .bind(to_status)
+        .bind(agent)
+        .bind(model)
+        .bind(details_json)
+        .execute(conn)
+        .await?;
+        Ok(())
+    }
+
+    async fn status_change(
+        conn: &mut SqliteConnection,
+        id: i64,
+        previous: &(String, Option<String>, Option<String>),
+        to: TaskStatus,
+        details: Option<&serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        activity(
+            conn,
+            id,
+            "status_change",
+            Some(previous.0.as_str()),
+            Some(to.as_str()),
+            previous.1.as_deref(),
+            previous.2.as_deref(),
+            details,
+        )
+        .await
+    }
+
+    /// Through Raft, ids come from the replicated rows so every node assigns the same one.
+    /// Otherwise NULL lets SQLite's AUTOINCREMENT pick it, as before
+    pub(crate) async fn create(
+        conn: &mut SqliteConnection,
+        now: &str,
+        new: &NewTask,
+        internal: bool,
+        replicated: bool,
+    ) -> anyhow::Result<i64> {
+        let labels_json = serde_json::to_string(&new.labels)?;
+        let row = sqlx::query(
+            "INSERT INTO tasks (id, external_id, repo, origin, title, body, source, source_id, author, url, labels, parent_id, created_at, updated_at)
+             VALUES ((SELECT CASE WHEN ? THEN COALESCE(MAX(id), 0) + 1 END FROM tasks), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             RETURNING id",
+        )
+        .bind(replicated)
+        .bind(&new.external_id)
+        .bind(&new.repo)
+        .bind(&new.origin)
+        .bind(&new.title)
+        .bind(&new.body)
+        .bind(&new.source)
+        .bind(&new.source_id)
+        .bind(&new.author)
+        .bind(&new.url)
+        .bind(&labels_json)
+        .bind(new.parent_id)
+        .bind(now)
+        .bind(now)
+        .fetch_one(&mut *conn)
+        .await?;
+        let id: i64 = row
+            .try_get("id")
+            .map_err(|e| anyhow::anyhow!("INSERT RETURNING id returned NULL or invalid: {e}"))?;
+        if internal {
+            // resolve_task_id finds internal tasks by this external id
+            sqlx::query("UPDATE tasks SET external_id = ? WHERE id = ?")
+                .bind(format!("internal:{id}"))
+                .bind(id)
+                .execute(conn)
+                .await?;
+        }
+
+        Ok(id)
+    }
+
+    pub(crate) async fn upsert_external(
+        conn: &mut SqliteConnection,
+        now: &str,
+        ext: &UpsertExternalCmd,
+        replicated: bool,
+    ) -> anyhow::Result<i64> {
+        let labels_json = serde_json::to_string(&ext.labels)?;
+        let row = sqlx::query(
+            "INSERT INTO tasks (id, external_id, repo, origin, title, body, author, url, labels, parent_id, created_at, updated_at)
+             VALUES ((SELECT CASE WHEN ? THEN COALESCE(MAX(id), 0) + 1 END FROM tasks), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(repo, external_id) DO UPDATE SET
+                title = excluded.title,
+                body = excluded.body,
+                labels = excluded.labels,
+                url = excluded.url,
+                parent_id = COALESCE(excluded.parent_id, tasks.parent_id)
+             RETURNING id",
+        )
+        .bind(replicated)
+        .bind(&ext.ext_id)
+        .bind(&ext.repo)
+        .bind(&ext.origin)
+        .bind(&ext.title)
+        .bind(&ext.body)
+        .bind(&ext.author)
+        .bind(&ext.url)
+        .bind(&labels_json)
+        .bind(ext.parent_id)
+        .bind(now)
+        .bind(now)
+        .fetch_one(conn)
+        .await?;
+        row.try_get("id")
+            .map_err(|e| anyhow::anyhow!("INSERT RETURNING id returned NULL or invalid: {e}"))
+    }
+
+    fn ensure_allowed(updates: &[(String, serde_json::Value)]) -> anyhow::Result<()> {
+        for (col, _) in updates {
+            anyhow::ensure!(
+                ALLOWED_FIELDS.contains(&col.as_str()),
+                "column {col} is not in the update allowlist"
+            );
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn update_status_and_fields(
+        conn: &mut SqliteConnection,
+        now: &str,
+        id: i64,
+        status: TaskStatus,
+        updates: &[(String, serde_json::Value)],
+    ) -> anyhow::Result<()> {
+        ensure_allowed(updates)?;
+        let prev = previous(conn, id).await?;
+
+        let mut set_parts = vec!["status = ?".to_string()];
+        let mut values: Vec<Option<String>> = vec![Some(status.as_str().to_string())];
+        let mut block_reason_in_updates = false;
+        for (col, val) in updates {
+            if col == "block_reason" {
+                block_reason_in_updates = true;
+            }
+
+            set_parts.push(format!("{col} = ?"));
+            match val {
+                serde_json::Value::String(s) => values.push(Some(s.clone())),
+                serde_json::Value::Number(n) => values.push(Some(n.to_string())),
+                serde_json::Value::Bool(b) => {
+                    values.push(Some(if *b { "1" } else { "0" }.to_string()));
+                }
+                serde_json::Value::Null => values.push(None),
+                other => values.push(Some(serde_json::to_string(other)?)),
+            }
+        }
+
+        if !block_reason_in_updates && status != TaskStatus::Blocked {
+            set_parts.push("block_reason = NULL".to_string());
+        }
+
+        set_parts.push("updated_at = ?".to_string());
+        values.push(Some(now.to_string()));
+        let sql = format!("UPDATE tasks SET {} WHERE id = ?", set_parts.join(", "));
+        let mut query = sqlx::query(&sql);
+        for v in &values {
+            query = query.bind(v.as_deref());
+        }
+        query.bind(id).execute(&mut *conn).await?;
+        status_change(conn, id, &prev, status, None).await
+    }
+
+    /// Moves the task to `status`, and when `expected` is set only if it still holds that status
+    pub(crate) async fn update_status(
+        conn: &mut SqliteConnection,
+        now: &str,
+        id: i64,
+        status: TaskStatus,
+        expected: Option<TaskStatus>,
+    ) -> anyhow::Result<bool> {
+        let prev = previous(conn, id).await?;
+        let clear_block = if status == TaskStatus::Blocked {
+            ""
+        } else {
+            ", block_reason = NULL"
+        };
+        let guard = if expected.is_some() {
+            " AND status = ?"
+        } else {
+            ""
+        };
+        let sql =
+            format!("UPDATE tasks SET status = ?{clear_block}, updated_at = ? WHERE id = ?{guard}");
+        let mut query = sqlx::query(&sql).bind(status.as_str()).bind(now).bind(id);
+        if let Some(expected) = expected {
+            query = query.bind(expected.as_str());
+        }
+
+        if query.execute(&mut *conn).await?.rows_affected() == 0 {
+            return Ok(false);
+        }
+
+        status_change(conn, id, &prev, status, None).await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn update_external_id(
+        conn: &mut SqliteConnection,
+        now: &str,
+        id: i64,
+        external_id: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE tasks SET external_id = ?, updated_at = ? WHERE id = ?")
+            .bind(external_id)
+            .bind(now)
+            .bind(id)
+            .execute(conn)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn touch(
+        conn: &mut SqliteConnection,
+        now: &str,
+        id: i64,
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE tasks SET updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(id)
+            .execute(conn)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn reset_to_new(
+        conn: &mut SqliteConnection,
+        now: &str,
+        id: i64,
+    ) -> anyhow::Result<()> {
+        let prev = previous(conn, id).await?;
+        sqlx::query(
+            "UPDATE tasks SET status = 'new', branch = '', worktree = '', worktree_cleaned = 0, block_reason = NULL, updated_at = ? WHERE id = ?",
+        )
+        .bind(now)
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+        let details = serde_json::json!({ "op": "reset_to_new" });
+        status_change(conn, id, &prev, TaskStatus::New, Some(&details)).await
+    }
+
+    /// `silent` leaves `updated_at` alone, for bookkeeping that must not look like activity
+    pub(crate) async fn set_fields(
+        conn: &mut SqliteConnection,
+        now: &str,
+        id: i64,
+        updates: &[(String, serde_json::Value)],
+        silent: bool,
+    ) -> anyhow::Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        ensure_allowed(updates)?;
+        let mut set_parts = Vec::new();
+        let mut values: Vec<Option<String>> = Vec::new();
+        for (col, val) in updates {
+            set_parts.push(format!("{col} = ?"));
+            values.push(sql_value_for_task_field(col, val)?);
+        }
+
+        if !silent {
+            set_parts.push("updated_at = ?".to_string());
+            values.push(Some(now.to_string()));
+        }
+
+        let sql = format!("UPDATE tasks SET {} WHERE id = ?", set_parts.join(", "));
+        let mut query = sqlx::query(&sql);
+        for v in &values {
+            query = query.bind(v.as_deref());
+        }
+        query.bind(id).execute(conn).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn increment(
+        conn: &mut SqliteConnection,
+        now: &str,
+        id: i64,
+        field: &str,
+    ) -> anyhow::Result<i64> {
+        anyhow::ensure!(
+            INCREMENTABLE_FIELDS.contains(&field),
+            "field {field} is not incrementable"
+        );
+        let sql = format!(
+            "UPDATE tasks SET {field} = {field} + 1, updated_at = ? WHERE id = ? RETURNING {field} AS val"
+        );
+        let row = sqlx::query(&sql).bind(now).bind(id).fetch_one(conn).await?;
+        let val: i32 = row.try_get("val")?;
+        Ok(val.into())
+    }
+
+    /// `failure_only` keeps `attempts`, `review_invocations`, `review_cycles`,
+    /// `ci_merge_failures` and `merge_conflict_retries`, see `reset_failure_counters`
+    pub(crate) async fn reset_counters(
+        conn: &mut SqliteConnection,
+        now: &str,
+        id: i64,
+        failure_only: bool,
+    ) -> anyhow::Result<()> {
+        let all = if failure_only {
+            ""
+        } else {
+            "attempts = 0, merge_conflict_retries = 0, ci_merge_failures = 0, review_cycles = 0, review_invocations = 0,"
+        };
+        let sql = format!(
+            "UPDATE tasks SET {all}
+            route_attempts = 0,
+            review_agent_failures = 0,
+            pr_create_failures = 0,
+            push_failures = 0,
+            network_retries = 0,
+            review_session_expected = 0,
+            auto_unblock_count = 0,
+            auto_unblock_last_at = '',
+            auto_unblock_last_reason = '',
+            ci_recovery_count = 0,
+            no_code_reroutes = 0,
+            no_code_last_agent = '',
+            needs_review_refires = 0,
+            updated_at = ?
+         WHERE id = ?"
+        );
+        sqlx::query(&sql).bind(now).bind(id).execute(conn).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn store_route(
+        conn: &mut SqliteConnection,
+        now: &str,
+        route: &StoreRouteCmd,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE tasks SET
+            agent = ?, model = ?, complexity = ?, estimate = ?, route_reason = ?,
+            agent_profile = ?, selected_skills = ?,
+            updated_at = ?
+         WHERE id = ?",
+        )
+        .bind(&route.agent)
+        .bind(&route.model)
+        .bind(&route.complexity)
+        .bind(route.estimate as i64)
+        .bind(&route.reason)
+        .bind(&route.profile)
+        .bind(&route.skills)
+        .bind(now)
+        .bind(route.id)
+        .execute(&mut *conn)
+        .await?;
+        let details = serde_json::json!({
+            "complexity": route.complexity,
+            "estimate": route.estimate,
+            "reason": route.reason,
+            "skills": route.skills,
+        });
+        activity(
+            conn,
+            route.id,
+            "dispatch",
+            None,
+            None,
+            Some(&route.agent),
+            route.model.as_deref(),
+            Some(&details),
+        )
+        .await
+    }
+
+    pub(crate) async fn set_estimate_if_zero(
+        conn: &mut SqliteConnection,
+        now: &str,
+        id: i64,
+        estimate: u8,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE tasks SET estimate = ?, updated_at = ? WHERE id = ? AND estimate = 0",
+        )
+        .bind(estimate as i64)
+        .bind(now)
+        .bind(id)
+        .execute(conn)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub(crate) async fn append_memory(
+        conn: &mut SqliteConnection,
+        now: &str,
+        id: i64,
+        entry: &MemoryEntry,
+    ) -> anyhow::Result<()> {
+        let row = sqlx::query("SELECT memory FROM tasks WHERE id = ?")
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await?;
+        // A corrupt value must fail, an empty array in its place would lose the old entries
+        let memory_opt: Option<String> = row
+            .try_get::<Option<String>, _>("memory")
+            .map_err(|e| anyhow::anyhow!("failed to read memory column for task {id}: {e}"))?;
+        let memory_str = memory_opt.unwrap_or_default();
+        let mut memory: Vec<MemoryEntry> = if memory_str.trim().is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(&memory_str)
+                .map_err(|e| anyhow::anyhow!("failed to parse memory JSON for task {id}: {e}"))?
+        };
+        memory.push(entry.clone());
+        sqlx::query("UPDATE tasks SET memory = ?, updated_at = ? WHERE id = ?")
+            .bind(serde_json::to_string(&memory)?)
+            .bind(now)
+            .bind(id)
+            .execute(conn)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn mark_cleaned(
+        conn: &mut SqliteConnection,
+        now: &str,
+        id: i64,
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE tasks SET worktree_cleaned = 1, updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(id)
+            .execute(&mut *conn)
+            .await?;
+        activity(
+            conn,
+            id,
+            "branch_delete",
+            None,
+            None,
+            None,
+            None,
+            Some(&serde_json::json!({ "worktree_cleaned": true })),
+        )
+        .await
     }
 }
 

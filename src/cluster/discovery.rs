@@ -1,0 +1,187 @@
+//! Finds the other orch nodes on the tailnet from `tailscale status --json`
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+
+use super::NodeId;
+
+#[derive(Deserialize)]
+struct Status {
+    #[serde(rename = "Self")]
+    me: Peer,
+    #[serde(rename = "Peer", default)]
+    peers: HashMap<String, Peer>,
+}
+
+#[derive(Deserialize)]
+struct Peer {
+    #[serde(rename = "DNSName", default)]
+    dns_name: String,
+    #[serde(rename = "TailscaleIPs", default)]
+    ips: Vec<String>,
+    #[serde(rename = "Online", default)]
+    online: bool,
+}
+
+/// A machine on the tailnet, by node name and Tailscale IPv4
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Host {
+    pub name: String,
+    pub ip: String,
+    pub online: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tailnet {
+    pub me: Host,
+    /// Every peer, online or not, sorted by name. A voter that is down still has an address
+    pub peers: Vec<Host>,
+}
+
+impl Tailnet {
+    /// The address of a machine by node name, this one included
+    pub fn ip_of(&self, name: &str) -> Option<&str> {
+        self.all_named(name).first().map(|h| h.ip.as_str())
+    }
+
+    /// Every machine with this node name, this one included
+    pub fn all_named(&self, name: &str) -> Vec<&Host> {
+        std::iter::once(&self.me)
+            .chain(&self.peers)
+            .filter(|h| h.name == name)
+            .collect()
+    }
+}
+
+/// The first label of the MagicDNS name. `HostName` can hold spaces, like "m1 max"
+fn node_name(dns_name: &str) -> String {
+    dns_name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+fn host(peer: &Peer) -> Option<Host> {
+    let name = node_name(&peer.dns_name);
+    let ip = peer.ips.iter().find(|ip| ip.contains('.'))?.clone();
+    (!name.is_empty()).then_some(Host {
+        name,
+        ip,
+        online: peer.online,
+    })
+}
+
+/// The MagicDNS suffix after the first label, which names the tailnet
+fn tailnet_suffix(dns_name: &str) -> &str {
+    dns_name
+        .split_once('.')
+        .map(|(_, rest)| rest)
+        .unwrap_or_default()
+}
+
+/// Only machines of this tailnet. A device shared in from another tailnet has another suffix
+pub fn parse(json: &str) -> anyhow::Result<Tailnet> {
+    let status: Status = serde_json::from_str(json)?;
+    let me = host(&status.me)
+        .ok_or_else(|| anyhow::anyhow!("tailscale reports no name or IPv4 for this machine"))?;
+    let suffix = tailnet_suffix(&status.me.dns_name).to_ascii_lowercase();
+    let mut peers: Vec<Host> = status
+        .peers
+        .values()
+        .filter(|p| tailnet_suffix(&p.dns_name).eq_ignore_ascii_case(&suffix))
+        .filter_map(host)
+        .collect();
+    peers.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(Tailnet { me, peers })
+}
+
+pub async fn status() -> anyhow::Result<Tailnet> {
+    let out = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new("tailscale")
+            .args(["status", "--json"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await??;
+    anyhow::ensure!(
+        out.status.success(),
+        "tailscale status failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    parse(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// A stable id from the node name, so a reinstall of orch keeps its Raft id
+pub fn node_id(name: &str) -> NodeId {
+    let digest = Sha256::digest(name.as_bytes());
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STATUS: &str = r#"{
+        "Self": {"HostName": "m4", "DNSName": "m4.tail0.ts.net.", "TailscaleIPs": ["100.1.1.4", "fd7a::4"], "Online": true},
+        "Peer": {
+            "a": {"HostName": "m1 max", "DNSName": "m1-max.tail0.ts.net.", "TailscaleIPs": ["100.1.1.1"], "Online": true},
+            "b": {"HostName": "legion", "DNSName": "Legion.tail0.ts.net.", "TailscaleIPs": ["fd7a::2", "100.1.1.2"], "Online": true},
+            "c": {"HostName": "localhost", "DNSName": "phone.tail0.ts.net.", "TailscaleIPs": ["100.1.1.9"], "Online": false},
+            "d": {"HostName": "odd", "DNSName": "", "TailscaleIPs": ["100.1.1.8"], "Online": true},
+            "e": {"HostName": "legion", "DNSName": "legion.other.ts.net.", "TailscaleIPs": ["100.9.9.9"], "Online": true}
+        }
+    }"#;
+
+    #[test]
+    fn parse_names_hosts_by_dns_label_and_keeps_ipv4_peers_with_their_state() {
+        let t = parse(STATUS).unwrap();
+        assert_eq!(
+            t.me,
+            Host {
+                name: "m4".into(),
+                ip: "100.1.1.4".into(),
+                online: true,
+            }
+        );
+        let names: Vec<(&str, &str, bool)> = t
+            .peers
+            .iter()
+            .map(|h| (h.name.as_str(), h.ip.as_str(), h.online))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("legion", "100.1.1.2", true),
+                ("m1-max", "100.1.1.1", true),
+                ("phone", "100.1.1.9", false)
+            ]
+        );
+        assert_eq!(t.ip_of("m4"), Some("100.1.1.4"));
+        assert_eq!(t.ip_of("phone"), Some("100.1.1.9"));
+        assert_eq!(t.ip_of("nowhere"), None);
+    }
+
+    #[test]
+    fn node_id_is_stable_and_distinct() {
+        assert_eq!(node_id("legion"), node_id("legion"));
+        assert_ne!(node_id("legion"), node_id("m1-max"));
+        // Pinned, so a change of hash would show here before it renumbers a live cluster
+        assert_eq!(
+            node_id("m4"),
+            u64::from_be_bytes(Sha256::digest(b"m4")[..8].try_into().unwrap())
+        );
+    }
+
+    #[test]
+    fn parse_rejects_a_machine_without_ipv4() {
+        let json = r#"{"Self": {"DNSName": "m4.t.ts.net.", "TailscaleIPs": ["fd7a::4"]}}"#;
+        assert!(parse(json).is_err());
+    }
+}

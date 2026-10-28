@@ -153,3 +153,7 @@ gh:
 ### Agent Session Tokens
 
 When spawning agents in tmux sessions, tokens are injected via the tmux session environment (`tmux set-environment`) rather than being embedded in runner scripts. This prevents token leakage to disk and enables centralized token rotation without restarting agents.
+
+## Cluster
+
+The `cluster` section runs orch on several machines. Without it orch runs on one machine. Keys, roles and setup are in [Cluster](@/cluster.md).

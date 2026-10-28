@@ -61,6 +61,23 @@ impl Shipcheck {
     }
 }
 
+/// The `orch progress` step appears only when a `cluster:` section turns the cluster on.
+/// Separate flags, because the template engine does not nest `{{#if}}` blocks
+fn insert_cluster_vars(shipcheck: Shipcheck, vars: &mut HashMap<String, String>) {
+    if !crate::cluster::enabled() {
+        return;
+    }
+
+    let commit = if shipcheck == Shipcheck::Available {
+        "CLUSTER_SHIPCHECK"
+    } else {
+        "CLUSTER_GIT"
+    };
+    for flag in ["CLUSTER", commit] {
+        vars.insert(flag.to_string(), "1".to_string());
+    }
+}
+
 async fn run_shipcheck(
     bin: &std::path::Path,
     work_dir: &std::path::Path,
@@ -538,6 +555,7 @@ pub fn build_system_prompt(
 
     vars.insert("DEFAULT_BRANCH".to_string(), default_branch.to_string());
     shipcheck.insert_vars(&mut vars);
+    insert_cluster_vars(shipcheck, &mut vars);
 
     if let Some(rr) = route_result {
         vars.insert("ROLE".to_string(), rr.profile.role.clone());
@@ -672,6 +690,7 @@ pub fn build_review_prompt(
 ) -> String {
     let mut vars = HashMap::new();
     shipcheck.insert_vars(&mut vars);
+    insert_cluster_vars(shipcheck, &mut vars);
     vars.insert("TASK_ID".to_string(), task.id.0.clone());
     vars.insert("TASK_TITLE".to_string(), task.title.clone());
     vars.insert("TASK_BODY".to_string(), task.body.clone());
@@ -1181,5 +1200,22 @@ mod tests {
             assert!(!install_shipcheck_hooks(work.path(), s, &bin).await);
         }
         assert!(!work.path().join("installed").exists());
+    }
+
+    #[test]
+    fn the_progress_step_appears_only_in_cluster_mode() {
+        let mut vars = HashMap::new();
+        insert_cluster_vars(Shipcheck::Available, &mut vars);
+        assert!(vars.is_empty(), "no cluster section, no cluster flags");
+        let plain = crate::template::render_template_str(AGENT_SYSTEM_TEMPLATE, &vars).unwrap();
+        assert!(!plain.contains("orch progress"));
+
+        for flag in ["CLUSTER", "CLUSTER_SHIPCHECK"] {
+            vars.insert(flag.to_string(), "1".to_string());
+        }
+        let cluster = crate::template::render_template_str(AGENT_SYSTEM_TEMPLATE, &vars).unwrap();
+        assert!(cluster.contains("orch progress"));
+        assert!(cluster.contains("commits only through `shipcheck commit`"));
+        assert!(!cluster.contains("It commits anything you left"));
     }
 }

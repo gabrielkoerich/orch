@@ -69,14 +69,14 @@ pub async fn run(
             }
             UserChoice::Edit => {
                 edit_messages(&mut plans)?;
-                execute_plans(&plans)?;
+                execute(&plans).await?;
                 return Ok(());
             }
             UserChoice::Yes => {}
         }
     }
 
-    execute_plans(&plans)
+    execute(&plans).await
 }
 
 /// Replace each plan's heuristic message with an LLM-drafted one.
@@ -304,6 +304,32 @@ fn run_git(args: &[String]) -> anyhow::Result<String> {
         anyhow::bail!("git {} failed", args.join(" "));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// shipcheck commits exactly the tree that passed, so in a shipcheck repository the groups become one commit
+async fn execute(plans: &[CommitPlan]) -> anyhow::Result<()> {
+    use crate::engine::runner::commit;
+    let dir = std::env::current_dir()?;
+    if commit::Tool::detect(&dir).await != commit::Tool::Shipcheck {
+        return execute_plans(plans);
+    }
+
+    let message = plans
+        .iter()
+        .map(|p| p.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    match commit::commit_all(&dir, &message, "orch", commit::When::Tested).await? {
+        commit::Outcome::Committed => {
+            println!("committed through shipcheck");
+            Ok(())
+        }
+        commit::Outcome::Nothing => {
+            println!("nothing to commit");
+            Ok(())
+        }
+        commit::Outcome::Refused { reason, .. } => anyhow::bail!(reason),
+    }
 }
 
 fn execute_plans(plans: &[CommitPlan]) -> anyhow::Result<()> {

@@ -7,8 +7,10 @@ pub mod doctor;
 pub mod events;
 pub mod job;
 pub mod ndjson;
+pub mod nodes;
 pub mod notify;
 pub mod plan;
+pub mod progress;
 pub mod prune;
 pub mod service;
 pub mod session;
@@ -758,18 +760,22 @@ fn read_project_repo(project_path: &std::path::Path) -> Option<String> {
 pub async fn init_task_manager() -> anyhow::Result<TaskManager> {
     use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
-    use crate::store::TaskStore;
 
     let repo = config::get_current_repo()
         .context("'repo' not set — run `orch init` or set gh.repo in .orch.yml")?;
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
-    let store = Arc::new(TaskStore::open(&crate::store::default_db_path().await?).await?);
+    let store = Arc::new(init_store().await?);
     Ok(TaskManager::with_store(backend, store, repo))
 }
 
 /// Initialize the unified task store for CLI commands.
 pub async fn init_store() -> anyhow::Result<crate::store::TaskStore> {
-    crate::store::TaskStore::open(&crate::store::default_db_path().await?).await
+    let store = crate::store::TaskStore::open(&crate::store::default_db_path().await?).await?;
+    if let Some(endpoint) = crate::cluster::local::daemon_endpoint().await {
+        store.attach_daemon(endpoint);
+    }
+
+    Ok(store)
 }
 
 #[cfg(test)]

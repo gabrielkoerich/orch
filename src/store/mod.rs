@@ -26,15 +26,17 @@
 use anyhow::Context;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
-mod control;
-mod dependencies;
+pub(crate) mod control;
+pub(crate) mod dependencies;
 mod helpers;
-mod jobs;
-mod kv;
+pub(crate) mod jobs;
+pub(crate) mod kv;
 mod metrics;
 mod pricing;
-mod tasks;
+pub(crate) mod replica;
+pub(crate) mod tasks;
 
 #[allow(unused_imports)]
 pub use control::{parse_since_duration, ChatCostSummary, ControlMessage, MemoryEntry};
@@ -76,6 +78,10 @@ pub async fn default_db_path() -> anyhow::Result<std::path::PathBuf> {
 #[derive(Clone)]
 pub struct TaskStore {
     pool: SqlitePool,
+    /// Set once on the daemon. Without it, replicated writes apply directly, as in tests and the CLI
+    raft: Arc<OnceLock<crate::cluster::Node>>,
+    /// Set on the CLI when a daemon runs, so its writes go through the daemon's log
+    daemon: Arc<OnceLock<crate::cluster::local::Endpoint>>,
 }
 
 impl TaskStore {
@@ -96,7 +102,11 @@ impl TaskStore {
             .await
             .with_context(|| format!("opening task store: {}", db_path.display()))?;
 
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            raft: Arc::default(),
+            daemon: Arc::default(),
+        };
         store.migrate().await?;
         Ok(store)
     }
@@ -121,7 +131,11 @@ impl TaskStore {
             .await
             .with_context(|| format!("opening task store (single): {}", db_path.display()))?;
 
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            raft: Arc::default(),
+            daemon: Arc::default(),
+        };
         store.migrate().await?;
         Ok(store)
     }
@@ -137,7 +151,11 @@ impl TaskStore {
             .connect_with(options)
             .await?;
 
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            raft: Arc::default(),
+            daemon: Arc::default(),
+        };
         store.migrate().await?;
         Ok(store)
     }
@@ -151,10 +169,95 @@ impl TaskStore {
         Ok(())
     }
 
+    pub fn attach_node(&self, node: crate::cluster::Node) {
+        if self.raft.set(node).is_err() {
+            tracing::warn!("raft already attached to the task store");
+        }
+    }
+
+    /// True on the node that decides: the Raft leader, or a store with no Raft, as in the CLI and tests.
+    /// A single node always leads, so one machine runs every phase as before
+    pub fn is_leader(&self) -> bool {
+        self.raft.get().is_none_or(|node| node.is_leader())
+    }
+
+    /// Writes go through Raft or a daemon that runs it, so they reach the other machines
+    pub(crate) fn replicates(&self) -> bool {
+        self.raft.get().is_some() || self.daemon.get().is_some()
+    }
+
+    pub fn node(&self) -> Option<&crate::cluster::Node> {
+        self.raft.get()
+    }
+
+    pub fn attach_daemon(&self, endpoint: crate::cluster::local::Endpoint) {
+        let _ = self.daemon.set(endpoint);
+    }
+
+    /// Propose a replicated write through Raft, or apply it directly when no Raft is attached
+    pub(crate) async fn write(
+        &self,
+        cmd: crate::cluster::Command,
+    ) -> anyhow::Result<crate::cluster::Reply> {
+        let Some(node) = self.raft.get() else {
+            if let Some(endpoint) = self.daemon.get() {
+                match crate::cluster::local::send(endpoint, &cmd).await {
+                    Ok(reply) => return reply_result(reply),
+                    // Nothing was sent, so applying here cannot apply the command twice
+                    Err(e) if e.is_connect() => {
+                        tracing::debug!(err = %e, "daemon not listening, writing directly");
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+
+            return self.apply_direct(cmd).await;
+        };
+        let req = crate::cluster::Request {
+            now: crate::cluster::now_stamp(),
+            cmd,
+        };
+        reply_result(node.write(req).await?)
+    }
+
+    pub(crate) async fn write_int(&self, cmd: crate::cluster::Command) -> anyhow::Result<i64> {
+        match self.write(cmd).await? {
+            crate::cluster::Reply::Int(n) => Ok(n),
+            other => anyhow::bail!("expected an integer reply, got {other:?}"),
+        }
+    }
+
+    pub(crate) async fn write_bool(&self, cmd: crate::cluster::Command) -> anyhow::Result<bool> {
+        match self.write(cmd).await? {
+            crate::cluster::Reply::Bool(b) => Ok(b),
+            other => anyhow::bail!("expected a boolean reply, got {other:?}"),
+        }
+    }
+
+    /// The same SQL apply runs, in one transaction on this node only
+    pub(crate) async fn apply_direct(
+        &self,
+        cmd: crate::cluster::Command,
+    ) -> anyhow::Result<crate::cluster::Reply> {
+        let mut tx = self.pool.begin().await?;
+        let reply = cmd
+            .apply(&mut tx, &crate::cluster::now_stamp(), false)
+            .await?;
+        tx.commit().await?;
+        Ok(reply)
+    }
+
     /// Get a reference to the underlying pool (for advanced queries).
     #[allow(dead_code)]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+}
+
+fn reply_result(reply: crate::cluster::Reply) -> anyhow::Result<crate::cluster::Reply> {
+    match reply {
+        crate::cluster::Reply::Err(e) => Err(anyhow::anyhow!(e)),
+        other => Ok(other),
     }
 }
 
