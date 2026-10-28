@@ -130,17 +130,8 @@ gh:
   #   review: ""
   #   done: ""
   auth:
-    # Auth mode: "auto" | "token" | "github_app" | "gh_cli"
-    # - "auto" (default): GH_TOKEN/GITHUB_TOKEN env → GitHub App → gh CLI
-    # - "token": Require PAT from env vars or gh.auth.token
-    # - "github_app": Use GitHub App authentication
-    # - "gh_cli": Always use `gh auth token`
-    mode: "auto"
+    # Used when GH_TOKEN and GITHUB_TOKEN are unset, before falling back to `gh auth token`
     # token: "ghp_xxxxxxxxxxxxxxxxxxxx"
-    # app_id: "123456"
-    # private_key: "/path/to/app-private-key.pem"
-    # installation_id: "78901234"
-    allow_gh_fallback: true
 
 # GitHub webhook server for instant event delivery (bypasses polling)
 # webhook:

@@ -7,7 +7,6 @@
 //! - `GH_TOKEN` / `GITHUB_TOKEN` environment variables
 //! - `gh.auth.token` config value
 //! - `gh auth token` CLI fallback (default — just run `gh auth login`)
-//! - GitHub App JWT generation (with app_id + private_key configuration)
 
 use super::token;
 use super::types::{
