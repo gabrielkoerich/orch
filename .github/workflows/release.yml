@@ -404,6 +404,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.94.1
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-build"
+          cache-all-crates: true
+
       # Publish first: a tag without a crate is worse than a crate without a tag, and a rerun then tags it
       - name: Publish to crates.io
         env:
