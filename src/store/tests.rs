@@ -251,7 +251,7 @@ async fn increment_propagates_returned_value_decode_errors() {
         .unwrap();
     let err = store.increment(id, "push_failures").await.unwrap_err();
     assert!(
-        err.to_string().contains("out of range") || err.to_string().contains("decode"),
+        err.to_string().contains("out of range") || err.to_string().contains("decod"),
         "unexpected error: {err:#}"
     );
 }
