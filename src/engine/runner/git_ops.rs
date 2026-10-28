@@ -995,7 +995,7 @@ pub(crate) async fn force_push_leased(
     let expected = expected_force_sha(dir, branch, default_branch).await?;
     let lease = format!("--force-with-lease={branch}:{expected}");
     tracing::info!(branch, expected_sha = %expected, "force-pushing with an expected remote sha");
-    let auth_env = build_git_auth_env();
+    let auth_env = build_git_auth_env().await;
     let output = Command::new("git")
         .args([
             "-c",
