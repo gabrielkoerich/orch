@@ -277,6 +277,15 @@ jobs:
           prefix-key: "v1-build"
           cache-all-crates: true
 
+      # After the cache step, so its key hashes the committed manifest. perl, since BSD and GNU sed -i differ
+      - name: Stamp the version
+        env:
+          VERSION: ${{ needs.check-release.outputs.version }}
+        run: |
+          export V="${VERSION#v}"
+          perl -0pi -e 's/^version = .*$/version = "$ENV{V}"/m' Cargo.toml
+          perl -0pi -e 's/^(name = "orch-cli"\n)version = .*$/$1version = "$ENV{V}"/m' Cargo.lock
+
       - name: Build release binary
         env:
           ORCH_BUILD_VERSION: ${{ needs.check-release.outputs.version }}
@@ -352,6 +361,14 @@ jobs:
           prefix-key: "v1-build"
           cache-all-crates: true
 
+      - name: Stamp the version
+        env:
+          VERSION: ${{ needs.check-release.outputs.version }}
+        run: |
+          export V="${VERSION#v}"
+          perl -0pi -e 's/^version = .*$/version = "$ENV{V}"/m' Cargo.toml
+          perl -0pi -e 's/^(name = "orch-cli"\n)version = .*$/$1version = "$ENV{V}"/m' Cargo.lock
+
       - name: Build release binary
         env:
           ORCH_BUILD_VERSION: ${{ needs.check-release.outputs.version }}
@@ -372,8 +389,6 @@ jobs:
   release:
     needs: [check, test, secrets, check-release, build-macos, build-linux]
     if: github.ref == 'refs/heads/main' && needs.check-release.outputs.skip == 'false'
-    # RELEASE_TOKEN lives in this environment, which only main can use
-    environment: release
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -405,24 +420,38 @@ jobs:
           prefix-key: "v1-build"
           cache-all-crates: true
 
+      - name: Stamp the version
+        env:
+          VERSION: ${{ needs.check-release.outputs.version }}
+        run: |
+          export V="${VERSION#v}"
+          perl -0pi -e 's/^version = .*$/version = "$ENV{V}"/m' Cargo.toml
+          perl -0pi -e 's/^(name = "orch-cli"\n)version = .*$/$1version = "$ENV{V}"/m' Cargo.lock
+
       # Publish first: a tag without a crate is worse than a crate without a tag, and a rerun then tags it
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           VERSION: ${{ needs.check-release.outputs.version }}
-        run: |
-          sed -i "0,/^version = .*/s//version = \"${VERSION#v}\"/" Cargo.toml
-          sed -i "/^name = \"orch-cli\"$/{n;s/^version = .*/version = \"${VERSION#v}\"/}" Cargo.lock
-          ORCH_BUILD_VERSION="$VERSION" cargo publish --allow-dirty
+        run: ORCH_BUILD_VERSION="$VERSION" cargo publish --allow-dirty
 
-      - name: Commit the version bump and tag it
+      - name: Create tag
         env:
-          # An admin token, main requires checks that the bump commit has not run
+          # Optional admin token, main requires checks that a bump commit has not run
           RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check-release.outputs.version }}
         run: |
-          VERSION="${{ needs.check-release.outputs.version }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -z "$RELEASE_TOKEN" ]; then
+            # The tag must sit on main, check-release finds the last version with git describe
+            echo "::notice::RELEASE_TOKEN is not set, main keeps its version and only the tag is pushed"
+            git tag -a "$VERSION" -m "$VERSION"
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$VERSION"
+            exit 0
+          fi
+
           git add Cargo.toml Cargo.lock
           git commit -m "chore: bump version to ${VERSION}"
           git tag -a "$VERSION" -m "$VERSION"
