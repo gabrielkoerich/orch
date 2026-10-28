@@ -2,7 +2,7 @@
 //!
 //! Uses the Telegram Bot API to receive commands and stream agent output.
 
-use super::{Channel, IncomingMessage, OutgoingMessage};
+use super::{html_escape, Channel, IncomingMessage, OutgoingMessage};
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -52,12 +52,6 @@ fn split_for_telegram(text: &str, max: usize) -> Vec<String> {
         parts.push(current);
     }
     parts
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 fn is_preformatted_html(msg: &OutgoingMessage) -> bool {
