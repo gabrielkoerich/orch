@@ -176,9 +176,11 @@ pub struct Node {
 
 impl Node {
     /// Propose on this node, or forward to the leader when this node follows. During an election
-    /// no leader is known yet, so it waits for one and tries again
+    /// the leader can be unknown or stale, so it waits and tries again, but only a write that was
+    /// certainly not applied is sent again
     pub async fn write(&self, req: Request) -> anyhow::Result<Reply> {
-        for attempt in 0..2 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
             let err = match self.raft.client_write(req.clone()).await {
                 Ok(r) => return Ok(r.data),
                 Err(e) => e,
@@ -186,21 +188,23 @@ impl Node {
             let RaftError::APIError(ClientWriteError::ForwardToLeader(f)) = &err else {
                 return Err(err.into());
             };
-            match (&f.leader_node, &self.secret) {
-                (Some(leader), Some(secret)) => {
-                    return network::forward(&leader.addr, secret, &req).await;
-                }
-                (None, Some(_)) if attempt == 0 => {
-                    self.raft
-                        .wait(Some(Duration::from_secs(5)))
-                        .metrics(|m| m.current_leader.is_some(), "a leader is known")
-                        .await?;
-                }
-                _ => return Err(err.into()),
+            let Some(secret) = &self.secret else {
+                return Err(err.into());
+            };
+            let reason = match &f.leader_node {
+                Some(leader) => match network::forward(&leader.addr, secret, &req).await {
+                    Ok(reply) => return Ok(reply),
+                    Err(network::ForwardError::Unknown(e)) => return Err(e),
+                    Err(network::ForwardError::NotApplied(why)) => why,
+                },
+                None => "no leader known".to_string(),
+            };
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("no leader took the write: {reason}");
             }
-        }
 
-        anyhow::bail!("no leader to send the write to")
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 
     pub fn is_leader(&self) -> bool {

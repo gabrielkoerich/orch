@@ -244,26 +244,59 @@ async fn write(State(a): State<App>, headers: HeaderMap, Json(req): Json<Request
 
     match a.raft.client_write(req).await {
         Ok(r) => Json(r.data).into_response(),
+        // Refused before anything was proposed, so the sender may safely try another node
+        Err(e @ RaftError::APIError(openraft::error::ClientWriteError::ForwardToLeader(_))) => {
+            (StatusCode::MISDIRECTED_REQUEST, e.to_string()).into_response()
+        }
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
     }
 }
 
-pub(crate) async fn forward(addr: &str, secret: &str, req: &Request) -> anyhow::Result<Reply> {
+/// Why a forwarded write failed. Only `NotApplied` is safe to send again
+#[derive(Debug)]
+pub(crate) enum ForwardError {
+    /// The connection was refused, or the node said it is not the leader
+    NotApplied(String),
+    /// It may or may not have been applied, so it must not be sent again
+    Unknown(anyhow::Error),
+}
+
+pub(crate) async fn forward(
+    addr: &str,
+    secret: &str,
+    req: &Request,
+) -> Result<Reply, ForwardError> {
     let res = CLIENT
         .post(format!("http://{addr}/cluster/write"))
         .header(SECRET_HEADER, secret)
         .json(req)
         .send()
-        .await?;
+        .await
+        .map_err(|e| {
+            if e.is_connect() {
+                ForwardError::NotApplied(e.to_string())
+            } else {
+                ForwardError::Unknown(e.into())
+            }
+        })?;
     let status = res.status();
-    if !status.is_success() {
-        anyhow::bail!(
-            "leader at {addr} refused the write ({status}): {}",
-            res.text().await?
-        );
+    if status == StatusCode::MISDIRECTED_REQUEST {
+        let body = res.text().await.unwrap_or_default();
+        return Err(ForwardError::NotApplied(format!(
+            "{addr} is not the leader: {body}"
+        )));
     }
 
-    Ok(res.json().await?)
+    if !status.is_success() {
+        let body = res.text().await.unwrap_or_default();
+        return Err(ForwardError::Unknown(anyhow::anyhow!(
+            "leader at {addr} refused the write ({status}): {body}"
+        )));
+    }
+
+    res.json()
+        .await
+        .map_err(|e| ForwardError::Unknown(e.into()))
 }
 
 pub(crate) struct HttpNetwork {
