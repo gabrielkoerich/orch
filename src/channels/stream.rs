@@ -21,7 +21,6 @@ const SLACK_MAX_BYTES: usize = 4000;
 
 fn platform_max_bytes(channel_name: &str) -> usize {
     match channel_name {
-        "telegram" => TELEGRAM_MAX_BYTES,
         "discord" => DISCORD_MAX_BYTES,
         "slack" => SLACK_MAX_BYTES,
         _ => TELEGRAM_MAX_BYTES,
@@ -31,7 +30,6 @@ fn platform_max_bytes(channel_name: &str) -> usize {
 fn platform_rate(channel_name: &str) -> Duration {
     match channel_name {
         "telegram" => Duration::from_millis(100),
-        "discord" => Duration::from_millis(500),
         "slack" => Duration::from_millis(200),
         _ => Duration::from_millis(500),
     }
