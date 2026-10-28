@@ -381,6 +381,8 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          # An admin token, main requires checks that the bump commit has not run
+          token: ${{ secrets.RELEASE_TOKEN }}
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -408,17 +410,19 @@ jobs:
           VERSION: ${{ needs.check-release.outputs.version }}
         run: |
           sed -i "0,/^version = .*/s//version = \"${VERSION#v}\"/" Cargo.toml
+          sed -i "/^name = \"orch-cli\"$/{n;s/^version = .*/version = \"${VERSION#v}\"/}" Cargo.lock
           ORCH_BUILD_VERSION="$VERSION" cargo publish --allow-dirty
 
-      - name: Create tag
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Commit the version bump and tag it
         run: |
           VERSION="${{ needs.check-release.outputs.version }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: bump version to ${VERSION}"
           git tag -a "$VERSION" -m "$VERSION"
-          git push origin "$VERSION"
+          # Atomic, so main and the tag land together or a newer main push fails both
+          git push --atomic origin main "$VERSION"
 
       - name: Build changelog
         id: changelog
