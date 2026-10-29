@@ -11,10 +11,16 @@ use std::sync::Arc;
 pub async fn list() -> anyhow::Result<()> {
     let store = Arc::new(crate::cli::init_store().await?);
     // Hydrate in-memory map from persisted KV so we see the full state.
-    cooldown::init_cooldown_store(store).await;
+    cooldown::init_cooldown_store(store.clone()).await;
+
+    // Recompute degraded agents so the CLI shows the same skip reasons as the
+    // service, including agents held only by the rate-limit threshold
+    let router = crate::engine::router::Router::from_config();
+    router.refresh_health(&store).await;
 
     let entries = cooldown::list_all_cooldowns();
-    if entries.is_empty() {
+    let degraded = cooldown::list_degraded_agents();
+    if entries.is_empty() && degraded.is_empty() {
         println!("No active cooldowns.");
         return Ok(());
     }
@@ -22,10 +28,16 @@ pub async fn list() -> anyhow::Result<()> {
     let now = chrono::Utc::now().timestamp();
     println!("{:<30} {:<12} REASON", "KEY", "REMAINING");
     println!("{}", "-".repeat(72_usize));
-    for (key, until, reason) in entries {
+    for (key, until, reason) in &entries {
         let remaining_secs = until - now;
         let remaining = format_remaining(remaining_secs);
         println!("{:<30} {:<12} {}", key, remaining, reason);
+    }
+    for (agent, reason) in degraded {
+        if entries.iter().any(|(key, ..)| key == &agent) {
+            continue;
+        }
+        println!("{:<30} {:<12} {}", agent, "degraded", reason);
     }
     Ok(())
 }
