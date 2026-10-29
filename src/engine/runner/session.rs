@@ -15,6 +15,8 @@ pub struct SessionOutput {
     pub raw_stdout: String,
     pub raw_stderr: String,
     pub elapsed_secs: Option<u64>,
+    /// Set when the sandbox could not start at spawn. No agent ran
+    pub sandbox_error: Option<String>,
 }
 
 /// Spawn the agent in tmux, wait for completion, and collect output.
@@ -42,6 +44,9 @@ pub async fn run_agent_session(
         Ok(s) => s,
         Err(e) => {
             tracing::error!(task_id, error = ?e, "failed to spawn agent in tmux");
+            let sandbox_error = e
+                .downcast_ref::<super::sandbox::SandboxFailed>()
+                .map(|_| e.to_string());
             return (
                 tmux,
                 String::new(),
@@ -50,6 +55,7 @@ pub async fn run_agent_session(
                     raw_stdout: String::new(),
                     raw_stderr: e.to_string(),
                     elapsed_secs: None,
+                    sandbox_error,
                 },
             );
         }
@@ -153,6 +159,7 @@ async fn collect_output(
         raw_stdout,
         raw_stderr,
         elapsed_secs: Some(elapsed_secs),
+        sandbox_error: None,
     }
 }
 
