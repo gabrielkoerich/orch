@@ -29,6 +29,7 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `workflow` | `max_review_cycles` | Max PR review cycles before escalating to human | `2` |
 | `workflow` | `max_reroute_attempts` | Max times a task may be re-routed automatically | `3` |
 | `workflow` | `timeout_seconds` | Task execution timeout (0 disables timeout) | `1800` |
+| `workflow` | `review_timeout_seconds` | Review agent timeout, separate from the task timeout, never under 300 | `900` |
 | `workflow` | `timeout_by_complexity` | Per-complexity overrides (e.g. `complex: 7200`) | `{}` |
 | `workflow` | `required_skills` | Skills always injected into agent prompts | `[]` |
 | `workflow` | `allowed_tools` | Tool patterns the agent may use (allowlist) | `[]` |

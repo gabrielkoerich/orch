@@ -217,6 +217,16 @@ fn approved_sha_key(repo: &str, task_id: &str, pr_number: u64) -> String {
 }
 
 /// Read `HEAD` of a worktree. `None` when the worktree is gone or not a repository
+const REVIEW_TIMEOUT_DEFAULT_SECS: u64 = 900;
+const REVIEW_TIMEOUT_MIN_SECS: u64 = 300;
+
+// A review reads a diff and runs the tests, so it gets its own limit, shorter than a task's
+fn review_timeout_secs(configured: Option<u64>) -> u64 {
+    configured
+        .unwrap_or(REVIEW_TIMEOUT_DEFAULT_SECS)
+        .max(REVIEW_TIMEOUT_MIN_SECS)
+}
+
 async fn worktree_head_sha(dir: &std::path::Path) -> Option<String> {
     let out = tokio::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
@@ -804,16 +814,11 @@ async fn build_review_context(
         crate::config::get("git.name").unwrap_or_else(|_| format!("{review_agent}[bot]"));
     let git_email = crate::config::get("git.email")
         .unwrap_or_else(|_| format!("{review_agent}[bot]@users.noreply.github.com"));
-    let review_timeout_secs: u64 = crate::config::get("workflow.review_timeout_seconds")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            crate::config::get("workflow.timeout_seconds")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1800)
-        })
-        .max(1800);
+    let review_timeout_secs = review_timeout_secs(
+        crate::config::get("workflow.review_timeout_seconds")
+            .ok()
+            .and_then(|s| s.parse().ok()),
+    );
 
     let invocation = runner::agent::AgentInvocation {
         agent: review_agent.clone(),
@@ -3117,6 +3122,14 @@ pub(crate) async fn review_and_merge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_review_gets_15_minutes_unless_configured_and_never_under_5() {
+        assert_eq!(review_timeout_secs(None), 900);
+        assert_eq!(review_timeout_secs(Some(600)), 600);
+        assert_eq!(review_timeout_secs(Some(60)), 300);
+        assert_eq!(review_timeout_secs(Some(3600)), 3600);
+    }
 
     use crate::backends::ExternalTask;
     use crate::engine::router::RouterConfig;
