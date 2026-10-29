@@ -810,6 +810,11 @@ fn may_merge_onto_base(behind_by: Option<u64>) -> bool {
     behind_by == Some(0)
 }
 
+/// `has_hooks` is `clean` on a server with pre-receive hooks, every other state waits
+fn mergeable_state_ready(state: &str) -> bool {
+    matches!(state, "clean" | "has_hooks")
+}
+
 /// Auto-merge a PR after review approval.
 ///
 /// Checks that the automated review comment says "approve" and that CI checks
@@ -1620,6 +1625,26 @@ pub(crate) async fn auto_merge_pr(
         }
     }
 
+    // GitHub's own verdict must read ready too, so an admin bypass cannot merge
+    // a PR that is behind, blocked by a rule, or not yet computed (#3839)
+    let fresh_pr = gh.get_pr(repo, pr_number).await?;
+    let mergeable_state = fresh_pr.mergeable_state.as_deref().unwrap_or("unknown");
+    if !mergeable_state_ready(mergeable_state) {
+        tracing::info!(
+            task_id = task.id.0,
+            pr_number,
+            mergeable_state,
+            "PR is not ready to merge on GitHub, holding merge"
+        );
+        if mergeable_state == "behind" {
+            if let Err(e) = gh.update_pr_branch(repo, pr_number).await {
+                tracing::warn!(task_id = task.id.0, pr_number, err = %e, "update-branch failed; retrying next tick");
+            }
+        }
+
+        return Ok(());
+    }
+
     tracing::info!(
         task_id = task.id.0,
         pr_number,
@@ -2283,6 +2308,15 @@ mod tests {
 
     /// Auto-merge refuses a PR whose head does not contain the current base
     /// commit: its green checks ran against older code (#3780).
+    #[test]
+    fn mergeable_state_ready_accepts_only_clean_states() {
+        assert!(mergeable_state_ready("clean"));
+        assert!(mergeable_state_ready("has_hooks"));
+        for state in ["behind", "blocked", "unknown", "unstable", "dirty", "draft"] {
+            assert!(!mergeable_state_ready(state), "{state} must hold the merge");
+        }
+    }
+
     #[test]
     fn may_merge_onto_base_refuses_a_head_behind_its_base() {
         assert!(
