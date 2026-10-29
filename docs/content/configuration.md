@@ -81,7 +81,7 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `git` | `name` / `email` | Commit identity for task and review agents | `<agent>[bot]` |
 | `jobs` | `bash_timeout_seconds` | Timeout for a `bash` job | `300` |
 
-> Authoritative reference: `config.example.yml` in the orch repo. Run `orch config <key>` to read the live value for any dotted key (e.g. `orch config engine.tick_interval`).
+> `config.example.yml` in the orch repo is a short starting config. This table lists every key. Run `orch config <key>` to read the live value for any dotted key (e.g. `orch config engine.tick_interval`).
 
 ## Per-Project Config
 

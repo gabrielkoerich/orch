@@ -13,23 +13,12 @@ agents:
   # - olm  # Ollama via Claude-compatible CLI
 
 workflow:
-  auto_close: true
-  review_owner: "@owner"
-  enable_review_agent: false
-  max_attempts: 10
-  # Only accept issues from these GitHub users. Repo owner is always included.
-  # allowed_authors:
-  #   - my-bot
-  #   - trusted-collaborator
-  # Default task timeout (seconds). Set to 0 to disable timeouts entirely.
-  timeout_seconds: 1800
-  # Optional: per-complexity overrides (takes precedence over timeout_seconds).
+  # Task timeout in seconds (default and minimum: 1800).
+  # timeout_seconds: 1800
+  # Per-complexity overrides, floored at timeout_seconds. Simple tasks use timeout_seconds.
   # timeout_by_complexity:
-  #   simple: 600
-  #   medium: 1800
+  #   medium: 2700
   #   complex: 3600
-  # Auto-create follow-up tasks when PR reviews request changes (default: true)
-  auto_create_followup_on_changes: true
   # Allowed tools for agents (used in permission rules)
   allowed_tools:
     - Edit
@@ -43,24 +32,23 @@ workflow:
     - Task
     - Skill
 
-# Engine settings
-engine:
-  tick_interval: 10
-  sync_interval: 45
-  max_parallel: 4
-  stuck_timeout: 1800
-  graceful_shutdown_timeout: 600
-  # Silence detection: grace period before flagging (seconds)
-  # silence_grace_period: 120
-  # silence_cooldown: 3600
+# Engine settings (defaults shown)
+# engine:
+#   tick_interval: 10
+#   sync_interval: 45
+#   max_parallel: 4
+#   stuck_timeout: 1800
+#   graceful_shutdown_timeout: 600
+#   silence_grace_period: 300
+#   silence_cooldown: 3600
 
 router:
-  mode: "round_robin"      # "round_robin" (default), "llm", or "local"
-  agent: "claude"          # Which agent performs routing
-  model: "haiku"           # Model for routing (fast/cheap)
-  timeout_seconds: 60
-  fallback_executor: "codex"
-  max_route_attempts: 3    # After N LLM routing failures, fall back to round-robin
+  # mode: "round_robin"    # "round_robin" (default), "llm", or "local"
+  # agent: "claude"        # Which agent performs routing (default)
+  # model: "haiku"         # Model for routing (default)
+  # timeout_seconds: 45    # Default and maximum
+  # fallback_executor: "codex"
+  # max_route_attempts: 3  # After N LLM routing failures, fall back to round-robin
   # Enable weighted round-robin: deprioritize agents hitting rate limits.
   # weighted_round_robin: false
   # Local Ollama routing (when mode: "local")
@@ -76,22 +64,6 @@ router:
   # pool:
   #   - claude:haiku
   #   - opencode:free
-  allowed_tools:
-    - yq
-    - jq
-    - bash
-    - just
-    - git
-    - rg
-    - sed
-    - awk
-    - python3
-    - node
-    - npm
-    - bun
-  default_skills:
-    - gh
-    - git-worktree
 
 # Simple model config. Each agent's candidates are used for simple, medium,
 # complex, and review tasks. When multiple candidates are listed, orch picks
@@ -137,20 +109,19 @@ gh:
 # webhook:
 #   enabled: false
 #   port: 8080
-#   secret: "${WEBHOOK_SECRET}"
+#   secret: "<webhook secret>"
 
 # Task completion notifications — broadcast to all configured channels.
-# Level: all (default) | errors_only | none
-notifications:
-  level: "all"
+# Level: all (default) | verbose | errors_only | none
+# notifications:
+#   level: "all"
 
-# External notification channels
-channels:
-  telegram:
-    enabled: false
-    bot_token: "${TELEGRAM_BOT_TOKEN}"
-    chat_id: "${TELEGRAM_CHAT_ID}"
-  discord:
-    enabled: false
-    bot_token: "${DISCORD_BOT_TOKEN}"
-    channel_id: "${DISCORD_CHANNEL_ID}"
+# External notification channels. A channel starts when its token is set.
+# Values are used as written, environment variables are not expanded.
+# channels:
+#   telegram:
+#     bot_token: "<telegram bot token>"
+#     chat_id: "<telegram chat id>"
+#   discord:
+#     bot_token: "<discord bot token>"
+#     channel_id: "<discord channel id>"

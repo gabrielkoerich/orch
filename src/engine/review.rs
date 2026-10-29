@@ -1113,13 +1113,11 @@ async fn record_review_agent_failure(
                 crate::engine::cooldown::record_transient_model_failure(review_agent, model).await;
             }
         }
-        runner::agents::AgentError::ModelUnavailable { .. } => {
-            // Model not available (provider error, model not found, etc.)
-            // Apply persistent model cooldown (4h base → 7d max) per settled
-            // architecture (AGENTS.md:325-328). The agent itself is not
-            // penalized — its other models still route normally.
+        runner::agents::AgentError::ModelUnavailable { message, .. } => {
+            // The agent is not penalized, its other models still route normally
             if let Some(model) = review_model {
-                crate::engine::cooldown::record_persistent_model_failure(review_agent, model).await;
+                crate::engine::cooldown::record_model_unavailable(review_agent, model, message)
+                    .await;
             }
         }
         _ => {
@@ -4072,6 +4070,58 @@ mod tests {
         assert!(
             (base - 30..=base).contains(&remaining),
             "first unusable review output must cool the model for 5 minutes, got {remaining}s"
+        );
+    }
+
+    /// A review `ModelUnavailable` that does not say the model is gone gets the generic backoff
+    #[serial_test::serial(cooldown_state)]
+    #[tokio::test]
+    async fn review_model_unavailable_transient_applies_short_cooldown() {
+        crate::engine::cooldown::reset_global_state().await;
+        let agent = "test-review-unavailable-transient";
+        let model = "test-model";
+        let key = format!("{agent}:{model}");
+
+        let err = runner::agents::AgentError::ModelUnavailable {
+            message: "model is temporarily overloaded".to_string(),
+            model: model.to_string(),
+        };
+        record_review_agent_failure("test-unavailable-a", agent, Some(model), &err).await;
+
+        let now = chrono::Utc::now().timestamp();
+        let until = crate::engine::cooldown::cooldown_until(&key)
+            .expect("review ModelUnavailable should set model cooldown");
+        let remaining = until.saturating_sub(now);
+        let base = crate::engine::cooldown::BACKOFF_BASE_SECS;
+        assert!(
+            (base - 30..=base).contains(&remaining),
+            "a non-permanent ModelUnavailable must get the 5 minute base, got {remaining}s"
+        );
+    }
+
+    /// A review `ModelUnavailable` that says "model not found" gets the persistent backoff
+    #[serial_test::serial(cooldown_state)]
+    #[tokio::test]
+    async fn review_model_not_found_applies_persistent_cooldown() {
+        crate::engine::cooldown::reset_global_state().await;
+        let agent = "test-review-unavailable-gone";
+        let model = "test-model";
+        let key = format!("{agent}:{model}");
+
+        let err = runner::agents::AgentError::ModelUnavailable {
+            message: "Model not found: test-model".to_string(),
+            model: model.to_string(),
+        };
+        record_review_agent_failure("test-unavailable-b", agent, Some(model), &err).await;
+
+        let now = chrono::Utc::now().timestamp();
+        let until = crate::engine::cooldown::cooldown_until(&key)
+            .expect("review model not found should set model cooldown");
+        let remaining = until.saturating_sub(now);
+        let base = crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS;
+        assert!(
+            (base - 30..=base).contains(&remaining),
+            "model not found must get the 4 hour persistent base, got {remaining}s"
         );
     }
 

@@ -415,20 +415,7 @@ pub async fn handle_error(
             format!("missing tool: {tool}"),
         ),
         agents::AgentError::ModelUnavailable { model, message } => {
-            // "Not found", "not supported" and region blocks never lift on their own, so they
-            // get the persistent model backoff (4h base → 7d max), not the transient 5min one
-            let lower = message.to_lowercase();
-            let is_permanently_gone = lower.contains("not found")
-                || lower.contains("not supported")
-                || lower.contains("not available in your country")
-                || lower.contains("not available in your region");
-            if is_permanently_gone {
-                // Persistent model failure backoff (starts at 4h, escalates to 7d)
-                crate::engine::cooldown::record_persistent_model_failure(agent_name, model).await;
-            } else {
-                // Generic model failure uses the standard model failure backoff (5m base → 4h max)
-                response::record_model_failure(agent_name, model).await;
-            }
+            crate::engine::cooldown::record_model_unavailable(agent_name, model, message).await;
 
             // Try next model before switching agent, unless the agent is cooled
             // (an agent-wide cooldown must not be defeated by model substitution)
