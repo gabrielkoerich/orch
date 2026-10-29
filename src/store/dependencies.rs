@@ -1049,7 +1049,73 @@ pub(crate) mod apply {
                 .execute(&mut *conn)
                 .await?;
         }
+        move_repo_kv(&mut *conn, old, new).await?;
         Ok(moved)
+    }
+
+    /**
+     * Rename or drop the KV keys that embed a repo slug. Matching is by exact segment, so a
+     * repo whose name merely starts with `old` keeps its keys, which a `LIKE '%old%'` would
+     * have taken. Snapshot, read-at and batch-failure keys are dropped because the next
+     * refresh rebuilds them. Notice, cycle-comment, approved-sha and ingest-cursor keys are
+     * renamed, because dropping one posts its comment again or re-ingests from the start
+     **/
+    async fn move_repo_kv(conn: &mut SqliteConnection, old: &str, new: &str) -> anyhow::Result<()> {
+        for prefix in [
+            format!("dep_blocker:{old}#"),
+            format!("dep_blocker_read_at:{old}#"),
+        ] {
+            sqlx::query("DELETE FROM kv WHERE substr(key, 1, ?) = ?")
+                .bind(prefix_len(&prefix)?)
+                .bind(&prefix)
+                .execute(&mut *conn)
+                .await?;
+        }
+        sqlx::query("DELETE FROM kv WHERE key = ?")
+            .bind(format!("review_batch_fail:{old}"))
+            .execute(&mut *conn)
+            .await?;
+        for (from, to) in [
+            (
+                format!("dep_cycle_comment:{old}#"),
+                format!("dep_cycle_comment:{new}#"),
+            ),
+            (
+                format!("review_approved_sha:{old}#"),
+                format!("review_approved_sha:{new}#"),
+            ),
+        ] {
+            sqlx::query(
+                "UPDATE OR REPLACE kv SET key = ? || substr(key, ?) WHERE substr(key, 1, ?) = ?",
+            )
+            .bind(&to)
+            .bind(prefix_len(&from)? + 1)
+            .bind(prefix_len(&from)?)
+            .bind(&from)
+            .execute(&mut *conn)
+            .await?;
+        }
+        // the repo sits mid-key, after the task id, and `:{repo}#` occurs once
+        sqlx::query(
+            "UPDATE OR REPLACE kv SET key = replace(key, ?, ?)
+             WHERE key GLOB 'dep_blocker_notice:*' AND instr(key, ?) > 0",
+        )
+        .bind(format!(":{old}#"))
+        .bind(format!(":{new}#"))
+        .bind(format!(":{old}#"))
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query("UPDATE OR REPLACE kv SET key = ? WHERE key = ?")
+            .bind(format!("issues_last_ingested:{new}"))
+            .bind(format!("issues_last_ingested:{old}"))
+            .execute(&mut *conn)
+            .await?;
+        Ok(())
+    }
+
+    /// `substr` and `length` count characters, so the prefix length must too
+    fn prefix_len(prefix: &str) -> anyhow::Result<i64> {
+        Ok(i64::try_from(prefix.chars().count())?)
     }
 
     pub(crate) async fn replace_dependencies(
