@@ -2388,6 +2388,7 @@ pub(crate) async fn handle_review_changes(
                     "review_agent_failures",
                     serde_json::json!(0), // reset failures for the new review round
                 ),
+                ("review_resets", serde_json::json!(0)),
             ];
             if let Err(e) = task_manager
                 .update_task_status_and_result(&task.id, Status::Routed, &fields)
@@ -2438,6 +2439,7 @@ pub(crate) async fn handle_review_changes(
                     "review_agent_failures",
                     serde_json::json!(0), // reset failures for the new review round
                 ),
+                ("review_resets", serde_json::json!(0)),
             ];
             if let Err(e) = task_manager
                 .update_task_status_and_result(&task.id, Status::New, &fields)

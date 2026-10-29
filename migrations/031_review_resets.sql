@@ -1,0 +1,1 @@
+ALTER TABLE tasks ADD COLUMN review_resets INTEGER DEFAULT 0;

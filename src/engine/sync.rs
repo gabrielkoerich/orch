@@ -1482,6 +1482,7 @@ async fn auto_unblock_blocked_tasks(
         if has_review_failure {
             fields.push(("review_agent_failures", serde_json::json!(0)));
             fields.push(("review_invocations", serde_json::json!(0)));
+            fields.push(("review_resets", serde_json::json!(0)));
         }
         if let Err(e) = store.set_fields(task.id, &fields).await {
             tracing::warn!(task_id = task.id, err = %e, "failed to set auto_unblock fields after successful status update");
@@ -5969,6 +5970,7 @@ mod tests {
             push_failures: 0,
             network_retries: 0,
             review_agent_failures: 0,
+            review_resets: 0,
             review_cycles: 0,
             review_invocations: 0,
             needs_review_refires: 0,
