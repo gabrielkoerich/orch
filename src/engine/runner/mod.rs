@@ -697,6 +697,39 @@ impl TaskRunner {
         }
     }
 
+    /// The blocked outcome for a sandbox that cannot start. No agent ran, so none is cooled down
+    async fn sandbox_blocked(&self, task_id: &str, reason: String) -> RunExecution {
+        tracing::error!(task_id, error = %reason, "blocking task");
+        if let Err(e) = store::store_set_result(
+            &self.store,
+            &self.repo,
+            task_id,
+            &[
+                ("last_error", serde_json::json!(reason)),
+                ("block_reason", serde_json::json!(reason)),
+            ],
+        )
+        .await
+        {
+            tracing::warn!(task_id, err = %e, "failed to write the sandbox block_reason");
+        }
+        RunExecution {
+            status: "blocked".to_string(),
+            exit_code: None,
+            audit: RunAudit {
+                stdout: String::new(),
+                stderr: String::new(),
+                parsed_response: String::new(),
+                outcome: "failed".to_string(),
+                error: reason,
+                input_tokens: 0,
+                output_tokens: 0,
+                total_cost_usd: 0.0,
+                duration_secs: 0.0,
+            },
+        }
+    }
+
     /// Run a task through the full execution pipeline.
     ///
     /// Returns `Ok(None)` if the runner guard skipped the task (caller should not
@@ -781,36 +814,7 @@ impl TaskRunner {
         // operator's setup that fails, so no agent or model is cooled down
         if init.invocation.sandbox {
             if let Err(e) = sandbox::argv(&init.invocation).await {
-                let reason = format!("the OS sandbox cannot start: {e:#}");
-                tracing::error!(task_id, error = %reason, "blocking task");
-                if let Err(e) = store::store_set_result(
-                    &self.store,
-                    &self.repo,
-                    task_id,
-                    &[
-                        ("last_error", serde_json::json!(reason)),
-                        ("block_reason", serde_json::json!(reason)),
-                    ],
-                )
-                .await
-                {
-                    tracing::warn!(task_id, err = %e, "failed to write the sandbox block_reason");
-                }
-                return Ok(Some(RunExecution {
-                    status: "blocked".to_string(),
-                    exit_code: None,
-                    audit: RunAudit {
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        parsed_response: String::new(),
-                        outcome: "failed".to_string(),
-                        error: reason,
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        total_cost_usd: 0.0,
-                        duration_secs: 0.0,
-                    },
-                }));
+                return Ok(Some(self.sandbox_blocked(task_id, e.to_string()).await));
             }
         }
 
@@ -822,6 +826,11 @@ impl TaskRunner {
             &self.orch_home,
         )
         .await;
+
+        // The pre-flight policy passed but the one built at spawn did not: block the same way
+        if let Some(reason) = session_output.sandbox_error.clone() {
+            return Ok(Some(self.sandbox_blocked(task_id, reason).await));
+        }
 
         // Touch updated_at immediately after session exit so the stuck-task recovery
         // timer resets before response_handler post-processing (git push, PR creation,
@@ -2929,6 +2938,7 @@ mod tests {
             raw_stdout: ndjson.to_string(),
             raw_stderr: String::new(),
             elapsed_secs: Some(1),
+            sandbox_error: None,
         };
 
         // Call the helper we added via the task runner logic by reusing the
@@ -3212,6 +3222,7 @@ mod tests {
             raw_stdout: ndjson.to_string(),
             raw_stderr: String::new(),
             elapsed_secs: Some(30),
+            sandbox_error: None,
         };
 
         let runner = agents::get_runner("claude");
@@ -3238,6 +3249,7 @@ mod tests {
             raw_stdout: telemetry.to_string(),
             raw_stderr: String::new(),
             elapsed_secs: Some(120),
+            sandbox_error: None,
         };
 
         let runner = agents::get_runner("glm");
@@ -3260,6 +3272,7 @@ mod tests {
             raw_stdout: telemetry.to_string(),
             raw_stderr: String::new(),
             elapsed_secs: Some(15),
+            sandbox_error: None,
         };
 
         let runner = agents::get_runner("glm");
@@ -3285,6 +3298,7 @@ mod tests {
             raw_stdout: ndjson.to_string(),
             raw_stderr: String::new(),
             elapsed_secs: Some(30),
+            sandbox_error: None,
         };
 
         let runner = agents::get_runner("kimi");
@@ -3310,6 +3324,7 @@ mod tests {
             raw_stdout: ndjson.to_string(),
             raw_stderr: String::new(),
             elapsed_secs: Some(120),
+            sandbox_error: None,
         };
 
         let runner = agents::get_runner("claude");
