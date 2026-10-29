@@ -1054,14 +1054,8 @@ async fn invoke_review_agent(
         Err(_) => {
             tracing::error!(task_id = task.id.0, "review agent timed out");
             let _ = tmux.kill_session(&session).await;
-            if let Some(model) = ctx.review_model.as_deref() {
-                // Structural review failure: the model cannot finish review inside
-                // the allowed time. Use persistent backoff (4h base → 7d max) so
-                // a successful agent run on the same model does not reset the
-                // failure counter and let this model be re-selected for review.
-                crate::engine::cooldown::record_persistent_model_failure(&ctx.review_agent, model)
-                    .await;
-            }
+            // A slow review says nothing about the model, so no cooldown: the task goes back
+            // to needs_review and the next review picks an agent as usual
             complete_review_run(
                 store,
                 run_id,
