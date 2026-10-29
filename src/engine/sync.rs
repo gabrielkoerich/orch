@@ -107,9 +107,10 @@ async fn prefetch_review_tasks(
     Vec<ReviewTaskSnapshot>,
     Vec<ReviewTaskSnapshot>,
 )> {
-    let in_review = store
-        .list_by_status(repo, TaskStatus::InReview)
-        .await?
+    // Approved tasks wait on the same merge path as a review in progress
+    let mut in_review = store.list_by_status(repo, TaskStatus::InReview).await?;
+    in_review.extend(store.list_by_status(repo, TaskStatus::Approved).await?);
+    let in_review = in_review
         .into_iter()
         .map(|stored| ReviewTaskSnapshot {
             external: crate::engine::tasks::store_task_to_external(&stored),
@@ -3100,6 +3101,7 @@ mod tests {
                     "status:in_progress" => Some(Status::InProgress),
                     "status:needs_review" => Some(Status::NeedsReview),
                     "status:in_review" => Some(Status::InReview),
+                    "status:approved" => Some(Status::Approved),
                     "status:blocked" => Some(Status::Blocked),
                     _ => None,
                 };

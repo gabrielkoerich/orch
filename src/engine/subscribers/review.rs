@@ -21,9 +21,12 @@ enum ReviewOutcome {
     RateLimited,
     /// The PR was approved but the merge did not land for a reason outside the
     /// review (mergeability not computed yet, rate limit, transient GitHub error).
-    /// Keep the task in InReview so `review_open_prs` retries the merge, instead of
+    /// The task moves to Approved so `review_open_prs` retries the merge, instead of
     /// resetting to NeedsReview (which spawns a redundant review agent)
     RetryMerge,
+    /// The review approved the PR. The task moves to Approved, where orch waits for CI and
+    /// merges with no agent running
+    Approved,
     /// Re-route to the task agent (e.g. merge conflicts that need the agent to fix).
     Reroute,
     Block(String),
@@ -341,16 +344,10 @@ pub fn spawn(
                                     tracing::warn!(task_id = %tid, err = %e, "failed to write needs_review_refires to store");
                                 }
 
-                                // Approval only means the code looks good — the PR
-                                // merge is the actual completion signal.  Leave the
-                                // task in InReview.  The review_open_prs polling loop
-                                // detects `batch_data.merged == true` on the next tick
-                                // and transitions the task to Done correctly.
-                                tracing::info!(
-                                    task_id = tid,
-                                    "approval received — leaving task in_review until PR is merged"
-                                );
-                                ReviewOutcome::Ok
+                                // Approval only means the code looks good, the merge is the
+                                // completion signal. review_open_prs merges Approved tasks and
+                                // moves them to Done
+                                ReviewOutcome::Approved
                             }
                             Ok(ReviewDecision::Rerouted) => {
                                 // Task was re-routed because there was no PR and no commits.
@@ -452,6 +449,7 @@ pub fn spawn(
                                 || matches!(
                                     current_status,
                                     Some(crate::store::TaskStatus::Done)
+                                        | Some(crate::store::TaskStatus::Approved)
                                         | Some(crate::store::TaskStatus::Routed)
                                         | Some(crate::store::TaskStatus::New)
                                 );
@@ -523,17 +521,34 @@ pub fn spawn(
                                     tracing::error!(task_id = %tid, err = %e, "update_task_status(Routed) failed");
                                 }
                             }
-                            ReviewOutcome::RetryMerge => {
-                                // The PR is already approved and the merge is the only
-                                // step left.  Keep the task in InReview and wait for
-                                // review_poll to retry the merge — do NOT reset to
-                                // NeedsReview, which would spawn a redundant review agent.
-                                tracing::info!(
-                                    task_id = tid,
-                                    "merge pending — task stays in InReview, review_poll will retry merge"
-                                );
-                                // Brief pause so the next review_poll cycle fires soon.
-                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            ReviewOutcome::Approved | ReviewOutcome::RetryMerge => {
+                                // The review is over, so its session goes. The merge may have
+                                // landed already, or CI sent the task back, so only in_review moves
+                                let stale_session =
+                                    tmux_c.session_name(&repo_s, &format!("{}-review", tid));
+                                tmux_c.kill_session(&stale_session).await.ok();
+                                match task_manager_c
+                                    .update_task_status_if(
+                                        &ExternalId(tid.clone()),
+                                        Status::Approved,
+                                        Status::InReview,
+                                    )
+                                    .await
+                                {
+                                    Ok(true) => tracing::info!(
+                                        task_id = tid,
+                                        "approval received, task approved until the PR is merged"
+                                    ),
+                                    Ok(false) => tracing::debug!(
+                                        task_id = tid,
+                                        "approval received after the task left in_review"
+                                    ),
+                                    Err(e) => tracing::error!(
+                                        task_id = %tid,
+                                        err = %e,
+                                        "update_task_status_if(Approved) failed, task may be stuck in in_review"
+                                    ),
+                                }
                             }
                             ReviewOutcome::RateLimited => {
                                 // Kill stale tmux session — same as Reset.

@@ -41,7 +41,7 @@ Expected outcome:
 ## Task Lifecycle
 
 ```
-new → routed → in_progress → needs_review → in_review → done (merged)
+new → routed → in_progress → needs_review → in_review → approved → done (merged)
                             → done (no PR)
                             → blocked
 ```
@@ -51,6 +51,7 @@ new → routed → in_progress → needs_review → in_review → done (merged)
 - **in_progress**: agent is running
 - **needs_review**: PR exists and is queued for review, or max attempts exceeded
 - **in_review**: review agent is actively running on the PR
+- **approved**: the review approved the PR, orch waits for CI and merges, no agent runs
 - **done**: PR merged (or agent completed with no code changes)
 - **blocked**: waiting on child tasks to complete
 

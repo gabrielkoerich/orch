@@ -981,6 +981,22 @@ pub(crate) async fn auto_merge_pr(
                     // Validate the PR's head ref matches our branch before treating as closed
                     match gh.get_pr(repo, closed_pr_number).await {
                         Ok(pr) if pr.head.ref_ == branch => {
+                            let approved = crate::store::opt_store_get_task(
+                                &Some(store.clone()),
+                                repo,
+                                &task.id.0,
+                            )
+                            .await
+                            .is_some_and(|t| t.status == crate::store::TaskStatus::Approved);
+                            if approved {
+                                crate::engine::review_poll::block_closed_approved_pr(
+                                    task_manager,
+                                    &task.id,
+                                )
+                                .await;
+                                return Ok(());
+                            }
+
                             tracing::info!(
                                 task_id = task.id.0,
                                 branch,
