@@ -111,7 +111,7 @@ sequenceDiagram
     participant A as Agent (claude/codex)
 
     loop Every 10 seconds
-        S->>P: tick()
+        S->>P: tick_all()
         P->>P: check session completions
         P->>P: recover stuck tasks
         P->>P: route new tasks (LLM)
@@ -133,6 +133,7 @@ sequenceDiagram
     end
 
     Note over S,GH: Every 45s: sync tick (ingest issues, review PRs, owner commands)
+    Note over S,P: Every phase but routing runs for all projects at once, so tick time is the slowest project, not the sum
 ```
 
 ## Task Lifecycle
@@ -300,12 +301,17 @@ graph LR
 │    4. Dispatch routed tasks (spawn agents)       │
 │    5. Unblock parents (sub-issue check)          │
 │    6. Job scheduler (cron matching)              │
+│    Only step 3 is serial, it holds the router    │
+│    write lock. The rest run for all projects     │
+│    at once, timed per project and per phase.     │
+│    Store-wide work (global sweeps, dependency    │
+│    reconcile) runs once per tick                 │
 │                                                  │
-│  Sync (every 45s):                              │
+│  Sync (every 45s, all projects at once):         │
 │    - Ingest external tasks (GitHub issues)       │
 │    - Review open PRs                             │
 │    - Scan for owner commands (/retry, /close)    │
-│    - Skills sync (git pull)                      │
+│    - Skills sync (git pull, once per pass)       │
 │                                                  │
 │  Channels:                                       │
 │    - Telegram (forum topics, inline keyboards)   │

@@ -110,6 +110,100 @@ pub struct ProjectEngine {
     pub store: Arc<TaskStore>,
 }
 
+/**
+ * Runs `sync_tick` for every project at once, then the tail that is the same for all of them,
+ * in a spawned task. Sync time is the slowest project instead of the sum of all of them
+ * (#3864). The caller must already hold `sync_in_progress`; this releases it when done
+ **/
+#[allow(clippy::too_many_arguments)]
+fn spawn_sync_pass(
+    project_engines: &[ProjectEngine],
+    tmux: &Arc<TmuxManager>,
+    engine_config: &EngineConfig,
+    router: &Arc<RwLock<Router>>,
+    dispatching: &Arc<dashmap::DashMap<String, String>>,
+    auto_merge_in_flight: &Arc<dashmap::DashSet<String>>,
+    sync_in_progress: &Arc<std::sync::atomic::AtomicBool>,
+    trigger: &'static str,
+) {
+    let engines = project_engines.to_vec();
+    let tmux = Arc::clone(tmux);
+    let engine_config = engine_config.clone();
+    let router = Arc::clone(router);
+    let dispatching = Arc::clone(dispatching);
+    let auto_merge_in_flight = Arc::clone(auto_merge_in_flight);
+    let guard = Arc::clone(sync_in_progress);
+
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let mut passes = Vec::with_capacity(engines.len());
+        for engine in &engines {
+            passes.push(REPO_CONTEXT.scope(
+                engine.repo.clone(),
+                sync_one_project(
+                    engine,
+                    &tmux,
+                    &engine_config,
+                    &router,
+                    &dispatching,
+                    &auto_merge_in_flight,
+                ),
+            ));
+        }
+        futures::future::join_all(passes).await;
+
+        sync::sync_shared_tail(&router, engines.first().map(|e| &e.store)).await;
+        tracing::info!(
+            trigger,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "sync tick complete"
+        );
+        guard.store(false, std::sync::atomic::Ordering::Release);
+    });
+}
+
+async fn sync_one_project(
+    engine: &ProjectEngine,
+    tmux: &Arc<TmuxManager>,
+    engine_config: &EngineConfig,
+    router: &Arc<RwLock<Router>>,
+    dispatching: &Arc<dashmap::DashMap<String, String>>,
+    auto_merge_in_flight: &Arc<dashmap::DashSet<String>>,
+) {
+    if let Err(e) = sync::sync_tick(
+        &engine.backend,
+        tmux,
+        &engine.repo,
+        engine_config,
+        router,
+        &engine.task_manager,
+        &engine.store,
+        dispatching,
+        auto_merge_in_flight,
+    )
+    .await
+    {
+        tracing::error!(repo = %engine.repo, ?e, "sync tick failed for project");
+    }
+}
+
+/// Milliseconds a group of tick or sync phases may take before it is worth an operator's eye
+const SLOW_PHASE_GROUP_MS: u128 = 1_000;
+
+/**
+ * Logs how long each phase of a tick or sync group took, for one project. Tick and sync time
+ * grows with the project count, and the totals alone did not say which project or phase spent
+ * it (#3864). Info once a group crosses `SLOW_PHASE_GROUP_MS`, so a quiet install stays quiet
+ **/
+pub(crate) fn log_phase_timings(group: &str, repo: &str, phases: &[(&str, u128)]) {
+    let total_ms: u128 = phases.iter().map(|(_, ms)| ms).sum();
+    if total_ms >= SLOW_PHASE_GROUP_MS {
+        tracing::info!(group, repo, total_ms, ?phases, "phase timings");
+    } else {
+        tracing::debug!(group, repo, total_ms, ?phases, "phase timings");
+    }
+}
+
 /// Return the configured agent list from top-level `agents` in config.yml,
 /// falling back to [`router::config::DEFAULT_AGENTS`] when not set.
 ///
@@ -2358,38 +2452,19 @@ pub async fn serve() -> anyhow::Result<()> {
                 }
 
                 // Core tick: poll tasks for all projects
-                let mut router_guard = router.write().await;
-                let mut routing_quota = tick::RoutingTickQuota::new(
-                    crate::engine::router::config::max_tasks_per_routing_tick(),
-                );
-                for engine in &project_engines {
-                    let repo = engine.repo.clone();
-                    let project_jobs_path = engine.project_dir.join(".orch.yml");
-                    REPO_CONTEXT.scope(repo, async {
-                        if let Err(e) = tick::tick(
-                            &engine.backend,
-                            &tmux,
-                            &engine.repo,
-                            &engine.runner,
-                            &capture_for_tick,
-                            &semaphore,
-                            &config,
-                            &project_jobs_path,
-                            &mut router_guard,
-                            &engine.task_manager,
-                            &weight_tx,
-                            &dispatching,
-                            &engine.store,
-                            Some(&transport),
-                            &active_repos,
-                            &auto_merge_in_flight,
-                            &mut routing_quota,
-                        ).await {
-                            tracing::error!(repo = %engine.repo, ?e, "tick failed for project");
-                        }
-                    }).await;
-                }
-                drop(router_guard);
+                tick::tick_all(
+                    &project_engines,
+                    &tmux,
+                    &capture_for_tick,
+                    &semaphore,
+                    &config,
+                    &router,
+                    &weight_tx,
+                    &dispatching,
+                    Some(&transport),
+                    &active_repos,
+                    &auto_merge_in_flight,
+                ).await;
 
                 // Drain pending weight signals after tick processing so the router
                 // learns from outcomes produced by this iteration's task dispatches.
@@ -2417,50 +2492,16 @@ pub async fn serve() -> anyhow::Result<()> {
                         std::sync::atomic::Ordering::AcqRel,
                         std::sync::atomic::Ordering::Relaxed,
                     ).is_ok() {
-                        // Clone everything sync_tick needs — it runs in a spawned task.
-                        let sync_engines: Vec<_> = project_engines.iter().map(|e| {
-                            (e.backend.clone(), e.repo.clone(),
-                             e.task_manager.clone(), e.store.clone())
-                        }).collect();
-                        let sync_tmux = Arc::clone(&tmux);
-                        let sync_config = config.clone();
-                        let sync_router = Arc::clone(&router);
-                        let sync_dispatching = Arc::clone(&dispatching);
-                        let sync_auto_merge = Arc::clone(&auto_merge_in_flight);
-                        let sync_guard = Arc::clone(&sync_in_progress);
-                        tokio::spawn(async move {
-                            let sync_start = std::time::Instant::now();
-                            for (backend, repo, task_manager, store) in &sync_engines {
-                                let repo = repo.clone();
-                                REPO_CONTEXT.scope(repo.clone(), async {
-                                    if let Err(e) = sync::sync_tick(
-                                        backend, &sync_tmux, &repo, &sync_config,
-                                        &sync_router, task_manager, store,
-                                        &sync_dispatching, &sync_auto_merge,
-                                    ).await {
-                                        tracing::error!(repo = %repo, ?e, "sync tick failed for project");
-                                    }
-                                }).await;
-                            }
-                            // Emit degraded-agents metric/log once per sync cycle.
-                            // Clone the needed data before releasing the read guard so
-                            // the lock is not held across the async store writes.
-                            if let Some((_, _, _, store)) = sync_engines.first() {
-                                let (available_agents, config) = {
-                                    let r = sync_router.read().await;
-                                    (r.available_agents.clone(), r.config.clone())
-                                };
-                                sync::emit_degraded_agents_if_needed(
-                                    &available_agents,
-                                    &config,
-                                    Some(store),
-                                )
-                                .await;
-                            }
-                            let elapsed = sync_start.elapsed();
-                            tracing::info!(elapsed_ms = elapsed.as_millis() as u64, "sync tick complete");
-                            sync_guard.store(false, std::sync::atomic::Ordering::Release);
-                        });
+                        spawn_sync_pass(
+                            &project_engines,
+                            &tmux,
+                            &config,
+                            &router,
+                            &dispatching,
+                            &auto_merge_in_flight,
+                            &sync_in_progress,
+                            "periodic",
+                        );
                     } else {
                         tracing::debug!("sync tick still in progress, skipping");
                     }
@@ -2552,38 +2593,19 @@ pub async fn serve() -> anyhow::Result<()> {
                 } else {
                     tracing::info!("webhook event triggered immediate tick");
 
-                    let mut router_guard = router.write().await;
-                    let mut routing_quota = tick::RoutingTickQuota::new(
-                        crate::engine::router::config::max_tasks_per_routing_tick(),
-                    );
-                    for engine in &project_engines {
-                        let repo = engine.repo.clone();
-                        let project_jobs_path = engine.project_dir.join(".orch.yml");
-                        REPO_CONTEXT.scope(repo, async {
-                            if let Err(e) = tick::tick(
-                                &engine.backend,
-                                &tmux,
-                                &engine.repo,
-                                &engine.runner,
-                                &capture_for_tick,
-                                &semaphore,
-                                &config,
-                                &project_jobs_path,
-                                &mut router_guard,
-                                &engine.task_manager,
-                                &weight_tx,
-                                &dispatching,
-                                &engine.store,
-                                Some(&transport),
-                                &active_repos,
-                                &auto_merge_in_flight,
-                                &mut routing_quota,
-                            ).await {
-                                tracing::error!(repo = %engine.repo, ?e, "webhook-triggered tick failed");
-                            }
-                        }).await;
-                    }
-                    drop(router_guard);
+                    tick::tick_all(
+                        &project_engines,
+                        &tmux,
+                        &capture_for_tick,
+                        &semaphore,
+                        &config,
+                        &router,
+                        &weight_tx,
+                        &dispatching,
+                        Some(&transport),
+                        &active_repos,
+                        &auto_merge_in_flight,
+                    ).await;
 
                 // Drain pending weight signals after webhook-triggered tick processing.
                 while let Ok(signal) = weight_rx.try_recv() {
@@ -2610,46 +2632,16 @@ pub async fn serve() -> anyhow::Result<()> {
                     std::sync::atomic::Ordering::AcqRel,
                     std::sync::atomic::Ordering::Relaxed,
                 ).is_ok() {
-                    // Clone everything sync_tick needs — it runs in a spawned task.
-                    let sync_engines: Vec<_> = project_engines.iter().map(|e| {
-                        (e.backend.clone(), e.repo.clone(), e.task_manager.clone(), e.store.clone())
-                    }).collect();
-                    let sync_tmux = Arc::clone(&tmux);
-                    let sync_config = config.clone();
-                    let sync_router = Arc::clone(&router);
-                    let sync_dispatching = Arc::clone(&dispatching);
-                    let sync_auto_merge = Arc::clone(&auto_merge_in_flight);
-                    let sync_guard = Arc::clone(&sync_in_progress);
-                    tokio::spawn(async move {
-                        let sync_start = std::time::Instant::now();
-                        for (backend, repo, task_manager, store) in &sync_engines {
-                            let repo = repo.clone();
-                            REPO_CONTEXT.scope(repo.clone(), async {
-                                if let Err(e) = sync::sync_tick(
-                                    backend, &sync_tmux, &repo, &sync_config,
-                                    &sync_router, task_manager, store,
-                                    &sync_dispatching, &sync_auto_merge,
-                                ).await {
-                                    tracing::error!(repo = %repo, ?e, "webhook immediate sync tick failed for project");
-                                }
-                            }).await;
-                        }
-                        // Emit degraded-agents metric/log once per sync cycle.
-                        if let Some((_, _, _, store)) = sync_engines.first() {
-                            let (available_agents, config) = {
-                                let r = sync_router.read().await;
-                                (r.available_agents.clone(), r.config.clone())
-                            };
-                            sync::emit_degraded_agents_if_needed(
-                                &available_agents,
-                                &config,
-                                Some(store),
-                            ).await;
-                        }
-                        let elapsed = sync_start.elapsed();
-                        tracing::info!(elapsed_ms = elapsed.as_millis() as u64, "webhook immediate sync tick complete");
-                        sync_guard.store(false, std::sync::atomic::Ordering::Release);
-                    });
+                    spawn_sync_pass(
+                        &project_engines,
+                        &tmux,
+                        &config,
+                        &router,
+                        &dispatching,
+                        &auto_merge_in_flight,
+                        &sync_in_progress,
+                        "webhook",
+                    );
                     // Record schedule time so periodic sync doesn't immediately re-run.
                     last_sync = std::time::Instant::now();
                 } else {

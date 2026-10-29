@@ -1154,7 +1154,7 @@ const REBROADCAST_BLOCK_REASON: &str = "review agent rebroadcast escalated after
 /// `REBROADCAST_BLOCK_REASON`. Once any review agent is routable again, this
 /// sweep resets matching tasks to `NeedsReview` so the subscriber can pick them up.
 /// Writes through the store via `*_by_store_id` helpers, not a repo-scoped
-/// `TaskManager`. Called once per main tick from `tick_recover_stuck_tasks`.
+/// `TaskManager`. Called once per main tick from `tick_global_sweeps`.
 ///
 /// Before resetting, the attached PR's live state is checked (mirroring
 /// `try_unblock_ci_failure_task`): merged means the task is marked done, closed
@@ -1534,7 +1534,7 @@ async fn auto_unblock_blocked_tasks(
 /// This function queries all blocked tasks across all repos and handles the CI-failure
 /// cases (block_reason LIKE '%CI failure%' or '%CI checks timed out%') so they are
 /// eventually cleaned up regardless of project activity. Called once per main tick from
-/// `tick_recover_stuck_tasks`.
+/// `tick_global_sweeps`.
 pub(crate) async fn auto_unblock_ci_failure_blocked_tasks_global(
     task_manager: &Arc<crate::engine::tasks::TaskManager>,
     store: &Arc<TaskStore>,
@@ -1602,7 +1602,7 @@ pub(crate) async fn auto_unblock_ci_failure_blocked_tasks_global(
 /// transition as its atomic guard (issue #857)
 ///
 /// Queries across all repos and writes through the store via `*_by_store_id`
-/// TaskManager helpers. Called once per main tick from `tick_recover_stuck_tasks`
+/// TaskManager helpers. Called once per main tick from `tick_global_sweeps`
 pub(crate) async fn refire_and_escalate_stale_needs_review_global(
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
@@ -1789,6 +1789,9 @@ pub(crate) async fn sync_tick(
 
     tracing::debug!("sync tick");
 
+    let mut phases: Vec<(&str, u128)> = Vec::new();
+    let mut at = std::time::Instant::now();
+
     // Global GitHub 5xx circuit breaker — skip non-critical background work
     // during sustained GitHub outages to reduce churn and wasted API calls.
     let gh_circuit_open = is_github_circuit_open();
@@ -1818,13 +1821,18 @@ pub(crate) async fn sync_tick(
         if let Err(e) = ingest_external_tasks(backend, repo, store).await {
             tracing::debug!(err = %e, "external task ingest failed");
         }
+        phases.push(("ingest", at.elapsed().as_millis()));
+        at = std::time::Instant::now();
+
         // Reconcile existing board members too: labels can change without a
         // local task transition, and a human/automation may move a card. The
         // backend only writes drifted fields through the shared GitHub client.
         if let Err(e) = backend.reconcile_project_statuses().await {
             tracing::warn!(err = %e, "project status reconciliation failed");
         }
+        phases.push(("board_reconcile", at.elapsed().as_millis()));
     }
+    at = std::time::Instant::now();
 
     // 1. Cleanup worktrees for done tasks (background — must not block routing/dispatch)
     if !gh_circuit_open {
@@ -1847,6 +1855,8 @@ pub(crate) async fn sync_tick(
                 (vec![], vec![], vec![])
             }
         };
+    phases.push(("prefetch_review", at.elapsed().as_millis()));
+    at = std::time::Instant::now();
 
     if !gh_circuit_open {
         let mention_fallback = chrono::Utc::now() - chrono::Duration::hours(24);
@@ -1925,7 +1935,9 @@ pub(crate) async fn sync_tick(
                 tracing::warn!(err = %e, "failed to refresh review task cache after sync work");
             }
         }
+        phases.push(("merge_comments_review", at.elapsed().as_millis()));
     }
+    at = std::time::Instant::now();
 
     // 5. Detect stale InReview tasks and recover them.
     //
@@ -2050,6 +2062,9 @@ pub(crate) async fn sync_tick(
         }
     }
 
+    phases.push(("stale_in_review", at.elapsed().as_millis()));
+    at = std::time::Instant::now();
+
     // 5c. Detect stale InProgress tasks and recover them.
     //
     // Similar to stale InReview detection, we check for InProgress tasks whose
@@ -2156,6 +2171,8 @@ pub(crate) async fn sync_tick(
         }
     }
 
+    phases.push(("stale_in_progress", at.elapsed().as_millis()));
+    at = std::time::Instant::now();
     // 5c. Auto-unblock tasks with recoverable failures.
     if let Err(e) =
         auto_unblock_blocked_tasks(repo, task_manager, store, dispatching, auto_merge_in_flight)
@@ -2164,13 +2181,27 @@ pub(crate) async fn sync_tick(
         tracing::warn!(err = %e, "auto-unblock failed");
     }
 
-    // 6. Sync skill repositories
+    phases.push(("auto_unblock", at.elapsed().as_millis()));
+
+    crate::engine::log_phase_timings("sync", repo, &phases);
+    Ok(())
+}
+
+/**
+ * Skill repos and agent health are the same whichever project asks, so they run once per
+ * sync pass rather than once per project. Called after every project's `sync_tick`
+ **/
+pub(crate) async fn sync_shared_tail(router: &Arc<RwLock<Router>>, store: Option<&Arc<TaskStore>>) {
+    let Some(store) = store else {
+        return;
+    };
+    if !store.is_leader() {
+        return;
+    }
     match skills_sync().await {
         Ok(()) => {
-            // Invalidate the LLM router's skills catalog cache so new/updated
-            // skill files are picked up on the next routing call.
-            // Clone the Arc handle *before* releasing the read guard so the
-            // read lock is not held across the async invalidation call.
+            // Clone the Arc handle before releasing the read guard so the read lock is not
+            // held across the async invalidation call
             let llm = router.read().await.llm_router_handle();
             llm.invalidate_skills_catalog().await;
         }
@@ -2179,34 +2210,31 @@ pub(crate) async fn sync_tick(
         }
     }
 
-    // Pre-emptive health check: refresh degraded-agent flags from rate_limits table.
-    // Clone the required data out of the router while holding the read guard,
-    // then release the guard before the async DB query so the write lock is
-    // not starved for the duration of the I/O operation.
-    {
-        let (available_agents, config) = {
-            let r = router.read().await;
-            (r.available_agents.clone(), r.config.clone())
-        };
-        let model_checker = |agent: &str| -> bool {
-            for comp in &["simple", "medium", "complex", "review"] {
-                if config.has_available_model_for_complexity(agent, comp) {
-                    return true;
-                }
+    // Pre-emptive health check: refresh degraded-agent flags from the rate_limits table.
+    // Clone what is needed out of the router first, so the write lock is not starved for the
+    // duration of the DB query
+    let (available_agents, config) = {
+        let r = router.read().await;
+        (r.available_agents.clone(), r.config.clone())
+    };
+    let model_checker = |agent: &str| -> bool {
+        for comp in &["simple", "medium", "complex", "review"] {
+            if config.has_available_model_for_complexity(agent, comp) {
+                return true;
             }
-            false
-        };
-        refresh_degraded_agents(
-            store,
-            &available_agents,
-            &model_checker,
-            crate::engine::router::config::health_check_window_hours(),
-            crate::engine::router::config::degraded_rate_limit_threshold(),
-        )
-        .await;
-    }
+        }
+        false
+    };
+    refresh_degraded_agents(
+        store,
+        &available_agents,
+        &model_checker,
+        crate::engine::router::config::health_check_window_hours(),
+        crate::engine::router::config::degraded_rate_limit_threshold(),
+    )
+    .await;
 
-    Ok(())
+    emit_degraded_agents_if_needed(&available_agents, &config, Some(store)).await;
 }
 
 /// Scan for @mentions and handle them.
