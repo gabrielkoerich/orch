@@ -437,8 +437,10 @@ fn record_response_for_limiter(cell: &Mutex<RateLimit>, resp: &Response) {
 pub struct GhHttp {
     client: Client,
     token_resolver: Arc<token::TokenResolver>,
-    // orch's own calls go through the App installation token when the App is configured
+    // A fixed App for tests, otherwise the shared App, which a background loader may set later
     app: Option<Arc<super::app::AppAuth>>,
+    // Calls the App cannot make, such as `GET /user` and Projects V2 on a personal account
+    owner_only: bool,
     cached_username: OnceLock<String>,
     #[cfg(test)]
     api_base: Option<String>,
@@ -463,7 +465,8 @@ impl GhHttp {
         Ok(Self {
             client,
             token_resolver: token::shared(),
-            app: super::app::shared(),
+            app: None,
+            owner_only: false,
             cached_username: OnceLock::new(),
             #[cfg(test)]
             api_base: None,
@@ -474,7 +477,7 @@ impl GhHttp {
     /// `GET /user` and Projects V2 on a personal account
     pub fn owner() -> anyhow::Result<Self> {
         let mut gh = Self::new()?;
-        gh.app = None;
+        gh.owner_only = true;
         Ok(gh)
     }
 
@@ -484,6 +487,7 @@ impl GhHttp {
             client: Client::new(),
             token_resolver: Arc::new(token::TokenResolver::default_env()),
             app,
+            owner_only: false,
             cached_username: OnceLock::new(),
             api_base: Some(api_base),
         }
@@ -544,10 +548,18 @@ impl GhHttp {
 
     // ── Low-level HTTP helpers ────────────────────────────────────
 
+    fn app(&self) -> Option<Arc<super::app::AppAuth>> {
+        if self.owner_only {
+            return None;
+        }
+
+        self.app.clone().or_else(super::app::shared)
+    }
+
     /// The App's token for a repository it is installed on, the owner token for anything else,
     /// including GraphQL, whose URL names no repository
     async fn auth_header(&self, url: &str) -> anyhow::Result<String> {
-        if let (Some(app), Some(repo)) = (&self.app, repo_from_url(url)) {
+        if let (Some(app), Some(repo)) = (self.app(), repo_from_url(url)) {
             match app.token_for_repo(&repo).await {
                 Ok(Some(token)) => return Ok(format!("Bearer {token}")),
                 Ok(None) => {}
@@ -634,7 +646,7 @@ impl GhHttp {
                                 "GitHub API 401 Bad credentials — clearing cached token and re-resolving"
                             );
                             self.token_resolver.clear_cache().await;
-                            if let Some(app) = &self.app {
+                            if let Some(app) = self.app() {
                                 app.invalidate();
                             }
                             match self.auth_header(&resp_url).await {
@@ -1929,7 +1941,7 @@ impl GhHttp {
 
         // An installation token cannot read `GET /user`, and the owner is the identity mentions name
         let mut owner = self.clone();
-        owner.app = None;
+        owner.owner_only = true;
         let user: serde_json::Value = owner.get_json(&format!("{GITHUB_API}/user")).await?;
         let username = user
             .get("login")
@@ -3921,6 +3933,7 @@ mod tests {
             client: reqwest::Client::new(),
             token_resolver: Arc::new(crate::github::token::TokenResolver::default_env()),
             app: None,
+            owner_only: false,
             cached_username: OnceLock::new(),
             api_base: None,
         }
@@ -4518,6 +4531,7 @@ mod tests {
                 client: reqwest::Client::new(),
                 token_resolver: Arc::new(crate::github::token::TokenResolver::default_env()),
                 app: None,
+                owner_only: false,
                 cached_username: OnceLock::new(),
                 api_base: None,
             };

@@ -9,7 +9,7 @@ use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use reqwest::{header, Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration as StdDuration;
 
 const JWT_IAT_SKEW_SECS: i64 = 60;
@@ -59,6 +59,75 @@ struct AppInfo {
     slug: String,
 }
 
+const REVIEW_CHECK: &str = "orch/review";
+// GitHub lists at most 3000 files of a pull request, 30 pages of 100
+const PR_FILE_PAGES: u32 = 30;
+
+pub(crate) enum CheckRunState<'a> {
+    InProgress,
+    Completed { approved: bool, summary: &'a str },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InlineComment {
+    pub path: String,
+    pub line: u32,
+    pub body: String,
+}
+
+#[derive(Deserialize)]
+struct PrFile {
+    filename: String,
+    patch: Option<String>,
+}
+
+/// Right-side `(first, last)` line of each hunk, from headers such as `@@ -10,4 +12,6 @@`
+pub(crate) fn right_side_ranges(patch: &str) -> Vec<(u32, u32)> {
+    patch
+        .lines()
+        .filter_map(|line| line.strip_prefix("@@ "))
+        .filter_map(|header| header.split_whitespace().find(|part| part.starts_with('+')))
+        .filter_map(|right| {
+            let mut parts = right.trim_start_matches('+').split(',');
+            let start: u32 = parts.next()?.parse().ok()?;
+            let count: u32 = parts.next().map_or(Some(1), |c| c.parse().ok())?;
+            (count > 0).then(|| (start, start + count - 1))
+        })
+        .collect()
+}
+
+/// Split issues into inline comments on a hunk line and the rest, which GitHub would refuse
+pub(crate) fn split_inline(
+    issues: &[crate::engine::runner::response::ReviewIssue],
+    hunks: &HashMap<String, Vec<(u32, u32)>>,
+) -> (Vec<InlineComment>, Vec<String>) {
+    let mut inline = Vec::new();
+    let mut rest = Vec::new();
+
+    for issue in issues {
+        let body = format!("**{}:** {}", issue.severity, issue.description);
+        let in_hunk = issue.line.filter(|line| {
+            hunks
+                .get(&issue.file)
+                .is_some_and(|ranges| ranges.iter().any(|(a, b)| (a..=b).contains(&line)))
+        });
+
+        match in_hunk {
+            Some(line) => inline.push(InlineComment {
+                path: issue.file.clone(),
+                line,
+                body,
+            }),
+            None => rest.push(match issue.line {
+                Some(line) => format!("- `{}:{line}` {body}", issue.file),
+                None => format!("- `{}` {body}", issue.file),
+            }),
+        }
+    }
+
+    (inline, rest)
+}
+
 pub(crate) struct AppAuth {
     app_id: String,
     pem: String,
@@ -84,26 +153,68 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
 }
 
-/// Process-wide App client, `None` when `gh.app.id` is unset or the App config is unusable
+static SHARED: RwLock<Option<Arc<AppAuth>>> = RwLock::new(None);
+const LOAD_RETRY: StdDuration = StdDuration::from_secs(300);
+
+/// Process-wide App client, `None` until the loader has read the key or when no App is set up
 pub(crate) fn shared() -> Option<Arc<AppAuth>> {
-    static SHARED: OnceLock<Option<Arc<AppAuth>>> = OnceLock::new();
-    SHARED.get_or_init(load_shared).clone()
+    SHARED.read().unwrap_or_else(|err| err.into_inner()).clone()
 }
 
-fn load_shared() -> Option<Arc<AppAuth>> {
+fn publish(app: Arc<AppAuth>) {
+    *SHARED.write().unwrap_or_else(|err| err.into_inner()) = Some(app);
+}
+
+/// Reads the App key in the background, once per daemon start. A passbox key waits on Touch
+/// ID, so the engine runs on the owner token and comment reviews until the read succeeds
+pub fn start_loader() {
     // `cfg(test)` is unset when tests/*.rs link the library, so check debug builds too, at run
     // time, which keeps the release path compiled and type-checked in every build
     if cfg!(any(test, debug_assertions)) {
-        return None;
+        return;
     }
-    let id = nonempty_config("gh.app.id")?;
-    match AppAuth::from_config(id) {
-        Ok(app) => Some(Arc::new(app)),
-        Err(err) => {
-            tracing::error!(error = %err, "GitHub App config unusable, orch uses the owner token");
-            None
+
+    tokio::spawn(run_loader(load_from_config, publish, LOAD_RETRY));
+}
+
+// One read at a time, so at most one passbox prompt is ever pending
+async fn run_loader<L, P>(load: L, publish: P, retry: StdDuration)
+where
+    L: Fn() -> anyhow::Result<Option<AppAuth>> + Clone + Send + 'static,
+    P: Fn(Arc<AppAuth>),
+{
+    let mut warned = false;
+
+    loop {
+        let attempt = load.clone();
+        let result = tokio::task::spawn_blocking(attempt)
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r);
+
+        match result {
+            Ok(Some(app)) => {
+                tracing::info!(app_id = %app.app_id, "GitHub App loaded, App reviews and App quota are on");
+                publish(Arc::new(app));
+                return;
+            }
+            Ok(None) => return,
+            Err(err) if !warned => {
+                tracing::warn!(error = %err, "GitHub App unavailable, using the owner token and comment reviews, retrying every 5 minutes");
+                warned = true;
+            }
+            Err(_) => {}
         }
+
+        tokio::time::sleep(retry).await;
     }
+}
+
+fn load_from_config() -> anyhow::Result<Option<AppAuth>> {
+    let Some(id) = nonempty_config("gh.app.id") else {
+        return Ok(None);
+    };
+    AppAuth::from_config(id).map(Some)
 }
 
 impl AppAuth {
@@ -229,15 +340,26 @@ impl AppAuth {
         event: ReviewEvent,
         body: &str,
         commit_id: &str,
+        comments: &[InlineComment],
     ) -> anyhow::Result<()> {
-        let Some(token) = self.token_for_repo(repo).await? else {
-            anyhow::bail!("the GitHub App is not installed on {repo}");
-        };
+        let token = self.repo_token(repo).await?;
         let url = format!("{}/repos/{repo}/pulls/{pr_number}/reviews", self.api_base);
+        let comments: Vec<serde_json::Value> = comments
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "path": c.path,
+                    "line": c.line,
+                    "side": "RIGHT",
+                    "body": super::http::redact_posted_body(&c.body),
+                })
+            })
+            .collect();
         let payload = serde_json::json!({
             "event": event.as_str(),
             "body": super::http::redact_posted_body(body),
             "commit_id": commit_id,
+            "comments": comments,
         });
         let result = self.send(self.http.post(&url).json(&payload), &token).await;
         if result
@@ -247,6 +369,78 @@ impl AppAuth {
             self.invalidate();
         }
         result.map(|_| ())
+    }
+
+    async fn repo_token(&self, repo: &str) -> anyhow::Result<String> {
+        match self.token_for_repo(repo).await? {
+            Some(token) => Ok(token),
+            None => anyhow::bail!("the GitHub App is not installed on {repo}"),
+        }
+    }
+
+    /// Post the `orch/review` check run on `head_sha`. The Checks API takes only an App token
+    pub(crate) async fn post_check_run(
+        &self,
+        repo: &str,
+        head_sha: &str,
+        state: CheckRunState<'_>,
+    ) -> anyhow::Result<()> {
+        let token = self.repo_token(repo).await?;
+        let url = format!("{}/repos/{repo}/check-runs", self.api_base);
+        let payload = match state {
+            CheckRunState::InProgress => serde_json::json!({
+                "name": REVIEW_CHECK,
+                "head_sha": head_sha,
+                "status": "in_progress",
+            }),
+            CheckRunState::Completed { approved, summary } => serde_json::json!({
+                "name": REVIEW_CHECK,
+                "head_sha": head_sha,
+                "status": "completed",
+                "conclusion": if approved { "success" } else { "failure" },
+                "output": {
+                    "title": if approved { "Approved by automated review" } else { "Automated review requested changes" },
+                    "summary": super::http::redact_posted_body(summary),
+                },
+            }),
+        };
+        self.send(self.http.post(&url).json(&payload), &token)
+            .await
+            .map(|_| ())
+    }
+
+    /// Right-side line ranges of every hunk in the pull request, per file path
+    pub(crate) async fn pull_request_hunks(
+        &self,
+        repo: &str,
+        pr_number: u64,
+    ) -> anyhow::Result<HashMap<String, Vec<(u32, u32)>>> {
+        let token = self.repo_token(repo).await?;
+        let mut hunks = HashMap::new();
+
+        for page in 1..=PR_FILE_PAGES {
+            let url = format!(
+                "{}/repos/{repo}/pulls/{pr_number}/files?per_page=100&page={page}",
+                self.api_base
+            );
+            let body = self.send(self.http.get(&url), &token).await?;
+            let files: Vec<PrFile> = serde_json::from_str(&body)
+                .map_err(|_| anyhow::anyhow!("pull request files could not be read"))?;
+            let last = files.len() < 100;
+
+            for file in files {
+                hunks.insert(
+                    file.filename,
+                    right_side_ranges(file.patch.as_deref().unwrap_or("")),
+                );
+            }
+
+            if last {
+                break;
+            }
+        }
+
+        Ok(hunks)
     }
 
     async fn send(&self, builder: reqwest::RequestBuilder, bearer: &str) -> anyhow::Result<String> {
@@ -293,6 +487,10 @@ fn nonempty_config(key: &str) -> Option<String> {
 }
 
 fn read_key() -> anyhow::Result<String> {
+    // `passbox:<name>` keeps the key out of every file an agent can read
+    if let Some(reference) = nonempty_config("gh.app.private_key") {
+        return normalize_pem(&crate::secret_ref::resolve(&reference)?);
+    }
     if let Some(path) = nonempty_config("gh.app.private_key_path") {
         let raw = std::fs::read_to_string(&path)
             .map_err(|err| anyhow::anyhow!("failed to read GitHub App private key file: {err}"))?;
@@ -304,7 +502,7 @@ fn read_key() -> anyhow::Result<String> {
             anyhow::anyhow!("GitHub App private key variable {name} is unset or empty")
         });
     }
-    anyhow::bail!("set gh.app.private_key_path or gh.app.private_key_env")
+    anyhow::bail!("set gh.app.private_key, gh.app.private_key_env or gh.app.private_key_path")
 }
 
 // A key injected through an environment variable often carries literal `\n`
@@ -397,7 +595,7 @@ pub(crate) fn effective_comment_flags(
 #[cfg(test)]
 fn test_keys() -> &'static (String, String) {
     use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
-    static KEYS: OnceLock<(String, String)> = OnceLock::new();
+    static KEYS: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
     KEYS.get_or_init(|| {
         let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).expect("rsa");
         let private = key.to_pkcs8_pem(LineEnding::LF).expect("pem").to_string();
@@ -631,7 +829,7 @@ mod tests {
             .mount(&server)
             .await;
         app(&server)
-            .submit_review("o/r", 9, ReviewEvent::Approve, "looks good", "abc123")
+            .submit_review("o/r", 9, ReviewEvent::Approve, "looks good", "abc123", &[])
             .await
             .expect("review submitted");
     }
@@ -645,7 +843,7 @@ mod tests {
             .mount(&server)
             .await;
         let err = app(&server)
-            .submit_review("org/b", 9, ReviewEvent::Approve, "ok", "abc123")
+            .submit_review("org/b", 9, ReviewEvent::Approve, "ok", "abc123", &[])
             .await
             .unwrap_err()
             .to_string();
@@ -702,5 +900,89 @@ mod tests {
             effective_comment_flags(&on_head, "head", None, true, false),
             (true, false)
         );
+    }
+
+    #[test]
+    fn hunk_headers_give_the_right_side_line_ranges() {
+        let patch =
+            "@@ -1,2 +10,3 @@\n a\n+b\n@@ -40 +44 @@ fn x()\n-c\n+d\n@@ -60,3 +70,0 @@\n-gone";
+        assert_eq!(right_side_ranges(patch), vec![(10, 12), (44, 44)]);
+        assert!(right_side_ranges("").is_empty());
+        assert!(right_side_ranges("@@ garbage @@").is_empty());
+    }
+
+    #[test]
+    fn issues_on_a_hunk_line_go_inline_and_the_rest_are_listed() {
+        use crate::engine::runner::response::ReviewIssue;
+        let issue = |file: &str, line: Option<u32>| ReviewIssue {
+            file: file.to_string(),
+            line,
+            severity: "warning".to_string(),
+            description: "check".to_string(),
+        };
+        let hunks = HashMap::from([("a.rs".to_string(), vec![(10, 12)])]);
+        let (inline, rest) = split_inline(
+            &[
+                issue("a.rs", Some(12)),
+                issue("a.rs", Some(13)),
+                issue("b.rs", None),
+            ],
+            &hunks,
+        );
+        assert_eq!(
+            inline,
+            vec![InlineComment {
+                path: "a.rs".to_string(),
+                line: 12,
+                body: "**warning:** check".to_string(),
+            }]
+        );
+        assert_eq!(
+            rest,
+            vec![
+                "- `a.rs:13` **warning:** check",
+                "- `b.rs` **warning:** check"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_key_read_retries_and_a_later_read_publishes_the_app() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let load = move || {
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                anyhow::bail!("nobody answered the prompt");
+            }
+            Ok(Some(AppAuth::new(
+                "12345".to_string(),
+                test_pem().to_string(),
+                "http://127.0.0.1:9".to_string(),
+            )))
+        };
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&published);
+
+        run_loader(
+            load,
+            move |app| lock(&sink).push(app.app_id.clone()),
+            StdDuration::from_millis(5),
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(*lock(&published), vec!["12345".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn no_app_configured_stops_the_loader_without_publishing() {
+        let published = Arc::new(Mutex::new(0));
+        let sink = Arc::clone(&published);
+        run_loader(
+            || Ok(None),
+            move |_| *lock(&sink) += 1,
+            StdDuration::from_millis(5),
+        )
+        .await;
+        assert_eq!(*lock(&published), 0);
     }
 }

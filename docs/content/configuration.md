@@ -53,6 +53,8 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `webhook` | `secret` | HMAC secret for verifying GitHub webhook payloads | `""` |
 | `relay` | `url` | orch-relay base URL. orch connects out to `<url>/ws` and wakes the sync on each GitHub App event. Unset means off | `""` |
 | `relay` | `token` | Bearer token for the relay. Write `passbox:<name>` to read it once from passbox at startup, so the config holds no secret | `""` |
+| `review` | `mode` | `comment` or `app`, see [Review mode](#review-mode). A project's `.orch.yml` overrides the global value | `comment` |
+| `gh.app` | `id` / `private_key` | GitHub App id and its key, `private_key` takes a `passbox:<name>` reference, see [GitHub App](#github-app) | `""` |
 | `gh` | `repo` | Default repo (`owner/repo`) | `"owner/repo"` |
 | `gh` | `project_id` | GitHub Project v2 ID | `""` |
 | `gh` | `project_status_field_id` | Status field ID in Project v2 | `""` |
@@ -156,7 +158,7 @@ gh:
 
 ### GitHub App
 
-With an App configured, orch makes its own REST calls to a repository with that repository's installation token, so they count against the App's quota. It also submits reviews as the App, because GitHub does not let an account approve its own pull request. Agents keep the owner's `gh`.
+With an App configured, orch makes its own REST calls to a repository with that repository's installation token, so they count against the App's quota. Agents keep the owner's `gh`.
 
 orch looks up the installation per repository (`GET /repos/{repo}/installation`), since your account and each organization are separate installations. A repository the App is not installed on, GraphQL, `GET /user` and Projects V2 on a personal account use the owner token. Without `gh.app.id`, orch behaves as before.
 
@@ -165,13 +167,30 @@ orch looks up the installation per repository (`GET /repos/{repo}/installation`)
 gh:
   app:
     id: "123456"
-    private_key_env: "ORCH_APP_KEY"       # name of a variable that holds the PEM, or
-    private_key_path: "/path/to/app.pem"  # absolute path
+    private_key: "passbox:orch/github-app-key"   # preferred, or
+    private_key_env: "ORCH_APP_KEY"               # a variable that holds the PEM, or
+    private_key_path: "/path/to/app.pem"          # an absolute path
 ```
 
-Agents run as your user and can read any file you can, so prefer `private_key_env` with the key injected at launch over a `.pem` file. orch signs an RS256 JWT, exchanges it for an installation token per installation, and refreshes each token 10 minutes before it expires. If a token is unavailable, orch logs a warning and uses the owner token.
+Agents run as your user and can read any file you can, so keep the key in passbox. passbox returns the first line of an entry, so store the PEM on one line with `\n` for each newline, for example `awk '{printf "%s\\n", $0}' app.pem | passbox add orch/github-app-key`. orch reads the key once after it starts, in the background, and keeps it in memory for the life of the process. A passbox read waits on Touch ID, so until it succeeds orch uses the owner token and comment reviews, logs one warning and retries every 5 minutes with at most one prompt pending. Debug builds and tests never load the App.
 
-The review gate counts an App review only when its `commit_id` is the current head. A review on an older sha does not count. The `## Automated Review` comment is still posted, and the gate reads it when the App has no review on the head.
+orch signs an RS256 JWT, exchanges it for an installation token per installation, and refreshes each token 10 minutes before it expires. If a token is unavailable, orch logs a warning and uses the owner token.
+
+### Review mode
+
+`review.mode` picks how a project's pull requests are reviewed. The project's `.orch.yml` wins, then the global config, then the default `comment`.
+
+```yaml
+review:
+  mode: app   # or comment
+```
+
+| Mode | Decision | Gate |
+|------|----------|------|
+| `comment` | a `## Automated Review` comment | the `orch/review` commit status |
+| `app` | a real `APPROVE` or `REQUEST_CHANGES` review from the App, with each issue on a changed line as an inline comment | the `orch/review` check run from the App, `in_progress` while the review runs, then `success` or `failure` |
+
+Both modes post the `## Automated Review` comment, and the gate reads it when the App has no review on the head. A review and the check run belong to the head sha the agent reviewed, so a new push makes the PR pending again. Issues on lines outside the diff stay in the review body, since GitHub refuses an inline comment there. A project in `app` mode whose repository does not have the App installed, or a daemon whose App key is not read yet, reviews in `comment` mode.
 
 ## Cluster
 

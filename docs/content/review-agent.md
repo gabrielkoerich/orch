@@ -23,6 +23,8 @@ The review agent automatically reviews pull requests after an agent completes a 
 
    Review comments use a `## Automated Review` header as the protocol. orch also posts the decision as a commit status on the PR head SHA, context `orch/review`: `pending` while the review runs, `success` for approve, `failure` for changes requested. A new push moves the head SHA, so an old approval does not carry over. `orch init` no longer installs `.github/workflows/orch-review.yml`. A repository that has it can delete the file and the `ORCH_REVIEWER` variable.
 
+   With `review.mode: app` and the GitHub App installed on the repository, the review agent's decision becomes a real App review with inline comments, and `orch/review` is a check run from the App instead of a commit status. See [Review mode](../configuration/#review-mode).
+
 ## Agent Selection
 
 The review agent is chosen via round-robin, excluding the task executor and all agents that have previously reviewed this task:

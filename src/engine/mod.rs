@@ -2131,6 +2131,7 @@ pub async fn serve() -> anyhow::Result<()> {
     }
 
     start_relay_client(&project_engines, &webhook_notify);
+    crate::github::app::start_loader();
 
     // Agent router (selects agent + model per task) - shared across projects.
     // Router::from_config() may run `opencode models` (a blocking subprocess) to
