@@ -51,6 +51,8 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `webhook` | `enabled` | Start the local webhook receiver (HTTP) | `false` |
 | `webhook` | `port` | Webhook listener port | `8080` |
 | `webhook` | `secret` | HMAC secret for verifying GitHub webhook payloads | `""` |
+| `relay` | `url` | orch-relay base URL. orch connects out to `<url>/ws` and wakes the sync on each GitHub App event. Unset means off | `""` |
+| `relay` | `token` | Bearer token for the relay. Write `passbox:<name>` to read it once from passbox at startup, so the config holds no secret | `""` |
 | `gh` | `repo` | Default repo (`owner/repo`) | `"owner/repo"` |
 | `gh` | `project_id` | GitHub Project v2 ID | `""` |
 | `gh` | `project_status_field_id` | Status field ID in Project v2 | `""` |
@@ -103,6 +105,7 @@ These settings still need `orch service restart`. Editing one logs `config chang
 |---------|-----|
 | `channels.*` | Telegram and Discord gateways hold long-lived websocket connections |
 | `webhook.*` | The HTTP listener binds its port at startup |
+| `relay.*` | The relay client reads its token and opens its websocket at startup |
 | Removing a project from `projects:` | Its subscriber tasks and already-dispatched agents outlive the config read |
 
 ## Skills
