@@ -9,7 +9,7 @@ An autonomous task orchestration engine that delegates work to AI coding agents 
 - **Multi-agent support** — Route tasks to Claude, Codex, OpenCode, Kimi, MiniMax, or Grok based on task complexity
 - **Multi-project** — Manage multiple repositories from a single service
 - **GitHub Issues integration** — Two-way sync with GitHub Issues as the source of truth
-- **Issue dependencies** — a task with open blockers stays `waiting` until each blocking pull request is approved and merged into the default branch. `orch task add --depends-on` writes the GitHub link. `orch task unblock all` does not start a waiting task
+- **Issue dependencies** — a task with open blockers stays `waiting` until each blocking pull request is merged into the default branch. `orch task add --depends-on` writes the GitHub link. `orch task unblock all` does not start a waiting task
 - **GitHub Projects V2** — Automatic project board column sync on status changes
 - **Isolated worktrees** — Each task runs in its own git worktree, never touching the main repo
 - **Live session streaming** — Watch agents work in real-time via `orch stream` (all sessions) or `orch stream <task_id>`

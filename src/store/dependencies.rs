@@ -1,10 +1,8 @@
 //! Issue dependency rows and the claim gate that keeps a waiting task from starting.
 //!
 //! A dependency is done when its blocker snapshot says the blocking pull request
-//! was approved and merged into the default branch, or the issue has no pull
-//! request and was closed as completed. Approval includes an orch
-//! `## Automated Review` comment from the reviewer account. A local `done` row
-//! is not enough.
+//! was merged into the default branch, or the issue has no pull request and was
+//! closed as completed. A local `done` row is not enough.
 //! `not_planned` and `duplicate` are not done. `new`, `routed`, `waiting`,
 //! `blocked`, and `needs_review` move to `waiting` while a dependency is open.
 //! `in_progress` and `in_review` stay where they are.
@@ -173,7 +171,8 @@ impl BlockerSnapshot {
             return false;
         }
         if self.has_pr {
-            return self.pr_merged && self.pr_merged_into_default && self.pr_approved;
+            // A merge into the default branch is the decision, even without an approving review
+            return self.pr_merged && self.pr_merged_into_default;
         }
         self.issue_state == "closed" && (reason.is_empty() || reason == "completed")
     }
@@ -767,7 +766,7 @@ mod tests {
                 closed_unmerged: false,
             }),
         );
-        assert!(!merged_unapproved.is_satisfied());
+        assert!(merged_unapproved.is_satisfied());
 
         assert!(BlockerSnapshot::observe("closed", None, None).is_satisfied());
         assert!(BlockerSnapshot::observe("closed", Some("completed"), None).is_satisfied());
