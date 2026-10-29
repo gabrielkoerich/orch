@@ -219,8 +219,11 @@ fn policy(run: &Run) -> Policy {
         }
     }
 
-    // /private/tmp stays writable, but the agent must not delete or replace these sockets
-    p.read_only.extend(socket_dirs(&run.temp));
+    // /private/tmp stays writable, but the agent must not delete or replace these sockets.
+    // bwrap hides them in an empty scratch dir, and binding them back would expose them
+    if run.seatbelt {
+        p.read_only.extend(socket_dirs(&run.temp));
+    }
 
     p.read_only.push(run.work_dir.join(".orch.yml"));
     p.read_only.extend(
