@@ -30,6 +30,7 @@ pub async fn dashboard(global: bool, project: Option<String>) -> anyhow::Result<
         Status::Routed,
         Status::InProgress,
         Status::InReview,
+        Status::Approved,
         Status::Done,
         Status::NeedsReview,
         Status::Blocked,
@@ -57,6 +58,7 @@ pub async fn dashboard(global: bool, project: Option<String>) -> anyhow::Result<
             Status::Done => TaskStatus::Done,
             Status::Blocked => TaskStatus::Blocked,
             Status::InReview => TaskStatus::InReview,
+            Status::Approved => TaskStatus::Approved,
             Status::NeedsReview => TaskStatus::NeedsReview,
             Status::Waiting => TaskStatus::Waiting,
         };
@@ -162,6 +164,7 @@ async fn dashboard_from_global_store(project: Option<&str>) -> anyhow::Result<()
         TaskStatus::Routed,
         TaskStatus::InProgress,
         TaskStatus::InReview,
+        TaskStatus::Approved,
         TaskStatus::NeedsReview,
         TaskStatus::Blocked,
         TaskStatus::Done,

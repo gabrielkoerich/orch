@@ -16,7 +16,7 @@ Key fields:
 | `external_id` | GitHub issue number (if external) |
 | `repo` | Repository slug (`owner/repo`) |
 | `title`, `body`, `labels` | Task description and metadata |
-| `status` | `new`, `routed`, `in_progress`, `done`, `in_review`, `blocked`, `needs_review` |
+| `status` | `new`, `routed`, `in_progress`, `done`, `in_review`, `approved`, `blocked`, `needs_review`, `waiting` |
 | `agent` | Executor (`codex`, `claude`, `opencode`, `kimi`, `minimax`, `grok`) |
 | `model` | Model chosen by the router |
 | `complexity` | Router-assigned complexity (`simple`, `medium`, `complex`) |
@@ -32,7 +32,7 @@ Key fields:
 ## Task Lifecycle
 
 ```
-new → routed → in_progress → needs_review → in_review → done (merged)
+new → routed → in_progress → needs_review → in_review → approved → done (merged)
   ↑                         → done (no PR)
   │                         → blocked
 waiting
@@ -44,6 +44,7 @@ waiting
 - **in_progress** — agent is running
 - **done** — PR merged (or agent completed with no code changes)
 - **in_review** — review agent is actively running on the PR
+- **approved** — the review approved the PR, orch waits for CI and merges, no agent runs
 - **blocked** — agent hit a blocker or crashed and requires human intervention (rare)
 - **needs_review** — agent needs human help, or review agent requested changes. After repeated failures the engine moves tasks to `needs_review` and removes any forced `agent:*` label so an owner can reassign.
 

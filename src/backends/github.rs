@@ -66,6 +66,7 @@ fn active_status_from_label(label: &str) -> Option<Status> {
         "status:in_progress" => Some(Status::InProgress),
         "status:needs_review" => Some(Status::NeedsReview),
         "status:in_review" => Some(Status::InReview),
+        "status:approved" => Some(Status::Approved),
         "status:blocked" => Some(Status::Blocked),
         "status:waiting" => Some(Status::Waiting),
         _ => None,

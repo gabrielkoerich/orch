@@ -52,6 +52,8 @@ pub enum Status {
     Done,
     Blocked,
     InReview,
+    // A review approved the PR, orch waits for CI and merges, no agent runs
+    Approved,
     NeedsReview,
     Waiting,
 }
@@ -65,6 +67,7 @@ impl Status {
             Self::Done => "status:done",
             Self::Blocked => "status:blocked",
             Self::InReview => "status:in_review",
+            Self::Approved => "status:approved",
             Self::NeedsReview => "status:needs_review",
             Self::Waiting => "status:waiting",
         }
@@ -78,6 +81,7 @@ impl Status {
             Self::Done => "done",
             Self::Blocked => "blocked",
             Self::InReview => "in_review",
+            Self::Approved => "approved",
             Self::NeedsReview => "needs_review",
             Self::Waiting => "waiting",
         }
@@ -235,6 +239,7 @@ pub trait ExternalBackend: Send + Sync {
             Status::Done,
             Status::Blocked,
             Status::InReview,
+            Status::Approved,
             Status::NeedsReview,
             Status::Waiting,
         ];
@@ -287,6 +292,7 @@ pub trait ExternalBackend: Send + Sync {
             Status::InProgress,
             Status::NeedsReview,
             Status::InReview,
+            Status::Approved,
             Status::Blocked,
             Status::Waiting,
         ];
@@ -772,6 +778,13 @@ mod tests {
         assert_eq!(Status::Done.as_label(), "status:done");
         assert_eq!(Status::Blocked.as_label(), "status:blocked");
         assert_eq!(Status::InReview.as_label(), "status:in_review");
+        assert_eq!(Status::Approved.as_label(), "status:approved");
+        assert_eq!(Status::Approved.as_str(), "approved");
+        assert_eq!(
+            crate::store::TaskStatus::from_str("approved"),
+            Some(crate::store::TaskStatus::Approved)
+        );
+        assert_eq!(crate::store::TaskStatus::Approved.as_str(), "approved");
         assert_eq!(Status::NeedsReview.as_label(), "status:needs_review");
     }
 

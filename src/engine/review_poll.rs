@@ -443,6 +443,8 @@ pub(crate) async fn review_open_prs(
                 {
                     tracing::warn!(task_id, err = %e, "failed to update status to done");
                 }
+            } else if task_info.stored.status == crate::store::TaskStatus::Approved {
+                block_closed_approved_pr(task_manager, &task_info.task.id).await;
             } else {
                 let max_reroutes: u32 = config::get("workflow.max_reroute_attempts")
                     .ok()
@@ -1070,6 +1072,24 @@ fn automated_review_from_comments(
     }
 }
 
+/// Someone closed an approved PR without merging it, so a person decides what happens next
+pub(crate) async fn block_closed_approved_pr(task_manager: &TaskManager, id: &ExternalId) {
+    tracing::warn!(
+        task_id = id.0,
+        "approved PR was closed without merge, blocking task"
+    );
+    let fields = [(
+        "block_reason",
+        serde_json::json!("approved PR was closed without merge"),
+    )];
+    if let Err(e) = task_manager
+        .update_task_status_and_result(id, Status::Blocked, &fields)
+        .await
+    {
+        tracing::warn!(task_id = id.0, err = %e, "failed to block a task whose approved PR was closed");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1645,6 +1665,72 @@ mod tests {
         let after = store.get(task_id).await.unwrap();
         assert_eq!(after.status, TaskStatus::Routed);
         assert_eq!(after.no_code_reroutes, 1);
+    }
+
+    // ─── review_open_prs: Phase 3 — approved PR closed without merge ──────────
+
+    #[tokio::test]
+    async fn review_open_prs_blocks_an_approved_task_whose_pr_closed_unmerged() {
+        let store = make_store().await;
+        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
+            "owner/repo".to_string(),
+        ));
+
+        let task_id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "approved".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let _ = crate::store::store_set_by_id(
+            &Some(&store),
+            task_id,
+            &[("branch", serde_json::json!("approved-branch"))],
+        )
+        .await;
+        store
+            .update_status(task_id, TaskStatus::Approved)
+            .await
+            .unwrap();
+        let stored = store.get(task_id).await.unwrap();
+        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
+            external: crate::engine::tasks::store_task_to_external(&stored),
+            stored,
+        };
+
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+        let in_flight = Arc::new(DashSet::new());
+        review_open_prs(
+            &backend,
+            "owner/repo",
+            &default_config(),
+            &tm,
+            &store,
+            &dispatching,
+            &in_flight,
+            &[snapshot],
+            &MockGh::default(),
+            &crate::engine::router::RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        let after = store.get(task_id).await.unwrap();
+        assert_eq!(after.status, TaskStatus::Blocked);
+        assert_eq!(
+            after.block_reason.as_deref(),
+            Some("approved PR was closed without merge")
+        );
+        assert_eq!(
+            after.no_code_reroutes, 0,
+            "an approved task is not rerouted"
+        );
     }
 
     // ─── review_open_prs: Phase 3 — no PR, max reroutes → blocked ────────────

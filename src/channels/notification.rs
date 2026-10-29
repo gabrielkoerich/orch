@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum NotificationLevel {
     /// Broadcast review-active and terminal completions only: `done`,
-    /// `in_review`, `blocked`, `failed`. Intermediate transitions (`new`,
+    /// `in_review`, `approved`, `blocked`, `failed`. Intermediate transitions (`new`,
     /// `routed`, `in_progress`, `needs_review`) are suppressed.
     All,
     /// Broadcast every status transition, including intermediate states.
@@ -50,7 +50,10 @@ impl NotificationLevel {
     /// `blocked`, `failed`) are the ones humans actually act on.
     pub fn should_notify(&self, status: &str) -> bool {
         match self {
-            Self::All => matches!(status, "done" | "in_review" | "blocked" | "failed"),
+            Self::All => matches!(
+                status,
+                "done" | "in_review" | "approved" | "blocked" | "failed"
+            ),
             Self::Verbose => true,
             Self::ErrorsOnly => matches!(status, "blocked" | "failed"),
             Self::None => false,
@@ -219,6 +222,7 @@ fn status_emoji(status: &str) -> &'static str {
     match status {
         "done" => "✅",
         "in_review" => "🔍",
+        "approved" => "👍",
         "in_progress" => "🔄",
         "needs_review" => "⚠️",
         "blocked" => "🚫",

@@ -332,7 +332,7 @@ async fn list_from_global_store(
         } else {
             let task_status = crate::store::TaskStatus::from_str(status_str)
                 .ok_or_else(|| anyhow::anyhow!(
-                    "invalid status: '{}'. allowed: new, routed, in_progress, needs_review, in_review, blocked, waiting, done, all",
+                    "invalid status: '{}'. allowed: new, routed, in_progress, needs_review, in_review, approved, blocked, waiting, done, all",
                     status_str
                 ))?;
             store.list_all_by_status_global(task_status).await?
@@ -664,6 +664,7 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
         Status::Done,
         Status::Blocked,
         Status::InReview,
+        Status::Approved,
         Status::NeedsReview,
         Status::Waiting,
     ];
@@ -695,6 +696,7 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
                 Status::Done => TaskStatus::Done,
                 Status::Blocked => TaskStatus::Blocked,
                 Status::InReview => TaskStatus::InReview,
+                Status::Approved => TaskStatus::Approved,
                 Status::NeedsReview => TaskStatus::NeedsReview,
                 Status::Waiting => TaskStatus::Waiting,
             };

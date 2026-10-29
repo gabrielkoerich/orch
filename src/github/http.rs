@@ -3489,6 +3489,7 @@ pub fn status_label_color(label: &str) -> &'static str {
         "status:done" => "6f42c1",
         "status:blocked" => "d73a4a",
         "status:in_review" => "0075ca",
+        "status:approved" => "2ea44f",
         "status:needs_review" => "e4e669",
         "status:waiting" => "5319e7",
         _ => "c5def5",

@@ -281,7 +281,7 @@ impl ProjectSync {
         match status {
             Status::New | Status::Routed | Status::Waiting => "backlog",
             Status::InProgress | Status::Blocked => "in_progress",
-            Status::InReview | Status::NeedsReview => "review",
+            Status::InReview | Status::NeedsReview | Status::Approved => "review",
             Status::Done => "done",
         }
     }
@@ -517,6 +517,7 @@ mod tests {
             "in_progress"
         );
         assert_eq!(ProjectSync::status_to_column(&Status::InReview), "review");
+        assert_eq!(ProjectSync::status_to_column(&Status::Approved), "review");
         assert_eq!(
             ProjectSync::status_to_column(&Status::NeedsReview),
             "review"

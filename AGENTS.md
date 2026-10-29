@@ -140,7 +140,7 @@ See also `## DO NOT TOUCH → No external endpoints`. In practice polling is the
 
 When a PR review on an `in_review` task returns `CHANGES_REQUESTED`, the engine stores feedback in `pr_review_context`, increments `review_cycles`, re-routes the task back to `Routed` (reuses existing agent/model/worktree/branch — skips LLM re-classification), and the agent commits fixes to the same PR.
 
-Task becomes `blocked` when `review_cycles >= max_review_cycles`, and `done` only when the PR is actually merged.
+An approving review moves the task to `approved`, in `comment` and `app` review mode alike. Task becomes `blocked` when `review_cycles >= max_review_cycles`, and `done` only when the PR is actually merged.
 
 ```yaml
 workflow:
@@ -265,6 +265,7 @@ No work is lost — tasks resume from their worktrees on restart.
 - **`in_progress`** — agent is working on the task in a tmux session
 - **`needs_review`** — agent completed, awaiting review agent dispatch (automatic, not human)
 - **`in_review`** — review agent is actively reviewing the PR
+- **`approved`** — the review approved the PR. orch waits for CI and merges with no agent or session, merged → `done`, conflict or red CI → `routed`, PR closed unmerged → `blocked`. Restarts and stuck-review recovery never reset it
 - **`done`** — PR merged, worktree cleaned up. **Terminal**: nothing moves a task out of done. `retry`, `unblock` and the `/retry`, `/reroute`, `/unblock` channel commands refuse a done task, `doctor --fix` reports a suspicious done task and leaves its status alone, and `orch task reopen` no longer exists. A revived task re-runs the body it was created with, which may be months stale — follow-up work gets a new issue or task (#3780)
 - **`blocked`** — requires human attention (max review cycles, max attempts, agent failures, unrecoverable errors)
 - `mark_needs_review()` sets `needs_review`, NOT `blocked`

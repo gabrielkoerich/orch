@@ -532,6 +532,7 @@ pub async fn tick(
                             | Some("status:new")
                             | Some("status:needs_review")
                             | Some("status:in_review")
+                            | Some("status:approved")
                             | Some("status:waiting") => true,
                             None => true,     // No status label — treat as active
                             Some(_) => false, // Terminal state
@@ -569,6 +570,7 @@ pub async fn tick(
                                 | TaskStatus::InProgress
                                 | TaskStatus::NeedsReview
                                 | TaskStatus::InReview
+                                | TaskStatus::Approved
                                 | TaskStatus::Waiting => true,
                                 _ => false, // Terminal state (Done, Blocked, Cancelled)
                             },

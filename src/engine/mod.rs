@@ -1042,8 +1042,8 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
                     }
                 }
                 // A blocked or waiting task resumes from this work, and without a PR the branch
-                // may hold the only copy of it
-                TaskStatus::Blocked | TaskStatus::Waiting => {
+                // may hold the only copy of it. An approved task's PR is updated on GitHub
+                TaskStatus::Blocked | TaskStatus::Waiting | TaskStatus::Approved => {
                     valid_kept += 1;
                 }
                 TaskStatus::Done => {
