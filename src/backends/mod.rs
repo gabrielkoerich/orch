@@ -113,8 +113,8 @@ pub struct PullRequestCompletion {
 
 /// Result of reading native blocked-by links.
 ///
-/// `Native` is authoritative, including when the list is empty.
-/// `Unavailable` means the API is missing or forbidden, so the body is the fallback.
+/// `Native` is the GitHub blocked-by list, including when it is empty.
+/// `Unavailable` means the API is missing or forbidden, so the native list is empty.
 /// `Failed` means the read did not succeed, so stored rows stay as they are
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockedByFetch {
@@ -477,8 +477,8 @@ pub trait ExternalBackend: Send + Sync {
 
     /// Native blocked-by issues for `issue_number` in `repo`.
     ///
-    /// Default is `Unavailable`, which keeps the body fallback. A 200 with an
-    /// empty list is `Native`, not this default
+    /// Default is `Unavailable`, an empty native list. A 200 with an empty list
+    /// is `Native`, not this default
     async fn blocked_by(&self, _repo: &str, _issue_number: i64) -> anyhow::Result<BlockedByFetch> {
         Ok(BlockedByFetch::Unavailable)
     }
