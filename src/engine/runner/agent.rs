@@ -325,8 +325,9 @@ fn build_tmux_runner_scripts(
                 .iter()
                 .map(|a| shell_single_quote(&a.to_string_lossy()))
                 .collect();
+            // The tmux and ssh-agent sockets are out of reach, and their variables go too
             format!(
-                "{} /bin/bash -c {}",
+                "env -u TMUX -u TMUX_PANE -u SSH_AUTH_SOCK {} /bin/bash -c {}",
                 prefix.join(" "),
                 shell_single_quote(agent_cmd)
             )
@@ -974,7 +975,7 @@ mod tests {
                 .expect("runner scripts should build");
         assert!(
             agent_cmd_script.contains(
-                "'/usr/bin/sandbox-exec' '-p' '(version 1)' /bin/bash -c 'claude -p '\\''hi'\\''' 2>"
+                "env -u TMUX -u TMUX_PANE -u SSH_AUTH_SOCK '/usr/bin/sandbox-exec' '-p' '(version 1)' /bin/bash -c 'claude -p '\\''hi'\\''' 2>"
             ),
             "the agent must run inside the sandbox with stderr split outside it, got: {agent_cmd_script}"
         );
