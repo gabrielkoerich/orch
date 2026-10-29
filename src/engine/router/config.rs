@@ -478,8 +478,13 @@ impl RouterConfig {
         // dispatching unavailable models during routing — the dynamic filter in
         // `expanded_model_pool` also catches these, but fails open when discovery returns
         // empty (e.g. during a background cache refresh), allowing stale models through.
-        let discovered_opencode =
-            crate::engine::runner::agents::opencode::discover_opencode_models();
+        // Reading the catalog costs an `opencode models` run, so only configs that can
+        // reach opencode pay for it
+        let discovered_opencode = if config.uses_opencode() {
+            crate::engine::runner::agents::opencode::discover_opencode_models()
+        } else {
+            Vec::new()
+        };
         if !discovered_opencode.is_empty() {
             let discovered: std::collections::HashSet<String> =
                 discovered_opencode.into_iter().collect();
@@ -712,6 +717,26 @@ impl RouterConfig {
         }
         // All models cooled — return None so the caller can fall back to a different agent
         None
+    }
+
+    /// True when this config can reach opencode: a `model_map` tier lists it, or the
+    /// effective router pool or fallback names it. Those are the only entries read out of
+    /// `opencode models`, so every other config can skip the call
+    pub(crate) fn uses_opencode(&self) -> bool {
+        fn names_opencode(entry: &str) -> bool {
+            entry == "opencode" || entry.starts_with("opencode:")
+        }
+
+        if self
+            .model_map
+            .values()
+            .any(|by_agent| by_agent.contains_key("opencode"))
+        {
+            return true;
+        }
+
+        self.effective_pool().iter().any(|e| names_opencode(e))
+            || names_opencode(&self.effective_fallback())
     }
 
     /// Remove `model_map` entries for the `opencode` agent whose identifiers do not
@@ -1291,6 +1316,53 @@ model_map:
             1,
             "claude model should be unchanged"
         );
+    }
+
+    #[test]
+    fn default_config_does_not_use_opencode() {
+        assert!(!RouterConfig::default().uses_opencode());
+    }
+
+    #[test]
+    fn uses_opencode_when_a_model_map_tier_lists_it() {
+        let mut config = RouterConfig::default();
+        config
+            .model_map
+            .entry("simple".to_string())
+            .or_default()
+            .insert("opencode".to_string(), vec!["some-model".to_string()]);
+        assert!(config.uses_opencode());
+    }
+
+    #[test]
+    fn uses_opencode_follows_the_effective_pool_and_fallback() {
+        let config = RouterConfig {
+            pool: vec!["opencode:free".to_string()],
+            ..RouterConfig::default()
+        };
+        assert!(config.uses_opencode());
+
+        let config = RouterConfig {
+            pool: vec!["claude:haiku".to_string()],
+            ..RouterConfig::default()
+        };
+        assert!(!config.uses_opencode());
+
+        // An empty pool derives its single entry from router_agent:router_model
+        let config = RouterConfig {
+            pool: vec![],
+            router_agent: "opencode".to_string(),
+            router_model: "free".to_string(),
+            ..RouterConfig::default()
+        };
+        assert!(config.uses_opencode());
+
+        let config = RouterConfig {
+            pool: vec!["claude:haiku".to_string()],
+            fallback: "opencode:some/model".to_string(),
+            ..RouterConfig::default()
+        };
+        assert!(config.uses_opencode());
     }
 
     #[serial(cooldown_state)]

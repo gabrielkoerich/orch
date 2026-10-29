@@ -5063,7 +5063,7 @@ mod tests {
         let capture = Arc::new(CaptureService::new(transport));
 
         let router_config = crate::engine::router::RouterConfig::default();
-        let router = Router::new(router_config);
+        let router = Router::new_for_test(router_config, vec!["claude".to_string()]);
         let router_arc = Arc::new(RwLock::new(router));
 
         // Simulate what the main loop does: hold a write lock, snapshot

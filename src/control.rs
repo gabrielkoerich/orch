@@ -217,22 +217,14 @@ pub async fn validate_model(spec: &ModelSpec) -> Result<()> {
 
 /// List available opencode models via `opencode models`.
 async fn list_opencode_models() -> Result<Vec<String>> {
-    let mut cmd = tokio::process::Command::new("opencode");
-    cmd.args(["models"]).kill_on_drop(true);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
-        .await
-        .map_err(|_| anyhow::anyhow!("opencode models timed out after 10s"))?
-        .context("running opencode models")?;
-
-    if !output.status.success() {
-        anyhow::bail!("opencode models failed");
+    match crate::engine::runner::agents::opencode::run_opencode_models_cli(
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    {
+        (models, "ok" | "empty_output") => Ok(models),
+        (_, reason) => anyhow::bail!("opencode models failed: {reason}"),
     }
-
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect())
 }
 
 /// Run a minimal test invocation to verify agent+model availability.

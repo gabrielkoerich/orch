@@ -237,10 +237,11 @@ impl Router {
             fallback = %config.effective_fallback(),
             "router LLM pool initialized"
         );
-        // Prime the RouterConfig free-model cache at startup (sync context) so
-        // that async callers hitting expanded_model_pool() later return
-        // instantly from cache instead of blocking a Tokio worker thread.
-        crate::engine::runner::agents::opencode::prime_free_model_cache();
+        // Prime only when this config names opencode, so a default or claude-only
+        // router never runs `opencode models`
+        if config.uses_opencode() {
+            crate::engine::runner::agents::opencode::prime_free_model_cache();
+        }
         let ollama_router = if config.mode == "local" {
             Some(ollama::OllamaRouter::new(&config))
         } else {
@@ -2990,20 +2991,14 @@ Hope that helps!"#;
     #[serial(cooldown_state)]
     #[test]
     fn expand_pool_opencode_free_skipped_when_not_installed() {
-        // `opencode` is unlikely to be in the test environment's PATH.
-        // If it's absent the entry should be silently skipped and the pool
-        // should fall back to the effective_fallback entry.
-        if crate::cmd_cache::command_exists("opencode") {
-            // If opencode IS installed we can't control what it returns, so skip
-            return;
-        }
+        // Test/debug builds skip live `opencode models`, so `opencode:free` expands
+        // to nothing and the pool falls back to effective_fallback
         let config = RouterConfig {
             pool: vec!["opencode:free".to_string()],
             fallback: "claude:haiku".to_string(),
             ..RouterConfig::default()
         };
         let expanded = Router::expand_pool(&config);
-        // Should fall back to the fallback entry since all pool entries were skipped
         assert_eq!(expanded.len(), 1);
         assert_eq!(expanded[0].0, "claude");
         assert_eq!(expanded[0].1, "haiku");
@@ -3036,6 +3031,103 @@ Hope that helps!"#;
         let config = RouterConfig::default();
         let router = Router::new(config);
         assert!(!router.router_pool.is_empty());
+    }
+
+    /**
+     * Router construction used to run `opencode models`, and opencode 2.2.1 leaves an
+     * `opencode serve --service` child behind, so a suite run leaked one server per test
+     * process. The stub on PATH records any exec, so this fails if discovery comes back
+     **/
+    #[cfg(unix)]
+    #[serial(cooldown_state)]
+    #[test]
+    fn building_a_router_never_runs_opencode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct PathRestore(Option<std::ffi::OsString>);
+        impl Drop for PathRestore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+                crate::cmd_cache::reset_for_test();
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("spawned");
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let stub = bin_dir.join("opencode");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho \"$@\" > '{}'\necho canary-model-free\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prev_path = std::env::var_os("PATH");
+        let mut new_path = bin_dir.as_os_str().to_os_string();
+        new_path.push(":");
+        if let Some(ref p) = prev_path {
+            new_path.push(p);
+        }
+        std::env::set_var("PATH", &new_path);
+        crate::cmd_cache::reset_for_test();
+        let _restore = PathRestore(prev_path);
+
+        // A config that names opencode everywhere discovery reads from
+        let mut config = RouterConfig {
+            pool: vec!["opencode:free".to_string()],
+            fallback: "opencode:free".to_string(),
+            ..RouterConfig::default()
+        };
+        config
+            .model_map
+            .entry("simple".to_string())
+            .or_default()
+            .insert(
+                "opencode".to_string(),
+                vec!["canary-model-free".to_string()],
+            );
+
+        let _router = Router::new(config.clone());
+        let _test_router = Router::new_for_test(config.clone(), vec!["opencode".to_string()]);
+        let _pool = Router::expand_pool(&config);
+        // Discovery refreshes on a background thread, give it room to exec
+        std::thread::sleep(Duration::from_millis(300));
+
+        assert!(
+            !marker.exists(),
+            "building a router ran opencode: {}",
+            std::fs::read_to_string(&marker).unwrap_or_default().trim()
+        );
+        assert!(
+            opencode_children().is_empty(),
+            "building a router left opencode processes: {:?}",
+            opencode_children()
+        );
+    }
+
+    /// Commands of this process's direct children that mention opencode
+    #[cfg(unix)]
+    fn opencode_children() -> Vec<String> {
+        let me = std::process::id().to_string();
+        let output = std::process::Command::new("ps")
+            .args(["-axo", "ppid=,command="])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let (ppid, cmd) = line.trim().split_once(char::is_whitespace)?;
+                (ppid == me && cmd.contains("opencode")).then(|| cmd.to_string())
+            })
+            .collect()
     }
 
     #[serial(cooldown_state)]

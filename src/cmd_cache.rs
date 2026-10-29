@@ -15,3 +15,8 @@ pub fn command_exists(cmd: &str) -> bool {
     cache.insert(cmd.to_string(), ok);
     ok
 }
+
+#[cfg(test)]
+pub fn reset_for_test() {
+    CMD_CACHE.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}

@@ -2227,11 +2227,8 @@ pub async fn serve() -> anyhow::Result<()> {
     crate::github::app::start_loader();
 
     // Agent router (selects agent + model per task) - shared across projects.
-    // Router::from_config() may run `opencode models` (a blocking subprocess) to
-    // discover free models. Wrapping in spawn_blocking keeps the Tokio runtime
-    // thread free during that I/O.
-    // NOTE: Router::new() also calls prime_free_model_cache() (another blocking
-    // subprocess), so the fallback must also run inside spawn_blocking.
+    // Router::from_config() may run `opencode models` when the config uses opencode.
+    // spawn_blocking keeps the Tokio runtime thread free during that I/O
     let router = Arc::new(RwLock::new(
         match tokio::task::spawn_blocking(Router::from_config).await {
             Ok(r) => r,
