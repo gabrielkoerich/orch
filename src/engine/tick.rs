@@ -3669,9 +3669,7 @@ mod tests {
             &config,
             &store,
             &std::collections::HashMap::new(),
-            &cooled_review_router_for_test(),
             &Arc::new(DashMap::new()),
-            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -3740,9 +3738,7 @@ mod tests {
             &config,
             &store,
             &session_map,
-            &cooled_review_router_for_test(),
             &Arc::new(DashMap::new()),
-            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
