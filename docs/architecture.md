@@ -307,7 +307,7 @@ graph LR
 │    Store-wide work (global sweeps, dependency    │
 │    reconcile) runs once per tick                 │
 │                                                  │
-│  Sync (every 45s, all projects at once):        │
+│  Sync (every 45s, all projects at once):         │
 │    - Ingest external tasks (GitHub issues)       │
 │    - Review open PRs                             │
 │    - Scan for owner commands (/retry, /close)    │
