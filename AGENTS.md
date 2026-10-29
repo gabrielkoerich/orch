@@ -338,7 +338,7 @@ There must be **zero literal model-identifier strings** in the routing/dispatch 
 When a model fails (including `Model not found` / `ProviderModelNotFoundError` / "model unavailable"), the **only** correct response is:
 
 1. Runner classifies the error as `AgentError::ModelUnavailable`.
-2. `cooldown::record_persistent_model_failure(agent, model)` puts that specific model into a long cooldown (4h base → 7d max).
+2. `cooldown::record_model_unavailable(agent, model, message)` cools that specific model. A message that says the model is gone ("not found", "not supported", "not available in your country" or "not available in your region") gets the persistent cooldown (4h base → 7d max) through `record_persistent_model_failure`. Any other message gets the generic `record_model_failure` backoff (5m base → 4h max). The runner and the review agent both use this function.
 3. The router's next selection skips that model via `is_model_in_cooldown()` and picks the next entry — or fails over to a different agent if none remain.
 4. The agent itself is not penalized — its other models still route normally.
 
@@ -360,7 +360,7 @@ Both reuse the generic cooldown system as the single source of truth.
 **Integration points** (`src/engine/router/mod.rs`):
 
 - `router.refresh_health(&store)` — each tick; delegates to `cooldown::refresh_degraded_agents()` (queries `rate_limits`, updates degraded set).
-- `router.agent_is_routable(agent, complexity)` — guards routing; false when `is_agent_in_cooldown` / `is_agent_degraded`; with `weighted_round_robin`, also skips agents whose `AgentWeights::get_weight` is below `router.skip_limited_threshold` (default `0.3`).
+- `router.agent_is_routable(agent, complexity)` — guards routing; false when `is_agent_in_cooldown` / `is_agent_degraded`; with `weighted_round_robin`, also skips agents whose `AgentWeights::get_weight` is below the fixed threshold `SKIP_LIMITED_THRESHOLD` (`0.3`, not configurable).
 - `router.available_agents_for_complexity(complexity)` — filters through `agent_is_routable`; used by round-robin, weighted, and LLM paths.
 - `cooldown::record_credit_exhaustion(agent, reason)` — exponential agent-wide cooldown (1h→8h for `out_of_credits`, 2h→8h for `org_level_disabled`, 24h→7d for `billing_cycle_exhausted`).
 - `cooldown::record_agent_success(agent, model)` — runner calls on success; resets `failure_count:*` so next failure restarts from base.
