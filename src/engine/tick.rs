@@ -1545,12 +1545,8 @@ pub(crate) async fn tick_recover_stuck_tasks(
         tracing::warn!(err = %e, "global CI-failure blocked sweep failed");
     }
 
-    // Global sweep for stale NeedsReview tasks from inactive or removed projects.
-    // The refire/escalation logic in sync_tick's "5d" step is scoped to the active
-    // repo, so a task that reaches NeedsReview for a repo later removed from the
-    // active `projects:` list never refires or escalates to Blocked. This sweep
-    // covers all repos, writing directly through the store to avoid the repo-scoped
-    // `TaskManager` resolution failure (same pattern as the CI-failure sweep above).
+    // Re-fire stale NeedsReview tasks and escalate persistently-stuck ones to
+    // Blocked, across all repos
     if let Err(e) = crate::engine::sync::refire_and_escalate_stale_needs_review_global(
         task_manager,
         store,
@@ -1562,13 +1558,8 @@ pub(crate) async fn tick_recover_stuck_tasks(
         tracing::warn!(err = %e, "global NeedsReview refire/escalation sweep failed");
     }
 
-    // Global sweep for rebroadcast-blocked tasks from inactive or removed projects.
-    // The escalation sweep above (`refire_and_escalate_stale_needs_review_global`) that
-    // *writes* this block_reason already runs across all repos, but the only recovery
-    // path (`auto_recover_rebroadcast_blocked_tasks`) is scoped to the active repo via
-    // `sync_tick` — so a task escalated for a repo later removed from the active
-    // `projects:` list could never recover. This sweep covers all repos (same pattern
-    // as the two sweeps above).
+    // Recover rebroadcast-blocked tasks once a review agent is routable, across
+    // all repos
     if let Err(e) = crate::engine::sync::auto_recover_rebroadcast_blocked_tasks_global(
         router,
         task_manager,

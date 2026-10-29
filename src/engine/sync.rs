@@ -1160,178 +1160,25 @@ async fn poll_and_merge_recovered_pr(
 }
 
 /// Exact `block_reason` written when a task's NeedsReview refire counter exhausts
-/// during a rebroadcast escalation (see the two production escalation sites: the
-/// per-repo `sync_tick` "5d" step and the global `refire_and_escalate_stale_needs_review_global`
-/// sweep). Shared with the two recovery sites (`auto_recover_rebroadcast_blocked_tasks`
-/// and `auto_recover_rebroadcast_blocked_tasks_global`) so escalation and recovery can
-/// never drift apart on the literal string.
+/// during a rebroadcast escalation (`refire_and_escalate_stale_needs_review_global`).
+/// Shared with `auto_recover_rebroadcast_blocked_tasks_global` so escalation and
+/// recovery never drift apart on the literal string
 const REBROADCAST_BLOCK_REASON: &str = "review agent rebroadcast escalated after repeated retries";
 
-/// Auto-recover tasks blocked due to refire-counter exhaustion during agent cooldowns.
+/// Global sweep: auto-recover rebroadcast-blocked tasks across all repos.
 ///
-/// When all review agents are cooled simultaneously the NeedsReview refire counter can
-/// exhaust (>5 attempts) before any agent becomes available, escalating the task to
-/// `Blocked` with `block_reason = "review agent rebroadcast escalated after repeated
-/// retries"`. This exact block_reason is written exclusively by refire-counter
-/// exhaustion (see the three escalation sites that set it), regardless of how many
-/// review cycles preceded it — a task can hit this same cooldown-driven exhaustion on
-/// its first review pass (`review_cycles == 0`) or after surviving an earlier
-/// `CHANGES_REQUESTED` round and re-entering `NeedsReview` for a second pass
-/// (`review_cycles > 0`). The block_reason match alone is a sufficient and exact
-/// signal. Once any review agent is routable again, reset them to `NeedsReview` and
-/// clear the refire counter so the subscriber can pick them up.
+/// When a NeedsReview refire counter exhausts, the task is blocked with
+/// `REBROADCAST_BLOCK_REASON`. Once any review agent is routable again, this
+/// sweep resets matching tasks to `NeedsReview` so the subscriber can pick them up.
+/// Writes through the store via `*_by_store_id` helpers, not a repo-scoped
+/// `TaskManager`. Called once per main tick from `tick_recover_stuck_tasks`.
 ///
-/// A minimum block age of `MIN_BLOCK_AGE_MINUTES` is enforced so that tasks escalated
-/// in the current tick are not immediately un-blocked by the same tick's recovery pass.
-///
-/// This function only runs for the currently active repo (called from `sync_tick`); see
-/// [`auto_recover_rebroadcast_blocked_tasks_global`] for the cross-repo counterpart that
-/// covers tasks belonging to repos removed from the active project list.
-async fn auto_recover_rebroadcast_blocked_tasks(
-    repo: &str,
-    router: &Arc<RwLock<Router>>,
-    task_manager: &Arc<TaskManager>,
-    store: &Arc<TaskStore>,
-) -> anyhow::Result<()> {
-    // Must have been blocked for at least this long before we consider recovering it.
-    // Prevents the recovery pass from immediately undoing an escalation that happened
-    // earlier in the same sync_tick call.
-    const MIN_BLOCK_AGE_MINUTES: i64 = 5;
-
-    // Bail early if no review agents are routable — re-firing while all agents are
-    // cooled would immediately re-exhaust the counter.
-    let (any_routable, available_agent_count, healthy_review_agents) = {
-        let r = router.read().await;
-        let healthy_review_agents = r.healthy_agent_count("review");
-        (
-            !r.available_agents.is_empty() && healthy_review_agents > 0,
-            r.available_agents.len(),
-            healthy_review_agents,
-        )
-    };
-    if !any_routable {
-        tracing::debug!(
-            repo,
-            available_agent_count,
-            healthy_review_agents,
-            "rebroadcast-recovery: skipping this tick — no routable review agents"
-        );
-        return Ok(());
-    }
-
-    let blocked = match store.list_by_status(repo, TaskStatus::Blocked).await {
-        Ok(tasks) => tasks,
-        Err(e) => {
-            tracing::warn!(err = %e, "failed to list blocked tasks — skipping rebroadcast recovery this tick");
-            return Ok(());
-        }
-    };
-
-    let now = chrono::Utc::now();
-    let rebroadcast_blocked_count = blocked
-        .iter()
-        .filter(|t| t.block_reason.as_deref() == Some(REBROADCAST_BLOCK_REASON))
-        .count();
-    let candidates: Vec<_> = blocked
-        .into_iter()
-        .filter(|t| {
-            if t.block_reason.as_deref() != Some(REBROADCAST_BLOCK_REASON) {
-                return false;
-            }
-            // Only recover tasks that have been blocked long enough to rule out
-            // same-tick escalations (i.e. tasks blocked by a previous sync cycle).
-            if let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&t.updated_at) {
-                let age = now - updated_at.with_timezone(&chrono::Utc);
-                age.num_minutes() >= MIN_BLOCK_AGE_MINUTES
-            } else {
-                // Unparseable timestamp → treat as old enough.
-                true
-            }
-        })
-        .collect();
-
-    if candidates.is_empty() {
-        if rebroadcast_blocked_count > 0 {
-            tracing::debug!(
-                repo,
-                rebroadcast_blocked_count,
-                min_block_age_minutes = MIN_BLOCK_AGE_MINUTES,
-                "rebroadcast-recovery: skipping this tick — matching blocked tasks found but none old enough yet"
-            );
-        }
-        return Ok(());
-    }
-
-    tracing::info!(
-        count = candidates.len(),
-        "sync: auto-recovering rebroadcast-blocked tasks — review agents now available"
-    );
-
-    for task in candidates {
-        let ext_id = task
-            .external_id
-            .clone()
-            .unwrap_or_else(|| format!("internal:{}", task.id));
-
-        if let Err(e) = task_manager
-            .update_task_status(
-                &crate::backends::ExternalId(ext_id.clone()),
-                Status::NeedsReview,
-            )
-            .await
-        {
-            tracing::warn!(
-                task_id = task.id,
-                err = %e,
-                "rebroadcast-recovery: failed to reset task to needs_review — skipping"
-            );
-            continue;
-        }
-
-        let fields: &[(&str, serde_json::Value)] = &[
-            ("block_reason", serde_json::Value::Null),
-            ("needs_review_refires", serde_json::json!(0)),
-        ];
-        if let Err(e) = store.set_fields(task.id, fields).await {
-            tracing::warn!(
-                task_id = task.id,
-                err = %e,
-                "rebroadcast-recovery: failed to clear block_reason/needs_review_refires after status reset"
-            );
-        }
-
-        tracing::info!(
-            task_id = task.id,
-            ext_id = %ext_id,
-            "auto-recovering rebroadcast-blocked task — review agents now available"
-        );
-    }
-
-    Ok(())
-}
-
-/// Global sweep: auto-recover rebroadcast-blocked tasks from inactive or removed
-/// projects, mirroring `auto_unblock_ci_failure_blocked_tasks_global` (CI-failure
-/// blocks) and `refire_and_escalate_stale_needs_review_global` (stale NeedsReview).
-///
-/// `auto_recover_rebroadcast_blocked_tasks` is called from `sync_tick` and only runs
-/// for the currently active repo. But `refire_and_escalate_stale_needs_review_global`
-/// — the function that actually *writes* `REBROADCAST_BLOCK_REASON` — already runs
-/// across all repos. That asymmetry means a task belonging to a repo later removed
-/// from the active `projects:` list can be escalated into this block_reason yet never
-/// recovered, because the only recovery path never executes for it. This sweep queries
-/// blocked tasks across all repos and applies the same recovery logic, writing directly
-/// through the store (via the `*_by_store_id` TaskManager helpers) instead of resolving
-/// through a repo-scoped `TaskManager`. Called once per main tick from
-/// `tick_recover_stuck_tasks`, alongside the other two global sweeps.
-///
-/// Before resetting a task back to `NeedsReview`, the attached PR's live state is
-/// checked first (mirroring `try_unblock_ci_failure_task`): if merged, the task is
-/// marked `done` directly; if closed without merging, the task is left blocked with an
-/// annotated reason instead of re-dispatching a review agent against a PR that no
-/// longer exists. Only tasks whose PR is still open (or has no PR attached) fall
-/// through to the reset-to-NeedsReview path, which — like the per-repo version — still
-/// requires at least one routable review agent.
+/// Before resetting, the attached PR's live state is checked (mirroring
+/// `try_unblock_ci_failure_task`): merged means the task is marked done, closed
+/// unmerged means it stays blocked with an annotated reason, and only an open PR
+/// (or no PR) falls through to `NeedsReview`. A 5-minute block age prevents
+/// same-tick escalate/recover flapping. Reset-to-NeedsReview still requires at
+/// least one routable review agent
 pub(crate) async fn auto_recover_rebroadcast_blocked_tasks_global(
     router: &Router,
     task_manager: &Arc<TaskManager>,
@@ -1377,9 +1224,8 @@ pub(crate) async fn auto_recover_rebroadcast_blocked_tasks_global(
         }
     };
 
-    // Bail on the reset-to-NeedsReview path (but not the PR-state checks below) if no
-    // review agents are routable — re-firing while all agents are cooled would
-    // immediately re-exhaust the counter, same guard as the per-repo version.
+    // Skip reset-to-NeedsReview when no review agent is routable, re-firing
+    // while cooled would immediately re-exhaust the counter
     let any_routable =
         !router.available_agents.is_empty() && router.healthy_agent_count("review") > 0;
 
@@ -1762,17 +1608,18 @@ pub(crate) async fn auto_unblock_ci_failure_blocked_tasks_global(
 }
 
 /// Global sweep: re-fire stale NeedsReview tasks and escalate persistently-stuck ones
-/// to Blocked, across all repos (not just the currently active project).
+/// to Blocked, across all repos.
 ///
-/// The equivalent per-repo logic in `sync_tick` ("5d. Re-fire events for stale
-/// NeedsReview tasks") only runs for entries in `project_engines`, so a task that
-/// transitions to NeedsReview for a repo later removed from the active `projects:`
-/// list never refires or escalates — it sits in NeedsReview forever with
-/// `needs_review_refires` frozen. This mirrors the fix `auto_unblock_ci_failure_blocked_tasks_global`
-/// applied for the CI-failure-blocked class: query across all repos and write
-/// directly through the store (via the `*_by_store_id` TaskManager helpers) instead
-/// of resolving through a repo-scoped `TaskManager`. Called once per main tick from
-/// `tick_recover_stuck_tasks`, alongside `auto_unblock_ci_failure_blocked_tasks_global`.
+/// Two cases where the event-driven subscriber in `subscribers/review.rs` can miss
+/// a NeedsReview task: all review slots are busy when the event fires, or the
+/// broadcast receiver lagged and dropped it. Re-publish the NeedsReview status
+/// after a short idle window so the subscriber can pick it up when a slot is free.
+/// Using a status re-fire rather than spawning the review agent directly keeps this
+/// path stateless. The subscriber is still the sole spawner and uses the InReview
+/// transition as its atomic guard (issue #857)
+///
+/// Queries across all repos and writes through the store via `*_by_store_id`
+/// TaskManager helpers. Called once per main tick from `tick_recover_stuck_tasks`
 pub(crate) async fn refire_and_escalate_stale_needs_review_global(
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
@@ -1797,9 +1644,8 @@ pub(crate) async fn refire_and_escalate_stale_needs_review_global(
         return Ok(());
     }
 
-    // Mirrors the per-tick skip in `sync_tick`: if every review agent is currently
-    // cooled, re-firing now would waste the refire counter (and risk escalating tasks
-    // to Blocked) while the subscriber would only bail again.
+    // Re-firing while every review agent is cooled wastes the counter and can
+    // escalate a task to Blocked while the subscriber would only bail again
     let all_review_agents_cooled = router.healthy_agent_count("review") == 0;
     if all_review_agents_cooled {
         tracing::info!(
@@ -1878,8 +1724,7 @@ pub(crate) async fn refire_and_escalate_stale_needs_review_global(
             continue;
         }
 
-        // Compute required age using exponential backoff: MIN * 2^(current_refires),
-        // matching the per-repo `sync_tick` behavior.
+        // Exponential backoff: MIN * 2^(current_refires)
         let required_minutes = MIN_STALE_NEEDS_REVIEW_MINUTES * (1i64 << (current_refires as u32));
 
         let should_fire = match age_minutes {
@@ -2011,7 +1856,7 @@ pub(crate) async fn sync_tick(
         });
     }
 
-    let (mut in_review_tasks, mut needs_review_tasks, blocked_review_candidates) =
+    let (mut in_review_tasks, needs_review_tasks, blocked_review_candidates) =
         match prefetch_review_tasks(store, repo).await {
             Ok(tasks) => tasks,
             Err(e) => {
@@ -2090,9 +1935,8 @@ pub(crate) async fn sync_tick(
         }
 
         match prefetch_review_tasks(store, repo).await {
-            Ok((latest_in_review, latest_needs_review, _latest_blocked_candidates)) => {
+            Ok((latest_in_review, _, _)) => {
                 in_review_tasks = latest_in_review;
-                needs_review_tasks = latest_needs_review;
             }
             Err(e) => {
                 tracing::warn!(err = %e, "failed to refresh review task cache after sync work");
@@ -2329,209 +2173,12 @@ pub(crate) async fn sync_tick(
         }
     }
 
-    // 5d. Re-fire events for stale NeedsReview tasks.
-    //
-    // Two cases where the event-driven subscriber in `subscribers/review.rs` can miss
-    // a NeedsReview task:
-    // 1. All review slots are busy when the NeedsReview event fires — subscriber skips
-    //    with `try_acquire_owned()`, task stays in NeedsReview with no future trigger.
-    // 2. The broadcast receiver lagged (fell behind) — NeedsReview events were dropped.
-    //
-    // For both cases: re-publish the NeedsReview status after a short idle window so the
-    // subscriber can pick it up when a slot is free. Using `update_task_status` (re-fire)
-    // rather than spawning the review agent directly keeps this path stateless and avoids
-    // re-introducing the double-trigger race fixed in issue #857 — the subscriber is still
-    // the sole spawner and uses the InReview transition as its atomic guard.
-    if enable_review {
-        const MIN_STALE_NEEDS_REVIEW_MINUTES: i64 = 1;
-        const MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS: u64 = 5; // escalate to Blocked after this many refires
-        let needs_review_count = needs_review_tasks.len();
-        if needs_review_count > 0 {
-            tracing::info!(
-                count = needs_review_count,
-                "sync catch-up: checking stale NeedsReview tasks"
-            );
-        } else {
-            tracing::debug!(
-                count = needs_review_count,
-                "sync catch-up: checking stale NeedsReview tasks"
-            );
-        }
-        // If every review agent is currently cooled, skip the per-task catch-up
-        // pass this tick. Re-firing now would waste the refire counter (and
-        // risk escalating tasks to Blocked) while the subscriber would only
-        // bail again. The next tick re-checks and resumes re-firing as soon as
-        // any review agent recovers.
-        let all_review_agents_cooled = {
-            let r = router.read().await;
-            r.healthy_agent_count("review") == 0
-        };
-        let skip_refires = all_review_agents_cooled && needs_review_count > 0;
-        if skip_refires {
-            tracing::info!(
-                count = needs_review_count,
-                "sync catch-up: all review agents currently cooled — skipping re-fire this tick (counter not incremented)"
-            );
-        }
-        for task in &needs_review_tasks {
-            if skip_refires {
-                break;
-            }
-            // Only retry tasks that have been in NeedsReview long enough that the
-            // subscriber should have handled them by now. Fresh tasks (just transitioned)
-            // are likely still in flight via the event bus. Unparseable timestamps are
-            // treated as stale (fall through to retry).
-            let age_minutes = if let Ok(updated_at) =
-                chrono::DateTime::parse_from_rfc3339(&task.external.updated_at)
-            {
-                let age = chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc);
-                if age.num_minutes() < MIN_STALE_NEEDS_REVIEW_MINUTES {
-                    continue;
-                }
-                Some(age.num_minutes())
-            } else {
-                None
-            };
-
-            // Skip tasks actively being dispatched (subscriber is working on them).
-            let dispatch_key = format!("{}/{}", repo, task.task_id());
-            if dispatching.contains_key(&dispatch_key) {
-                continue;
-            }
-            // Decide whether to re-fire now using exponential backoff based on a per-task counter.
-            let current_refires = task.stored.needs_review_refires.max(0) as u64;
-            let new_refires = current_refires + 1;
-
-            // If we've exceeded max attempts, escalate the task to Blocked with a clear reason.
-            // Allow exactly MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS refires; only escalate when
-            // the new_refires value exceeds that limit (fix off-by-one where `>=` would
-            // escalate one attempt too early).
-            if new_refires > MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS {
-                tracing::warn!(
-                    task_id = task.task_id(),
-                    new_refires,
-                    "escalating NeedsReview task to Blocked after repeated refires"
-                );
-                let fields = [
-                    ("block_reason", serde_json::json!(REBROADCAST_BLOCK_REASON)),
-                    (
-                        "last_error",
-                        serde_json::json!(format!("escalated after {} retries", new_refires)),
-                    ),
-                ];
-                if let Err(e) = task_manager
-                    .update_task_status_and_result(&task.external.id, Status::Blocked, &fields)
-                    .await
-                {
-                    tracing::error!(task_id = task.task_id(), err = %e, "update_task_status_and_result(Blocked) failed — skipping block to avoid silent auto-unblock loop");
-                    continue;
-                }
-                // Increment only after the block transition succeeds — counter reflects actual escalations.
-                if let Err(e) = crate::store::store_increment(
-                    &Some(Arc::clone(store)),
-                    repo,
-                    task.task_id(),
-                    "needs_review_refires",
-                )
-                .await
-                {
-                    tracing::warn!(
-                        task_id = task.task_id(),
-                        err = %e,
-                        "failed to increment needs_review_refires after escalation"
-                    );
-                }
-                continue;
-            }
-
-            // Compute required age using exponential backoff: MIN * 2^(current_refires)
-            // current_refires == 0 → required == MIN (1 min)
-            // current_refires == 1 → required == 2 * MIN (2 min)
-            // current_refires == 2 → required == 4 * MIN (4 min) …
-            let required_minutes =
-                MIN_STALE_NEEDS_REVIEW_MINUTES * (1i64 << (current_refires as u32));
-
-            let should_fire = match age_minutes {
-                Some(age) => age >= required_minutes,
-                None => true,
-            };
-
-            if !should_fire {
-                // Not firing yet — do NOT increment the refire counter on mere
-                // delay/backoff checks. The counter must reflect *actual* re-fire
-                // attempts so it can be used as an escalation quota. Incrementing
-                // here inflated the counter when the subscriber was simply still
-                // within the backoff window and could wrongly cause escalation.
-                tracing::debug!(
-                    task_id = task.task_id(),
-                    age_minutes,
-                    current_refires,
-                    required_minutes,
-                    "sync catch-up: delaying NeedsReview re-fire due to backoff (no counter increment)"
-                );
-                continue;
-            }
-
-            // Fire: attempt the status update first. Only increment the counter on
-            // success so that transient DB failures don't artificially inflate
-            // needs_review_refires and cause premature Blocked escalation.
-            if let Err(e) = task_manager
-                .update_task_status(&task.external.id, Status::NeedsReview)
-                .await
-            {
-                tracing::warn!(
-                    task_id = task.task_id(),
-                    err = %e,
-                    "sync catch-up: failed to re-fire NeedsReview event — not incrementing counter"
-                );
-                continue;
-            }
-
-            // Increment only after the re-fire succeeds (mirrors the escalation path).
-            let fired_refires = match crate::store::store_increment(
-                &Some(Arc::clone(store)),
-                repo,
-                task.task_id(),
-                "needs_review_refires",
-            )
-            .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(
-                        task_id = task.task_id(),
-                        err = %e,
-                        "failed to increment needs_review_refires after re-fire"
-                    );
-                    current_refires + 1
-                }
-            };
-
-            tracing::info!(
-                task_id = task.task_id(),
-                age_minutes,
-                refires = fired_refires,
-                required_minutes,
-                "sync catch-up: re-firing NeedsReview event for stale task"
-            );
-        }
-    }
-
     // 5c. Auto-unblock tasks with recoverable failures.
     if let Err(e) =
         auto_unblock_blocked_tasks(repo, task_manager, store, dispatching, auto_merge_in_flight)
             .await
     {
         tracing::warn!(err = %e, "auto-unblock failed");
-    }
-
-    // 5d. Auto-recover tasks blocked by rebroadcast-escalation once review agents return.
-    if enable_review {
-        if let Err(e) =
-            auto_recover_rebroadcast_blocked_tasks(repo, router, task_manager, store).await
-        {
-            tracing::warn!(err = %e, "rebroadcast-recovery failed");
-        }
     }
 
     // 6. Sync skill repositories
@@ -4464,16 +4111,13 @@ mod tests {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
+            backend,
             store.clone(),
             "owner/repo".to_string(),
         ));
-        let tmux = Arc::new(TmuxManager::new());
-        let router = Arc::new(RwLock::new(reviewer_router()));
+        let router = reviewer_router();
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
-        let auto_merge_in_flight: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
-        // Create external task and set to NeedsReview
         let id = store
             .upsert_external(&crate::store::UpsertExternal {
                 repo: "owner/repo",
@@ -4491,31 +4135,18 @@ mod tests {
             .update_status(id, crate::store::TaskStatus::NeedsReview)
             .await
             .unwrap();
-        // Backdate updated_at so it's considered stale (>1 minute)
         sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
             .bind(id)
             .execute(store.pool())
             .await
             .unwrap();
 
-        // Ensure initial counter is zero
         let t = store.get(id).await.unwrap();
         assert_eq!(t.needs_review_refires, 0);
 
-        // Run sync tick — should increment counter and re-fire (no status transition beyond NeedsReview)
-        sync_tick(
-            &backend,
-            &tmux,
-            "owner/repo",
-            &EngineConfig::default(),
-            &router,
-            &task_manager,
-            &store,
-            &dispatching,
-            &auto_merge_in_flight,
-        )
-        .await
-        .unwrap();
+        refire_and_escalate_stale_needs_review_global(&task_manager, &store, &router, &dispatching)
+            .await
+            .unwrap();
 
         let t2 = store.get(id).await.unwrap();
         assert_eq!(t2.needs_review_refires, 1);
@@ -4529,14 +4160,12 @@ mod tests {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
+            backend,
             store.clone(),
             "owner/repo".to_string(),
         ));
-        let tmux = Arc::new(TmuxManager::new());
-        let router = Arc::new(RwLock::new(crate::engine::router::Router::from_config()));
+        let router = reviewer_router();
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
-        let auto_merge_in_flight: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
         let id = store
             .upsert_external(&crate::store::UpsertExternal {
@@ -4556,13 +4185,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Set existing refires to 1 to simulate a prior attempt
         store
             .set_fields(id, &[("needs_review_refires", serde_json::json!(1))])
             .await
             .unwrap();
 
-        // Set updated_at to now - 1 minute (>= MIN but less than required for refires=2 which is 2 minutes)
+        // Age 1 minute: stale enough to consider, but backoff at refires=1 needs 2 minutes
         let now_minus_1 = (chrono::Utc::now() - chrono::Duration::minutes(1))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
@@ -4576,23 +4204,12 @@ mod tests {
         let before = store.get(id).await.unwrap();
         assert_eq!(before.needs_review_refires, 1);
 
-        sync_tick(
-            &backend,
-            &tmux,
-            "owner/repo",
-            &EngineConfig::default(),
-            &router,
-            &task_manager,
-            &store,
-            &dispatching,
-            &auto_merge_in_flight,
-        )
-        .await
-        .unwrap();
+        refire_and_escalate_stale_needs_review_global(&task_manager, &store, &router, &dispatching)
+            .await
+            .unwrap();
 
         let after = store.get(id).await.unwrap();
-        // Counter should NOT have been incremented on a mere backoff delay —
-        // only actual re-fire attempts increment the counter.
+        // Counter must not increment on a backoff delay, only on an actual re-fire
         assert_eq!(after.needs_review_refires, 1);
         assert_eq!(after.updated_at, now_minus_1);
         assert_eq!(after.status, crate::store::TaskStatus::NeedsReview);
@@ -4615,14 +4232,12 @@ mod tests {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
+            backend,
             store.clone(),
             "owner/repo".to_string(),
         ));
-        let tmux = Arc::new(TmuxManager::new());
-        let router = Arc::new(RwLock::new(reviewer_router()));
+        let router = reviewer_router();
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
-        let auto_merge_in_flight: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
         let id = store
             .upsert_external(&crate::store::UpsertExternal {
@@ -4642,42 +4257,28 @@ mod tests {
             .await
             .unwrap();
 
-        // Set counter to MAX (5) so incrementing to MAX+1 (6) triggers escalation.
-        // With the fix (new_refires > MAX), escalation happens at the 6th attempt
-        // (current=5 -> new=6), allowing exactly 5 refires before blocking.
+        // Counter at MAX (5): the next pass is attempt 6 and escalates
         store
             .set_fields(id, &[("needs_review_refires", serde_json::json!(5))])
             .await
             .unwrap();
-        // Backdate updated_at so age check passes
         sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
             .bind(id)
             .execute(store.pool())
             .await
             .unwrap();
 
-        sync_tick(
-            &backend,
-            &tmux,
-            "owner/repo",
-            &EngineConfig::default(),
-            &router,
-            &task_manager,
-            &store,
-            &dispatching,
-            &auto_merge_in_flight,
-        )
-        .await
-        .unwrap();
+        refire_and_escalate_stale_needs_review_global(&task_manager, &store, &router, &dispatching)
+            .await
+            .unwrap();
 
         let after = store.get(id).await.unwrap();
         assert_eq!(after.status, crate::store::TaskStatus::Blocked);
         assert!(after.block_reason.is_some());
     }
 
-    /// Verify that exactly MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS refires are allowed
-    /// before escalation. Task should still be NeedsReview at 5 refires,
-    /// only block at the 6th attempt.
+    /// Exactly MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS refires are allowed before
+    /// escalation. Task stays NeedsReview at 5 refires and only blocks on the 6th
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn needs_review_allows_max_refires_before_escalation() {
@@ -4685,14 +4286,12 @@ mod tests {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
+            backend,
             store.clone(),
             "owner/repo".to_string(),
         ));
-        let tmux = Arc::new(TmuxManager::new());
-        let router = Arc::new(RwLock::new(reviewer_router()));
+        let router = reviewer_router();
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
-        let auto_merge_in_flight: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
         let id = store
             .upsert_external(&crate::store::UpsertExternal {
@@ -4712,35 +4311,22 @@ mod tests {
             .await
             .unwrap();
 
-        // Set counter to MAX-1 (4) so incrementing hits MAX (5) but does NOT escalate.
-        // With new_refires > MAX, escalation happens at 6, so 5 should still be safe.
+        // Counter at MAX-1 (4): incrementing hits MAX (5) and must not escalate
         store
             .set_fields(id, &[("needs_review_refires", serde_json::json!(4))])
             .await
             .unwrap();
-        // Backdate updated_at so age check passes
         sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
             .bind(id)
             .execute(store.pool())
             .await
             .unwrap();
 
-        sync_tick(
-            &backend,
-            &tmux,
-            "owner/repo",
-            &EngineConfig::default(),
-            &router,
-            &task_manager,
-            &store,
-            &dispatching,
-            &auto_merge_in_flight,
-        )
-        .await
-        .unwrap();
+        refire_and_escalate_stale_needs_review_global(&task_manager, &store, &router, &dispatching)
+            .await
+            .unwrap();
 
         let after = store.get(id).await.unwrap();
-        // Task should still be NeedsReview at 5 refires (MAX), not Blocked
         assert_eq!(after.status, crate::store::TaskStatus::NeedsReview);
         assert_eq!(after.needs_review_refires, 5);
         assert!(after.block_reason.is_none());
@@ -4761,12 +4347,10 @@ mod tests {
         router
     }
 
-    /// Regression test for #3469: the per-repo refire/escalation logic inside
-    /// `sync_tick` never runs for a repo that has been removed from the active
-    /// `projects:` list, so a task stuck in NeedsReview for such a repo never
-    /// refires. The global sweep must catch it via `list_all_by_status_global`
-    /// and write through the store directly, bypassing the repo-scoped
-    /// `TaskManager` (which is scoped to a *different*, currently-active repo).
+    /// Regression test for #3469: a task stuck in NeedsReview for a repo that
+    /// is not the TaskManager's own repo must still be refired. The sweep
+    /// queries via `list_all_by_status_global` and writes through the store
+    /// directly, bypassing the repo-scoped TaskManager
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn global_refire_sweep_refires_stale_task_from_inactive_repo() {
@@ -4817,8 +4401,8 @@ mod tests {
         assert_eq!(task.status, crate::store::TaskStatus::NeedsReview);
     }
 
-    /// Companion to the refire test: after `MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS` refires,
-    /// a cross-repo task must escalate to Blocked, same as the per-repo `sync_tick` path.
+    /// After `MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS` refires, a cross-repo task must
+    /// escalate to Blocked
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn global_refire_sweep_escalates_cross_repo_task_to_blocked() {
@@ -4872,10 +4456,10 @@ mod tests {
         );
     }
 
-    /// When every review agent is cooled, the global sweep must skip entirely —
-    /// re-firing while all agents are cooled would waste the refire counter and
-    /// could escalate a task to Blocked purely because agents happened to be
-    /// temporarily unavailable, mirroring `sync_tick`'s per-repo skip.
+    /// When every review agent is cooled, the sweep must skip entirely.
+    /// Re-firing while all agents are cooled would waste the refire counter and
+    /// could escalate a task to Blocked because agents happened to be
+    /// temporarily unavailable
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn global_refire_sweep_skips_when_all_review_agents_cooled() {
@@ -5001,7 +4585,7 @@ mod tests {
             store.clone(),
             "owner/repo".to_string(),
         ));
-        let router = Arc::new(RwLock::new(router_with_healthy_review_agent()));
+        let router = router_with_healthy_review_agent();
 
         let id = store
             .upsert_external(&crate::store::UpsertExternal {
@@ -5020,7 +4604,6 @@ mod tests {
             .update_status(id, crate::store::TaskStatus::Blocked)
             .await
             .unwrap();
-        // Mirror the state left by the refire-exhaustion escalation path.
         store
             .set_block_reason(
                 id,
@@ -5036,14 +4619,13 @@ mod tests {
             .set_fields(id, &[("needs_review_refires", serde_json::json!(6))])
             .await
             .unwrap();
-        // Backdate so the MIN_BLOCK_AGE_MINUTES (>=5 min) age filter passes.
         sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
             .bind(id)
             .execute(store.pool())
             .await
             .unwrap();
 
-        auto_recover_rebroadcast_blocked_tasks("owner/repo", &router, &task_manager, &store)
+        auto_recover_rebroadcast_blocked_tasks_global(&router, &task_manager, &store)
             .await
             .unwrap();
 
@@ -6980,12 +6562,10 @@ mod tests {
         assert_eq!(task.status, crate::store::TaskStatus::Blocked);
     }
 
-    /// Regression test for #3532: `auto_recover_rebroadcast_blocked_tasks` (the only
-    /// recovery path for this block_reason) is called from `sync_tick`, which never
-    /// runs for a repo removed from the active `projects:` list. The global sweep must
-    /// recover such a task by querying across all repos and writing through the store
-    /// directly, bypassing the repo-scoped `TaskManager` (scoped to a different,
-    /// currently-active repo).
+    /// Regression test for #3532: a rebroadcast-blocked task whose repo is not
+    /// the TaskManager's own repo must still be recovered. The sweep queries
+    /// across all repos and writes through the store directly, bypassing the
+    /// repo-scoped TaskManager
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn global_rebroadcast_sweep_recovers_task_from_inactive_repo() {
@@ -7052,9 +6632,8 @@ mod tests {
         );
     }
 
-    /// Companion to the above: with no routable review agent anywhere, the global
-    /// sweep must not reset the task — that would immediately re-exhaust the refire
-    /// counter, same guard as the per-repo `auto_recover_rebroadcast_blocked_tasks`.
+    /// With no routable review agent, the sweep must not reset the task, that
+    /// would immediately re-exhaust the refire counter
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn global_rebroadcast_sweep_skips_reset_without_routable_review_agent() {
