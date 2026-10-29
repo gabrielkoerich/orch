@@ -585,10 +585,23 @@ pub(crate) async fn review_open_prs(
     // we can verify collaborator status with a single pass instead of one REST
     // call per task.
 
+    // The App posts orch's comments when it is configured, and it is never a collaborator
+    let app_login = crate::github::app::bot_login().await;
+    let is_app = |login: &str| {
+        app_login
+            .as_deref()
+            .is_some_and(|app| crate::github::app::same_login(login, app))
+    };
     let mut unique_users: std::collections::HashSet<String> = Default::default();
+    let mut app_users: Vec<String> = Vec::new();
     for data in batch.values() {
         for c in &data.issue_comments {
-            if c.body.starts_with("## Automated Review") {
+            if !c.body.starts_with("## Automated Review") {
+                continue;
+            }
+            if is_app(&c.user.login) {
+                app_users.push(c.user.login.clone());
+            } else {
                 unique_users.insert(c.user.login.clone());
             }
         }
@@ -607,6 +620,7 @@ pub(crate) async fn review_open_prs(
                 (u, None)
             }
         })
+        .chain(app_users.into_iter().map(|u| (u, Some(true))))
         .collect();
 
     // ─── Phase 6: Process each task using batch data ──────────────────────────
@@ -653,7 +667,13 @@ pub(crate) async fn review_open_prs(
                 _ => serde_json::json!({}),
             };
 
-        let reviews = &batch_data.reviews;
+        // App reviews count only on the current head, an older sha does not pass the gate
+        let gate_reviews = crate::github::app::reviews_for_gate(
+            &batch_data.reviews,
+            &batch_data.head_sha,
+            app_login.as_deref(),
+        );
+        let reviews = &gate_reviews;
         let all_comments = &batch_data.review_comments;
 
         // Deduplicate reviews: keep only the latest per reviewer.
@@ -668,8 +688,14 @@ pub(crate) async fn review_open_prs(
         // Determine automated review status from batch issue comments + collaborator cache.
         let automated_review =
             automated_review_from_comments(&batch_data.issue_comments, &collab_cache, pr_number);
-        let comment_approved = automated_review.as_deref() == Some("approve");
-        let comment_changes_requested = automated_review.as_deref() == Some("changes_requested");
+        let (comment_approved, comment_changes_requested) =
+            crate::github::app::effective_comment_flags(
+                &batch_data.reviews,
+                &batch_data.head_sha,
+                app_login.as_deref(),
+                automated_review.as_deref() == Some("approve"),
+                automated_review.as_deref() == Some("changes_requested"),
+            );
 
         // Handle fully-approved PRs: mark done only when actually merged,
         // otherwise attempt auto-merge. Never mark done on approval alone.
@@ -1895,6 +1921,7 @@ mod tests {
             77,
             PrReviewBatchData {
                 merged: false,
+                head_sha: String::new(),
                 mergeable: Some(false),
                 reviews: vec![make_review(
                     1,
@@ -2049,6 +2076,7 @@ mod tests {
         let review = make_review(1, "reviewer1", "CHANGES_REQUESTED", ts, Some("Fix this"));
         let batch_data = PrReviewBatchData {
             merged: false,
+            head_sha: String::new(),
             mergeable: Some(true),
             reviews: vec![review],
             review_comments: vec![],
@@ -2202,6 +2230,7 @@ mod tests {
         let comment = make_comment(1, "bot", comment_body, ts);
         let batch_data = PrReviewBatchData {
             merged: false,
+            head_sha: String::new(),
             mergeable: Some(true),
             reviews: vec![],
             review_comments: vec![],

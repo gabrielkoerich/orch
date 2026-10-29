@@ -1641,7 +1641,11 @@ pub(crate) async fn auto_merge_pr(
     }
 
     // 5. Re-verify no reviewer has requested changes since the CI wait started.
-    let post_ci_reviews = gh.get_pr_reviews(repo, pr_number).await?;
+    let post_ci_reviews = crate::github::app::reviews_for_gate(
+        &gh.get_pr_reviews(repo, pr_number).await?,
+        &head_sha,
+        crate::github::app::bot_login().await.as_deref(),
+    );
     if any_changes_requested_in_reviews(&post_ci_reviews) {
         tracing::warn!(
             task_id = task.id.0,

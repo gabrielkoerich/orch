@@ -54,7 +54,16 @@ pub(crate) fn is_full_commit_sha(sha: &str) -> bool {
 }
 
 // Shared gate for every GitHub-posted body so a new call site cannot skip the scan
-fn redact_posted_body(body: &str) -> String {
+/// `owner/repo` from a REST URL such as `https://api.github.com/repos/owner/repo/pulls`
+fn repo_from_url(url: &str) -> Option<String> {
+    let rest = url.split_once("/repos/")?.1;
+    let mut parts = rest.split(['/', '?']);
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let name = parts.next().filter(|s| !s.is_empty())?;
+    Some(format!("{owner}/{name}"))
+}
+
+pub(crate) fn redact_posted_body(body: &str) -> String {
     if !crate::security::has_leaks(body) {
         return body.to_string();
     }
@@ -428,6 +437,8 @@ fn record_response_for_limiter(cell: &Mutex<RateLimit>, resp: &Response) {
 pub struct GhHttp {
     client: Client,
     token_resolver: Arc<token::TokenResolver>,
+    // orch's own calls go through the App installation token when the App is configured
+    app: Option<Arc<super::app::AppAuth>>,
     cached_username: OnceLock<String>,
     #[cfg(test)]
     api_base: Option<String>,
@@ -452,10 +463,30 @@ impl GhHttp {
         Ok(Self {
             client,
             token_resolver: token::shared(),
+            app: super::app::shared(),
             cached_username: OnceLock::new(),
             #[cfg(test)]
             api_base: None,
         })
+    }
+
+    /// A client that always uses the owner token, for calls the App cannot make, such as
+    /// `GET /user` and Projects V2 on a personal account
+    pub fn owner() -> anyhow::Result<Self> {
+        let mut gh = Self::new()?;
+        gh.app = None;
+        Ok(gh)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(api_base: String, app: Option<Arc<super::app::AppAuth>>) -> Self {
+        Self {
+            client: Client::new(),
+            token_resolver: Arc::new(token::TokenResolver::default_env()),
+            app,
+            cached_username: OnceLock::new(),
+            api_base: Some(api_base),
+        }
     }
 
     #[cfg_attr(not(test), allow(clippy::unused_self))]
@@ -513,7 +544,18 @@ impl GhHttp {
 
     // ── Low-level HTTP helpers ────────────────────────────────────
 
-    async fn auth_header(&self) -> anyhow::Result<String> {
+    /// The App's token for a repository it is installed on, the owner token for anything else,
+    /// including GraphQL, whose URL names no repository
+    async fn auth_header(&self, url: &str) -> anyhow::Result<String> {
+        if let (Some(app), Some(repo)) = (&self.app, repo_from_url(url)) {
+            match app.token_for_repo(&repo).await {
+                Ok(Some(token)) => return Ok(format!("Bearer {token}")),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, repo, "GitHub App token unavailable, using the owner token");
+                }
+            }
+        }
         match self.token_resolver.get_token().await? {
             Some(token) if !token.is_empty() => Ok(format!("Bearer {token}")),
             _ => anyhow::bail!("No GitHub token available — run `gh auth login` or set GH_TOKEN"),
@@ -584,6 +626,7 @@ impl GhHttp {
                     }
 
                     if resp.status() == StatusCode::UNAUTHORIZED {
+                        let resp_url = resp.url().to_string();
                         let status = resp.status();
                         let body = resp.text().await.unwrap_or_default();
                         if body.contains("Bad credentials") && !auth_retried {
@@ -591,7 +634,10 @@ impl GhHttp {
                                 "GitHub API 401 Bad credentials — clearing cached token and re-resolving"
                             );
                             self.token_resolver.clear_cache().await;
-                            match self.auth_header().await {
+                            if let Some(app) = &self.app {
+                                app.invalidate();
+                            }
+                            match self.auth_header(&resp_url).await {
                                 Ok(new_auth) => {
                                     auth_retried = true;
                                     auth_override = Some(new_auth);
@@ -708,7 +754,7 @@ impl GhHttp {
     /// GET request, returns deserialized JSON.
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> anyhow::Result<T> {
         Self::check_backoff(url)?;
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(url).await?;
         // Use send_with_retries to handle transient 5xx/network failures
         let make_req = || {
             Ok(self
@@ -733,7 +779,7 @@ impl GhHttp {
     /// GET raw bytes (for endpoints that return non-JSON or we parse manually).
     async fn get_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
         Self::check_backoff(url)?;
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(url).await?;
         let make_req = || {
             Ok(self
                 .client
@@ -759,7 +805,7 @@ impl GhHttp {
         query: &[(&str, &str)],
     ) -> anyhow::Result<T> {
         Self::check_backoff(url)?;
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(url).await?;
         let make_req = || {
             Ok(self
                 .client
@@ -784,7 +830,7 @@ impl GhHttp {
     /// POST with JSON body, returns raw response text.
     async fn post_json_raw(&self, url: &str, body: &serde_json::Value) -> anyhow::Result<String> {
         Self::check_backoff(url)?;
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(url).await?;
         let make_req = || {
             Ok(self
                 .client
@@ -819,7 +865,7 @@ impl GhHttp {
     /// PATCH with JSON body, returns raw response.
     async fn patch_json_raw(&self, url: &str, body: &serde_json::Value) -> anyhow::Result<String> {
         Self::check_backoff(url)?;
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(url).await?;
         let make_req = || {
             Ok(self
                 .client
@@ -844,7 +890,7 @@ impl GhHttp {
     /// DELETE request.
     async fn delete(&self, url: &str) -> anyhow::Result<StatusCode> {
         Self::check_backoff(url)?;
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(url).await?;
         let make_req = || {
             Ok(self
                 .client
@@ -892,7 +938,7 @@ impl GhHttp {
             let mut cached_etag = cache_key.as_deref().and_then(page_cache_etag);
             let mut decode_attempt = 0;
             let (page, next) = loop {
-                let auth = self.auth_header().await?;
+                let auth = self.auth_header(request_url).await?;
                 let mut req = self
                     .client
                     .get(request_url)
@@ -1011,7 +1057,7 @@ impl GhHttp {
         let mut current_url: String = url.to_string();
 
         loop {
-            let auth = self.auth_header().await?;
+            let auth = self.auth_header(&current_url).await?;
             let make_req = || {
                 self.client
                     .get(&current_url)
@@ -1094,7 +1140,7 @@ impl GhHttp {
         } else {
             serde_json::json!({ "query": query })
         };
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(url).await?;
         let mut req = self
             .client
             .post(url)
@@ -1373,7 +1419,7 @@ impl GhHttp {
         body: Option<serde_json::Value>,
     ) -> anyhow::Result<Response> {
         Self::check_backoff(url)?;
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(url).await?;
         let make_req = || {
             let mut req = self
                 .client
@@ -1881,7 +1927,10 @@ impl GhHttp {
             return Ok(cached.clone());
         }
 
-        let user: serde_json::Value = self.get_json(&format!("{GITHUB_API}/user")).await?;
+        // An installation token cannot read `GET /user`, and the owner is the identity mentions name
+        let mut owner = self.clone();
+        owner.app = None;
+        let user: serde_json::Value = owner.get_json(&format!("{GITHUB_API}/user")).await?;
         let username = user
             .get("login")
             .and_then(|v| v.as_str())
@@ -1957,7 +2006,7 @@ impl GhHttp {
             base,
         };
 
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(&url).await?;
         let make_req = || {
             Ok(self
                 .client
@@ -2370,7 +2419,7 @@ impl GhHttp {
     pub async fn is_collaborator(&self, repo: &str, username: &str) -> anyhow::Result<bool> {
         let url = format!("{GITHUB_API}/repos/{repo}/collaborators/{username}");
         Self::check_backoff(&url)?;
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(&url).await?;
         let make_req = || {
             Ok(self
                 .client
@@ -2622,7 +2671,7 @@ impl GhHttp {
         let url = format!("{GITHUB_API}/repos/{repo}/pulls/{pr_number}/merge");
         Self::check_backoff(&url)?;
         let payload = merge_pr_body(head_sha);
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(&url).await?;
         let make_req = || {
             Ok(self
                 .client
@@ -2672,7 +2721,7 @@ impl GhHttp {
     pub async fn update_pr_branch(&self, repo: &str, pr_number: u64) -> anyhow::Result<()> {
         let url = format!("{GITHUB_API}/repos/{repo}/pulls/{pr_number}/update-branch");
         Self::check_backoff(&url)?;
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(&url).await?;
         let make_req = || {
             Ok(self
                 .client
@@ -2948,7 +2997,7 @@ impl GhHttp {
 
         // POST rerun — no body needed
         let rerun_url = format!("{GITHUB_API}/repos/{repo}/actions/runs/{run_id}/rerun");
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(&rerun_url).await?;
         let make_req = || {
             Ok(self
                 .client
@@ -3118,6 +3167,11 @@ impl GhHttp {
                 n,
                 PrReviewBatchData {
                     merged,
+                    head_sha: pr_data
+                        .get("headRefOid")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
                     mergeable,
                     reviews,
                     review_comments,
@@ -3185,13 +3239,18 @@ impl GhHttp {
     ) -> anyhow::Result<Option<String>> {
         let comments = self.list_comments(repo, &pr_number.to_string()).await?;
 
-        // Find the most recent automated review comment authored by a collaborator.
+        // Find the most recent automated review comment authored by a collaborator or the App
+        let app_login = super::app::bot_login().await;
         let mut newest: Option<&crate::github::types::GitHubComment> = None;
         for c in &comments {
             if !c.body.starts_with("## Automated Review") {
                 continue;
             }
-            match self.is_collaborator(repo, &c.user.login).await {
+            let trusted = match app_login.as_deref() {
+                Some(app) if super::app::same_login(&c.user.login, app) => Ok(true),
+                _ => self.is_collaborator(repo, &c.user.login).await,
+            };
+            match trusted {
                 Ok(true) => match newest {
                     None => newest = Some(c),
                     Some(prev) => {
@@ -3428,6 +3487,8 @@ pub fn status_label_color(label: &str) -> &'static str {
 pub struct PrReviewBatchData {
     /// True when the pull request was merged.
     pub merged: bool,
+    /// Head commit of the pull request, empty when GitHub did not return it.
+    pub head_sha: String,
     /// `Some(true)` = MERGEABLE, `Some(false)` = CONFLICTING, `None` = UNKNOWN.
     pub mergeable: Option<bool>,
     /// All reviews submitted on the PR.
@@ -3445,6 +3506,7 @@ fn build_pr_review_alias(n: u64) -> String {
         r#"pr{n}: pullRequest(number: {n}) {{
   merged
   mergeable
+  headRefOid
   reviews(first: 50) {{
     nodes {{
       databaseId
@@ -3658,6 +3720,26 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[test]
+    fn repo_from_url_names_the_repository_or_nothing() {
+        let api = "https://api.github.com";
+        assert_eq!(
+            repo_from_url(&format!("{api}/repos/me/a/pulls/9")).as_deref(),
+            Some("me/a")
+        );
+        assert_eq!(
+            repo_from_url(&format!("{api}/repos/org/b?per_page=1")).as_deref(),
+            Some("org/b")
+        );
+        assert_eq!(
+            repo_from_url(&format!("{api}/repos/org/b")).as_deref(),
+            Some("org/b")
+        );
+        assert_eq!(repo_from_url(&format!("{api}/graphql")), None);
+        assert_eq!(repo_from_url(&format!("{api}/user")), None);
+        assert_eq!(repo_from_url(&format!("{api}/repos/only-owner")), None);
+    }
+
+    #[test]
     fn no_branch_protection_errors() {
         let free_plan = "GitHub API GET https://api.github.com/repos/o/r/branches/main/protection failed (403 Forbidden): {\"message\":\"Upgrade to GitHub Pro or make this repository public to enable this feature.\"}";
         assert!(is_no_branch_protection_error(free_plan));
@@ -3838,6 +3920,7 @@ mod tests {
         GhHttp {
             client: reqwest::Client::new(),
             token_resolver: Arc::new(crate::github::token::TokenResolver::default_env()),
+            app: None,
             cached_username: OnceLock::new(),
             api_base: None,
         }
@@ -4434,6 +4517,7 @@ mod tests {
             let client = GhHttp {
                 client: reqwest::Client::new(),
                 token_resolver: Arc::new(crate::github::token::TokenResolver::default_env()),
+                app: None,
                 cached_username: OnceLock::new(),
                 api_base: None,
             };
