@@ -159,7 +159,7 @@ impl TaskStore {
     }
 
     pub async fn insert_task_metric(&self, metric: &InsertTaskMetric<'_>) -> anyhow::Result<i64> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
 
         sqlx::query(
             "DELETE FROM task_metrics WHERE datetime(completed_at) < datetime('now', '-90 days')",
@@ -450,7 +450,7 @@ impl TaskStore {
         limit_type: &str,
         task_id: Option<&str>,
     ) -> anyhow::Result<i64> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
 
         sqlx::query("DELETE FROM rate_limits WHERE occurred_at < datetime('now', '-30 days')")
             .execute(&mut *tx)
@@ -479,7 +479,7 @@ impl TaskStore {
         task_id: Option<&str>,
         occurred_at: &str,
     ) -> anyhow::Result<i64> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
 
         sqlx::query("DELETE FROM rate_limits WHERE occurred_at < datetime('now', '-30 days')")
             .execute(&mut *tx)

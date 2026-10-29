@@ -7457,3 +7457,61 @@ async fn move_repo_refuses_when_target_has_tasks() {
         .unwrap();
     assert_eq!(n, 1);
 }
+
+async fn locking_connection(path: &std::path::Path) -> sqlx::SqliteConnection {
+    use sqlx::ConnectOptions;
+    SqliteConnectOptions::new()
+        .filename(path)
+        .busy_timeout(std::time::Duration::ZERO)
+        .connect()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_write_lock_conflict_is_recognized() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("orch.db");
+    let store = TaskStore::open(&path).await.unwrap();
+    let held = store.begin_write().await.unwrap();
+
+    let mut other = locking_connection(&path).await;
+    let err = sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut other)
+        .await
+        .unwrap_err();
+    drop(held);
+
+    assert!(is_write_lock_error(&anyhow::Error::from(err)));
+    assert!(!is_write_lock_error(&anyhow::anyhow!("some other failure")));
+}
+
+#[tokio::test]
+async fn a_store_write_waits_for_another_connection_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("orch.db");
+    let store = TaskStore::open(&path).await.unwrap();
+    let id = store
+        .create(&NewTask {
+            repo: "owner/repo".to_string(),
+            origin: "internal".to_string(),
+            title: "locked".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut other = locking_connection(&path).await;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut other)
+        .await
+        .unwrap();
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        sqlx::query("COMMIT").execute(&mut other).await.unwrap();
+    });
+
+    store.update_status(id, TaskStatus::Routed).await.unwrap();
+    release.await.unwrap();
+    assert_eq!(store.get(id).await.unwrap().status, TaskStatus::Routed);
+}
