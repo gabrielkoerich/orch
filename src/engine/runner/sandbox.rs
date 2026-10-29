@@ -43,6 +43,11 @@ const SCRATCH: &[&str] = &["/tmp", "/run", "/var/tmp"];
 /// LaunchServices, which `open` uses to start an app outside the sandbox
 const KEYCHAIN: &str = "com.apple.SecurityServer";
 
+/// The run's own temp dir, so no socket of the operator's apps in the shared one is in reach
+pub fn run_temp_dir(attempt_dir: &Path) -> PathBuf {
+    attempt_dir.join("tmp")
+}
+
 /// Whether the project runs its agents in the sandbox: `workflow.sandbox: os` in its `.orch.yml`
 /// or the global config. `false` or no setting leaves it off
 pub fn enabled(project_dir: &Path) -> bool {
@@ -59,8 +64,8 @@ pub fn enabled_globally() -> bool {
  * The worktree's `.git` file is the agent's to write, so the common dir comes from the main
  * checkout and the branch from orch's records, and a git dir outside them refuses the run
  **/
-pub async fn argv(inv: &AgentInvocation) -> anyhow::Result<Vec<OsString>> {
-    build(inv)
+pub async fn argv(inv: &AgentInvocation, temp: &Path) -> anyhow::Result<Vec<OsString>> {
+    build(inv, temp)
         .await
         .map_err(|e| anyhow::Error::new(SandboxFailed(format!("{e:#}"))))
 }
@@ -77,7 +82,7 @@ impl std::fmt::Display for SandboxFailed {
 
 impl std::error::Error for SandboxFailed {}
 
-async fn build(inv: &AgentInvocation) -> anyhow::Result<Vec<OsString>> {
+async fn build(inv: &AgentInvocation, temp: &Path) -> anyhow::Result<Vec<OsString>> {
     let backend = Backend::detect()?;
     let common_dir =
         super::agent::resolve_git_dir_arg(&inv.main_project_dir, "--git-common-dir").await?;
@@ -112,7 +117,7 @@ async fn build(inv: &AgentInvocation) -> anyhow::Result<Vec<OsString>> {
         orch_home: crate::home::orch_home()?,
         projects,
         path_dirs,
-        temp: std::env::temp_dir(),
+        temp: temp.to_path_buf(),
         internal: inv.task_id.starts_with("internal:"),
         seatbelt: backend == Backend::Seatbelt,
     };
@@ -176,7 +181,7 @@ struct Run {
     orch_home: PathBuf,
     projects: Vec<PathBuf>,
     path_dirs: Vec<PathBuf>,
-    /// This process's temp dir, where the agent may also connect to a socket
+    /// The run's own temp dir, where the agent may also connect to a socket
     temp: PathBuf,
     internal: bool,
     seatbelt: bool,
@@ -193,10 +198,10 @@ fn policy(run: &Run) -> Policy {
     p.writable.push(run.work_dir.clone());
     p.writable.extend(run.git_dirs().cloned());
     p.writable.extend(home_writable(&run.home));
-    let temp = run.temp.clone();
+    p.writable.push(run.temp.clone());
 
     if run.seatbelt {
-        p.writable.extend([temp.clone(), "/private/tmp".into()]);
+        p.writable.push("/private/tmp".into());
         p.mach_services = Access::Only(
             known::BASIC_MACH_SERVICES
                 .iter()
@@ -211,18 +216,10 @@ fn policy(run: &Run) -> Policy {
             .map(PathBuf::from)
             .filter(|d| d.is_dir())
             .collect();
-
-        if !p.scratch.iter().any(|s| temp.starts_with(s)) {
-            p.writable.push(temp.clone());
-        }
     }
 
     // The tmux server runs outside the sandbox, so its socket in /tmp must stay out of reach
-    let mut sockets = vec![run.work_dir.clone()];
-    if !["/tmp", "/private/tmp"].iter().any(|t| temp.starts_with(t)) {
-        sockets.push(temp);
-    }
-    p.unix_sockets = Access::Only(sockets);
+    p.unix_sockets = Access::Only(vec![run.work_dir.clone(), run.temp.clone()]);
 
     if let Some(common) = &run.common_dir {
         git_rules(
@@ -265,7 +262,7 @@ fn policy(run: &Run) -> Policy {
             .cloned(),
     );
 
-    let mut keep: Vec<PathBuf> = vec![run.work_dir.clone()];
+    let mut keep: Vec<PathBuf> = vec![run.work_dir.clone(), run.temp.clone()];
     keep.extend(run.git_dirs().cloned());
 
     if run.internal {
@@ -485,7 +482,9 @@ mod tests {
             main_project_dir: PathBuf::from("/nonexistent/main"),
             branch: String::new(),
         };
-        let err = argv(&inv).await.expect_err("no checkout, so no sandbox");
+        let err = argv(&inv, Path::new("/tmp/orch-test-run"))
+            .await
+            .expect_err("no checkout, so no sandbox");
         assert!(err.downcast_ref::<SandboxFailed>().is_some());
         assert!(err.to_string().starts_with("the OS sandbox cannot start: "));
     }
@@ -648,7 +647,7 @@ mod tests {
         let Access::Only(sockets) = &p.unix_sockets else {
             panic!("every unix socket is reachable");
         };
-        assert!(sockets.contains(&run.work_dir));
+        assert_eq!(sockets, &vec![run.work_dir.clone(), run.temp.clone()]);
         assert!(!sockets
             .iter()
             .any(|s| s.starts_with("/tmp") || s.starts_with("/private/tmp")));

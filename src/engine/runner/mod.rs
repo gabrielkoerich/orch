@@ -813,7 +813,12 @@ impl TaskRunner {
         // A sandbox that cannot start blocks the task, which never runs without it. It is the
         // operator's setup that fails, so no agent or model is cooled down
         if init.invocation.sandbox {
-            if let Err(e) = sandbox::argv(&init.invocation).await {
+            if let Err(e) = sandbox::argv(
+                &init.invocation,
+                &std::env::temp_dir().join("orch-sandbox-preflight"),
+            )
+            .await
+            {
                 return Ok(Some(self.sandbox_blocked(task_id, e.to_string()).await));
             }
         }
