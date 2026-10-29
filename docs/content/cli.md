@@ -50,7 +50,7 @@ orch task log <id> [--limit N] [--json]                # activity timeline
 orch task history <id>                                 # routing history / attempts
 orch task runs <id> [--verbose]                        # full run audit (stdout/stderr/response)
 orch task close <id> [-n "note"]                       # mark done without running an agent
-orch task watch <id>                                   # follow status changes live
+orch task watch <id>                                   # follow the agent's output live, with its review
 orch task inspect <id>                                 # unified diagnostic view
 orch stream [id]                                       # stream live output (all sessions if no id)
 orch log -f --task <id>                                # stream one task through log

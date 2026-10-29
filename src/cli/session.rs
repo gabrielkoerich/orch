@@ -1,6 +1,5 @@
 use crate::cli::init_store;
 use crate::cli::ndjson;
-use crate::home;
 use crate::store::{TaskStatus, TaskStore};
 use anyhow::Context;
 use serde::Serialize;
@@ -14,7 +13,11 @@ pub async fn export(
 ) -> anyhow::Result<()> {
     let store = Arc::new(init_store().await?);
 
-    let (internal_id, repo) = parse_task_id(task_id, &store).await?;
+    let resolved = crate::cli::task_ref::resolve(&store, task_id).await?;
+    let internal_id = resolved
+        .store_id
+        .ok_or_else(|| anyhow::anyhow!("task not found in store: {task_id}"))?;
+    let repo = resolved.repo.clone();
     let task = store.get(internal_id).await.context("task not found")?;
 
     let attempt = match attempt {
@@ -29,11 +32,16 @@ pub async fn export(
         }
     };
 
-    let attempt_dir = home::task_attempt_dir(&repo, task_id, attempt)?;
-    let output_path = attempt_dir.join("output.json");
+    let output_path = crate::cli::task_ref::state_dir(&resolved)?
+        .join("attempts")
+        .join(attempt.to_string())
+        .join("output.json");
 
     if !output_path.exists() {
-        anyhow::bail!("attempt {} not found (no output file)", attempt);
+        anyhow::bail!(
+            "attempt {attempt} not found (no output file at {})",
+            output_path.display()
+        );
     }
 
     let content = std::fs::read_to_string(&output_path)?;
@@ -423,27 +431,6 @@ fn export_json(task: &crate::store::Task, attempt: u32, content: &str) -> anyhow
     println!("{}", serde_json::to_string_pretty(&export)?);
 
     Ok(())
-}
-
-async fn parse_task_id(task_id: &str, store: &Arc<TaskStore>) -> anyhow::Result<(i64, String)> {
-    if task_id.starts_with("internal:") {
-        let id_part = task_id
-            .strip_prefix("internal:")
-            .unwrap_or(task_id)
-            .parse::<i64>()
-            .context("invalid internal task ID")?;
-        let repo = store
-            .get(id_part)
-            .await
-            .context("internal task not found")?
-            .repo;
-        Ok((id_part, repo))
-    } else {
-        let id: i64 = task_id.parse().context("invalid task ID")?;
-        let repo = crate::config::get_current_repo()
-            .context("no project configured — run `orch init` first")?;
-        Ok((id, repo))
-    }
 }
 
 fn task_id_display(internal_id: &i64, external_id: &Option<String>) -> String {

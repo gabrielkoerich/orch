@@ -650,7 +650,7 @@ enum WebhookAction {
 enum SessionAction {
     /// Export session output for a task in human-readable format
     Export {
-        /// Task ID (e.g. "internal:8" or issue number)
+        /// Task ID: a number, owner/repo#N or internal:N
         task_id: String,
         /// Attempt number (defaults to latest)
         #[arg(long, short = 'a')]

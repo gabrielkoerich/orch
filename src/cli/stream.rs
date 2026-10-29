@@ -67,19 +67,28 @@ impl Tail {
 /// Follow one task (and its review) when `task_id` is set, else every running agent session
 pub async fn run(task_id: Option<&str>, formatted: bool) -> anyhow::Result<()> {
     let color = formatted && std::io::stdout().is_terminal();
-    match task_id {
-        Some(id) => println!("Watching task {id}. Ctrl+C to stop"),
-        None => println!("Watching all running agents. Ctrl+C to stop"),
-    }
+    let watched = match task_id {
+        Some(id) => {
+            println!("Watching task {id}. Ctrl+C to stop");
+            Some(Watched::resolve(id).await?)
+        }
+        None => {
+            println!("Watching all running agents. Ctrl+C to stop");
+            None
+        }
+    };
 
     let mut tails: HashMap<String, Tail> = HashMap::new();
     let mut colors: HashMap<String, &str> = HashMap::new();
     let mut tag_width = 0;
     let mut said_waiting = false;
     loop {
-        let found = sources(task_id).await?;
-        if let (Some(id), true, false) = (task_id, found.is_empty(), said_waiting) {
-            println!("No output for task {id} yet, waiting for it to start");
+        let found = match &watched {
+            Some(task) => task.sources(),
+            None => session_sources().await,
+        };
+        if let (Some(task), true, false) = (&watched, found.is_empty(), said_waiting) {
+            println!("{}", task.nothing_yet());
             said_waiting = true;
         }
 
@@ -132,92 +141,102 @@ pub async fn run(task_id: Option<&str>, formatted: bool) -> anyhow::Result<()> {
     }
 }
 
-/// Output files to follow, keyed by the session or task they belong to
-async fn sources(task_id: Option<&str>) -> anyhow::Result<Vec<(String, PathBuf)>> {
-    if let Some(id) = task_id {
-        let names = watch_dir_names(id, task_dir_exists)?;
-        return Ok(latest_output(None, &names)
-            .map(|p| (id.to_string(), p))
-            .into_iter()
-            .collect());
+/// The task `orch task watch <id>` follows, resolved once through the shared CLI helper
+struct Watched {
+    id: String,
+    status: String,
+    /// The task's review dir and its own
+    dirs: Vec<PathBuf>,
+}
+
+impl Watched {
+    async fn resolve(id: &str) -> anyhow::Result<Self> {
+        let store = crate::cli::init_store().await?;
+        // The review dir is watched anyway, so `<id>-review` watches the same pair
+        let id = id.strip_suffix("-review").unwrap_or(id);
+        let task = crate::cli::task_ref::resolve(&store, id).await?;
+        Ok(Self {
+            id: task.display_spec(),
+            status: task.status.clone(),
+            dirs: crate::cli::task_ref::state_dirs(&task)?,
+        })
     }
 
+    fn sources(&self) -> Vec<(String, PathBuf)> {
+        newest_output(&self.dirs)
+            .map(|path| (self.id.clone(), path))
+            .into_iter()
+            .collect()
+    }
+
+    /// A running task with no output file is a problem, so name the path instead of waiting quietly
+    fn nothing_yet(&self) -> String {
+        if self.status != crate::store::TaskStatus::InProgress.as_str() {
+            return format!(
+                "No output for task {} yet, waiting for it to start",
+                self.id
+            );
+        }
+
+        let searched: Vec<String> = self
+            .dirs
+            .iter()
+            .map(|dir| dir.join("attempts").display().to_string())
+            .collect();
+        format!(
+            "Task {} is in_progress but no output file was found under {}",
+            self.id,
+            searched.join(" or ")
+        )
+    }
+}
+
+/// Output files of every running agent session, keyed by session name
+async fn session_sources() -> Vec<(String, PathBuf)> {
     let tmux = crate::tmux::TmuxManager::new();
-    Ok(crate::channels::tmux::list_orch_sessions()
+    crate::channels::tmux::list_orch_sessions()
         .await
         .unwrap_or_default()
         .into_iter()
         .filter_map(|session| {
             let (project, task) = tmux.parse_session_name(&session)?;
-            let path = latest_output(Some(&project), &[task_dir_name(&task)])?;
+            let path = session_output(&project, &task_dir_name(&task))?;
             Some((session, path))
         })
-        .collect())
-}
-
-/// Task dirs for a watched id and its review. A bare number may name an internal task, unless
-/// a GitHub task has the same number
-fn watch_dir_names(task_id: &str, exists: impl Fn(&str) -> bool) -> anyhow::Result<Vec<String>> {
-    let name = task_dir_name(task_id);
-    let base = name.strip_suffix("-review").unwrap_or(&name);
-    let with_review = |b: &str| vec![format!("{b}-review"), b.to_string()];
-    if base.starts_with("internal:") {
-        return Ok(with_review(base));
-    }
-
-    let github = with_review(base);
-    let internal = with_review(&format!("internal:{base}"));
-    let has_github = github.iter().any(|n| exists(n));
-    let has_internal = internal.iter().any(|n| exists(n));
-    match (has_github, has_internal) {
-        (true, true) => anyhow::bail!(
-            "{base} matches GitHub task {base} and internal task internal:{base}, \
-             watch internal:{base} for the internal one"
-        ),
-        (false, true) => Ok(internal),
-        _ => Ok(github),
-    }
-}
-
-/// Whether any repo has state for a task dir named `name`
-fn task_dir_exists(name: &str) -> bool {
-    let Ok(state) = crate::home::state_dir() else {
-        return false;
-    };
-    subdirs(&state)
-        .iter()
-        .flat_map(|owner| subdirs(owner))
-        .any(|repo| repo.join("tasks").join(name).is_dir())
+        .collect()
 }
 
 /// Session names replace `:` with `-`, task dirs keep the `internal:` id
-fn task_dir_name(task_id: &str) -> String {
-    match task_id.strip_prefix("internal-") {
+fn task_dir_name(task: &str) -> String {
+    match task.strip_prefix("internal-") {
         Some(rest) => format!("internal:{rest}"),
-        None => task_id.to_string(),
+        None => task.to_string(),
     }
 }
 
-/// Newest `output.json` under `state/<owner>/<repo>/tasks/<name>/attempts/*`, in any repo unless `project` is set
-fn latest_output(project: Option<&str>, names: &[String]) -> Option<PathBuf> {
+/// A tmux session names the repo without its owner, so look under every owner
+fn session_output(project: &str, name: &str) -> Option<PathBuf> {
     let state = crate::home::state_dir().ok()?;
-    let mut best: Option<(SystemTime, PathBuf)> = None;
-    for owner in subdirs(&state) {
-        for repo in subdirs(&owner) {
-            if project.is_some_and(|p| repo.file_name() != Some(p.as_ref())) {
-                continue;
-            }
+    let dirs: Vec<PathBuf> = subdirs(&state)
+        .iter()
+        .flat_map(|owner| subdirs(owner))
+        .filter(|repo| repo.file_name() == Some(project.as_ref()))
+        .map(|repo| repo.join("tasks").join(name))
+        .collect();
+    newest_output(&dirs)
+}
 
-            for name in names {
-                for attempt in subdirs(&repo.join("tasks").join(name).join("attempts")) {
-                    let output = attempt.join("output.json");
-                    let Ok(modified) = output.metadata().and_then(|m| m.modified()) else {
-                        continue;
-                    };
-                    if best.as_ref().is_none_or(|(t, _)| modified > *t) {
-                        best = Some((modified, output));
-                    }
-                }
+/// Newest `output.json` under `<dir>/attempts/*` for any of `dirs`
+fn newest_output(dirs: &[PathBuf]) -> Option<PathBuf> {
+    let mut best: Option<(SystemTime, PathBuf)> = None;
+    for dir in dirs {
+        for attempt in subdirs(&dir.join("attempts")) {
+            let output = attempt.join("output.json");
+            let Ok(modified) = output.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|(t, _)| modified > *t) {
+                best = Some((modified, output));
             }
         }
     }
@@ -317,35 +336,19 @@ mod tests {
     }
 
     #[test]
-    fn watch_dir_names_resolve_bare_and_prefixed_ids() {
-        let only = |dirs: &'static [&'static str]| move |n: &str| dirs.contains(&n);
-
-        // Bare id of an internal task
-        assert_eq!(
-            watch_dir_names("189497", only(&["internal:189497"])).unwrap(),
-            vec!["internal:189497-review", "internal:189497"]
-        );
-        // Bare id of a GitHub task, or of a task with no state yet
-        assert_eq!(
-            watch_dir_names("3601-review", only(&["3601"])).unwrap(),
-            vec!["3601-review", "3601"]
-        );
-        assert_eq!(
-            watch_dir_names("42", only(&[])).unwrap(),
-            vec!["42-review", "42"]
-        );
-        // Prefixed ids never look at GitHub tasks
-        assert_eq!(
-            watch_dir_names("internal:8", only(&["8"])).unwrap(),
-            vec!["internal:8-review", "internal:8"]
-        );
-    }
-
-    #[test]
-    fn watch_dir_names_reject_ambiguous_bare_id() {
-        let both = |n: &str| n == "77" || n == "internal:77-review";
-        let err = watch_dir_names("77", both).unwrap_err().to_string();
-        assert!(err.contains("watch internal:77"), "{err}");
+    fn newest_output_picks_the_latest_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = dir.path().join("tasks").join("5");
+        for attempt in ["1", "2"] {
+            let d = task.join("attempts").join(attempt);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("output.json"), attempt).unwrap();
+            // mtime resolution is coarse on some filesystems
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let found = newest_output(&[task.join("5-review"), task.clone()]).unwrap();
+        assert_eq!(found, task.join("attempts").join("2").join("output.json"));
+        assert!(newest_output(&[dir.path().join("missing")]).is_none());
     }
 
     #[test]
