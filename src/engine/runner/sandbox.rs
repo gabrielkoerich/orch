@@ -219,6 +219,10 @@ fn policy(run: &Run) -> Policy {
         }
     }
 
+    for dir in home_writable(&run.home) {
+        find_git_dirs(&dir, GIT_SCAN_DEPTH, &mut p.read_only);
+    }
+
     p.read_only.push(run.work_dir.join(".orch.yml"));
     p.read_only.extend(
         AGENT_CONFIG
@@ -267,6 +271,30 @@ fn policy(run: &Run) -> Policy {
     }
 
     p
+}
+
+/// How many levels below a writable home dir are searched for repositories
+const GIT_SCAN_DEPTH: usize = 4;
+
+// Hooks and config of a repository orch does not know run as the operator on its next git command
+fn find_git_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    let git = dir.join(".git");
+
+    if git.is_dir() {
+        out.extend(["hooks", "config"].map(|f| git.join(f)));
+    }
+
+    if depth == 0 {
+        return;
+    }
+
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+
+        if entry.file_type().is_ok_and(|t| t.is_dir()) && name != ".git" && name != "node_modules" {
+            find_git_dirs(&entry.path(), depth - 1, out);
+        }
+    }
 }
 
 /// The home's writable parts: its top-level dirs but [`HOME_READ_ONLY`], and [`HOME_WRITABLE`]
@@ -498,6 +526,17 @@ mod tests {
         assert!(p.read_only.contains(&git.join("worktrees/mine/HEAD")));
         assert!(p.read_only.contains(&run.work_dir.join(".git")));
         assert!(p.writable.contains(&git));
+    }
+
+    #[test]
+    fn hooks_and_config_of_an_unknown_repository_are_read_only() {
+        let (_root, run) = fixture(false);
+        let git = run.home.join("code/deep/other/.git");
+        fs::create_dir_all(&git).unwrap();
+        let p = policy(&run);
+        assert!(p.read_only.contains(&git.join("hooks")));
+        assert!(p.read_only.contains(&git.join("config")));
+        assert!(!p.read_only.contains(&git));
     }
 
     #[test]
