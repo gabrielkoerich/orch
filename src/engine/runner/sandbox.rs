@@ -237,6 +237,8 @@ fn policy(run: &Run) -> Policy {
     if run.internal {
         keep.extend(["orch.db", "orch.db-wal", "orch.db-shm"].map(|f| run.orch_home.join(f)));
     }
+    // The daemon's loopback write endpoint takes this token, so reading it is a write to the store
+    let write_token = run.orch_home.join("state/cluster.port");
 
     read_only_around(&run.orch_home, &keep, &mut p.read_only);
 
@@ -254,6 +256,11 @@ fn policy(run: &Run) -> Policy {
         })
         .collect();
     p.hidden.push(run.home.join(".gnupg"));
+
+    if !run.internal {
+        p.hidden.push(write_token);
+    }
+
     p.own_signals = true;
 
     // launchctl and setuid binaries start processes outside the sandbox
@@ -307,6 +314,9 @@ fn git_rules(
             "modules",
             "packed-refs",
             "refs/tags",
+            "commondir",
+            "gitdir",
+            "config.worktree",
         ]
         .map(|d| common.join(d)),
     );
@@ -482,6 +492,9 @@ mod tests {
             "packed-refs",
             "hooks",
             "config",
+            "commondir",
+            "gitdir",
+            "config.worktree",
         ] {
             assert!(
                 p.read_only.contains(&git.join(path)),
@@ -575,6 +588,15 @@ mod tests {
     }
 
     #[test]
+    fn only_a_job_task_sees_the_write_endpoint_token() {
+        let (_root, run) = fixture(false);
+        let token = run.orch_home.join("state/cluster.port");
+        assert!(policy(&run).hidden.contains(&token));
+        let (_root, run) = fixture(true);
+        assert!(!policy(&run).hidden.contains(&token));
+    }
+
+    #[test]
     fn keys_are_hidden_and_startup_files_read_only() {
         let (_root, run) = fixture(false);
         let p = policy(&run);
@@ -656,6 +678,37 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(fs::read_to_string(git.join("refs/heads/main")).unwrap(), "");
+    }
+
+    // A missing commondir in the common dir would redirect git to a dir the agent controls
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_kernel_refuses_a_new_commondir_in_the_common_dir() {
+        let Ok(backend) = Backend::detect() else {
+            eprintln!("skipped: no OS sandbox starts here");
+            return;
+        };
+        let (_root, mut run) = fixture(false);
+        run.seatbelt = backend == Backend::Seatbelt;
+        let git = run.home.join("proj/.git");
+        assert!(!git.join("commondir").exists());
+        let script = format!(
+            "! echo {w} > {g}/commondir",
+            w = run.work_dir.display(),
+            g = git.display()
+        );
+        let out = Sandbox::new(backend, policy(&run))
+            .unwrap()
+            .command("/bin/sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!git.join("commondir").exists());
     }
 
     // A logged-in claude answers under the policy with the real home: `--run-ignored only claude`
