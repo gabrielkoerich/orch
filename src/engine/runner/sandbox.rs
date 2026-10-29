@@ -23,6 +23,19 @@ const HOME_WRITABLE: &[&str] = &[
 /// Codex's settings and instructions, which sit beside the state it rewrites
 const AGENT_CONFIG: &[&str] = &[".codex/config.toml", ".codex/AGENTS.md", ".codex/rules"];
 
+/// Config inside writable home dirs that runs code on the operator's next build or shell, read-only
+/// even when missing. Cargo's `rustc-wrapper` and `runner`, gradle's init scripts, shell frameworks
+const HOME_EXEC_CONFIG: &[&str] = &[
+    ".cargo/config",
+    ".cargo/config.toml",
+    ".gradle/init.d",
+    ".gradle/init.gradle",
+    ".gradle/gradle.properties",
+    ".m2/settings.xml",
+    ".oh-my-zsh",
+    ".zprezto",
+];
+
 /// The tmux, ssh-agent and Docker sockets that would let an agent start a process outside
 const SCRATCH: &[&str] = &["/tmp", "/run", "/var/tmp"];
 
@@ -52,15 +65,12 @@ pub async fn argv(inv: &AgentInvocation) -> anyhow::Result<Vec<OsString>> {
         super::agent::resolve_git_dir_arg(&inv.main_project_dir, "--git-common-dir").await?;
     let git_dir = super::agent::resolve_git_dir_arg(&inv.work_dir, "--git-dir").await?;
 
-    if let (Some(git), Some(common)) = (&git_dir, &common_dir) {
-        if git != common && !git.starts_with(common.join("worktrees")) {
-            anyhow::bail!(
-                "the worktree's git dir {} is outside its repository {}",
-                git.display(),
-                common.display()
-            );
-        }
-    }
+    check_git_dirs(
+        &inv.work_dir,
+        &inv.main_project_dir,
+        git_dir.as_deref(),
+        common_dir.as_deref(),
+    )?;
 
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -90,6 +100,51 @@ pub async fn argv(inv: &AgentInvocation) -> anyhow::Result<Vec<OsString>> {
     };
     let sandbox = Sandbox::new(backend, policy(&run))?;
     Ok(sandbox.argv().to_vec())
+}
+
+/**
+ * Refuses a worktree whose git dir the agent could have pointed elsewhere. Only the main checkout
+ * has the common dir as its git dir. A linked worktree's git dir is in `<common>/worktrees`, and
+ * its `gitdir` file, which the agent cannot write, points back at this worktree
+ **/
+fn check_git_dirs(
+    work_dir: &Path,
+    main_project_dir: &Path,
+    git_dir: Option<&Path>,
+    common_dir: Option<&Path>,
+) -> anyhow::Result<()> {
+    let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+
+    match (git_dir, common_dir) {
+        (Some(git), Some(common)) if git == common => anyhow::ensure!(
+            real(work_dir) == real(main_project_dir),
+            "the worktree {} uses the repository's own git dir {}",
+            work_dir.display(),
+            common.display()
+        ),
+        (Some(git), Some(common)) => {
+            anyhow::ensure!(
+                git.starts_with(common.join("worktrees")),
+                "the worktree's git dir {} is outside its repository {}",
+                git.display(),
+                common.display()
+            );
+            let back = std::fs::read_to_string(git.join("gitdir")).unwrap_or_default();
+            anyhow::ensure!(
+                real(Path::new(back.trim())) == real(&work_dir.join(".git")),
+                "the git dir {} belongs to another worktree",
+                git.display()
+            );
+        }
+        (None, Some(common)) => anyhow::bail!(
+            "the worktree {} has no git dir in {}",
+            work_dir.display(),
+            common.display()
+        ),
+        _ => {}
+    }
+
+    Ok(())
 }
 
 /// What the policy of one run depends on
@@ -165,8 +220,12 @@ fn policy(run: &Run) -> Policy {
     }
 
     p.read_only.push(run.work_dir.join(".orch.yml"));
-    p.read_only
-        .extend(AGENT_CONFIG.iter().map(|path| run.home.join(path)));
+    p.read_only.extend(
+        AGENT_CONFIG
+            .iter()
+            .chain(HOME_EXEC_CONFIG)
+            .map(|path| run.home.join(path)),
+    );
     // A tool on PATH inside the home, such as ~/.cargo/bin, runs later as the operator
     p.read_only.extend(
         run.path_dirs
@@ -473,6 +532,41 @@ mod tests {
         };
         assert!(mach.iter().any(|s| s == KEYCHAIN));
         assert!(!mach.iter().any(|s| s.contains("launchservices")));
+    }
+
+    #[test]
+    fn code_running_config_in_a_writable_home_dir_is_read_only() {
+        let (_root, run) = fixture(false);
+        let p = policy(&run);
+        assert!(p.writable.contains(&run.home.join(".cargo")));
+        assert!(p.read_only.contains(&run.home.join(".cargo/config.toml")));
+    }
+
+    #[test]
+    fn a_git_dir_the_agent_could_have_pointed_elsewhere_is_refused() {
+        let (_root, run) = fixture(false);
+        let (work, main) = (&run.work_dir, run.home.join("proj"));
+        let (git, common) = (
+            run.git_dir.clone().unwrap(),
+            run.common_dir.clone().unwrap(),
+        );
+
+        fs::write(
+            git.join("gitdir"),
+            format!("{}\n", work.join(".git").display()),
+        )
+        .unwrap();
+        assert!(check_git_dirs(work, &main, Some(&git), Some(&common)).is_ok());
+
+        // Pointed at the common dir, which only the main checkout uses
+        assert!(check_git_dirs(work, &main, Some(&common), Some(&common)).is_err());
+        assert!(check_git_dirs(&main, &main, Some(&common), Some(&common)).is_ok());
+        // Another worktree's git dir, or none at all
+        let other = common.join("worktrees/other");
+        fs::write(other.join("gitdir"), "/elsewhere/.git\n").unwrap();
+        assert!(check_git_dirs(work, &main, Some(&other), Some(&common)).is_err());
+        assert!(check_git_dirs(work, &main, Some(&run.home), Some(&common)).is_err());
+        assert!(check_git_dirs(work, &main, None, Some(&common)).is_err());
     }
 
     #[test]
