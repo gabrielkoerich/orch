@@ -237,6 +237,15 @@ fn policy(run: &Run) -> Policy {
         }
     }
 
+    // /private/tmp stays writable, but the agent must not delete or replace these sockets.
+    // bwrap hides those in a scratch dir, and binding one back would expose it
+    let hidden = p.scratch.clone();
+    p.read_only.extend(
+        socket_dirs(&run.temp)
+            .into_iter()
+            .filter(|d| !hidden.iter().any(|s| d.starts_with(s))),
+    );
+
     p.read_only.push(run.work_dir.join(".orch.yml"));
     p.read_only.extend(
         AGENT_CONFIG
@@ -292,6 +301,27 @@ fn policy(run: &Run) -> Policy {
     }
 
     p
+}
+
+/// The tmux and launchd socket dirs in the shared temp dirs, which the tmux server and the
+/// ssh-agent keep running outside the sandbox
+fn socket_dirs(temp: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![PathBuf::from("/private/tmp"), PathBuf::from("/tmp")];
+    roots.extend(std::env::var_os("TMUX_TMPDIR").map(PathBuf::from));
+    roots.push(temp.to_path_buf());
+
+    roots
+        .iter()
+        .filter_map(|r| std::fs::read_dir(r).ok())
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("tmux-") || name.starts_with("com.apple.launchd.")
+        })
+        .map(|e| e.path())
+        .collect()
 }
 
 /// The home's writable parts: its top-level dirs but [`HOME_READ_ONLY`], and [`HOME_WRITABLE`]
@@ -755,6 +785,42 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(!git.join("commondir").exists());
+    }
+
+    // Removing or replacing tmux's socket file is refused
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_kernel_keeps_the_tmux_socket_in_the_temp_dir_in_place() {
+        let Ok(backend) = Backend::detect() else {
+            eprintln!("skipped: no OS sandbox starts here");
+            return;
+        };
+        let (_root, mut run) = fixture(false);
+        run.seatbelt = backend == Backend::Seatbelt;
+        let dir = tempfile::Builder::new()
+            .prefix("tmux-")
+            .tempdir_in(&run.home)
+            .unwrap();
+        run.temp = run.home.clone();
+        let sock = dir.path().join("default");
+        fs::write(&sock, "").unwrap();
+        let script = format!(
+            "! rm {s} && ! mv {s} {s}2 && ! echo x > {d}/new",
+            s = sock.display(),
+            d = dir.path().display(),
+        );
+        let out = Sandbox::new(backend, policy(&run))
+            .unwrap()
+            .command("/bin/sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(sock.exists());
     }
 
     // A logged-in claude answers under the policy with the real home: `--run-ignored only claude`
