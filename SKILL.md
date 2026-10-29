@@ -100,7 +100,7 @@ These commands change a task's state. Use them after the cause is understood or 
 | `orch task retry <id>` | A finished or failed task must run again from the start, for example after its issue was rewritten | Resets it to `new`, attempts reset |
 | `orch task reroute <id> --agent <agent> [--model <model>]` | One agent or model keeps failing the same task and another fits better | Same as retry, with the agent forced |
 | `orch task kill <id>` | Rarely: a session that is truly dead (an idle shell, no agent) and blocks dispatch | Ends the tmux session. The run stays open until its limit, so a retry right after still waits |
-| `orch cooldown clear` | A cooldown was recorded by mistake | Removes it |
+| `orch cooldown clear` | A cooldown was recorded by mistake, or an agent stays degraded from rate rows | Removes the cooldown and the degraded rate-limit window |
 | `orch task close <id>` | The work was done outside orch | Marks it `done` without running an agent |
 
 Do not kill or retry a running task to make it pick up a changed issue. It ends on its own and the next attempt reads the new text. Never use `orch task unblock all`.

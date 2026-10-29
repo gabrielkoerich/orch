@@ -98,9 +98,9 @@ orch log [N]                # tail server logs (last N lines)
 orch log -f                 # follow service logs
 orch service doctor [--fix] # diagnose SQLite ↔ GitHub drift. A done task is reported, never moved out of done
 orch service prune [--dry-run] # remove orphaned worktrees
-orch cooldown list          # show active agent/model cooldowns
-orch cooldown clear <key>   # clear a specific cooldown (e.g. claude, claude:sonnet)
-orch cooldown clear --all   # clear every active cooldown
+orch cooldown list          # show active cooldowns and degraded agents
+orch cooldown clear <key>   # clear a cooldown and that agent's degraded rate-limit window
+orch cooldown clear --all   # clear every cooldown and mark every configured agent as cleared
 orch task session export <id> # export a task's session in markdown/json/raw
 orch notify "message"       # send a Telegram notification (uses config target by default)
 orch config <key>           # read a live config value (dot-separated path)

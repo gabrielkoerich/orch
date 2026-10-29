@@ -95,6 +95,7 @@ fn classify_run_outcome(
     }
     match parse_result {
         Err(agents::AgentError::Timeout { .. }) => "timeout",
+        Err(agents::AgentError::Interrupted { .. }) => "interrupted",
         // Generic rate-limit patterns (e.g. "usage limit") also match billing-cycle
         // exhaustion messages, so consult the credit-exhaustion detector first —
         // otherwise Kimi-style "usage limit for this billing cycle" errors are
@@ -132,6 +133,8 @@ fn classify_run_error_type(last_error: &str) -> &'static str {
         "success"
     } else if last_error.contains("timeout") {
         "timeout"
+    } else if last_error.contains("interrupted") {
+        "interrupted"
     } else if last_error.contains("billing cycle") || last_error.contains("monthly quota") {
         "billing_cycle_exhausted"
     } else if last_error.contains("rate limit") || last_error.contains("usage limit") {
@@ -397,16 +400,23 @@ fn parse_success_output(
 
 /// Whether the last `type: result` line reports `subtype: success` or
 /// `terminal_reason: completed`. Grok omits `terminal_reason`.
-fn result_envelope_completed(raw_stdout: &str) -> bool {
+fn result_envelope_line(raw_stdout: &str) -> Option<serde_json::Value> {
     raw_stdout
         .lines()
         .rev()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
         .find(|v| v.get("type").and_then(|t| t.as_str()) == Some("result"))
-        .is_some_and(|v| {
-            v.get("subtype").and_then(|t| t.as_str()) == Some("success")
-                || v.get("terminal_reason").and_then(|t| t.as_str()) == Some("completed")
-        })
+}
+
+fn has_result_envelope(raw_stdout: &str) -> bool {
+    result_envelope_line(raw_stdout).is_some()
+}
+
+fn result_envelope_completed(raw_stdout: &str) -> bool {
+    result_envelope_line(raw_stdout).is_some_and(|v| {
+        v.get("subtype").and_then(|t| t.as_str()) == Some("success")
+            || v.get("terminal_reason").and_then(|t| t.as_str()) == Some("completed")
+    })
 }
 
 // A timeout kill has no result envelope. Salvage only the wrap-up shape: a successful
@@ -543,6 +553,11 @@ pub fn parse_session_output(
                         &session_output.raw_stderr,
                         session_output.elapsed_secs,
                     ));
+                }
+                if !has_result_envelope(&combined_output) {
+                    return Err(agents::AgentError::Interrupted {
+                        message: "exited without a result envelope".to_string(),
+                    });
                 }
                 return Err(err);
             }
@@ -1422,7 +1437,7 @@ impl TaskRunner {
                 // Record in the metrics store so the router's health check detects it.
                 if let Some(ref store) = self.store {
                     if let Err(e) = store
-                        .record_rate_limit(&agent_name, "rate_limit", Some(task_id))
+                        .record_rate_limit(&agent_name, "rate", Some(task_id))
                         .await
                     {
                         tracing::warn!(task_id, agent = %agent_name, err = %e, "failed to persist rate_limit event — router health check may miss this signal");
@@ -2010,6 +2025,10 @@ mod tests {
             ("lint failed on warning", "ci_failure"),
             ("3 tests failed", "ci_failure"),
             ("test suite failed: 3 tests failed", "ci_failure"),
+            (
+                "claude interrupted: exited without a result envelope",
+                "interrupted",
+            ),
         ];
 
         for (input, expected) in cases {
@@ -2196,6 +2215,18 @@ mod tests {
         assert_eq!(
             classify_run_outcome("needs_review", &parse_result, false),
             "failed"
+        );
+    }
+
+    #[test]
+    fn classify_run_outcome_interrupted() {
+        let parse_result: Result<agents::ParsedResponse, agents::AgentError> =
+            Err(agents::AgentError::Interrupted {
+                message: "exited without a result envelope".to_string(),
+            });
+        assert_eq!(
+            classify_run_outcome("new", &parse_result, false),
+            "interrupted"
         );
     }
 
@@ -3270,6 +3301,25 @@ mod tests {
     /// normally fall back to classify_error — grabbing a garbled JSON tail and
     /// producing a spurious Unknown/Auth error. The fix intercepts this and
     /// returns InvalidResponse (soft error, re-route) instead.
+    #[test]
+    fn parse_session_output_exit0_without_envelope_is_interrupted() {
+        let session = session::SessionOutput {
+            exit_code: 0,
+            raw_stdout: "\u{4}\u{4}\u{4} truncated pane junk".to_string(),
+            raw_stderr: String::new(),
+            elapsed_secs: Some(180),
+            sandbox_error: None,
+        };
+
+        let runner = agents::get_runner("claude");
+        let err = parse_session_output("3876", "claude", &*runner, &session)
+            .expect_err("missing envelope should be an error");
+        assert!(
+            matches!(err, agents::AgentError::Interrupted { .. }),
+            "exit 0 with no result envelope should be Interrupted, got {err:?}"
+        );
+    }
+
     #[test]
     fn parse_session_output_exit1_with_terminal_reason_completed_returns_invalid_response() {
         // Empty result text causes synthesize_response_from_text to return None

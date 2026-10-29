@@ -125,6 +125,14 @@ const CREDIT_FAILURE_COUNT_PREFIX: &str = "credit_failure_count:";
 /// escalation progress for structurally unreliable models — see `record_persistent_model_failure`).
 const PERSISTENT_FAILURE_COUNT_PREFIX: &str = "persistent_failure_count:";
 
+/// KV key prefix for the unix timestamp after which `rate_limits` rows count toward degraded
+const RATE_LIMITS_CLEARED_AT_PREFIX: &str = "rate_limits_cleared_at:";
+
+/// Agent name from a cooldown key (`claude:sonnet` -> `claude`)
+fn agent_from_key(key: &str) -> &str {
+    key.split_once(':').map(|(agent, _)| agent).unwrap_or(key)
+}
+
 struct CooldownEntry {
     /// Unix timestamp when the cooldown expires.
     cooldown_until: i64,
@@ -861,12 +869,31 @@ pub fn list_all_cooldowns() -> Vec<(String, i64, String)> {
     result
 }
 
+/// Write `rate_limits_cleared_at:{agent}` = now so the next health check
+/// ignores older `rate_limits` rows. Rows stay in the table for metrics
+pub async fn mark_rate_limits_cleared(store: &Arc<crate::store::TaskStore>, agents: &[String]) {
+    let now = chrono::Utc::now().timestamp().to_string();
+    let mut seen = std::collections::HashSet::new();
+    for key in agents {
+        let agent = agent_from_key(key);
+        if agent.is_empty() || !seen.insert(agent.to_string()) {
+            continue;
+        }
+        let kv_key = format!("{RATE_LIMITS_CLEARED_AT_PREFIX}{agent}");
+        if let Err(e) = store.kv_set(&kv_key, &now).await {
+            tracing::warn!(agent, err = %e, "failed to mark rate limits cleared");
+        }
+    }
+}
+
 /// Clear a specific cooldown by key, or all cooldowns when `key == "*"`.
 ///
 /// Removes from the in-memory map, writes a past timestamp to KV, and resets
 /// the corresponding `failure_count:` entries so the next failure starts
-/// backoff from the base duration.
+/// backoff from the base duration. Also writes `rate_limits_cleared_at:{agent}`
+/// so a degraded agent held only by rate rows recovers on the next health check
 pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
+    let mut agents_to_mark: Vec<String> = Vec::new();
     if key == "*" {
         let keys: Vec<String> = {
             let mut map = cooldown_lock();
@@ -923,6 +950,22 @@ pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
             count = keys.len(),
             "cleared all cooldowns and failure counts"
         );
+        agents_to_mark.extend(keys.iter().map(|k| agent_from_key(k).to_string()));
+        match store.rate_limit_agents().await {
+            Ok(rl_agents) => agents_to_mark.extend(rl_agents),
+            Err(e) => tracing::warn!(err = %e, "failed to list rate_limits agents while clearing"),
+        }
+        match store.kv_list_prefix(RATE_LIMITS_CLEARED_AT_PREFIX).await {
+            Ok(marks) => {
+                for (k, _) in marks {
+                    let agent = k.trim_start_matches(RATE_LIMITS_CLEARED_AT_PREFIX);
+                    if !agent.is_empty() {
+                        agents_to_mark.push(agent.to_string());
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(err = %e, "failed to list rate_limits_cleared_at keys"),
+        }
     } else {
         {
             let mut map = cooldown_lock();
@@ -948,7 +991,9 @@ pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
             tracing::warn!(key = persistent_fc_key, err = %e, "failed to reset persistent failure count");
         }
         tracing::info!(key, "cleared cooldown and failure count");
+        agents_to_mark.push(agent_from_key(key).to_string());
     }
+    mark_rate_limits_cleared(store, &agents_to_mark).await;
 }
 
 /// Set a cooldown with a specific expiry timestamp. Updates in-memory state only.
@@ -1024,7 +1069,7 @@ fn cooldown_lock() -> std::sync::MutexGuard<'static, HashMap<String, CooldownEnt
 }
 
 /// Helper to acquire the degraded agents lock, logging and recovering on poison.
-fn degraded_agents_lock() -> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
+fn degraded_agents_lock() -> std::sync::MutexGuard<'static, HashMap<String, String>> {
     degraded_agents().lock().unwrap_or_else(|e| {
         tracing::error!("degraded agents lock poisoned — recovering with partial state; health check decisions may be incorrect");
         e.into_inner()
@@ -1069,26 +1114,45 @@ pub const DEFAULT_HEALTH_CHECK_WINDOW_HOURS: u32 = 6;
 /// a pattern of repeated failures.
 pub const DEFAULT_DEGRADED_RATE_LIMIT_THRESHOLD: i64 = 3;
 
-/// In-memory set of agents currently flagged as degraded.
-fn degraded_agents() -> &'static Mutex<std::collections::HashSet<String>> {
-    static DEGRADED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-    DEGRADED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+/// In-memory map of agents currently flagged as degraded, keyed by agent
+/// with the reason that holds now
+fn degraded_agents() -> &'static Mutex<HashMap<String, String>> {
+    static DEGRADED: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    DEGRADED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Check if an agent is currently flagged as degraded by the health check.
 ///
 /// Degraded means: all configured models are cooled **or** the agent has
-/// exceeded the rate-limit/out_of_credits threshold within the configured
-/// lookback window.
+/// exceeded the rate-limit threshold within the configured lookback window.
 pub fn is_agent_degraded(agent: &str) -> bool {
     let set = degraded_agents_lock();
-    set.contains(agent)
+    set.contains_key(agent)
+}
+
+/// Reason the agent is currently degraded, if it is
+pub fn agent_degraded_reason(agent: &str) -> Option<String> {
+    degraded_agents_lock().get(agent).cloned()
+}
+
+/// Active degraded agents as `(agent, reason)`, sorted by agent name
+pub fn list_degraded_agents() -> Vec<(String, String)> {
+    let mut entries: Vec<(String, String)> = degraded_agents_lock()
+        .iter()
+        .map(|(agent, reason)| (agent.clone(), reason.clone()))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
 }
 
 /// Mark an agent as degraded (called by [`refresh_degraded_agents`]).
 pub fn mark_agent_degraded(agent: &str) {
+    mark_agent_degraded_with_reason(agent, "degraded");
+}
+
+fn mark_agent_degraded_with_reason(agent: &str, reason: &str) {
     let mut set = degraded_agents_lock();
-    set.insert(agent.to_string());
+    set.insert(agent.to_string(), reason.to_string());
 }
 
 /// Clear the degraded flag for an agent.
@@ -1102,8 +1166,9 @@ pub fn clear_agent_degraded(agent: &str) {
 /// An agent is marked degraded when:
 /// 1. It is in agent-level cooldown (explicit cooldown KV key exists and hasn't expired), **or**
 /// 2. All its configured models are in cooldown, **or**
-/// 3. It has >= `threshold` rate_limit/out_of_credits events within `window_hours`.
+/// 3. It has >= `threshold` `limit_type = 'rate'` events within `window_hours`.
 ///
+/// Failures keep their own cooldowns and do not count toward the threshold
 /// Agents that no longer meet these criteria are cleared.
 ///
 /// Note: This function calls `clear_expired_cooldowns()` first to ensure the
@@ -1154,24 +1219,35 @@ pub async fn refresh_degraded_agents(
         let degraded = in_cooldown || no_models || over_threshold;
 
         if degraded {
-            if !is_agent_degraded(agent) {
-                let reason = if in_cooldown {
-                    "agent in cooldown"
-                } else if no_models {
-                    "all models cooled"
-                } else {
-                    "rate limit threshold exceeded"
-                };
-                tracing::warn!(
+            let reason = if in_cooldown {
+                "agent in cooldown"
+            } else if no_models {
+                "all models cooled"
+            } else {
+                "rate limit threshold exceeded"
+            };
+            let previous = agent_degraded_reason(agent);
+            match previous.as_deref() {
+                None => tracing::warn!(
                     agent,
                     reason,
                     rate_limit_count,
                     window_hours,
                     threshold,
                     "pre-emptive health check: marking agent as degraded"
-                );
+                ),
+                Some(prev) if prev != reason => tracing::warn!(
+                    agent,
+                    reason,
+                    previous = prev,
+                    rate_limit_count,
+                    window_hours,
+                    threshold,
+                    "pre-emptive health check: degraded reason changed"
+                ),
+                Some(_) => {}
             }
-            mark_agent_degraded(agent);
+            mark_agent_degraded_with_reason(agent, reason);
         } else {
             if is_agent_degraded(agent) {
                 tracing::info!(
@@ -1584,6 +1660,12 @@ mod tests {
                 .await
                 .expect("in-memory store"),
         )
+    }
+
+    fn sqlite_datetime_offset(secs: i64) -> String {
+        (chrono::Utc::now() + chrono::Duration::seconds(secs))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
     }
 
     #[serial(cooldown_state)]
@@ -2582,10 +2664,7 @@ mod tests {
 
         // Insert rate limit events exceeding threshold
         for _ in 0..4 {
-            store
-                .record_rate_limit(agent, "rate_limit", None)
-                .await
-                .unwrap();
+            store.record_rate_limit(agent, "rate", None).await.unwrap();
         }
 
         let agents = vec![agent.to_string()];
@@ -2910,10 +2989,7 @@ mod tests {
 
         // Insert rate limit events below threshold
         for _ in 0..2 {
-            store
-                .record_rate_limit(agent, "rate_limit", None)
-                .await
-                .unwrap();
+            store.record_rate_limit(agent, "rate", None).await.unwrap();
         }
 
         let agents = vec![agent.to_string()];
@@ -2923,6 +2999,175 @@ mod tests {
         assert!(
             !is_agent_degraded(agent),
             "agent with rate limit count < threshold should not be degraded"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn refresh_degraded_agents_ignores_error_limit_type() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        let agent = "test_refresh_error_rows";
+
+        for _ in 0..3 {
+            store.record_rate_limit(agent, "error", None).await.unwrap();
+        }
+
+        let agents = vec![agent.to_string()];
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+
+        assert!(
+            !is_agent_degraded(agent),
+            "three error rows in 6 hours must not mark an agent degraded"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn refresh_degraded_agents_marks_three_rate_rows() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        let agent = "test_refresh_three_rate_rows";
+
+        for _ in 0..3 {
+            store.record_rate_limit(agent, "rate", None).await.unwrap();
+        }
+
+        let agents = vec![agent.to_string()];
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+
+        assert!(
+            is_agent_degraded(agent),
+            "three rate rows in 6 hours must mark an agent degraded"
+        );
+        assert_eq!(
+            agent_degraded_reason(agent).as_deref(),
+            Some("rate limit threshold exceeded")
+        );
+        let listed = list_degraded_agents();
+        assert!(
+            listed
+                .iter()
+                .any(|(a, r)| a == agent && r == "rate limit threshold exceeded"),
+            "orch cooldown list must show the degraded reason, got {listed:?}"
+        );
+
+        clear_agent_degraded(agent);
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn refresh_degraded_agents_logs_reason_change() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        let agent = "test_refresh_reason_change";
+        *cooldown_store().lock().await = Some(store.clone());
+
+        set_agent_cooldown(agent, 600).await;
+        let agents = vec![agent.to_string()];
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+        assert_eq!(
+            agent_degraded_reason(agent).as_deref(),
+            Some("agent in cooldown")
+        );
+
+        clear_cooldown(agent, &store).await;
+        let after_clear = sqlite_datetime_offset(60);
+        for _ in 0..3 {
+            store
+                .record_rate_limit_at(agent, "rate", None, &after_clear)
+                .await
+                .unwrap();
+        }
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+        assert_eq!(
+            agent_degraded_reason(agent).as_deref(),
+            Some("rate limit threshold exceeded"),
+            "degraded reason must update when the hold changes"
+        );
+
+        clear_agent_degraded(agent);
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn clear_un_degrades_on_next_health_check() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        let agent = "test_clear_un_degrades";
+        let before = sqlite_datetime_offset(-30);
+        let after = sqlite_datetime_offset(60);
+
+        for _ in 0..3 {
+            store
+                .record_rate_limit_at(agent, "rate", None, &before)
+                .await
+                .unwrap();
+        }
+
+        let agents = vec![agent.to_string()];
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+        assert!(
+            is_agent_degraded(agent),
+            "three rate rows must mark an agent degraded"
+        );
+
+        clear_cooldown(agent, &store).await;
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+        assert!(
+            !is_agent_degraded(agent),
+            "clear must un-degrade on the next health check"
+        );
+
+        store
+            .record_rate_limit_at(agent, "rate", None, &after)
+            .await
+            .unwrap();
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+        assert!(
+            !is_agent_degraded(agent),
+            "one rate row after the mark must not degrade again"
+        );
+
+        for _ in 0..2 {
+            store
+                .record_rate_limit_at(agent, "rate", None, &after)
+                .await
+                .unwrap();
+        }
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+        assert!(
+            is_agent_degraded(agent),
+            "three rate rows after the mark must degrade again"
+        );
+
+        clear_agent_degraded(agent);
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn clear_all_un_degrades_rate_limited_agent() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        let agent = "test_clear_all_un_degrades";
+        let before = sqlite_datetime_offset(-30);
+
+        for _ in 0..3 {
+            store
+                .record_rate_limit_at(agent, "rate", None, &before)
+                .await
+                .unwrap();
+        }
+
+        let agents = vec![agent.to_string()];
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+        assert!(is_agent_degraded(agent));
+
+        clear_cooldown("*", &store).await;
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+        assert!(
+            !is_agent_degraded(agent),
+            "clear --all must un-degrade an agent held only by rate rows"
         );
     }
 

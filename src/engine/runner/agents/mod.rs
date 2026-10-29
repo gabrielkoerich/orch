@@ -227,8 +227,10 @@ pub enum AgentError {
     ModelUnavailable { message: String, model: String },
     /// Context window exceeded — truncate and retry, then switch agent.
     ContextOverflow { message: String },
-    /// Agent timed out — retry once, then switch agent.
+    /// Agent hit the task time limit. Retry without cooling the model
     Timeout { elapsed: Duration },
+    /// Process exited with no result envelope, usually a kill rather than a model fault
+    Interrupted { message: String },
     /// Required tool/binary missing from the environment.
     MissingTool { tool: String },
     /// Sandbox or filesystem permission denied.
@@ -267,6 +269,7 @@ impl std::fmt::Display for AgentError {
             }
             Self::ContextOverflow { message, .. } => write!(f, "context overflow: {message}"),
             Self::Timeout { elapsed } => write!(f, "timeout after {}s", elapsed.as_secs()),
+            Self::Interrupted { message } => write!(f, "interrupted: {message}"),
             Self::MissingTool { tool } => write!(f, "missing tool: {tool}"),
             Self::PermissionDenied { message } => write!(f, "permission denied: {message}"),
             Self::WaitingForInput { message } => write!(f, "waiting for input: {message}"),
@@ -300,6 +303,7 @@ pub fn error_class_name(err: &AgentError) -> &'static str {
         AgentError::ModelUnavailable { .. } => "ModelUnavailable",
         AgentError::ContextOverflow { .. } => "ContextOverflow",
         AgentError::Timeout { .. } => "Timeout",
+        AgentError::Interrupted { .. } => "Interrupted",
         AgentError::MissingTool { .. } => "MissingTool",
         AgentError::PermissionDenied { .. } => "PermissionDenied",
         AgentError::WaitingForInput { .. } => "WaitingForInput",

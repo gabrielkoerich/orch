@@ -1818,6 +1818,7 @@ pub(crate) async fn tick_route_tasks(
                         task_id = %task.id.0,
                         scope = %cooled.scope(),
                         remaining_secs = ?cooled.remaining_secs(),
+                        degraded = ?cooled.degraded(),
                         "ALL AGENTS COOLED — no agent available to route this task. \
                          Task stays in 'new' and will be retried on every tick. \
                          Check `orch cooldown list` to see what is blocking dispatch."
@@ -1950,6 +1951,7 @@ pub(crate) async fn route_new_tasks_global(
                         repo = %task.repo,
                         scope = %cooled.scope(),
                         remaining_secs = ?cooled.remaining_secs(),
+                        degraded = ?cooled.degraded(),
                         "global sweep: ALL AGENTS COOLED — task stays in 'new'"
                     );
                     continue;
