@@ -440,15 +440,9 @@ jobs:
           perl -0pi -e 's/^version = .*$/version = "$ENV{V}"/m' Cargo.toml
           perl -0pi -e 's/^(name = "orch-cli"\n)version = .*$/$1version = "$ENV{V}"/m' Cargo.lock
 
-      # Publish first: a tag without a crate is worse than a crate without a tag, and a rerun then tags it
-      - name: Publish to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          VERSION: ${{ needs.check-release.outputs.version }}
-        run: ORCH_BUILD_VERSION="$VERSION" cargo publish --allow-dirty
-
       # Pushes only the tag, with GITHUB_TOKEN so it starts no run, the bump reaches main in the last step
       - name: Create tag
+        id: tag
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           GH_TOKEN: ${{ github.token }}
@@ -646,8 +640,17 @@ jobs:
           git -C tap-repo commit -m "chore: update orch formula to ${VERSION}"
           git -C tap-repo push origin main
 
+      # After the tag, a run cancelled mid publish left a crate with no tag, so every later run reused its version
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.check-release.outputs.version }}
+        run: ORCH_BUILD_VERSION="$VERSION" cargo publish --allow-dirty
+
       # Last, a push to main starts a run that cancels this one, [skip ci] stops it and the step order covers a miss
+      # Runs after a failed publish too, a tag missing from main makes the next run reuse its version
       - name: Push the version bump to main
+        if: ${{ !cancelled() && steps.tag.outcome == 'success' }}
         env:
           # The owner's token, main requires checks that the bump commit has not run
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
