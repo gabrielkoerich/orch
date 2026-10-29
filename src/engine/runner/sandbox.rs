@@ -60,6 +60,24 @@ pub fn enabled_globally() -> bool {
  * checkout and the branch from orch's records, and a git dir outside them refuses the run
  **/
 pub async fn argv(inv: &AgentInvocation) -> anyhow::Result<Vec<OsString>> {
+    build(inv)
+        .await
+        .map_err(|e| anyhow::Error::new(SandboxFailed(format!("{e:#}"))))
+}
+
+/// The sandbox cannot start. It is the operator's setup, so it blocks the task and counts against no agent
+#[derive(Debug)]
+pub struct SandboxFailed(pub String);
+
+impl std::fmt::Display for SandboxFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the OS sandbox cannot start: {}", self.0)
+    }
+}
+
+impl std::error::Error for SandboxFailed {}
+
+async fn build(inv: &AgentInvocation) -> anyhow::Result<Vec<OsString>> {
     let backend = Backend::detect()?;
     let common_dir =
         super::agent::resolve_git_dir_arg(&inv.main_project_dir, "--git-common-dir").await?;
@@ -378,6 +396,31 @@ fn read_only_around(dir: &Path, keep: &[PathBuf], out: &mut Vec<PathBuf>) {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[tokio::test]
+    async fn argv_error_is_tagged_so_spawn_blocks_the_task() {
+        let inv = AgentInvocation {
+            agent: "claude".to_string(),
+            model: None,
+            work_dir: PathBuf::from("/nonexistent/work"),
+            system_prompt: String::new(),
+            agent_message: String::new(),
+            task_id: "t".to_string(),
+            disallowed_tools: vec![],
+            git_author_name: String::new(),
+            git_author_email: String::new(),
+            output_file: PathBuf::from("/nonexistent/out.json"),
+            timeout_seconds: 0,
+            repo: "o/r".to_string(),
+            attempt: 1,
+            sandbox: true,
+            main_project_dir: PathBuf::from("/nonexistent/main"),
+            branch: String::new(),
+        };
+        let err = argv(&inv).await.expect_err("no checkout, so no sandbox");
+        assert!(err.downcast_ref::<SandboxFailed>().is_some());
+        assert!(err.to_string().starts_with("the OS sandbox cannot start: "));
+    }
 
     /// A home with an orch home inside, two worktrees and a main checkout, and the run of one task
     fn fixture(internal: bool) -> (tempfile::TempDir, Run) {
