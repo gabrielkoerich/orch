@@ -445,9 +445,9 @@ jobs:
           VERSION: ${{ needs.check-release.outputs.version }}
         run: ORCH_BUILD_VERSION="$VERSION" cargo publish --allow-dirty
 
+      # Pushes only the tag, with GITHUB_TOKEN so it starts no run, the bump reaches main in the last step
       - name: Create tag
         env:
-          # The owner's token, main requires checks that the bump commit has not run
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.check-release.outputs.version }}
@@ -456,19 +456,9 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           if [ -n "$TAP_TOKEN" ]; then
             git add Cargo.toml Cargo.lock
-            git commit -m "chore: bump version to ${VERSION}"
-            git tag -a "$VERSION" -m "$VERSION"
-            # Atomic, so main and the tag land together or a newer main push fails both
-            if git push --atomic "https://x-access-token:${TAP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main "$VERSION"; then
-              exit 0
-            fi
-
-            echo "::warning::could not push the version bump to main, only the tag is pushed"
-            git tag -d "$VERSION"
-            git reset --soft HEAD~1
+            git commit -m "chore: bump version to ${VERSION} [skip ci]"
           fi
 
-          # The tag must sit on main, check-release finds the last version with git describe
           git tag -a "$VERSION" -m "$VERSION"
           git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$VERSION"
 
@@ -653,3 +643,20 @@ jobs:
           fi
           git -C tap-repo commit -m "chore: update orch formula to ${VERSION}"
           git -C tap-repo push origin main
+
+      # Last, a push to main starts a run that cancels this one, [skip ci] stops it and the step order covers a miss
+      - name: Push the version bump to main
+        env:
+          # The owner's token, main requires checks that the bump commit has not run
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.check-release.outputs.version }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            exit 0
+          fi
+
+          # The tag must sit on main, check-release finds the last version with git describe
+          if ! git push "https://x-access-token:${TAP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main; then
+            echo "::error::main moved during the release, merge ${VERSION} into main by hand"
+            exit 1
+          fi
