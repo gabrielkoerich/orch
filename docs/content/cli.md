@@ -9,7 +9,7 @@ weight = 6
 ```bash
 orch task     list|add|get|status|route|run|retry|reroute|unblock|attach|live|kill
               publish|cost|tree|logs|log|history|runs|close|watch|inspect
-orch service  start|stop|restart|status|doctor|prune
+orch service  start|stop|restart|status|install|uninstall|doctor|prune
 orch job      list|add|remove|enable|disable|tick|run
 orch plan     import
 orch project  list|add|remove|board
@@ -61,6 +61,8 @@ Note: `orch task add` does not take a `-p`/project flag — task creation always
 ## Background Service
 
 ```bash
+orch service install [--force]  # write systemd user unit and enable it (Linux)
+orch service uninstall          # disable and remove the systemd user unit (Linux)
 orch service start      # start background service
 orch service stop       # stop background service
 orch service restart    # restart service

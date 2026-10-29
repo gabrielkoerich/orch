@@ -33,9 +33,10 @@ On Linux, install the prebuilt binary with [cargo-binstall](https://github.com/c
 ```bash
 cargo binstall orch-cli      # prebuilt x86_64 binary
 cargo install orch-cli       # from source, needs libssl-dev and pkg-config
+orch service install         # systemd user unit for `orch serve`
 ```
 
-Run it as a systemd user service with `orch serve` as its command, then `orch service start|stop|restart|status` drives it through `systemctl --user`.
+`orch service start|stop|restart|status` drives it through `systemctl --user`.
 
 ## Quick Start
 
@@ -118,6 +119,8 @@ export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
 
 ```bash
 orch serve                    # Run orch service (foreground)
+orch service install          # Write systemd user unit and enable it (Linux)
+orch service uninstall        # Disable and remove the systemd user unit (Linux)
 orch service start            # Start background service
 orch service stop             # Stop background service
 orch service restart          # Restart service

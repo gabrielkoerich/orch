@@ -16,9 +16,10 @@ On Linux, install the prebuilt binary with [cargo-binstall](https://github.com/c
 ```bash
 cargo binstall orch-cli      # prebuilt x86_64 binary
 cargo install orch-cli       # from source, needs libssl-dev and pkg-config
+orch service install         # systemd user unit for `orch serve`
 ```
 
-Run it as a systemd user service with `orch serve` as its command, then `orch service start|stop|restart|status` drives it through `systemctl --user`.
+`orch service start|stop|restart|status` drives it through `systemctl --user`. A user service stops at logout unless lingering is on (`loginctl enable-linger $USER`).
 
 All dependencies (`yq`, `jq`, `just`, `python3`, `rg`, `fd`) are installed automatically.
 
