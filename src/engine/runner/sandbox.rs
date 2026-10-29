@@ -240,6 +240,8 @@ fn policy(run: &Run) -> Policy {
     if run.internal {
         keep.extend(["orch.db", "orch.db-wal", "orch.db-shm"].map(|f| run.orch_home.join(f)));
     }
+    // The daemon's loopback write endpoint takes this token, so reading it is a write to the store
+    let write_token = run.orch_home.join("state/cluster.port");
 
     read_only_around(&run.orch_home, &keep, &mut p.read_only);
 
@@ -257,6 +259,11 @@ fn policy(run: &Run) -> Policy {
         })
         .collect();
     p.hidden.push(run.home.join(".gnupg"));
+
+    if !run.internal {
+        p.hidden.push(write_token);
+    }
+
     p.own_signals = true;
 
     // launchctl and setuid binaries start processes outside the sandbox
@@ -581,6 +588,15 @@ mod tests {
         assert!(!policy(&run)
             .read_only
             .contains(&run.orch_home.join("orch.db")));
+    }
+
+    #[test]
+    fn only_a_job_task_sees_the_write_endpoint_token() {
+        let (_root, run) = fixture(false);
+        let token = run.orch_home.join("state/cluster.port");
+        assert!(policy(&run).hidden.contains(&token));
+        let (_root, run) = fixture(true);
+        assert!(!policy(&run).hidden.contains(&token));
     }
 
     #[test]
