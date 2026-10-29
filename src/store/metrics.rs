@@ -471,11 +471,10 @@ impl TaskStore {
         Ok(row.try_get("id")?)
     }
 
-    /// Count recent rate limit events per agent within the given window (in hours).
+    /// Count recent rate-limit events per agent within the given window (in hours).
     ///
-    /// Returns a map of `agent -> count` for agents that have rate_limit or
-    /// out_of_credits events in the `rate_limits` table within the window.
-    /// Used by the pre-emptive health check to detect degraded agents.
+    /// Only `limit_type = 'rate'` rows count. Failures, auth errors and
+    /// timeouts keep their own cooldowns and must not mark an agent degraded
     pub async fn recent_rate_limit_counts(
         &self,
         window_hours: u32,
@@ -488,6 +487,7 @@ impl TaskStore {
             "SELECT agent, COUNT(*) as cnt
              FROM rate_limits
              WHERE occurred_at >= datetime('now', ?)
+               AND limit_type = 'rate'
              GROUP BY agent",
         )
         .bind(&interval)

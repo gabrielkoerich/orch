@@ -7009,20 +7009,20 @@ async fn recent_rate_limit_counts_empty() {
 async fn recent_rate_limit_counts_groups_by_agent() {
     let store = TaskStore::open_memory().await.unwrap();
     store
-        .record_rate_limit("claude", "rate_limit", None)
+        .record_rate_limit("claude", "rate", None)
         .await
         .unwrap();
     store
-        .record_rate_limit("claude", "out_of_credits", None)
+        .record_rate_limit("claude", "error", None)
         .await
         .unwrap();
     store
-        .record_rate_limit("codex", "rate_limit", None)
+        .record_rate_limit("codex", "rate", None)
         .await
         .unwrap();
 
     let counts = store.recent_rate_limit_counts(6).await.unwrap();
-    assert_eq!(counts.get("claude"), Some(&2));
+    assert_eq!(counts.get("claude"), Some(&1));
     assert_eq!(counts.get("codex"), Some(&1));
     assert_eq!(counts.get("opencode"), None);
 }
