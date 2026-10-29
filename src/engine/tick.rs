@@ -10,7 +10,8 @@
 //! 5. Run cron job scheduler
 //!
 //! [`tick_all`] runs them for every project. Phases 1-2 and 3b-5 run for all projects at
-//! once; only routing is serial, because it holds the router write lock.
+//! once; only routing is serial, because it holds the router write lock. Store-wide work
+//! (`tick_global_sweeps`, `reconcile_dependencies`) runs once per tick, not once per project.
 
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::channels::capture::CaptureService;
@@ -701,9 +702,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
     config: &EngineConfig,
     store: &Arc<TaskStore>,
     session_map: &std::collections::HashMap<String, bool>,
-    router: &Router,
     dispatching: &Arc<DashMap<String, String>>,
-    auto_merge_in_flight: &Arc<DashSet<String>>,
 ) -> anyhow::Result<()> {
     let _span = tracing::info_span!("engine.tick.phase2.stuck_tasks").entered();
 
@@ -1551,6 +1550,24 @@ pub(crate) async fn tick_recover_stuck_tasks(
         }
     }
 
+    Ok(())
+}
+
+/**
+ * The three store-wide recovery sweeps, run once per tick rather than once per project.
+ *
+ * Each one reads every repo, so a per-project call duplicates the work. The NeedsReview
+ * sweep also reads `needs_review_refires` and then increments it, so concurrent per-project
+ * passes all see the same count and four projects burn four of the five refire attempts in
+ * one tick (#3864)
+ **/
+pub(crate) async fn tick_global_sweeps(
+    task_manager: &Arc<TaskManager>,
+    store: &Arc<TaskStore>,
+    router: &Router,
+    dispatching: &Arc<DashMap<String, String>>,
+    auto_merge_in_flight: &Arc<DashSet<String>>,
+) {
     // Global sweep for CI-failure blocked tasks from inactive or removed projects.
     // auto_unblock_blocked_tasks runs inside sync_tick and is scoped to the active repo.
     // Tasks blocked for projects no longer in orch config are never processed there.
@@ -1589,8 +1606,6 @@ pub(crate) async fn tick_recover_stuck_tasks(
     {
         tracing::warn!(err = %e, "global rebroadcast-blocked recovery sweep failed");
     }
-
-    Ok(())
 }
 
 /// Phase 3a of tick: route status:new tasks to an agent and transition them to status:routed.
@@ -2714,11 +2729,13 @@ pub(crate) async fn tick_job_scheduler(
 
 /// Core tick for one project, up to the routing phase.
 ///
-/// Takes a shared `&Router` so every project can run this at the same time:
+/// Every phase here is scoped to one project, so all projects can run this at the same time:
 /// 1. `tick_check_session_completions` — poll tmux for finished sessions
 /// 2. `tick_detect_silent_agents`      — cooldown agents that produced no output
 /// 3. `tick_recover_stuck_tasks`       — reset in_progress/in_review tasks with no session
-/// 4. `reconcile_dependencies`         — re-check tasks waiting on a dependency
+///
+/// The store-wide work that used to sit in here runs once per tick in `tick_all`:
+/// `tick_global_sweeps` and `reconcile_dependencies`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn tick_before_routing(
     backend: &Arc<dyn ExternalBackend>,
@@ -2726,12 +2743,9 @@ pub(crate) async fn tick_before_routing(
     repo: &str,
     capture: &Arc<CaptureService>,
     config: &EngineConfig,
-    router: &Router,
     task_manager: &Arc<TaskManager>,
     dispatching: &Arc<DashMap<String, String>>,
     store: &Arc<TaskStore>,
-    transport: Option<&Arc<crate::channels::transport::Transport>>,
-    auto_merge_in_flight: &Arc<DashSet<String>>,
     session_map: &std::collections::HashMap<String, bool>,
 ) {
     let mut phases: Vec<(&str, u128)> = Vec::new();
@@ -2766,27 +2780,13 @@ pub(crate) async fn tick_before_routing(
         config,
         store,
         session_map,
-        router,
         dispatching,
-        auto_merge_in_flight,
     )
     .await
     {
         tracing::warn!(err = %e, "stuck-task recovery phase failed");
     }
     phases.push(("stuck_tasks", at.elapsed().as_millis()));
-
-    at = Instant::now();
-    if let Err(err) = crate::engine::dependencies::reconcile_dependencies(
-        backend.as_ref(),
-        store,
-        transport.map(|arc| arc.as_ref()),
-    )
-    .await
-    {
-        tracing::warn!(err = %err, "dependency reconcile failed");
-    }
-    phases.push(("dependencies", at.elapsed().as_millis()));
 
     super::log_phase_timings("tick.pre_routing", repo, &phases);
 }
@@ -2861,8 +2861,8 @@ pub(crate) async fn tick_after_routing(
 /// because it needs the router write lock and one shared `RoutingTickQuota`, which is what
 /// gives `router.max_tasks_per_tick` its meaning.
 ///
-/// The tmux session map and the two global sweeps are the same for every project, so they
-/// run once per tick rather than once per project.
+/// The tmux session map, the global sweeps and the dependency reconcile are the same for
+/// every project, so they run once per tick rather than once per project.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn tick_all(
     engines: &[ProjectEngine],
@@ -2905,34 +2905,64 @@ pub(crate) async fn tick_all(
     // One `tmux list-panes -a` for every project's stuck-task recovery, instead of one each
     let session_map = tmux.batch_session_active().await;
 
-    {
-        let router_guard = router.read().await;
-        let mut passes = Vec::with_capacity(engines.len());
-        for engine in engines {
-            passes.push(REPO_CONTEXT.scope(
-                engine.repo.clone(),
-                tick_before_routing(
-                    &engine.backend,
-                    tmux,
-                    &engine.repo,
-                    capture,
-                    config,
-                    &router_guard,
-                    &engine.task_manager,
-                    dispatching,
-                    &engine.store,
-                    transport,
-                    auto_merge_in_flight,
-                    &session_map,
-                ),
-            ));
-        }
-        futures::future::join_all(passes).await;
+    let mut passes = Vec::with_capacity(engines.len());
+    for engine in engines {
+        passes.push(REPO_CONTEXT.scope(
+            engine.repo.clone(),
+            tick_before_routing(
+                &engine.backend,
+                tmux,
+                &engine.repo,
+                capture,
+                config,
+                &engine.task_manager,
+                dispatching,
+                &engine.store,
+                &session_map,
+            ),
+        ));
     }
+    futures::future::join_all(passes).await;
 
     if !store.is_leader() {
         return;
     }
+
+    // Store-wide, so once per tick rather than once per project. Both read every repo, and
+    // the NeedsReview sweep increments a counter it just read, which concurrent per-project
+    // passes would each consume (#3864)
+    let at = Instant::now();
+    {
+        let router_guard = router.read().await;
+        tick_global_sweeps(
+            &first.task_manager,
+            store,
+            &router_guard,
+            dispatching,
+            auto_merge_in_flight,
+        )
+        .await;
+    }
+    let sweeps_ms = at.elapsed().as_millis();
+
+    let at = Instant::now();
+    if let Err(err) = crate::engine::dependencies::reconcile_dependencies(
+        first.backend.as_ref(),
+        store,
+        transport.map(|arc| arc.as_ref()),
+    )
+    .await
+    {
+        tracing::warn!(err = %err, "dependency reconcile failed");
+    }
+    super::log_phase_timings(
+        "tick.global",
+        &first.repo,
+        &[
+            ("global_sweeps", sweeps_ms),
+            ("dependencies", at.elapsed().as_millis()),
+        ],
+    );
 
     {
         let mut router_guard = router.write().await;
@@ -3044,8 +3074,8 @@ mod tests {
     }
 
     /// A router reporting one available agent with no healthy "review" model, so the
-    /// global NeedsReview refire sweep inside `tick_recover_stuck_tasks` treats every
-    /// review agent as cooled and skips — keeping it a no-op for tests unrelated to it.
+    /// global NeedsReview refire sweep in `tick_global_sweeps` treats every review agent
+    /// as cooled and skips — keeping it a no-op for tests unrelated to it.
     fn cooled_review_router_for_test() -> Router {
         Router::new_for_test(
             crate::engine::router::RouterConfig::default(),
@@ -3469,9 +3499,7 @@ mod tests {
             &config,
             &store,
             &std::collections::HashMap::new(),
-            &cooled_review_router_for_test(),
             &Arc::new(DashMap::new()),
-            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -3529,9 +3557,7 @@ mod tests {
             &config,
             &store,
             &std::collections::HashMap::new(),
-            &cooled_review_router_for_test(),
             &Arc::new(DashMap::new()),
-            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -3580,9 +3606,7 @@ mod tests {
             &config,
             &store,
             &std::collections::HashMap::new(),
-            &cooled_review_router_for_test(),
             &Arc::new(DashMap::new()),
-            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -3779,9 +3803,7 @@ mod tests {
             &config,
             &store,
             &std::collections::HashMap::new(),
-            &cooled_review_router_for_test(),
             &Arc::new(DashMap::new()),
-            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -3863,9 +3885,7 @@ mod tests {
             &config,
             &store,
             &std::collections::HashMap::new(),
-            &cooled_review_router_for_test(),
             &Arc::new(DashMap::new()),
-            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -3962,9 +3982,7 @@ mod tests {
             &config,
             &store,
             &std::collections::HashMap::new(),
-            &cooled_review_router_for_test(),
             &dispatching,
-            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -3991,9 +4009,7 @@ mod tests {
             &config,
             &store,
             &std::collections::HashMap::new(),
-            &cooled_review_router_for_test(),
             &dispatching,
-            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -4119,9 +4135,7 @@ mod tests {
                 &config,
                 &store,
                 &std::collections::HashMap::new(),
-                &cooled_review_router_for_test(),
                 &dispatching,
-                &Arc::new(DashSet::new()),
             )
             .await
             .unwrap();
@@ -4152,9 +4166,7 @@ mod tests {
             &config,
             &store,
             &std::collections::HashMap::new(),
-            &cooled_review_router_for_test(),
             &dispatching,
-            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -4211,9 +4223,7 @@ mod tests {
             &config,
             &store,
             &std::collections::HashMap::new(),
-            &cooled_review_router_for_test(),
             &Arc::new(DashMap::new()),
-            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -4307,6 +4317,99 @@ mod tests {
         assert!(
             weight_rx.try_recv().is_err(),
             "no project, so no weight signal"
+        );
+    }
+
+    /// The store-wide sweeps must run once per tick, not once per project. The NeedsReview
+    /// refire sweep reads `needs_review_refires` and then increments it, so when it ran
+    /// inside the per-project join every project saw the same count and spent one of the
+    /// five refire attempts — four projects burned four attempts in a single tick (#3864).
+    #[serial_test::serial(cooldown_state)]
+    #[tokio::test]
+    async fn tick_all_runs_the_global_needs_review_sweep_once_for_two_projects() {
+        use crate::engine::router::{Router, RouterConfig};
+        use crate::store::UpsertExternal;
+
+        crate::engine::cooldown::reset_global_state().await;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let id = store
+            .upsert_external(&UpsertExternal {
+                repo: "owner/one",
+                ext_id: "7",
+                title: "Stale needs_review task",
+                body: "",
+                author: "user",
+                url: "https://github.com/owner/one/issues/7",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::NeedsReview)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let engines: Vec<ProjectEngine> = ["owner/one", "owner/two"]
+            .iter()
+            .map(|repo| {
+                let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+                ProjectEngine {
+                    repo: repo.to_string(),
+                    project_dir: std::path::PathBuf::from("/nonexistent"),
+                    backend: backend.clone(),
+                    task_manager: Arc::new(TaskManager::with_store(
+                        backend,
+                        store.clone(),
+                        repo.to_string(),
+                    )),
+                    runner: Arc::new(crate::engine::runner::TaskRunner::new(repo.to_string())),
+                    store: store.clone(),
+                }
+            })
+            .collect();
+
+        // A healthy review agent, so the sweep does not skip the pass
+        let mut config = RouterConfig::default();
+        config
+            .model_map
+            .entry("review".to_string())
+            .or_default()
+            .insert("claude".to_string(), vec!["sonnet".to_string()]);
+        let router = Arc::new(tokio::sync::RwLock::new(Router::new_for_test(
+            config,
+            vec!["claude".to_string()],
+        )));
+
+        let transport = Arc::new(Transport::new());
+        let capture = Arc::new(CaptureService::new(transport.clone()));
+        let (weight_tx, _weight_rx) = mpsc::channel(8);
+
+        tick_all(
+            &engines,
+            &Arc::new(TmuxManager::new()),
+            &capture,
+            &Arc::new(Semaphore::new(1)),
+            &EngineConfig::default(),
+            &router,
+            &weight_tx,
+            &Arc::new(DashMap::new()),
+            Some(&transport),
+            &engines.iter().map(|e| e.repo.clone()).collect(),
+            &Arc::new(DashSet::new()),
+        )
+        .await;
+
+        assert_eq!(
+            store.get(id).await.unwrap().needs_review_refires,
+            1,
+            "two projects must share one pass of the global NeedsReview sweep"
         );
     }
 
@@ -4517,9 +4620,7 @@ mod tests {
             &config,
             &store,
             &std::collections::HashMap::new(),
-            &cooled_review_router_for_test(),
             &Arc::new(DashMap::new()),
-            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -4726,9 +4827,7 @@ mod tests {
             &config,
             &store,
             &session_map,
-            &cooled_review_router_for_test(),
             &Arc::new(DashMap::new()),
-            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();
@@ -5132,9 +5231,7 @@ mod tests {
             &config,
             &store,
             &std::collections::HashMap::new(),
-            &cooled_review_router_for_test(),
             &Arc::new(DashMap::new()),
-            &Arc::new(DashSet::new()),
         )
         .await
         .unwrap();

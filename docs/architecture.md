@@ -303,7 +303,9 @@ graph LR
 │    6. Job scheduler (cron matching)              │
 │    Only step 3 is serial, it holds the router    │
 │    write lock. The rest run for all projects     │
-│    at once, timed per project and per phase      │
+│    at once, timed per project and per phase.     │
+│    Store-wide work (global sweeps, dependency    │
+│    reconcile) runs once per tick                 │
 │                                                  │
 │  Sync (every 45s, all projects at once):        │
 │    - Ingest external tasks (GitHub issues)       │

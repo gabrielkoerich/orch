@@ -1154,7 +1154,7 @@ const REBROADCAST_BLOCK_REASON: &str = "review agent rebroadcast escalated after
 /// `REBROADCAST_BLOCK_REASON`. Once any review agent is routable again, this
 /// sweep resets matching tasks to `NeedsReview` so the subscriber can pick them up.
 /// Writes through the store via `*_by_store_id` helpers, not a repo-scoped
-/// `TaskManager`. Called once per main tick from `tick_recover_stuck_tasks`.
+/// `TaskManager`. Called once per main tick from `tick_global_sweeps`.
 ///
 /// Before resetting, the attached PR's live state is checked (mirroring
 /// `try_unblock_ci_failure_task`): merged means the task is marked done, closed
@@ -1534,7 +1534,7 @@ async fn auto_unblock_blocked_tasks(
 /// This function queries all blocked tasks across all repos and handles the CI-failure
 /// cases (block_reason LIKE '%CI failure%' or '%CI checks timed out%') so they are
 /// eventually cleaned up regardless of project activity. Called once per main tick from
-/// `tick_recover_stuck_tasks`.
+/// `tick_global_sweeps`.
 pub(crate) async fn auto_unblock_ci_failure_blocked_tasks_global(
     task_manager: &Arc<crate::engine::tasks::TaskManager>,
     store: &Arc<TaskStore>,
@@ -1602,7 +1602,7 @@ pub(crate) async fn auto_unblock_ci_failure_blocked_tasks_global(
 /// transition as its atomic guard (issue #857)
 ///
 /// Queries across all repos and writes through the store via `*_by_store_id`
-/// TaskManager helpers. Called once per main tick from `tick_recover_stuck_tasks`
+/// TaskManager helpers. Called once per main tick from `tick_global_sweeps`
 pub(crate) async fn refire_and_escalate_stale_needs_review_global(
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
