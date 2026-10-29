@@ -12,10 +12,46 @@ use crate::store::{
     NewDependency, ObservedPullRequest, TaskStore,
 };
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 const DEP_SYNC_TTL_SECS: i64 = 45;
 // Each pass costs one to four REST calls per open blocker, so 40 blockers at 45s would pass 5000 an hour
 const BLOCKER_REFRESH_TTL_SECS: i64 = 300;
+// Every entry is first read in the same tick after a restart, so a fixed TTL expires them together
+const BLOCKER_REFRESH_SPREAD_SECS: i64 = 120;
+
+fn blocker_read_key(repo: &str, number: i64) -> String {
+    format!("dep_blocker_read_at:{repo}#{number}")
+}
+
+/**
+ * How long a blocker's snapshot is reused, spread over `BLOCKER_REFRESH_SPREAD_SECS`. The
+ * offset is a hash of the blocker, not a fresh random number, so each blocker keeps its
+ * own slot across ticks instead of drifting on every read
+ **/
+fn blocker_refresh_ttl_secs(repo: &str, number: i64) -> i64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    repo.hash(&mut hasher);
+    number.hash(&mut hasher);
+    let offset = (hasher.finish() % BLOCKER_REFRESH_SPREAD_SECS as u64) as i64;
+    BLOCKER_REFRESH_TTL_SECS + offset
+}
+
+/**
+ * Forget when a blocker was last read, so the next refresh reads it at once. Called when a
+ * task reaches `done`. Without it a blocker that finishes right after a read holds its
+ * dependents for the rest of the TTL, and a chain pays that at each step. A blocker orch
+ * does not manage has no task to finish, so it keeps the full TTL
+ **/
+pub async fn clear_blocker_read_cache(store: &TaskStore, repo: &str, external_id: &str) {
+    // An internal id never names a GitHub issue, so it can never be a blocker
+    let Ok(number) = external_id.parse::<i64>() else {
+        return;
+    };
+    if let Err(err) = store.kv_delete(&blocker_read_key(repo, number)).await {
+        tracing::warn!(repo, number, err = %err, "clearing the blocker read cache failed");
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DepRef {
@@ -384,11 +420,11 @@ async fn refresh_one_blocker(
         return Ok(());
     }
 
-    let key = format!("dep_blocker_read_at:{repo}#{number}");
+    let key = blocker_read_key(repo, number);
     let now = chrono::Utc::now().timestamp();
     if let Ok(Some(prev)) = store.kv_get(&key).await {
         if let Ok(prev) = prev.parse::<i64>() {
-            if now.saturating_sub(prev) < BLOCKER_REFRESH_TTL_SECS {
+            if now.saturating_sub(prev) < blocker_refresh_ttl_secs(repo, number) {
                 return Ok(());
             }
         }
@@ -1393,7 +1429,8 @@ See #4 in the notes
             "a refresh inside the TTL must not call GitHub"
         );
 
-        let stale = chrono::Utc::now().timestamp() - BLOCKER_REFRESH_TTL_SECS;
+        let stale = chrono::Utc::now().timestamp()
+            - (BLOCKER_REFRESH_TTL_SECS + BLOCKER_REFRESH_SPREAD_SECS);
         store
             .kv_set("dep_blocker_read_at:owner/repo#1", &stale.to_string())
             .await
@@ -1402,6 +1439,108 @@ See #4 in the notes
         assert!(
             reads() > first,
             "an expired entry has to read the blocker again"
+        );
+    }
+
+    /// Set up `#1` as an open blocker of `#2` and read it once, so the TTL is live
+    async fn read_open_blocker_once(store: &TaskStore) -> Arc<ScriptedBackend> {
+        let b = insert(store, "owner/repo", "2", "B", "").await;
+        store
+            .replace_dependencies(
+                b,
+                &[NewDependency {
+                    repo: "owner/repo".into(),
+                    number: 1,
+                    source: DepSource::Github,
+                }],
+            )
+            .await
+            .unwrap();
+        let backend = Arc::new(ScriptedBackend::new(HashMap::new()));
+        backend
+            .close_state
+            .lock()
+            .unwrap()
+            .insert(1, ("open".into(), None));
+        refresh_blocker_snapshots(&*backend, store).await.unwrap();
+        backend
+    }
+
+    #[tokio::test]
+    async fn a_blockers_task_going_done_makes_the_next_refresh_read_it() {
+        use crate::engine::tasks::TaskManager;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        insert(&store, "owner/repo", "1", "A", "").await;
+        let backend = read_open_blocker_once(&store).await;
+        let reads = || backend.reads.load(std::sync::atomic::Ordering::Relaxed);
+        let first = reads();
+        assert!(first > 0, "the first refresh has to read the blocker");
+
+        let task_manager = TaskManager::with_store(
+            backend.clone() as Arc<dyn ExternalBackend>,
+            store.clone(),
+            "owner/repo".into(),
+        );
+        task_manager
+            .update_task_status(&ExternalId("1".into()), Status::Done)
+            .await
+            .unwrap();
+
+        refresh_blocker_snapshots(&*backend, &store).await.unwrap();
+        assert!(
+            reads() > first,
+            "a blocker whose task is done has to be read inside the TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blocker_orch_does_not_manage_keeps_its_ttl() {
+        use crate::engine::tasks::TaskManager;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend = read_open_blocker_once(&store).await;
+        let reads = || backend.reads.load(std::sync::atomic::Ordering::Relaxed);
+        let first = reads();
+        assert!(first > 0, "the first refresh has to read the blocker");
+
+        // `#1` has no task row here, so finishing the dependent must not clear its entry
+        let task_manager = TaskManager::with_store(
+            backend.clone() as Arc<dyn ExternalBackend>,
+            store.clone(),
+            "owner/repo".into(),
+        );
+        task_manager
+            .update_task_status(&ExternalId("2".into()), Status::Done)
+            .await
+            .unwrap();
+
+        refresh_blocker_snapshots(&*backend, &store).await.unwrap();
+        assert_eq!(
+            reads(),
+            first,
+            "a blocker orch does not manage is read once per TTL"
+        );
+    }
+
+    #[test]
+    fn blocker_ttls_spread_within_a_bounded_range() {
+        let ttls: Vec<i64> = (1..200)
+            .map(|n| blocker_refresh_ttl_secs("owner/repo", n))
+            .collect();
+        for ttl in &ttls {
+            assert!(
+                (BLOCKER_REFRESH_TTL_SECS..BLOCKER_REFRESH_TTL_SECS + BLOCKER_REFRESH_SPREAD_SECS)
+                    .contains(ttl),
+                "{ttl} is outside the TTL range"
+            );
+        }
+        let spread: HashSet<i64> = ttls.iter().copied().collect();
+        assert!(spread.len() > 50, "the TTLs have to spread the reads out");
+        assert_eq!(
+            blocker_refresh_ttl_secs("owner/repo", 1),
+            blocker_refresh_ttl_secs("owner/repo", 1),
+            "one blocker keeps the same TTL across ticks"
         );
     }
 
