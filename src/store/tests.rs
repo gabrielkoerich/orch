@@ -7340,8 +7340,48 @@ async fn move_repo_keeps_tasks_and_dependencies() {
         .execute(&store.pool)
         .await
         .unwrap();
+    let dropped = [
+        "dep_blocker:a/x#1",
+        "dep_blocker_read_at:a/x#1",
+        "review_batch_fail:a/x",
+    ];
+    let renamed = [
+        (
+            "dep_blocker_notice:7:a/x#1:blocked",
+            "dep_blocker_notice:7:b/x#1:blocked",
+        ),
+        ("dep_cycle_comment:a/x#1:sig", "dep_cycle_comment:b/x#1:sig"),
+        ("review_approved_sha:a/x#2#9", "review_approved_sha:b/x#2#9"),
+        ("issues_last_ingested:a/x", "issues_last_ingested:b/x"),
+    ];
+    // a repo whose name starts with the moved one must keep its keys
+    let untouched = ["dep_blocker:a/x2#1", "issues_last_ingested:a/x2"];
+    for key in dropped
+        .iter()
+        .chain(renamed.iter().map(|(from, _)| from))
+        .chain(untouched.iter())
+    {
+        store.kv_set(key, "1").await.unwrap();
+    }
 
     assert_eq!(store.move_repo("a/x", "b/x").await.unwrap(), 2);
+    for key in dropped.iter().chain(renamed.iter().map(|(from, _)| from)) {
+        assert_eq!(store.kv_get(key).await.unwrap(), None, "{key} left behind");
+    }
+    for (_, to) in renamed {
+        assert_eq!(
+            store.kv_get(to).await.unwrap().as_deref(),
+            Some("1"),
+            "{to} missing"
+        );
+    }
+    for key in untouched {
+        assert_eq!(
+            store.kv_get(key).await.unwrap().as_deref(),
+            Some("1"),
+            "{key} touched"
+        );
+    }
     let t = store.get(one).await.unwrap();
     assert_eq!((t.repo.as_str(), t.id), ("b/x", one));
     assert_eq!(t.branch, "br");
