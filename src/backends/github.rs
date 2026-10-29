@@ -28,7 +28,6 @@ fn is_trusted_author(issue: &crate::github::types::GitHubIssue) -> bool {
         .unwrap_or(false) // missing field = untrusted
 }
 
-// Comment trust uses only this payload's association, never the parent issue
 fn is_trusted_comment_author(c: &crate::github::types::GitHubComment) -> bool {
     c.author_association
         .as_deref()
@@ -36,7 +35,6 @@ fn is_trusted_comment_author(c: &crate::github::types::GitHubComment) -> bool {
         .unwrap_or(false)
 }
 
-/// Keep comments whose own association is trusted. Parent issue association is ignored
 fn trusted_mentions(
     comments: impl IntoIterator<Item = crate::github::types::GitHubComment>,
 ) -> Vec<Mention> {
@@ -120,6 +118,14 @@ impl GitHubBackend {
             repo,
             gh: GhHttp::new()?,
         })
+    }
+
+    #[cfg(test)]
+    fn for_test(repo: impl Into<String>, gh: GhHttp) -> Self {
+        Self {
+            repo: repo.into(),
+            gh,
+        }
     }
 
     async fn sync_project_status(
@@ -1125,8 +1131,19 @@ mod tests {
         assert!(is_trusted_comment_author(&c));
     }
 
+    fn comment_json(id: u64, login: &str, association: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "body": format!("from {login}"),
+            "user": { "login": login },
+            "created_at": "2026-01-01T00:00:00Z",
+            "issue_url": "https://api.github.com/repos/o/r/issues/1",
+            "author_association": association,
+        })
+    }
+
     #[test]
-    fn get_mentions_and_list_issue_comments_exclude_contributor_on_owner_issue() {
+    fn trusted_mentions_drops_contributor_on_owner_issue() {
         use crate::github::types::GitHubComment;
         let comment = GitHubComment {
             id: 42,
@@ -1162,6 +1179,75 @@ mod tests {
         assert!(!is_trusted_comment_author(&comment));
         let mentions = trusted_mentions([comment]);
         assert!(mentions.is_empty());
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn get_mentions_and_list_issue_comments_exclude_contributor_on_owner_issue() {
+        use crate::github::http::GhHttp;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env = crate::github::token::ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("GH_TOKEN");
+        std::env::set_var("GH_TOKEN", "test_token");
+
+        let server = MockServer::start().await;
+        let comments = serde_json::json!([
+            comment_json(42, "stranger", "CONTRIBUTOR"),
+            comment_json(43, "owner", "OWNER"),
+        ]);
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(comments.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(comments))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "number": 1,
+                "id": 1,
+                "title": "t",
+                "state": "open",
+                "labels": [],
+                "user": { "login": "owner" },
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "html_url": "https://github.com/o/r/issues/1",
+                "author_association": "OWNER",
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let backend = GitHubBackend::for_test("o/r", GhHttp::for_test(server.uri(), None));
+        let mentions = backend
+            .get_mentions("2026-01-01T00:00:00Z")
+            .await
+            .expect("get_mentions");
+        let listed = backend
+            .list_issue_comments(&ExternalId("1".to_string()))
+            .await
+            .expect("list_issue_comments");
+
+        match prev {
+            Some(value) => std::env::set_var("GH_TOKEN", value),
+            None => std::env::remove_var("GH_TOKEN"),
+        }
+
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].id, "43");
+        assert_eq!(mentions[0].author, "owner");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "43");
+        assert_eq!(listed[0].author, "owner");
     }
 
     fn make_test_issue(labels: &[&str]) -> GitHubIssue {
