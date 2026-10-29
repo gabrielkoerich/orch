@@ -281,7 +281,7 @@ fn find_git_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     let git = dir.join(".git");
 
     if git.is_dir() {
-        out.extend(["hooks", "config"].map(|f| git.join(f)));
+        out.extend(["hooks", "config", "info", "modules"].map(|f| git.join(f)));
     }
 
     if depth == 0 {
