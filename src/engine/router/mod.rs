@@ -22,10 +22,6 @@ pub mod weights;
 pub use config::{parse_pool_entry, RouterConfig};
 pub use weights::AgentWeights;
 
-/// Error returned when all agents/models are in cooldown and routing is temporarily unavailable.
-///
-/// This is a transient error that should not count against `max_route_attempts` since
-/// no agent was actually invoked. The caller should back off and retry later.
 fn fmt_degraded(degraded: &[String]) -> String {
     if degraded.is_empty() {
         String::new()
@@ -34,6 +30,10 @@ fn fmt_degraded(degraded: &[String]) -> String {
     }
 }
 
+/// Error returned when all agents/models are in cooldown and routing is temporarily unavailable.
+///
+/// This is a transient error that should not count against `max_route_attempts` since
+/// no agent was actually invoked. The caller should back off and retry later.
 #[derive(Debug, thiserror::Error)]
 pub enum AllAgentsCooledError {
     #[error("all agents/models in cooldown for {scope}{}", fmt_degraded(.degraded))]
