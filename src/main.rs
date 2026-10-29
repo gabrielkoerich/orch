@@ -650,7 +650,7 @@ enum WebhookAction {
 enum SessionAction {
     /// Export session output for a task in human-readable format
     Export {
-        /// Task ID (e.g. "internal:8" or issue number)
+        /// Task ID: a number, owner/repo#N or internal:N
         task_id: String,
         /// Attempt number (defaults to latest)
         #[arg(long, short = 'a')]
@@ -766,14 +766,14 @@ enum TaskAction {
     },
     /// Attach to a running agent's tmux session
     Attach {
-        /// Task ID
+        /// Task ID (`58`, `owner/repo#58`, or `internal:58`)
         id: String,
     },
     /// List active agent tmux sessions
     Live,
     /// Kill a running agent tmux session
     Kill {
-        /// Task ID
+        /// Task ID (`58`, `owner/repo#58`, or `internal:58`)
         id: String,
     },
     /// Publish internal task to GitHub
@@ -841,7 +841,7 @@ enum TaskAction {
     },
     /// Watch a task's agent work live, including its review (status changes: `orch task events`)
     Watch {
-        /// Task ID
+        /// Task ID (`58`, `owner/repo#58`, or `internal:58`)
         id: String,
     },
     /// Unified diagnostic view: status, agent, attempts, last error, PR, block reason
@@ -1277,7 +1277,7 @@ async fn async_main() -> anyhow::Result<()> {
                 cli::task::unblock(&id).await?;
             }
             TaskAction::Attach { id } => {
-                cli::task::attach(&id)?;
+                cli::task::attach(&id).await?;
             }
             TaskAction::Live => {
                 cli::task::live().await?;

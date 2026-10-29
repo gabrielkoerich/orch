@@ -446,8 +446,25 @@ fn ambiguous_cli_id_error(spec: &str, matches: &[CliTaskRef]) -> anyhow::Error {
     for task in matches {
         lines.push(task.format_match());
     }
-    lines.push("Use owner/repo#N for an issue, or internal:N for an internal task.".to_string());
+    lines.push(ambiguous_cli_id_hint(matches));
     anyhow::anyhow!(lines.join("\n"))
+}
+
+fn ambiguous_cli_id_hint(matches: &[CliTaskRef]) -> String {
+    let github = matches
+        .iter()
+        .find(|task| !task.is_internal())
+        .map(CliTaskRef::display_spec);
+    let internal = matches
+        .iter()
+        .find(|task| task.is_internal())
+        .map(CliTaskRef::display_spec);
+    match (github, internal) {
+        (Some(github), Some(internal)) => {
+            format!("Use {github} for the GitHub task or {internal} for the internal one")
+        }
+        _ => "Use owner/repo#N for an issue, or internal:N for an internal task.".to_string(),
+    }
 }
 
 fn dedup_cli_refs(rows: Vec<sqlx::sqlite::SqliteRow>) -> anyhow::Result<Vec<CliTaskRef>> {

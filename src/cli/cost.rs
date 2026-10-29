@@ -1,11 +1,13 @@
-use crate::config;
 use crate::store::{self, TaskStore};
 use std::sync::Arc;
 
 /// Show cost breakdown for a specific task.
 pub async fn show_task(id: &str) -> anyhow::Result<()> {
-    let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
-    let repo = config::get_current_repo().unwrap_or_default();
+    let owned = crate::cli::init_store().await?;
+    let resolved = crate::cli::task_ref::resolve(&owned, id).await?;
+    let store: Option<Arc<TaskStore>> = Some(Arc::new(owned));
+    let repo = resolved.repo.clone();
+    let id = resolved.external_id.as_str();
 
     let usage = store::get_token_usage(&store, &repo, id).await;
     let cost_estimate = store::get_cost_estimate(&store, &repo, id).await;

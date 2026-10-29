@@ -1,5 +1,5 @@
-//! CLI handler for `orch task events` and `orch task watch` — connects to the
-//! event bus websocket server and prints task status transitions in real-time.
+//! CLI handler for `orch task events`. Connects to the event bus websocket
+//! and prints task status transitions in real time
 //!
 //! If the websocket is unreachable (stale port file after service restart/crash),
 //! falls back to polling the SQLite store for status changes.
