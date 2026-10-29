@@ -74,6 +74,23 @@ pub struct GitHubCheckRun {
     pub name: String,
     pub status: String,
     pub conclusion: Option<String>,
+    /// GitHub App that posted the run, used to match a ruleset `integration_id`
+    #[serde(default)]
+    pub app: Option<GitHubApp>,
+}
+
+/// The GitHub App that created a check run (`check_run.app`)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubApp {
+    pub id: i64,
+}
+
+/// A required status check from classic branch protection or a ruleset
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RequiredStatusCheck {
+    pub context: String,
+    /// GitHub App that must post this check. `None` means any app's check with this name counts
+    pub integration_id: Option<i64>,
 }
 
 /// A check run annotation returned by the GitHub Checks API.
@@ -232,6 +249,32 @@ mod tests {
         assert_eq!(comment.commit_id, "abc123");
         assert_eq!(comment.in_reply_to_id, None);
         assert!(comment.diff_hunk.is_some());
+    }
+
+    #[test]
+    fn github_check_run_deserializes_app_id() {
+        let json = r#"{
+            "id": 4,
+            "name": "ci/test",
+            "status": "completed",
+            "conclusion": "success",
+            "app": { "id": 42, "slug": "shipcheck", "name": "shipcheck" }
+        }"#;
+        let run: GitHubCheckRun = serde_json::from_str(json).unwrap();
+        assert_eq!(run.name, "ci/test");
+        assert_eq!(run.app.unwrap().id, 42);
+    }
+
+    #[test]
+    fn github_check_run_deserializes_without_app() {
+        let json = r#"{
+            "id": 4,
+            "name": "ci/test",
+            "status": "completed",
+            "conclusion": "success"
+        }"#;
+        let run: GitHubCheckRun = serde_json::from_str(json).unwrap();
+        assert!(run.app.is_none());
     }
 
     #[test]

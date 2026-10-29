@@ -14,7 +14,7 @@ use crate::engine::cleanup::cleanup_task_worktree;
 use crate::engine::runner::{git_ops, worktree};
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
-use crate::github::types::{GitHubCheckRun, GitHubPullRequest, GitHubReview};
+use crate::github::types::{GitHubCheckRun, GitHubPullRequest, GitHubReview, RequiredStatusCheck};
 use crate::store::TaskStore;
 use crate::store::{
     opt_store_get_task, store_increment, store_reset_failure_counters, store_set_result,
@@ -643,8 +643,8 @@ async fn poll_mergeable_until(
 }
 
 pub(crate) fn required_checks_state(
-    required_contexts: &[String],
-    check_runs: &[(String, String, Option<String>)],
+    required_contexts: &[RequiredStatusCheck],
+    check_runs: &[GitHubCheckRun],
     statuses: &[(String, String)],
 ) -> (String, u64, u64, u64, u64) {
     if required_contexts.is_empty() {
@@ -655,19 +655,16 @@ pub(crate) fn required_checks_state(
     let mut failing = 0u64;
     let mut pending = 0u64;
 
-    for context in required_contexts {
+    for required in required_contexts {
         let mut matched = false;
 
-        let mut check_run_match = None;
-        for (name, status, conclusion) in check_runs {
-            if name == context {
-                check_run_match = Some((status.as_str(), conclusion.as_deref()));
-                break;
-            }
-        }
-
-        if let Some((status, conclusion)) = check_run_match {
+        if let Some(run) = check_runs
+            .iter()
+            .find(|run| required_check_run_matches(required, run))
+        {
             matched = true;
+            let status = run.status.as_str();
+            let conclusion = run.conclusion.as_deref();
             if status != "completed" || conclusion.is_none() {
                 pending += 1;
             } else if matches!(conclusion, Some("success" | "neutral" | "skipped")) {
@@ -675,9 +672,9 @@ pub(crate) fn required_checks_state(
             } else {
                 failing += 1;
             }
-        } else {
+        } else if required.integration_id.is_none() {
             for (name, state) in statuses {
-                if name != context {
+                if name != required.context.as_str() {
                     continue;
                 }
                 matched = true;
@@ -705,6 +702,16 @@ pub(crate) fn required_checks_state(
     };
 
     (state, total, passing, failing, pending)
+}
+
+fn required_check_run_matches(required: &RequiredStatusCheck, run: &GitHubCheckRun) -> bool {
+    if run.name != required.context {
+        return false;
+    }
+    match required.integration_id {
+        None => true,
+        Some(id) => run.app.as_ref().is_some_and(|app| app.id == id),
+    }
 }
 
 /// Deduplicate GitHub reviews by reviewer, keeping only the latest per reviewer.
@@ -1105,12 +1112,7 @@ pub(crate) async fn auto_merge_pr(
             } else {
                 let check_runs = gh.get_check_runs(repo, &head_sha).await?;
                 let statuses = gh.get_commit_status_contexts(repo, &head_sha).await?;
-                let check_run_tuples = check_runs
-                    .iter()
-                    .map(|run| (run.name.clone(), run.status.clone(), run.conclusion.clone()))
-                    .collect::<Vec<_>>();
-                let result =
-                    required_checks_state(&required_contexts, &check_run_tuples, &statuses);
+                let result = required_checks_state(&required_contexts, &check_runs, &statuses);
                 prefetched_check_runs = Some(check_runs);
                 result
             }
@@ -1601,6 +1603,23 @@ pub(crate) async fn auto_merge_pr(
         return Ok(());
     }
 
+    // Confirm every required check passed on this head SHA so an admin token
+    // cannot merge through a ruleset bypass while a required check is missing
+    if !required_contexts.is_empty() {
+        let check_runs = gh.get_check_runs(repo, &head_sha).await?;
+        let statuses = gh.get_commit_status_contexts(repo, &head_sha).await?;
+        let (state, ..) = required_checks_state(&required_contexts, &check_runs, &statuses);
+        if state != "success" {
+            tracing::info!(
+                task_id = task.id.0,
+                pr_number,
+                state = %state,
+                "required checks have not all passed on the head SHA, holding merge"
+            );
+            return Ok(());
+        }
+    }
+
     tracing::info!(
         task_id = task.id.0,
         pr_number,
@@ -1845,10 +1864,7 @@ async fn required_ci_checks_pass(gh: &GhHttp, repo: &str, pr_number: u64) -> Opt
     }
 
     let check_runs = match gh.get_check_runs(repo, &head_sha).await {
-        Ok(runs) => runs
-            .into_iter()
-            .map(|r| (r.name, r.status, r.conclusion))
-            .collect::<Vec<_>>(),
+        Ok(runs) => runs,
         Err(e) => {
             tracing::warn!(
                 pr_number,
@@ -2301,20 +2317,34 @@ mod tests {
         }
     }
 
+    fn required_check(context: &str, integration_id: Option<i64>) -> RequiredStatusCheck {
+        RequiredStatusCheck {
+            context: context.to_string(),
+            integration_id,
+        }
+    }
+
+    fn check_run(
+        name: &str,
+        status: &str,
+        conclusion: Option<&str>,
+        app_id: Option<i64>,
+    ) -> GitHubCheckRun {
+        GitHubCheckRun {
+            id: 1,
+            name: name.to_string(),
+            status: status.to_string(),
+            conclusion: conclusion.map(str::to_string),
+            app: app_id.map(|id| crate::github::types::GitHubApp { id }),
+        }
+    }
+
     #[test]
     fn required_checks_state_uses_required_contexts() {
-        let required = vec!["ci".to_string(), "lint".to_string()];
+        let required = vec![required_check("ci", None), required_check("lint", None)];
         let check_runs = vec![
-            (
-                "ci".to_string(),
-                "completed".to_string(),
-                Some("success".to_string()),
-            ),
-            (
-                "lint".to_string(),
-                "completed".to_string(),
-                Some("failure".to_string()),
-            ),
+            check_run("ci", "completed", Some("success"), None),
+            check_run("lint", "completed", Some("failure"), None),
         ];
         let statuses = vec![("unused".to_string(), "success".to_string())];
 
@@ -2326,6 +2356,90 @@ mod tests {
         assert_eq!(passing, 1);
         assert_eq!(failing, 1);
         assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn required_checks_state_ruleset_missing_run_is_pending() {
+        let required = vec![required_check("ci/test", Some(42))];
+        let (state, total, passing, failing, pending) = required_checks_state(&required, &[], &[]);
+
+        assert_eq!(state, "pending");
+        assert_eq!(total, 1);
+        assert_eq!(passing, 0);
+        assert_eq!(failing, 0);
+        assert_eq!(pending, 1);
+    }
+
+    #[test]
+    fn required_checks_state_ruleset_passing_run_is_success() {
+        let required = vec![required_check("ci/test", Some(42))];
+        let check_runs = vec![check_run("ci/test", "completed", Some("success"), Some(42))];
+        let (state, total, passing, failing, pending) =
+            required_checks_state(&required, &check_runs, &[]);
+
+        assert_eq!(state, "success");
+        assert_eq!(total, 1);
+        assert_eq!(passing, 1);
+        assert_eq!(failing, 0);
+        assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn required_checks_state_ruleset_failing_run_is_failure() {
+        let required = vec![required_check("ci/test", Some(42))];
+        let check_runs = vec![check_run("ci/test", "completed", Some("failure"), Some(42))];
+        let (state, ..) = required_checks_state(&required, &check_runs, &[]);
+        assert_eq!(state, "failure");
+    }
+
+    #[test]
+    fn required_checks_state_wrong_app_does_not_satisfy() {
+        let required = vec![required_check("ci/test", Some(42))];
+        let check_runs = vec![check_run("ci/test", "completed", Some("success"), Some(99))];
+        let (state, total, passing, failing, pending) =
+            required_checks_state(&required, &check_runs, &[]);
+
+        assert_eq!(state, "pending");
+        assert_eq!(total, 1);
+        assert_eq!(passing, 0);
+        assert_eq!(failing, 0);
+        assert_eq!(pending, 1);
+    }
+
+    #[test]
+    fn required_checks_state_classic_name_only_still_matches() {
+        let required = vec![required_check("ci/test", None)];
+        let check_runs = vec![check_run("ci/test", "completed", Some("success"), Some(99))];
+        let (state, ..) = required_checks_state(&required, &check_runs, &[]);
+        assert_eq!(state, "success");
+    }
+
+    #[test]
+    fn required_checks_state_empty_required_is_success() {
+        let (state, total, passing, failing, pending) = required_checks_state(&[], &[], &[]);
+        assert_eq!(state, "success");
+        assert_eq!(total, 0);
+        assert_eq!(passing, 0);
+        assert_eq!(failing, 0);
+        assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn required_checks_state_commit_status_cannot_satisfy_app_bound_rule() {
+        let required = vec![required_check("ci/test", Some(42))];
+        let statuses = vec![("ci/test".to_string(), "success".to_string())];
+        let (state, _total, _passing, _failing, pending) =
+            required_checks_state(&required, &[], &statuses);
+        assert_eq!(state, "pending");
+        assert_eq!(pending, 1);
+    }
+
+    #[test]
+    fn required_checks_state_check_run_without_app_does_not_satisfy_app_bound_rule() {
+        let required = vec![required_check("ci/test", Some(42))];
+        let check_runs = vec![check_run("ci/test", "completed", Some("success"), None)];
+        let (state, ..) = required_checks_state(&required, &check_runs, &[]);
+        assert_eq!(state, "pending");
     }
 
     #[test]
