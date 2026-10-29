@@ -414,6 +414,28 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
         permissions.sandbox = super::agents::SandboxLevel::Os;
         let temp = super::sandbox::run_temp_dir(&attempt_dir);
         tokio::fs::create_dir_all(&temp).await?;
+
+        // The policy makes only paths that exist read-only, so the files orch writes later in the
+        // attempt dir must exist now, or the agent could create them first
+        for name in [
+            "runner.sh",
+            "agent_cmd.sh",
+            "exit.txt",
+            "stderr.txt",
+            "prompt-sys.md",
+            "prompt-msg.md",
+        ] {
+            let path = attempt_dir.join(name);
+
+            if !path.exists() {
+                tokio::fs::write(&path, "").await?;
+            }
+        }
+
+        if !inv.output_file.exists() && inv.output_file.parent().is_some_and(|p| p.is_dir()) {
+            tokio::fs::write(&inv.output_file, "").await?;
+        }
+
         Some(super::sandbox::argv(inv, &temp).await?)
     } else {
         None
