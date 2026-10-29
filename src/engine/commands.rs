@@ -6,6 +6,7 @@
 
 use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::github::http::GhHttp;
+use crate::github::types::GitHubIssue;
 use crate::store::TaskStatus;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -48,6 +49,35 @@ impl CommandStoreOps for crate::store::TaskStore {
             return Ok(None);
         };
         Ok(Some(self.get(id).await?.status))
+    }
+}
+
+/// Minimal GitHub interface required by command validation and execution.
+///
+/// Exists so tests can inject a mock that simulates transient API failures
+/// without reaching the network.
+#[allow(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
+#[async_trait]
+pub trait CommandGh: Send + Sync {
+    async fn get_issue(&self, repo: &str, number: &str) -> anyhow::Result<GitHubIssue>;
+
+    async fn is_collaborator(&self, repo: &str, username: &str) -> anyhow::Result<bool>;
+
+    async fn close_issue(&self, repo: &str, number: &str) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+impl CommandGh for GhHttp {
+    async fn get_issue(&self, repo: &str, number: &str) -> anyhow::Result<GitHubIssue> {
+        GhHttp::get_issue(self, repo, number).await
+    }
+
+    async fn is_collaborator(&self, repo: &str, username: &str) -> anyhow::Result<bool> {
+        GhHttp::is_collaborator(self, repo, username).await
+    }
+
+    async fn close_issue(&self, repo: &str, number: &str) -> anyhow::Result<()> {
+        GhHttp::close_issue(self, repo, number).await
     }
 }
 
@@ -188,7 +218,7 @@ async fn refuse_if_done(
 /// Execute a single owner command against a task.
 pub async fn execute_command(
     backend: &Arc<dyn ExternalBackend>,
-    gh: &GhHttp,
+    gh: &dyn CommandGh,
     repo: &str,
     task_id: &ExternalId,
     command: &OwnerCommand,
@@ -316,7 +346,7 @@ pub enum CommandOutcome {
 #[allow(clippy::too_many_arguments)]
 pub async fn validate_and_run_command(
     backend: &Arc<dyn ExternalBackend>,
-    gh: &GhHttp,
+    gh: &dyn CommandGh,
     repo: &str,
     issue_number: &str,
     command: &OwnerCommand,
