@@ -328,8 +328,13 @@ fn build_tmux_runner_scripts(
                 .map(|a| shell_single_quote(&a.to_string_lossy()))
                 .collect();
             // The tmux and ssh-agent sockets are out of reach, and their variables go too
+            let tmpdir = shell_single_quote(
+                &super::sandbox::run_temp_dir(attempt_dir)
+                    .display()
+                    .to_string(),
+            );
             format!(
-                "env -u TMUX -u TMUX_PANE -u SSH_AUTH_SOCK {} /bin/bash -c {}",
+                "env -u TMUX -u TMUX_PANE -u SSH_AUTH_SOCK TMPDIR={tmpdir} {} /bin/bash -c {}",
                 prefix.join(" "),
                 shell_single_quote(agent_cmd)
             )
@@ -407,7 +412,9 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
     // Codex cannot start its own Seatbelt inside the OS sandbox, so the OS sandbox replaces it
     let sandbox = if inv.sandbox {
         permissions.sandbox = super::agents::SandboxLevel::Os;
-        Some(super::sandbox::argv(inv).await?)
+        let temp = super::sandbox::run_temp_dir(&attempt_dir);
+        tokio::fs::create_dir_all(&temp).await?;
+        Some(super::sandbox::argv(inv, &temp).await?)
     } else {
         None
     };
@@ -978,9 +985,18 @@ mod tests {
                 .expect("runner scripts should build");
         assert!(
             agent_cmd_script.contains(
-                "env -u TMUX -u TMUX_PANE -u SSH_AUTH_SOCK '/usr/bin/sandbox-exec' '-p' '(version 1)' /bin/bash -c 'claude -p '\\''hi'\\''' 2>"
+                "env -u TMUX -u TMUX_PANE -u SSH_AUTH_SOCK TMPDIR='"
+            ) && agent_cmd_script.contains(
+                "' '/usr/bin/sandbox-exec' '-p' '(version 1)' /bin/bash -c 'claude -p '\\''hi'\\''' 2>"
             ),
             "the agent must run inside the sandbox with stderr split outside it, got: {agent_cmd_script}"
+        );
+        assert!(
+            agent_cmd_script.contains(&format!(
+                "TMPDIR='{}'",
+                crate::engine::runner::sandbox::run_temp_dir(tmp.path()).display()
+            )),
+            "the agent must get its own TMPDIR, got: {agent_cmd_script}"
         );
     }
 
