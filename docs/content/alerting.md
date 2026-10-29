@@ -15,12 +15,14 @@ Every sync tick (~45 s) the engine iterates all configured agents and checks whe
 - It is in **agent-level cooldown** (e.g. repeated failures, credit exhaustion, silence detection), **or**
 - All of its configured model pools are individually in **model-level cooldown** (every model across `simple`, `medium`, `complex`, and `review` tiers is cooled).
 
+This metric counts cooldowns only. The router's own degraded set, shown by `orch cooldown list`, also holds an agent with `dispatch.degraded_rate_limit_threshold` (default 3) rate-limit rows within `dispatch.health_check_window_hours` (default 6). Failed runs and timeouts do not count toward that threshold. `orch cooldown clear` resets the window for the agents it clears.
+
 ### Metrics
 
 | KV key | Type | Written | Description |
 |--------|------|---------|-------------|
-| `metrics:orch.agents_degraded.count` | gauge | every tick | Number of currently degraded agents (0 when healthy) |
-| `metrics:orch.agents_degraded.alert` | flag | every tick | `"1"` when `count >= 3`, `"0"` otherwise |
+| `metrics:orch.agents_degraded.count` | gauge | every sync tick | Number of currently degraded agents (0 when healthy) |
+| `metrics:orch.agents_degraded.alert` | flag | every sync tick | `"1"` when `count >= 3`, `"0"` otherwise |
 
 Read metrics from the SQLite KV store:
 
@@ -68,8 +70,12 @@ Example log line (JSON mode):
 |---------------|-------|-----------------|
 | `agent_error` | Repeated agent failures | 5 min → 15 min → 45 min → 2 h → 4 h (cap) |
 | `model_error` | Specific model failure | 5 min → 15 min → 45 min → 2 h → 4 h (cap) |
+| `transient_model_error` | One-off model failure: empty or cut-off output, an unparseable review, an opaque provider error | 5 min → 15 min (cap) |
+| `persistent_model_error` | Model not found or unsupported, billing cycle exhausted on a known model | 4 h, escalating to 7 d (cap) |
+| `rate_limit_usage_window` | Rate limit that names a usage window, such as a 5-hour limit | The window length |
+| `vendor_reset_at` | Rate limit with a "try again at" time | Until that time |
 | `silence_agent_cooldown` | Agent produced no output | 2 min |
-| `silence_detected` | Model silently exited (model-level) | 30 min–4 h |
+| `silence_detected` | Model went silent (model-level) | `engine.silence_cooldown` (1 h), 4 h after 5 silences within 24 h |
 | `credit_exhaustion_out_of_credits` | Per-model credit exhaustion | 1 h → 3 h → 8 h (cap) |
 | `credit_exhaustion_org_level_disabled` | Org billing disabled | 2 h → 6 h → 8 h (cap) |
 | `billing_cycle_exhausted` | Monthly billing cycle quota | 24 h → 3 d → 7 d (cap) |

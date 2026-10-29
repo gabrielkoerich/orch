@@ -8,17 +8,20 @@ weight = 6
 
 ```bash
 orch task     list|add|get|status|route|run|retry|reroute|unblock|attach|live|kill
-              publish|cost|tree|logs|log|history|runs|close|watch|inspect
+              publish|cost|tree|deps|logs|log|history|runs|close|watch|inspect
+              events|session
 orch service  start|stop|restart|status|install|uninstall|doctor|prune
-orch job      list|add|remove|enable|disable|tick|run
+orch job      list|add|remove|enable|disable|tick|run|cron
 orch plan     import
-orch project  list|add|remove|board
+orch project  list|add|remove|move|board
 orch stats    overview|metrics|cost|dashboard
 orch cooldown list|clear
 orch chat     [message…] | history | stats
 ```
 
-Visible top-level commands: `log`, `commit`, `stream`, `notify`, `chat`, `task`, `job`, `plan`, `service`, `project`, `stats`, `cooldown`, `config`.
+Visible top-level commands: `init`, `log`, `nodes`, `progress`, `commit`, `config`, `stream`, `chat`, `task`, `job`, `plan`, `service`, `project`, `cooldown`, `stats`, `notify`.
+
+`orch serve` is hidden. It runs the engine in the foreground, and the launchd and systemd units run it. `orch progress --done "..." [--left "..."] [--state "..."]` records what a task step finished and commits it, and the service pushes. `orch nodes` lists the cluster's machines, see [Cluster](@/cluster.md).
 
 ## Task Commands
 
@@ -61,7 +64,7 @@ Note: `orch task add` does not take a `-p`/project flag — task creation always
 ## Background Service
 
 ```bash
-orch service install [--force]  # write systemd user unit and enable it (Linux)
+orch service install [--force]  # write the systemd user unit and enable it (Linux), --force overwrites an existing unit
 orch service uninstall          # disable and remove the systemd user unit (Linux)
 orch service start      # start background service
 orch service stop       # stop background service
@@ -78,10 +81,10 @@ brew services restart orch
 
 The service ticks every `engine.tick_interval` seconds (default 10s):
 - Syncs GitHub issues and PR events (webhook or polling)
-- Routes new tasks to agents via LLM router
+- Routes new tasks to agents (round-robin by default, LLM router with `router.mode: llm`)
 - Dispatches routed tasks into tmux sessions in worktrees
 - Runs due scheduled jobs (per-project)
-- Recovers stuck tasks (no tmux session, age >10 min → reset to `new`)
+- Recovers stuck tasks (no tmux session, age >10 min → reset to `new`, an `in_review` task without a review session → `needs_review`)
 
 ## Stats & Status
 
@@ -91,17 +94,17 @@ orch stats dashboard -g     # aggregate across all configured projects
 orch task status            # show task counts for current project
 orch stats metrics [--details] # task metrics summary (slow tasks, error dist.)
 orch stats cost [--summary] # cost tracking and token usage
-orch stats [--all]          # task throughput / per-project rollups
+orch stats [--all] [--since 7d] # task throughput / per-project rollups (default window 24h)
 orch stats overview [--all] # explicit overview subcommand
-orch task events [--repo X] # tail task events live
+orch task events [--repo X] [--task ID] # tail task events live
 orch log [N]                # tail server logs (last N lines)
 orch log -f                 # follow service logs
-orch service doctor [--fix] # diagnose SQLite ↔ GitHub drift. A done task is reported, never moved out of done
+orch service doctor [--fix] [--dry-run] [--full] # diagnose SQLite ↔ GitHub drift. A done task is reported, never moved out of done
 orch service prune [--dry-run] # remove orphaned worktrees
 orch cooldown list          # show active cooldowns and degraded agents
-orch cooldown clear <key>   # clear a cooldown and that agent's degraded rate-limit window
+orch cooldown clear <key>   # clear a cooldown (claude or claude:sonnet) and that agent's degraded rate-limit window
 orch cooldown clear --all   # clear every cooldown and mark every configured agent as cleared
-orch task session export <id> # export a task's session in markdown/json/raw
+orch task session export <id> [-a N] [-f markdown|json|raw] # export a task's session
 orch notify "message"       # send a Telegram notification (uses config target by default)
 orch config <key>           # read a live config value (dot-separated path)
 orch config agents          # list installed agent CLIs
@@ -125,6 +128,7 @@ orch project board list                    # list GitHub Projects V2 boards
 orch project board link <id>               # link a board
 orch project board sync                    # discover field IDs
 orch project board info                    # show board config
+orch project board reconcile [--repo o/r]  # set label-managed board Status fields once, no agents start
 ```
 
 ## Job Commands
@@ -138,6 +142,7 @@ orch job enable <id>                                       # enable a job
 orch job disable <id>                                      # disable a job
 orch job tick                                              # run one scheduler tick manually
 orch job run <id>                                          # run a job immediately, ignoring schedule
+orch job cron "0 9 * * *" [--since <ts>]                    # check if a cron expression matches now
 ```
 
 Jobs can also be defined declaratively as markdown files under `prompts/jobs/*.md` (frontmatter: `id`, `schedule`, `title`, `type`, `enabled`, `external`, `agent`, `command`, `dir`). See [Jobs](@/jobs.md).
@@ -174,7 +179,8 @@ orch chat                           # interactive REPL
 orch chat "what's running?"         # single message
 orch chat --session ops             # use a named session profile
 orch chat history                   # show recent messages
-orch chat history --search "bean"   # search past conversations
+orch chat history --search "deploy" # search past conversations
+orch chat stats                     # session cost statistics
 ```
 
 Conversational control plane — talk to orch in natural language. Each message invokes a one-shot agent with context assembled from the live task state, memories, and recent summaries. Switch the model with `/model agent:model` inside the REPL.
@@ -190,7 +196,7 @@ orch config agents          # list available agents and their status
 | Log | Location |
 |-----|----------|
 | Server log | `~/.orch/state/orch.log` |
-| Server archive | `~/.orch/state/orch.archive.log` |
+| Rotated server logs | `~/.orch/state/orch.log.1` to `orch.log.3`, rotated at startup when the log is over 2 MB |
 | Task database | `~/.orch/orch.db` (SQLite — all task state) |
 | Per-task output | `~/.orch/state/<repo>/tasks/<id>/attempts/<n>/output.json` |
 | Per-task prompts | `~/.orch/state/<repo>/tasks/<id>/attempts/<n>/prompt-sys.md` |

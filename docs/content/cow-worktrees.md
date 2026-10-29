@@ -83,7 +83,7 @@ Conclusion: for this project warming cuts build time by about 40% and saves abou
 
 Not measured: end to end setup on a large JS repo and Linux timings.
 
-CI coverage: `test-cow-macos` (APFS) and `test-cow-linux` (XFS with `reflink=1` on a loop volume, `TMPDIR` on the mount) run the clone path. Both set `ORCH_COW_EXPECT_CLONE=1`, so the tests fail if the probe finds no clone support. They also check that ignored directories from the checkout reach the template and the clone, that a merged task's ignored directories reach the template of a bare clone, and that `.git` and loose ignored files are never copied. Plain unit tests on ext4 take the fallback branch.
+CI coverage: the `test` job runs the whole suite with `TMPDIR` on an XFS loop volume with `reflink=1`, so the cow tests take the clone path. It sets `ORCH_COW_EXPECT_CLONE=1`, so the tests fail if the probe finds no clone support. No macOS job runs the cow tests, since git-cow's own CI tests `clonefile` on macOS. They also check that ignored directories from the checkout reach the template and the clone, that a merged task's ignored directories reach the template of a bare clone, and that `.git` and loose ignored files are never copied. Plain unit tests on ext4 take the fallback branch.
 
 On Linux, `cp -a --reflink=always <template>/<entry> <dir>` copies the entry into the existing `<dir>` without nesting. `.git` is skipped, so the `.git` file is never overwritten. The tests check this through the resulting file contents and a clean `git status`.
 
