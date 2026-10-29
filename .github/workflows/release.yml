@@ -170,6 +170,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_CONFIG: .gitleaks.toml
+          # The action's default 8.24 ignores [[allowlists]], a dispatched run scans the whole history and fails
+          GITLEAKS_VERSION: "8.30.1"
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
   # Determine if a release is needed and what version to use
