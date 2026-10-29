@@ -467,6 +467,12 @@ Do not add a `git push origin --delete`, a `git branch -D` or a forced `git work
 
 Many writes touch `updated_at` without changing the status. `review_open_prs` writes `pr_number` on every pass, so an `in_review` task with a PR never looked older than a minute, and a task with no reviewer sat for 10 hours (#3791). Stuck and stale checks must age a task from the `task_activity` row where it entered its current status. Do not move them back to `updated_at`. `stale_in_review_recovery_resets_orphaned_task_without_session` guards this.
 
+### One periodic owner for an orphaned review
+
+`tick_recover_stuck_tasks` is the only periodic path that resets an `in_review` task whose review session is gone or hung. `sync_tick` had a second copy that fired after one minute, so the tick limit was unreachable and the race it guards against stayed open: a review agent ends its tmux session before its result reaches the engine, so a short limit resets a task whose finished review is still being delivered and the result is dropped as stale (#3900). Do not add a second sweep anywhere, and do not shorten the limit.
+
+`engine.in_review_no_session_stuck_timeout` sets the limit. `EngineConfig::from_config` raises it to the review agent's own timeout plus `REVIEW_RESULT_DELIVERY_SECS`, so a short configured value cannot reopen the race. A recorded `review_decision` means the review finished and the task waits on the merge, so recovery skips it. Startup is separate: a restart ends every session, so the startup reset runs at once for any `in_review` task with no live review session.
+
 ### Tests do not read the operator's config
 
 A test must not depend on `~/.orch/config.yml`. CI has no config, so a test that passes locally through `Router::from_config()` or `config::get()` fails in CI, and the PR loops through review cycles until it blocks (#3790). Build what the test needs, for example `Router::new_for_test(...)`, or point `ORCH_HOME` at a temp dir. Before pushing, run the suite with an empty home: `HOME=$(mktemp -d) ORCH_HOME=$(mktemp -d) GIT_CONFIG_GLOBAL=/dev/null cargo nextest run`.

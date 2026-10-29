@@ -76,7 +76,7 @@ Orch writes tens of rows a minute and nothing per agent output line. The heavy p
 | Replicated | Local to each node |
 |---|---|
 | `tasks`: status, routing, counters (`attempts`, `review_cycles` and the rest), `block_reason`, `pr_number`, `parent_id`, and new `owner_node`, `lease_until`, `term` | `task_runs`, `task_metrics`, `rate_limits`, `control_messages`, `metrics:*` keys |
-| `task_dependencies`, `job_state`, `channel_subscriptions` | `tasks.worktree`, `review_session_expected`, token and cost columns |
+| `task_dependencies`, `job_state`, `channel_subscriptions` | `tasks.worktree`, token and cost columns |
 | `kv` coordination keys: cooldowns and failure counts, approved SHAs, `ci_pending_since`, `github:rate_limited_until`, ingest cursors, `control:*` | tmux sessions, worktrees, `output.json`, `orch.log` |
 | Node registry, progress records, GitHub outbox, and an internal id counter | `task_activity`, written by each node when it applies a status change |
 

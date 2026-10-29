@@ -248,9 +248,6 @@ pub fn spawn(
                         continue;
                     }
 
-                    crate::store::set_review_session_expected(&store, &repo, &task.id.0, true)
-                        .await;
-
                     let backend_c = backend.clone();
                     let task_manager_c = task_manager.clone();
                     let tmux_c = tmux.clone();
@@ -274,13 +271,6 @@ pub fn spawn(
                                 task_id = tid,
                                 "all agents cooled at review spawn time — resetting to needs_review for sync to re-fire"
                             );
-                            crate::store::set_review_session_expected(
-                                &store_c,
-                                &repo_s,
-                                &tid,
-                                false,
-                            )
-                            .await;
                             if let Err(e) = task_manager_c
                                 .update_task_status(
                                     &ExternalId(tid.clone()),
@@ -411,14 +401,6 @@ pub fn spawn(
                                 ReviewOutcome::Ok
                             }
                         };
-                        crate::store::set_review_session_expected(
-                            &store_c,
-                            &repo_s,
-                            &tid,
-                            false,
-                        )
-                        .await;
-
                         // Freshness guard: re-fetch the task's current status before applying
                         // any outcome transitions. A concurrent path (e.g. PR merge, manual
                         // close, or another review cycle) may have already moved the task out

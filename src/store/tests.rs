@@ -2625,7 +2625,7 @@ async fn resolve_task_id_internal_returns_none() {
 }
 
 #[tokio::test]
-async fn set_fields_persists_review_session_expected() {
+async fn set_fields_persists_review_invocations() {
     let store = TaskStore::open_memory().await.unwrap();
 
     let id = store
@@ -2640,12 +2640,12 @@ async fn set_fields_persists_review_session_expected() {
         .unwrap();
 
     store
-        .set_fields(id, &[("review_session_expected", serde_json::json!(true))])
+        .set_fields(id, &[("review_invocations", serde_json::json!(3))])
         .await
         .unwrap();
 
     let task = store.get(id).await.unwrap();
-    assert!(task.review_session_expected);
+    assert_eq!(task.review_invocations, 3);
 }
 
 // ── prune_old_runs ──────────────────────────────────────────────────────

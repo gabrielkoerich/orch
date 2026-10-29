@@ -93,7 +93,7 @@ pub(crate) async fn startup_cleanup(tmux: &TmuxManager) {
 }
 
 use super::{EngineConfig, ProjectEngine};
-use crate::store::{set_review_session_expected, store_set_by_id, store_touch_updated_at};
+use crate::store::{store_set_by_id, store_touch_updated_at};
 
 async fn recover_routed_blocked_dispatch(
     backend: &Arc<dyn ExternalBackend>,
@@ -331,18 +331,19 @@ fn stuck_task_timing_from_map(
     })
 }
 
-// Age from the in_review status entry, the same source the no-session stale sweep uses
-async fn in_review_stuck_timestamp(store: &TaskStore, store_id: i64, fallback: &str) -> String {
+/// When the task last entered in_review, and whether a review decision landed since. Age from the
+/// status entry: `review_open_prs` rewrites `updated_at` on every pass, so it never ages
+async fn in_review_stuck_entry(store: &TaskStore, store_id: i64, fallback: &str) -> (String, bool) {
     match store.in_review_entry(store_id).await {
-        Ok(Some((entered_at, _))) => entered_at,
-        Ok(None) => fallback.to_string(),
+        Ok(Some(entry)) => entry,
+        Ok(None) => (fallback.to_string(), false),
         Err(e) => {
             tracing::warn!(
                 store_id,
                 error = %e,
                 "failed to read in_review entry, falling back to updated_at"
             );
-            fallback.to_string()
+            (fallback.to_string(), false)
         }
     }
 }
@@ -1187,176 +1188,66 @@ pub(crate) async fn tick_recover_stuck_tasks(
         }
     }
 
-    // Recover external tasks stuck in in_review.
-    // Unlike in_progress recovery, we reset to NeedsReview (not New) so the review
-    // agent re-triggers without clearing the routing state.
-    let in_review = match task_manager.list_external_by_status(Status::InReview).await {
-        Ok(tasks) => tasks,
-        Err(e) => {
-            tracing::warn!(?e, "failed to list in_review tasks for stuck recovery");
-            vec![]
-        }
-    };
-    // Read the stored in_review rows once to avoid per-task DB lookups for
-    // `review_session_expected`. Build a set of external_ids that have the
-    // flag set so the per-task loop can check it cheaply.
-    let store_in_review = match store
+    // Recover tasks stuck in in_review, external and internal in one sweep. Reset to NeedsReview
+    // (not New) so the review agent re-triggers without clearing the routing state.
+    //
+    // This is the only periodic owner of the case where the review session is gone. The sync
+    // sweep used to reset the same tasks after one minute, which beat a finished review's result
+    // to the engine and dropped it as stale, and left this longer limit unreachable
+    let in_review = match store
         .list_by_status(repo, crate::store::TaskStatus::InReview)
         .await
     {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(
-                ?e,
-                "failed to list store in_review tasks for review_session_expected prefetch"
-            );
+            tracing::warn!(?e, "failed to list in_review tasks for stuck recovery");
             vec![]
         }
     };
-    let review_expected_ids: std::collections::HashMap<String, i64> = store_in_review
-        .into_iter()
-        .filter(|t| t.review_session_expected)
-        .filter_map(|t| t.external_id.map(|eid| (eid, t.id)))
-        .collect();
+    // A review agent ends its tmux session before its result reaches the engine, so the
+    // no-session limit for a review has to be longer than for a task agent. The floor in
+    // `EngineConfig::from_config` keeps it above the review agent's own timeout
+    let in_review_config = crate::engine::EngineConfig {
+        no_session_stuck_timeout: config.in_review_no_session_stuck_timeout,
+        ..config.clone()
+    };
     for task in &in_review {
-        let Some(&store_id) = review_expected_ids.get(&task.id.0) else {
-            tracing::debug!(
-                task_id = task.id.0,
-                "in_review task is waiting on PR review, skipping stuck-session recovery"
+        let Some(task_id) = task.external_id.clone() else {
+            tracing::warn!(
+                store_id = task.id,
+                "in_review task has no external id, skipping stuck recovery"
             );
             continue;
         };
 
-        let review_task_id = format!("{}-review", task.id.0);
-        // Use in_review_no_session_stuck_timeout instead of the standard
-        // no_session_stuck_timeout. Review agents exit their tmux session on
-        // normal completion before delivering the result to the engine, so a
-        // short no-session timeout causes a race: the stuck recovery fires,
-        // resets the task to needs_review, and the completed result arriving
-        // moments later is discarded as stale. A longer threshold gives the
-        // result delivery enough time to complete.
-        let in_review_config = crate::engine::EngineConfig {
-            no_session_stuck_timeout: config.in_review_no_session_stuck_timeout,
-            ..config.clone()
-        };
-        let age_at = in_review_stuck_timestamp(store, store_id, &task.updated_at).await;
-        let Some(timing) = stuck_task_timing_from_map(
-            tmux,
-            repo,
-            &review_task_id,
-            &age_at,
-            &in_review_config,
-            "cannot parse in_review timestamp, skipping stuck in_review check",
-            session_map,
-        ) else {
-            continue;
-        };
-
-        tracing::warn!(
-            task_id = task.id.0,
-            age_mins = timing.age.num_minutes(),
-            threshold_mins = timing.threshold / 60,
-            "recovering stuck in_review task: no session found — resetting to needs_review"
-        );
-        if let Err(e) = task_manager
-            .update_task_status(&task.id, Status::NeedsReview)
-            .await
-        {
-            tracing::warn!(
-                task_id = task.id.0,
-                ?e,
-                "failed to reset stuck in_review task status"
-            );
-            continue;
-        } else {
-            set_review_session_expected(store, repo, &task.id.0, false).await;
-        }
-
-        // Finalize any open review run row
-        if let Ok(Some(store_id)) = store.resolve_task_id(repo, &task.id.0).await {
-            finalize_open_runs_for_recovery(
-                store,
-                store_id,
-                "stuck-task recovery: in_review session killed",
-            )
-            .await;
-        }
-
-        // Log activity for stuck in_review recovery
-        let details = serde_json::json!({
-            "failure_reason": "stuck_in_review",
-            "age_minutes": timing.age.num_minutes(),
-            "had_session": timing.has_session,
-        });
-        crate::store::store_log_activity(
-            &Some(Arc::clone(store)),
-            repo,
-            &task.id.0,
-            "rerouted",
-            Some("in_review"),
-            Some("needs_review"),
-            None::<&str>,
-            None::<&str>,
-            Some(&details),
-        )
-        .await;
-        if let Err(e) = backend
-            .post_comment(
-                &task.id,
-                &format!(
-                    "[{}] recovered: stuck in_review — no session found after {}m, resetting to needs_review{}",
-                    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-                    timing.age.num_minutes(),
-                    crate::engine::orch_footer()
-                ),
-            )
-            .await
-        {
-            tracing::warn!(
-                task_id = task.id.0,
-                ?e,
-                "failed to post stuck in_review recovery comment"
-            );
-        }
-    }
-
-    // Recover internal (SQLite) tasks stuck in in_review.
-    let internal_in_review = match task_manager
-        .list_internal_by_status(DbStatus::InReview)
-        .await
-    {
-        Ok(tasks) => tasks,
-        Err(e) => {
-            tracing::warn!(
-                ?e,
-                "failed to list internal in_review tasks for stuck recovery"
-            );
-            vec![]
-        }
-    };
-    for task in &internal_in_review {
-        let task_id = task.id.0.clone();
-        let Some(&store_id) = review_expected_ids.get(&task_id) else {
+        // The dispatch flow owns a task while it holds the guard
+        if dispatching.contains_key(&format!("{repo}/{task_id}")) {
             tracing::debug!(
                 task_id,
-                "internal in_review task is waiting on PR review, skipping stuck-session recovery"
+                "task locked by dispatch flow, skipping stuck check"
             );
             continue;
-        };
+        }
 
-        let review_task_id = format!("{}-review", task_id);
-        let in_review_config = crate::engine::EngineConfig {
-            no_session_stuck_timeout: config.in_review_no_session_stuck_timeout,
-            ..config.clone()
-        };
-        let age_at = in_review_stuck_timestamp(store, store_id, &task.updated_at).await;
+        // A recorded decision means the review finished and the task waits on the merge, not on
+        // a review agent
+        let (entered_at, decided) = in_review_stuck_entry(store, task.id, &task.updated_at).await;
+        if decided {
+            tracing::debug!(
+                task_id,
+                "in_review task already has a review decision, waiting on merge"
+            );
+            continue;
+        }
+
+        let review_task_id = format!("{task_id}-review");
         let Some(timing) = stuck_task_timing_from_map(
             tmux,
             repo,
             &review_task_id,
-            &age_at,
+            &entered_at,
             &in_review_config,
-            "cannot parse in_review timestamp, skipping stuck internal in_review check",
+            "cannot parse in_review timestamp, skipping stuck in_review check",
             session_map,
         ) else {
             continue;
@@ -1366,29 +1257,97 @@ pub(crate) async fn tick_recover_stuck_tasks(
             task_id,
             age_mins = timing.age.num_minutes(),
             threshold_mins = timing.threshold / 60,
-            "recovering stuck internal in_review task: no session found — resetting to needs_review"
+            has_session = timing.has_session,
+            "recovering stuck in_review task — resetting to needs_review"
         );
-        if let Err(e) = task_manager
-            .update_task_status(&ExternalId(task_id.clone()), Status::NeedsReview)
+
+        match task_manager
+            .update_task_status_if(
+                &ExternalId(task_id.clone()),
+                Status::NeedsReview,
+                Status::InReview,
+            )
+            .await
+        {
+            Err(e) => {
+                tracing::warn!(task_id, ?e, "failed to reset stuck in_review task status");
+                continue;
+            }
+            Ok(false) => {
+                tracing::debug!(
+                    task_id,
+                    "stuck in_review reset skipped — task already transitioned"
+                );
+                continue;
+            }
+            Ok(true) => {}
+        }
+
+        // A dead or hung session is an infrastructure event, a tmux crash or a restart, not an
+        // agent parse failure. Keeping the counter would spend the next cycle's quota
+        if let Err(e) = store
+            .set_fields(task.id, &[("review_agent_failures", serde_json::json!(0))])
+            .await
+        {
+            tracing::warn!(task_id, ?e, "failed to reset review_agent_failures");
+        }
+
+        finalize_open_runs_for_recovery(
+            store,
+            task.id,
+            if timing.has_session {
+                "stuck-task recovery: in_review session killed"
+            } else {
+                "stuck-task recovery: in_review no session found"
+            },
+        )
+        .await;
+
+        let details = serde_json::json!({
+            "failure_reason": "stuck_in_review",
+            "age_minutes": timing.age.num_minutes(),
+            "had_session": timing.has_session,
+        });
+        crate::store::store_log_activity(
+            &Some(Arc::clone(store)),
+            repo,
+            &task_id,
+            "rerouted",
+            Some("in_review"),
+            Some("needs_review"),
+            None::<&str>,
+            None::<&str>,
+            Some(&details),
+        )
+        .await;
+
+        // An internal task has no issue to comment on
+        if task.origin == "internal" {
+            continue;
+        }
+
+        if let Err(e) = backend
+            .post_comment(
+                &ExternalId(task_id.clone()),
+                &format!(
+                    "[{}] recovered: stuck in_review — {} after {}m, resetting to needs_review{}",
+                    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+                    if timing.has_session {
+                        "review session hung"
+                    } else {
+                        "no session found"
+                    },
+                    timing.age.num_minutes(),
+                    crate::engine::orch_footer()
+                ),
+            )
             .await
         {
             tracing::warn!(
                 task_id,
                 ?e,
-                "failed to reset stuck internal in_review task status"
+                "failed to post stuck in_review recovery comment"
             );
-        } else {
-            set_review_session_expected(store, repo, &task_id, false).await;
-        }
-
-        // Finalize any open review run row
-        if let Ok(Some(store_id)) = store.resolve_task_id(repo, &task_id).await {
-            finalize_open_runs_for_recovery(
-                store,
-                store_id,
-                "stuck-task recovery: internal in_review session killed",
-            )
-            .await;
         }
     }
 
@@ -3488,7 +3447,6 @@ mod tests {
             .update_status(id, crate::store::TaskStatus::InReview)
             .await
             .unwrap();
-        set_review_session_expected(&store, "owner/repo", "99", true).await;
         set_in_review_entered_at_past(&store, id).await;
         set_task_updated_at_past(&store, id).await;
 
@@ -3547,7 +3505,6 @@ mod tests {
             .update_status(id, crate::store::TaskStatus::InReview)
             .await
             .unwrap();
-        set_review_session_expected(&store, "owner/repo", "100", true).await;
         set_task_updated_at_past(&store, id).await;
 
         tick_recover_stuck_tasks(
@@ -3595,7 +3552,6 @@ mod tests {
             .update_status(id, crate::store::TaskStatus::InReview)
             .await
             .unwrap();
-        set_review_session_expected(&store, "owner/repo", "internal:1", true).await;
         set_in_review_entered_at_past(&store, id).await;
         set_task_updated_at_past(&store, id).await;
 
@@ -3655,7 +3611,6 @@ mod tests {
             .update_status(id, crate::store::TaskStatus::InReview)
             .await
             .unwrap();
-        set_review_session_expected(&store, "owner/repo", "102", true).await;
         set_in_review_entered_at_past(&store, id).await;
         store
             .set_fields(id, &[("pr_number", serde_json::json!(42))])
@@ -3683,6 +3638,141 @@ mod tests {
         );
         assert_eq!(updates[0].0, "102");
         assert_eq!(updates[0].1, Status::NeedsReview);
+    }
+
+    /// An in_review task whose review session is gone goes back to needs_review, unless its
+    /// review already recorded a decision and the task is only waiting on the merge
+    async fn orphaned_review_status_after_recovery(
+        with_decision: bool,
+    ) -> crate::store::TaskStatus {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(TmuxManager::new());
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "55",
+                title: "Orphaned review",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::InReview)
+            .await
+            .unwrap();
+        // Entered in_review long ago. updated_at stays fresh, as review_poll rewrites it
+        set_in_review_entered_at_past(&store, id).await;
+        if with_decision {
+            crate::store::store_log_activity(
+                &Some(store.clone()),
+                "owner/repo",
+                "55",
+                "review_decision",
+                None,
+                None,
+                None::<&str>,
+                None::<&str>,
+                Some(&serde_json::json!({"decision": "approve"})),
+            )
+            .await;
+        }
+
+        tick_recover_stuck_tasks(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &task_manager,
+            &EngineConfig::default(),
+            &store,
+            &std::collections::HashMap::new(),
+            &Arc::new(DashMap::new()),
+        )
+        .await
+        .unwrap();
+
+        store.get(id).await.unwrap().status
+    }
+
+    #[tokio::test]
+    async fn stale_in_review_recovery_resets_orphaned_task_without_session() {
+        assert_eq!(
+            orphaned_review_status_after_recovery(false).await,
+            crate::store::TaskStatus::NeedsReview
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_in_review_recovery_leaves_decided_task_waiting_on_merge() {
+        assert_eq!(
+            orphaned_review_status_after_recovery(true).await,
+            crate::store::TaskStatus::InReview
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_stuck_tasks_resets_review_agent_failures() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(TmuxManager::new());
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "104",
+                title: "Orphaned review with failures",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::InReview)
+            .await
+            .unwrap();
+        store
+            .set_fields(id, &[("review_agent_failures", serde_json::json!(2))])
+            .await
+            .unwrap();
+        set_in_review_entered_at_past(&store, id).await;
+
+        tick_recover_stuck_tasks(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &task_manager,
+            &EngineConfig::default(),
+            &store,
+            &std::collections::HashMap::new(),
+            &Arc::new(DashMap::new()),
+        )
+        .await
+        .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.status, crate::store::TaskStatus::NeedsReview);
+        assert_eq!(
+            task.review_agent_failures, 0,
+            "a dead review session is an infrastructure event, not an agent failure"
+        );
     }
 
     #[tokio::test]
@@ -3720,7 +3810,6 @@ mod tests {
             .update_status(id, crate::store::TaskStatus::InReview)
             .await
             .unwrap();
-        set_review_session_expected(&store, "owner/repo", "103", true).await;
         set_in_review_entered_at_past(&store, id).await;
         store
             .set_fields(id, &[("pr_number", serde_json::json!(43))])
