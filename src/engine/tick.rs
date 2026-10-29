@@ -4326,6 +4326,9 @@ mod tests {
         use crate::engine::router::{Router, RouterConfig};
         use crate::store::UpsertExternal;
 
+        // tick_all runs startup_cleanup, which kills every orch tmux session older than
+        // this process, so the suite would reap the live agents on the operator's machine
+        STARTUP_CLEANUP_DONE.store(true, Ordering::SeqCst);
         crate::engine::cooldown::reset_global_state().await;
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
