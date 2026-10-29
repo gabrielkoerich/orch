@@ -945,14 +945,8 @@ async fn invoke_review_agent(
     let start_comment = review_started_comment(&ctx.review_agent, ctx.review_model_str());
     match GhHttp::new() {
         Ok(gh) => {
-            post_review_status(
-                &gh,
-                repo,
-                ctx.head_sha.as_deref(),
-                "pending",
-                "Automated review running",
-            )
-            .await;
+            let app = review_app(repo).await;
+            post_review_started(app.as_deref(), &gh, repo, ctx.head_sha.as_deref()).await;
             if let Err(e) = gh
                 .add_comment(repo, &ctx.pr_number.to_string(), &start_comment)
                 .await
@@ -1961,16 +1955,23 @@ async fn post_review_comment(
         .await
         .or_else(|| ctx.head_sha.clone());
 
-    if let Some((state, description)) = review_status(decision) {
-        post_review_status(&gh, repo, head_sha.as_deref(), state, description).await;
-    }
+    let app = review_app(repo).await;
+    post_review_decision(
+        app.as_deref(),
+        &gh,
+        repo,
+        head_sha.as_deref(),
+        decision,
+        review_notes_for_comment,
+    )
+    .await;
 
     if !pr_comment.is_empty() {
         let footer =
             attribution_footer("Reviewed", &ctx.review_agent, Some(ctx.review_model_str()));
         let pr_comment_with_footer = format!("{}{}", pr_comment, footer);
         if let Err(e) = publish_review(
-            crate::github::app::shared().as_deref(),
+            app.as_deref(),
             &gh,
             repo,
             ctx.pr_number,
@@ -1992,8 +1993,90 @@ async fn post_review_comment(
     Ok(())
 }
 
-/// Submit the decision as an App review on the sha the agent read, then post the comment the
-/// gate falls back to. Without an App only the comment goes out
+/// The App to review `repo` with, `None` in comment mode or where the App is not installed
+async fn review_app(repo: &str) -> Option<Arc<crate::github::app::AppAuth>> {
+    let mode = crate::review_mode::for_repo(repo);
+    review_app_for(mode, crate::github::app::shared(), repo).await
+}
+
+async fn review_app_for(
+    mode: crate::review_mode::ReviewMode,
+    app: Option<Arc<crate::github::app::AppAuth>>,
+    repo: &str,
+) -> Option<Arc<crate::github::app::AppAuth>> {
+    if mode != crate::review_mode::ReviewMode::App {
+        return None;
+    }
+
+    let app = app?;
+    match app.token_for_repo(repo).await {
+        Ok(Some(_)) => Some(app),
+        Ok(None) => {
+            tracing::info!(
+                repo,
+                "review.mode is app but the App is not installed here, reviewing with a comment"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(repo, error = %e, "App installation lookup failed, reviewing with a comment");
+            None
+        }
+    }
+}
+
+/// `orch/review` as an App check run in app mode, as a commit status in comment mode
+async fn post_review_started(
+    app: Option<&crate::github::app::AppAuth>,
+    gh: &GhHttp,
+    repo: &str,
+    sha: Option<&str>,
+) {
+    use crate::github::app::CheckRunState;
+    match (app, sha) {
+        (Some(app), Some(sha)) => {
+            if let Err(e) = app
+                .post_check_run(repo, sha, CheckRunState::InProgress)
+                .await
+            {
+                tracing::warn!(sha, error = %e, "failed to post the orch/review check run");
+            }
+        }
+        _ => post_review_status(gh, repo, sha, "pending", "Automated review running").await,
+    }
+}
+
+async fn post_review_decision(
+    app: Option<&crate::github::app::AppAuth>,
+    gh: &GhHttp,
+    repo: &str,
+    sha: Option<&str>,
+    decision: &ReviewDecision,
+    notes: &str,
+) {
+    use crate::github::app::CheckRunState;
+    let Some((state, description)) = review_status(decision) else {
+        return;
+    };
+
+    match (app, sha) {
+        (Some(app), Some(sha)) => {
+            let approved = state == "success";
+            let completed = CheckRunState::Completed {
+                approved,
+                summary: if notes.is_empty() { description } else { notes },
+            };
+            if let Err(e) = app.post_check_run(repo, sha, completed).await {
+                tracing::warn!(sha, error = %e, "failed to complete the orch/review check run");
+            }
+        }
+        _ => post_review_status(gh, repo, sha, state, description).await,
+    }
+}
+
+/// Submit the decision as an App review on the sha the agent read, with the issues on diff lines
+/// as inline comments, then post the comment the gate falls back to. Without an App only the
+/// comment goes out
 async fn publish_review(
     app: Option<&crate::github::app::AppAuth>,
     gh: &GhHttp,
@@ -2010,14 +2093,40 @@ async fn publish_review(
         _ => None,
     };
     if let (Some(app), Some(sha), Some(event)) = (app, head_sha, event) {
+        let inline = inline_comments(app, repo, pr_number, decision).await;
         if let Err(e) = app
-            .submit_review(repo, pr_number, event, comment, sha)
+            .submit_review(repo, pr_number, event, comment, sha, &inline)
             .await
         {
             tracing::warn!(pr_number, sha, error = %e, "failed to submit App review, the comment stays the decision");
         }
     }
     gh.add_comment(repo, &pr_number.to_string(), comment).await
+}
+
+/// Issues on a changed line become inline comments, the rest stay in the review body, which
+/// already lists every issue. GitHub refuses a review whose comment points outside the diff
+async fn inline_comments(
+    app: &crate::github::app::AppAuth,
+    repo: &str,
+    pr_number: u64,
+    decision: &ReviewDecision,
+) -> Vec<crate::github::app::InlineComment> {
+    let ReviewDecision::RequestChanges { issues, .. } = decision else {
+        return Vec::new();
+    };
+
+    if issues.is_empty() {
+        return Vec::new();
+    }
+
+    match app.pull_request_hunks(repo, pr_number).await {
+        Ok(hunks) => crate::github::app::split_inline(issues, &hunks).0,
+        Err(e) => {
+            tracing::warn!(pr_number, error = %e, "could not read the PR diff, issues stay in the review body");
+            Vec::new()
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4304,6 +4413,162 @@ mod tests {
             "second persistent model failure should escalate past the 4h base despite an \
              intervening success (issue #3571); got {remaining}s, base is {}s",
             crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS
+        );
+    }
+
+    fn app_for_test(server: &wiremock::MockServer) -> Arc<crate::github::app::AppAuth> {
+        Arc::new(crate::github::app::AppAuth::new(
+            "12345".to_string(),
+            crate::github::app::test_pem().to_string(),
+            server.uri(),
+        ))
+    }
+
+    async fn mount_installed(server: &wiremock::MockServer, repo: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/{repo}/installation")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 42})))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/app/installations/42/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "inst-1",
+                "expires_at": "2099-01-01T00:00:00Z",
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn app_mode_falls_back_to_comments_where_the_app_is_not_installed() {
+        use crate::review_mode::ReviewMode;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/org/b/installation"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let app = app_for_test(&server);
+
+        assert!(
+            review_app_for(ReviewMode::App, Some(Arc::clone(&app)), "org/b")
+                .await
+                .is_none()
+        );
+        // Comment mode never asks GitHub, the expect(1) above counts the only lookup
+        assert!(
+            review_app_for(ReviewMode::Comment, Some(Arc::clone(&app)), "org/b")
+                .await
+                .is_none()
+        );
+        assert!(review_app_for(ReviewMode::App, None, "org/b")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn the_check_run_starts_and_completes_on_the_reviewed_sha() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        mount_installed(&server, "o/r").await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/check-runs"))
+            .and(body_partial_json(serde_json::json!({
+                "name": "orch/review", "head_sha": "abc123", "status": "in_progress",
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 1})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/check-runs"))
+            .and(body_partial_json(serde_json::json!({
+                "name": "orch/review", "head_sha": "abc123", "status": "completed",
+                "conclusion": "failure", "output": {"summary": "fix it"},
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 2})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let app = app_for_test(&server);
+        let gh = GhHttp::for_test(server.uri(), Some(Arc::clone(&app)));
+        let decision = ReviewDecision::RequestChanges {
+            notes: "fix it".to_string(),
+            issues: vec![],
+        };
+
+        post_review_started(Some(&app), &gh, "o/r", Some("abc123")).await;
+        post_review_decision(Some(&app), &gh, "o/r", Some("abc123"), &decision, "fix it").await;
+        let requests = server.received_requests().await.expect("requests");
+        assert!(requests
+            .iter()
+            .all(|req| !req.url.path().contains("/statuses/")));
+    }
+
+    #[tokio::test]
+    async fn issues_on_diff_lines_go_inline_and_the_rest_stay_in_the_body() {
+        use crate::engine::runner::response::ReviewIssue;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        mount_installed(&server, "o/r").await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls/9/files"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"filename": "src/a.rs", "patch": "@@ -1,2 +10,3 @@\n ctx\n+new\n+new"},
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/pulls/9/reviews"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 1})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/issues/9/comments"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 2})))
+            .mount(&server)
+            .await;
+        let issue = |file: &str, line: Option<u32>| ReviewIssue {
+            file: file.to_string(),
+            line,
+            severity: "error".to_string(),
+            description: "wrong".to_string(),
+        };
+        let decision = ReviewDecision::RequestChanges {
+            notes: "fix".to_string(),
+            issues: vec![
+                issue("src/a.rs", Some(11)),
+                issue("src/a.rs", Some(50)),
+                issue("src/b.rs", Some(3)),
+                issue("src/a.rs", None),
+            ],
+        };
+        let app = app_for_test(&server);
+        let gh = GhHttp::for_test(server.uri(), Some(Arc::clone(&app)));
+
+        publish_review(Some(&app), &gh, "o/r", 9, Some("abc123"), &decision, "body")
+            .await
+            .expect("comment posted");
+        let requests = server.received_requests().await.expect("requests");
+        let review = requests
+            .iter()
+            .find(|req| req.url.path().ends_with("/reviews"))
+            .expect("review submitted");
+        let body: serde_json::Value = serde_json::from_slice(&review.body).unwrap();
+        assert_eq!(
+            body["comments"],
+            serde_json::json!([{"path": "src/a.rs", "line": 11, "side": "RIGHT", "body": "**error:** wrong"}])
         );
     }
 

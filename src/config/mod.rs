@@ -391,6 +391,16 @@ pub fn get_for_project(project_dir: &std::path::Path, key: &str) -> anyhow::Resu
     anyhow::bail!("config key not found: {key}")
 }
 
+/// The project's `.orch.yml` alone, without the global fallback of [`get_for_project`]
+pub fn get_project_only(project_dir: &std::path::Path, key: &str) -> anyhow::Result<String> {
+    let project_path = project_dir.join(".orch.yml");
+    if project_path.exists() {
+        return resolve_key(&project_path, key);
+    }
+
+    anyhow::bail!("config key not found: {key}")
+}
+
 /// The global config alone, for a setting no project file may override
 pub fn get_global(key: &str) -> anyhow::Result<String> {
     let global_path = global_config_path()?;
