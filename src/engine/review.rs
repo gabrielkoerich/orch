@@ -21,6 +21,7 @@ const MAX_PR_CREATE_FAILURES: u64 = 3;
 fn outcome_for_agent_error(err: &runner::agents::AgentError) -> &'static str {
     match err {
         runner::agents::AgentError::Timeout { .. } => "timeout",
+        runner::agents::AgentError::Interrupted { .. } => "interrupted",
         // Consult credit-exhaustion detection first — generic rate-limit patterns
         // (e.g. "usage limit") also match billing-cycle exhaustion messages, so
         // reviews on a billing-cycle-exhausted model must not be stored as a
@@ -1105,6 +1106,8 @@ async fn record_review_agent_failure(
                     .await;
             }
         }
+        // Killed or truncated review run, not a model fault
+        runner::agents::AgentError::Interrupted { .. } => {}
         runner::agents::AgentError::InvalidResponse { .. } => {
             // Structural failure: model produced no parseable output at all.
             // Apply persistent backoff (4h base → 7d max) — same rationale as
