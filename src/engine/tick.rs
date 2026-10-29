@@ -31,23 +31,9 @@ use crate::repo_context::REPO_CONTEXT;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use dashmap::{DashMap, DashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::time::{Instant, SystemTime};
 use tokio::sync::{mpsc, Semaphore};
-
-/// Unix timestamp when the engine process started.
-/// Used to identify tmux sessions from previous runs.
-static ENGINE_START_TIME: LazyLock<u64> = LazyLock::new(|| {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-});
-
-/// Flag to ensure startup cleanup only runs once.
-static STARTUP_CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
 
 /// Per outer engine-loop quota for expensive routing calls.
 ///
@@ -81,17 +67,12 @@ impl RoutingTickQuota {
 }
 
 /// Cleanup stale tmux sessions from previous engine runs.
-/// Called once at startup to kill sessions created before this process started.
-async fn startup_cleanup(tmux: &TmuxManager) {
-    // Use compare_exchange to ensure this only runs once across all threads
-    if STARTUP_CLEANUP_DONE
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return;
-    }
-
-    let start_time = *ENGINE_START_TIME;
+/// Called once from `serve()` before the main loop, never from a tick
+pub(crate) async fn startup_cleanup(tmux: &TmuxManager) {
+    let start_time = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     tracing::info!(
         start_time,
         "running startup cleanup for stale tmux sessions"
@@ -2907,9 +2888,6 @@ pub(crate) async fn tick_all(
         );
     }
 
-    // Run startup cleanup once to kill stale sessions from previous runs.
-    startup_cleanup(tmux).await;
-
     // One `tmux list-panes -a` for every project's stuck-task recovery, instead of one each
     let session_map = tmux.batch_session_active().await;
 
@@ -4378,9 +4356,6 @@ mod tests {
         use crate::engine::router::{Router, RouterConfig};
         use crate::store::UpsertExternal;
 
-        // tick_all runs startup_cleanup, which kills every orch tmux session older than
-        // this process, so the suite would reap the live agents on the operator's machine
-        STARTUP_CLEANUP_DONE.store(true, Ordering::SeqCst);
         crate::engine::cooldown::reset_global_state().await;
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
@@ -4461,6 +4436,70 @@ mod tests {
             store.get(id).await.unwrap().needs_review_refires,
             1,
             "two projects must share one pass of the global NeedsReview sweep"
+        );
+    }
+
+    /// `tick_all` must not reap tmux sessions it did not start. Startup cleanup used to
+    /// live here, and nextest's per-test process made the once-flag kill live agents (#3889)
+    #[tokio::test]
+    async fn tick_all_does_not_kill_sessions_it_did_not_create() {
+        let tmux = Arc::new(TmuxManager::new());
+        let session_name = match tmux
+            .create_session("other/foreign", "3889", "/tmp", "sleep 30", &[])
+            .await
+        {
+            Ok(name) => name,
+            Err(_) => {
+                eprintln!("Skipping test: tmux not available or failed to create test session");
+                return;
+            }
+        };
+        let _guard = SessionGuard(session_name.clone());
+
+        // Cross a unix-second boundary so a reintroduced startup_cleanup would treat
+        // this session as stale (created_at < now)
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let engines = vec![ProjectEngine {
+            repo: "owner/one".to_string(),
+            project_dir: std::path::PathBuf::from("/nonexistent"),
+            backend: backend.clone(),
+            task_manager: Arc::new(TaskManager::with_store(
+                backend,
+                store.clone(),
+                "owner/one".to_string(),
+            )),
+            runner: Arc::new(crate::engine::runner::TaskRunner::new(
+                "owner/one".to_string(),
+            )),
+            store,
+        }];
+
+        let transport = Arc::new(Transport::new());
+        let capture = Arc::new(CaptureService::new(transport.clone()));
+        let (weight_tx, _weight_rx) = mpsc::channel(8);
+        let router = Arc::new(tokio::sync::RwLock::new(cooled_review_router_for_test()));
+
+        tick_all(
+            &engines,
+            &tmux,
+            &capture,
+            &Arc::new(Semaphore::new(1)),
+            &EngineConfig::default(),
+            &router,
+            &weight_tx,
+            &Arc::new(DashMap::new()),
+            Some(&transport),
+            &engines.iter().map(|e| e.repo.clone()).collect(),
+            &Arc::new(DashSet::new()),
+        )
+        .await;
+
+        assert!(
+            tmux.session_exists(&session_name).await,
+            "tick_all must not kill a tmux session it did not start"
         );
     }
 
@@ -4691,7 +4730,8 @@ mod tests {
         let task_id = "internal:33498";
         let session_name = tmux.session_name(repo, task_id);
 
-        let create_result = tokio::process::Command::new("tmux")
+        let create_result = tmux
+            .command()
             .args(["new-session", "-d", "-s", &session_name, "-c", "/tmp"])
             .output()
             .await;
@@ -4706,7 +4746,8 @@ mod tests {
 
         let _guard = SessionGuard(session_name.clone());
 
-        let set_option_result = tokio::process::Command::new("tmux")
+        let set_option_result = tmux
+            .command()
             .args(["set-option", "-t", &session_name, "remain-on-exit", "on"])
             .output()
             .await;
@@ -4715,7 +4756,8 @@ mod tests {
             return;
         }
 
-        let send_exit_result = tokio::process::Command::new("tmux")
+        let send_exit_result = tmux
+            .command()
             .args(["send-keys", "-t", &session_name, "exit", "Enter"])
             .output()
             .await;
@@ -4846,7 +4888,8 @@ mod tests {
 
         let task_id = format!("internal:{id}");
         let session_name = tmux.session_name("owner/repo", &task_id);
-        let create_result = tokio::process::Command::new("tmux")
+        let create_result = tmux
+            .command()
             .args([
                 "new-session",
                 "-d",
@@ -5209,7 +5252,8 @@ mod tests {
         // Register a real tmux session for this task and then exit it so it's observed dead
         let task_id = "200";
         let session_name = tmux.session_name("owner/repo", task_id);
-        let create_result = tokio::process::Command::new("tmux")
+        let create_result = tmux
+            .command()
             .args(["new-session", "-d", "-s", &session_name, "-c", "/tmp"])
             .output()
             .await;
@@ -5223,11 +5267,13 @@ mod tests {
         let _guard = SessionGuard(session_name.clone());
 
         // Ensure remain-on-exit so the session lingers as dead long enough to be snapshot
-        let _ = tokio::process::Command::new("tmux")
+        let _ = tmux
+            .command()
             .args(["set-option", "-t", &session_name, "remain-on-exit", "on"])
             .output()
             .await;
-        let _ = tokio::process::Command::new("tmux")
+        let _ = tmux
+            .command()
             .args(["send-keys", "-t", &session_name, "exit", "Enter"])
             .output()
             .await;
@@ -5340,7 +5386,8 @@ mod tests {
         // for this repo would have created.
         let task_id = "201";
         let session_name = tmux.session_name(repo, task_id);
-        let create_result = tokio::process::Command::new("tmux")
+        let create_result = tmux
+            .command()
             .args(["new-session", "-d", "-s", &session_name, "-c", "/tmp"])
             .output()
             .await;
@@ -5353,11 +5400,13 @@ mod tests {
         }
         let _guard = SessionGuard(session_name.clone());
 
-        let _ = tokio::process::Command::new("tmux")
+        let _ = tmux
+            .command()
             .args(["set-option", "-t", &session_name, "remain-on-exit", "on"])
             .output()
             .await;
-        let _ = tokio::process::Command::new("tmux")
+        let _ = tmux
+            .command()
             .args(["send-keys", "-t", &session_name, "exit", "Enter"])
             .output()
             .await;
