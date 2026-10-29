@@ -721,9 +721,19 @@ async fn a_learner_joins_through_any_node_and_catches_up() {
             .is_none()
     );
 
-    network::send_join(&voters[&follower], "s3cret", &network::Join { id: 4, addr })
-        .await
-        .unwrap();
+    // A loaded runner can trigger a re-election here, and the leader answers "no leader yet" until it ends
+    let join = network::Join { id: 4, addr };
+    let mut joined = Err(anyhow::anyhow!("join never sent"));
+    for _ in 0..200 {
+        joined = network::send_join(&voters[&follower], "s3cret", &join).await;
+        if joined.is_ok() {
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    joined.unwrap();
     assert_eq!(wait_for_task(&learner_store, before).await.title, "before");
     let after = learner_store
         .create(&new_task("from learner", ""))

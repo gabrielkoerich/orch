@@ -626,16 +626,27 @@ impl TaskRunner {
         let error = if outcome == "success" {
             String::new()
         } else {
-            let error = match input.error_override.as_deref().filter(|s| !s.is_empty()) {
-                Some(error_override) => error_override.to_string(),
-                None => match last_error {
-                    Some(last_error) => last_error,
-                    None => match input.parse_result {
-                        Ok(parsed) => parsed.response.error.clone().unwrap_or_default(),
-                        Err(err) => err.to_string(),
-                    },
-                },
-            };
+            // Prefer this run's parsed error over a last_error left by a previous
+            // agent's failover. last_error stays the Err/EarlyReturn fallback (#3851)
+            let error = input
+                .error_override
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| match input.parse_result {
+                    Ok(parsed) => parsed
+                        .response
+                        .error
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                    Err(_) => None,
+                })
+                .or(last_error)
+                .unwrap_or_else(|| match input.parse_result {
+                    Ok(_) => String::new(),
+                    Err(err) => err.to_string(),
+                });
 
             if error.is_empty() {
                 if input.status == "blocked" {
@@ -2243,6 +2254,67 @@ mod tests {
 
         assert_eq!(audit.outcome, "success");
         assert!(audit.error.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_run_audit_ok_parse_prefers_parsed_error_over_stale_last_error() {
+        // needs_review classifies as success and wipes the error. The #3851
+        // misattribution is an Ok parse whose outcome is failed or blocked
+        let cases = [("needs_action", "failed"), ("blocked", "blocked")];
+        let parsed_error = "passbox Touch ID prompt timed out for cf/read-token";
+        let stale = "minimax auth error: API Error: 402 insufficient balance (1008), clearing agent/model for re-route";
+        for (status, expected_outcome) in cases {
+            let store = Arc::new(TaskStore::open_memory().await.unwrap());
+            let task_id = store
+                .create(&NewTask {
+                    repo: "owner/repo".to_string(),
+                    origin: "internal".to_string(),
+                    title: "Test".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            store
+                .set_fields(task_id, &[("last_error", serde_json::json!(stale))])
+                .await
+                .unwrap();
+
+            let runner = TaskRunner::new("owner/repo".to_string()).with_store(store);
+            let parse_result = Ok(agents::ParsedResponse {
+                response: AgentResponse {
+                    status: status.to_string(),
+                    summary: "cache_stats.py did not run".to_string(),
+                    accomplished: vec![],
+                    remaining: vec![],
+                    files: vec![],
+                    error: Some(parsed_error.to_string()),
+                    input_tokens: None,
+                    output_tokens: None,
+                    learnings: vec![],
+                    delegations: vec![],
+                },
+                input_tokens: None,
+                output_tokens: None,
+                duration_ms: None,
+            });
+            let started_at = Utc::now();
+            let audit = runner
+                .build_run_audit(RunAuditInput {
+                    task_id: &task_id.to_string(),
+                    status,
+                    parse_result: &parse_result,
+                    raw_stdout: "",
+                    raw_stderr: "",
+                    started_at: &started_at,
+                    error_override: None,
+                    elapsed_secs: Some(261),
+                    push_failed: false,
+                })
+                .await;
+
+            assert_eq!(audit.outcome, expected_outcome, "status={status}");
+            assert_eq!(audit.error, parsed_error, "status={status}");
+        }
     }
 
     #[tokio::test]

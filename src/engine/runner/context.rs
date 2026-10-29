@@ -126,9 +126,19 @@ pub async fn build_parent_context(
 /// Build project instructions from CLAUDE.md, AGENTS.md, README.md.
 pub async fn build_project_instructions(project_dir: &Path) -> String {
     let mut instructions = String::new();
+    let mut seen = std::collections::HashSet::new();
 
     for filename in &["CLAUDE.md", "AGENTS.md", "README.md"] {
         let path = project_dir.join(filename);
+        // CLAUDE.md is often a symlink to AGENTS.md, reading both put the same file in every prompt twice
+        let Ok(real) = tokio::fs::canonicalize(&path).await else {
+            continue;
+        };
+
+        if !seen.insert(real) {
+            continue;
+        }
+
         if let Ok(content) = tokio::fs::read_to_string(&path).await {
             if !content.is_empty() {
                 instructions.push_str(&format!("## {filename}\n\n{content}\n\n"));
@@ -462,6 +472,21 @@ mod tests {
         let dir = std::env::temp_dir().join("orch_test_nonexistent");
         let instructions = build_project_instructions(&dir).await;
         assert!(instructions.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_instructions_read_a_symlinked_file_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "agent rules").unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", dir.path().join("CLAUDE.md")).unwrap();
+        std::fs::write(dir.path().join("README.md"), "readme").unwrap();
+
+        let instructions = build_project_instructions(dir.path()).await;
+        assert_eq!(instructions.matches("agent rules").count(), 1);
+        assert!(instructions.contains("## CLAUDE.md"));
+        assert!(!instructions.contains("## AGENTS.md"));
+        assert!(instructions.contains("readme"));
     }
 
     #[tokio::test]
