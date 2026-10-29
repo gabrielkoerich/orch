@@ -45,8 +45,8 @@ waiting
 - **done** — PR merged (or agent completed with no code changes)
 - **in_review** — review agent is actively running on the PR
 - **approved** — the review approved the PR, orch waits for CI and merges, no agent runs
-- **blocked** — agent hit a blocker or crashed and requires human intervention (rare)
-- **needs_review** — agent needs human help, or review agent requested changes. After repeated failures the engine moves tasks to `needs_review` and removes any forced `agent:*` label so an owner can reassign.
+- **blocked** — requires human attention: the agent hit a blocker, the task ran out of `workflow.max_attempts`, it reached `workflow.max_review_cycles`, or an approved PR was closed unmerged. A task that runs out of attempts also loses its forced `agent:*` label, so `/retry` routes it freely
+- **needs_review** — the agent finished and the PR waits for a review agent. A review that fails or times out also puts the task back here
 
 ## Dependencies
 
@@ -76,6 +76,6 @@ There is no `decompose:true` router flag, no `plan` label, and no `orch task pla
 ## Concurrency
 
 - The engine dispatches tasks concurrently up to `engine.max_parallel` (semaphore-guarded)
-- SQLite WAL mode allows concurrent reads; writes are serialized by SQLite
+- SQLite WAL mode allows concurrent reads. A write transaction starts with `BEGIN IMMEDIATE`, so it waits for the write lock up front, and a write that still finds the database locked is retried
 - The `needs_review` to `in_review` status transition serves as an atomic guard against duplicate review agent spawns
 - Worktree cleanup runs in a background task so it does not block routing or dispatch

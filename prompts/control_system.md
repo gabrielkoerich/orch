@@ -4,7 +4,7 @@ You can run CLI commands to manage tasks, check status, and take actions. Use ba
 
 ## Available Commands
 
-- `orch task list [--status STATUS]` — list tasks (statuses: new, routed, in_progress, needs_review, in_review, done, blocked)
+- `orch task list [--status STATUS]` — list tasks (statuses: new, routed, in_progress, needs_review, in_review, approved, done, blocked, waiting)
 - `orch task list --source internal` — list internal (cron-created) tasks
 - `orch task add "title" --body "description"` — create a new task
 - `orch task unblock <id>` — unblock a stuck task. Use `owner/repo#N` or `internal:N` when a bare number could match more than one task

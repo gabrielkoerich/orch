@@ -119,7 +119,7 @@ Reconnect uses `resume_gateway_url` + `session_id` + last seq; falls back to re-
 
 ## Webhooks & Polling Fallback
 
-Two modes for receiving GitHub events: webhook (instant) and polling (`sync_tick()` every 45 s). If the local webhook server's `/health` fails, orch auto-switches to faster polling (30 s) and logs `entering polling fallback mode`; recovery logs `exiting polling fallback mode`.
+Polling runs `sync_tick()` every `engine.sync_interval` (45 s) in every mode. A webhook delivery or an event from the relay client starts a tick and a background sync at once. The local webhook server's `/health` is checked every `engine.webhook_health_check_interval` seconds, and a change logs `webhook health check failed` or `webhook health restored`. The sync interval does not change when the webhook is down.
 
 ```yaml
 webhook:
@@ -130,11 +130,12 @@ webhook:
 engine:
   tick_interval: 10
   sync_interval: 45
-  fallback_sync_interval: 30
   webhook_health_check_interval: 60
 ```
 
 See also `## DO NOT TOUCH → No external endpoints`. In practice polling is the default — webhooks rarely work without a public endpoint.
+
+The relay client (`src/engine/relay.rs`) connects out to orch-relay at `<relay.url>/ws`, which receives the GitHub App's webhooks, so it needs no inbound endpoint. It keeps a cursor in the KV store, reconnects with a backoff up to 60 s, and is off when `relay.url` is unset. `relay.token` takes a `passbox:<name>` reference.
 
 ## PR Review Integration
 
@@ -222,15 +223,13 @@ Or all at once:
 cargo fmt && cargo clippy --all-targets -- -D warnings && cargo nextest run
 ```
 
-**Installing nextest locally:** CI uses prebuilt binaries via `taiki-e/install-action`. For local use,
-install with `cargo binstall cargo-nextest` (requires [cargo-binstall](https://github.com/cargo-bins/cargo-binstall)),
-or fall back to `cargo test` if nextest is unavailable.
+**Installing nextest locally:** CI uses prebuilt binaries via `taiki-e/install-action`. For local use, install with `cargo binstall cargo-nextest` (requires [cargo-binstall](https://github.com/cargo-bins/cargo-binstall)), or fall back to `cargo test` if nextest is unavailable.
 
 ## Release pipeline
 
 1. Push to `main`
-2. CI runs tests, auto-tags (semver from conventional commits)
-3. GitHub release created, Homebrew tap formula updated automatically
+2. CI runs tests, picks the semver bump from conventional commits and builds the macOS and Linux binaries
+3. The release job creates the tag, builds the changelog, creates the GitHub release, publishes the docs, updates the Homebrew tap formula and publishes to crates.io. It pushes the version bump commit (`[skip ci]`) to `main` last
 4. `brew upgrade orch` picks up the new version
 5. `orch service restart` to load new code
 
@@ -313,6 +312,8 @@ All cooldowns are **persisted to SQLite KV** (`cooldown:{key}`) so they survive 
 
 - Agent failures → exponential backoff starting at 5 min, capping at 4h → router picks a different agent
 - Model failures → exponential backoff starting at 5 min, capping at 4h → router picks a different model
+- One-off model failures (empty or cut off output, an unparseable review, an opaque provider error) → `record_transient_model_failure()`, 5 min then 15 min. A stopped session looks the same, so the backoff stays short
+- A review that times out → no cooldown, the task goes back to `needs_review` and the next review picks an agent as usual
 - Rate limits with "try again at" → cooldown set to that vendor-specified timestamp (always authoritative)
 - Silence detection → model cooldown + short 120s agent cooldown → re-route
 - Credit exhaustion (`out_of_credits`) → exponential from 1h, capping at 8h

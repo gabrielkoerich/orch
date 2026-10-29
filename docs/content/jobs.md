@@ -17,6 +17,7 @@ orch job disable <id>
 orch job remove <id>
 orch job tick                                                # run one scheduler tick
 orch job run <id> [-p repo-slug]                             # run a job immediately, ignoring schedule
+orch job cron "0 9 * * *" [--since <ts>]                      # check whether a cron expression matches now
 ```
 
 ## Job Types
@@ -50,7 +51,7 @@ Standard cron syntax with aliases:
 * * * * *
 ```
 
-Aliases: `@hourly`, `@daily`, `@weekly`, `@monthly`, `@yearly`
+Aliases: `@hourly`, `@daily`, `@weekly`, `@monthly`, `@yearly`. Each takes an optional parameter: `@hourly 30`, `@daily 9:30`, `@weekly 1`, `@monthly 15`, `@yearly 3-15`.
 
 ## Example
 
@@ -62,4 +63,4 @@ orch job add "0 9 * * 1-5" "Code quality review" -b "Run lints, check for TODO i
 orch job add "0 2 * * *" "DB backup" -t bash -c "pg_dump mydb > /backups/nightly.sql"
 ```
 
-Jobs integrate with GitHub sync — job-created tasks get synced to GitHub issues like any other task.
+A task job creates an internal SQLite task by default. Set `external: true` on the job to create a GitHub issue instead.

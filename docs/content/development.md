@@ -38,21 +38,24 @@ cargo fmt && cargo clippy --all-targets -- -D warnings && cargo nextest run
 
 ## Release Pipeline
 
-1. Push to `main` → CI runs tests and linters
-2. CI auto-tags from conventional commits
-3. CI signs and notarizes the macOS binary, generates changelog and creates GitHub release
-4. CI updates `gabrielkoerich/homebrew-tap` Formula and publishes the Homebrew package
-5. Users `brew upgrade orch` to install the new version
+A push to `main` runs `.github/workflows/release.yml`:
+
+1. `check`, `test` and `secrets` run formatting, clippy, the docs build, the test suite and gitleaks
+2. `check-release` picks the next version from the commit subjects, or skips the release
+3. `build-macos` builds, signs and notarizes the arm64 binary, and `build-linux` builds the `x86_64-unknown-linux-gnu` binary
+4. `release` then runs these steps in order: create and push the tag, build the changelog, create the GitHub release, publish the docs for that tag, update the `gabrielkoerich/homebrew-tap` formula, publish `orch-cli` to crates.io, and push the version bump commit to `main` last
+
+The bump commit is `chore: bump version to vX.Y.Z [skip ci]`, so its push starts no new run.
 
 ### Conventional Commits
 
 Use prefixes in commit messages:
-- `feat:` — new feature (bumps minor version)
-- `fix:` — bug fix (bumps patch version)
-- `chore:` — maintenance (no version bump)
-- `docs:` — documentation (no version bump)
+- `feat:` bumps the minor version
+- `BREAKING CHANGE:` or `breaking:` bumps the major version
+- any other subject bumps the patch version
+- `chore:` and `docs:` alone make no release
 
-If all commits since the last tag are `chore:`/`docs:` only, the release job is skipped.
+If all commits since the last tag are `chore:`/`docs:` only, the release is skipped. Otherwise the highest bump in the range wins.
 
 ## Project Structure
 
@@ -65,6 +68,7 @@ src/
   github/           — GitHub API (HTTP client, token resolution, types, Projects V2)
   backends/         — External task backends (GitHub Issues)
   channels/         — Communication channels (Telegram, Discord, Slack, GitHub, tmux)
+  cluster/          — Multi-machine cluster (Raft)
   cli/              — CLI command implementations
 prompts/
   agent_system.md   — agent system prompt

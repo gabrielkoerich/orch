@@ -4,22 +4,20 @@ description = "Automated PR reviews using a different agent when one is availabl
 weight = 10
 +++
 
-The review agent automatically reviews pull requests after an agent completes a task. It picks a different agent from the one that wrote the code (and from any agents that previously reviewed the same task), and posts a real GitHub PR review. If no other agent is available, the authoring agent reviews and the fallback is logged as a `review_agent_fallback` task activity and noted in the review comment.
+The review agent automatically reviews pull requests after an agent completes a task. It picks a different agent from the one that wrote the code (and from any agents that previously reviewed the same task), and posts its decision on the PR, see [Review mode](@/configuration.md#review-mode). If no other agent is available, the authoring agent reviews and the fallback is logged as a `review_agent_fallback` task activity and noted in the review comment.
 
 ## How It Works
 
 1. Agent completes a task and returns `status: done`
-2. Orch detects an open PR on the task's branch → sets status to `in_review`
-3. If `enable_review_agent` is `true`, the review agent runs:
+2. Orch detects an open PR on the task's branch → sets status to `needs_review`, then `in_review` when the review starts
+3. If `enable_review_agent` is `true` (the default), the review agent runs, limited to `workflow.review_timeout_seconds` (default 900, never under 300):
    - Picks a reviewer via round-robin, excluding the task executor and all agents that have previously reviewed this task.
-   - Fetches the PR diff via `gh pr diff`
-   - Sends the diff, task summary, and files changed to the review agent
+   - Runs in the task's worktree with the diff, git log, task body and the agent's summary (`prompts/review_task.md`)
    - Parses the review decision
 
 4. Based on the decision:
-   - **approve** → posts a comment with `## Automated Review -- Approve` header on the PR, auto-merges if required checks pass. Required checks come from classic branch protection and from repository rulesets. A missing required check is pending, so a PR with no check runs yet does not merge. GitHub `unstable` (a non-required check failing or still running) still merges once every required check has passed. A repository with no required checks waits until running checks finish.
-   - **request_changes** → posts a comment with `## Automated Review -- Changes Requested` header, task re-routes to `New` for the agent to fix
-   - **reject** → posts review comment, closes the PR, task goes to `needs_review`
+   - **approve** → posts a comment with `## Automated Review -- Approve` header on the PR and moves the task to `approved`. orch then waits for CI and merges with no agent running, and the merged PR moves the task to `done`. A merge conflict or red CI sends the task back to `routed`, and a PR closed without merge blocks it. An approve that reports `test_results: fail` or an `error` severity issue counts as request_changes. Required checks come from classic branch protection and from repository rulesets. A missing required check is pending, so a PR with no check runs yet does not merge. GitHub `unstable` (a non-required check failing or still running) still merges once every required check has passed. A repository with no required checks waits until running checks finish.
+   - **request_changes** → posts a comment with `## Automated Review -- Changes Requested` header, task goes back to `routed` with the same agent and worktree to fix it
 
    Review comments use a `## Automated Review` header as the protocol. orch also posts the decision as a commit status on the PR head SHA, context `orch/review`: `pending` while the review runs, `success` for approve, `failure` for changes requested. A new push moves the head SHA, so an old approval does not carry over. `orch init` no longer installs `.github/workflows/orch-review.yml`. A repository that has it can delete the file and the `ORCH_REVIEWER` variable.
 
@@ -30,45 +28,43 @@ The review agent automatically reviews pull requests after an agent completes a 
 The review agent is chosen via round-robin, excluding the task executor and all agents that have previously reviewed this task:
 
 1. Build an exclude list: the task's executor + all agents that have previously run as reviewer on this task
-2. Pick the next available agent (not disabled, installed on the system) not in the exclude list
-3. Falls back to `workflow.review_agent` config if no different agent is available
-4. Last resort: uses the same agent as the executor
+2. Pick the next routable agent (installed, not cooled, not degraded) outside the exclude list that has a `model_map.review` model
+3. If no such agent is left, the first routable agent reviews, which can be the executor. orch logs a `review_agent_fallback` activity and says so in the review comment
 
 Examples:
 - codex wrote the code → claude reviews (first cycle); if claude fails, kimi reviews (second cycle)
 - claude wrote the code → codex reviews (first cycle)
 - Only one agent installed → that agent reviews (same as executor)
 
-Override the reviewer for a specific run:
-```bash
-REVIEW_AGENT=claude orch task run <id>
-```
-
 ## Config
 
 ```yaml
 workflow:
-  enable_review_agent: true    # enable automatic PR reviews (default: false)
-  review_agent: "claude"       # fallback reviewer if opposite_agent can't find a different one
+  enable_review_agent: true    # default true, false skips the review agent
+  review_timeout_seconds: 900  # review time limit, never under 300
+  max_review_cycles: 2         # change requests before the task is blocked
+review:
+  mode: comment                # comment or app
 ```
 
-The `review_agent` config key is now a fallback — `opposite_agent()` handles primary selection. You only need to set `enable_review_agent: true`.
+A review that times out puts no model in cooldown. The task goes back to `needs_review` and the next review picks an agent as usual. On startup, every `in_review` task with no review session goes back to `needs_review`. While orch runs, an `in_review` task with no review session for `engine.in_review_no_session_stuck_timeout` goes back to `needs_review`. orch keeps that limit above the review timeout plus 120 seconds, so a finished review still on its way is not dropped.
 
 ## Review Prompt
 
-The review prompt (`prompts/review_task.md`) sends:
+The review prompt (`prompts/review_task.md`, with `prompts/review_system.md`) sends:
 
-- Task ID and title
-- PR number
+- Task ID, title and body
+- PR number and default branch
 - Task summary from the executor
-- Files changed
-- PR diff (first 500 lines via `gh pr diff`)
+- Git log and diff of the branch
 
-The reviewer is asked to return JSON:
+The reviewer rebases, checks the required CI checks, and returns JSON:
 ```json
 {
-  "decision": "approve|request_changes|reject",
-  "notes": "detailed feedback with file paths and line references"
+  "decision": "approve|request_changes",
+  "notes": "detailed feedback with file paths and line references",
+  "test_results": "pass|fail|skipped",
+  "issues": [{"file": "src/foo.rs", "line": 42, "severity": "error|warning", "description": "..."}]
 }
 ```
 
@@ -76,32 +72,22 @@ The reviewer is asked to return JSON:
 
 | Decision | When to use | What happens |
 |----------|-------------|--------------|
-| **approve** | Changes correctly implement the task, no obvious bugs or security issues | `gh pr review --approve`, task records `review_decision: approve` |
-| **request_changes** | Changes are on the right track but have fixable issues (missing edge cases, style, minor bugs) | `gh pr review --request-changes`, task goes to `needs_review` |
-| **reject** | Changes are fundamentally wrong — hallucinated APIs, empty diff, broken code, unrelated changes | `gh pr review --request-changes` + `gh pr close`, task goes to `needs_review` |
+| **approve** | Changes correctly implement the task, no obvious bugs or security issues | `orch/review` passes, the task moves to `approved` and orch merges once CI passes |
+| **request_changes** | The changes have fixable issues, or the reviewer could not resolve a conflict | `orch/review` fails, the task goes back to `routed` |
 
-## GitHub PR Reviews
-
-The review agent posts real GitHub PR reviews (not just issue comments):
-
-- **Approve**: shows as a green checkmark review on the PR
-- **Request changes**: shows as a red X review requiring changes before merge
-- **Reject**: same as request changes + the PR is closed automatically
-
-All `gh pr review` calls are non-fatal (`|| true`) — if the API fails, the review decision is still recorded locally.
+In `comment` mode the decision is a `## Automated Review` comment and an `orch/review` commit status. In `app` mode it is also a real `APPROVE` or `REQUEST_CHANGES` review from the GitHub App with inline comments, and `orch/review` is a check run. See [Review mode](@/configuration.md#review-mode).
 
 ## Task Flow
 
 ```
 agent completes (done) → PR detected → needs_review → in_review → review agent runs
-                                                                   ├─ approve → auto-merge → done
-                                                                   ├─ request_changes → re-route to new → agent fixes
-                                                                   └─ reject → needs_review (PR closed)
+                                                                   ├─ approve → approved → CI passes, merge → done
+                                                                   └─ request_changes → routed → agent fixes
 ```
 
-Review re-routing: when a review requests changes, the task is re-routed back to `Routed` status (not a child task). The agent reuses the existing worktree/branch and commits fixes — the engine handles pushing to the same PR. If `review_cycles >= max_review_cycles`, the task is blocked for human review.
+Review re-routing: when a review requests changes, the task goes back to `routed` (not a child task). The agent reuses the existing worktree/branch and commits fixes — the engine handles pushing to the same PR. If `review_cycles >= max_review_cycles`, the task is blocked for human review.
 
-Without the review agent enabled, tasks with open PRs still transition to `in_review` but skip the automated review step.
+With `enable_review_agent: false`, no review agent starts for a task that enters `needs_review`.
 
 ## Observability
 
