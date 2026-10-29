@@ -374,6 +374,23 @@ pub fn get(key: &str) -> anyhow::Result<String> {
     anyhow::bail!("config key not found: {key}")
 }
 
+/// Like [`get`], but reads the `.orch.yml` in `project_dir`, since the service runs from `/`
+pub fn get_for_project(project_dir: &std::path::Path, key: &str) -> anyhow::Result<String> {
+    let project_path = project_dir.join(".orch.yml");
+    if project_path.exists() {
+        if let Ok(val) = resolve_key(&project_path, key) {
+            return Ok(val);
+        }
+    }
+
+    let global_path = global_config_path()?;
+    if global_path.exists() {
+        return resolve_key(&global_path, key);
+    }
+
+    anyhow::bail!("config key not found: {key}")
+}
+
 /// Get all project paths from the global config `projects:` list.
 ///
 /// Returns a list of absolute paths to project directories.
@@ -932,6 +949,26 @@ mod tests {
         std::fs::write(&path, "engine: [broken\n").unwrap();
         assert!(reload_file(&path), "first bad read logs");
         assert!(!reload_file(&path), "same breakage does not log again");
+    }
+
+    #[test]
+    #[serial_test::serial(orch_home)]
+    fn a_project_setting_overrides_the_global_one() {
+        let (home, with, without) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        write_yaml(home.path(), "config.yml", "workflow:\n  sandbox: os\n");
+        write_yaml(with.path(), ".orch.yml", "workflow:\n  sandbox: false\n");
+        std::env::set_var("ORCH_HOME", home.path());
+
+        let got = (
+            get_for_project(with.path(), "workflow.sandbox").unwrap(),
+            get_for_project(without.path(), "workflow.sandbox").unwrap(),
+        );
+        std::env::remove_var("ORCH_HOME");
+        assert_eq!(got, ("false".to_string(), "os".to_string()));
     }
 
     #[test]

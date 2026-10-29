@@ -724,6 +724,12 @@ async fn build_review_context(
     let default_branch = runner::worktree::detect_default_branch(&worktree_path).await;
     let git_diff = runner::context::build_git_diff(&worktree_path, &default_branch).await;
     let git_log = runner::context::build_git_log(&worktree_path, &default_branch).await;
+    let main_project_dir = crate::config::get_projects_with_paths()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(candidate, _)| candidate == repo)
+        .map_or_else(|| worktree_path.clone(), |(_, dir)| dir);
+    let sandboxed = runner::sandbox::enabled(&main_project_dir);
     let review_prompt = runner::agent::build_review_prompt(
         task,
         &agent_summary,
@@ -731,7 +737,9 @@ async fn build_review_context(
         &git_log,
         &default_branch,
         pr_number,
-        runner::agent::Shipcheck::detect(&worktree_path).await,
+        runner::agent::Shipcheck::detect(&worktree_path)
+            .await
+            .for_prompt(sandboxed),
     );
 
     let task_agent = stored_task
@@ -810,6 +818,8 @@ async fn build_review_context(
         timeout_seconds: review_timeout_secs,
         repo: repo.to_string(),
         attempt: review_attempt,
+        sandbox: sandboxed,
+        main_project_dir,
     };
 
     let head_sha = match GhHttp::new() {
@@ -3871,6 +3881,8 @@ mod tests {
                 timeout_seconds: 0,
                 repo: "owner/repo".to_string(),
                 attempt: 1,
+                sandbox: false,
+                main_project_dir: work_dir.to_path_buf(),
             },
             same_agent_fallback: false,
         }

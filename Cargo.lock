@@ -1736,6 +1736,7 @@ dependencies = [
  "openraft",
  "regex",
  "reqwest",
+ "sandbox-jail",
  "scopeguard",
  "serde",
  "serde_json",
@@ -2235,6 +2236,12 @@ checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
 ]
+
+[[package]]
+name = "sandbox-jail"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca2390d2d18a72b5297636e9e70ea65bd7484377789bbccafe48d3acab597057"
 
 [[package]]
 name = "scc"

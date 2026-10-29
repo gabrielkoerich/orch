@@ -35,6 +35,7 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `workflow` | `disallowed_tools` | Tool patterns blocked via `--disallowedTools` | `["Bash(rm *)","Bash(rm -*)"]` |
 | `workflow` | `permissions.mode` | Agent permission mode (`autonomous` / `supervised`) | `autonomous` |
 | `workflow` | `permissions.sandbox` | Sandbox level for Codex (`workspace-write` / `full-access`) | `workspace-write` |
+| `workflow` | `sandbox` | Run task and review agents in the OS sandbox (`os`), or not (`false`). A project's `.orch.yml` can set `false` to opt out. See [OS Sandbox](agents.md#os-sandbox) | `false` |
 | `workflow` | `worktree_janitor_ttl_hours` | Janitor TTL before pruning orphaned worktrees | (see config.example.yml) |
 | `workflow` | `auto_create_followup_on_changes` | Auto-create follow-up task when review requests changes | `false` |
 | `router` | `mode` | `llm`, `round_robin`, or `local` (Ollama) | `llm` |
