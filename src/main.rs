@@ -120,7 +120,16 @@ fn rotate_log_if_needed(path: &std::path::Path) {
         let _ = std::fs::rename(from, to);
     }
 
-    let _ = std::fs::rename(path, rotated_log_path(path, 1));
+    // Copy then truncate so launchd's already-open stdout keeps writing to this path
+    // A rename would move the inode it holds, and later writes would land in orch.log.1
+    let backup = rotated_log_path(path, 1);
+    if std::fs::copy(path, &backup).is_err() {
+        return;
+    }
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.set_len(0));
 }
 
 fn rotate_service_logs_if_needed() {
@@ -168,7 +177,7 @@ mod tests {
 
         rotate_log_if_needed(&path);
 
-        assert!(!path.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
         assert_eq!(
             std::fs::read(path.with_file_name("orch.log.1"))
                 .unwrap()
@@ -183,6 +192,45 @@ mod tests {
             std::fs::read(path.with_file_name("orch.log.3")).unwrap(),
             b"two"
         );
+    }
+
+    #[test]
+    fn rotate_log_if_needed_keeps_an_open_append_fd_on_the_live_path() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orch.log");
+        std::fs::write(&path, vec![b'a'; (MAX_SERVICE_LOG_BYTES + 1) as usize]).unwrap();
+
+        let mut live = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+
+        rotate_log_if_needed(&path);
+
+        live.write_all(b"after-rotate").unwrap();
+        live.flush().unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"after-rotate");
+        assert_eq!(
+            std::fs::read(path.with_file_name("orch.log.1"))
+                .unwrap()
+                .len() as u64,
+            MAX_SERVICE_LOG_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn rotate_log_if_needed_leaves_small_files_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orch.log");
+        std::fs::write(&path, b"small").unwrap();
+
+        rotate_log_if_needed(&path);
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"small");
+        assert!(!path.with_file_name("orch.log.1").exists());
     }
 
     #[test]
