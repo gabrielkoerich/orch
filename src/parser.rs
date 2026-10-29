@@ -1158,6 +1158,13 @@ Some output here.
     }
 
     #[test]
+    fn parse_normalizes_failed_alias_to_blocked() {
+        let input = r#"{"status":"failed","summary":"could not complete","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "blocked");
+    }
+
+    #[test]
     fn parse_normalizes_failure_alias_to_blocked() {
         let input = r#"{"status":"failure","summary":"could not complete","accomplished":[],"remaining":[],"files":[]}"#;
         let resp = parse(input).unwrap();
