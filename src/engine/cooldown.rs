@@ -125,6 +125,14 @@ const CREDIT_FAILURE_COUNT_PREFIX: &str = "credit_failure_count:";
 /// escalation progress for structurally unreliable models — see `record_persistent_model_failure`).
 const PERSISTENT_FAILURE_COUNT_PREFIX: &str = "persistent_failure_count:";
 
+/// KV key prefix for the unix timestamp after which `rate_limits` rows count toward degraded
+const RATE_LIMITS_CLEARED_AT_PREFIX: &str = "rate_limits_cleared_at:";
+
+/// Agent name from a cooldown key (`claude:sonnet` -> `claude`)
+fn agent_from_key(key: &str) -> &str {
+    key.split_once(':').map(|(agent, _)| agent).unwrap_or(key)
+}
+
 struct CooldownEntry {
     /// Unix timestamp when the cooldown expires.
     cooldown_until: i64,
@@ -861,12 +869,31 @@ pub fn list_all_cooldowns() -> Vec<(String, i64, String)> {
     result
 }
 
+/// Write `rate_limits_cleared_at:{agent}` = now so the next health check
+/// ignores older `rate_limits` rows. Rows stay in the table for metrics
+pub async fn mark_rate_limits_cleared(store: &Arc<crate::store::TaskStore>, agents: &[String]) {
+    let now = chrono::Utc::now().timestamp().to_string();
+    let mut seen = std::collections::HashSet::new();
+    for key in agents {
+        let agent = agent_from_key(key);
+        if agent.is_empty() || !seen.insert(agent.to_string()) {
+            continue;
+        }
+        let kv_key = format!("{RATE_LIMITS_CLEARED_AT_PREFIX}{agent}");
+        if let Err(e) = store.kv_set(&kv_key, &now).await {
+            tracing::warn!(agent, err = %e, "failed to mark rate limits cleared");
+        }
+    }
+}
+
 /// Clear a specific cooldown by key, or all cooldowns when `key == "*"`.
 ///
 /// Removes from the in-memory map, writes a past timestamp to KV, and resets
 /// the corresponding `failure_count:` entries so the next failure starts
-/// backoff from the base duration.
+/// backoff from the base duration. Also writes `rate_limits_cleared_at:{agent}`
+/// so a degraded agent held only by rate rows recovers on the next health check
 pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
+    let mut agents_to_mark: Vec<String> = Vec::new();
     if key == "*" {
         let keys: Vec<String> = {
             let mut map = cooldown_lock();
@@ -923,6 +950,22 @@ pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
             count = keys.len(),
             "cleared all cooldowns and failure counts"
         );
+        agents_to_mark.extend(keys.iter().map(|k| agent_from_key(k).to_string()));
+        match store.rate_limit_agents().await {
+            Ok(rl_agents) => agents_to_mark.extend(rl_agents),
+            Err(e) => tracing::warn!(err = %e, "failed to list rate_limits agents while clearing"),
+        }
+        match store.kv_list_prefix(RATE_LIMITS_CLEARED_AT_PREFIX).await {
+            Ok(marks) => {
+                for (k, _) in marks {
+                    let agent = k.trim_start_matches(RATE_LIMITS_CLEARED_AT_PREFIX);
+                    if !agent.is_empty() {
+                        agents_to_mark.push(agent.to_string());
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(err = %e, "failed to list rate_limits_cleared_at keys"),
+        }
     } else {
         {
             let mut map = cooldown_lock();
@@ -948,7 +991,9 @@ pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
             tracing::warn!(key = persistent_fc_key, err = %e, "failed to reset persistent failure count");
         }
         tracing::info!(key, "cleared cooldown and failure count");
+        agents_to_mark.push(agent_from_key(key).to_string());
     }
+    mark_rate_limits_cleared(store, &agents_to_mark).await;
 }
 
 /// Set a cooldown with a specific expiry timestamp. Updates in-memory state only.
@@ -1615,6 +1660,12 @@ mod tests {
                 .await
                 .expect("in-memory store"),
         )
+    }
+
+    fn sqlite_datetime_offset(secs: i64) -> String {
+        (chrono::Utc::now() + chrono::Duration::seconds(secs))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
     }
 
     #[serial(cooldown_state)]
@@ -3021,8 +3072,12 @@ mod tests {
         );
 
         clear_cooldown(agent, &store).await;
+        let after_clear = sqlite_datetime_offset(60);
         for _ in 0..3 {
-            store.record_rate_limit(agent, "rate", None).await.unwrap();
+            store
+                .record_rate_limit_at(agent, "rate", None, &after_clear)
+                .await
+                .unwrap();
         }
         refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
         assert_eq!(
@@ -3032,6 +3087,88 @@ mod tests {
         );
 
         clear_agent_degraded(agent);
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn clear_un_degrades_on_next_health_check() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        let agent = "test_clear_un_degrades";
+        let before = sqlite_datetime_offset(-30);
+        let after = sqlite_datetime_offset(60);
+
+        for _ in 0..3 {
+            store
+                .record_rate_limit_at(agent, "rate", None, &before)
+                .await
+                .unwrap();
+        }
+
+        let agents = vec![agent.to_string()];
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+        assert!(
+            is_agent_degraded(agent),
+            "three rate rows must mark an agent degraded"
+        );
+
+        clear_cooldown(agent, &store).await;
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+        assert!(
+            !is_agent_degraded(agent),
+            "clear must un-degrade on the next health check"
+        );
+
+        store
+            .record_rate_limit_at(agent, "rate", None, &after)
+            .await
+            .unwrap();
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+        assert!(
+            !is_agent_degraded(agent),
+            "one rate row after the mark must not degrade again"
+        );
+
+        for _ in 0..2 {
+            store
+                .record_rate_limit_at(agent, "rate", None, &after)
+                .await
+                .unwrap();
+        }
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+        assert!(
+            is_agent_degraded(agent),
+            "three rate rows after the mark must degrade again"
+        );
+
+        clear_agent_degraded(agent);
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn clear_all_un_degrades_rate_limited_agent() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        let agent = "test_clear_all_un_degrades";
+        let before = sqlite_datetime_offset(-30);
+
+        for _ in 0..3 {
+            store
+                .record_rate_limit_at(agent, "rate", None, &before)
+                .await
+                .unwrap();
+        }
+
+        let agents = vec![agent.to_string()];
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+        assert!(is_agent_degraded(agent));
+
+        clear_cooldown("*", &store).await;
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+        assert!(
+            !is_agent_degraded(agent),
+            "clear --all must un-degrade an agent held only by rate rows"
+        );
     }
 
     // ---- Exponential backoff integration tests ----

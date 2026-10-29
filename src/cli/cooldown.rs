@@ -49,7 +49,9 @@ pub async fn clear(key: Option<String>, all: bool) -> anyhow::Result<()> {
     cooldown::init_cooldown_store(store.clone()).await;
 
     if all {
+        let agents = crate::engine::router::Router::from_config().available_agents;
         cooldown::clear_cooldown("*", &store).await;
+        cooldown::mark_rate_limits_cleared(&store, &agents).await;
         println!("Cleared all cooldowns.");
     } else if let Some(k) = key {
         cooldown::clear_cooldown(&k, &store).await;

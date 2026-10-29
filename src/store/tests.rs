@@ -7027,6 +7027,43 @@ async fn recent_rate_limit_counts_groups_by_agent() {
     assert_eq!(counts.get("opencode"), None);
 }
 
+#[tokio::test]
+async fn recent_rate_limit_counts_skips_rows_before_cleared_at() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let past = (chrono::Utc::now() - chrono::Duration::seconds(30))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let future = (chrono::Utc::now() + chrono::Duration::seconds(30))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+
+    for _ in 0..3 {
+        store
+            .record_rate_limit_at("claude", "rate", None, &past)
+            .await
+            .unwrap();
+    }
+    store
+        .kv_set(
+            "rate_limits_cleared_at:claude",
+            &chrono::Utc::now().timestamp().to_string(),
+        )
+        .await
+        .unwrap();
+    store
+        .record_rate_limit_at("claude", "rate", None, &future)
+        .await
+        .unwrap();
+    store
+        .record_rate_limit_at("codex", "rate", None, &past)
+        .await
+        .unwrap();
+
+    let counts = store.recent_rate_limit_counts(6).await.unwrap();
+    assert_eq!(counts.get("claude"), Some(&1));
+    assert_eq!(counts.get("codex"), Some(&1));
+}
+
 // ---------------------------------------------------------------------------
 // Batch methods
 // ---------------------------------------------------------------------------
