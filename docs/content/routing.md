@@ -92,6 +92,6 @@ When a task's stored model is no longer in its agent's model pools, orch replace
 The router performs a pre-emptive routability check before attempting to invoke agents or the router LLM. This does two things:
 
 - It excludes agents that are currently in cooldown or have been marked degraded by the health check (rate-limit signals). These checks are authoritative — if an agent is degraded, it will be skipped regardless of weight.
-- When `router.weighted_round_robin` is enabled, an additional weight-based threshold (`router.skip_limited_threshold`) is applied after the degraded check. Agents whose routing weight has decayed below this threshold are skipped proactively to avoid sending work to recently rate-limited agents. This weight-based exclusion only layers on top of existing cooldown/degraded logic and does not replace it.
+- When `router.weighted_round_robin` is enabled, an additional weight-based threshold is applied after the degraded check. Agents whose routing weight has decayed below this threshold are skipped proactively to avoid sending work to recently rate-limited agents. This weight-based exclusion only layers on top of existing cooldown/degraded logic and does not replace it.
 
-The threshold is `0.3`. The `router.skip_limited_threshold` key is not read from config yet.
+The threshold is fixed at `0.3`. No config key changes it.

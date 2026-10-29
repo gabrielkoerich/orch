@@ -64,7 +64,7 @@ Generate one secret and use the same value on every machine:
 openssl rand -hex 32
 ```
 
-Find each machine's node name. It is the first label of its MagicDNS name, in lowercase, as `tailscale status` shows it. A machine named "m1 max" in the admin console is `m1-max`:
+Find each machine's node name. It is the first label of its MagicDNS name, in lowercase, as `tailscale status` shows it. A machine named "Node A" in the admin console is `node-a`:
 
 ```sh
 tailscale status --json | jq -r '.Self.DNSName' | cut -d. -f1
@@ -76,7 +76,7 @@ Add the same section to `~/.orch/config.yml` on every machine. Only `witness` di
 cluster:
   secret: "<the value from openssl>"
   port: 7420
-  voters: [m1-max, legion, vpsbr-16153223]
+  voters: [node-a, node-b, node-c]
   witness: false   # true on the witness only
 ```
 
@@ -96,16 +96,16 @@ The secret already keeps other machines out, and an ACL also stops them from rea
 ```json
 {
   "hosts": {
-    "m1-max": "100.73.204.46",
-    "legion": "100.90.49.41",
-    "vpsbr": "100.70.185.32",
-    "m4": "100.123.138.124"
+    "node-a": "100.64.0.1",
+    "node-b": "100.64.0.2",
+    "node-c": "100.64.0.3",
+    "node-d": "100.64.0.4"
   },
   "acls": [
     {
       "action": "accept",
-      "src": ["m1-max", "legion", "vpsbr", "m4"],
-      "dst": ["m1-max:7420", "legion:7420", "vpsbr:7420", "m4:7420"]
+      "src": ["node-a", "node-b", "node-c", "node-d"],
+      "dst": ["node-a:7420", "node-b:7420", "node-c:7420", "node-d:7420"]
     }
   ]
 }
@@ -125,9 +125,9 @@ orch nodes
 
 ```
 NODE                 ADDRESS                ROLE     STATE
-m1-max               100.73.204.46:7420     voter    leader
-legion               100.90.49.41:7420      voter    this machine
-vpsbr-16153223       100.70.185.32:7420     voter
+node-a               100.64.0.1:7420        voter    leader
+node-b               100.64.0.2:7420        voter    this machine
+node-c               100.64.0.3:7420        voter
 ```
 
 A witness shows as a voter. `orch nodes` prints the members of the cluster as this machine's service sees them, so the service must be running.

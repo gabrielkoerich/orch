@@ -72,6 +72,10 @@ pub fn retry_max_delay_ms() -> u64 {
 /// slow model does not stall fallback to other healthy agents.
 pub const MAX_ROUTER_TIMEOUT_SECS: u64 = 45;
 
+/// With weighted round robin, an agent whose routing weight decays below this
+/// value is skipped during pre-emptive routability checks.
+pub const SKIP_LIMITED_THRESHOLD: f64 = 0.3;
+
 /// Return the configured base backoff (seconds) for an agent.
 ///
 /// Returns the value of `router.backoff_base.{agent}` if set, otherwise
@@ -176,11 +180,6 @@ pub struct RouterConfig {
     ///     kimi: 0.02
     /// ```
     pub weights: HashMap<String, f64>,
-    /// If an agent's routing weight falls below this threshold, consider it
-    /// degraded and skip it during proactive routing decisions. Value in
-    /// `0.0..=1.0` where `1.0` means never skip and `0.0` skips only when
-    /// weight is exactly zero (practically never). Default: `0.3`.
-    pub skip_limited_threshold: f64,
     /// Per-agent base backoff overrides (seconds). Agents not listed use the
     /// default BACKOFF_BASE_SECS (5 minutes). Configure as `router.backoff_base.{agent}`.
     ///
@@ -255,7 +254,6 @@ impl Default for RouterConfig {
             // exist for a particular agent (e.g. anthropic/ prefixed models for opencode).
             model_map: HashMap::new(),
             weighted_round_robin: false,
-            skip_limited_threshold: 0.3,
             agent_backoff_bases: HashMap::new(),
             max_tasks_per_tick: 1,
             ollama_url: "http://localhost:11434".to_string(),

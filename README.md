@@ -353,10 +353,6 @@ workflow:
 router:
   fallback_executor: "codex"
 
-required_tools:
-  - cargo
-  - bun
-
 # Per-project scheduled jobs
 jobs:
   - id: code-review

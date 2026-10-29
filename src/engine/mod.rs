@@ -2074,9 +2074,8 @@ pub async fn serve() -> anyhow::Result<()> {
     // Notify used by webhook events to wake up the engine tick immediately
     let webhook_notify = Arc::new(Notify::new());
 
-    // Track webhook state for health checks and fallback.
-    // When webhooks are disabled, `in_fallback_mode` stays true so sync
-    // uses the faster fallback interval for polling.
+    // `WebhookStatus::fallback_mode` is only shown by `orch webhook status`, the sync
+    // tick always runs every `engine.sync_interval` whether or not webhooks work
     let webhook_port: Option<u16>;
     let mut webhook_healthy: bool;
     let mut last_webhook_health_check = std::time::Instant::now();
