@@ -292,6 +292,8 @@ pub struct AgentInvocation {
     pub sandbox: bool,
     /// The project's main checkout, which the sandbox keeps read-only but for its `.git`
     pub main_project_dir: PathBuf,
+    /// The task's branch, from orch's records, the one ref the sandbox lets the agent move
+    pub branch: String,
     /// Current attempt number (1-indexed)
     pub attempt: u32,
 }
@@ -325,8 +327,9 @@ fn build_tmux_runner_scripts(
                 .iter()
                 .map(|a| shell_single_quote(&a.to_string_lossy()))
                 .collect();
+            // The tmux and ssh-agent sockets are out of reach, and their variables go too
             format!(
-                "{} /bin/bash -c {}",
+                "env -u TMUX -u TMUX_PANE -u SSH_AUTH_SOCK {} /bin/bash -c {}",
                 prefix.join(" "),
                 shell_single_quote(agent_cmd)
             )
@@ -851,6 +854,7 @@ mod tests {
             attempt: 1,
             sandbox: false,
             main_project_dir: std::path::PathBuf::from("/tmp"),
+            branch: String::new(),
         }
     }
 
@@ -974,7 +978,7 @@ mod tests {
                 .expect("runner scripts should build");
         assert!(
             agent_cmd_script.contains(
-                "'/usr/bin/sandbox-exec' '-p' '(version 1)' /bin/bash -c 'claude -p '\\''hi'\\''' 2>"
+                "env -u TMUX -u TMUX_PANE -u SSH_AUTH_SOCK '/usr/bin/sandbox-exec' '-p' '(version 1)' /bin/bash -c 'claude -p '\\''hi'\\''' 2>"
             ),
             "the agent must run inside the sandbox with stderr split outside it, got: {agent_cmd_script}"
         );

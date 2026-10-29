@@ -81,12 +81,13 @@ With `workflow.sandbox: os`, task and review agents run inside Seatbelt on macOS
 
 | The agent | Paths |
 |-----------|-------|
-| May write | Its worktree, its git dirs, the temp dirs and the home |
-| May not write | The git dir's `hooks` and `config`, the worktree's `.orch.yml`, every main checkout but its `.git`, `~/.orch` but the task's own worktree (and `orch.db` for job tasks), shell and git startup files, `~/.local/bin`, `~/bin`, `~/Library/LaunchAgents` |
-| May not read | Credentials (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.docker/config.json`, `.netrc`, `.npmrc` and the like) and `~/Library/Keychains`. Keychain access through `securityd` still works |
+| May write | Its worktree. In the git dir, the objects, the task's branch, remote refs and the task's own worktree dir. The temp dirs. The home's top-level dirs but `.config`, `.claude`, `.ssh`, `.gnupg`, `bin`, `Library` and `.local`, and inside those `Library/Caches`, `Library/Logs`, `.local/share` and `.local/state` |
+| May not write | Everything else, among it every file at the top of the home and any new one there, `~/.claude.json`, `~/.config`, the agents' settings, every `PATH` dir inside the home such as `~/.cargo/bin`, cargo's `config.toml` and gradle's init scripts, the git dir's hooks, config and other branches, the worktree's `.git` file and `.orch.yml`, every main checkout but its `.git`, and `~/.orch` but the task's own worktree (and `orch.db` for job tasks) |
+| May not read | Credentials: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.docker/config.json`, `.netrc`, `.npmrc` and the like. The login keychain stays readable and `security` stays runnable, since Claude reads its login through them. An agent can read any item whose access list trusts `security`, as it can today without the sandbox |
+| May not connect to | A unix socket outside the worktree and `$TMPDIR`: tmux's, Docker's, the ssh-agent's. On macOS, any service but the basic ones and the keychain's, so `open` cannot start an app outside the sandbox |
 | May not run (macOS) | `launchctl` and setuid binaries such as `sudo` |
 
-The network stays open. Codex runs with its own sandbox off, since Seatbelt cannot nest. shipcheck cannot start its own sandbox inside this one either, so a sandboxed agent's prompt has it run the project's checks itself, and the push hook runs shipcheck outside.
+The agent's environment drops `TMUX`, `TMUX_PANE` and `SSH_AUTH_SOCK`. The network stays open. Codex runs with its own sandbox off, since Seatbelt cannot nest. shipcheck cannot start its own sandbox inside this one either, so a sandboxed agent's prompt has it run the project's checks itself, and the push hook runs shipcheck outside.
 
 When the sandbox cannot start, the task blocks with the reason and no agent runs. A path the agent needs and cannot write shows up as `Operation not permitted` in its output.
 

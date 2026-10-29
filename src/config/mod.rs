@@ -391,6 +391,16 @@ pub fn get_for_project(project_dir: &std::path::Path, key: &str) -> anyhow::Resu
     anyhow::bail!("config key not found: {key}")
 }
 
+/// The global config alone, for a setting no project file may override
+pub fn get_global(key: &str) -> anyhow::Result<String> {
+    let global_path = global_config_path()?;
+    if global_path.exists() {
+        return resolve_key(&global_path, key);
+    }
+
+    anyhow::bail!("config key not found: {key}")
+}
+
 /// Get all project paths from the global config `projects:` list.
 ///
 /// Returns a list of absolute paths to project directories.

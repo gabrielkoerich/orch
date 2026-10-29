@@ -1008,3 +1008,62 @@ async fn one_machine_keeps_autoincrement_ids_and_task_json() {
     let json = serde_json::to_value(store.get(next).await.unwrap()).unwrap();
     assert!(json.get("owner_node").is_none());
 }
+
+#[tokio::test]
+async fn a_replicated_write_never_touches_local_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path()).await;
+    let mut conn = store.pool().acquire().await.unwrap();
+    let raft_key = Command::KvSet {
+        key: "raft:vote".into(),
+        value: "forged".into(),
+    };
+    assert!(raft_key
+        .clone()
+        .apply(&mut conn, "2026-01-02T03:04:05Z", true)
+        .await
+        .is_err());
+    assert!(raft_key
+        .apply(&mut conn, "2026-01-02T03:04:05Z", false)
+        .await
+        .is_ok());
+
+    let worktree = Command::TaskSetFields {
+        id: 1,
+        updates: vec![("worktree".into(), serde_json::json!("/"))],
+        silent: false,
+    };
+    let err = worktree
+        .apply(&mut conn, "2026-01-02T03:04:05Z", true)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("worktree"), "{err}");
+}
+
+#[tokio::test]
+async fn a_snapshot_never_brings_in_local_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path()).await;
+    let mut conn = store.pool().acquire().await.unwrap();
+    let rows = vec![
+        (
+            "raft:vote".to_string(),
+            "forged".to_string(),
+            "t".to_string(),
+        ),
+        (
+            "cooldown:claude".to_string(),
+            "1".to_string(),
+            "t".to_string(),
+        ),
+    ];
+    crate::store::kv::replace_replicated(&mut conn, &rows)
+        .await
+        .unwrap();
+    drop(conn);
+    assert_eq!(store.kv_get("raft:vote").await.unwrap(), None);
+    assert_eq!(
+        store.kv_get("cooldown:claude").await.unwrap().as_deref(),
+        Some("1")
+    );
+}

@@ -242,6 +242,10 @@ async fn write(State(a): State<App>, headers: HeaderMap, Json(req): Json<Request
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
+    if let Err(e) = req.cmd.check_replicable() {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+
     match a.raft.client_write(req).await {
         Ok(r) => Json(r.data).into_response(),
         // Refused before anything was proposed, so the sender may safely try another node

@@ -724,12 +724,18 @@ async fn build_review_context(
     let default_branch = runner::worktree::detect_default_branch(&worktree_path).await;
     let git_diff = runner::context::build_git_diff(&worktree_path, &default_branch).await;
     let git_log = runner::context::build_git_log(&worktree_path, &default_branch).await;
-    let main_project_dir = crate::config::get_projects_with_paths()
+    // An unknown project falls back to the global config, never to the worktree's .orch.yml,
+    // which the task agent may have written
+    let project_dir = crate::config::get_projects_with_paths()
         .unwrap_or_default()
         .into_iter()
         .find(|(candidate, _)| candidate == repo)
-        .map_or_else(|| worktree_path.clone(), |(_, dir)| dir);
-    let sandboxed = runner::sandbox::enabled(&main_project_dir);
+        .map(|(_, dir)| dir);
+    let sandboxed = match &project_dir {
+        Some(dir) => runner::sandbox::enabled(dir),
+        None => runner::sandbox::enabled_globally(),
+    };
+    let main_project_dir = project_dir.unwrap_or_else(|| worktree_path.clone());
     let review_prompt = runner::agent::build_review_prompt(
         task,
         &agent_summary,
@@ -820,6 +826,7 @@ async fn build_review_context(
         attempt: review_attempt,
         sandbox: sandboxed,
         main_project_dir,
+        branch: branch_name.clone(),
     };
 
     let head_sha = match GhHttp::new() {
@@ -3883,6 +3890,7 @@ mod tests {
                 attempt: 1,
                 sandbox: false,
                 main_project_dir: work_dir.to_path_buf(),
+                branch: String::new(),
             },
             same_agent_fallback: false,
         }

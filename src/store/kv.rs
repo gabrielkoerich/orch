@@ -102,7 +102,7 @@ pub(crate) async fn replace_replicated(
         delete(conn, key).await?;
     }
 
-    for (key, value, updated_at) in rows {
+    for (key, value, updated_at) in rows.iter().filter(|(k, _, _)| !is_local(k)) {
         set(conn, updated_at, key, value).await?;
     }
 

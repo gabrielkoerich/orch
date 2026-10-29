@@ -118,6 +118,11 @@ async fn write(State(app): State<App>, headers: HeaderMap, Json(cmd): Json<Comma
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
+    // The store writes local state directly, so a command that carries any came from outside it
+    if let Err(e) = cmd.check_replicable() {
+        return Json(Reply::Err(format!("{e:#}"))).into_response();
+    }
+
     Json(match app.store.write(cmd).await {
         Ok(reply) => reply,
         Err(e) => Reply::Err(format!("{e:#}")),
