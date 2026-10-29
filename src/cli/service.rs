@@ -230,7 +230,7 @@ fn systemd_user_dir() -> anyhow::Result<PathBuf> {
 #[cfg(not(target_os = "macos"))]
 fn current_binary() -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe().context("cannot resolve the orch binary path")?;
-    Ok(exe.canonicalize().unwrap_or_else(|_| exe))
+    Ok(exe.canonicalize().unwrap_or(exe))
 }
 
 #[cfg(test)]
