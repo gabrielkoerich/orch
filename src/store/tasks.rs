@@ -873,7 +873,23 @@ impl TaskStore {
         status: TaskStatus,
         updates: &[(&str, serde_json::Value)],
     ) -> anyhow::Result<()> {
-        let updates = owned_updates(updates)?;
+        let mut updates = owned_updates(updates)?;
+        // Local columns stay on this node, as set_fields keeps them
+        if self.replicates() {
+            let local: Vec<_> = updates
+                .iter()
+                .filter(|(col, _)| is_local_column(col))
+                .cloned()
+                .collect();
+            updates.retain(|(col, _)| !is_local_column(col));
+
+            if !local.is_empty() {
+                let mut tx = self.pool.begin().await?;
+                apply::set_fields(&mut tx, &crate::cluster::now_stamp(), id, &local, true).await?;
+                tx.commit().await?;
+            }
+        }
+
         self.write(Command::TaskUpdateStatusAndFields {
             id,
             status,

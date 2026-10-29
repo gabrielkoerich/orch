@@ -126,6 +126,38 @@ pub enum Reply {
 }
 
 impl Command {
+    /// A write through the log may not touch this node's own state: a local kv key, such as its
+    /// Raft position, or a local task column, such as the worktree path that cleanup removes
+    pub(crate) fn check_replicable(&self) -> anyhow::Result<()> {
+        let key = match self {
+            Command::KvSet { key, .. }
+            | Command::KvIncrement { key }
+            | Command::KvInsertIfAbsent { key, .. }
+            | Command::KvDelete { key } => Some(key),
+            _ => None,
+        };
+        if let Some(key) = key {
+            anyhow::ensure!(
+                !kv::is_local(key),
+                "{key} is local to each node, never replicated"
+            );
+        }
+
+        let updates = match self {
+            Command::TaskSetFields { updates, .. }
+            | Command::TaskUpdateStatusAndFields { updates, .. } => &updates[..],
+            _ => &[],
+        };
+        if let Some((col, _)) = updates
+            .iter()
+            .find(|(col, _)| crate::store::tasks::is_local_column(col))
+        {
+            anyhow::bail!("{col} is local to each node, never replicated");
+        }
+
+        Ok(())
+    }
+
     /// `replicated` is true when Raft applies the command, so new ids come from the replicated
     /// rows. A direct write keeps SQLite's AUTOINCREMENT, as orch on one machine always has
     pub(crate) async fn apply(
@@ -134,6 +166,10 @@ impl Command {
         now: &str,
         replicated: bool,
     ) -> anyhow::Result<Reply> {
+        if replicated {
+            self.check_replicable()?;
+        }
+
         Ok(match self {
             Command::KvSet { key, value } => {
                 kv::set(conn, now, &key, &value).await?;
