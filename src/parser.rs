@@ -68,26 +68,12 @@ pub fn parse_and_print(path: &str) -> anyhow::Result<()> {
 }
 
 /// Known canonical statuses - used to prefer better candidates.
-/// NOTE: Does NOT include aliases like "ready_for_review" - those are
-/// normalized to canonical forms in normalize_status().
+/// NOTE: Does NOT include aliases like "ready_for_review" or "ok" - the only
+/// caller runs normalize_status() first, which maps every alias to one of these.
 fn status_is_known(status: &str) -> bool {
     matches!(
         status,
-        "new"
-            | "routed"
-            | "in_progress"
-            | "done"
-            | "completed"
-            | "ok"
-            | "success"
-            | "running"
-            | "blocked"
-            | "error"
-            | "failed"
-            | "in_review"
-            | "reviewing"
-            | "needs_review"
-            | "pending_review"
+        "new" | "routed" | "in_progress" | "done" | "blocked" | "in_review" | "needs_review"
     )
 }
 
@@ -214,17 +200,8 @@ fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
         "needs_review" | "pending_review" | "ready_for_review" => "needs_review".to_string(),
         // Canonical error statuses.
         "blocked" | "error" | "failed" | "failure" => "blocked".to_string(),
-        // Passthrough: known canonical statuses (already canonical, keep as-is).
-        s if s == "new"
-            || s == "routed"
-            || s == "in_progress"
-            || s == "done"
-            || s == "blocked"
-            || s == "in_review"
-            || s == "needs_review" =>
-        {
-            s.to_string()
-        }
+        // Passthrough: the canonical statuses the arms above do not already cover.
+        "new" | "routed" => normalized.clone(),
         // Unknown status reading as completion, done if the response carries orch
         // fields — domain records without them stay non-canonical and get rejected (#3336)
         _ if !resp.summary.is_empty()

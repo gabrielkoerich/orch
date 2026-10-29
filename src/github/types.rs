@@ -39,16 +39,6 @@ pub struct GitHubUser {
     pub login: String,
 }
 
-/// One issue in a blocked-by or blocking dependency list.
-///
-/// `id` is the database id required by the write endpoints, `number` is the issue number
-#[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize)]
-pub struct IssueDependency {
-    pub id: u64,
-    pub number: u64,
-}
-
 /// Pull request details from the GitHub API.
 /// The `mergeable` field indicates if the PR can be merged:
 /// - `true` - PR can be merged
