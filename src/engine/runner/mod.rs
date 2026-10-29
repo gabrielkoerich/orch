@@ -35,7 +35,6 @@ use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
 use crate::engine::router::RouteResult;
 use crate::engine::tasks::is_internal_id;
-use crate::security;
 use crate::store;
 use crate::store::InsertTaskMetric;
 use crate::tmux::TmuxManager;
@@ -1554,9 +1553,8 @@ impl TaskRunner {
             );
         }
 
-        // Post comment (scan for secrets before posting to GitHub)
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-        let mut raw_comment = if !summary.is_empty() {
+        let mut comment = if !summary.is_empty() {
             format!("[{now}] {status}: {summary}")
         } else if !last_error.is_empty() {
             format!("[{now}] {status}: {last_error}")
@@ -1566,22 +1564,8 @@ impl TaskRunner {
 
         // Append visible attribution footer (matches PR body style)
         let footer = crate::engine::attribution_footer("Created", &agent_name, model);
-        raw_comment.push_str(&footer);
+        comment.push_str(&footer);
 
-        // Scan for leaked secrets and redact if needed
-        let comment = if security::has_leaks(&raw_comment) {
-            let leaks = security::scan(&raw_comment);
-            let rules: Vec<&str> = leaks.iter().map(|l| l.rule).collect();
-            let warning = format!(
-                "\n\n> ⚠️ **Security Notice**: {} potential secret(s) detected and redacted: {}",
-                leaks.len(),
-                rules.join(", ")
-            );
-            let redacted = security::redact(&raw_comment);
-            format!("{redacted}{warning}")
-        } else {
-            raw_comment
-        };
         backend.post_comment(&task.id, &comment).await?;
 
         Ok(weight_signal)
