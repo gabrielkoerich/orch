@@ -2414,6 +2414,28 @@ impl GhHttp {
         parse_behind_by(&body)
     }
 
+    /// Parent commit shas of `sha`, first parent first
+    pub async fn commit_parents(&self, repo: &str, sha: &str) -> anyhow::Result<Vec<String>> {
+        let url = format!("{GITHUB_API}/repos/{repo}/commits/{sha}");
+        let value: serde_json::Value = self.get_json(&url).await?;
+        Ok(parse_commit_parents(&value))
+    }
+
+    /// True when `branch` already contains the commit `sha`
+    pub async fn branch_contains(
+        &self,
+        repo: &str,
+        branch: &str,
+        sha: &str,
+    ) -> anyhow::Result<bool> {
+        let url = format!("{GITHUB_API}/repos/{repo}/compare/{branch}...{sha}");
+        let body: serde_json::Value = self.get_json(&url).await?;
+        body.get("ahead_by")
+            .and_then(|v| v.as_u64())
+            .map(|ahead| ahead == 0)
+            .ok_or_else(|| anyhow::anyhow!("compare response has no numeric ahead_by field"))
+    }
+
     /// Close a GitHub issue.
     pub async fn close_issue(&self, repo: &str, number: &str) -> anyhow::Result<()> {
         let url = format!("{GITHUB_API}/repos/{repo}/issues/{number}");
@@ -3313,6 +3335,19 @@ impl GhHttp {
 ///
 /// A missing field is an error, not zero: treating an unreadable response as
 /// "head is up to date" would let a stale PR merge
+fn parse_commit_parents(commit: &serde_json::Value) -> Vec<String> {
+    commit
+        .get("parents")
+        .and_then(|p| p.as_array())
+        .map(|parents| {
+            parents
+                .iter()
+                .filter_map(|p| p.get("sha").and_then(|s| s.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn parse_behind_by(body: &serde_json::Value) -> anyhow::Result<u64> {
     body.get("behind_by")
         .and_then(|v| v.as_u64())
@@ -3886,6 +3921,13 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn parse_commit_parents_keeps_their_order() {
+        let merge = serde_json::json!({"parents": [{"sha": "approved"}, {"sha": "base"}]});
+        assert_eq!(parse_commit_parents(&merge), vec!["approved", "base"]);
+        assert!(parse_commit_parents(&serde_json::json!({})).is_empty());
     }
 
     #[test]

@@ -216,7 +216,6 @@ fn approved_sha_key(repo: &str, task_id: &str, pr_number: u64) -> String {
     format!("review_approved_sha:{repo}#{task_id}#{pr_number}")
 }
 
-/// Read `HEAD` of a worktree. `None` when the worktree is gone or not a repository
 const REVIEW_TIMEOUT_DEFAULT_SECS: u64 = 900;
 const REVIEW_TIMEOUT_MIN_SECS: u64 = 300;
 
@@ -227,6 +226,7 @@ fn review_timeout_secs(configured: Option<u64>) -> u64 {
         .max(REVIEW_TIMEOUT_MIN_SECS)
 }
 
+/// Read `HEAD` of a worktree. `None` when the worktree is gone or not a repository
 async fn worktree_head_sha(dir: &std::path::Path) -> Option<String> {
     let out = tokio::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
@@ -340,6 +340,131 @@ async fn pr_head_already_approved(
         }
     };
     approval_covers_head(approved.as_deref(), pr_head.as_deref())
+}
+
+/**
+ * Carry an approval to a head that only merged the base branch in, as GitHub's update-branch
+ * does: a merge commit whose first parent is the approved commit and whose second parent the
+ * base branch already holds. The approval is recorded for the new head and published on it: in
+ * app mode an App approval and the check run, in comment mode the commit status, so a required
+ * `orch/review` or approving review does not hold the merge. Any other change keeps the approval
+ * where it was
+ **/
+pub(crate) async fn carry_approval_across_base_update(
+    store: &Arc<TaskStore>,
+    gh: &GhHttp,
+    repo: &str,
+    task_id: &str,
+    pr_number: u64,
+    head_sha: &str,
+    base_branch: &str,
+) {
+    let key = approved_sha_key(repo, task_id, pr_number);
+    let Ok(Some(approved)) = store.kv_get(&key).await else {
+        return;
+    };
+    if approved.is_empty() || approved == head_sha {
+        return;
+    }
+    let parents = match gh.commit_parents(repo, head_sha).await {
+        Ok(parents) => parents,
+        Err(e) => {
+            tracing::warn!(task_id, err = %e, "cannot read the PR head's parents to carry the approval");
+            return;
+        }
+    };
+    let Some(base_parent) = base_merge_parent(&approved, &parents) else {
+        return;
+    };
+    match gh.branch_contains(repo, base_branch, base_parent).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            tracing::warn!(task_id, err = %e, "cannot check the merged parent against the base branch");
+            return;
+        }
+    }
+
+    publish_carried_approval(store, gh, repo, task_id, pr_number, head_sha).await;
+}
+
+/// After orch rebased an approved branch onto the base with no conflict, the approval of the
+/// head it rebased moves to the rebased head
+pub(crate) async fn carry_approval_after_rebase(
+    store: &Arc<TaskStore>,
+    gh: &GhHttp,
+    repo: &str,
+    task_id: &str,
+    pr_number: u64,
+    rebased_from: &str,
+    worktree: &std::path::Path,
+) {
+    let key = approved_sha_key(repo, task_id, pr_number);
+    if !matches!(store.kv_get(&key).await, Ok(Some(approved)) if approved == rebased_from) {
+        return;
+    }
+    let Some(new_head) = worktree_head_sha(worktree).await else {
+        return;
+    };
+    publish_carried_approval(store, gh, repo, task_id, pr_number, &new_head).await;
+}
+
+/// Record `head_sha` as approved and publish the approval on it: in app mode an App approval
+/// and the check run, in comment mode the commit status
+async fn publish_carried_approval(
+    store: &Arc<TaskStore>,
+    gh: &GhHttp,
+    repo: &str,
+    task_id: &str,
+    pr_number: u64,
+    head_sha: &str,
+) {
+    let key = approved_sha_key(repo, task_id, pr_number);
+    if let Err(e) = store.kv_set(&key, head_sha).await {
+        tracing::warn!(task_id, err = %e, "failed to record the carried approval");
+        return;
+    }
+    let note = "Approval carried across a base branch update";
+    let app = review_app(repo).await;
+    // A ruleset that dismisses stale approvals needs an App approval on the new head too
+    if let Some(app) = app.as_deref() {
+        if let Err(e) = app
+            .submit_review(
+                repo,
+                pr_number,
+                crate::github::app::ReviewEvent::Approve,
+                note,
+                head_sha,
+                &[],
+            )
+            .await
+        {
+            tracing::warn!(task_id, err = %e, "failed to carry the App approval to the new head");
+        }
+    }
+    post_review_decision(
+        app.as_deref(),
+        gh,
+        repo,
+        Some(head_sha),
+        &ReviewDecision::Approve { issues: vec![] },
+        note,
+    )
+    .await;
+    tracing::info!(
+        task_id,
+        pr_number,
+        head_sha,
+        "approval carried across a base branch update"
+    );
+}
+
+/// The second parent of a merge of `approved` with another commit, the commit to check against the base
+fn base_merge_parent<'a>(approved: &str, parents: &'a [String]) -> Option<&'a str> {
+    match parents {
+        [first, second] if first == approved => Some(second.as_str()),
+        _ => None,
+    }
 }
 
 /// Whether a recorded approval still applies to the PR's current head commit
@@ -3691,6 +3816,25 @@ mod tests {
             "an unreadable PR head must not skip the review"
         );
         assert!(!approval_covers_head(Some(""), Some("")));
+    }
+
+    #[test]
+    fn only_a_merge_of_the_approved_commit_carries_the_approval() {
+        let parents = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            base_merge_parent("approved", &parents(&["approved", "base"])),
+            Some("base")
+        );
+        // A new commit on top of the approval, or a merge of something else, needs a review
+        assert_eq!(base_merge_parent("approved", &parents(&["approved"])), None);
+        assert_eq!(
+            base_merge_parent("approved", &parents(&["other", "base"])),
+            None
+        );
+        assert_eq!(
+            base_merge_parent("approved", &parents(&["approved", "a", "b"])),
+            None
+        );
     }
 
     /**

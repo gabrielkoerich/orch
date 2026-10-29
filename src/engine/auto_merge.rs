@@ -104,6 +104,55 @@ enum WorktreeRebaseOutcome {
     Unavailable(String),
 }
 
+/// Rebase a PR that fell behind its base in the task's worktree and carry its approval to the
+/// rebased head. Without a worktree, or when the rebase or push fails, GitHub merges the base in
+async fn bring_branch_up_to_date(
+    task: &ExternalTask,
+    repo: &str,
+    pr_number: u64,
+    head_sha: &str,
+    gh: &GhHttp,
+    store: &Arc<TaskStore>,
+) {
+    let task_id = task.id.0.as_str();
+    let worktree = opt_store_get_task(&Some(Arc::clone(store)), repo, task_id)
+        .await
+        .map(|t| t.worktree)
+        .filter(|wt| !wt.is_empty());
+    match attempt_worktree_rebase_and_force_push(task_id, worktree.clone()).await {
+        WorktreeRebaseOutcome::RebasedAndPushed => {
+            if let Some(wt) = worktree {
+                crate::engine::review::carry_approval_after_rebase(
+                    store,
+                    gh,
+                    repo,
+                    task_id,
+                    pr_number,
+                    head_sha,
+                    std::path::Path::new(&wt),
+                )
+                .await;
+            }
+            tracing::info!(
+                task_id,
+                pr_number,
+                "rebased the branch onto its base, checks run again"
+            );
+        }
+        outcome => {
+            tracing::info!(
+                task_id,
+                pr_number,
+                ?outcome,
+                "rebase not possible, merging the base in"
+            );
+            if let Err(e) = gh.update_pr_branch(repo, pr_number).await {
+                tracing::warn!(task_id, pr_number, err = %e, "update-branch failed; retrying next tick");
+            }
+        }
+    }
+}
+
 pub(crate) fn is_pr_behind(pr: &GitHubPullRequest) -> bool {
     pr.mergeable_state
         .as_deref()
@@ -1150,6 +1199,16 @@ pub(crate) async fn auto_merge_pr(
     }
     let head_sha = pr.head.sha.clone();
     let base_branch = pr.base.ref_.clone();
+    crate::engine::review::carry_approval_across_base_update(
+        store,
+        &gh,
+        repo,
+        &task.id.0,
+        pr_number,
+        &head_sha,
+        &base_branch,
+    )
+    .await;
     let required_contexts = gh
         .get_required_status_check_contexts(repo, &base_branch)
         .await?;
@@ -1687,9 +1746,7 @@ pub(crate) async fn auto_merge_pr(
             "PR head does not contain the base tip — updating branch and re-running checks before merge"
         );
         if behind_by.is_some() {
-            if let Err(e) = gh.update_pr_branch(repo, pr_number).await {
-                tracing::warn!(task_id = task.id.0, pr_number, err = %e, "update-branch failed; retrying next tick");
-            }
+            bring_branch_up_to_date(task, repo, pr_number, &head_sha, &gh, store).await;
         }
         return Ok(());
     }
@@ -1729,9 +1786,7 @@ pub(crate) async fn auto_merge_pr(
             "PR is not ready to merge on GitHub, holding merge"
         );
         if mergeable_state == "behind" {
-            if let Err(e) = gh.update_pr_branch(repo, pr_number).await {
-                tracing::warn!(task_id = task.id.0, pr_number, err = %e, "update-branch failed; retrying next tick");
-            }
+            bring_branch_up_to_date(task, repo, pr_number, &head_sha, &gh, store).await;
         }
 
         return Ok(());
