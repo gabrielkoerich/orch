@@ -72,7 +72,7 @@ A separate **sync tick** (~45s) handles less-frequent operations:
 2. **Merged PR detection** — marks tasks done when their PRs are merged
 3. **Mention scanning** — detects `@orch` (and legacy `@orchestrator`) mentions in issue comments
 4. **PR review processing** — re-routes tasks when reviews request changes (not child task creation), resets `ci_merge_failures` counter on re-route
-5. **Review agent** — spawns review agent for `needs_review` tasks
+5. **Review agent** — spawns review agent for `needs_review` tasks once CI has run on the PR head. Running checks hold the review, red CI routes the task back to its agent, and no CI or no started check after 15 minutes starts the review
 6. **Stale review detection** — resets `in_review` tasks with no active tmux session (>5 min)
 7. **Owner commands** — scans for `/slash` commands in issue comments
 8. **Skills sync** — clones/pulls skill repositories

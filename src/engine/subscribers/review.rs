@@ -1,6 +1,6 @@
 //! Reacts to NeedsReview events — spawns review agent immediately.
 
-use crate::backends::{ExternalBackend, ExternalId, Status};
+use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::engine::cooldown::AGENT_COOLDOWN_SECS;
 use crate::engine::dispatch_guard::DispatchGuard;
 use crate::engine::events::TaskEvent;
@@ -230,6 +230,10 @@ pub fn spawn(
                             );
                             continue;
                         }
+                    }
+
+                    if !ci_allows_review(&store, &task_manager, &repo, &task).await {
+                        continue;
                     }
 
                     // Try to acquire a semaphore permit.
@@ -643,6 +647,131 @@ pub fn spawn(
  * review agent cannot control escalated healthy tasks to Blocked during a rate-limit
  * window. The retry itself is already handled by the `RateLimited` / `Reset` arms
  **/
+/// The CI gate (#3904): true when the review may start. A task held for CI stays in needs_review
+/// and its refire count goes back to 0, so the sync sweep checks it again and never blocks it
+async fn ci_allows_review(
+    store: &Arc<TaskStore>,
+    task_manager: &Arc<TaskManager>,
+    repo: &str,
+    task: &ExternalTask,
+) -> bool {
+    let task_id = task.id.0.as_str();
+    let Some(pr_number) = opt_store_get_task(&Some(store.clone()), repo, task_id)
+        .await
+        .and_then(|t| t.pr_number)
+        .and_then(|n| u64::try_from(n).ok())
+    else {
+        return true;
+    };
+    let gate = match GhHttp::new() {
+        Ok(gh) => {
+            crate::engine::review_gate::review_ci_gate(&gh, store, repo, task_id, pr_number).await
+        }
+        Err(e) => Err(e),
+    };
+
+    match gate {
+        Ok(crate::engine::review_gate::CiGate::Start) => true,
+        // The merge still waits for green CI, so a lookup error does not hold the review
+        Err(e) => {
+            tracing::warn!(task_id, pr_number, err = %e, "CI gate lookup failed, starting the review");
+            true
+        }
+        Ok(crate::engine::review_gate::CiGate::Wait) => {
+            tracing::info!(
+                task_id,
+                pr_number,
+                "CI still running on the PR head, review waits"
+            );
+            if let Err(e) = crate::store::store_set_result(
+                &Some(store.clone()),
+                repo,
+                task_id,
+                &[("needs_review_refires", serde_json::json!(0))],
+            )
+            .await
+            {
+                tracing::warn!(task_id, err = %e, "failed to reset needs_review_refires for a task held by the CI gate");
+            }
+            false
+        }
+        Ok(crate::engine::review_gate::CiGate::Red(failed)) => {
+            route_back_on_red_ci(store, task_manager, repo, task, pr_number, &failed).await;
+            false
+        }
+    }
+}
+
+/// CI failed before the review, so the task agent fixes it without a review round
+async fn route_back_on_red_ci(
+    store: &Arc<TaskStore>,
+    task_manager: &Arc<TaskManager>,
+    repo: &str,
+    task: &ExternalTask,
+    pr_number: u64,
+    failed: &[String],
+) {
+    let task_id = task.id.0.as_str();
+    let failures = match crate::store::store_increment(
+        &Some(store.clone()),
+        repo,
+        task_id,
+        "ci_merge_failures",
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(task_id, err = %e, "failed to increment ci_merge_failures, review waits");
+            return;
+        }
+    };
+    let checks = failed.join(", ");
+    let max = crate::engine::auto_merge::MAX_CI_MERGE_FAILURES;
+    let (status, fields) = if failures >= max {
+        tracing::error!(
+            task_id,
+            pr_number,
+            failures,
+            checks,
+            "CI failed before review, CI failure limit reached"
+        );
+        (
+            Status::Blocked,
+            vec![(
+                "block_reason",
+                serde_json::json!(format!("CI failure limit ({max}) reached before review")),
+            )],
+        )
+    } else {
+        tracing::warn!(
+            task_id,
+            pr_number,
+            failures,
+            checks,
+            "CI failed before review, routing back to the task agent"
+        );
+        (
+            Status::Routed,
+            vec![
+                (
+                    "last_error",
+                    serde_json::json!(format!(
+                        "CI failed on PR #{pr_number} before review: {checks}. Fix the failing checks"
+                    )),
+                ),
+                ("route_reason", serde_json::json!("re-dispatch after CI failed before review")),
+            ],
+        )
+    };
+    if let Err(e) = task_manager
+        .update_task_status_and_result(&task.id, status, &fields)
+        .await
+    {
+        tracing::error!(task_id, err = %e, "failed to move a task whose CI failed before review");
+    }
+}
+
 async fn recorded(
     store: &Arc<TaskStore>,
     repo: &str,

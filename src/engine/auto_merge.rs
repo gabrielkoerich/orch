@@ -41,7 +41,7 @@ pub(crate) const MAX_MERGE_CONFLICT_RETRIES: u64 = 3;
 
 /// Maximum number of CI failure or CI timeout events in `auto_merge_pr` before
 /// the task is blocked for human intervention instead of re-entering NeedsReview.
-const MAX_CI_MERGE_FAILURES: u64 = 3;
+pub(crate) const MAX_CI_MERGE_FAILURES: u64 = 3;
 
 // Global semaphore limiting concurrent CI polling loops across all tasks.
 static CI_POLL_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -751,7 +751,7 @@ pub(crate) fn any_changes_requested_in_reviews(reviews: &[GitHubReview]) -> bool
 /// the agent retry loop — but no code change can fix a billing problem.
 /// This function lets the caller short-circuit that loop and block the task
 /// immediately with a human-readable billing message instead.
-async fn billing_failed_runs(
+pub(crate) async fn billing_failed_runs(
     gh: &GhHttp,
     repo: &str,
     sha: &str,

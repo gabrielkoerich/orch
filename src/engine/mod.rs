@@ -23,6 +23,7 @@ pub mod events;
 pub mod jobs;
 pub mod relay;
 pub mod review;
+pub mod review_gate;
 pub mod review_poll;
 pub mod router;
 pub mod runner;
