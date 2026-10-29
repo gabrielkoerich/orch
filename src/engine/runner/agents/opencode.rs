@@ -30,6 +30,7 @@ use super::{
 };
 use crate::parser;
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -56,6 +57,18 @@ pub(crate) fn reset_model_caches_for_test() {
     }
     FREE_MODELS_REFRESH_IN_PROGRESS.store(false, Ordering::Release);
     ALL_MODELS_REFRESH_IN_PROGRESS.store(false, Ordering::Release);
+}
+
+/**
+ * Model discovery runs the real `opencode` binary, and opencode 2.2.1 starts an
+ * `opencode serve --service` child that outlives it, so a suite run left one server
+ * behind per test process. It also made the result depend on the machine, and CI has no
+ * opencode at all. A test that needs models passes them in, or uses `Router::new_for_test`.
+ * `cfg(test)` is unset when the integration tests link the library, so debug builds count
+ * too, and the run-time check keeps the live path compiled in every build
+ **/
+fn skip_live_opencode_discovery() -> bool {
+    cfg!(any(test, debug_assertions))
 }
 
 fn update_discovered_models_cache(
@@ -799,6 +812,9 @@ fn classify_opencode_message(message: &str) -> AgentError {
 /// Non-blocking: returns cached data immediately. When the cache is cold
 /// or expired, spawns a background thread to refresh via `opencode models`.
 pub fn discover_free_opencode_models() -> Vec<String> {
+    if skip_live_opencode_discovery() {
+        return Vec::new();
+    }
     let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
 
     let now = chrono::Utc::now().timestamp();
@@ -857,6 +873,9 @@ pub fn discover_free_opencode_models() -> Vec<String> {
 /// Non-blocking: returns cached data immediately. When the cache is cold
 /// or expired, spawns a background refresh via `opencode models`.
 pub fn discover_opencode_models() -> Vec<String> {
+    if skip_live_opencode_discovery() {
+        return Vec::new();
+    }
     let cache = ALL_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
     let now = chrono::Utc::now().timestamp();
 
@@ -900,6 +919,9 @@ pub fn discover_opencode_models() -> Vec<String> {
 /// own tokio runtime, avoiding `block_on` restrictions when called from within
 /// an existing runtime (e.g. `#[tokio::test]` or a nested runtime context).
 pub fn prime_free_model_cache() {
+    if skip_live_opencode_discovery() {
+        return;
+    }
     let discovered_all = std::thread::spawn(|| {
         if let Ok(rt) = tokio::runtime::Runtime::new() {
             rt.block_on(run_opencode_models_discovery_async()).0
@@ -936,84 +958,114 @@ pub fn prime_free_model_cache() {
 /// the "returned empty" warning says which of the failure branches fired,
 /// without requiring `RUST_LOG=debug` in production.
 async fn run_opencode_models_discovery_async() -> (Vec<String>, &'static str) {
-    if !crate::cmd_cache::command_exists("opencode") {
-        tracing::warn!("opencode not in PATH — skipping model discovery");
+    run_opencode_models_cli(std::time::Duration::from_secs(30)).await
+}
+
+/// Run `opencode models` and reap any process-group leftovers when it returns
+pub(crate) async fn run_opencode_models_cli(
+    timeout: std::time::Duration,
+) -> (Vec<String>, &'static str) {
+    run_opencode_models_cli_inner("opencode", timeout).await
+}
+
+fn opencode_program_available(program: &str) -> bool {
+    let path = Path::new(program);
+    if path.is_absolute() || program.contains('/') {
+        path.is_file()
+    } else {
+        crate::cmd_cache::command_exists(program)
+    }
+}
+
+/// `kill(2)`. A negative `pid` addresses the process group with that id
+#[cfg(unix)]
+fn raw_kill(pid: i32, sig: i32) -> i32 {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    // SAFETY: both arguments are plain integers and kill has no other effect on this process
+    unsafe { kill(pid, sig) }
+}
+
+/// SIGKILL the group that `opencode models` leads, because the `opencode serve --service`
+/// child it starts outlives it and the group is the only handle on that grandchild
+#[cfg(unix)]
+fn kill_process_group(pgid: u32) {
+    const SIGKILL: i32 = 9;
+    let _ = raw_kill(-(pgid as i32), SIGKILL);
+}
+
+async fn run_opencode_models_cli_inner(
+    program: &str,
+    timeout: std::time::Duration,
+) -> (Vec<String>, &'static str) {
+    if !opencode_program_available(program) {
+        tracing::warn!("opencode not in PATH, skipping model discovery");
         return (vec![], "command_not_found");
     }
 
-    let mut child = match tokio::process::Command::new("opencode")
-        .args(["models"])
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(["models"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %e, "failed to spawn opencode models");
             return (vec![], "spawn_failed");
         }
     };
+    let pgid = child.id();
+    let wait = tokio::time::timeout(timeout, child.wait_with_output()).await;
 
-    let timeout = std::time::Duration::from_secs(30);
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => {
-                // Use tokio's async read to read stdout
-                let stdout = match child.stdout.take() {
-                    Some(mut s) => {
-                        let mut buf = String::new();
-                        use tokio::io::AsyncReadExt;
-                        let _ = s.read_to_string(&mut buf).await.ok();
-                        buf
-                    }
-                    None => String::new(),
-                };
-                let models: Vec<String> = stdout
-                    .lines()
-                    .map(|l| l.trim().to_string())
-                    .filter(|l| !l.is_empty())
-                    .collect();
-                let reason = if models.is_empty() {
-                    "empty_output"
-                } else {
-                    "ok"
-                };
-                return (models, reason);
-            }
-            Ok(Some(status)) => {
-                let stderr = match child.stderr.take() {
-                    Some(mut s) => {
-                        let mut buf = String::new();
-                        use tokio::io::AsyncReadExt;
-                        let _ = s.read_to_string(&mut buf).await.ok();
-                        buf
-                    }
-                    None => String::new(),
-                };
-                let stderr_trimmed = stderr.trim();
-                let stderr_display = if stderr_trimmed.len() > 500 {
-                    format!("{}...", &stderr_trimmed[..500])
-                } else {
-                    stderr_trimmed.to_string()
-                };
-                tracing::warn!(?status, stderr = %stderr_display, "opencode models command failed");
-                return (vec![], "exit_status_failure");
-            }
-            Ok(None) => {
-                if start.elapsed() > timeout {
-                    tracing::warn!("opencode models timed out after 30s, killing process");
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                    return (vec![], "timeout");
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to wait on opencode models");
-                let _ = child.kill().await;
-                return (vec![], "wait_failed");
-            }
+    #[cfg(unix)]
+    if let Some(pid) = pgid {
+        kill_process_group(pid);
+    }
+
+    match wait {
+        Ok(Ok(output)) if output.status.success() => {
+            let models: Vec<String> = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+            let reason = if models.is_empty() {
+                "empty_output"
+            } else {
+                "ok"
+            };
+            (models, reason)
+        }
+        Ok(Ok(output)) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim();
+            let stderr_display = if stderr.len() > 500 {
+                format!("{}...", &stderr[..stderr.floor_char_boundary(500)])
+            } else {
+                stderr.to_string()
+            };
+            tracing::warn!(
+                status = ?output.status,
+                stderr = %stderr_display,
+                "opencode models command failed"
+            );
+            (vec![], "exit_status_failure")
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "failed to wait on opencode models");
+            (vec![], "wait_failed")
+        }
+        Err(_) => {
+            tracing::warn!(
+                secs = timeout.as_secs(),
+                "opencode models timed out, killing process group"
+            );
+            (vec![], "timeout")
         }
     }
 }
@@ -1620,12 +1672,69 @@ mod tests {
 
     #[test]
     fn free_models_discovery_returns_vec() {
-        // discover_free_opencode_models returns empty when cache is cold
-        // and opencode isn't installed (no hardcoded fallbacks)
+        // discover_free_opencode_models returns empty in test/debug builds
         let models = discover_free_opencode_models();
-        // Just verify it returns without panicking — actual content
-        // depends on whether opencode is installed and responsive
-        assert!(models.len() < 1000, "sanity check");
+        assert!(models.is_empty());
+    }
+
+    #[test]
+    fn live_opencode_discovery_is_skipped_in_test_builds() {
+        assert!(skip_live_opencode_discovery());
+        assert!(discover_opencode_models().is_empty());
+        assert!(discover_free_opencode_models().is_empty());
+        prime_free_model_cache();
+        assert!(discover_opencode_models().is_empty());
+    }
+
+    /// The stub stands in for opencode 2.2.1, which starts `opencode serve --service`
+    /// as a child that outlives it
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn models_cli_reaps_orphaned_process_group() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sleeper_pid_path = dir.path().join("sleeper.pid");
+        let script = dir.path().join("opencode");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n/bin/sleep 60 </dev/null >/dev/null 2>&1 &\necho $! > '{}'\necho test-model-free\n",
+                sleeper_pid_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The production discovery timeout, so a loaded machine does not turn this into
+        // a timeout run, which reaps the group too and would assert nothing
+        let (models, reason) = run_opencode_models_cli_inner(
+            script.to_str().unwrap(),
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(reason, "ok");
+        assert_eq!(models, vec!["test-model-free".to_string()]);
+
+        let sleeper: u32 = std::fs::read_to_string(&sleeper_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("sleeper pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pid_is_alive(sleeper) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !pid_is_alive(sleeper),
+            "sleeper {sleeper} must die with the process group when opencode models returns"
+        );
+    }
+
+    #[cfg(unix)]
+    fn pid_is_alive(pid: u32) -> bool {
+        // Signal 0 is the POSIX existence probe
+        super::raw_kill(pid as i32, 0) == 0
     }
 
     #[test]

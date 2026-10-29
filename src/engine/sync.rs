@@ -3858,7 +3858,10 @@ mod tests {
             &Arc::new(TmuxManager::new()),
             "owner/repo",
             &EngineConfig::default(),
-            &Arc::new(RwLock::new(crate::engine::router::Router::from_config())),
+            &Arc::new(RwLock::new(crate::engine::router::Router::new_for_test(
+                crate::engine::router::RouterConfig::default(),
+                vec!["claude".to_string()],
+            ))),
             &task_manager,
             &store,
             &dispatching,
@@ -4436,7 +4439,10 @@ mod tests {
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
-        let router = Arc::new(RwLock::new(crate::engine::router::Router::from_config()));
+        let router = Arc::new(RwLock::new(crate::engine::router::Router::new_for_test(
+            crate::engine::router::RouterConfig::default(),
+            vec!["claude".to_string()],
+        )));
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let auto_merge_in_flight: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
