@@ -1,6 +1,6 @@
 //! Core tick loop phases.
 //!
-//! The engine ticks every ~10 seconds. Each tick runs six sequential phases:
+//! The engine ticks every ~10 seconds. Each tick runs six phases:
 //! 1. Poll tmux for finished sessions
 //! 2. Recover stuck in-progress tasks
 //! 3. Route and dispatch:
@@ -8,6 +8,9 @@
 //!    - 3b. Dispatch routed tasks (spawn agents)
 //! 4. Unblock parents whose children are all done
 //! 5. Run cron job scheduler
+//!
+//! [`tick_all`] runs them for every project. Phases 1-2 and 3b-5 run for all projects at
+//! once; only routing is serial, because it holds the router write lock.
 
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::channels::capture::CaptureService;
@@ -47,10 +50,9 @@ static STARTUP_CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
 
 /// Per outer engine-loop quota for expensive routing calls.
 ///
-/// `tick()` runs once per active project. Without a quota shared by all those
-/// project ticks, `router.max_tasks_per_tick = 1` still permits one slow LLM
-/// routing call per project plus one global sweep route per project, multiplying
-/// 45s router timeouts into multi-minute watchdog stalls.
+/// Routing runs once per active project. Without a quota shared by all of them,
+/// `router.max_tasks_per_tick = 1` still permits one slow LLM routing call per
+/// project, multiplying 45s router timeouts into multi-minute watchdog stalls.
 pub(crate) struct RoutingTickQuota {
     remaining: usize,
 }
@@ -108,7 +110,7 @@ async fn startup_cleanup(tmux: &TmuxManager) {
     }
 }
 
-use super::EngineConfig;
+use super::{EngineConfig, ProjectEngine};
 use crate::store::{set_review_session_expected, store_set_by_id, store_touch_updated_at};
 
 async fn recover_routed_blocked_dispatch(
@@ -1844,10 +1846,10 @@ pub(crate) async fn tick_route_tasks(
 /// `active_repos` must be the full set of currently-configured project repos,
 /// not just the repo of the tick that called this — mirroring
 /// `dispatch_routed_tasks_global` (see its doc comment for the "racing the real
-/// per-repo dispatch" failure mode this guards against). `tick()` runs once per
-/// active project; filtering on `t.repo != current_repo` alone (the previous
-/// behavior) made every *other* active repo's new tasks look "orphaned" too and
-/// routed them a tick early, through the wrong repo's tick.
+/// per-repo dispatch" failure mode this guards against). Filtering on
+/// `t.repo != current_repo` alone (the previous behavior) made every *other*
+/// active repo's new tasks look "orphaned" too and routed them a tick early,
+/// through the wrong repo's tick.
 pub(crate) async fn route_new_tasks_global(
     router: &mut Router,
     store: &Arc<TaskStore>,
@@ -2444,10 +2446,9 @@ fn group_orphaned_routed_tasks(
 /// tasks are eventually dispatched.
 ///
 /// `active_repos` must be the full set of currently-configured project repos,
-/// not just the repo of the tick that called this. `tick()` runs once per
-/// active project; passing only that project's own repo would make every
-/// other active repo's routed tasks look "orphaned" too and dispatch them a
-/// second time through this fallback path, racing the real per-repo dispatch.
+/// not just one project's repo; passing only that project's own repo would make
+/// every other active repo's routed tasks look "orphaned" too and dispatch them
+/// a second time through this fallback path, racing the real per-repo dispatch.
 ///
 /// `TaskRunner::resolve_project_dir` already falls back to the deterministic
 /// `~/.orch/projects/<owner>/<repo>.git` bare-clone convention when a repo is
@@ -2711,36 +2712,179 @@ pub(crate) async fn tick_job_scheduler(
     jobs::tick(jobs_path, backend, store, repo, transport).await
 }
 
-/// Core tick — runs every 10s.
+/// Core tick for one project, up to the routing phase.
 ///
-/// Delegates to named phase functions in order:
+/// Takes a shared `&Router` so every project can run this at the same time:
 /// 1. `tick_check_session_completions` — poll tmux for finished sessions
-/// 2. `tick_recover_stuck_tasks`       — reset in_progress/in_review tasks with no active session
-/// 3. `tick_route_tasks`               — route status:new tasks to an agent
-/// 4. `tick_dispatch_tasks`            — spawn agents for status:routed tasks
-/// 5. `tick_unblock_parents`           — unblock parents whose sub-issues are all done
-/// 6. `tick_job_scheduler`             — fire due cron jobs
+/// 2. `tick_detect_silent_agents`      — cooldown agents that produced no output
+/// 3. `tick_recover_stuck_tasks`       — reset in_progress/in_review tasks with no session
+/// 4. `reconcile_dependencies`         — re-check tasks waiting on a dependency
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn tick(
+pub(crate) async fn tick_before_routing(
+    backend: &Arc<dyn ExternalBackend>,
+    tmux: &Arc<TmuxManager>,
+    repo: &str,
+    capture: &Arc<CaptureService>,
+    config: &EngineConfig,
+    router: &Router,
+    task_manager: &Arc<TaskManager>,
+    dispatching: &Arc<DashMap<String, String>>,
+    store: &Arc<TaskStore>,
+    transport: Option<&Arc<crate::channels::transport::Transport>>,
+    auto_merge_in_flight: &Arc<DashSet<String>>,
+    session_map: &std::collections::HashMap<String, bool>,
+) {
+    let mut phases: Vec<(&str, u128)> = Vec::new();
+    let mut at = Instant::now();
+
+    if let Err(e) = tick_check_session_completions(tmux, repo, capture, store).await {
+        tracing::warn!(err = %e, "session completion phase failed");
+    }
+    phases.push(("sessions", at.elapsed().as_millis()));
+
+    // Every node tends its own sessions, only the leader decides. Followers dispatch once
+    // tasks are assigned to nodes
+    if !store.is_leader() {
+        super::log_phase_timings("tick.pre_routing", repo, &phases);
+        return;
+    }
+
+    at = Instant::now();
+    if let Err(e) =
+        tick_detect_silent_agents(tmux, repo, capture, backend, task_manager, config, store).await
+    {
+        tracing::warn!(err = %e, "silent-agent detection phase failed");
+    }
+    phases.push(("silent_agents", at.elapsed().as_millis()));
+
+    at = Instant::now();
+    if let Err(e) = tick_recover_stuck_tasks(
+        backend,
+        tmux,
+        repo,
+        task_manager,
+        config,
+        store,
+        session_map,
+        router,
+        dispatching,
+        auto_merge_in_flight,
+    )
+    .await
+    {
+        tracing::warn!(err = %e, "stuck-task recovery phase failed");
+    }
+    phases.push(("stuck_tasks", at.elapsed().as_millis()));
+
+    at = Instant::now();
+    if let Err(err) = crate::engine::dependencies::reconcile_dependencies(
+        backend.as_ref(),
+        store,
+        transport.map(|arc| arc.as_ref()),
+    )
+    .await
+    {
+        tracing::warn!(err = %err, "dependency reconcile failed");
+    }
+    phases.push(("dependencies", at.elapsed().as_millis()));
+
+    super::log_phase_timings("tick.pre_routing", repo, &phases);
+}
+
+/// Core tick for one project, after the routing phase.
+///
+/// Takes the router's decision as a `DispatchMode` value instead of the router itself, so
+/// every project can run this at the same time:
+/// 1. `tick_dispatch_tasks`  — spawn agents for status:routed tasks
+/// 2. `tick_unblock_parents` — unblock parents whose sub-issues are all done
+/// 3. `tick_job_scheduler`   — fire due cron jobs
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn tick_after_routing(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
     repo: &str,
     runner: &Arc<TaskRunner>,
     capture: &Arc<CaptureService>,
     semaphore: &Arc<Semaphore>,
-    config: &EngineConfig,
-    jobs_path: &std::path::Path,
-    router: &mut Router,
+    project_dir: &std::path::Path,
     task_manager: &Arc<TaskManager>,
     weight_tx: &mpsc::Sender<WeightSignal>,
+    dispatch_mode: DispatchMode,
     dispatching: &Arc<DashMap<String, String>>,
     store: &Arc<TaskStore>,
     transport: Option<&Arc<crate::channels::transport::Transport>>,
+    session_map: &std::collections::HashMap<String, bool>,
+) {
+    let mut phases: Vec<(&str, u128)> = Vec::new();
+    let mut at = Instant::now();
+
+    if let Err(e) = tick_dispatch_tasks(
+        backend,
+        tmux,
+        repo,
+        runner,
+        capture,
+        semaphore,
+        task_manager,
+        weight_tx,
+        dispatch_mode,
+        dispatching,
+        store,
+        session_map,
+    )
+    .await
+    {
+        tracing::warn!(err = %e, "dispatch phase failed");
+    }
+    phases.push(("dispatch", at.elapsed().as_millis()));
+
+    at = Instant::now();
+    if let Err(e) = tick_unblock_parents(backend, task_manager, store, repo).await {
+        tracing::warn!(err = %e, "parent-unblock phase failed");
+    }
+    phases.push(("unblock_parents", at.elapsed().as_millis()));
+
+    at = Instant::now();
+    let jobs_path = project_dir.join(".orch.yml");
+    if let Err(e) = tick_job_scheduler(&jobs_path, backend, Some(store), repo, transport).await {
+        tracing::error!(?e, "job scheduler tick failed");
+    }
+    phases.push(("jobs", at.elapsed().as_millis()));
+
+    super::log_phase_timings("tick.post_routing", repo, &phases);
+}
+
+/// Core tick — runs every 10s for every project.
+///
+/// Projects no longer wait on each other: the phases around routing run for all of them at
+/// once, so tick time tracks the slowest project instead of the sum. Routing stays serial
+/// because it needs the router write lock and one shared `RoutingTickQuota`, which is what
+/// gives `router.max_tasks_per_tick` its meaning.
+///
+/// The tmux session map and the two global sweeps are the same for every project, so they
+/// run once per tick rather than once per project.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn tick_all(
+    engines: &[ProjectEngine],
+    tmux: &Arc<TmuxManager>,
+    capture: &Arc<CaptureService>,
+    semaphore: &Arc<Semaphore>,
+    config: &EngineConfig,
+    router: &Arc<tokio::sync::RwLock<Router>>,
+    weight_tx: &mpsc::Sender<WeightSignal>,
+    dispatching: &Arc<DashMap<String, String>>,
+    transport: Option<&Arc<crate::channels::transport::Transport>>,
     active_repos: &std::collections::HashSet<String>,
     auto_merge_in_flight: &Arc<DashSet<String>>,
-    routing_quota: &mut RoutingTickQuota,
-) -> anyhow::Result<()> {
+) {
     let _tick_span = tracing::info_span!("engine.tick").entered();
+
+    let Some(first) = engines.first() else {
+        return;
+    };
+    // All project engines share one SQLite store, so leadership and the global sweeps below
+    // are the same whichever project they are read from
+    let store = &first.store;
 
     // Calls made since the previous tick, so hourly quota exhaustion can be traced
     for (project, call_type, calls) in crate::github::http::drain_call_counts()
@@ -2758,82 +2902,112 @@ pub(crate) async fn tick(
     // Run startup cleanup once to kill stale sessions from previous runs.
     startup_cleanup(tmux).await;
 
-    if let Err(e) = tick_check_session_completions(tmux, repo, capture, store).await {
-        tracing::warn!(err = %e, "session completion phase failed");
-    }
-    // Every node tends its own sessions, only the leader decides. Followers dispatch once tasks are assigned to nodes
-    if !store.is_leader() {
-        return Ok(());
+    // One `tmux list-panes -a` for every project's stuck-task recovery, instead of one each
+    let session_map = tmux.batch_session_active().await;
+
+    {
+        let router_guard = router.read().await;
+        let mut passes = Vec::with_capacity(engines.len());
+        for engine in engines {
+            passes.push(REPO_CONTEXT.scope(
+                engine.repo.clone(),
+                tick_before_routing(
+                    &engine.backend,
+                    tmux,
+                    &engine.repo,
+                    capture,
+                    config,
+                    &router_guard,
+                    &engine.task_manager,
+                    dispatching,
+                    &engine.store,
+                    transport,
+                    auto_merge_in_flight,
+                    &session_map,
+                ),
+            ));
+        }
+        futures::future::join_all(passes).await;
     }
 
-    if let Err(e) =
-        tick_detect_silent_agents(tmux, repo, capture, backend, task_manager, config, store).await
-    {
-        tracing::warn!(err = %e, "silent-agent detection phase failed");
+    if !store.is_leader() {
+        return;
     }
-    // Fetch session map once and share between stuck-task recovery and dispatch to avoid
-    // spawning two `tmux list-panes -a` subprocesses per tick.
+
+    {
+        let mut router_guard = router.write().await;
+        let mut routing_quota =
+            RoutingTickQuota::new(crate::engine::router::config::max_tasks_per_routing_tick());
+        for engine in engines {
+            let at = Instant::now();
+            REPO_CONTEXT
+                .scope(engine.repo.clone(), async {
+                    if let Err(e) = tick_route_tasks(
+                        &engine.backend,
+                        &engine.task_manager,
+                        &mut router_guard,
+                        &engine.store,
+                        &engine.repo,
+                        &mut routing_quota,
+                    )
+                    .await
+                    {
+                        tracing::warn!(err = %e, "routing phase failed");
+                    }
+                })
+                .await;
+            super::log_phase_timings(
+                "tick.routing",
+                &engine.repo,
+                &[("route", at.elapsed().as_millis())],
+            );
+        }
+
+        // Global routing sweep for tasks from inactive or removed repos.
+        // tick_route_tasks is scoped to the active repo; tasks from projects no longer
+        // in config are never returned by list_routable and would stay in 'new' indefinitely.
+        if let Err(e) =
+            route_new_tasks_global(&mut router_guard, store, active_repos, &mut routing_quota).await
+        {
+            tracing::warn!(err = %e, "global new-task routing sweep failed");
+        }
+    }
+
+    let dispatch_mode = dispatch_mode_from_router(&*router.read().await);
+
+    // Re-read the session map: the completion phase above kills the sessions of finished
+    // agents, and dispatch must not treat a killed session as one that still blocks a task
     let session_map = tmux.batch_session_active().await;
-    if let Err(e) = tick_recover_stuck_tasks(
-        backend,
-        tmux,
-        repo,
-        task_manager,
-        config,
-        store,
-        &session_map,
-        router,
-        dispatching,
-        auto_merge_in_flight,
-    )
-    .await
-    {
-        tracing::warn!(err = %e, "stuck-task recovery phase failed");
+
+    let mut passes = Vec::with_capacity(engines.len());
+    for engine in engines {
+        passes.push(REPO_CONTEXT.scope(
+            engine.repo.clone(),
+            tick_after_routing(
+                &engine.backend,
+                tmux,
+                &engine.repo,
+                &engine.runner,
+                capture,
+                semaphore,
+                &engine.project_dir,
+                &engine.task_manager,
+                weight_tx,
+                dispatch_mode,
+                dispatching,
+                &engine.store,
+                transport,
+                &session_map,
+            ),
+        ));
     }
-    if let Err(err) = crate::engine::dependencies::reconcile_dependencies(
-        backend.as_ref(),
-        store,
-        transport.map(|arc| arc.as_ref()),
-    )
-    .await
-    {
-        tracing::warn!(err = %err, "dependency reconcile failed");
-    }
-    if let Err(e) =
-        tick_route_tasks(backend, task_manager, router, store, repo, routing_quota).await
-    {
-        tracing::warn!(err = %e, "routing phase failed");
-    }
-    // Global routing sweep for tasks from inactive or removed repos.
-    // tick_route_tasks is scoped to the active repo; tasks from projects no longer
-    // in config are never returned by list_routable and would stay in 'new' indefinitely.
-    if let Err(e) = route_new_tasks_global(router, store, active_repos, routing_quota).await {
-        tracing::warn!(err = %e, "global new-task routing sweep failed");
-    }
-    let dispatch_mode = dispatch_mode_from_router(router);
-    if let Err(e) = tick_dispatch_tasks(
-        backend,
-        tmux,
-        repo,
-        runner,
-        capture,
-        semaphore,
-        task_manager,
-        weight_tx,
-        dispatch_mode,
-        dispatching,
-        store,
-        &session_map,
-    )
-    .await
-    {
-        tracing::warn!(err = %e, "dispatch phase failed");
-    }
+    futures::future::join_all(passes).await;
+
     // Global dispatch sweep for routed tasks from inactive or removed repos.
-    // tick_dispatch_tasks is scoped to the active repo; tasks from projects no longer
+    // tick_dispatch_tasks is scoped to each active repo; tasks from projects no longer
     // in config are never returned by list_external_by_status and would stay in
     // 'routed' indefinitely (see #3413). Excludes the full active-repo set, not just
-    // `repo`, so this per-project tick doesn't treat other active repos as orphaned.
+    // one repo, so it doesn't treat other active repos as orphaned.
     if let Err(e) = dispatch_routed_tasks_global(
         tmux,
         capture,
@@ -2849,13 +3023,6 @@ pub(crate) async fn tick(
     {
         tracing::warn!(err = %e, "global routed-task dispatch sweep failed");
     }
-    if let Err(e) = tick_unblock_parents(backend, task_manager, store, repo).await {
-        tracing::warn!(err = %e, "parent-unblock phase failed");
-    }
-    if let Err(e) = tick_job_scheduler(jobs_path, backend, Some(store), repo, transport).await {
-        tracing::error!(?e, "job scheduler tick failed");
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -4106,6 +4273,41 @@ mod tests {
         assert_eq!(updates.len(), 1, "only one parent should be unblocked");
         assert_eq!(updates[0].0, "40", "task 40 should be unblocked");
         assert_eq!(updates[0].1, Status::New);
+    }
+
+    /// `tick_all` reads leadership and the global sweeps from the first project's store, so
+    /// an empty project list must return before any of that, and touch nothing.
+    #[tokio::test]
+    async fn tick_all_is_a_no_op_without_projects() {
+        let transport = Arc::new(Transport::new());
+        let capture = Arc::new(CaptureService::new(transport.clone()));
+        let tmux = Arc::new(TmuxManager::new());
+        let semaphore = Arc::new(Semaphore::new(1));
+        let router = Arc::new(tokio::sync::RwLock::new(cooled_review_router_for_test()));
+        let (weight_tx, mut weight_rx) = mpsc::channel(8);
+        let dispatching = Arc::new(DashMap::new());
+        let auto_merge_in_flight = Arc::new(DashSet::new());
+
+        tick_all(
+            &[],
+            &tmux,
+            &capture,
+            &semaphore,
+            &EngineConfig::default(),
+            &router,
+            &weight_tx,
+            &dispatching,
+            Some(&transport),
+            &std::collections::HashSet::new(),
+            &auto_merge_in_flight,
+        )
+        .await;
+
+        assert!(dispatching.is_empty(), "no project, so no dispatch claimed");
+        assert!(
+            weight_rx.try_recv().is_err(),
+            "no project, so no weight signal"
+        );
     }
 
     #[tokio::test]
@@ -5527,9 +5729,9 @@ mod tests {
         );
     }
 
-    /// Regression test for the PR #3413 review finding: `tick()` runs once per active
-    /// project, so a single `current_repo` string is the wrong exclusion — repo B's
-    /// routed tasks must not look "orphaned" during repo A's tick just because A != B.
+    /// Regression test for the PR #3413 review finding: a single `current_repo` string is
+    /// the wrong exclusion — repo B's routed tasks must not look "orphaned" during repo A's
+    /// dispatch just because A != B.
     /// `group_orphaned_routed_tasks` must exclude every repo in the full active set.
     #[tokio::test]
     async fn group_orphaned_routed_tasks_excludes_all_active_repos_not_just_current() {
