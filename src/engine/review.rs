@@ -140,7 +140,9 @@ use super::router::Router;
 #[derive(Debug, Clone)]
 pub(crate) enum ReviewDecision {
     /// Review approved, PR can be merged.
-    Approve,
+    Approve {
+        issues: Vec<crate::engine::runner::response::ReviewIssue>,
+    },
     /// Changes requested, PR needs fixes.
     RequestChanges {
         notes: String,
@@ -466,7 +468,9 @@ async fn build_review_context(
                 "PR head already approved — skipping review, merge retry continues"
             );
             record_carried_approval(store, repo, &task.id.0, pr_number).await;
-            return Ok(ReviewPhase::EarlyReturn(ReviewDecision::Approve));
+            return Ok(ReviewPhase::EarlyReturn(ReviewDecision::Approve {
+                issues: Vec::new(),
+            }));
         }
     }
 
@@ -1140,7 +1144,7 @@ fn review_decision_from_response(
     review_response: runner::response::ReviewResponse,
 ) -> ReviewDecision {
     match review_response.decision.as_str() {
-        "approve" => ReviewDecision::Approve,
+        "approve" => approve_from_evidence(review_response),
         "request_changes" => ReviewDecision::RequestChanges {
             notes: review_response.notes,
             issues: review_response.issues,
@@ -1149,9 +1153,47 @@ fn review_decision_from_response(
     }
 }
 
+/// An approve that reports failing tests or error-severity issues is treated as request_changes
+fn approve_from_evidence(review_response: runner::response::ReviewResponse) -> ReviewDecision {
+    let tests_failed = review_response
+        .test_results
+        .as_deref()
+        .is_some_and(|s| s.trim().eq_ignore_ascii_case("fail"));
+    let has_error = review_response
+        .issues
+        .iter()
+        .any(|issue| issue.severity.trim().eq_ignore_ascii_case("error"));
+    if tests_failed || has_error {
+        let notes = if tests_failed {
+            notes_for_failed_tests(review_response.notes)
+        } else {
+            review_response.notes
+        };
+        ReviewDecision::RequestChanges {
+            notes,
+            issues: review_response.issues,
+        }
+    } else {
+        ReviewDecision::Approve {
+            issues: review_response.issues,
+        }
+    }
+}
+
+fn notes_for_failed_tests(notes: String) -> String {
+    const MARK: &str = "Review reported test_results: fail";
+    if notes.trim().is_empty() {
+        MARK.to_string()
+    } else if notes.contains("test_results: fail") {
+        notes
+    } else {
+        format!("{notes}\n\n{MARK}")
+    }
+}
+
 fn review_decision_name(decision: &ReviewDecision) -> &'static str {
     match decision {
-        ReviewDecision::Approve => "approve",
+        ReviewDecision::Approve { .. } => "approve",
         ReviewDecision::RequestChanges { .. } => "request_changes",
         ReviewDecision::Failed(_) => "failed",
         ReviewDecision::Blocked(_) => "blocked",
@@ -1594,7 +1636,7 @@ async fn finalize_review_run(
     store: &Arc<TaskStore>,
 ) {
     let outcome = match &parsed.decision {
-        ReviewDecision::Approve
+        ReviewDecision::Approve { .. }
         | ReviewDecision::RequestChanges { .. }
         | ReviewDecision::Skipped
         | ReviewDecision::Rerouted => "success",
@@ -1860,34 +1902,47 @@ async fn push_review_branch(
     }
 }
 
+fn append_review_issues(
+    body: &mut String,
+    issues: &[crate::engine::runner::response::ReviewIssue],
+) {
+    if issues.is_empty() {
+        return;
+    }
+    body.push_str("\n**Issues Found:**\n");
+    for issue in issues {
+        body.push_str(&format!(
+            "- `{}` line {}: {} [{}]\n",
+            issue.file,
+            issue
+                .line
+                .map(|line| line.to_string())
+                .unwrap_or_else(|| "?".to_string()),
+            issue.description,
+            issue.severity
+        ));
+    }
+}
+
 fn build_pr_review_comment(decision: &ReviewDecision, review_notes_for_comment: &str) -> String {
     match decision {
-        ReviewDecision::Approve => {
-            format!(
+        ReviewDecision::Approve { issues } => {
+            let mut body = format!(
                 "## Automated Review \u{2014} Approve\n\n{}",
                 review_notes_for_comment
-            )
+            );
+            if !issues.is_empty() && !body.ends_with('\n') {
+                body.push('\n');
+            }
+            append_review_issues(&mut body, issues);
+            body
         }
         ReviewDecision::RequestChanges { notes, issues } => {
             let mut body = format!(
                 "## Automated Review \u{2014} Changes Requested\n\n{}\n",
                 notes
             );
-            if !issues.is_empty() {
-                body.push_str("\n**Issues Found:**\n");
-                for issue in issues {
-                    body.push_str(&format!(
-                        "- `{}` line {}: {} [{}]\n",
-                        issue.file,
-                        issue
-                            .line
-                            .map(|line| line.to_string())
-                            .unwrap_or_else(|| "?".to_string()),
-                        issue.description,
-                        issue.severity
-                    ));
-                }
-            }
+            append_review_issues(&mut body, issues);
             body
         }
         _ => String::new(),
@@ -1899,7 +1954,7 @@ const REVIEW_STATUS_CONTEXT: &str = "orch/review";
 /// Commit status state and description for a review decision. Other decisions post nothing.
 fn review_status(decision: &ReviewDecision) -> Option<(&'static str, &'static str)> {
     match decision {
-        ReviewDecision::Approve => Some(("success", "Approved by automated review")),
+        ReviewDecision::Approve { .. } => Some(("success", "Approved by automated review")),
         ReviewDecision::RequestChanges { .. } => {
             Some(("failure", "Automated review requested changes"))
         }
@@ -2091,7 +2146,7 @@ async fn publish_review(
 ) -> anyhow::Result<()> {
     use crate::github::app::ReviewEvent;
     let event = match decision {
-        ReviewDecision::Approve => Some(ReviewEvent::Approve),
+        ReviewDecision::Approve { .. } => Some(ReviewEvent::Approve),
         ReviewDecision::RequestChanges { .. } => Some(ReviewEvent::RequestChanges),
         _ => None,
     };
@@ -2159,7 +2214,7 @@ async fn apply_review_decision(
     .await?;
 
     match &parsed.decision {
-        ReviewDecision::Approve => {
+        ReviewDecision::Approve { .. } => {
             record_approved_sha(store, repo, &task.id.0, ctx.pr_number, &ctx.worktree_path).await;
             // Always attempt auto-merge on approval. Tasks are only marked
             // Done when the PR is actually merged (detected by review_poll).
@@ -2197,7 +2252,7 @@ async fn apply_review_decision(
                 }
                 return Ok(ReviewDecision::Failed(format!("merge failed: {e}")));
             }
-            Ok(ReviewDecision::Approve)
+            Ok(parsed.decision.clone())
         }
         ReviewDecision::RequestChanges { notes, issues } => {
             clear_approved_sha(store, repo, &task.id.0, ctx.pr_number).await;
@@ -3434,7 +3489,9 @@ mod tests {
     #[test]
     fn review_status_maps_decisions() {
         assert_eq!(
-            review_status(&ReviewDecision::Approve).unwrap().0,
+            review_status(&ReviewDecision::Approve { issues: vec![] })
+                .unwrap()
+                .0,
             "success"
         );
         let changes = ReviewDecision::RequestChanges {
@@ -3443,6 +3500,89 @@ mod tests {
         };
         assert_eq!(review_status(&changes).unwrap().0, "failure");
         assert!(review_status(&ReviewDecision::Failed("x".into())).is_none());
+    }
+
+    fn sample_review_issue(severity: &str) -> runner::response::ReviewIssue {
+        runner::response::ReviewIssue {
+            file: "src/engine/tick.rs".into(),
+            line: Some(142),
+            severity: severity.into(),
+            description: "index out of bounds on the last element".into(),
+        }
+    }
+
+    fn sample_review_response(
+        decision: &str,
+        test_results: Option<&str>,
+        issues: Vec<runner::response::ReviewIssue>,
+    ) -> runner::response::ReviewResponse {
+        runner::response::ReviewResponse {
+            decision: decision.into(),
+            notes: "looks fine".into(),
+            test_results: test_results.map(str::to_string),
+            issues,
+        }
+    }
+
+    #[test]
+    fn approve_with_failing_tests_becomes_request_changes() {
+        let decision =
+            review_decision_from_response(sample_review_response("approve", Some("fail"), vec![]));
+        match decision {
+            ReviewDecision::RequestChanges { notes, issues } => {
+                assert!(
+                    notes.contains("test_results: fail"),
+                    "notes must name the failing test run, got {notes:?}"
+                );
+                assert!(issues.is_empty());
+            }
+            other => panic!("expected RequestChanges, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approve_with_error_issue_becomes_request_changes() {
+        let issue = sample_review_issue("error");
+        let decision = review_decision_from_response(sample_review_response(
+            "approve",
+            Some("pass"),
+            vec![issue.clone()],
+        ));
+        match decision {
+            ReviewDecision::RequestChanges { issues, .. } => {
+                assert_eq!(issues, vec![issue]);
+            }
+            other => panic!("expected RequestChanges, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approve_with_warning_issue_stays_approve_and_comment_lists_it() {
+        let issue = sample_review_issue("warning");
+        let decision = review_decision_from_response(sample_review_response(
+            "approve",
+            Some("pass"),
+            vec![issue.clone()],
+        ));
+        match &decision {
+            ReviewDecision::Approve { issues } => {
+                assert_eq!(issues, &vec![issue.clone()]);
+            }
+            other => panic!("expected Approve, got {other:?}"),
+        }
+        let comment = build_pr_review_comment(&decision, "looks fine");
+        assert!(
+            comment.contains("Approve"),
+            "approve header missing from {comment}"
+        );
+        assert!(
+            comment.contains(&issue.description),
+            "warning issue missing from {comment}"
+        );
+        assert!(
+            comment.contains("warning"),
+            "warning severity missing from {comment}"
+        );
     }
 
     #[test]
@@ -4224,7 +4364,7 @@ mod tests {
 
         match phase {
             ReviewPhase::Ready(parsed) => {
-                assert!(matches!(parsed.decision, ReviewDecision::Approve));
+                assert!(matches!(parsed.decision, ReviewDecision::Approve { .. }));
             }
             ReviewPhase::EarlyReturn(_) => {
                 panic!("expected Ready(Approve) from assistant text, got EarlyReturn")
@@ -4303,7 +4443,7 @@ mod tests {
 
         let work_dir = TempDir::new().unwrap();
         let ctx = test_review_context(agent, model, work_dir.path());
-        let parsed = test_parsed_review(ReviewDecision::Approve);
+        let parsed = test_parsed_review(ReviewDecision::Approve { issues: vec![] });
         let task = test_review_task("1");
 
         finalize_review_run(&task, &ctx, &parsed, &store).await;
@@ -4359,7 +4499,7 @@ mod tests {
             // A successful review interleaves between each failure, mirroring the
             // real-world pattern from issue #3478 (reviews for other tasks succeed
             // in between isolated failures for this model).
-            let parsed = test_parsed_review(ReviewDecision::Approve);
+            let parsed = test_parsed_review(ReviewDecision::Approve { issues: vec![] });
             finalize_review_run(&task, &ctx, &parsed, &store).await;
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -4394,7 +4534,7 @@ mod tests {
 
         // A successful review for the same model interleaves, exactly like the
         // real-world pattern from issue #3571.
-        let parsed = test_parsed_review(ReviewDecision::Approve);
+        let parsed = test_parsed_review(ReviewDecision::Approve { issues: vec![] });
         finalize_review_run(&task, &ctx, &parsed, &store).await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
@@ -4597,7 +4737,7 @@ mod tests {
             "o/r",
             9,
             Some("abc123"),
-            &ReviewDecision::Approve,
+            &ReviewDecision::Approve { issues: vec![] },
             "## Automated Review \u{2014} Approve\n\nok",
         )
         .await;
