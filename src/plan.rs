@@ -2,7 +2,8 @@
 //!
 //! A milestone is `## M1. Title`. A task is `### M1-03 Title` with Goal, Scope,
 //! Acceptance, Depends on and Owner lines. Later milestones may be a table with
-//! those columns. `none` is no dependency.
+//! those columns. An unknown table column or a task with no title is an error.
+//! `none` is no dependency.
 
 use std::collections::{HashMap, HashSet};
 
@@ -216,7 +217,11 @@ pub fn parse_roadmap_for(
                 continue;
             };
             if let Some((id, title)) = parse_task_heading(rest) {
-                draft = Some(Draft::new(id, title, milestone, rest.trim(), line_no));
+                if title.is_empty() {
+                    errors.push(format!("line {line_no}: {id} has no title"));
+                } else {
+                    draft = Some(Draft::new(id, title, milestone, rest.trim(), line_no));
+                }
             }
             continue;
         }
@@ -237,9 +242,15 @@ pub fn parse_roadmap_for(
             continue;
         }
 
-        if let Some(cols) = table_cols(line) {
+        if let Some((cols, unknown)) = table_cols(line) {
             flush_draft(&mut draft, &mut tasks, &mut seen, &mut errors);
             if current.is_some() {
+                if !unknown.is_empty() {
+                    errors.push(format!(
+                        "line {line_no}: unknown table column {}",
+                        unknown.join(", ")
+                    ));
+                }
                 table = Some(cols);
             }
             continue;
@@ -1009,7 +1020,7 @@ fn parse_task_heading(rest: &str) -> Option<(String, String)> {
     is_task_id(id).then(|| (id.to_string(), title.to_string()))
 }
 
-fn table_cols(line: &str) -> Option<TableCols> {
+fn table_cols(line: &str) -> Option<(TableCols, Vec<String>)> {
     if !line.trim().starts_with('|') {
         return None;
     }
@@ -1019,15 +1030,28 @@ fn table_cols(line: &str) -> Option<TableCols> {
     if !names.iter().any(|name| name == "depends on") {
         return None;
     }
+    let unknown = cells
+        .iter()
+        .zip(names.iter())
+        .filter(|(_, name)| !name.is_empty() && !is_known_table_column(name))
+        .map(|(cell, _)| cell.clone())
+        .collect();
     let pos = |label: &str| names.iter().position(|name| name == label);
-    Some(TableCols {
-        task,
-        goal: pos("goal"),
-        scope: pos("scope"),
-        acceptance: pos("acceptance"),
-        depends: pos("depends on"),
-        owner: pos("owner"),
-    })
+    Some((
+        TableCols {
+            task,
+            goal: pos("goal"),
+            scope: pos("scope"),
+            acceptance: pos("acceptance"),
+            depends: pos("depends on"),
+            owner: pos("owner"),
+        },
+        unknown,
+    ))
+}
+
+fn is_known_table_column(name: &str) -> bool {
+    name.eq_ignore_ascii_case("task") || is_known_field(name)
 }
 
 fn is_separator_row(line: &str) -> bool {
@@ -1065,6 +1089,9 @@ fn task_from_row(
     let Some((id, title)) = parse_task_heading(task_cell) else {
         return Ok(None);
     };
+    if title.is_empty() {
+        return Err(format!("line {line_no}: {id} has no title"));
+    }
     let depends_raw = cell(&cells, cols.depends);
     let depends_on =
         parse_depends(depends_raw).map_err(|err| format!("line {line_no}: {id} {err}"))?;
@@ -1314,6 +1341,77 @@ mod tests {
                 "status:new".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn unknown_table_column_is_an_error() {
+        let markdown = r#"
+## M3. Session
+
+| Task | Title | Depends on |
+|---|---|---|
+| M3-01 Session backfill | ignored | none |
+"#;
+        let err = parse_roadmap(markdown).unwrap_err();
+        assert!(err.message.contains("Title"), "{}", err.message);
+        assert!(err.message.contains("line 4"), "{}", err.message);
+        assert!(
+            err.message.contains("unknown table column"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn table_row_with_only_an_id_has_no_title() {
+        let markdown = r#"
+## M3. Session
+
+| Task | Depends on |
+|---|---|
+| M3-01 | none |
+"#;
+        let err = parse_roadmap(markdown).unwrap_err();
+        assert!(err.message.contains("M3-01"), "{}", err.message);
+        assert!(err.message.contains("no title"), "{}", err.message);
+        assert!(err.message.contains("line 6"), "{}", err.message);
+    }
+
+    #[test]
+    fn heading_task_with_no_title_is_an_error() {
+        let markdown = r#"
+## M3. Session
+
+### M3-01
+
+- Goal: backfill.
+- Depends on: none.
+"#;
+        let err = parse_roadmap(markdown).unwrap_err();
+        assert!(err.message.contains("M3-01"), "{}", err.message);
+        assert!(err.message.contains("no title"), "{}", err.message);
+        assert!(err.message.contains("line 4"), "{}", err.message);
+    }
+
+    #[test]
+    fn table_owner_column_keeps_title_in_the_task_cell() {
+        let markdown = r#"
+## M3. Session
+
+| Task | Owner | Depends on |
+|---|---|---|
+| M3-01 Session backfill | human | none |
+| M3-02 Follow up | | M3-01 |
+"#;
+        let roadmap = parse_roadmap(markdown).unwrap();
+        let first = task(&roadmap, "M3-01");
+        assert_eq!(first.title, "Session backfill");
+        assert!(first.owner_human);
+        assert!(first.depends_on.is_empty());
+        let second = task(&roadmap, "M3-02");
+        assert_eq!(second.title, "Follow up");
+        assert!(!second.owner_human);
+        assert_eq!(second.depends_on, vec!["M3-01".to_string()]);
     }
 
     #[test]
