@@ -829,6 +829,15 @@ impl ExternalBackend for GitHubBackend {
             .iter()
             .chain(app_login.iter())
             .any(|login| latest_automated_review_approves(&comment_refs, login));
+        // An App review on the head replaces the comment, as in review_poll, so a stale
+        // approving comment cannot outvote an App change request
+        let (comment_approved, _) = crate::github::app::effective_comment_flags(
+            &reviews,
+            &pr.head.sha,
+            app_login.as_deref(),
+            comment_approved,
+            false,
+        );
         let merged = pr.merged.unwrap_or(false);
         Ok(Some(crate::backends::PullRequestCompletion {
             merged,

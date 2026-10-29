@@ -338,7 +338,7 @@ async fn make_dispatch_harness(
     let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
     let transport = Arc::new(Transport::new());
     let capture = Arc::new(CaptureService::new(transport));
-    let tmux = Arc::new(TmuxManager::new());
+    let tmux = Arc::new(TmuxManager::isolated());
     let runner = Arc::new(TaskRunner::new(repo.to_string()).with_store(store.clone()));
     let semaphore = Arc::new(Semaphore::new(4));
     let task_manager = Arc::new(TaskManager::with_store(
@@ -544,7 +544,7 @@ async fn make_review_harness(
     let tmp = temp_db(&format!("review-{}", repo.replace('/', "-")));
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
     let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
-    let tmux = Arc::new(TmuxManager::new());
+    let tmux = Arc::new(TmuxManager::isolated());
     let semaphore = Arc::new(Semaphore::new(4));
     let task_manager = Arc::new(TaskManager::with_store(
         backend.clone(),
@@ -665,7 +665,7 @@ async fn review_subscriber_only_handles_its_repo() {
     let store_b = Arc::new(TaskStore::open_single(&tmp_b).await.expect("open b"));
     let backend_a: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
     let backend_b: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
-    let tmux = Arc::new(TmuxManager::new());
+    let tmux = Arc::new(TmuxManager::isolated());
     let semaphore = Arc::new(Semaphore::new(4));
     let config = RouterConfig {
         mode: "round_robin".to_string(),
