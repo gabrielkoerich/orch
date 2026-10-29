@@ -200,8 +200,9 @@ impl ExternalBackend for GitHubBackend {
     }
 
     async fn reconcile_project_statuses(&self) -> anyhow::Result<()> {
+        // Projects V2 on a personal account is out of reach for an installation token
         LabelSyncConfig::from_config()?
-            .reconcile(&self.gh, &self.repo)
+            .reconcile(&GhHttp::owner()?, &self.repo)
             .await
             .map(|_| ())
     }

@@ -1955,8 +1955,14 @@ async fn post_review_comment(
         );
     }
 
+    // The agent may have rebased or committed a fix, pushed just before this, so the head read
+    // before the review is stale and an App review on it would be refused or ignored
+    let head_sha = worktree_head_sha(&ctx.worktree_path)
+        .await
+        .or_else(|| ctx.head_sha.clone());
+
     if let Some((state, description)) = review_status(decision) {
-        post_review_status(&gh, repo, ctx.head_sha.as_deref(), state, description).await;
+        post_review_status(&gh, repo, head_sha.as_deref(), state, description).await;
     }
 
     if !pr_comment.is_empty() {
@@ -1968,7 +1974,7 @@ async fn post_review_comment(
             &gh,
             repo,
             ctx.pr_number,
-            ctx.head_sha.as_deref(),
+            head_sha.as_deref(),
             decision,
             &pr_comment_with_footer,
         )
