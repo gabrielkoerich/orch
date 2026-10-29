@@ -54,7 +54,7 @@ channels:
     general_topic_id: "1"                # optional: topic ID for the General thread
 ```
 
-Store the token in `~/.private` so the brew service picks it up:
+Store the token in `~/.private`. orch loads its `export` lines at startup, so the service picks it up:
 
 ```bash
 echo 'export TELEGRAM_BOT_TOKEN="123456789:ABCDef..."' >> ~/.private
@@ -103,7 +103,7 @@ Agent: `claude` | Duration: 2m 0s
 Fixed the OAuth flow — PAT token refresh now retries on 401.
 ```
 
-Status emojis: ✅ done · 🔄 in_progress · 🔍 in_review · ⚠️ needs_review · 🚫 blocked · ❌ failed
+Status emojis: ✅ done · 🔄 in_progress · 🔍 in_review · 👍 approved · ⚠️ needs_review · 🚫 blocked · ❌ failed
 
 ---
 
@@ -258,12 +258,15 @@ Both Telegram and Discord support the same command set. Commands sent in a proje
 | `/subscribe <project>` | Subscribe the current topic/channel to notifications from a project |
 | `/unsubscribe <project>` | Unsubscribe the current topic/channel from a project |
 | `/stream <task_id>` | Attach this topic/channel to a running task's live output stream |
-| `/retry <task_id>` | Re-dispatch a failed or blocked task |
-| `/close <task_id>` | Mark a task as done |
-| `/block <task_id>` | Block a task |
-| `/unblock <task_id>` | Unblock a task |
-| `/review <task_id>` | Trigger a review cycle |
+| `/retry` | Re-dispatch the thread's task. Refused for a done task |
+| `/reroute [agent]` | Route the thread's task again, to `agent` when given |
+| `/close` | Mark the thread's task as done |
+| `/block [reason]` | Block the thread's task |
+| `/unblock` | Unblock the thread's task |
+| `/review` | Start a review cycle for the thread's task |
 | Any free-form text | Creates an internal task for the resolved project (or first project if unresolved) |
+
+`/retry`, `/reroute`, `/close`, `/block`, `/unblock` and `/review` take no task id. They act on the task bound to the thread, so send them in that task's thread. Sent anywhere else, orch replies that the command needs a task context.
 
 ### `/subscribe` / `/unsubscribe`
 
@@ -312,13 +315,14 @@ Both channels respect the `notifications.level` config key:
 
 ```yaml
 notifications:
-  level: all        # all | errors_only | none
+  level: all        # all | verbose | errors_only | none
 ```
 
 | Level | Sends notifications for |
 |-------|------------------------|
-| `all` | Every task completion (default) |
-| `errors_only` | `needs_review`, `blocked`, `failed` only |
+| `all` | `done`, `in_review`, `approved`, `blocked`, `failed` (default, also used for an unknown value) |
+| `verbose` | Every status change |
+| `errors_only` | `blocked`, `failed` only |
 | `none` | Disabled |
 
 ---
@@ -346,7 +350,7 @@ Possible log messages:
 ### Telegram: bot not responding
 
 1. Verify the token with `curl https://api.telegram.org/bot<TOKEN>/getMe`
-2. Make sure the service sources `~/.private`: `grep TELEGRAM ~/.private`
+2. Make sure `~/.private` exports the token, since orch loads it at startup: `grep TELEGRAM ~/.private`
 3. Check `chat_id` format — it must be a numeric string (e.g. `"-100123456789"` for supergroups)
 
 ### Telegram: messages not sent

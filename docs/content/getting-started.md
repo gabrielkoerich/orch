@@ -21,7 +21,7 @@ orch service install         # systemd user unit for `orch serve`
 
 `orch service start|stop|restart|status` drives it through `systemctl --user`. A user service stops at logout unless lingering is on (`loginctl enable-linger $USER`).
 
-All dependencies (`yq`, `jq`, `just`, `python3`, `rg`, `fd`) are installed automatically.
+The Homebrew formula targets macOS on Apple silicon and installs `gh` and `tmux`. On Linux, install `gh` and `tmux` yourself.
 
 ### Agent CLIs
 
@@ -34,7 +34,6 @@ brew install opencode             # OpenCode
 
 The `grok` CLI must be on `PATH`. Orch discovers it by the binary name `grok`.
 
-Optional: `gh` for GitHub sync, `bats` for tests.
 
 ## Quick Start
 
@@ -72,7 +71,7 @@ Tokens are resolved in this order (first match wins):
 
 ### Security: Service Deployments (Homebrew / launchd)
 
-When orch runs as a background service (`brew services start orch`), it does **not** inherit your shell environment. The service process starts with a minimal environment, so you must pass the token through one of these channels:
+When orch runs as a background service (launchd on macOS, the systemd user unit on Linux), it does **not** inherit your shell environment. The service process starts with a minimal environment, so you must pass the token through one of these channels:
 
 **Option A — `~/.private` file** (recommended for local installs):
 
@@ -82,7 +81,7 @@ echo 'export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"' >> ~/.private
 chmod 600 ~/.private
 ```
 
-The service sources `~/.private` if it exists.
+At startup orch loads the `export KEY=VALUE` lines of `~/.private` into its environment, if the file exists.
 
 **Option B — launchd `EnvironmentVariables`** in the plist (for system-wide installs):
 
@@ -127,9 +126,9 @@ Source files:
 ## How It Works
 
 1. **Add a task** via `orch task add` (or via a GitHub issue / scheduled job).
-2. **Route the task** — the LLM router chooses executor + builds a specialized profile and selects skills.
+2. **Route the task:** the router picks an agent and the agent's model for the task's complexity. `router.mode` is `round_robin` by default. In `llm` mode the router also builds a profile and selects skills.
 3. **Run the task** — the chosen executor runs in agentic mode inside a tmux session in the task worktree (`PROJECT_DIR`) with controlled tool access.
 4. **Output** — the agent writes results to `~/.orch/state/{repo}/tasks/{id}/attempts/{n}/output.json`; task metadata is updated in the SQLite store (`~/.orch/orch.db`).
-5. **Review:** if enabled, a different agent reviews the PR when one is available (the authoring agent reviews otherwise) and posts a GitHub review comment.
+5. **Review:** a different agent reviews the PR when one is available (the authoring agent reviews otherwise) and posts an `## Automated Review` comment, or an App review in `review.mode: app`. An approved task waits in `approved` until CI passes and orch merges the PR.
 6. **Delegation** — if the agent returns `delegations`, child tasks are created and the parent is blocked until children finish.
-7. **Error handling** — if the agent fails or returns `blocked`, the error is commented on the GitHub issue with a `needs_review` label.
+7. **Error handling:** a failed run puts the agent or model in cooldown and routes the task again. After `workflow.max_attempts` attempts (default 5) the task is `blocked`.

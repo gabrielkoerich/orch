@@ -71,7 +71,6 @@ Agents are constrained by rules in the system prompt and by runner-enforced tool
 
 - **No `rm`**: `--disallowedTools` blocks `rm` — agents must use `trash` (macOS) or `trash-put` (Linux)
 - **No commits to main**: agents must always work in feature branches
-- **Required skills**: skills listed in `workflow.required_skills` are marked `[REQUIRED]` in the agent prompt
 - **GitHub issue linking**: if a task has a linked issue, the agent receives the issue reference for branch naming and PR linking
 - **Cost-conscious sub-agents**: agents are instructed to use cheap models for routine sub-agent work
 
@@ -120,7 +119,7 @@ Every agent receives a rich context built from multiple sources:
 | Prior run context | `contexts/task-{id}.md` | On retries |
 | Tool call summaries | `.orch/tools-{id}.json` | On retries |
 | Repo tree | `git ls-files` | Always |
-| Project instructions | `CLAUDE.md` + `AGENTS.md` + `README.md` | If files exist |
+| Project instructions | `CLAUDE.md` + `AGENTS.md` + `README.md`, a file read once when one links to the other | If files exist |
 | Skills docs | `skills/{id}/SKILL.md` | If skills selected |
 | Parent/sibling context | Parent task summary + accomplished | If child task |
 | Git diff | Uncommitted changes | On retries |
@@ -129,18 +128,42 @@ Every agent receives a rich context built from multiple sources:
 
 When a task fails:
 1. Error is recorded in `last_error` and `history`
-2. After repeated failures the task is moved to `needs_review` (human attention) instead of being permanently blocked; orch also removes any forced `agent:*` label so an owner can reassign or inspect the task. The change in behavior ensures tasks don't remain stuck with a forced agent after owner intervention is needed.
+2. The failed agent or model gets a cooldown, and the task is re-routed (see [Cooldowns](#cooldowns))
 3. A structured comment is posted on the linked GitHub issue with an attribution footer (for example: `Created by claude[bot] via Orch`) so it's clear which agent produced the comment
-4. A `needs_review` label is applied to the issue and the configured review owner is notified
-
-**Retry loop detection**: if the same error repeats 3 times (4+ attempts), the task is moved to `needs_review` to avoid wasting cycles.
-
-**Max attempts**: default 10 per task (configurable via `workflow.max_attempts`).
+4. After `workflow.max_attempts` (default 5) the task goes to `blocked`, and orch removes any forced `agent:*` label so `/retry` routes it freely
 
 ```bash
-orch task retry <id>       # reset any task to new
-orch task unblock <id>     # reset a needs_review/stalled task to new
-orch task unblock all      # reset all needs_review/blocked tasks
+orch task retry <id>       # reset a task to new (a done task is refused)
+orch task unblock <id>     # reset a blocked task to new
+orch task unblock all      # reset all blocked tasks to new
+```
+
+## Cooldowns
+
+A failed run puts the agent or the model in a cooldown, and the router skips it until the cooldown ends. Cooldowns are stored in SQLite and survive a restart.
+
+| Failure | Cooldown |
+|---------|----------|
+| One-off model failure: empty or cut off output, an unparseable review, an opaque provider error | That model, 5 minutes, then 15 minutes |
+| Model not found, not supported or region blocked | That model, 4 hours, growing to 7 days |
+| Other model-unavailable error | That model, 5 minutes, growing to 4 hours |
+| Billing cycle exhausted on a known model | That model, 4 hours, growing to 7 days |
+| Generic agent failure | That agent, 5 minutes, growing to 4 hours |
+| Out of credits | That agent, 1 hour, growing to 8 hours |
+| Org-level disabled | That agent, 2 hours, growing to 8 hours |
+| Billing cycle exhausted, model unknown | That agent, 24 hours, growing to 7 days |
+| Rate limit with a "try again at" time | Until that time |
+| Silence | That model for `engine.silence_cooldown` (1 hour, 4 hours after 5 silences in 24 hours), and the agent for 120 seconds |
+| Review timeout | None, the task goes back to `needs_review` |
+
+A success resets the agent's failure counts, so the next failure starts from the base again.
+
+An agent is degraded, and skipped, when all its models are cooled or it has `dispatch.degraded_rate_limit_threshold` (3) rate-limit rows in the last `dispatch.health_check_window_hours` (6). Only rows of type `rate` count. Failed runs and timeouts keep their own cooldowns and do not count.
+
+```bash
+orch cooldown list          # active cooldowns and degraded agents
+orch cooldown clear <key>   # clear one cooldown (claude or claude:sonnet) and that agent's rate-limit window
+orch cooldown clear --all   # clear every cooldown and every agent's rate-limit window
 ```
 
 ## Codex Sandbox Notes

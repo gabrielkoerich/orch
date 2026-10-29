@@ -139,16 +139,21 @@ sequenceDiagram
 ## Task Lifecycle
 
 ```
-new → routed → in_progress → needs_review → in_review → done
-                    │              ▲              │
-                    │              │              ├── approve + merge → done
+new → routed → in_progress → needs_review → in_review → approved → done
+                    │              ▲              │           │
+                    │              │              │           ├── CI passes + merge → done
+                    │              │              │           ├── conflict or red CI → routed
+                    │              │              │           └── PR closed unmerged → blocked
                     │              │              ├── request_changes → routed → ... → needs_review
-                    │              │              ├── conflicts/CI/merge fail → needs_review (retry)
-                    │              │              └── 3x retry limit → blocked
+                    │              │              ├── review failed or timed out → needs_review (retry)
+                    │              │              └── max review cycles → blocked
                     │              └──────────────┘
                     │
                     ├── push failed (1-2x) → routed (different agent)
-                    └── push failed (3x) → blocked
+                    ├── push failed (3x) → blocked
+                    └── max attempts → blocked
+
+waiting → new (when the last open dependency is done)
 ```
 
 ### Status Semantics
@@ -158,6 +163,8 @@ new → routed → in_progress → needs_review → in_review → done
 - `in_progress` — agent running in tmux session
 - `needs_review` — PR ready, queued for review agent
 - `in_review` — review agent actively working
+- `approved` — the review approved the PR, orch waits for CI and merges, no agent runs
+- `waiting` — a dependency is still open
 - `done` — task complete (PR merged or no code changes)
 - `blocked` — requires human intervention
 
@@ -171,10 +178,14 @@ new → routed → in_progress → needs_review → in_review → done
 | in_progress → done | runner | `runner/response_handler.rs` | Agent completes, no PR created |
 | in_progress → routed | runner | `runner/response_handler.rs` | Push failed (reroute to different agent) |
 | in_progress → blocked | runner | `runner/response_handler.rs` | Push failed 3+ times |
-| needs_review → in_review | engine tick | `engine/tick.rs` | Review agent spawned |
-| in_review → done | engine | `engine/review.rs` | PR approved + merged |
+| in_progress → blocked | runner | `runner/mod.rs` | `workflow.max_attempts` reached |
+| needs_review → in_review | review subscriber | `engine/subscribers/review.rs` | Review agent spawned |
+| in_review → approved | review subscriber | `engine/subscribers/review.rs` | Review approved |
+| approved → done | sync | `engine/review_poll.rs` | PR merged |
+| approved → routed | sync | `engine/review_poll.rs`, `engine/auto_merge.rs` | Merge conflict or red CI |
+| approved → blocked | sync | `engine/review_poll.rs` | PR closed without merge |
 | in_review → routed | engine | `engine/review.rs` | Changes requested → re-dispatch |
-| in_review → needs_review | engine | `engine/review.rs` | Review agent failed/crashed |
+| in_review → needs_review | engine | `engine/review.rs`, `engine/tick.rs` | Review agent failed, timed out, or its session is gone |
 | in_review → blocked | engine | `engine/review.rs` | Max review cycles, merge failures |
 
 ## Responsibility Split
@@ -345,7 +356,7 @@ graph LR
 
 These are short pointers — the authoritative descriptions and rationales live in [`AGENTS.md`](../AGENTS.md) under "DO NOT TOUCH". Read those before changing any of the areas below.
 
-- **`src/github/token.rs`** — Token resolution uses `std::process::Command` (blocking, cached 1h). Intentional.
+- **`src/github/token.rs`** — Token resolution uses `std::process::Command` (blocking, cached until a 401 clears it). Intentional.
 - **`src/engine/runner/`** — Tmux IS the PTY. No external PTY runners.
 - **No external endpoints** — Orch is an internal tool. The webhook receiver exists but only works when the host is reachable; the default mode is GitHub polling. External consumers connect via localhost-only websocket.
 - **Migrations are immutable** — Never modify existing files in `migrations/`. SQLx locks checksums on first run; create a new numbered file instead.
