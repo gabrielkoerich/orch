@@ -14,6 +14,8 @@ use crate::store::{
 use std::collections::{HashMap, HashSet};
 
 const DEP_SYNC_TTL_SECS: i64 = 45;
+// Each pass costs one to four REST calls per open blocker, so 40 blockers at 45s would pass 5000 an hour
+const BLOCKER_REFRESH_TTL_SECS: i64 = 300;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DepRef {
@@ -381,6 +383,18 @@ async fn refresh_one_blocker(
     {
         return Ok(());
     }
+
+    let key = format!("dep_blocker_read_at:{repo}#{number}");
+    let now = chrono::Utc::now().timestamp();
+    if let Ok(Some(prev)) = store.kv_get(&key).await {
+        if let Ok(prev) = prev.parse::<i64>() {
+            if now.saturating_sub(prev) < BLOCKER_REFRESH_TTL_SECS {
+                return Ok(());
+            }
+        }
+    }
+
+    store.kv_set(&key, &now.to_string()).await?;
     let close = match backend.issue_close_state(repo, number).await {
         Ok(state) => state,
         Err(err) => {
@@ -1335,6 +1349,62 @@ See #4 in the notes
         assert_eq!(store.get(b).await.unwrap().route_attempts, 0);
     }
 
+    async fn refresh_uncached(backend: &ScriptedBackend, store: &TaskStore) {
+        store
+            .kv_delete("dep_blocker_read_at:owner/repo#1")
+            .await
+            .unwrap();
+        refresh_blocker_snapshots(backend, store).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_open_blocker_is_read_once_per_ttl() {
+        let store = TaskStore::open_memory().await.unwrap();
+        insert(&store, "owner/repo", "1", "A", "").await;
+        let b = insert(&store, "owner/repo", "2", "B", "").await;
+        store
+            .replace_dependencies(
+                b,
+                &[NewDependency {
+                    repo: "owner/repo".into(),
+                    number: 1,
+                    source: DepSource::Github,
+                }],
+            )
+            .await
+            .unwrap();
+        let backend = ScriptedBackend::new(HashMap::new());
+        backend
+            .close_state
+            .lock()
+            .unwrap()
+            .insert(1, ("open".into(), None));
+        let reads = || backend.reads.load(std::sync::atomic::Ordering::Relaxed);
+
+        refresh_blocker_snapshots(&backend, &store).await.unwrap();
+        let first = reads();
+        assert!(first > 0, "the first refresh has to read the blocker");
+
+        refresh_blocker_snapshots(&backend, &store).await.unwrap();
+        refresh_blocker_snapshots(&backend, &store).await.unwrap();
+        assert_eq!(
+            reads(),
+            first,
+            "a refresh inside the TTL must not call GitHub"
+        );
+
+        let stale = chrono::Utc::now().timestamp() - BLOCKER_REFRESH_TTL_SECS;
+        store
+            .kv_set("dep_blocker_read_at:owner/repo#1", &stale.to_string())
+            .await
+            .unwrap();
+        refresh_blocker_snapshots(&backend, &store).await.unwrap();
+        assert!(
+            reads() > first,
+            "an expired entry has to read the blocker again"
+        );
+    }
+
     #[tokio::test]
     async fn a_blocker_already_known_done_costs_no_github_call() {
         let store = TaskStore::open_memory().await.unwrap();
@@ -1422,7 +1492,7 @@ See #4 in the notes
                 closed: false,
             }),
         );
-        refresh_blocker_snapshots(&backend, &store).await.unwrap();
+        refresh_uncached(&backend, &store).await;
         assert!(store.block_claim_if_waiting(b).await.unwrap().is_some());
 
         backend.pulls.lock().unwrap().insert(
@@ -1435,7 +1505,7 @@ See #4 in the notes
                 closed: true,
             }),
         );
-        refresh_blocker_snapshots(&backend, &store).await.unwrap();
+        refresh_uncached(&backend, &store).await;
         assert!(store.block_claim_if_waiting(b).await.unwrap().is_some());
 
         backend.pulls.lock().unwrap().insert(
@@ -1448,7 +1518,7 @@ See #4 in the notes
                 closed: true,
             }),
         );
-        refresh_blocker_snapshots(&backend, &store).await.unwrap();
+        refresh_uncached(&backend, &store).await;
         assert!(store.block_claim_if_waiting(b).await.unwrap().is_some());
 
         backend.pulls.lock().unwrap().insert(
@@ -1461,7 +1531,7 @@ See #4 in the notes
                 closed: true,
             }),
         );
-        refresh_blocker_snapshots(&backend, &store).await.unwrap();
+        refresh_uncached(&backend, &store).await;
         assert_eq!(store.block_claim_if_waiting(b).await.unwrap(), None);
         assert_eq!(store.get(b).await.unwrap().status, TaskStatus::New);
     }
@@ -1524,7 +1594,7 @@ See #4 in the notes
                 created_at: "2026-01-02T00:00:00Z".into(),
             }],
         );
-        refresh_blocker_snapshots(&backend, &store).await.unwrap();
+        refresh_uncached(&backend, &store).await;
         assert_eq!(store.block_claim_if_waiting(b).await.unwrap(), None);
         assert_eq!(store.get(b).await.unwrap().status, TaskStatus::New);
     }
