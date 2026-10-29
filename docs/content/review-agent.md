@@ -17,7 +17,7 @@ The review agent automatically reviews pull requests after an agent completes a 
    - Parses the review decision
 
 4. Based on the decision:
-   - **approve** → posts a comment with `## Automated Review -- Approve` header on the PR, auto-merges if required checks pass. Required checks come from classic branch protection and from repository rulesets. A missing required check is pending, so a PR with no check runs yet does not merge.
+   - **approve** → posts a comment with `## Automated Review -- Approve` header on the PR, auto-merges if required checks pass. Required checks come from classic branch protection and from repository rulesets. A missing required check is pending, so a PR with no check runs yet does not merge. GitHub `unstable` (a non-required check failing or still running) still merges once every required check has passed. A repository with no required checks waits until running checks finish.
    - **request_changes** → posts a comment with `## Automated Review -- Changes Requested` header, task re-routes to `New` for the agent to fix
    - **reject** → posts review comment, closes the PR, task goes to `needs_review`
 
