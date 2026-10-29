@@ -1391,10 +1391,16 @@ async fn invoke_review_agent(
 
     let poll_interval = std::time::Duration::from_secs(5);
     let timeout_duration = std::time::Duration::from_secs(ctx.invocation.timeout_seconds);
-    let wait_result = tokio::time::timeout(
-        timeout_duration,
-        tmux.wait_for_completion(&session, poll_interval),
-    )
+    let wait_result = tokio::time::timeout(timeout_duration, async {
+        tokio::select! {
+            result = tmux.wait_for_completion(&session, poll_interval) => result,
+            // An agent can write its decision and still hold the session open
+            () = wait_for_review_decision(ctx, poll_interval) => {
+                tracing::info!(task_id = task.id.0, "review decision is in while the session is still open, ending it");
+                Ok(String::new())
+            }
+        }
+    })
     .await;
 
     match wait_result {
@@ -1462,8 +1468,16 @@ async fn invoke_review_agent(
             ReviewPhase::EarlyReturn(ReviewDecision::Failed(format!("agent error: {e}")))
         }
         Err(_) => {
-            tracing::error!(task_id = task.id.0, "review agent timed out");
             let _ = tmux.kill_session(&session).await;
+            if review_output_has_decision(ctx).await {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    "review agent timed out after writing its decision, using it"
+                );
+                return ReviewPhase::Ready(ReviewRun { run_id });
+            }
+
+            tracing::error!(task_id = task.id.0, "review agent timed out");
             // A slow review says nothing about the model, so no cooldown: the task goes back
             // to needs_review and the next review picks an agent as usual
             complete_review_run(
@@ -1479,6 +1493,31 @@ async fn invoke_review_agent(
             )
             .await;
             ReviewPhase::EarlyReturn(ReviewDecision::Failed("timeout".to_string()))
+        }
+    }
+}
+
+/// The decision is in when this attempt's final result parses as a review, whatever the session
+/// does. Only this attempt's file counts, an older attempt may have reviewed another commit
+async fn review_output_has_decision(ctx: &ReviewContext) -> bool {
+    let raw = tokio::fs::read_to_string(&ctx.output_file)
+        .await
+        .unwrap_or_default();
+    output_has_review_decision(&ctx.review_agent, &raw)
+}
+
+fn output_has_review_decision(agent: &str, raw: &str) -> bool {
+    let raw = runner::agents::claude::strip_tty_control_lines(raw);
+    runner::agents::find_agent_result(agent, &raw)
+        .filter(|result| !result.is_error)
+        .is_some_and(|result| runner::response::parse_review_response(&result.result_text).is_ok())
+}
+
+async fn wait_for_review_decision(ctx: &ReviewContext, poll_interval: std::time::Duration) {
+    loop {
+        tokio::time::sleep(poll_interval).await;
+        if review_output_has_decision(ctx).await {
+            return;
         }
     }
 }
@@ -3544,6 +3583,20 @@ pub(crate) async fn review_and_merge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_review_decision_counts_only_from_a_successful_result() {
+        let approve = r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"decision\":\"approve\",\"notes\":\"LGTM\",\"issues\":[]}"}"#;
+        let prose = r#"{"type":"result","subtype":"success","is_error":false,"result":"I have finished looking at the code."}"#;
+        let failed = r#"{"type":"result","subtype":"error","is_error":true,"result":"{\"decision\":\"approve\",\"notes\":\"\",\"issues\":[]}"}"#;
+        let thinking = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Reading the diff"}]}}"#;
+
+        assert!(output_has_review_decision("claude", approve));
+        assert!(!output_has_review_decision("claude", prose));
+        assert!(!output_has_review_decision("claude", failed));
+        assert!(!output_has_review_decision("claude", thinking));
+        assert!(!output_has_review_decision("claude", ""));
+    }
 
     #[test]
     fn a_review_gets_15_minutes_unless_configured_and_never_under_5() {
