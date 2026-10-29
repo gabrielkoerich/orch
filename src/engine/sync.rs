@@ -1024,11 +1024,7 @@ async fn poll_and_merge_recovered_pr(
         } else {
             let check_runs = gh.get_check_runs(repo, &head_sha).await?;
             let statuses = gh.get_commit_status_contexts(repo, &head_sha).await?;
-            let check_run_tuples = check_runs
-                .iter()
-                .map(|run| (run.name.clone(), run.status.clone(), run.conclusion.clone()))
-                .collect::<Vec<_>>();
-            required_checks_state(&required_contexts, &check_run_tuples, &statuses)
+            required_checks_state(&required_contexts, &check_runs, &statuses)
         };
 
         tracing::info!(

@@ -11,7 +11,7 @@
 use super::token;
 use super::types::{
     GitHubAnnotation, GitHubCheckRun, GitHubComment, GitHubIssue, GitHubPullRequest, GitHubReview,
-    GitHubReviewComment,
+    GitHubReviewComment, RequiredStatusCheck,
 };
 use crate::engine::cooldown as engine_cooldown;
 use anyhow::Context;
@@ -2110,34 +2110,43 @@ impl GhHttp {
         Ok(result)
     }
 
-    /// Get the required status check contexts for a branch.
+    /// Required status checks for a branch from classic protection and from rulesets
     pub async fn get_required_status_check_contexts(
         &self,
         repo: &str,
         branch: &str,
-    ) -> anyhow::Result<Vec<String>> {
+    ) -> anyhow::Result<Vec<RequiredStatusCheck>> {
         let branch = urlencoding::encode(branch);
-        let url = format!("{GITHUB_API}/repos/{repo}/branches/{branch}/protection");
-        let resp = self.get_json::<serde_json::Value>(&url).await;
-        match resp {
-            Ok(value) => Ok(value
-                .pointer("/required_status_checks/contexts")
-                .and_then(|v| v.as_array())
-                .map(|contexts| {
-                    contexts
-                        .iter()
-                        .filter_map(|context| context.as_str().map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default()),
+        let classic_url = format!("{GITHUB_API}/repos/{repo}/branches/{branch}/protection");
+        let rules_url = format!("{GITHUB_API}/repos/{repo}/rules/branches/{branch}");
+
+        let classic_fut = self.get_json::<serde_json::Value>(&classic_url);
+        let rules_fut = self.get_all_pages::<serde_json::Value>(&rules_url, &[("per_page", "100")]);
+        let (classic_resp, rules_resp) = tokio::join!(classic_fut, rules_fut);
+
+        let classic = match classic_resp {
+            Ok(value) => parse_classic_required_status_checks(&value),
             Err(e) => {
                 if is_no_branch_protection_error(&e.to_string()) {
-                    Ok(vec![])
+                    Vec::new()
                 } else {
-                    Err(e)
+                    return Err(e);
                 }
             }
-        }
+        };
+
+        let ruleset = match rules_resp {
+            Ok(rules) => parse_ruleset_required_status_checks(&rules),
+            Err(e) => {
+                if e.to_string().contains("404") {
+                    Vec::new()
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+
+        Ok(merge_required_status_checks(classic, ruleset))
     }
 
     /// Get commit status contexts for a SHA.
@@ -3213,6 +3222,89 @@ fn is_no_branch_protection_error(err: &str) -> bool {
             && err.contains("Upgrade to GitHub Pro or make this repository public"))
 }
 
+/// Classic protection prefers `checks` (includes `app_id`) and falls back to `contexts`
+fn parse_classic_required_status_checks(value: &serde_json::Value) -> Vec<RequiredStatusCheck> {
+    if let Some(checks) = value
+        .pointer("/required_status_checks/checks")
+        .and_then(|v| v.as_array())
+    {
+        let parsed: Vec<RequiredStatusCheck> =
+            checks.iter().filter_map(parse_classic_check).collect();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+
+    value
+        .pointer("/required_status_checks/contexts")
+        .and_then(|v| v.as_array())
+        .map(|contexts| {
+            contexts
+                .iter()
+                .filter_map(|context| {
+                    context.as_str().map(|s| RequiredStatusCheck {
+                        context: s.to_string(),
+                        integration_id: None,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_classic_check(check: &serde_json::Value) -> Option<RequiredStatusCheck> {
+    let context = check.get("context")?.as_str()?.to_string();
+    let integration_id = check
+        .get("app_id")
+        .and_then(|v| v.as_i64())
+        .filter(|&id| id > 0);
+    Some(RequiredStatusCheck {
+        context,
+        integration_id,
+    })
+}
+
+/// Collect `required_status_checks` entries from every active `required_status_checks` rule
+fn parse_ruleset_required_status_checks(rules: &[serde_json::Value]) -> Vec<RequiredStatusCheck> {
+    let mut out = Vec::new();
+    for rule in rules {
+        if rule.get("type").and_then(|t| t.as_str()) != Some("required_status_checks") {
+            continue;
+        }
+        let Some(checks) = rule
+            .pointer("/parameters/required_status_checks")
+            .or_else(|| rule.get("required_status_checks"))
+            .and_then(|v| v.as_array())
+        else {
+            continue;
+        };
+        for check in checks {
+            let Some(context) = check.get("context").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let integration_id = check
+                .get("integration_id")
+                .and_then(|v| v.as_i64())
+                .filter(|&id| id > 0);
+            out.push(RequiredStatusCheck {
+                context: context.to_string(),
+                integration_id,
+            });
+        }
+    }
+    out
+}
+
+fn merge_required_status_checks(
+    mut checks: Vec<RequiredStatusCheck>,
+    extra: Vec<RequiredStatusCheck>,
+) -> Vec<RequiredStatusCheck> {
+    checks.extend(extra);
+    let mut seen = std::collections::HashSet::new();
+    checks.retain(|c| seen.insert((c.context.clone(), c.integration_id)));
+    checks
+}
+
 fn sanitize_github_issue_numbers(issue_numbers: &[u64]) -> (Vec<u64>, Vec<u64>) {
     let mut valid = Vec::with_capacity(issue_numbers.len());
     let mut invalid = Vec::new();
@@ -3544,6 +3636,127 @@ mod tests {
         assert!(!is_no_branch_protection_error(
             "failed (403 Forbidden): {\"message\":\"Resource not accessible\"}"
         ));
+    }
+
+    #[test]
+    fn parse_classic_required_status_checks_reads_checks_app_id() {
+        let value = serde_json::json!({
+            "required_status_checks": {
+                "contexts": ["ci/test"],
+                "checks": [{ "context": "ci/test", "app_id": 42 }]
+            }
+        });
+        assert_eq!(
+            parse_classic_required_status_checks(&value),
+            vec![RequiredStatusCheck {
+                context: "ci/test".to_string(),
+                integration_id: Some(42),
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_classic_required_status_checks_falls_back_to_contexts() {
+        let value = serde_json::json!({
+            "required_status_checks": {
+                "contexts": ["ci/test", "lint"]
+            }
+        });
+        assert_eq!(
+            parse_classic_required_status_checks(&value),
+            vec![
+                RequiredStatusCheck {
+                    context: "ci/test".to_string(),
+                    integration_id: None,
+                },
+                RequiredStatusCheck {
+                    context: "lint".to_string(),
+                    integration_id: None,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_classic_required_status_checks_empty_when_unprotected() {
+        assert!(parse_classic_required_status_checks(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn parse_ruleset_required_status_checks_reads_integration_id() {
+        let rules = vec![
+            serde_json::json!({ "type": "pull_request" }),
+            serde_json::json!({
+                "type": "required_status_checks",
+                "parameters": {
+                    "required_status_checks": [
+                        { "context": "ci/test", "integration_id": 42 },
+                        { "context": "lint" }
+                    ]
+                }
+            }),
+        ];
+        assert_eq!(
+            parse_ruleset_required_status_checks(&rules),
+            vec![
+                RequiredStatusCheck {
+                    context: "ci/test".to_string(),
+                    integration_id: Some(42),
+                },
+                RequiredStatusCheck {
+                    context: "lint".to_string(),
+                    integration_id: None,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_ruleset_required_status_checks_treats_zero_integration_id_as_any_app() {
+        let rules = vec![serde_json::json!({
+            "type": "required_status_checks",
+            "parameters": {
+                "required_status_checks": [{ "context": "ci/test", "integration_id": 0 }]
+            }
+        })];
+        assert_eq!(
+            parse_ruleset_required_status_checks(&rules),
+            vec![RequiredStatusCheck {
+                context: "ci/test".to_string(),
+                integration_id: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn merge_required_status_checks_dedupes_identical_pairs() {
+        let classic = vec![RequiredStatusCheck {
+            context: "ci/test".to_string(),
+            integration_id: None,
+        }];
+        let ruleset = vec![
+            RequiredStatusCheck {
+                context: "ci/test".to_string(),
+                integration_id: None,
+            },
+            RequiredStatusCheck {
+                context: "ci/test".to_string(),
+                integration_id: Some(42),
+            },
+        ];
+        assert_eq!(
+            merge_required_status_checks(classic, ruleset),
+            vec![
+                RequiredStatusCheck {
+                    context: "ci/test".to_string(),
+                    integration_id: None,
+                },
+                RequiredStatusCheck {
+                    context: "ci/test".to_string(),
+                    integration_id: Some(42),
+                }
+            ]
+        );
     }
 
     #[test]
