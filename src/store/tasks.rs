@@ -20,13 +20,13 @@ pub(crate) const TASK_COLS: &str = "id, external_id, repo, origin, title, body, 
     pr_create_failures, review_agent_failures, review_cycles, input_tokens, \
     output_tokens, input_cost_usd, output_cost_usd, total_cost_usd, \
     model_reroute_chain, limit_reroute_chain, \
-    memory, delegations, created_at, updated_at, review_session_expected, \
+    memory, delegations, created_at, updated_at, \
      review_invocations, needs_review_refires, push_failures, auto_unblock_count, auto_unblock_last_at, \
      ci_recovery_count, auto_unblock_last_reason, no_code_reroutes, network_retries, no_code_last_agent, \
      owner_node";
 
 /// Number of columns in TASK_COLS (used for diagnostic verification).
-pub(crate) const TASK_COLS_COUNT: usize = 61;
+pub(crate) const TASK_COLS_COUNT: usize = 60;
 
 /// Explicit column list for `SELECT` queries on the `task_runs` table.
 const TASK_RUN_COLS: &str =
@@ -69,7 +69,6 @@ const ALLOWED_FIELDS: &[&str] = &[
     "review_cycles",
     "review_invocations",
     "needs_review_refires",
-    "review_session_expected",
     "input_tokens",
     "output_tokens",
     "input_cost_usd",
@@ -247,7 +246,6 @@ pub struct Task {
     pub review_agent_failures: i32,
     pub review_cycles: i32,
     pub review_invocations: i32,
-    pub review_session_expected: bool,
     // NeedsReview re-fire counter (incremented by sync catch-up and reset on successful review cycles)
     pub needs_review_refires: i32,
 
@@ -1610,7 +1608,6 @@ impl TaskStore {
             pr_create_failures = 0,
             push_failures = 0,
             network_retries = 0,
-            review_session_expected = 0,
             auto_unblock_count = 0,
             auto_unblock_last_at = '',
             auto_unblock_last_reason = '',
@@ -2227,10 +2224,6 @@ impl TaskStore {
             review_agent_failures: row.try_get("review_agent_failures").unwrap_or(0),
             review_cycles: row.try_get("review_cycles").unwrap_or(0),
             review_invocations: row.try_get::<i32, _>("review_invocations").unwrap_or(0),
-            review_session_expected: row
-                .try_get::<i32, _>("review_session_expected")
-                .unwrap_or(0)
-                != 0,
             needs_review_refires: row.try_get::<i32, _>("needs_review_refires").unwrap_or(0),
             input_tokens: row.try_get("input_tokens").unwrap_or(0),
             output_tokens: row.try_get("output_tokens").unwrap_or(0),
@@ -2585,7 +2578,6 @@ impl TaskStore {
 /// Columns that describe this node's own copy of a task, never sent through the log
 const LOCAL_TASK_COLUMNS: &[&str] = &[
     "worktree",
-    "review_session_expected",
     "input_tokens",
     "output_tokens",
     "input_cost_usd",
@@ -3109,7 +3101,6 @@ pub(crate) mod apply {
             pr_create_failures = 0,
             push_failures = 0,
             network_retries = 0,
-            review_session_expected = 0,
             auto_unblock_count = 0,
             auto_unblock_last_at = '',
             auto_unblock_last_reason = '',

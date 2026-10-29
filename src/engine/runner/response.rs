@@ -971,7 +971,6 @@ mod tests {
             review_cycles: 0,
             review_invocations: 0,
             needs_review_refires: 0,
-            review_session_expected: false,
             input_tokens: 0,
             output_tokens: 0,
             input_cost_usd: 0.0,

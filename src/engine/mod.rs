@@ -78,7 +78,6 @@ use crate::engine::runner::worktree::{
 use crate::engine::tasks::TaskManager;
 use crate::github::http::{rate_limit_metrics, GhHttp};
 use crate::repo_context::REPO_CONTEXT;
-use crate::store::set_review_session_expected;
 use crate::store::{TaskStatus, TaskStore};
 use crate::tmux::TmuxManager;
 use runner::WeightSignal;
@@ -156,7 +155,6 @@ pub(crate) async fn reset_orphaned_reviews(
             continue;
         }
 
-        set_review_session_expected(store, repo, &id.0, false).await;
         if let Ok(Some(store_id)) = store.resolve_task_id(repo, &id.0).await {
             let reason = "startup: review session gone, reset to needs_review";
 
@@ -367,11 +365,11 @@ pub struct EngineConfig {
     /// Shorter than `stuck_timeout` because no session means the agent has already exited.
     pub no_session_stuck_timeout: u64,
     /// Stuck task timeout for in_review tasks with no active tmux session (seconds).
-    /// Longer than `no_session_stuck_timeout` because review agents exit their tmux session
-    /// on normal completion before the result is delivered to the engine. Using a short
-    /// no-session timeout for in_review tasks causes a race where a completed review result
-    /// arrives after the stuck recovery has already reset the task to needs_review, discarding
-    /// the review work.
+    /// Longer than `no_session_stuck_timeout` because a review agent ends its tmux session on
+    /// normal completion before its result reaches the engine. A shorter limit resets a task
+    /// whose finished review is still being delivered, and the result is dropped as stale.
+    /// `from_config` keeps it above the review agent's own timeout plus
+    /// `review::REVIEW_RESULT_DELIVERY_SECS`.
     pub in_review_no_session_stuck_timeout: u64,
     /// Auto-create follow-up tasks when PR reviews request changes
     pub auto_create_followup_on_changes: bool,
@@ -401,7 +399,7 @@ impl Default for EngineConfig {
             max_parallel: 4,
             stuck_timeout: 1800,
             no_session_stuck_timeout: 600,
-            in_review_no_session_stuck_timeout: 1800,
+            in_review_no_session_stuck_timeout: 1920,
             auto_create_followup_on_changes: true,
             graceful_shutdown_timeout: std::time::Duration::from_secs(600),
             silence_grace_period: 300,
@@ -457,12 +455,40 @@ impl EngineConfig {
             }
         }
 
+        let mut in_review_from_config = false;
         if let Ok(val) = crate::config::get("engine.in_review_no_session_stuck_timeout") {
             if let Ok(secs) = val.parse::<u64>() {
                 config.in_review_no_session_stuck_timeout = secs;
+                in_review_from_config = true;
             } else {
                 tracing::warn!(key = "engine.in_review_no_session_stuck_timeout", value = %val, default_secs = config.in_review_no_session_stuck_timeout, "invalid value for engine.in_review_no_session_stuck_timeout, using default");
             }
+        }
+
+        // Keep the no-session review limit over the review agent's own timeout plus delivery
+        // time, whatever either is set to. Under that, recovery resets a task whose finished
+        // review is still on its way to the engine and the result is dropped as stale
+        let review_timeout = crate::engine::review::review_timeout_seconds();
+        let floored = crate::engine::review::no_session_review_floor(
+            config.in_review_no_session_stuck_timeout,
+            review_timeout,
+        );
+        if floored != config.in_review_no_session_stuck_timeout {
+            if in_review_from_config {
+                tracing::warn!(
+                    configured_secs = config.in_review_no_session_stuck_timeout,
+                    review_timeout_secs = review_timeout,
+                    raised_to_secs = floored,
+                    "engine.in_review_no_session_stuck_timeout is below the review timeout plus result delivery time, raising it"
+                );
+            } else {
+                tracing::debug!(
+                    review_timeout_secs = review_timeout,
+                    raised_to_secs = floored,
+                    "raised the default in_review no-session limit over a long review timeout"
+                );
+            }
+            config.in_review_no_session_stuck_timeout = floored;
         }
 
         if let Ok(val) = crate::config::get("engine.webhook_health_check_interval") {
@@ -2848,7 +2874,6 @@ pub async fn serve() -> anyhow::Result<()> {
                                     if let Err(e) = engine.task_manager.update_task_status(&task.id, Status::NeedsReview).await {
                                         tracing::warn!(task_id = task.id.0, ?e, "failed to reset in_review task on shutdown");
                                     } else {
-                                        set_review_session_expected(&engine.store, &engine.repo, &task.id.0, false).await;
                                         if let Ok(Some(store_id)) =
                                             engine.store.resolve_task_id(&engine.repo, &task.id.0).await
                                         {
@@ -2882,7 +2907,6 @@ pub async fn serve() -> anyhow::Result<()> {
                                     ).await {
                                         tracing::warn!(task_id, ?e, "failed to reset internal in_review task on shutdown");
                                     } else {
-                                        set_review_session_expected(&engine.store, &engine.repo, &task_id, false).await;
                                         if let Err(e) = engine
                                             .store
                                             .finalize_incomplete_runs(

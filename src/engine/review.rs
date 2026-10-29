@@ -124,7 +124,7 @@ use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
 use crate::store::store_log_activity;
 use crate::store::TaskStore;
-use crate::store::{opt_store_get_task, set_review_session_expected, store_increment};
+use crate::store::{opt_store_get_task, store_increment};
 use crate::store::{store_set, store_set_result};
 use crate::store::{CompleteRun, RunTokenUsage, StartRun};
 use crate::tmux::TmuxManager;
@@ -814,11 +814,7 @@ async fn build_review_context(
         crate::config::get("git.name").unwrap_or_else(|_| format!("{review_agent}[bot]"));
     let git_email = crate::config::get("git.email")
         .unwrap_or_else(|_| format!("{review_agent}[bot]@users.noreply.github.com"));
-    let review_timeout_secs = review_timeout_secs(
-        crate::config::get("workflow.review_timeout_seconds")
-            .ok()
-            .and_then(|s| s.parse().ok()),
-    );
+    let review_timeout_secs = review_timeout_seconds();
 
     let invocation = runner::agent::AgentInvocation {
         agent: review_agent.clone(),
@@ -3072,6 +3068,27 @@ async fn ensure_pr_exists(
     }
 }
 
+/// The review agent's own time limit, as configured.
+pub(crate) fn review_timeout_seconds() -> u64 {
+    review_timeout_secs(
+        crate::config::get("workflow.review_timeout_seconds")
+            .ok()
+            .and_then(|s| s.parse().ok()),
+    )
+}
+
+/// Seconds a finished review needs to get its result from the agent's output file into the engine.
+/// The agent ends its tmux session first, so the no-session recovery sees a dead session while the
+/// result is still in flight
+pub(crate) const REVIEW_RESULT_DELIVERY_SECS: u64 = 120;
+
+/// Smallest no-session recovery limit that cannot cut a review short. Below the review agent's own
+/// timeout plus delivery time, recovery resets a task whose finished review is still arriving and
+/// the result is dropped as stale
+pub(crate) fn no_session_review_floor(configured: u64, review_timeout: u64) -> u64 {
+    configured.max(review_timeout + REVIEW_RESULT_DELIVERY_SECS)
+}
+
 /// Run the review agent on a completed task and handle the outcome.
 ///
 /// Called after a task completes with status:done and a PR is created.
@@ -3086,8 +3103,6 @@ pub(crate) async fn review_and_merge(
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<ReviewDecision> {
-    set_review_session_expected(store, repo, &task.id.0, true).await;
-
     let ctx = match build_review_context(task, repo, router, task_manager, store).await? {
         ReviewPhase::Ready(ctx) => ctx,
         ReviewPhase::EarlyReturn(decision) => return Ok(decision),
@@ -3138,6 +3153,32 @@ mod tests {
     use tempfile::TempDir;
 
     // ── outcome_for_agent_error ─────────────────────────────────────────────
+
+    // ── no_session_review_floor ─────────────────────────────────────────────
+
+    #[test]
+    fn no_session_review_floor_raises_a_limit_under_the_review_timeout() {
+        assert_eq!(
+            no_session_review_floor(600, 900),
+            900 + REVIEW_RESULT_DELIVERY_SECS
+        );
+    }
+
+    #[test]
+    fn no_session_review_floor_keeps_a_limit_over_the_review_timeout() {
+        assert_eq!(no_session_review_floor(1800, 900), 1800);
+    }
+
+    #[test]
+    fn no_session_review_floor_clears_the_review_timeout_by_the_delivery_margin() {
+        for (configured, review_timeout) in [(0, 0), (1800, 1800), (120, 7200)] {
+            let floored = no_session_review_floor(configured, review_timeout);
+            assert!(
+                floored >= review_timeout + REVIEW_RESULT_DELIVERY_SECS,
+                "{floored} must leave a finished review time to deliver its result"
+            );
+        }
+    }
 
     #[test]
     fn outcome_for_agent_error_kimi_billing_cycle_is_not_rate_limit() {

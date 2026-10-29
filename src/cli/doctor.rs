@@ -889,16 +889,13 @@ fn check_pr_merged_not_done(
     }
 }
 
-/// Check 9: Dead review sessions.
+/// Check 9: Dead review sessions. Callers pass only in_review tasks.
 async fn check_dead_review_session(
     task: &Task,
     repo: &str,
     tmux: &TmuxManager,
     findings: &mut Vec<Finding>,
 ) {
-    if !task.review_session_expected {
-        return;
-    }
     let task_id_str = match &task.external_id {
         Some(id) => id.clone(),
         None => format!("internal:{}", task.id),
@@ -910,7 +907,7 @@ async fn check_dead_review_session(
             severity: Severity::Error,
             task_id: task_label(task),
             message: format!(
-                "status is 'in_review' with review_session_expected but no review session '{}' found",
+                "status is 'in_review' but no review session '{}' found",
                 session
             ),
             fix: FixAction::ResetDeadReview { store_id: task.id },
@@ -1231,21 +1228,11 @@ async fn apply_fixes(
             }
             FixAction::ResetDeadReview { store_id } => {
                 if dry_run {
-                    println!(
-                        "  {}would reset #{} review_session_expected=0 + set needs_review",
-                        prefix, f.task_id
-                    );
+                    println!("  {}would set #{} needs_review", prefix, f.task_id);
                     fixed += 1;
                     continue;
                 }
 
-                // Reset review_session_expected and set status to needs_review
-                let _ = store
-                    .set_fields(
-                        *store_id,
-                        &[("review_session_expected", serde_json::json!(false))],
-                    )
-                    .await;
                 if let Err(e) = store
                     .update_status(*store_id, TaskStatus::NeedsReview)
                     .await
@@ -1266,7 +1253,7 @@ async fn apply_fixes(
                         .await;
                 }
                 println!(
-                    "  fixed #{}: reset review session + set needs_review",
+                    "  fixed #{}: reset dead review session + set needs_review",
                     f.task_id
                 );
                 fixed += 1;
@@ -1394,7 +1381,6 @@ mod tests {
             review_agent_failures: 0,
             review_cycles: 0,
             review_invocations: 0,
-            review_session_expected: false,
             needs_review_refires: 0,
             input_tokens: 0,
             output_tokens: 0,

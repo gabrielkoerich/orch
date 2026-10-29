@@ -21,7 +21,6 @@ use crate::engine::cooldown::{
 use crate::engine::router::Router;
 use crate::engine::runner::agents::patterns;
 use crate::engine::tasks::{status_to_task_status, TaskManager};
-use crate::store;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
@@ -98,12 +97,6 @@ use crate::github::types::extract_issue_number_from_url;
 pub(crate) struct ReviewTaskSnapshot {
     pub external: crate::backends::ExternalTask,
     pub stored: crate::store::Task,
-}
-
-impl ReviewTaskSnapshot {
-    fn task_id(&self) -> &str {
-        &self.external.id.0
-    }
 }
 
 async fn prefetch_review_tasks(
@@ -1847,7 +1840,7 @@ pub(crate) async fn sync_tick(
         });
     }
 
-    let (mut in_review_tasks, needs_review_tasks, blocked_review_candidates) =
+    let (in_review_tasks, needs_review_tasks, blocked_review_candidates) =
         match prefetch_review_tasks(store, repo).await {
             Ok(tasks) => tasks,
             Err(e) => {
@@ -1927,143 +1920,13 @@ pub(crate) async fn sync_tick(
             tracing::warn!(err = %e, "PR review failed");
         }
 
-        match prefetch_review_tasks(store, repo).await {
-            Ok((latest_in_review, _, _)) => {
-                in_review_tasks = latest_in_review;
-            }
-            Err(e) => {
-                tracing::warn!(err = %e, "failed to refresh review task cache after sync work");
-            }
-        }
         phases.push(("merge_comments_review", at.elapsed().as_millis()));
     }
     at = std::time::Instant::now();
 
-    // 5. Detect stale InReview tasks and recover them.
-    //
-    // NeedsReview → InReview triggering is handled exclusively by the event-driven
-    // subscriber (`src/engine/subscribers/review.rs`). Having the sync tick do the
-    // same thing caused a race: both paths could fire simultaneously, each spawning
-    // a review agent, each incrementing the failure counter on a single real failure —
-    // prematurely blocking tasks at half the expected retry quota (issue #857).
-    let enable_review = config::get("workflow.enable_review_agent")
-        .map(|v| v != "false")
-        .unwrap_or(true);
-    if enable_review {
-        // Detect stale InReview tasks (review agent crashed, no active tmux session).
-        // Read from the store (includes both external and internal tasks).
-        // Fetch all live tmux sessions once instead of one subprocess call per task.
-        let live_sessions: std::collections::HashSet<String> = tmux
-            .list_sessions()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| s.name)
-            .collect();
-        for task in &in_review_tasks {
-            // Skip tasks currently being processed by the main tick (dispatch + review flow).
-            let dispatch_key = format!("{}/{}", repo, task.task_id());
-            {
-                if dispatching.contains_key(&dispatch_key) {
-                    tracing::debug!(
-                        task_id = task.task_id(),
-                        "task locked by dispatch flow, skipping stale check"
-                    );
-                    continue;
-                }
-            }
-            // Skip tasks that just transitioned to InReview — allow time for the
-            // review agent to start its tmux session before treating it as stale.
-            // A task is only considered stale if it has been in InReview for > 1 minute.
-            const MIN_STALE_MINUTES: i64 = 1;
-            // review_poll rewrites the row on every pass, so updated_at never ages. Age from
-            // the in_review entry, and leave a task alone once its review has a decision
-            let entered_at = match store.in_review_entry(task.stored.id).await {
-                Ok(Some((_, true))) => {
-                    tracing::debug!(
-                        task_id = task.task_id(),
-                        "InReview task already has a review decision, waiting on merge"
-                    );
-                    continue;
-                }
-                Ok(Some((entered_at, false))) => entered_at,
-                Ok(None) | Err(_) => task.external.updated_at.clone(),
-            };
-            match chrono::DateTime::parse_from_rfc3339(&entered_at) {
-                Ok(updated_at) => {
-                    let age = chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc);
-                    if age.num_minutes() < MIN_STALE_MINUTES {
-                        tracing::debug!(
-                            task_id = task.task_id(),
-                            age_seconds = age.num_seconds(),
-                            "InReview task is too young to be considered stale, skipping"
-                        );
-                        continue;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        task_id = task.task_id(),
-                        ts = %entered_at,
-                        err = %e,
-                        "invalid in_review timestamp — treating task as potentially stale"
-                    );
-                }
-            }
-
-            let review_task_id = format!("{}-review", task.task_id());
-            let review_session = tmux.session_name(repo, &review_task_id);
-            if live_sessions.contains(&review_session) {
-                // Review agent is still alive — skip.
-                continue;
-            }
-
-            // No review session exists. The review agent is dead regardless of
-            // review_session_expected — hard restart, crash, or flag not persisted.
-            // Reset to NeedsReview so the subscriber re-dispatches.
-            {
-                tracing::warn!(
-                    task_id = task.task_id(),
-                    session = %review_session,
-                    "InReview task has no active review session — resetting to NeedsReview"
-                );
-                // Reset the failure counter: stale-session recovery is an infrastructure
-                // event (tmux crash, service restart) not a genuine agent parse failure.
-                // Keeping the counter would unfairly consume the quota for the next cycle.
-                if let Err(e) = store::store_set_result(
-                    &Some(Arc::clone(store)),
-                    repo,
-                    task.task_id(),
-                    &[("review_agent_failures", serde_json::json!(0))],
-                )
-                .await
-                {
-                    tracing::error!(task_id = task.task_id(), err = %e, "failed to write review_agent_failures to store");
-                }
-                match task_manager
-                    .update_task_status_if(&task.external.id, Status::NeedsReview, Status::InReview)
-                    .await
-                {
-                    Err(e) => {
-                        tracing::error!(task_id = task.task_id(), err = %e, "failed to reset stale InReview task — task may be stuck in InReview indefinitely");
-                    }
-                    Ok(false) => {
-                        tracing::debug!(
-                            task_id = task.task_id(),
-                            "stale InReview reset skipped — task already transitioned (concurrent Done/Blocked/InProgress)"
-                        );
-                    }
-                    Ok(true) => {
-                        store::set_review_session_expected(store, repo, task.task_id(), false)
-                            .await;
-                    }
-                }
-            }
-        }
-    }
-
-    phases.push(("stale_in_review", at.elapsed().as_millis()));
-    at = std::time::Instant::now();
+    // 5. Stale InReview recovery lives in `tick_recover_stuck_tasks`, the single owner of an
+    // in_review task whose review session is gone or hung. It ran here too, after one minute,
+    // which beat a finished review's result to the engine and dropped it as stale
 
     // 5c. Detect stale InProgress tasks and recover them.
     //
@@ -4016,103 +3879,6 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
-    }
-
-    /// An InReview task with no tmux session should be reset to NeedsReview
-    /// regardless of review_session_expected — the review agent is dead.
-    async fn stale_in_review_status_after_sync(with_decision: bool) -> crate::store::TaskStatus {
-        crate::engine::cooldown::reset_global_state().await;
-        let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
-        let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
-            "owner/repo".to_string(),
-        ));
-        let tmux = Arc::new(TmuxManager::new());
-        let router = Arc::new(RwLock::new(crate::engine::router::Router::from_config()));
-        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
-        let auto_merge_in_flight: Arc<DashSet<String>> = Arc::new(DashSet::new());
-
-        let id = store
-            .upsert_external(&crate::store::UpsertExternal {
-                repo: "owner/repo",
-                ext_id: "55",
-                title: "Orphaned review",
-                body: "",
-                author: "",
-                url: "",
-                labels: &[],
-                origin: "github",
-            })
-            .await
-            .unwrap();
-        store
-            .update_status(id, crate::store::TaskStatus::InReview)
-            .await
-            .unwrap();
-        store
-            .set_fields(id, &[("branch", serde_json::json!("feature/55"))])
-            .await
-            .unwrap();
-        // Entered in_review long ago. updated_at stays fresh, as review_poll rewrites it
-        sqlx::query(
-            "UPDATE task_activity SET timestamp = '2020-01-01T00:00:00Z'
-             WHERE task_id = ? AND to_status = 'in_review'",
-        )
-        .bind(id)
-        .execute(store.pool())
-        .await
-        .unwrap();
-        if with_decision {
-            crate::store::store_log_activity(
-                &Some(store.clone()),
-                "owner/repo",
-                "55",
-                "review_decision",
-                None,
-                None,
-                None::<&str>,
-                None::<&str>,
-                Some(&serde_json::json!({"decision": "approve"})),
-            )
-            .await;
-        }
-
-        sync_tick(
-            &backend,
-            &tmux,
-            "owner/repo",
-            &EngineConfig::default(),
-            &router,
-            &task_manager,
-            &store,
-            &dispatching,
-            &auto_merge_in_flight,
-        )
-        .await
-        .unwrap();
-
-        store.get(id).await.unwrap().status
-    }
-
-    #[serial(cooldown_state)]
-    #[tokio::test]
-    async fn stale_in_review_recovery_resets_orphaned_task_without_session() {
-        // No reviewer session and no review decision since entering in_review
-        assert_eq!(
-            stale_in_review_status_after_sync(false).await,
-            crate::store::TaskStatus::NeedsReview
-        );
-    }
-
-    #[serial(cooldown_state)]
-    #[tokio::test]
-    async fn stale_in_review_recovery_leaves_decided_task_waiting_on_merge() {
-        assert_eq!(
-            stale_in_review_status_after_sync(true).await,
-            crate::store::TaskStatus::InReview
-        );
     }
 
     #[serial(cooldown_state)]
@@ -6197,7 +5963,6 @@ mod tests {
             review_agent_failures: 0,
             review_cycles: 0,
             review_invocations: 0,
-            review_session_expected: false,
             needs_review_refires: 0,
             input_tokens: 0,
             output_tokens: 0,
