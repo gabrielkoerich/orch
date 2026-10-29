@@ -74,7 +74,7 @@ A separate **sync tick** (~45s) handles less-frequent operations. With `relay.ur
 5. **Owner commands** — scans for `/slash` commands in issue comments
 6. **Skills sync** — clones/pulls skill repositories
 
-The review agent does not wait for a tick. A subscriber starts it as soon as a task enters `needs_review`.
+The review agent does not wait for a tick. A subscriber starts it when a task enters `needs_review`, once CI has run on the PR head. Running checks hold the review, red CI routes the task back to its agent, and with no CI, or no started check after 15 minutes, the review starts at once.
 
 ### Channels & Live Sessions
 
