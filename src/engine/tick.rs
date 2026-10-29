@@ -347,11 +347,19 @@ fn stuck_task_timing_from_map(
     })
 }
 
-// review_poll rewrites pr_number on every pass, so updated_at never ages
+// Age from the in_review status entry, the same source the no-session stale sweep uses
 async fn in_review_stuck_timestamp(store: &TaskStore, store_id: i64, fallback: &str) -> String {
     match store.in_review_entry(store_id).await {
         Ok(Some((entered_at, _))) => entered_at,
-        Ok(None) | Err(_) => fallback.to_string(),
+        Ok(None) => fallback.to_string(),
+        Err(e) => {
+            tracing::warn!(
+                store_id,
+                error = %e,
+                "failed to read in_review entry, falling back to updated_at"
+            );
+            fallback.to_string()
+        }
     }
 }
 
@@ -3273,7 +3281,7 @@ mod tests {
             ..EngineConfig::default()
         };
 
-        // Insert an external task and transition it to InReview with an old updated_at
+        // Insert an external task and age both the status entry and updated_at
         let id = store
             .upsert_external(&crate::store::UpsertExternal {
                 repo: "owner/repo",
@@ -3334,7 +3342,7 @@ mod tests {
             ..EngineConfig::default()
         };
 
-        // Insert a recently-updated InReview task (updated_at = now)
+        // Age updated_at, leave the in_review status entry at now
         let id = store
             .upsert_external(&crate::store::UpsertExternal {
                 repo: "owner/repo",
@@ -3393,7 +3401,7 @@ mod tests {
             ..EngineConfig::default()
         };
 
-        // Create an internal task in InReview with old updated_at
+        // Create an internal task in InReview and age both clocks
         let id = store
             .create_internal("owner/repo", "Internal InReview", "", "cron", "1", None)
             .await

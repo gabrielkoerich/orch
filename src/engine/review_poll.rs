@@ -623,7 +623,7 @@ pub(crate) async fn review_open_prs(
         };
 
         // Skip a rewrite of the same number, set_fields would bump updated_at
-        if task_info.stored.pr_number.map(|n| n as u64) != Some(pr_number) {
+        if stored_task.pr_number.map(|n| n as u64) != Some(pr_number) {
             if let Err(e) = store_set_result_by_id(
                 &Some(Arc::clone(store)),
                 task_info.store_id,
