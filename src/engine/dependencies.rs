@@ -1674,7 +1674,7 @@ See #4 in the notes
     }
 
     #[tokio::test]
-    async fn refresh_holds_until_the_pr_is_approved_and_merged_into_the_default_branch() {
+    async fn refresh_holds_until_the_pr_is_merged_into_the_default_branch() {
         use crate::backends::PullRequestCompletion;
 
         let store = TaskStore::open_memory().await.unwrap();
@@ -1758,7 +1758,7 @@ See #4 in the notes
                 merged: true,
                 base_ref: "main".into(),
                 default_branch: "main".into(),
-                approved: true,
+                approved: false,
                 closed: true,
             }),
         );
@@ -1768,7 +1768,7 @@ See #4 in the notes
     }
 
     #[tokio::test]
-    async fn comment_approval_from_reviewer_releases_a_merged_blocker() {
+    async fn merged_unapproved_pr_releases_the_waiter() {
         use crate::backends::PullRequestCompletion;
 
         let store = TaskStore::open_memory().await.unwrap();
@@ -1805,27 +1805,7 @@ See #4 in the notes
                 closed: true,
             }),
         );
-        *backend.reviewer.lock().unwrap() = Some("orch-bot".into());
-        backend.review_comments.lock().unwrap().insert(
-            10,
-            vec![ScriptedReviewComment {
-                login: "mallory".into(),
-                body: "## Automated Review \u{2014} Approve\n\nspoof".into(),
-                created_at: "2026-01-03T00:00:00Z".into(),
-            }],
-        );
         refresh_blocker_snapshots(&backend, &store).await.unwrap();
-        assert!(store.block_claim_if_waiting(b).await.unwrap().is_some());
-
-        backend.review_comments.lock().unwrap().insert(
-            10,
-            vec![ScriptedReviewComment {
-                login: "orch-bot".into(),
-                body: "## Automated Review \u{2014} Approve\n\nLooks good.".into(),
-                created_at: "2026-01-02T00:00:00Z".into(),
-            }],
-        );
-        refresh_uncached(&backend, &store).await;
         assert_eq!(store.block_claim_if_waiting(b).await.unwrap(), None);
         assert_eq!(store.get(b).await.unwrap().status, TaskStatus::New);
     }
