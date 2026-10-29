@@ -27,8 +27,8 @@ brew services restart orch
 
 ```bash
 orch cooldown list                  # list all active cooldowns
-orch cooldown clear <key>           # clear a cooldown (e.g., "claude", "kimi:opus")
-orch cooldown clear --all           # clear all active cooldowns
+orch cooldown clear <key>           # clear a cooldown and that agent's degraded rate-limit window
+orch cooldown clear --all           # clear all cooldowns and mark every configured agent as cleared
 orch task unblock all               # unblock blocked tasks
 ```
 
