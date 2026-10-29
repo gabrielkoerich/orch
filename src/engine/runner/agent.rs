@@ -424,6 +424,7 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
             "stderr.txt",
             "prompt-sys.md",
             "prompt-msg.md",
+            "result.json",
         ] {
             let path = attempt_dir.join(name);
 
