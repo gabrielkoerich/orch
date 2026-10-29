@@ -40,6 +40,12 @@ pub const PERSISTENT_MODEL_BACKOFF_BASE_SECS: i64 = 4 * 60 * 60;
 /// Maximum backoff for persistent model failures: 7 days.
 pub const PERSISTENT_MODEL_BACKOFF_MAX_SECS: i64 = 7 * 24 * 60 * 60;
 
+/// Base backoff for a one-off model failure that does not mean the model is gone: 5 minutes.
+pub const TRANSIENT_MODEL_BACKOFF_BASE_SECS: i64 = 5 * 60;
+
+/// Maximum backoff for a one-off model failure: 15 minutes.
+pub const TRANSIENT_MODEL_BACKOFF_MAX_SECS: i64 = 15 * 60;
+
 /// Base backoff for credit exhaustion (out_of_credits): 1 hour.
 pub const CREDIT_BACKOFF_BASE_SECS: i64 = 60 * 60;
 
@@ -714,6 +720,25 @@ pub async fn record_persistent_model_failure(agent_name: &str, model: &str) {
     );
     let cooldown_until = chrono::Utc::now().timestamp() + cooldown_secs;
     set_cooldown_async(&key, cooldown_until, "persistent_model_error").await;
+}
+
+/// Record a run that failed without showing the model is gone: empty or cut off output, an
+/// unparseable review, an opaque provider error.
+///
+/// A stopped session or one odd answer causes these, so the backoff is 5 then 15 minutes. Billing
+/// exhaustion and "model not found" keep [`record_persistent_model_failure`]
+pub async fn record_transient_model_failure(agent_name: &str, model: &str) {
+    let key = format!("{agent_name}:{model}");
+    let store_opt = cooldown_store().lock().await.clone();
+    let count = read_and_increment_failure_count(&store_opt, &key).await;
+    let cooldown_secs = compute_backoff(
+        count,
+        TRANSIENT_MODEL_BACKOFF_BASE_SECS,
+        TRANSIENT_MODEL_BACKOFF_MAX_SECS,
+        false,
+    );
+    let cooldown_until = chrono::Utc::now().timestamp() + cooldown_secs;
+    set_cooldown_async(&key, cooldown_until, "transient_model_error").await;
 }
 
 /// Set a model cooldown with a custom duration (in seconds) and reason.
