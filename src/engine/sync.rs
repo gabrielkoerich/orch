@@ -520,7 +520,8 @@ pub(crate) fn classify_comment(
 ///
 /// Returns:
 /// - `Ok(true)` — command processed and cursor may continue advancing
-/// - `Ok(false)` — mention task insert failed; caller must stop cursor advancement
+/// - `Ok(false)` — mention task insert failed, or validation hit a transient
+///   GitHub error; caller must stop cursor advancement so the next tick retries
 /// - `Err(_)` — DB lookup failed for parent_id; caller must NOT advance cursor
 ///   so this mention is retried on the next sync
 async fn handle_slash_command(
@@ -528,7 +529,7 @@ async fn handle_slash_command(
     store: Option<&Arc<TaskStore>>,
     repo: &str,
     task_manager: &Arc<TaskManager>,
-    gh: &crate::github::http::GhHttp,
+    gh: &dyn crate::engine::commands::CommandGh,
     mention: &Mention,
     command: &crate::engine::commands::OwnerCommand,
     cursor: &mut MentionCursor,
@@ -565,12 +566,14 @@ async fn handle_slash_command(
         | CommandOutcome::NotOpen { is_pr }
         | CommandOutcome::NotCollaborator { is_pr } => *is_pr,
         CommandOutcome::FetchFailed | CommandOutcome::CollaboratorCheckFailed => {
-            // Advance cursor so this comment is not re-processed on the next sync tick.
-            // The mention was already acknowledged; the worst case is the command was
-            // not executed but the mention is marked as processed — acceptable vs
-            // an infinite retry loop.
-            cursor.advance(&mention.created_at);
-            return Ok(true);
+            // Nothing was executed and nothing was posted to GitHub. Leave the cursor
+            // before this comment so the next tick retries the command.
+            tracing::warn!(
+                comment_id = %mention.id,
+                command = %command,
+                "deferring @orch slash command after a transient GitHub error"
+            );
+            return Ok(false);
         }
     };
 
@@ -2708,7 +2711,7 @@ async fn scan_comments(
                 let store_opt: Option<Arc<dyn CommandStoreOps>> =
                     store.map(|s| Arc::clone(s) as Arc<dyn CommandStoreOps>);
                 let gh = get_gh().await?;
-                let _outcome = validate_and_run_command(
+                let outcome = validate_and_run_command(
                     backend,
                     gh,
                     repo,
@@ -2719,9 +2722,24 @@ async fn scan_comments(
                     task_manager,
                 )
                 .await;
-                // Always advance cursor: the outcome comment (success or error) was
-                // already posted to GitHub, so re-processing would create duplicates.
-                cursor.advance(&comment.created_at);
+                match outcome {
+                    // Validation hit a transient GitHub error: nothing ran and nothing
+                    // was posted. Stop the cursor so the next tick retries this comment.
+                    CommandOutcome::FetchFailed | CommandOutcome::CollaboratorCheckFailed => {
+                        tracing::warn!(
+                            comment_id = %comment.id,
+                            command = %command,
+                            "deferring slash command after a transient GitHub error"
+                        );
+                        cursor.block_on_gap();
+                        break;
+                    }
+                    // The outcome comment (success or error) was already posted to
+                    // GitHub, so re-processing would create duplicates.
+                    CommandOutcome::Executed { .. }
+                    | CommandOutcome::NotOpen { .. }
+                    | CommandOutcome::NotCollaborator { .. } => cursor.advance(&comment.created_at),
+                }
             }
 
             CommentAction::ExecuteCommandForMention { command, .. } => {
@@ -6130,6 +6148,7 @@ mod tests {
     /// Backend that tracks acknowledge_mention calls and can be configured to fail them.
     struct AckTrackingBackend {
         ack_calls: tokio::sync::Mutex<Vec<String>>,
+        posted: tokio::sync::Mutex<Vec<String>>,
         ack_failure: bool,
         inner: crate::backends::test_helpers::NoopBackend,
     }
@@ -6138,6 +6157,7 @@ mod tests {
         fn new(ack_failure: bool) -> Arc<Self> {
             Arc::new(Self {
                 ack_calls: tokio::sync::Mutex::new(Vec::new()),
+                posted: tokio::sync::Mutex::new(Vec::new()),
                 ack_failure,
                 inner: crate::backends::test_helpers::NoopBackend,
             })
@@ -6187,6 +6207,7 @@ mod tests {
             self.inner.list_routable().await
         }
         async fn post_comment(&self, id: &ExternalId, b: &str) -> anyhow::Result<()> {
+            self.posted.lock().await.push(b.to_string());
             self.inner.post_comment(id, b).await
         }
         async fn set_labels(&self, id: &ExternalId, l: &[String]) -> anyhow::Result<()> {
@@ -6339,6 +6360,201 @@ mod tests {
             cursor.as_deref(),
             Some(initial_ts),
             "cursor must not advance when acknowledge_mention fails for ExecuteCommandForMention"
+        );
+    }
+
+    // ── slash commands retry after a transient GitHub error ──────────────────
+
+    /// GitHub stub whose `get_issue` fails once, then succeeds.
+    #[derive(Default)]
+    struct FlakyGh {
+        get_issue_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl crate::engine::commands::CommandGh for FlakyGh {
+        async fn get_issue(
+            &self,
+            _repo: &str,
+            number: &str,
+        ) -> anyhow::Result<crate::github::types::GitHubIssue> {
+            if self
+                .get_issue_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                anyhow::bail!("network error: temporary failure fetching issue");
+            }
+            Ok(crate::github::types::GitHubIssue {
+                number: number.parse().unwrap_or(0),
+                id: 1,
+                title: "t".into(),
+                body: None,
+                state: "open".into(),
+                labels: Vec::new(),
+                user: crate::github::types::GitHubUser {
+                    login: "alice".into(),
+                },
+                created_at: String::new(),
+                updated_at: String::new(),
+                html_url: String::new(),
+                node_id: None,
+                pull_request: None,
+                author_association: Some("OWNER".into()),
+                state_reason: None,
+            })
+        }
+
+        async fn is_collaborator(&self, _repo: &str, _username: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
+        async fn close_issue(&self, _repo: &str, _number: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A transient `get_issue` failure must leave the cursor before the comment so
+    /// the next scan retries it — and the command must then run exactly once.
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn slash_command_retries_after_transient_fetch_failure() {
+        crate::engine::cooldown::reset_global_state().await;
+        let backend: Arc<AckTrackingBackend> = AckTrackingBackend::new(false);
+        let store: Arc<TaskStore> = Arc::new(TaskStore::open_memory().await.unwrap());
+        let initial_ts = "2026-01-01T00:00:00Z";
+
+        let mention = Mention {
+            id: "mention-ghi".into(),
+            body: "@bot /unblock".into(),
+            author: "alice".into(),
+            created_at: "2026-01-02T00:00:00Z".into(),
+            issue_url: Some("https://api.github.com/repos/owner/repo/issues/42".into()),
+        };
+
+        let backend_trait: Arc<dyn ExternalBackend> = backend.clone();
+        let task_manager = Arc::new(TaskManager::new(backend_trait.clone()));
+        let gh = FlakyGh::default();
+        let mut cursor = MentionCursor::default();
+
+        // First scan: get_issue fails.
+        let advanced_safely = handle_slash_command(
+            &backend_trait,
+            Some(&store),
+            "owner/repo",
+            &task_manager,
+            &gh,
+            &mention,
+            &crate::engine::commands::OwnerCommand::Unblock,
+            &mut cursor,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !advanced_safely,
+            "a transient fetch failure must stop cursor advancement"
+        );
+        assert!(
+            cursor.last_safe_ts.is_none(),
+            "cursor must stay before the comment so the next tick retries it"
+        );
+        assert!(
+            store.list_all("owner/repo").await.unwrap().is_empty(),
+            "no mention task on a transient failure"
+        );
+        assert!(
+            backend.posted.lock().await.is_empty(),
+            "nothing is posted to GitHub on a transient failure"
+        );
+        assert_eq!(
+            filter_mentions_by_since(std::slice::from_ref(&mention), initial_ts).len(),
+            1,
+            "the comment is still in range for the next scan"
+        );
+
+        // Second scan: get_issue succeeds and the command runs.
+        let mut cursor = MentionCursor::default();
+        let advanced_safely = handle_slash_command(
+            &backend_trait,
+            Some(&store),
+            "owner/repo",
+            &task_manager,
+            &gh,
+            &mention,
+            &crate::engine::commands::OwnerCommand::Unblock,
+            &mut cursor,
+        )
+        .await
+        .unwrap();
+
+        assert!(advanced_safely);
+        assert_eq!(
+            cursor.into_last_safe_ts().as_deref(),
+            Some("2026-01-02T00:00:00Z"),
+            "cursor advances once the command actually runs"
+        );
+        assert_eq!(
+            backend.posted.lock().await.len(),
+            1,
+            "the command runs once, posting a single confirmation"
+        );
+        assert_eq!(
+            store.list_all("owner/repo").await.unwrap().len(),
+            1,
+            "one sentinel mention task for the executed command"
+        );
+    }
+
+    /// In the plain `ExecuteCommand` arm the GitHub client points at a dead port
+    /// under `cfg(test)`, so `get_issue` always fails — the cursor must stay put.
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn execute_command_keeps_cursor_on_fetch_failure() {
+        crate::engine::cooldown::reset_global_state().await;
+        let backend: Arc<AckTrackingBackend> = AckTrackingBackend::new(false);
+        let store: Arc<TaskStore> = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        let initial_ts = "2026-01-01T00:00:00Z";
+        store
+            .kv_set("mentions_last_checked", initial_ts)
+            .await
+            .unwrap();
+
+        // Slash command without a mention → ExecuteCommand.
+        let comment = Mention {
+            id: "comment-jkl".into(),
+            body: "/unblock".into(),
+            author: "alice".into(),
+            created_at: "2026-01-02T00:00:00Z".into(),
+            issue_url: Some("https://api.github.com/repos/owner/repo/issues/42".into()),
+        };
+
+        let backend_trait: Arc<dyn ExternalBackend> = backend.clone();
+        let task_manager = Arc::new(TaskManager::new(backend_trait.clone()));
+
+        scan_comments(
+            &backend_trait,
+            Some(&store),
+            "owner/repo",
+            &task_manager,
+            Some(&[comment]),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            backend.posted.lock().await.is_empty(),
+            "nothing is posted when the issue fetch fails"
+        );
+        assert_eq!(
+            store
+                .kv_get("mentions_last_checked")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(initial_ts),
+            "cursor must not advance past a command that never ran"
         );
     }
 
