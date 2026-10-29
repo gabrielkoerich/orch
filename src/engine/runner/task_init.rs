@@ -335,6 +335,7 @@ pub async fn prepare_task(
         attempt: next_attempt,
         sandbox: sandboxed,
         main_project_dir: wt.main_project_dir.clone(),
+        branch: wt.branch.clone(),
     };
 
     // Increment attempts counter — must succeed so max_attempts guard cannot be bypassed

@@ -826,6 +826,7 @@ async fn build_review_context(
         attempt: review_attempt,
         sandbox: sandboxed,
         main_project_dir,
+        branch: branch_name.clone(),
     };
 
     let head_sha = match GhHttp::new() {
@@ -3889,6 +3890,7 @@ mod tests {
                 attempt: 1,
                 sandbox: false,
                 main_project_dir: work_dir.to_path_buf(),
+                branch: String::new(),
             },
             same_agent_fallback: false,
         }

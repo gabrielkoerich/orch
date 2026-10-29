@@ -292,6 +292,8 @@ pub struct AgentInvocation {
     pub sandbox: bool,
     /// The project's main checkout, which the sandbox keeps read-only but for its `.git`
     pub main_project_dir: PathBuf,
+    /// The task's branch, from orch's records, the one ref the sandbox lets the agent move
+    pub branch: String,
     /// Current attempt number (1-indexed)
     pub attempt: u32,
 }
@@ -852,6 +854,7 @@ mod tests {
             attempt: 1,
             sandbox: false,
             main_project_dir: std::path::PathBuf::from("/tmp"),
+            branch: String::new(),
         }
     }
 

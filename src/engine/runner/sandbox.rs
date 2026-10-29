@@ -6,39 +6,22 @@ use sandbox_jail::{known, Access, Backend, Policy, Sandbox};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-/// Files and dirs in the home that run later as the operator, read-only even when missing
-const STARTUP: &[&str] = &[
-    ".zshrc",
-    ".zshenv",
-    ".zprofile",
-    ".zlogin",
-    ".bashrc",
-    ".bash_profile",
-    ".bash_login",
-    ".profile",
-    ".gitconfig",
-    ".local/bin",
-    "bin",
-    "Library/LaunchAgents",
+/// Top-level dirs of the home that stay read-only: what loads or runs later as the operator, the
+/// agents' own settings, and keys. Everything at the top of the home that is not a dir is read-only too
+const HOME_READ_ONLY: &[&str] = &[
+    ".config", ".claude", ".ssh", ".gnupg", "bin", "Library", ".local",
 ];
 
-/// The agents' own settings, hooks and instructions, which the operator's sessions load too
-const AGENT_CONFIG: &[&str] = &[
-    ".claude/settings.json",
-    ".claude/settings.local.json",
-    ".claude/hooks",
-    ".claude/commands",
-    ".claude/agents",
-    ".claude/skills",
-    ".claude/plugins",
-    ".claude/CLAUDE.md",
-    ".codex/config.toml",
-    ".codex/AGENTS.md",
-    ".codex/rules",
+/// Writable parts of the read-only dirs above, for caches and agent state
+const HOME_WRITABLE: &[&str] = &[
+    "Library/Caches",
+    "Library/Logs",
+    ".local/share",
+    ".local/state",
 ];
 
-/// Agent state that stays writable inside read-only parts of the home
-const AGENT_STATE: &[&str] = &[".claude.json", ".config/opencode"];
+/// Codex's settings and instructions, which sit beside the state it rewrites
+const AGENT_CONFIG: &[&str] = &[".codex/config.toml", ".codex/AGENTS.md", ".codex/rules"];
 
 /// The tmux, ssh-agent and Docker sockets that would let an agent start a process outside
 const SCRATCH: &[&str] = &["/tmp", "/run", "/var/tmp"];
@@ -58,20 +41,26 @@ pub fn enabled_globally() -> bool {
     crate::config::get_global("workflow.sandbox").is_ok_and(|v| v.trim() == "os")
 }
 
-/// The program and arguments that go before the agent command, or why the sandbox cannot start
+/**
+ * The program and arguments that go before the agent command, or why the sandbox cannot start.
+ * The worktree's `.git` file is the agent's to write, so the common dir comes from the main
+ * checkout and the branch from orch's records, and a git dir outside them refuses the run
+ **/
 pub async fn argv(inv: &AgentInvocation) -> anyhow::Result<Vec<OsString>> {
     let backend = Backend::detect()?;
-    let resolve = |arg| super::agent::resolve_git_dir_arg(&inv.work_dir, arg);
-    let git_dir = resolve("--git-dir").await?;
-    let common_dir = resolve("--git-common-dir").await?;
-    let head_ref = tokio::process::Command::new("git")
-        .args(["symbolic-ref", "--quiet", "HEAD"])
-        .current_dir(&inv.work_dir)
-        .output()
-        .await
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let common_dir =
+        super::agent::resolve_git_dir_arg(&inv.main_project_dir, "--git-common-dir").await?;
+    let git_dir = super::agent::resolve_git_dir_arg(&inv.work_dir, "--git-dir").await?;
+
+    if let (Some(git), Some(common)) = (&git_dir, &common_dir) {
+        if git != common && !git.starts_with(common.join("worktrees")) {
+            anyhow::bail!(
+                "the worktree's git dir {} is outside its repository {}",
+                git.display(),
+                common.display()
+            );
+        }
+    }
 
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -90,7 +79,7 @@ pub async fn argv(inv: &AgentInvocation) -> anyhow::Result<Vec<OsString>> {
         work_dir: inv.work_dir.clone(),
         git_dir,
         common_dir,
-        head_ref,
+        own_ref: (!inv.branch.is_empty()).then(|| format!("refs/heads/{}", inv.branch)),
         home,
         orch_home: crate::home::orch_home()?,
         projects,
@@ -108,8 +97,8 @@ struct Run {
     work_dir: PathBuf,
     git_dir: Option<PathBuf>,
     common_dir: Option<PathBuf>,
-    /// The worktree's branch, `refs/heads/<branch>`
-    head_ref: Option<String>,
+    /// The task's branch, `refs/heads/<branch>`, from orch's records
+    own_ref: Option<String>,
     home: PathBuf,
     orch_home: PathBuf,
     projects: Vec<PathBuf>,
@@ -128,10 +117,9 @@ impl Run {
 
 fn policy(run: &Run) -> Policy {
     let mut p = Policy::default();
-    // The home is writable for agent state and every language's caches, minus what runs later
     p.writable.push(run.work_dir.clone());
     p.writable.extend(run.git_dirs().cloned());
-    p.writable.push(run.home.clone());
+    p.writable.extend(home_writable(&run.home));
     let temp = run.temp.clone();
 
     if run.seatbelt {
@@ -164,15 +152,28 @@ fn policy(run: &Run) -> Policy {
     p.unix_sockets = Access::Only(sockets);
 
     if let Some(common) = &run.common_dir {
-        git_rules(common, run.head_ref.as_deref(), &mut p.read_only);
-    }
+        git_rules(
+            common,
+            run.git_dir.as_ref(),
+            run.own_ref.as_deref(),
+            &mut p.read_only,
+        );
 
-    if let Some(dir) = &run.git_dir {
-        p.read_only.push(dir.join("config.worktree"));
+        if run.git_dir.as_ref().is_some_and(|g| g != common) {
+            p.read_only.push(run.work_dir.join(".git"));
+        }
     }
 
     p.read_only.push(run.work_dir.join(".orch.yml"));
-    home_rules(run, &mut p.read_only);
+    p.read_only
+        .extend(AGENT_CONFIG.iter().map(|path| run.home.join(path)));
+    // A tool on PATH inside the home, such as ~/.cargo/bin, runs later as the operator
+    p.read_only.extend(
+        run.path_dirs
+            .iter()
+            .filter(|d| d.starts_with(&run.home))
+            .cloned(),
+    );
 
     let mut keep: Vec<PathBuf> = vec![run.work_dir.clone()];
     keep.extend(run.git_dirs().cloned());
@@ -209,26 +210,69 @@ fn policy(run: &Run) -> Policy {
     p
 }
 
+/// The home's writable parts: its top-level dirs but [`HOME_READ_ONLY`], and [`HOME_WRITABLE`]
+/// inside those. The home itself stays read-only, so no new dotfile appears at its top
+fn home_writable(home: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(home)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| !HOME_READ_ONLY.contains(&e.file_name().to_string_lossy().as_ref()))
+        .map(|e| e.path())
+        .collect();
+    dirs.extend(
+        HOME_WRITABLE
+            .iter()
+            .map(|d| home.join(d))
+            .filter(|d| d.is_dir()),
+    );
+    dirs
+}
+
 /**
- * The git common dir is writable for objects and the task's branch. A hook or config written to it
- * runs the next time the operator runs git, and another branch's ref is the operator's work, so
- * those stay read-only. A branch that only `packed-refs` holds gets a read-only loose ref too,
- * since a new loose ref would win over the packed one
+ * The git common dir is writable for objects, the task's branch, remote refs and the task's own
+ * worktree dir, and read-only around those: hooks and config run the next time the operator runs
+ * git, and another branch is the operator's work. Paths git would pick up when they appear are
+ * read-only even when missing, and so is a loose ref for a branch only `packed-refs` holds, since
+ * it would win over the packed one
  **/
-fn git_rules(common: &Path, head_ref: Option<&str>, out: &mut Vec<PathBuf>) {
-    let own = head_ref.map(|r| common.join(r));
+fn git_rules(
+    common: &Path,
+    git_dir: Option<&PathBuf>,
+    own_ref: Option<&str>,
+    out: &mut Vec<PathBuf>,
+) {
     out.extend(
         [
             "hooks",
             "config",
+            "info",
+            "modules",
             "packed-refs",
             "refs/tags",
-            "modules",
-            "info",
         ]
         .map(|d| common.join(d)),
     );
-    read_only_around(&common.join("refs/heads"), own.as_slice(), out);
+    let own: Vec<PathBuf> = own_ref
+        .map(|r| vec![common.join(r), common.join("logs").join(r)])
+        .unwrap_or_default();
+
+    match git_dir {
+        Some(dir) if dir != common => {
+            let mut keep = vec![
+                common.join("objects"),
+                common.join("refs/remotes"),
+                common.join("logs/refs/remotes"),
+                dir.clone(),
+            ];
+            keep.extend(own.iter().cloned());
+            read_only_around(common, &keep, out);
+            out.extend(["HEAD", "commondir", "gitdir", "config.worktree"].map(|f| dir.join(f)));
+        }
+        // The worktree is the main checkout, so its index and HEAD live in the common dir
+        _ => read_only_around(&common.join("refs/heads"), &own, out),
+    }
 
     let packed = std::fs::read_to_string(common.join("packed-refs")).unwrap_or_default();
     for name in packed
@@ -237,44 +281,8 @@ fn git_rules(common: &Path, head_ref: Option<&str>, out: &mut Vec<PathBuf>) {
     {
         let path = common.join(name);
 
-        if name.starts_with("refs/heads/") && Some(&path) != own.as_ref() && !path.exists() {
+        if name.starts_with("refs/heads/") && !own.contains(&path) && !path.exists() {
             out.push(path);
-        }
-    }
-}
-
-/**
- * The home is writable, so everything in it that runs later as the operator is read-only: the
- * startup files, every dotfile at its top, `~/.config`, the agents' own settings and every `PATH`
- * dir inside it, such as `~/.cargo/bin`. Agent state those cover stays writable
- **/
-fn home_rules(run: &Run, out: &mut Vec<PathBuf>) {
-    let home = &run.home;
-    out.extend(STARTUP.iter().map(|p| home.join(p)));
-    out.extend(AGENT_CONFIG.iter().map(|p| home.join(p)));
-    out.extend(
-        run.path_dirs
-            .iter()
-            .filter(|d| d.starts_with(home))
-            .cloned(),
-    );
-
-    let keep: Vec<PathBuf> = AGENT_STATE.iter().map(|p| home.join(p)).collect();
-    read_only_around(&home.join(".config"), &keep, out);
-
-    let Ok(entries) = std::fs::read_dir(home) else {
-        return;
-    };
-
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let is_file = entry
-            .file_type()
-            .is_ok_and(|t| t.is_file() || t.is_symlink());
-
-        // Claude rewrites its state file and the backups beside it
-        if is_file && name.starts_with('.') && !name.starts_with(".claude.json") {
-            out.push(entry.path());
         }
     }
 }
@@ -324,9 +332,13 @@ mod tests {
             "home/proj/.git/worktrees/mine",
             "home/proj/.git/refs/heads/feat",
             "home/proj/src",
+            "home/proj/.git/objects",
+            "home/proj/.git/worktrees/other",
             "home/.config/nvim",
-            "home/.config/opencode",
+            "home/.claude",
             "home/.cargo/bin",
+            "home/Library/Caches",
+            "home/Library/LaunchAgents",
         ] {
             fs::create_dir_all(r.join(dir)).unwrap();
         }
@@ -336,6 +348,7 @@ mod tests {
             "home/proj/README.md",
             "home/proj/.git/refs/heads/main",
             "home/proj/.git/refs/heads/feat/mine",
+            "home/proj/.git/worktrees/mine/HEAD",
             "home/.zshrc",
             "home/.claude.json",
         ] {
@@ -351,7 +364,7 @@ mod tests {
             work_dir: orch.join("worktrees/proj/mine"),
             git_dir: Some(home.join("proj/.git/worktrees/mine")),
             common_dir: Some(home.join("proj/.git")),
-            head_ref: Some("refs/heads/feat/mine".into()),
+            own_ref: Some("refs/heads/feat/mine".into()),
             home: home.clone(),
             orch_home: orch,
             projects: vec![home.join("proj")],
@@ -421,25 +434,25 @@ mod tests {
         }
         assert!(!p.read_only.contains(&git.join("refs/heads/feat/mine")));
         assert!(!p.read_only.contains(&git.join("refs/heads/feat")));
+        assert!(!p.read_only.contains(&git.join("objects")));
+        assert!(p.read_only.contains(&git.join("worktrees/other")));
+        assert!(p.read_only.contains(&git.join("worktrees/mine/HEAD")));
+        assert!(p.read_only.contains(&run.work_dir.join(".git")));
         assert!(p.writable.contains(&git));
     }
 
     #[test]
-    fn what_runs_later_in_the_home_is_read_only() {
+    fn only_the_home_s_cache_dirs_are_writable() {
         let (_root, run) = fixture(false);
         let p = policy(&run);
         let h = &run.home;
-        for path in [
-            ".zshrc",
-            ".config/nvim",
-            ".cargo/bin",
-            ".claude/settings.json",
-        ] {
-            assert!(p.read_only.contains(&h.join(path)), "{path} not read-only");
+        for path in [".cargo", ".orch", "Library/Caches"] {
+            assert!(p.writable.contains(&h.join(path)), "{path} not writable");
         }
-        for path in [".claude.json", ".config/opencode"] {
-            assert!(!p.read_only.contains(&h.join(path)), "{path} read-only");
+        for path in ["", ".config", ".claude", "Library"] {
+            assert!(!p.writable.contains(&h.join(path)), "{path:?} writable");
         }
+        assert!(p.read_only.contains(&h.join(".cargo/bin")));
         assert!(!p.read_only.contains(&PathBuf::from("/usr/bin")));
     }
 
@@ -477,7 +490,6 @@ mod tests {
         assert!(p.hidden.contains(&run.home.join(".ssh")));
         assert!(p.hidden.contains(&run.home.join(".gnupg")));
         assert!(!p.hidden.iter().any(|h| h.ends_with(".cargo/config.toml")));
-        assert!(p.read_only.contains(&run.home.join(".zshrc")));
         assert!(p.read_only.contains(&run.work_dir.join(".orch.yml")));
     }
 
@@ -497,7 +509,8 @@ mod tests {
         let script = format!(
             "echo ok > {w}/f && ! echo x > {o}/config.yml && ! echo x > {other}/f \
              && ! echo x > {w}/.orch.yml && ! echo x >> {h}/.zshrc && ! cat {h}/.ssh/key \
-             && echo cache > {h}/.cache-probe",
+             && ! echo x > {h}/.new-dotfile && ! echo x > {h}/.claude.json \
+             && echo cache > {h}/.cargo/probe",
             w = run.work_dir.display(),
             o = run.orch_home.display(),
             other = other.display(),
@@ -566,7 +579,7 @@ mod tests {
             work_dir: work.clone(),
             git_dir: None,
             common_dir: None,
-            head_ref: None,
+            own_ref: None,
             home: home.clone(),
             orch_home: home.join(".orch"),
             projects: vec![],

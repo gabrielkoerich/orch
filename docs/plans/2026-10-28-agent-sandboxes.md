@@ -50,20 +50,20 @@ The redirect, `script`, `tee` and tmux stay outside the sandbox in both modes, s
 
 | Field | Value |
 |-------|-------|
-| `writable` | The worktree, its `--git-dir` and `--git-common-dir` (`resolve_git_dir_arg()`, line 196), `$TMPDIR`, `/private/tmp`, `$HOME` |
-| `read_only` | In the git common dir, `hooks`, `config`, `info`, `modules`, `packed-refs`, `refs/tags` and every branch ref but the task's own, including branches only `packed-refs` holds. The worktree git dir's `config.worktree`. The main checkout of every configured project, except its `.git`. Every entry of `~/.orch` and of `~/.orch/worktrees` but the task's own worktree and git dir. `~/Library/LaunchAgents`, `~/.local/bin`, `~/bin`. The shell and git startup files. Every dotfile at the top of the home but `.claude.json*`, `~/.config` but `~/.config/opencode`, every `PATH` dir inside the home, and the agents' settings, hooks and instructions under `~/.claude` and `~/.codex` |
+| `writable` | The worktree, its `--git-dir`, and in the `--git-common-dir` (from the main checkout, since the worktree's `.git` file is the agent's to write) the objects, the task's branch ref and log from orch's records, and remote refs. `$TMPDIR`, `/private/tmp`. The home's top-level dirs but `.config`, `.claude`, `.ssh`, `.gnupg`, `bin`, `Library` and `.local`, plus `Library/Caches`, `Library/Logs`, `.local/share` and `.local/state` |
+| `read_only` | Every other entry of the git common dir, and `hooks`, `config`, `info`, `modules`, `packed-refs`, `refs/tags` and a loose ref for each packed branch even when missing. In the task's worktree git dir, `HEAD`, `commondir`, `gitdir` and `config.worktree`, and the worktree's `.git` file. The worktree's `.orch.yml`. The main checkout of every configured project but its `.git`. Every entry of `~/.orch` and `~/.orch/worktrees` but the task's own worktree and git dir. Codex's `config.toml`, `AGENTS.md` and `rules`, and every `PATH` dir inside the home. A git dir outside the repository's `worktrees` refuses the run |
 | `hidden` | `sandbox_jail::known::credentials($HOME)` but cargo's config, and `~/.gnupg` |
 | `unix_sockets` | The worktree and `$TMPDIR` when it is not `/tmp`. tmux's socket is in `/tmp`, Docker's and the ssh-agent's in the home. On Linux, `/tmp`, `/run` and `/var/tmp` are empty scratch dirs, since bwrap has no socket filter |
 | `mach_services` | `sandbox_jail::known::BASIC_MACH_SERVICES` and `com.apple.SecurityServer` for the keychain. LaunchServices is out, so `open` cannot start an app outside |
 | Everything else | The default: readable, network on |
 
-- `$HOME` writable covers agent state (`~/.claude`, `~/.codex`, `~/.local/share/opencode`) and every language's caches without naming any.
+- The home's root is read-only, so no file at its top, existing or new, is writable: shell startup files, `.gitconfig`, `.claude.json`, which holds `mcpServers`. Its existing top-level dirs stay writable for every language's caches without naming any. Claude works with `~/.claude` and `~/.claude.json` read-only, and codex rewrites its login in `~/.codex`. A tool that first creates a new top-level dir, such as `~/.npm` on a fresh machine, fails until the operator creates it.
 - A hook or `core.hooksPath` written to the git common dir runs outside the sandbox the next time the operator runs git. Startup files, `~/.local/bin` and `LaunchAgents` run later as the operator.
 - `read_only` wins over `writable`, so `~/.orch` cannot be one rule with the worktree as an exception. Orch lists the entries and leaves out the task's own.
 - `~/.orch` stays readable. Job prompts read `orch.db` and `~/.orch/state/*/tasks/*/attempts/`, and agents read the template and the main checkout.
 - Job agents run `orch task list` and `orch task runs`, which write `orch.db-wal` and `orch.db-shm`. Internal (job) tasks get `orch.db*` writable, GitHub-issue tasks do not.
-- Claude's login is in the login keychain, which macOS reads in the client process, so `~/Library/Keychains` stays readable. Hiding it logged Claude out in a probe on 2026-10-28. Each item keeps its own access list.
-- The home stays writable for caches, and a denylist misses what it does not name: a toolchain under `~/.rustup` or `~/.nvm` runs later as the operator. Closing that needs a read-only home with per-language cache paths, which #3674 ruled out.
+- Claude's login is in the login keychain, which it reads through `/usr/bin/security`, so the keychain stays readable and `security` runnable. Hiding either logged Claude out in probes on 2026-10-28. An agent can then read any item whose access list trusts `security`, as it can without the sandbox. A token login through `CLAUDE_CODE_OAUTH_TOKEN` would close this.
+- A toolchain under a writable dir, such as `~/.rustup` or `~/.nvm`, runs later as the operator. Closing that needs per-language cache paths, which #3674 ruled out.
 
 The crate keeps a renamed parent from moving a ruled path out from under its rule, so an agent cannot `mv ~/.config` to get at `~/.config/git`. The cost is that the agent cannot rename or `chmod` `$HOME` itself.
 
