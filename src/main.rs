@@ -998,6 +998,14 @@ enum ServiceAction {
     Restart,
     /// Show service status
     Status,
+    /// Write the systemd user unit and enable it (Linux)
+    Install {
+        /// Overwrite an existing unit file
+        #[arg(long)]
+        force: bool,
+    },
+    /// Disable and remove the systemd user unit (Linux)
+    Uninstall,
     /// Diagnose state inconsistencies between SQLite and GitHub
     Doctor {
         /// Run a full (expensive) audit including historical done tasks
@@ -1396,6 +1404,12 @@ async fn async_main() -> anyhow::Result<()> {
             }
             ServiceAction::Status => {
                 cli::service::status()?;
+            }
+            ServiceAction::Install { force } => {
+                cli::service::install(force)?;
+            }
+            ServiceAction::Uninstall => {
+                cli::service::uninstall()?;
             }
             ServiceAction::Doctor { full, fix, dry_run } => {
                 cli::doctor::run(full, fix, dry_run).await?;

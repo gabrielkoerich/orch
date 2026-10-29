@@ -27,13 +27,35 @@ pub struct Session {
 pub struct TmuxManager {
     /// Prefix for session names (e.g. "orch-")
     prefix: String,
+    /// Socket name for `tmux -L`. None uses the default server
+    socket: Option<String>,
 }
 
 impl TmuxManager {
     pub fn new() -> Self {
-        Self {
-            prefix: "orch-".to_string(),
+        #[cfg(test)]
+        {
+            Self {
+                prefix: "orch-test-".to_string(),
+                socket: Some(test_socket_name()),
+            }
         }
+        #[cfg(not(test))]
+        {
+            Self {
+                prefix: "orch-".to_string(),
+                socket: None,
+            }
+        }
+    }
+
+    /// Build a `tmux` command scoped to this manager's server
+    pub(crate) fn command(&self) -> Command {
+        let mut cmd = Command::new("tmux");
+        if let Some(socket) = &self.socket {
+            cmd.args(["-L", socket]);
+        }
+        cmd
     }
 
     /// Session name for a task: `orch-{project}-{task_id}`.
@@ -74,7 +96,7 @@ impl TmuxManager {
     ) -> anyhow::Result<String> {
         let name = self.session_name(repo, task_id);
 
-        let mut cmd = Command::new("tmux");
+        let mut cmd = self.command();
         cmd.args(["new-session", "-d", "-s", &name, "-c", working_dir]);
 
         // Suppress oh-my-zsh update prompts that can intercept agent input.
@@ -106,7 +128,7 @@ impl TmuxManager {
 
     /// Check if a session exists.
     pub async fn session_exists(&self, session: &str) -> bool {
-        Command::new("tmux")
+        self.command()
             .args(["has-session", "-t", session])
             .output_with_context()
             .await
@@ -116,14 +138,18 @@ impl TmuxManager {
 
     /// Kill a session.
     pub async fn kill_session(&self, session: &str) -> anyhow::Result<()> {
-        let output = Command::new("tmux")
+        let output = self
+            .command()
             .args(["kill-session", "-t", session])
             .output_with_context()
             .await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("can't find session") || stderr.contains("no server running") {
+            if stderr.contains("can't find session")
+                || stderr.contains("no server running")
+                || stderr.contains("error connecting to")
+            {
                 tracing::debug!(session, %stderr, "kill-session: session already gone");
             } else {
                 tracing::warn!(session, %stderr, "kill-session failed unexpectedly");
@@ -139,7 +165,8 @@ impl TmuxManager {
     /// `is_session_active()` check and this capture.
     pub async fn capture_pane(&self, session: &str, lines: i32) -> anyhow::Result<String> {
         let start = format!("-{lines}");
-        let output = Command::new("tmux")
+        let output = self
+            .command()
             .args(["capture-pane", "-t", session, "-p", "-S", &start])
             .output_with_context()
             .await?;
@@ -149,9 +176,11 @@ impl TmuxManager {
             // "can't find pane" / "can't find session" / "no server running" are expected
             // teardown races — the session was cleaned up between the caller's activity
             // check and this call, or the tmux server exited entirely.
+            // "error connecting to" is the same race on a `tmux -L` socket that was never started
             if stderr.contains("can't find pane")
                 || stderr.contains("can't find session")
                 || stderr.contains("no server running")
+                || stderr.contains("error connecting to")
             {
                 tracing::debug!(
                     session,
@@ -168,7 +197,8 @@ impl TmuxManager {
     /// Returns false if the session doesn't exist or the pane has no active process.
     pub async fn is_session_active(&self, session: &str) -> bool {
         // Check pane_dead flag
-        let output = Command::new("tmux")
+        let output = self
+            .command()
             .args(["list-panes", "-t", session, "-F", "#{pane_dead}"])
             .output_with_context()
             .await;
@@ -309,7 +339,8 @@ impl TmuxManager {
     /// Uses `list-panes -a` to avoid one subprocess per session.
     pub async fn batch_session_active(&self) -> HashMap<String, bool> {
         let mut map = HashMap::new();
-        let o = match Command::new("tmux")
+        let o = match self
+            .command()
             .args(["list-panes", "-a", "-F", "#{session_name} #{pane_dead}"])
             .output_with_context()
             .await
@@ -341,7 +372,8 @@ impl TmuxManager {
     /// List all orch-prefixed sessions with metadata including creation time.
     pub async fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
         // Get both name and creation timestamp in one call
-        let output = Command::new("tmux")
+        let output = self
+            .command()
             .args(["list-sessions", "-F", "#{session_name} #{session_created}"])
             .output_with_context()
             .await?;
@@ -509,7 +541,8 @@ impl TmuxManager {
     /// Note: does NOT affect the initial pane — use `-e` in `create_session` for that.
     #[cfg(test)]
     pub async fn set_env(&self, session: &str, key: &str, value: &str) -> anyhow::Result<()> {
-        let output = Command::new("tmux")
+        let output = self
+            .command()
             .args(["set-environment", "-t", session, key, value])
             .output_with_context()
             .await?;
@@ -527,7 +560,8 @@ impl TmuxManager {
     ///
     /// Uses: `tmux set-environment -gu <key>`
     pub async fn unset_global_env(&self, key: &str) -> anyhow::Result<()> {
-        let output = Command::new("tmux")
+        let output = self
+            .command()
             .args(["set-environment", "-gu", key])
             .output_with_context()
             .await?;
@@ -553,6 +587,11 @@ pub(crate) fn test_session_name() -> String {
     )
 }
 
+#[cfg(test)]
+fn test_socket_name() -> String {
+    format!("orch-test-{}", std::process::id())
+}
+
 /// RAII guard that kills a tmux session on drop, even if the test panics.
 #[cfg(test)]
 pub(crate) struct SessionGuard(pub(crate) String);
@@ -561,7 +600,7 @@ pub(crate) struct SessionGuard(pub(crate) String);
 impl Drop for SessionGuard {
     fn drop(&mut self) {
         let _ = std::process::Command::new("tmux")
-            .args(["kill-session", "-t", &self.0])
+            .args(["-L", &test_socket_name(), "kill-session", "-t", &self.0])
             .output();
     }
 }
@@ -573,18 +612,20 @@ mod tests {
     #[test]
     fn session_name_internal_task_id_is_sanitized() {
         let tmux = TmuxManager::new();
+        let name = tmux.session_name("owner/repo", "internal:8");
+        assert!(!name.contains(':'), "colon must be sanitized for tmux");
         assert_eq!(
-            tmux.session_name("owner/repo", "internal:8"),
-            "orch-repo-internal-8"
+            tmux.parse_session_name(&name),
+            Some(("repo".to_string(), "internal-8".to_string()))
         );
     }
 
     #[test]
     fn task_id_from_session_name_parses_external_task() {
         let tmux = TmuxManager::new();
-        // "orch-repo-1234" → project "repo", task_id "1234"
+        let name = tmux.session_name("owner/repo", "1234");
         assert_eq!(
-            tmux.parse_session_name("orch-repo-1234"),
+            tmux.parse_session_name(&name),
             Some(("repo".to_string(), "1234".to_string()))
         );
     }
@@ -592,9 +633,9 @@ mod tests {
     #[test]
     fn task_id_from_session_name_parses_internal_task() {
         let tmux = TmuxManager::new();
-        // "orch-orch-internal-21116" → project "orch", task_id "internal-21116"
+        let name = tmux.session_name("owner/orch", "internal:21116");
         assert_eq!(
-            tmux.parse_session_name("orch-orch-internal-21116"),
+            tmux.parse_session_name(&name),
             Some(("orch".to_string(), "internal-21116".to_string()))
         );
     }
@@ -602,9 +643,9 @@ mod tests {
     #[test]
     fn task_id_from_session_name_parses_internal_task_small_id() {
         let tmux = TmuxManager::new();
-        // "orch-repo-internal-8" → project "repo", task_id "internal-8"
+        let name = tmux.session_name("owner/repo", "internal:8");
         assert_eq!(
-            tmux.parse_session_name("orch-repo-internal-8"),
+            tmux.parse_session_name(&name),
             Some(("repo".to_string(), "internal-8".to_string()))
         );
     }
@@ -616,11 +657,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_session_name_ignores_production_prefix_in_tests() {
+        let tmux = TmuxManager::new();
+        assert_eq!(tmux.parse_session_name("orch-repo-1234"), None);
+    }
+
+    #[test]
     fn parse_session_name_hyphenated_project_external() {
         let tmux = TmuxManager::new();
-        // "orch-my-repo-1234" → project "my-repo", task_id "1234"
+        let name = tmux.session_name("owner/my-repo", "1234");
         assert_eq!(
-            tmux.parse_session_name("orch-my-repo-1234"),
+            tmux.parse_session_name(&name),
             Some(("my-repo".to_string(), "1234".to_string()))
         );
     }
@@ -628,9 +675,9 @@ mod tests {
     #[test]
     fn parse_session_name_hyphenated_project_internal() {
         let tmux = TmuxManager::new();
-        // "orch-my-repo-internal-8" → project "my-repo", task_id "internal-8"
+        let name = tmux.session_name("owner/my-repo", "internal:8");
         assert_eq!(
-            tmux.parse_session_name("orch-my-repo-internal-8"),
+            tmux.parse_session_name(&name),
             Some(("my-repo".to_string(), "internal-8".to_string()))
         );
     }
@@ -638,9 +685,9 @@ mod tests {
     #[test]
     fn parse_session_name_hyphenated_project_review() {
         let tmux = TmuxManager::new();
-        // "orch-my-repo-1234-review" → project "my-repo", task_id "1234-review"
+        let name = tmux.session_name("owner/my-repo", "1234-review");
         assert_eq!(
-            tmux.parse_session_name("orch-my-repo-1234-review"),
+            tmux.parse_session_name(&name),
             Some(("my-repo".to_string(), "1234-review".to_string()))
         );
     }
@@ -648,9 +695,9 @@ mod tests {
     #[test]
     fn parse_session_name_multi_hyphen_project() {
         let tmux = TmuxManager::new();
-        // "orch-my-cool-repo-42" → project "my-cool-repo", task_id "42"
+        let name = tmux.session_name("owner/my-cool-repo", "42");
         assert_eq!(
-            tmux.parse_session_name("orch-my-cool-repo-42"),
+            tmux.parse_session_name(&name),
             Some(("my-cool-repo".to_string(), "42".to_string()))
         );
     }
@@ -659,7 +706,7 @@ mod tests {
     fn parse_session_name_roundtrip_hyphenated_project() {
         let tmux = TmuxManager::new();
         let name = tmux.session_name("owner/my-repo", "1793");
-        assert_eq!(name, "orch-my-repo-1793");
+        assert!(name.ends_with("my-repo-1793"));
         assert_eq!(
             tmux.parse_session_name(&name),
             Some(("my-repo".to_string(), "1793".to_string()))
@@ -674,7 +721,8 @@ mod tests {
         let session = test_session_name();
 
         // Create a temporary detached session for testing
-        let create_result = tokio::process::Command::new("tmux")
+        let create_result = tmux
+            .command()
             .args(["new-session", "-d", "-s", &session, "-c", "/tmp"])
             .output()
             .await;
@@ -694,7 +742,8 @@ mod tests {
         assert!(result.is_ok(), "set_env should succeed");
 
         // Verify the variable was set by reading it back
-        let check_result = tokio::process::Command::new("tmux")
+        let check_result = tmux
+            .command()
             .args(["show-environment", "-t", &session, "TEST_VAR"])
             .output()
             .await;
@@ -719,7 +768,8 @@ mod tests {
         let tmux = TmuxManager::new();
         let session = test_session_name();
 
-        let create_result = tokio::process::Command::new("tmux")
+        let create_result = tmux
+            .command()
             .args(["new-session", "-d", "-s", &session, "-c", "/tmp"])
             .output()
             .await;
@@ -742,7 +792,8 @@ mod tests {
         let tmux = TmuxManager::new();
         let session = test_session_name();
 
-        let create_result = tokio::process::Command::new("tmux")
+        let create_result = tmux
+            .command()
             .args(["new-session", "-d", "-s", &session, "-c", "/tmp"])
             .output()
             .await;
@@ -756,7 +807,8 @@ mod tests {
         }
         let _guard = SessionGuard(session.clone());
 
-        let set_option_result = tokio::process::Command::new("tmux")
+        let set_option_result = tmux
+            .command()
             .args(["set-option", "-t", &session, "remain-on-exit", "on"])
             .output()
             .await;
@@ -765,16 +817,19 @@ mod tests {
             return;
         }
 
-        let send_exit_result = tokio::process::Command::new("tmux")
-            .args(["send-keys", "-t", &session, "exit", "Enter"])
+        // respawn-pane -k runs `false` in place of the shell so the pane dies without
+        // waiting for an interactive prompt, which a cold `tmux -L` server may not have yet
+        let respawn_result = tmux
+            .command()
+            .args(["respawn-pane", "-k", "-t", &session, "false"])
             .output()
             .await;
-        if !matches!(send_exit_result, Ok(ref o) if o.status.success()) {
+        if !matches!(respawn_result, Ok(ref o) if o.status.success()) {
             eprintln!("Skipping test: unable to exit tmux pane");
             return;
         }
 
-        // Poll until pane is dead (up to 2s) — fixed sleep is unreliable under load.
+        // Poll until pane is dead (up to 2s), fixed sleep is unreliable under load
         for _ in 0..20 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             if !tmux.session_is_running(&session).await {
@@ -832,6 +887,40 @@ mod tests {
             result.unwrap(),
             "",
             "wait_for_completion should return empty string for non-existent session"
+        );
+    }
+
+    /// A test TmuxManager must create sessions on `tmux -L orch-test-<pid>`, never on
+    /// the operator's default server. The suite runs on the same machine as live agents.
+    #[tokio::test]
+    async fn test_manager_does_not_touch_the_default_server() {
+        let tmux = TmuxManager::new();
+        let name = match tmux
+            .create_session("owner/repo", "isolation", "/tmp", "sleep 30", &[])
+            .await
+        {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("Skipping test: tmux not available or failed to create test session");
+                return;
+            }
+        };
+        let _guard = SessionGuard(name.clone());
+
+        assert!(
+            tmux.session_exists(&name).await,
+            "session must exist on the isolated test server"
+        );
+
+        let on_default = tokio::process::Command::new("tmux")
+            .args(["has-session", "-t", &name])
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(
+            !on_default,
+            "TmuxManager under cfg(test) must not create sessions on the default tmux server"
         );
     }
 }

@@ -1535,6 +1535,9 @@ pub async fn serve() -> anyhow::Result<()> {
 
     // Initialize tmux manager (shared across all projects)
     let tmux = Arc::new(TmuxManager::new());
+    // Kill leftover sessions from a previous process. This is daemon start only,
+    // never a tick, because nextest makes a once-flag in tick_all kill live agents
+    tick::startup_cleanup(&tmux).await;
 
     // Initialize transport
     let transport = Arc::new(Transport::new());
@@ -3237,18 +3240,20 @@ mod tests {
     async fn integration_channel_to_tmux_to_capture() {
         use crate::channels::capture::CaptureService;
         use crate::channels::transport::Transport;
-        use crate::tmux::SessionGuard;
+        use crate::tmux::{SessionGuard, TmuxManager};
         use std::sync::Arc;
 
         // Create transport and capture service
         let transport = Arc::new(Transport::new());
         let capture = Arc::new(CaptureService::new(transport.clone()));
+        let tmux = TmuxManager::new();
 
         let task_id = "testtask1".to_string();
         let session_name = format!("orch-test-{}", task_id);
 
         // Start a detached tmux session
-        let _ = tokio::process::Command::new("tmux")
+        let _ = tmux
+            .command()
             .args(["new-session", "-d", "-s", &session_name])
             .output()
             .await
@@ -3283,7 +3288,8 @@ mod tests {
             .expect("no subscription");
 
         // Send a message into the tmux session via tmux send-keys (simulate channel input)
-        let send = tokio::process::Command::new("tmux")
+        let send = tmux
+            .command()
             .args([
                 "send-keys",
                 "-t",

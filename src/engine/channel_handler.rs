@@ -1160,6 +1160,13 @@ mod tests {
         );
 
         // After the fix, channel_handler uses tmux.session_name() — same as the runner.
-        assert_eq!(actual_session, "orch-repo-internal-42");
+        assert!(
+            actual_session.ends_with("repo-internal-42"),
+            "internal task session must use the sanitized hyphenated id, got {actual_session}"
+        );
+        assert!(
+            !actual_session.contains(':'),
+            "tmux session names cannot contain a colon"
+        );
     }
 }
