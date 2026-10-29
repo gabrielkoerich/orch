@@ -324,6 +324,10 @@ mod router_text_tests {
     }
 }
 
+// Each worktree gets its own snapshot git repo under opencode's data dir and nothing removes it.
+// Orch commits the work itself, so turn snapshots off for orch runs only
+const NO_SNAPSHOT_CONFIG: &str = r#"{"snapshot":false}"#;
+
 impl OpenCodeRunner {
     pub fn new() -> Self {
         Self
@@ -519,8 +523,9 @@ impl AgentRunner for OpenCodeRunner {
         // stage in the runner script's pipeline, so PIPESTATUS[0] there would
         // always report cat's (always-zero) exit code instead of opencode's.
         format!(
-            r#"{timeout_cmd} opencode run {model_flag} {variant_part} {skip_perms}\
+            r#"OPENCODE_CONFIG_CONTENT={config} {timeout_cmd} opencode run {model_flag} {variant_part} {skip_perms}\
   --format json - < <(cat "{sys_file}" "{msg_file}")"#,
+            config = super::shell_single_quote(NO_SNAPSHOT_CONFIG),
             sys_file = sys_file,
             msg_file = msg_file,
             timeout_cmd = timeout_cmd,
@@ -640,7 +645,8 @@ impl AgentRunner for OpenCodeRunner {
         // "edit":"ask") from producing PermissionError events that the router
         // would misclassify as model failures.
         let mut cmd = tokio::process::Command::new("opencode");
-        cmd.arg("run")
+        cmd.env("OPENCODE_CONFIG_CONTENT", NO_SNAPSHOT_CONFIG)
+            .arg("run")
             .arg("--format")
             .arg("json")
             .arg("--dangerously-skip-permissions");
@@ -1471,6 +1477,12 @@ mod tests {
         assert!(cmd.contains("opencode run"));
         assert!(cmd.contains("--model 'anthropic/claude-sonnet-4-20250514'"));
         assert!(cmd.contains("--format json"));
+        assert!(
+            cmd.starts_with(
+                r#"OPENCODE_CONFIG_CONTENT='{"snapshot":false}' timeout 1800 opencode run"#
+            ),
+            "snapshots must be off for orch runs, got: {cmd}"
+        );
         // Autonomous mode passes --dangerously-skip-permissions instead of
         // writing a config file or overriding XDG_CONFIG_HOME.
         assert!(
