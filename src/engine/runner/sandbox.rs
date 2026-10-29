@@ -328,6 +328,9 @@ fn git_rules(
             "modules",
             "packed-refs",
             "refs/tags",
+            "commondir",
+            "gitdir",
+            "config.worktree",
         ]
         .map(|d| common.join(d)),
     );
@@ -528,6 +531,9 @@ mod tests {
             "packed-refs",
             "hooks",
             "config",
+            "commondir",
+            "gitdir",
+            "config.worktree",
         ] {
             assert!(
                 p.read_only.contains(&git.join(path)),
@@ -702,6 +708,37 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(fs::read_to_string(git.join("refs/heads/main")).unwrap(), "");
+    }
+
+    // A missing commondir in the common dir would redirect git to a dir the agent controls
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_kernel_refuses_a_new_commondir_in_the_common_dir() {
+        let Ok(backend) = Backend::detect() else {
+            eprintln!("skipped: no OS sandbox starts here");
+            return;
+        };
+        let (_root, mut run) = fixture(false);
+        run.seatbelt = backend == Backend::Seatbelt;
+        let git = run.home.join("proj/.git");
+        assert!(!git.join("commondir").exists());
+        let script = format!(
+            "! echo {w} > {g}/commondir",
+            w = run.work_dir.display(),
+            g = git.display()
+        );
+        let out = Sandbox::new(backend, policy(&run))
+            .unwrap()
+            .command("/bin/sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!git.join("commondir").exists());
     }
 
     // A logged-in claude answers under the policy with the real home: `--run-ignored only claude`
