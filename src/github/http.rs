@@ -1449,7 +1449,7 @@ impl GhHttp {
 
     /// Get a single issue.
     pub async fn get_issue(&self, repo: &str, number: &str) -> anyhow::Result<GitHubIssue> {
-        self.get_json(&format!("{GITHUB_API}/repos/{repo}/issues/{number}"))
+        self.get_json(&format!("{}/repos/{repo}/issues/{number}", self.api_root()))
             .await
     }
 
@@ -1918,7 +1918,7 @@ impl GhHttp {
         repo: &str,
         since: &str,
     ) -> anyhow::Result<Vec<GitHubComment>> {
-        let url = format!("{GITHUB_API}/repos/{repo}/issues/comments");
+        let url = format!("{}/repos/{repo}/issues/comments", self.api_root());
         self.get_all_pages(&url, &[("since", since), ("per_page", "100")])
             .await
     }
@@ -1929,7 +1929,10 @@ impl GhHttp {
         repo: &str,
         issue_number: u64,
     ) -> anyhow::Result<Vec<GitHubComment>> {
-        let url = format!("{GITHUB_API}/repos/{repo}/issues/{issue_number}/comments");
+        let url = format!(
+            "{}/repos/{repo}/issues/{issue_number}/comments",
+            self.api_root()
+        );
         self.get_all_pages(&url, &[("per_page", "100")]).await
     }
 

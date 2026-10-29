@@ -28,14 +28,36 @@ fn is_trusted_author(issue: &crate::github::types::GitHubIssue) -> bool {
         .unwrap_or(false) // missing field = untrusted
 }
 
-// Check if a comment's author is trusted. The
-// GitHub REST comment payload includes an `author_association` field, so
-// prefer that when present. Missing association is treated as untrusted.
 fn is_trusted_comment_author(c: &crate::github::types::GitHubComment) -> bool {
     c.author_association
         .as_deref()
         .map(|a| ALLOWED_ASSOCIATIONS.contains(&a))
         .unwrap_or(false)
+}
+
+fn trusted_mentions(
+    comments: impl IntoIterator<Item = crate::github::types::GitHubComment>,
+) -> Vec<Mention> {
+    comments
+        .into_iter()
+        .filter_map(|c| {
+            if !is_trusted_comment_author(&c) {
+                tracing::debug!(
+                    comment_id = c.id,
+                    author = %c.user.login,
+                    "ignoring comment from untrusted author"
+                );
+                return None;
+            }
+            Some(Mention {
+                id: c.id.to_string(),
+                body: c.body,
+                author: c.user.login,
+                created_at: c.created_at,
+                issue_url: c.issue_url,
+            })
+        })
+        .collect()
 }
 
 fn active_status_from_label(label: &str) -> Option<Status> {
@@ -96,6 +118,14 @@ impl GitHubBackend {
             repo,
             gh: GhHttp::new()?,
         })
+    }
+
+    #[cfg(test)]
+    fn for_test(repo: impl Into<String>, gh: GhHttp) -> Self {
+        Self {
+            repo: repo.into(),
+            gh,
+        }
     }
 
     async fn sync_project_status(
@@ -630,57 +660,7 @@ impl ExternalBackend for GitHubBackend {
 
     async fn get_mentions(&self, since: &str) -> anyhow::Result<Vec<Mention>> {
         let comments = self.gh.get_mentions(&self.repo, since).await?;
-        // Only include mentions authored by trusted associations. The GitHub
-        // REST issue comment payload does not include author_association, so
-        // we conservatively check the parent issue's author_association when
-        // an issue_url is available. If we cannot resolve association, skip
-        // the comment.
-        let mut out = Vec::new();
-        for c in comments.into_iter() {
-            // Prefer the comment's own author_association when present. If the
-            // comment payload doesn't include it (older endpoints), fall back to
-            // inspecting the parent issue's association when an issue_url is
-            // available. If neither yields a trusted association, skip the
-            // comment.
-            let trusted = if is_trusted_comment_author(&c) {
-                true
-            } else if let Some(ref issue_url) = c.issue_url {
-                // extract issue number and fetch issue to inspect author_association
-                if let Some(n) = issue_url.rsplit('/').next() {
-                    if let Ok(issue) = self.gh.get_issue(&self.repo, n).await {
-                        is_trusted_author(&issue)
-                    } else {
-                        tracing::warn!(
-                            repo = %self.repo,
-                            issue_url = %issue_url,
-                            comment_id = c.id,
-                            author = %c.user.login,
-                            "get_mentions: failed to fetch parent issue to check author trust, treating as untrusted — mention may be silently dropped"
-                        );
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            if !trusted {
-                tracing::debug!(comment_id = c.id, author = %c.user.login, "ignoring mention from untrusted author");
-                continue;
-            }
-
-            out.push(Mention {
-                id: c.id.to_string(),
-                body: c.body,
-                author: c.user.login,
-                created_at: c.created_at,
-                issue_url: c.issue_url,
-            });
-        }
-
-        Ok(out)
+        Ok(trusted_mentions(comments))
     }
 
     async fn list_issue_comments(&self, id: &ExternalId) -> anyhow::Result<Vec<Mention>> {
@@ -688,47 +668,7 @@ impl ExternalBackend for GitHubBackend {
             id.0.parse()
                 .map_err(|_| anyhow::anyhow!("invalid issue number: {}", id.0))?;
         let comments = self.gh.get_issue_comments(&self.repo, issue_number).await?;
-        // Filter comments to only include those from trusted associations.
-        let mut out = Vec::new();
-        for c in comments.into_iter() {
-            // Prefer the comment's own association when present.
-            if is_trusted_comment_author(&c) {
-                out.push(Mention {
-                    id: c.id.to_string(),
-                    body: c.body,
-                    author: c.user.login,
-                    created_at: c.created_at,
-                    issue_url: c.issue_url,
-                });
-                continue;
-            }
-
-            // Fall back to parent issue association when necessary.
-            if let Ok(issue) = self.gh.get_issue(&self.repo, &id.0).await {
-                if is_trusted_author(&issue) {
-                    out.push(Mention {
-                        id: c.id.to_string(),
-                        body: c.body,
-                        author: c.user.login,
-                        created_at: c.created_at,
-                        issue_url: c.issue_url,
-                    });
-                    continue;
-                } else {
-                    tracing::debug!(comment_id = c.id, author = %c.user.login, "ignoring issue comment from untrusted author");
-                    continue;
-                }
-            } else {
-                // If we cannot fetch the issue, skip the comment conservatively
-                tracing::debug!(
-                    comment_id = c.id,
-                    "failed to fetch parent issue, skipping comment"
-                );
-                continue;
-            }
-        }
-
-        Ok(out)
+        Ok(trusted_mentions(comments))
     }
 
     async fn acknowledge_issue(&self, id: &ExternalId) -> anyhow::Result<()> {
@@ -1189,6 +1129,125 @@ mod tests {
             author_association: Some("MEMBER".to_string()),
         };
         assert!(is_trusted_comment_author(&c));
+    }
+
+    fn comment_json(id: u64, login: &str, association: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "body": format!("from {login}"),
+            "user": { "login": login },
+            "created_at": "2026-01-01T00:00:00Z",
+            "issue_url": "https://api.github.com/repos/o/r/issues/1",
+            "author_association": association,
+        })
+    }
+
+    #[test]
+    fn trusted_mentions_drops_contributor_on_owner_issue() {
+        use crate::github::types::GitHubComment;
+        let comment = GitHubComment {
+            id: 42,
+            body: "@orch please look".to_string(),
+            user: GitHubUser {
+                login: "stranger".to_string(),
+            },
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: None,
+            html_url: None,
+            issue_url: Some("https://api.github.com/repos/o/r/issues/1".to_string()),
+            author_association: Some("CONTRIBUTOR".to_string()),
+        };
+        let issue = GitHubIssue {
+            number: 1,
+            id: 0,
+            title: "t".to_string(),
+            body: None,
+            state: "open".to_string(),
+            labels: vec![],
+            user: GitHubUser {
+                login: "owner".to_string(),
+            },
+            created_at: "".to_string(),
+            updated_at: "".to_string(),
+            html_url: "".to_string(),
+            node_id: None,
+            pull_request: None,
+            state_reason: None,
+            author_association: Some("OWNER".to_string()),
+        };
+        assert!(is_trusted_author(&issue));
+        assert!(!is_trusted_comment_author(&comment));
+        let mentions = trusted_mentions([comment]);
+        assert!(mentions.is_empty());
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn get_mentions_and_list_issue_comments_exclude_contributor_on_owner_issue() {
+        use crate::github::http::GhHttp;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env = crate::github::token::ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("GH_TOKEN");
+        std::env::set_var("GH_TOKEN", "test_token");
+
+        let server = MockServer::start().await;
+        let comments = serde_json::json!([
+            comment_json(42, "stranger", "CONTRIBUTOR"),
+            comment_json(43, "owner", "OWNER"),
+        ]);
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(comments.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(comments))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "number": 1,
+                "id": 1,
+                "title": "t",
+                "state": "open",
+                "labels": [],
+                "user": { "login": "owner" },
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "html_url": "https://github.com/o/r/issues/1",
+                "author_association": "OWNER",
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let backend = GitHubBackend::for_test("o/r", GhHttp::for_test(server.uri(), None));
+        let mentions = backend
+            .get_mentions("2026-01-01T00:00:00Z")
+            .await
+            .expect("get_mentions");
+        let listed = backend
+            .list_issue_comments(&ExternalId("1".to_string()))
+            .await
+            .expect("list_issue_comments");
+
+        match prev {
+            Some(value) => std::env::set_var("GH_TOKEN", value),
+            None => std::env::remove_var("GH_TOKEN"),
+        }
+
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].id, "43");
+        assert_eq!(mentions[0].author, "owner");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "43");
+        assert_eq!(listed[0].author, "owner");
     }
 
     fn make_test_issue(labels: &[&str]) -> GitHubIssue {
