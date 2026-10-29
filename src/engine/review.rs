@@ -2143,7 +2143,7 @@ async fn publish_review(
 ) -> anyhow::Result<()> {
     use crate::github::app::ReviewEvent;
     let event = match decision {
-        ReviewDecision::Approve => Some(ReviewEvent::Approve),
+        ReviewDecision::Approve { .. } => Some(ReviewEvent::Approve),
         ReviewDecision::RequestChanges { .. } => Some(ReviewEvent::RequestChanges),
         _ => None,
     };
@@ -4734,7 +4734,7 @@ mod tests {
             "o/r",
             9,
             Some("abc123"),
-            &ReviewDecision::Approve,
+            &ReviewDecision::Approve { issues: vec![] },
             "## Automated Review \u{2014} Approve\n\nok",
         )
         .await;
