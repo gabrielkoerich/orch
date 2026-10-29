@@ -622,15 +622,17 @@ pub(crate) async fn review_open_prs(
             continue;
         };
 
-        // Persist PR number (idempotent if already stored).
-        if let Err(e) = store_set_result_by_id(
-            &Some(Arc::clone(store)),
-            task_info.store_id,
-            &[("pr_number", serde_json::json!(pr_number as i64))],
-        )
-        .await
-        {
-            tracing::warn!(task_id, err = %e, "failed to persist pr_number");
+        // Skip a rewrite of the same number, set_fields would bump updated_at
+        if task_info.stored.pr_number.map(|n| n as u64) != Some(pr_number) {
+            if let Err(e) = store_set_result_by_id(
+                &Some(Arc::clone(store)),
+                task_info.store_id,
+                &[("pr_number", serde_json::json!(pr_number as i64))],
+            )
+            .await
+            {
+                tracing::warn!(task_id, err = %e, "failed to persist pr_number");
+            }
         }
 
         let batch_data = match batch.get(&pr_number) {
@@ -2075,6 +2077,74 @@ mod tests {
         // Status must remain InReview — review was skipped due to watermark.
         let after = store.get(task_id).await.unwrap();
         assert_eq!(after.status, TaskStatus::InReview);
+    }
+
+    #[tokio::test]
+    async fn review_open_prs_does_not_rewrite_stored_pr_number() {
+        let store = make_store().await;
+        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
+            "owner/repo".to_string(),
+        ));
+
+        let task_id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "task-pr-number".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let _ = crate::store::store_set_by_id(
+            &Some(&store),
+            task_id,
+            &[
+                ("branch", serde_json::json!("feat-branch")),
+                ("pr_number", serde_json::json!(42i64)),
+            ],
+        )
+        .await;
+        store
+            .update_status(task_id, TaskStatus::InReview)
+            .await
+            .unwrap();
+        let stored = store.get(task_id).await.unwrap();
+        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
+            external: crate::engine::tasks::store_task_to_external(&stored),
+            stored,
+        };
+        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(task_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+        let in_flight = Arc::new(DashSet::new());
+        review_open_prs(
+            &backend,
+            "owner/repo",
+            &default_config(),
+            &tm,
+            &store,
+            &dispatching,
+            &in_flight,
+            &[snapshot],
+            &MockGh::default(),
+            &crate::engine::router::RouterConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        let after = store.get(task_id).await.unwrap();
+        assert_eq!(after.pr_number, Some(42));
+        assert_eq!(
+            after.updated_at, "2020-01-01T00:00:00Z",
+            "rewriting an already-stored pr_number must not bump updated_at"
+        );
     }
 
     // ─── review_open_prs: last_comment_review_ts dedup ───────────────────────

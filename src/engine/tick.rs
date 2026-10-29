@@ -347,6 +347,14 @@ fn stuck_task_timing_from_map(
     })
 }
 
+// review_poll rewrites pr_number on every pass, so updated_at never ages
+async fn in_review_stuck_timestamp(store: &TaskStore, store_id: i64, fallback: &str) -> String {
+    match store.in_review_entry(store_id).await {
+        Ok(Some((entered_at, _))) => entered_at,
+        Ok(None) | Err(_) => fallback.to_string(),
+    }
+}
+
 /// Finalize any open `task_runs` rows for a task during recovery paths.
 /// Best-effort: logs a warning on failure but does not block recovery.
 async fn finalize_open_runs_for_recovery(store: &TaskStore, store_id: i64, reason: &str) {
@@ -1354,19 +1362,19 @@ pub(crate) async fn tick_recover_stuck_tasks(
             vec![]
         }
     };
-    let review_expected_set: std::collections::HashSet<String> = store_in_review
+    let review_expected_ids: std::collections::HashMap<String, i64> = store_in_review
         .into_iter()
         .filter(|t| t.review_session_expected)
-        .filter_map(|t| t.external_id)
+        .filter_map(|t| t.external_id.map(|eid| (eid, t.id)))
         .collect();
     for task in &in_review {
-        if !review_expected_set.contains(&task.id.0) {
+        let Some(&store_id) = review_expected_ids.get(&task.id.0) else {
             tracing::debug!(
                 task_id = task.id.0,
                 "in_review task is waiting on PR review, skipping stuck-session recovery"
             );
             continue;
-        }
+        };
 
         let review_task_id = format!("{}-review", task.id.0);
         // Use in_review_no_session_stuck_timeout instead of the standard
@@ -1380,13 +1388,14 @@ pub(crate) async fn tick_recover_stuck_tasks(
             no_session_stuck_timeout: config.in_review_no_session_stuck_timeout,
             ..config.clone()
         };
+        let age_at = in_review_stuck_timestamp(store, store_id, &task.updated_at).await;
         let Some(timing) = stuck_task_timing_from_map(
             tmux,
             repo,
             &review_task_id,
-            &task.updated_at,
+            &age_at,
             &in_review_config,
-            "cannot parse updated_at, skipping stuck in_review check",
+            "cannot parse in_review timestamp, skipping stuck in_review check",
             session_map,
         ) else {
             continue;
@@ -1476,26 +1485,27 @@ pub(crate) async fn tick_recover_stuck_tasks(
     };
     for task in &internal_in_review {
         let task_id = task.id.0.clone();
-        if !review_expected_set.contains(&task_id) {
+        let Some(&store_id) = review_expected_ids.get(&task_id) else {
             tracing::debug!(
                 task_id,
                 "internal in_review task is waiting on PR review, skipping stuck-session recovery"
             );
             continue;
-        }
+        };
 
         let review_task_id = format!("{}-review", task_id);
         let in_review_config = crate::engine::EngineConfig {
             no_session_stuck_timeout: config.in_review_no_session_stuck_timeout,
             ..config.clone()
         };
+        let age_at = in_review_stuck_timestamp(store, store_id, &task.updated_at).await;
         let Some(timing) = stuck_task_timing_from_map(
             tmux,
             repo,
             &review_task_id,
-            &task.updated_at,
+            &age_at,
             &in_review_config,
-            "cannot parse updated_at, skipping stuck internal in_review check",
+            "cannot parse in_review timestamp, skipping stuck internal in_review check",
             session_map,
         ) else {
             continue;
@@ -3233,6 +3243,18 @@ mod tests {
             .unwrap();
     }
 
+    /// Age the in_review status-entry the same way the stale sweep tests do
+    async fn set_in_review_entered_at_past(store: &TaskStore, task_id: i64) {
+        sqlx::query(
+            "UPDATE task_activity SET timestamp = '2020-01-01T00:00:00Z'
+             WHERE task_id = ? AND to_status = 'in_review'",
+        )
+        .bind(task_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn recover_stuck_tasks_resets_external_in_review_to_needs_review() {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
@@ -3270,6 +3292,7 @@ mod tests {
             .await
             .unwrap();
         set_review_session_expected(&store, "owner/repo", "99", true).await;
+        set_in_review_entered_at_past(&store, id).await;
         set_task_updated_at_past(&store, id).await;
 
         tick_recover_stuck_tasks(
@@ -3329,7 +3352,8 @@ mod tests {
             .update_status(id, crate::store::TaskStatus::InReview)
             .await
             .unwrap();
-        // updated_at stays at now — age < 600s → should NOT be recovered
+        set_review_session_expected(&store, "owner/repo", "100", true).await;
+        set_task_updated_at_past(&store, id).await;
 
         tick_recover_stuck_tasks(
             &backend,
@@ -3379,6 +3403,7 @@ mod tests {
             .await
             .unwrap();
         set_review_session_expected(&store, "owner/repo", "internal:1", true).await;
+        set_in_review_entered_at_past(&store, id).await;
         set_task_updated_at_past(&store, id).await;
 
         tick_recover_stuck_tasks(
@@ -3402,6 +3427,144 @@ mod tests {
             crate::store::TaskStatus::NeedsReview,
             "stuck internal InReview task should be reset to NeedsReview"
         );
+    }
+
+    #[tokio::test]
+    async fn recover_stuck_tasks_ages_in_review_from_status_entry_not_updated_at() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let mock = MockBackend::new();
+        let status_updates = mock.status_updates.clone();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(TmuxManager::new());
+        let config = EngineConfig {
+            no_session_stuck_timeout: 600,
+            stuck_timeout: 1800,
+            ..EngineConfig::default()
+        };
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "102",
+                title: "Fresh updated_at InReview",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::InReview)
+            .await
+            .unwrap();
+        set_review_session_expected(&store, "owner/repo", "102", true).await;
+        set_in_review_entered_at_past(&store, id).await;
+        store
+            .set_fields(id, &[("pr_number", serde_json::json!(42))])
+            .await
+            .unwrap();
+
+        tick_recover_stuck_tasks(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &task_manager,
+            &config,
+            &store,
+            &std::collections::HashMap::new(),
+            &cooled_review_router_for_test(),
+            &Arc::new(DashMap::new()),
+            &Arc::new(DashSet::new()),
+        )
+        .await
+        .unwrap();
+
+        let updates = status_updates.lock().unwrap();
+        assert_eq!(
+            updates.len(),
+            1,
+            "in_review stuck recovery must age from the status entry even when updated_at is fresh"
+        );
+        assert_eq!(updates[0].0, "102");
+        assert_eq!(updates[0].1, Status::NeedsReview);
+    }
+
+    #[tokio::test]
+    async fn recover_stuck_tasks_reclaims_hung_in_review_session() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let mock = MockBackend::new();
+        let status_updates = mock.status_updates.clone();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(TmuxManager::new());
+        let config = EngineConfig {
+            no_session_stuck_timeout: 600,
+            stuck_timeout: 1800,
+            ..EngineConfig::default()
+        };
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "103",
+                title: "Hung review session",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::InReview)
+            .await
+            .unwrap();
+        set_review_session_expected(&store, "owner/repo", "103", true).await;
+        set_in_review_entered_at_past(&store, id).await;
+        store
+            .set_fields(id, &[("pr_number", serde_json::json!(43))])
+            .await
+            .unwrap();
+
+        let session_name = tmux.session_name("owner/repo", "103-review");
+        let mut session_map = std::collections::HashMap::new();
+        session_map.insert(session_name, true);
+
+        tick_recover_stuck_tasks(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &task_manager,
+            &config,
+            &store,
+            &session_map,
+            &cooled_review_router_for_test(),
+            &Arc::new(DashMap::new()),
+            &Arc::new(DashSet::new()),
+        )
+        .await
+        .unwrap();
+
+        let updates = status_updates.lock().unwrap();
+        assert_eq!(
+            updates.len(),
+            1,
+            "a live hung review session must be reclaimed once the in_review entry ages past stuck_timeout"
+        );
+        assert_eq!(updates[0].0, "103");
+        assert_eq!(updates[0].1, Status::NeedsReview);
     }
 
     #[tokio::test]
