@@ -11,10 +11,18 @@ fn resolve_with(passbox: &str, value: &str) -> anyhow::Result<String> {
         return Ok(value.to_string());
     };
 
+    // `exec --stdin` hands the value to a child, so it works without a terminal and does not
+    // depend on a flag of `get` that passbox versions differ on
     let out = std::process::Command::new(passbox)
-        .args(["get", name, "--reveal"])
+        .args(["exec", "--stdin", name, "--", "/bin/cat"])
+        .stdin(std::process::Stdio::null())
         .output()?;
-    anyhow::ensure!(out.status.success(), "passbox could not read {name}");
+
+    if !out.status.success() {
+        let reason = String::from_utf8_lossy(&out.stderr);
+        let reason = reason.lines().next().unwrap_or("no error output").trim();
+        anyhow::bail!("passbox could not read {name}: {reason}");
+    }
 
     // The first line is the secret, later `key: value` lines are fields
     let text = String::from_utf8(out.stdout)?;
@@ -45,7 +53,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bin = stub(
             dir.path(),
-            r#"[ "$2" = "orch/relay-token" ] && printf 's3cret\nnote: x\n'"#,
+            r#"[ "$1 $2 $3 $4 $5" = "exec --stdin orch/relay-token -- /bin/cat" ] && printf 's3cret\nnote: x\n'"#,
         );
         assert_eq!(
             resolve_with(&bin, "passbox:orch/relay-token").unwrap(),
@@ -56,7 +64,16 @@ mod tests {
     #[test]
     fn a_failed_or_empty_read_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(resolve_with(&stub(dir.path(), "exit 1"), "passbox:x").is_err());
+        let err = resolve_with(
+            &stub(dir.path(), "echo 'error: denied' >&2; exit 1"),
+            "passbox:x",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("passbox could not read x: error: denied"),
+            "{err}"
+        );
         let empty = tempfile::tempdir().unwrap();
         assert!(resolve_with(&stub(empty.path(), "true"), "passbox:x").is_err());
     }
