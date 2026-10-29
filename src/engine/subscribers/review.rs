@@ -827,6 +827,46 @@ async fn recorded(
     outcome
 }
 
+/// Resets that end with no decision and do not count as a failure, before the task blocks
+pub(crate) const MAX_REVIEW_RESETS: u64 = 6;
+
+/// A reset that does not count toward `MAX_REVIEW_AGENT_FAILURES` still raises `review_resets`,
+/// so a review that never produces a decision stops bouncing between needs_review and in_review
+async fn reset_or_block(
+    store: &Arc<TaskStore>,
+    repo: &str,
+    task_id: &str,
+    reason: &str,
+    cause: &str,
+    external: bool,
+    context: &str,
+) -> ReviewOutcome {
+    let resets =
+        match crate::store::store_increment(&Some(store.clone()), repo, task_id, "review_resets")
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(task_id, err = %e, "failed to increment review_resets");
+                0
+            }
+        };
+    let outcome = if resets >= MAX_REVIEW_RESETS {
+        tracing::error!(
+            task_id,
+            reason,
+            resets,
+            "{context} ended {resets} times without a decision, blocking task"
+        );
+        ReviewOutcome::Block(format!(
+            "{context} ended {resets} times without a decision: {reason}"
+        ))
+    } else {
+        ReviewOutcome::Reset
+    };
+    recorded(store, repo, task_id, reason, cause, external, outcome).await
+}
+
 /// Classify a review failure and return the appropriate outcome.
 ///
 /// Both the `Ok(ReviewDecision::Failed)` and `Err(e)` arms share the same
@@ -854,16 +894,7 @@ async fn classify_review_failure(
             reason,
             "{context} hit parse error — re-routing for retry without counting as failure"
         );
-        return recorded(
-            store,
-            repo,
-            task_id,
-            reason,
-            "parse_error",
-            false,
-            ReviewOutcome::Reset,
-        )
-        .await;
+        return reset_or_block(store, repo, task_id, reason, "parse_error", false, context).await;
     }
 
     // Session exited mid-thought with no result envelope (issue #3734). Same
@@ -874,14 +905,14 @@ async fn classify_review_failure(
             reason,
             "{context} session incomplete — re-routing for retry without counting as failure"
         );
-        return recorded(
+        return reset_or_block(
             store,
             repo,
             task_id,
             reason,
             "incomplete_session",
             false,
-            ReviewOutcome::Reset,
+            context,
         )
         .await;
     }
@@ -895,14 +926,14 @@ async fn classify_review_failure(
             reason,
             "{context} output truncated by token budget — re-routing for retry without counting as failure"
         );
-        return recorded(
+        return reset_or_block(
             store,
             repo,
             task_id,
             reason,
             "truncated_output",
             false,
-            ReviewOutcome::Reset,
+            context,
         )
         .await;
     }
@@ -1028,14 +1059,14 @@ async fn classify_review_failure(
             reason,
             "{context} hit transient GitHub error — deferring retry without counting as failure"
         );
-        return recorded(
+        return reset_or_block(
             store,
             repo,
             task_id,
             reason,
             "github_api_error",
             true,
-            ReviewOutcome::Reset,
+            context,
         )
         .await;
     }
@@ -1049,14 +1080,14 @@ async fn classify_review_failure(
             reason,
             "{context} hit transient provider network error — re-routing for retry without counting as failure"
         );
-        return recorded(
+        return reset_or_block(
             store,
             repo,
             task_id,
             reason,
             "provider_network_error",
             true,
-            ReviewOutcome::Reset,
+            context,
         )
         .await;
     }
@@ -1351,6 +1382,11 @@ mod tests {
         ];
 
         for msg in &error_messages {
+            // Each message on its own, the reset cap has its own test
+            store
+                .set_fields(store_id, &[("review_resets", serde_json::json!(0))])
+                .await
+                .unwrap();
             let outcome =
                 classify_review_failure(&store, repo, &task_id, msg, "review agent").await;
             assert!(
@@ -1410,6 +1446,42 @@ mod tests {
         assert_eq!(
             task.review_agent_failures, 0,
             "missing review model errors must not count toward review_agent_failures"
+        );
+    }
+
+    /// Resets that do not count as failures still stop at `MAX_REVIEW_RESETS`
+    #[tokio::test]
+    async fn classify_review_failure_blocks_after_max_resets() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let repo = "owner/repo";
+        let store_id = store
+            .create_internal(repo, "Looping review", "", "review", "review-resets", None)
+            .await
+            .unwrap();
+        let task_id = format!("internal:{store_id}");
+        let msg = "parse error: failed to parse review response";
+
+        for attempt in 1..MAX_REVIEW_RESETS {
+            let outcome =
+                classify_review_failure(&store, repo, &task_id, msg, "review agent").await;
+            assert!(
+                matches!(outcome, ReviewOutcome::Reset),
+                "reset {attempt} must retry the review"
+            );
+        }
+        let outcome = classify_review_failure(&store, repo, &task_id, msg, "review agent").await;
+        assert!(
+            matches!(outcome, ReviewOutcome::Block(ref r) if r.contains("without a decision")),
+            "reset {MAX_REVIEW_RESETS} must block the task"
+        );
+
+        let task = opt_store_get_task(&Some(store.clone()), repo, &task_id)
+            .await
+            .expect("task should exist");
+        assert_eq!(task.review_resets as u64, MAX_REVIEW_RESETS);
+        assert_eq!(
+            task.review_agent_failures, 0,
+            "a reset must not count as a review failure"
         );
     }
 

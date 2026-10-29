@@ -17,7 +17,7 @@ pub(crate) const TASK_COLS: &str = "id, external_id, repo, origin, title, body, 
     branch, worktree, worktree_cleaned, summary, last_error, parent_id, \
     block_reason, pr_number, pr_review_context, last_review_ts, review_ts_map, \
     last_comment_review_ts, merge_conflict_retries, ci_merge_failures, \
-    pr_create_failures, review_agent_failures, review_cycles, input_tokens, \
+    pr_create_failures, review_agent_failures, review_resets, review_cycles, input_tokens, \
     output_tokens, input_cost_usd, output_cost_usd, total_cost_usd, \
     model_reroute_chain, limit_reroute_chain, \
     memory, delegations, created_at, updated_at, \
@@ -26,7 +26,7 @@ pub(crate) const TASK_COLS: &str = "id, external_id, repo, origin, title, body, 
      owner_node";
 
 /// Number of columns in TASK_COLS (used for diagnostic verification).
-pub(crate) const TASK_COLS_COUNT: usize = 60;
+pub(crate) const TASK_COLS_COUNT: usize = 61;
 
 /// Explicit column list for `SELECT` queries on the `task_runs` table.
 const TASK_RUN_COLS: &str =
@@ -66,6 +66,7 @@ const ALLOWED_FIELDS: &[&str] = &[
     "pr_create_failures",
     "push_failures",
     "review_agent_failures",
+    "review_resets",
     "review_cycles",
     "review_invocations",
     "needs_review_refires",
@@ -99,6 +100,7 @@ const INCREMENTABLE_FIELDS: &[&str] = &[
     "pr_create_failures",
     "push_failures",
     "review_agent_failures",
+    "review_resets",
     "review_cycles",
     "review_invocations",
     "needs_review_refires",
@@ -247,6 +249,8 @@ pub struct Task {
     pub push_failures: i32,
     pub network_retries: i32,
     pub review_agent_failures: i32,
+    // Review retries that ended without a decision and without counting as a failure
+    pub review_resets: i32,
     pub review_cycles: i32,
     pub review_invocations: i32,
     // NeedsReview re-fire counter (incremented by sync catch-up and reset on successful review cycles)
@@ -1607,6 +1611,7 @@ impl TaskStore {
                 "UPDATE tasks SET
             route_attempts = 0,
             review_agent_failures = 0,
+            review_resets = 0,
             review_invocations = 0,
             pr_create_failures = 0,
             push_failures = 0,
@@ -2225,6 +2230,7 @@ impl TaskStore {
             push_failures: row.try_get::<i32, _>("push_failures").unwrap_or(0),
             network_retries: row.try_get::<i32, _>("network_retries").unwrap_or(0),
             review_agent_failures: row.try_get("review_agent_failures").unwrap_or(0),
+            review_resets: row.try_get::<i32, _>("review_resets").unwrap_or(0),
             review_cycles: row.try_get("review_cycles").unwrap_or(0),
             review_invocations: row.try_get::<i32, _>("review_invocations").unwrap_or(0),
             needs_review_refires: row.try_get::<i32, _>("needs_review_refires").unwrap_or(0),
@@ -3101,6 +3107,7 @@ pub(crate) mod apply {
             "UPDATE tasks SET {all}
             route_attempts = 0,
             review_agent_failures = 0,
+            review_resets = 0,
             pr_create_failures = 0,
             push_failures = 0,
             network_retries = 0,

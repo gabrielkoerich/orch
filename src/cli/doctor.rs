@@ -1380,6 +1380,7 @@ mod tests {
             push_failures: 0,
             network_retries: 0,
             review_agent_failures: 0,
+            review_resets: 0,
             review_cycles: 0,
             review_invocations: 0,
             needs_review_refires: 0,

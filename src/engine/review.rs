@@ -2054,6 +2054,16 @@ async fn parse_review_output(
         })),
     )
     .await;
+    if let Err(e) = crate::store::store_set_result(
+        &Some(Arc::clone(store)),
+        repo,
+        &task.id.0,
+        &[("review_resets", serde_json::json!(0))],
+    )
+    .await
+    {
+        tracing::warn!(task_id = task.id.0, err = %e, "failed to clear review_resets after a decision");
+    }
 
     ReviewPhase::Ready(ParsedReview {
         run_id: run.run_id,
