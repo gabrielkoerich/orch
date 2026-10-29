@@ -4407,7 +4407,16 @@ async fn resolve_cli_id_bare_number_outside_a_project_is_ambiguous() {
         msg.contains(&format!("owner/project-b#{internal_id}")),
         "{msg}"
     );
-    assert!(msg.contains("internal:N"), "{msg}");
+    assert!(
+        msg.contains(&format!(
+            "Use owner/project-b#{internal_id} for the GitHub task"
+        )),
+        "{msg}"
+    );
+    assert!(
+        msg.contains(&format!("or internal:{internal_id} for the internal one")),
+        "{msg}"
+    );
 }
 
 #[tokio::test]

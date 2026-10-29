@@ -22,7 +22,7 @@ Visible top-level commands: `log`, `commit`, `stream`, `notify`, `chat`, `task`,
 
 ## Task Commands
 
-Task commands that take an id accept a bare number, `owner/repo#N`, or `internal:N`. Inside a project directory a bare number is that project's GitHub issue. If the same number matches more than one task and you are not in a project directory, the command lists the matches and stops.
+Task commands that take an id accept a bare number, `owner/repo#N`, `repo#N`, `internal:N`, or `internal-N`. Inside a project directory a bare number is that project's GitHub issue. If the same number matches more than one task and you are not in a project directory, the command names both forms and stops.
 
 ```bash
 orch task add "title" -b "body" -l label1 -l label2   # create a task
@@ -50,7 +50,7 @@ orch task log <id> [--limit N] [--json]                # activity timeline
 orch task history <id>                                 # routing history / attempts
 orch task runs <id> [--verbose]                        # full run audit (stdout/stderr/response)
 orch task close <id> [-n "note"]                       # mark done without running an agent
-orch task watch <id>                                   # follow status changes live
+orch task watch <id>                                   # follow the agent's output live, with its review
 orch task inspect <id>                                 # unified diagnostic view
 orch stream [id]                                       # stream live output (all sessions if no id)
 orch log -f --task <id>                                # stream one task through log

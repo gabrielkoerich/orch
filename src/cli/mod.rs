@@ -17,6 +17,7 @@ pub mod session;
 pub mod stats;
 pub mod stream;
 pub mod task;
+pub mod task_ref;
 pub mod tree;
 pub mod webhook;
 
