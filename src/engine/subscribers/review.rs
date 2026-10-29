@@ -328,7 +328,7 @@ pub fn spawn(
                                 )
                                 .await
                             }
-                            Ok(ReviewDecision::Approve) => {
+                            Ok(ReviewDecision::Approve { .. }) => {
                                 // On approval we clear transient failure counters
                                 // but preserve the `review_cycles` counter which
                                 // tracks how many times the PR has requested
