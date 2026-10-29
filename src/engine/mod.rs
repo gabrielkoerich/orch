@@ -21,6 +21,7 @@ pub mod dependencies;
 pub mod dispatch_guard;
 pub mod events;
 pub mod jobs;
+pub mod relay;
 pub mod review;
 pub mod review_poll;
 pub mod router;
@@ -108,6 +109,49 @@ pub struct ProjectEngine {
     pub task_manager: Arc<TaskManager>,
     pub runner: Arc<runner::TaskRunner>,
     pub store: Arc<TaskStore>,
+}
+
+/// Starts the relay client when `relay.url` is set. The token is read in the background, so a
+/// passbox prompt nobody answers never holds up the engine
+fn start_relay_client(project_engines: &[ProjectEngine], notify: &Arc<Notify>) {
+    let url = crate::config::get("relay.url").unwrap_or_default();
+    let Some(store) = project_engines.first().map(|e| Arc::clone(&e.store)) else {
+        return;
+    };
+
+    if url.is_empty() {
+        return;
+    }
+
+    let token_ref = crate::config::get("relay.token").unwrap_or_default();
+    let notify = Arc::clone(notify);
+    tokio::spawn(async move {
+        let mut warned = false;
+        let token = loop {
+            let reference = token_ref.clone();
+            let read = tokio::task::spawn_blocking(move || crate::secret_ref::resolve(&reference))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r);
+
+            match read {
+                Ok(token) if !token.is_empty() => break token,
+                Ok(_) => {
+                    tracing::warn!("relay.token is empty, the relay client stays off");
+                    return;
+                }
+                Err(e) if !warned => {
+                    tracing::warn!(err = %e, "could not read relay.token, retrying every 5 minutes");
+                    warned = true;
+                }
+                Err(_) => {}
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        };
+
+        relay::run(url, token, store, notify).await;
+    });
 }
 
 /**
@@ -500,7 +544,7 @@ fn resize_dispatch_pool(semaphore: &Semaphore, in_force: usize, target: usize) -
 
 /// Config subtrees the engine only reads at startup: the channel gateways hold
 /// long-lived websockets and the webhook listener binds its port once.
-const RESTART_ONLY_KEYS: [&str; 2] = ["channels", "webhook"];
+const RESTART_ONLY_KEYS: [&str; 3] = ["channels", "webhook", "relay"];
 
 /// Read the restart-only subtrees so a later reload can tell they changed.
 fn restart_only_snapshot() -> Vec<Option<String>> {
@@ -2083,6 +2127,8 @@ pub async fn serve() -> anyhow::Result<()> {
         );
     }
 
+    start_relay_client(&project_engines, &webhook_notify);
+
     // Agent router (selects agent + model per task) - shared across projects.
     // Router::from_config() may run `opencode models` (a blocking subprocess) to
     // discover free models. Wrapping in spawn_blocking keeps the Tokio runtime
@@ -3057,7 +3103,7 @@ mod tests {
     fn restart_only_keys_are_the_settings_read_once_at_startup() {
         // Guards the docs table: every key listed here is documented as needing
         // `orch service restart`, and nothing reloadable may be added to it.
-        assert_eq!(RESTART_ONLY_KEYS, ["channels", "webhook"]);
+        assert_eq!(RESTART_ONLY_KEYS, ["channels", "webhook", "relay"]);
     }
 
     #[test]

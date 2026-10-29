@@ -28,6 +28,7 @@ pub mod home;
 pub mod parser;
 pub mod plan;
 pub mod repo_context;
+pub mod secret_ref;
 pub mod security;
 pub mod status_heuristics;
 pub mod store;
