@@ -33,19 +33,22 @@ pub struct TmuxManager {
 
 impl TmuxManager {
     pub fn new() -> Self {
-        #[cfg(test)]
-        {
-            Self {
-                prefix: "orch-test-".to_string(),
-                socket: Some(test_socket_name()),
-            }
+        if cfg!(test) {
+            return Self::isolated();
         }
-        #[cfg(not(test))]
-        {
-            Self {
-                prefix: "orch-".to_string(),
-                socket: None,
-            }
+
+        Self {
+            prefix: "orch-".to_string(),
+            socket: None,
+        }
+    }
+
+    /// A tmux server of its own with its own prefix, for tests. `cfg(test)` is unset when
+    /// tests/*.rs link the library, so those tests call this directly
+    pub fn isolated() -> Self {
+        Self {
+            prefix: "orch-test-".to_string(),
+            socket: Some(isolated_socket_name()),
         }
     }
 
@@ -587,8 +590,7 @@ pub(crate) fn test_session_name() -> String {
     )
 }
 
-#[cfg(test)]
-fn test_socket_name() -> String {
+fn isolated_socket_name() -> String {
     format!("orch-test-{}", std::process::id())
 }
 
@@ -600,7 +602,7 @@ pub(crate) struct SessionGuard(pub(crate) String);
 impl Drop for SessionGuard {
     fn drop(&mut self) {
         let _ = std::process::Command::new("tmux")
-            .args(["-L", &test_socket_name(), "kill-session", "-t", &self.0])
+            .args(["-L", &isolated_socket_name(), "kill-session", "-t", &self.0])
             .output();
     }
 }

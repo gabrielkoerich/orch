@@ -90,13 +90,12 @@ pub(crate) fn shared() -> Option<Arc<AppAuth>> {
     SHARED.get_or_init(load_shared).clone()
 }
 
-#[cfg(test)]
 fn load_shared() -> Option<Arc<AppAuth>> {
-    None
-}
-
-#[cfg(not(test))]
-fn load_shared() -> Option<Arc<AppAuth>> {
+    // `cfg(test)` is unset when tests/*.rs link the library, so check debug builds too, at run
+    // time, which keeps the release path compiled and type-checked in every build
+    if cfg!(any(test, debug_assertions)) {
+        return None;
+    }
     let id = nonempty_config("gh.app.id")?;
     match AppAuth::from_config(id) {
         Ok(app) => Some(Arc::new(app)),
@@ -108,7 +107,6 @@ fn load_shared() -> Option<Arc<AppAuth>> {
 }
 
 impl AppAuth {
-    #[cfg(not(test))]
     fn from_config(app_id: String) -> anyhow::Result<Self> {
         if !app_id.chars().all(|c| c.is_ascii_digit()) {
             anyhow::bail!("gh.app.id must be digits");
@@ -287,7 +285,6 @@ fn token_is_fresh(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     expires_at > now + Duration::minutes(10)
 }
 
-#[cfg(not(test))]
 fn nonempty_config(key: &str) -> Option<String> {
     crate::config::get(key)
         .ok()
@@ -295,7 +292,6 @@ fn nonempty_config(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-#[cfg(not(test))]
 fn read_key() -> anyhow::Result<String> {
     if let Some(path) = nonempty_config("gh.app.private_key_path") {
         let raw = std::fs::read_to_string(&path)
