@@ -401,18 +401,17 @@ pub async fn handle_error(
             (retryable, format!("{agent_name} auth error: {message}"))
         }
         agents::AgentError::Timeout { elapsed } => {
-            // Record model-specific cooldown so the same slow model isn't
-            // immediately reselected on the next attempt of this (or another)
-            // task — mirrors the InvalidResponse/AgentFailed arms above and the
-            // review-path fix in review.rs (issue #3307/#3310).
-            if let Some(model) = model_name {
-                response::record_model_failure(agent_name, model).await;
-            }
+            // A task time limit says the work was long, not that the model is
+            // unavailable. Retry without a model cooldown or rate_limits row
             (
                 response::RetryableError::Timeout,
                 format!("{agent_name} timed out after {}s", elapsed.as_secs()),
             )
         }
+        agents::AgentError::Interrupted { message } => (
+            response::RetryableError::Interrupted,
+            format!("{agent_name} interrupted: {message}"),
+        ),
         agents::AgentError::MissingTool { tool } => (
             response::RetryableError::MissingTooling,
             format!("missing tool: {tool}"),
@@ -717,10 +716,11 @@ pub async fn handle_error(
         }
     };
 
-    // If this was a timeout, clear the stored agent so the router can
-    // pick a different executor on re-dispatch. Without this the same
-    // slow agent can be picked again and will timeout repeatedly.
-    if retryable == response::RetryableError::Timeout {
+    // Timeouts and interrupts clear the agent and skip the rate_limits row
+    if matches!(
+        retryable,
+        response::RetryableError::Timeout | response::RetryableError::Interrupted
+    ) {
         if let Err(e) = store::store_set_result(
             store,
             repo,
@@ -736,19 +736,23 @@ pub async fn handle_error(
         }
     }
 
-    // Record rate limit in store (sqlx)
+    // Record rate limit in store (sqlx). Timeouts and interrupted runs are
+    // not usage limits, so they must not write a row
     {
         let error_type_str = match retryable {
-            response::RetryableError::UsageLimit => "rate",
-            response::RetryableError::AuthError => "auth",
-            _ => "error",
+            response::RetryableError::UsageLimit => Some("rate"),
+            response::RetryableError::AuthError => Some("auth"),
+            response::RetryableError::Timeout | response::RetryableError::Interrupted => None,
+            _ => Some("error"),
         };
-        if let Some(ref s) = store {
-            if let Err(e) = s
-                .record_rate_limit(agent_name, error_type_str, Some(task_id))
-                .await
-            {
-                tracing::warn!(task_id, agent = %agent_name, err = %e, "failed to persist rate_limit event — router health check may miss this signal");
+        if let Some(limit_type) = error_type_str {
+            if let Some(ref s) = store {
+                if let Err(e) = s
+                    .record_rate_limit(agent_name, limit_type, Some(task_id))
+                    .await
+                {
+                    tracing::warn!(task_id, agent = %agent_name, err = %e, "failed to persist rate_limit event — router health check may miss this signal");
+                }
             }
         }
     }
@@ -1166,47 +1170,102 @@ mod tests {
         );
     }
 
-    /// Regression test for issue #3576: a Timeout classification must record a
-    /// model-specific cooldown, not just clear the agent from the task. Without
-    /// this, the router's model_for_complexity() has no signal that this model
-    /// just burned a full timeout window and can immediately reselect it —
-    /// exactly what happened to task 162289 (same model timed out twice, 90
-    /// minutes apart). Mirrors the fix already applied to the review path in
-    /// review.rs (issue #3307/#3310).
+    /// A timeout is a long task, not an unavailable model. Two timeouts in a
+    /// row must leave the model routable and write no rate_limits row
     #[serial(cooldown_state)]
     #[tokio::test]
-    async fn timeout_sets_model_specific_cooldown() {
+    async fn two_timeouts_leave_model_routable() {
         crate::engine::cooldown::reset_global_state().await;
+        let store = std::sync::Arc::new(
+            crate::store::TaskStore::open_memory()
+                .await
+                .expect("in-memory store"),
+        );
+        crate::engine::cooldown::init_cooldown_store(store.clone()).await;
+
         let runner = MockRunner { free: vec![] };
         let agent = "opencode";
         let model = "opencode/nemotron-3-ultra-free";
-
-        assert!(
-            !crate::engine::cooldown::is_model_in_cooldown(agent, model),
-            "model should not be in cooldown before handle_error"
-        );
 
         let err = AgentError::Timeout {
             elapsed: std::time::Duration::from_secs(1800),
         };
 
+        for i in 1..=2 {
+            let _result = handle_error(
+                &format!("test-3876-timeout-{i}"),
+                &err,
+                agent,
+                &runner,
+                Some(model),
+                Some("simple"),
+                i,
+                &Some(store.clone()),
+                "owner/repo",
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(
+            !crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            "timeouts must not cool the model"
+        );
+        assert!(
+            !crate::engine::cooldown::is_agent_in_cooldown(agent),
+            "timeouts must not cool the agent"
+        );
+        let counts = store.recent_rate_limit_counts(6).await.unwrap();
+        assert_eq!(
+            counts.get(agent).copied().unwrap_or(0),
+            0,
+            "timeouts must not write a rate_limits row"
+        );
+    }
+
+    /// A run that exits without a result envelope retries without cooling the
+    /// model or writing a rate_limits row
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn interrupted_run_does_not_write_rate_limit() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = std::sync::Arc::new(
+            crate::store::TaskStore::open_memory()
+                .await
+                .expect("in-memory store"),
+        );
+        crate::engine::cooldown::init_cooldown_store(store.clone()).await;
+
+        let runner = MockRunner { free: vec![] };
+        let agent = "claude";
+        let model = "sonnet";
+        let err = AgentError::Interrupted {
+            message: "exited without a result envelope".to_string(),
+        };
+
         let _result = handle_error(
-            "test-3576-timeout",
+            "test-3876-interrupted",
             &err,
             agent,
             &runner,
             Some(model),
-            Some("simple"),
+            Some("medium"),
             1,
-            &None,
+            &Some(store.clone()),
             "owner/repo",
         )
         .await
         .unwrap();
 
         assert!(
-            crate::engine::cooldown::is_model_in_cooldown(agent, model),
-            "model should be in model-level cooldown after Timeout (fixes issue #3576)"
+            !crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            "interrupted runs must not cool the model"
+        );
+        let counts = store.recent_rate_limit_counts(6).await.unwrap();
+        assert_eq!(
+            counts.get(agent).copied().unwrap_or(0),
+            0,
+            "interrupted runs must not write a rate_limits row"
         );
     }
 

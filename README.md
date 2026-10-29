@@ -215,8 +215,8 @@ orch log -f                   # Tail service logs live
 orch log -f --task <task_id>  # Stream a single task
 orch service doctor           # Diagnose SQLite ↔ GitHub drift
 orch service prune            # Remove orphaned worktrees
-orch cooldown list            # Show active agent/model cooldowns
-orch cooldown clear <key>     # Clear a specific cooldown
+orch cooldown list            # Show active cooldowns and degraded agents
+orch cooldown clear <key>     # Clear a cooldown and that agent's degraded window
 orch webhook status           # Show webhook server health (hidden, rare public-host use)
 orch task session export <id> # Export a task's session
 orch notify "message"         # Send a Telegram notification

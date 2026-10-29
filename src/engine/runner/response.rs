@@ -314,6 +314,8 @@ pub fn pick_fallback_agent(
 pub enum RetryableError {
     /// Agent timed out.
     Timeout,
+    /// Run exited without a result envelope
+    Interrupted,
     /// Usage/rate limit hit.
     UsageLimit,
     /// Auth/billing error.
@@ -335,6 +337,7 @@ impl RetryableError {
     pub fn type_str(self) -> &'static str {
         match self {
             RetryableError::Timeout => "timeout",
+            RetryableError::Interrupted => "interrupted",
             RetryableError::UsageLimit => "rate_limit",
             RetryableError::AuthError => "auth_error",
             RetryableError::ModelUnavailable => "model_unavailable",
@@ -389,6 +392,8 @@ pub async fn handle_failover(
             RetryableError::UsageLimit
                 | RetryableError::AuthError
                 | RetryableError::ModelUnavailable
+                | RetryableError::Timeout
+                | RetryableError::Interrupted
         );
         let next_status = if is_retryable { "new" } else { "blocked" };
 
@@ -421,12 +426,6 @@ pub async fn handle_failover(
 
         if let Err(e) = store::store_set_result(store, repo, task_id, &store_fields).await {
             tracing::warn!(task_id, err = %e, "failed to write agents_exhausted fields to store");
-        }
-
-        // If this was a timeout, ensure the agent is placed into cooldown
-        // so the router's round-robin avoids it for a while.
-        if matches!(error_type, RetryableError::Timeout) {
-            record_agent_failure_with_message(agent_name, error_message).await;
         }
 
         // Log reroute activity for exhausted agents
@@ -463,11 +462,13 @@ pub async fn handle_failover(
             "failover: switching to fallback agent"
         );
 
-        // Record agent failure for cooldown tracking. Skipped for
-        // MissingTooling/ModelUnavailable; see handle_failover docs above
+        // Timeouts and interrupts are not agent faults, skip the agent cooldown
         if !matches!(
             error_type,
-            RetryableError::MissingTooling | RetryableError::ModelUnavailable
+            RetryableError::MissingTooling
+                | RetryableError::ModelUnavailable
+                | RetryableError::Timeout
+                | RetryableError::Interrupted
         ) {
             // Credit errors skip the generic counter (already counted via
             // credit_failure_count); the 120s cooldown below still applies
@@ -532,11 +533,13 @@ pub async fn handle_failover(
     // No fallback available
     tracing::warn!(task_id, agent = agent_name, "no fallback agents available");
 
-    // Record agent failure for cooldown tracking. Skipped for
-    // MissingTooling/ModelUnavailable and already-counted credit errors
+    // Timeouts and interrupts are not agent faults, skip the agent cooldown
     if !matches!(
         error_type,
-        RetryableError::MissingTooling | RetryableError::ModelUnavailable
+        RetryableError::MissingTooling
+            | RetryableError::ModelUnavailable
+            | RetryableError::Timeout
+            | RetryableError::Interrupted
     ) && !credit_recorded
     {
         record_agent_failure_with_message(agent_name, error_message).await;
@@ -995,6 +998,7 @@ mod tests {
     #[test]
     fn retryable_type_str_returns_correct_labels() {
         assert_eq!(RetryableError::Timeout.type_str(), "timeout");
+        assert_eq!(RetryableError::Interrupted.type_str(), "interrupted");
         assert_eq!(RetryableError::UsageLimit.type_str(), "rate_limit");
         assert_eq!(RetryableError::AuthError.type_str(), "auth_error");
         assert_eq!(RetryableError::Failed.type_str(), "failed");

@@ -22,25 +22,38 @@ pub mod weights;
 pub use config::{parse_pool_entry, RouterConfig};
 pub use weights::AgentWeights;
 
+fn fmt_degraded(degraded: &[String]) -> String {
+    if degraded.is_empty() {
+        String::new()
+    } else {
+        format!(" (degraded: {})", degraded.join(", "))
+    }
+}
+
 /// Error returned when all agents/models are in cooldown and routing is temporarily unavailable.
 ///
 /// This is a transient error that should not count against `max_route_attempts` since
 /// no agent was actually invoked. The caller should back off and retry later.
 #[derive(Debug, thiserror::Error)]
 pub enum AllAgentsCooledError {
-    #[error("all agents/models in cooldown for {scope}")]
+    #[error("all agents/models in cooldown for {scope}{}", fmt_degraded(.degraded))]
     AllCooled {
         scope: String,
         remaining_secs: Option<u64>,
+        degraded: Vec<String>,
     },
 }
 
 impl AllAgentsCooledError {
-    /// Create a new error for the given scope.
+    /// Create a new error for the given scope, naming currently degraded agents
     pub fn new(scope: String, remaining_secs: Option<u64>) -> Self {
         Self::AllCooled {
             scope,
             remaining_secs,
+            degraded: list_degraded_agents()
+                .into_iter()
+                .map(|(agent, _reason)| agent)
+                .collect(),
         }
     }
 
@@ -59,6 +72,13 @@ impl AllAgentsCooledError {
             Self::AllCooled { remaining_secs, .. } => *remaining_secs,
         }
     }
+
+    /// Agents currently marked degraded, shown by `orch cooldown list`
+    pub fn degraded(&self) -> &[String] {
+        match self {
+            Self::AllCooled { degraded, .. } => degraded,
+        }
+    }
 }
 
 /// Typed error returned by [`get_route_result`].
@@ -75,7 +95,7 @@ pub enum RouteResultError {
 use crate::backends::ExternalTask;
 use crate::engine::cooldown::{
     cooldown_until, is_agent_degraded, is_agent_in_cooldown, is_model_in_cooldown,
-    record_agent_success, refresh_degraded_agents, sync_from_kv,
+    list_degraded_agents, record_agent_success, refresh_degraded_agents, sync_from_kv,
 };
 use crate::store::{get_task_field_direct, store_log_activity, TaskStore};
 use serde::{Deserialize, Serialize};
@@ -1669,6 +1689,23 @@ mod tests {
     }
 
     #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn all_agents_cooled_error_names_degraded_agents() {
+        crate::engine::cooldown::reset_global_state().await;
+        mark_agent_degraded("claude");
+        mark_agent_degraded("grok");
+        let err = AllAgentsCooledError::new("all agents".to_string(), None);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("degraded: claude, grok"),
+            "ALL AGENTS COOLED must name degraded agents, got {msg}"
+        );
+        assert_eq!(err.degraded(), &["claude".to_string(), "grok".to_string()]);
+        clear_agent_degraded("claude");
+        clear_agent_degraded("grok");
+    }
+
+    #[serial(cooldown_state)]
     #[test]
     fn default_agents_constant() {
         assert_eq!(DEFAULT_AGENTS.len(), 7);
@@ -3191,10 +3228,7 @@ Hope that helps!"#;
 
         // Insert rate limit events exceeding default threshold (3)
         for _ in 0..4 {
-            store
-                .record_rate_limit(agent, "rate_limit", None)
-                .await
-                .unwrap();
+            store.record_rate_limit(agent, "rate", None).await.unwrap();
         }
 
         router.refresh_health(&store).await;

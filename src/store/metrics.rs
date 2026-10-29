@@ -471,11 +471,54 @@ impl TaskStore {
         Ok(row.try_get("id")?)
     }
 
-    /// Count recent rate limit events per agent within the given window (in hours).
+    /// Record a rate limit event at an explicit SQLite datetime (`YYYY-MM-DD HH:MM:SS`)
+    pub async fn record_rate_limit_at(
+        &self,
+        agent: &str,
+        limit_type: &str,
+        task_id: Option<&str>,
+        occurred_at: &str,
+    ) -> anyhow::Result<i64> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("DELETE FROM rate_limits WHERE occurred_at < datetime('now', '-30 days')")
+            .execute(&mut *tx)
+            .await?;
+
+        let row = sqlx::query(
+            "INSERT INTO rate_limits (agent, limit_type, occurred_at, task_id)
+         VALUES (?, ?, ?, ?)
+         RETURNING id",
+        )
+        .bind(agent)
+        .bind(limit_type)
+        .bind(occurred_at)
+        .bind(task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(row.try_get("id")?)
+    }
+
+    /// Distinct agents that have at least one `rate_limits` row
+    pub async fn rate_limit_agents(&self) -> anyhow::Result<Vec<String>> {
+        let rows = sqlx::query("SELECT DISTINCT agent FROM rate_limits")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut agents = Vec::with_capacity(rows.len());
+        for row in &rows {
+            agents.push(row.try_get("agent")?);
+        }
+        Ok(agents)
+    }
+
+    /// Count recent rate-limit events per agent within the given window (in hours).
     ///
-    /// Returns a map of `agent -> count` for agents that have rate_limit or
-    /// out_of_credits events in the `rate_limits` table within the window.
-    /// Used by the pre-emptive health check to detect degraded agents.
+    /// Only `limit_type = 'rate'` rows count. Failures, auth errors and
+    /// timeouts keep their own cooldowns and must not mark an agent degraded.
+    /// Rows at or before `rate_limits_cleared_at:{agent}` are ignored so
+    /// `orch cooldown clear` can un-degrade without deleting metrics
     pub async fn recent_rate_limit_counts(
         &self,
         window_hours: u32,
@@ -485,10 +528,16 @@ impl TaskStore {
         // from a config integer, not user input, so this is safe.
         let interval = format!("-{window_hours} hours");
         let rows = sqlx::query(
-            "SELECT agent, COUNT(*) as cnt
-             FROM rate_limits
-             WHERE occurred_at >= datetime('now', ?)
-             GROUP BY agent",
+            "SELECT r.agent, COUNT(*) as cnt
+             FROM rate_limits r
+             LEFT JOIN kv ON kv.key = 'rate_limits_cleared_at:' || r.agent
+             WHERE r.occurred_at >= datetime('now', ?)
+               AND r.limit_type = 'rate'
+               AND (
+                 kv.value IS NULL
+                 OR r.occurred_at > datetime(CAST(kv.value AS INTEGER), 'unixepoch')
+               )
+             GROUP BY r.agent",
         )
         .bind(&interval)
         .fetch_all(&self.pool)
