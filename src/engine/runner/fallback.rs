@@ -330,9 +330,7 @@ pub async fn handle_error(
                 // Also record the model-specific cooldown so model_for_complexity skips it.
                 if let Some(model) = model_name {
                     if is_provider_returned_error {
-                        // Opaque provider failures can remain unstable for hours.
-                        // Use longer exponential model backoff to avoid repeated runs.
-                        crate::engine::cooldown::record_persistent_model_failure(agent_name, model)
+                        crate::engine::cooldown::record_transient_model_failure(agent_name, model)
                             .await;
                     } else {
                         response::record_model_failure(agent_name, model).await;
@@ -673,9 +671,8 @@ pub async fn handle_error(
                     || message.starts_with("empty-output-exit0:"))
             {
                 if let Some(m) = model_name {
-                    // Silent exits can remain broken for long periods. Start with 4h,
-                    // then escalate using exponential backoff for persistent failures.
-                    crate::engine::cooldown::record_persistent_model_failure(agent_name, m).await;
+                    // A stopped session also exits 0 with no output, so the backoff stays short
+                    crate::engine::cooldown::record_transient_model_failure(agent_name, m).await;
                 }
                 // Before falling through to handle_failover() (which tries claude/codex),
                 // check whether this agent has any free models that haven't been tried yet.
@@ -1326,7 +1323,7 @@ mod tests {
 
     #[serial(cooldown_state)]
     #[tokio::test]
-    async fn provider_returned_error_sets_extended_model_cooldown() {
+    async fn provider_returned_error_sets_short_model_cooldown() {
         crate::engine::cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "opencode";
@@ -1356,10 +1353,9 @@ mod tests {
             .expect("provider error should set model cooldown");
         let remaining = until.saturating_sub(now);
 
-        // Allow a wider margin for scheduler/runtime jitter in concurrent test runs.
         assert!(
-            remaining >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
-            "expected ~4h model cooldown, got {remaining}s"
+            remaining <= crate::engine::cooldown::TRANSIENT_MODEL_BACKOFF_BASE_SECS,
+            "expected a 5 minute model cooldown, got {remaining}s"
         );
     }
 

@@ -113,6 +113,20 @@ pub async fn build_pseudo_task(
     }
 }
 
+/// The router clears a stale model by writing an empty string, and `--model ""` makes the claude
+/// API answer 400, so an empty name at any level means no model
+fn resolve_model_name(
+    param: Option<&str>,
+    routed: Option<&str>,
+    stored: Option<&str>,
+) -> Option<String> {
+    [param, routed, stored]
+        .into_iter()
+        .flatten()
+        .find(|m| !m.is_empty())
+        .map(String::from)
+}
+
 /// Prepare the full task: set up worktree, build context and prompts, create invocation.
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_task(
@@ -189,10 +203,11 @@ pub async fn prepare_task(
         .or_else(|| route_result.as_ref().map(|r| r.agent.clone()))
         .unwrap_or_else(|| "claude".to_string());
 
-    let model_name = model
-        .map(String::from)
-        .or_else(|| route_result.as_ref().and_then(|r| r.model.clone()))
-        .or(stored_model);
+    let model_name = resolve_model_name(
+        model,
+        route_result.as_ref().and_then(|r| r.model.as_deref()),
+        stored_model.as_deref(),
+    );
 
     let complexity = route_result.as_ref().map(|r| r.complexity.clone());
 
@@ -369,6 +384,20 @@ pub async fn prepare_task(
 mod tests {
     use super::*;
     use crate::store::NewTask;
+
+    #[test]
+    fn resolve_model_name_skips_a_model_cleared_to_empty() {
+        assert_eq!(resolve_model_name(None, None, Some("")), None);
+        assert_eq!(resolve_model_name(None, Some(""), Some("")), None);
+        assert_eq!(
+            resolve_model_name(None, None, Some("sonnet")).as_deref(),
+            Some("sonnet")
+        );
+        assert_eq!(
+            resolve_model_name(Some("opus"), Some("sonnet"), Some("haiku")).as_deref(),
+            Some("opus")
+        );
+    }
 
     #[tokio::test]
     async fn max_attempts_writes_block_reason() {

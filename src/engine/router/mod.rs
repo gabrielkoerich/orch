@@ -1563,18 +1563,25 @@ pub async fn get_route_result(
         valid
     });
 
-    // If a stale model was discarded, update the database to clear the model
-    // and record a diagnostic last_error so task_runs.error is populated if
-    // the subsequent run fails (fixes issue #2527).
+    // A stale model is replaced by the agent's model for the task's complexity, an empty
+    // model would reach the agent as `--model ""`. last_error keeps the reason (#2527)
     let original_model = task.model.clone().filter(|m| !m.is_empty());
+    let mut model = model;
     if original_model.is_some() && model.is_none() {
+        model = config.model_for_complexity(&agent, &complexity, task_id);
         let stale_model = original_model.as_deref().unwrap_or("unknown");
-        let stale_err = format!("stale model discarded: {stale_model} not in {agent} model pools");
+        let stale_err = format!(
+            "stale model discarded: {stale_model} not in {agent} model pools, using {}",
+            model.as_deref().unwrap_or("the agent default")
+        );
         if let Err(e) = store
             .set_fields(
                 store_id,
                 &[
-                    ("model", serde_json::json!("")),
+                    (
+                        "model",
+                        serde_json::json!(model.clone().unwrap_or_default()),
+                    ),
                     ("last_error", serde_json::json!(stale_err)),
                 ],
             )
@@ -1614,6 +1621,48 @@ mod tests {
     use crate::store::TaskStore;
     use serial_test::serial;
     use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    #[serial_test::serial(orch_home)]
+    async fn get_route_result_replaces_a_stale_model_with_the_complexity_model() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.yml"),
+            "model_map:\n  medium:\n    claude: sonnet\n",
+        )
+        .unwrap();
+        std::env::set_var("ORCH_HOME", home.path());
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let store_id = store
+            .create(&crate::store::NewTask {
+                external_id: Some("7".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "stale model".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .set_fields(
+                store_id,
+                &[
+                    ("agent", serde_json::json!("claude")),
+                    ("model", serde_json::json!("claude-removed-model")),
+                    ("complexity", serde_json::json!("medium")),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let route = get_route_result(&store, "owner/repo", "7").await;
+        let stored = store.get(store_id).await.unwrap().model;
+        std::env::remove_var("ORCH_HOME");
+
+        assert_eq!(route.unwrap().model.as_deref(), Some("sonnet"));
+        assert_eq!(stored.as_deref(), Some("sonnet"));
+    }
 
     // Test-only delegates so tests can call router.parse_llm_response() and
     // router.check_routing_sanity() directly without referencing llm_router.

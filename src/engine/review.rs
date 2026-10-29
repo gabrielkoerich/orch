@@ -1108,12 +1108,9 @@ async fn record_review_agent_failure(
         // Killed or truncated review run, not a model fault
         runner::agents::AgentError::Interrupted { .. } => {}
         runner::agents::AgentError::InvalidResponse { .. } => {
-            // Structural failure: model produced no parseable output at all.
-            // Apply persistent backoff (4h base → 7d max) — same rationale as
-            // silent exit-0 in the agent runner. A model that cannot produce
-            // ANY output for a review is unlikely to self-heal on the next try.
+            // No usable review output, a short backoff since the model itself still works
             if let Some(model) = review_model {
-                crate::engine::cooldown::record_persistent_model_failure(review_agent, model).await;
+                crate::engine::cooldown::record_transient_model_failure(review_agent, model).await;
             }
         }
         runner::agents::AgentError::ModelUnavailable { .. } => {
@@ -1481,12 +1478,7 @@ async fn parse_review_output(
                     return ReviewPhase::EarlyReturn(ReviewDecision::Failed(stored_error));
                 }
 
-                // The model was cut off for exceeding its output/reasoning
-                // token budget (opencode step_finish reason=length), not
-                // because it produced malformed prose. Like a timeout, this is
-                // a structural inability to finish review under the current
-                // budget, so use the persistent 4h-7d cooldown rather than the
-                // generic success-resettable model failure counter.
+                // Cut off at the output token limit (opencode step_finish reason=length)
                 if agent_result
                     .as_ref()
                     .map(|r| r.truncated_by_length)
@@ -1500,7 +1492,7 @@ async fn parse_review_output(
                          (token budget exceeded before completion)"
                     );
                     if let Some(model) = ctx.review_model.as_deref() {
-                        crate::engine::cooldown::record_persistent_model_failure(
+                        crate::engine::cooldown::record_transient_model_failure(
                             &ctx.review_agent,
                             model,
                         )
@@ -1525,7 +1517,7 @@ async fn parse_review_output(
                 }
 
                 // No envelope and last content is thinking/tool_use: retry without
-                // the persistent format-failure cooldown (issue #3734)
+                // the format-failure cooldown (issue #3734)
                 if runner::agents::claude::review_session_exited_mid_thought(&raw_output) {
                     tracing::warn!(
                         task_id = task.id.0,
@@ -1560,9 +1552,7 @@ async fn parse_review_output(
                     "failed to parse review response"
                 );
                 if let Some(model) = ctx.review_model.as_deref() {
-                    // Finished output that is not a review decision: persistent backoff
-                    // (4h base → 7d max) so a later success cannot immediately re-select it
-                    crate::engine::cooldown::record_persistent_model_failure(
+                    crate::engine::cooldown::record_transient_model_failure(
                         &ctx.review_agent,
                         model,
                     )
@@ -4055,16 +4045,10 @@ mod tests {
 
     // ── review cooldown escalation (issue #3314) ────────────────────────────
 
-    /// Review `InvalidResponse` (hard failure: empty/error output) must apply the
-    /// persistent model backoff (~4h base) so the model isn't re-selected on the
-    /// next tick after a brief standard cooldown expires.
-    ///
-    /// Regression test for issue #3314: `record_model_failure` (5-min base) was used
-    /// instead of `record_persistent_model_failure` (4h base), allowing repeated
-    /// re-selection of a structurally broken review model.
+    /// Review `InvalidResponse` applies the short review output backoff: 5 minutes first
     #[serial_test::serial(cooldown_state)]
     #[tokio::test]
-    async fn review_invalid_response_applies_persistent_model_cooldown() {
+    async fn review_invalid_response_applies_short_model_cooldown() {
         crate::engine::cooldown::reset_global_state().await;
         let agent = "opencode-3314-review-invalid";
         let model = "opencode/north-mini-code-free";
@@ -4084,55 +4068,41 @@ mod tests {
         let until = crate::engine::cooldown::cooldown_until(&key)
             .expect("review InvalidResponse should set model cooldown");
         let remaining = until.saturating_sub(now);
-
-        // Persistent backoff base is ~4h (14400s); standard model backoff base is 5min (300s).
-        // Verify the persistent (4h) path was taken, not the short one.
+        let base = crate::engine::cooldown::TRANSIENT_MODEL_BACKOFF_BASE_SECS;
         assert!(
-            remaining >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
-            "review InvalidResponse must apply ~4h persistent cooldown (issue #3314), \
-             got {remaining}s — may have used 5-min standard backoff instead"
+            (base - 30..=base).contains(&remaining),
+            "first unusable review output must cool the model for 5 minutes, got {remaining}s"
         );
     }
 
-    /// Review `parse_error` (got output but couldn't parse it as a review response) must
-    /// also apply the persistent model backoff so the model is cooled long enough to
-    /// prevent re-selection after a brief cooldown or a success-reset from another task.
-    ///
-    /// Verifies the `record_review_agent_failure` path for `InvalidResponse`
-    /// (which covers both the hard-failure and soft parse-error paths that were
-    /// changed in the fix for issue #3314).
+    /// Repeated unusable review output escalates to 15 minutes and stays there
     #[serial_test::serial(cooldown_state)]
     #[tokio::test]
-    async fn review_persistent_cooldown_survives_after_first_failure() {
+    async fn review_output_cooldown_caps_at_fifteen_minutes() {
         crate::engine::cooldown::reset_global_state().await;
-        let agent = "opencode-3314-review-parse";
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        crate::engine::cooldown::init_cooldown_store(store).await;
+        let agent = "opencode-review-output-cap";
         let model = "opencode/north-mini-code-free";
         let key = format!("{agent}:{model}");
+        let base = crate::engine::cooldown::TRANSIENT_MODEL_BACKOFF_BASE_SECS;
+        let max = crate::engine::cooldown::TRANSIENT_MODEL_BACKOFF_MAX_SECS;
 
-        // First failure: persistent backoff should apply immediately
-        let err = runner::agents::AgentError::InvalidResponse {
-            raw: "failed to parse review response".to_string(),
-        };
-        record_review_agent_failure("test-3314-b", agent, Some(model), &err).await;
-
-        let now = chrono::Utc::now().timestamp();
-        let until1 = crate::engine::cooldown::cooldown_until(&key)
-            .expect("first failure should set cooldown");
-        let remaining1 = until1.saturating_sub(now);
-
-        // Simulate a success for the same agent+model (from a non-review task).
-        // This resets failure_count:{agent}:{model} to 0.
-        crate::engine::cooldown::record_agent_success(agent, model).await;
-
-        // After success reset, cooldown timestamp is still set — the success only
-        // resets the failure count, NOT the existing cooldown timer.
-        // The next review failure will restart from count=1 (base backoff).
-        // The key invariant: persistent base (4h) >> standard base (5min) so even
-        // after a reset, the first-failure cooldown still lasts ~4h.
-        assert!(
-            remaining1 >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
-            "after success reset, first-failure cooldown should still be ~4h, got {remaining1}s"
-        );
+        for (i, expected) in [base, max, max].into_iter().enumerate() {
+            let err = runner::agents::AgentError::InvalidResponse {
+                raw: format!("failed to parse review response {i}"),
+            };
+            record_review_agent_failure("test-review-output-cap", agent, Some(model), &err).await;
+            let now = chrono::Utc::now().timestamp();
+            let remaining = crate::engine::cooldown::cooldown_until(&key)
+                .expect("unusable review output should set model cooldown")
+                .saturating_sub(now);
+            assert!(
+                (expected - 30..=expected).contains(&remaining),
+                "failure {} should cool the model for {expected}s, got {remaining}s",
+                i + 1
+            );
+        }
     }
 
     /// Regression test for issue #3551: a billing-cycle-exhaustion message caught by
@@ -4343,10 +4313,10 @@ mod tests {
     }
 
     /// A finished result envelope whose text is not a review decision still
-    /// gets the persistent format-failure cooldown.
+    /// gets the short format-failure cooldown.
     #[serial_test::serial(cooldown_state)]
     #[tokio::test]
-    async fn parse_review_output_unparseable_envelope_applies_persistent_cooldown() {
+    async fn parse_review_output_unparseable_envelope_applies_short_cooldown() {
         crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let work_dir = TempDir::new().unwrap();
@@ -4380,9 +4350,13 @@ mod tests {
             ReviewPhase::EarlyReturn(_) => panic!("expected Failed(parse error)"),
             ReviewPhase::Ready(_) => panic!("expected Failed(parse error), got Ready"),
         }
+        let now = chrono::Utc::now().timestamp();
+        let remaining = crate::engine::cooldown::cooldown_until(&format!("{agent}:{model}"))
+            .expect("finished format failure must apply a model cooldown")
+            .saturating_sub(now);
         assert!(
-            crate::engine::cooldown::is_model_in_cooldown(agent, model),
-            "finished format failure must apply persistent model cooldown"
+            remaining <= crate::engine::cooldown::TRANSIENT_MODEL_BACKOFF_BASE_SECS,
+            "finished format failure must apply the 5 minute cooldown, got {remaining}s"
         );
     }
 
@@ -4507,8 +4481,8 @@ mod tests {
     /// Regression test for issue #3478: successful reviews interleaved between
     /// isolated generic failures must keep each failure's backoff at the base
     /// duration instead of escalating, since the previous success reset the
-    /// counter. Uses AgentFailed (generic/transient), not InvalidResponse
-    /// (persistent-model path — see issue #3571).
+    /// counter. Uses AgentFailed (generic/transient), not ModelUnavailable
+    /// (persistent-model path, see issue #3571).
     #[serial_test::serial(cooldown_state)]
     #[tokio::test]
     async fn finalize_review_run_interleaved_success_keeps_generic_cooldown_at_base() {
@@ -4554,7 +4528,7 @@ mod tests {
     }
 
     /// Regression test for issue #3571: unlike generic failures, persistent
-    /// model failures (e.g. review parse errors, InvalidResponse) must NOT be
+    /// model failures (e.g. ModelUnavailable) must NOT be
     /// reset by an intervening successful review. Otherwise a model that fails
     /// structurally every so often — but succeeds most of the time — never
     /// escalates past the 4h base cooldown and stays in rotation indefinitely.
@@ -4573,9 +4547,10 @@ mod tests {
         let ctx = test_review_context(agent, model, work_dir.path());
         let task = test_review_task("3");
 
-        // First structural (parse-error-equivalent) failure -> base 4h cooldown.
-        let err = runner::agents::AgentError::InvalidResponse {
-            raw: "empty review output".to_string(),
+        // First persistent model failure -> base 4h cooldown.
+        let err = runner::agents::AgentError::ModelUnavailable {
+            message: "model not found".to_string(),
+            model: model.to_string(),
         };
         record_review_agent_failure("task-3571-a", agent, Some(model), &err).await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -4586,10 +4561,11 @@ mod tests {
         finalize_review_run(&task, &ctx, &parsed, &store).await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
-        // Second structural failure must escalate from count 2 (~12h), not
+        // Second persistent failure must escalate from count 2 (~12h), not
         // reset back to the 4h base, despite the intervening success.
-        let err2 = runner::agents::AgentError::InvalidResponse {
-            raw: "empty review output again".to_string(),
+        let err2 = runner::agents::AgentError::ModelUnavailable {
+            message: "model not found again".to_string(),
+            model: model.to_string(),
         };
         record_review_agent_failure("task-3571-b", agent, Some(model), &err2).await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
