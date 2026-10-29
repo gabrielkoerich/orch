@@ -461,6 +461,8 @@ impl TaskManager {
     /// Store is always updated when available.
     pub async fn update_task_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
         let task_status = status_to_task_status(status);
+        self.release_dependents_if_done(task_status, &self.repo, &id.0)
+            .await;
 
         // Read pre-update snapshot from the store (old_status + context fields).
         // This must happen BEFORE any store.update_status() call so we capture
@@ -519,6 +521,8 @@ impl TaskManager {
         updates: &[(&str, serde_json::Value)],
     ) -> anyhow::Result<()> {
         let task_status = status_to_task_status(status);
+        self.release_dependents_if_done(task_status, &self.repo, &id.0)
+            .await;
 
         // Read pre-update snapshot from the store (old_status + context fields).
         let (pre_snapshot, snapshot_store_id) = self.read_task_snapshot(&id.0).await;
@@ -576,6 +580,8 @@ impl TaskManager {
         expected_status: Status,
     ) -> anyhow::Result<bool> {
         let task_status = status_to_task_status(status);
+        self.release_dependents_if_done(task_status, &self.repo, &id.0)
+            .await;
         let expected_task_status = status_to_task_status(expected_status);
 
         let (pre_snapshot, snapshot_store_id) = self.read_task_snapshot(&id.0).await;
@@ -651,6 +657,8 @@ impl TaskManager {
         duration_seconds: Option<f64>,
     ) -> anyhow::Result<()> {
         let task_status = status_to_task_status(status);
+        self.release_dependents_if_done(task_status, &self.repo, &id.0)
+            .await;
         let (pre_snapshot, snapshot_store_id) = self.read_task_snapshot(&id.0).await;
 
         if is_internal_id(&id.0) {
@@ -756,6 +764,21 @@ impl TaskManager {
         }
     }
 
+    /**
+     * Drop the blocker read cache for a task that is finishing, so the next snapshot
+     * refresh reads it and releases its dependents instead of waiting out the read TTL.
+     * Called before the write, because a cleared cache only costs one extra read if the
+     * write then fails or no-ops
+     **/
+    async fn release_dependents_if_done(&self, status: TaskStatus, repo: &str, ext_id: &str) {
+        if status != TaskStatus::Done {
+            return;
+        }
+        if let Some(ref store) = self.store {
+            crate::engine::dependencies::clear_blocker_read_cache(store, repo, ext_id).await;
+        }
+    }
+
     /// Publish a TaskEvent to the event bus (if wired).
     fn publish_event(
         &self,
@@ -820,6 +843,8 @@ impl TaskManager {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("store required for status update"))?;
         let task_status = status_to_task_status(status);
+        self.release_dependents_if_done(task_status, repo, &ext_id.0)
+            .await;
 
         let snapshot = Self::snapshot_for_store_id(store, store_id, &ext_id.0).await;
         if task_status != TaskStatus::Blocked {
@@ -845,6 +870,8 @@ impl TaskManager {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("store required for status update"))?;
         let task_status = status_to_task_status(status);
+        self.release_dependents_if_done(task_status, repo, &ext_id.0)
+            .await;
 
         let snapshot = Self::snapshot_for_store_id(store, store_id, &ext_id.0).await;
         store
