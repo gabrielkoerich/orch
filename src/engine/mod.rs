@@ -78,7 +78,7 @@ use crate::engine::runner::worktree::{
 use crate::engine::tasks::TaskManager;
 use crate::github::http::{rate_limit_metrics, GhHttp};
 use crate::repo_context::REPO_CONTEXT;
-use crate::store::{review_session_expected, set_review_session_expected};
+use crate::store::set_review_session_expected;
 use crate::store::{TaskStatus, TaskStore};
 use crate::tmux::TmuxManager;
 use runner::WeightSignal;
@@ -109,6 +109,73 @@ pub struct ProjectEngine {
     pub task_manager: Arc<TaskManager>,
     pub runner: Arc<runner::TaskRunner>,
     pub store: Arc<TaskStore>,
+}
+
+/// A restart ends every review session, so an `in_review` task with no session has no reviewer.
+/// Hand it back to `needs_review` at start, so it does not wait for the stuck-review recovery
+pub(crate) async fn reset_orphaned_reviews(
+    task_manager: &TaskManager,
+    store: &Arc<TaskStore>,
+    repo: &str,
+    tmux: &TmuxManager,
+) -> usize {
+    // The store holds external and internal tasks, the second list is the legacy internal table
+    let mut ids: Vec<ExternalId> = store
+        .list_by_status(repo, crate::store::TaskStatus::InReview)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|t| crate::engine::tasks::store_task_to_external(t).id)
+        .collect();
+    if let Ok(legacy) = task_manager
+        .list_internal_by_status(crate::store::TaskStatus::InReview)
+        .await
+    {
+        ids.extend(legacy.into_iter().map(|t| t.id));
+    }
+    ids.sort_by(|a, b| a.0.cmp(&b.0));
+    ids.dedup_by(|a, b| a.0 == b.0);
+
+    let mut reset = 0;
+    for id in &ids {
+        let session = tmux.session_name(repo, &format!("{}-review", id.0));
+
+        if tmux.session_exists(&session).await {
+            continue;
+        }
+
+        if let Err(e) = task_manager
+            .update_task_status(id, Status::NeedsReview)
+            .await
+        {
+            tracing::warn!(
+                task_id = id.0,
+                ?e,
+                "failed to reset an orphaned review at start"
+            );
+            continue;
+        }
+
+        set_review_session_expected(store, repo, &id.0, false).await;
+        if let Ok(Some(store_id)) = store.resolve_task_id(repo, &id.0).await {
+            let reason = "startup: review session gone, reset to needs_review";
+
+            if let Err(e) = store
+                .finalize_incomplete_runs(store_id, "aborted", reason)
+                .await
+            {
+                tracing::warn!(
+                    task_id = id.0,
+                    ?e,
+                    "failed to finalize the orphaned review's runs"
+                );
+            }
+        }
+
+        reset += 1;
+    }
+
+    reset
 }
 
 /// Starts the relay client when `relay.url` is set. The token is read in the background, so a
@@ -2197,96 +2264,13 @@ pub async fn serve() -> anyhow::Result<()> {
     // Channel for weight signals from task runners back to the router
     let (weight_tx, mut weight_rx) = mpsc::channel::<WeightSignal>(64);
 
-    // Reset InReview tasks on startup. A task is reset to NeedsReview if:
-    // 1. It was expecting a live review session (review_session_expected=true), OR
-    // 2. It has been in InReview for >10 minutes (catches cases where the flag
-    //    was never set due to crash-loops or lost events).
-    // Tasks with a recent review comment on their PR are left alone.
+    // A restart ends every review session, so reset each in_review task left without one
     for engine in project_engines.iter().filter(|_| leads) {
-        // Read from SQLite (source of truth) — GitHub labels may be out of sync.
-        let in_review_from_store = engine
-            .store
-            .list_by_status(&engine.repo, crate::store::TaskStatus::InReview)
-            .await
-            .unwrap_or_default()
-            .iter()
-            .map(crate::engine::tasks::store_task_to_external)
-            .collect::<Vec<_>>();
-        if !in_review_from_store.is_empty() {
-            let in_review = &in_review_from_store;
-            for task in in_review {
-                let session_expected =
-                    review_session_expected(&engine.store, &engine.repo, &task.id.0).await;
-                let age_minutes = chrono::DateTime::parse_from_rfc3339(&task.updated_at)
-                    .map(|dt| (chrono::Utc::now() - dt.with_timezone(&chrono::Utc)).num_minutes())
-                    .unwrap_or(i64::MAX);
-                if !session_expected && age_minutes < 10 {
-                    continue;
-                }
-                if let Err(e) = engine
-                    .task_manager
-                    .update_task_status(&task.id, Status::NeedsReview)
-                    .await
-                {
-                    tracing::warn!(
-                        task_id = task.id.0,
-                        err = %e,
-                        "failed to reset stale InReview task on startup"
-                    );
-                } else {
-                    set_review_session_expected(&engine.store, &engine.repo, &task.id.0, false)
-                        .await;
-                }
-            }
-            if !in_review.is_empty() {
-                tracing::info!(
-                    repo = %engine.repo,
-                    count = in_review.len(),
-                    "reset stale InReview tasks to NeedsReview on startup"
-                );
-            }
-        }
+        let reset =
+            reset_orphaned_reviews(&engine.task_manager, &engine.store, &engine.repo, &tmux).await;
 
-        // Also reset internal (SQLite) InReview tasks on startup.
-        // Note: the block above already covers internal tasks from the store,
-        // but this second pass catches any that were only in the old internal_tasks table.
-        use crate::store::TaskStatus as DbStatus;
-        if let Ok(internal_in_review) = engine
-            .task_manager
-            .list_internal_by_status(DbStatus::InReview)
-            .await
-        {
-            for task in &internal_in_review {
-                let task_id = task.id.0.clone();
-                let session_expected =
-                    review_session_expected(&engine.store, &engine.repo, &task_id).await;
-                let age_minutes = chrono::DateTime::parse_from_rfc3339(&task.updated_at)
-                    .map(|dt| (chrono::Utc::now() - dt.with_timezone(&chrono::Utc)).num_minutes())
-                    .unwrap_or(i64::MAX);
-                if !session_expected && age_minutes < 10 {
-                    continue;
-                }
-                if let Err(e) = engine
-                    .task_manager
-                    .update_task_status(&ExternalId(task_id.clone()), Status::NeedsReview)
-                    .await
-                {
-                    tracing::warn!(
-                        task_id,
-                        err = %e,
-                        "failed to reset stale internal InReview task on startup"
-                    );
-                } else {
-                    set_review_session_expected(&engine.store, &engine.repo, &task_id, false).await;
-                }
-            }
-            if !internal_in_review.is_empty() {
-                tracing::info!(
-                    repo = %engine.repo,
-                    count = internal_in_review.len(),
-                    "reset stale internal InReview tasks to NeedsReview on startup"
-                );
-            }
+        if reset > 0 {
+            tracing::info!(repo = %engine.repo, reset, "reset orphaned reviews to needs_review on startup");
         }
     }
 
@@ -2991,6 +2975,56 @@ pub async fn serve() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn in_review_task(store: &TaskStore, number: &str) -> i64 {
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: number,
+                title: "Under review",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::InReview)
+            .await
+            .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn a_review_without_a_session_goes_back_to_needs_review_and_a_live_one_stays() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> =
+            Arc::new(crate::backends::test_helpers::NoopBackend);
+        let task_manager =
+            TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+        let tmux = TmuxManager::isolated();
+        let orphaned = in_review_task(&store, "11").await;
+        let live = in_review_task(&store, "12").await;
+        let session = tmux
+            .create_session("owner/repo", "12-review", "/tmp", "sleep 30", &[])
+            .await
+            .unwrap();
+        let _guard = crate::tmux::SessionGuard(session);
+
+        let reset = reset_orphaned_reviews(&task_manager, &store, "owner/repo", &tmux).await;
+
+        assert_eq!(reset, 1);
+        assert_eq!(
+            store.get(orphaned).await.unwrap().status,
+            crate::store::TaskStatus::NeedsReview
+        );
+        assert_eq!(
+            store.get(live).await.unwrap().status,
+            crate::store::TaskStatus::InReview
+        );
+    }
 
     #[test]
     fn growing_max_parallel_lets_more_tasks_run_without_a_restart() {
