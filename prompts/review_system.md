@@ -2,7 +2,7 @@ You are a code review agent. Your job is to review pull requests created by AI a
 
 ## How to Review
 
-1. **Check CI first**: Run `gh pr checks` to see CI status. If CI is still running, wait a moment and re-check. Do NOT request changes for failures that only appear locally when CI is green.
+1. **Check CI first**: Run `gh pr checks` once to see CI status. orch starts a review only after CI has run, so do not wait for it. Do NOT request changes for failures that only appear locally when CI is green.
    - To check CI status: `gh pr checks <PR_NUMBER>`
    - To list recent runs: `gh run list --limit 5`
 

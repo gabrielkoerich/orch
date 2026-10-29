@@ -1,49 +1,28 @@
 ## Review Task #{{TASK_ID}}: {{TASK_TITLE}}
 
-You are reviewing a PR created by an AI agent. Complete all steps in order (Step 1 is optional and may be skipped if lockfile errors occur).
+You are reviewing a PR created by an AI agent. Complete all steps in order.
 
-### Step 1: Rebase onto default branch (optional)
+### Step 1: Check CI
 
-Keep the branch up to date — other PRs may have merged since this was created:
-1. Rebase onto the default branch:
-   - `git rebase origin/{{DEFAULT_BRANCH}}`
-   - Orch has already run `git fetch origin` before launching you — do NOT run `git fetch` or `git pull` yourself (they will fail in sandboxed environments because they need to write outside the worktree directory). Remote refs are already available locally.
-2. If there are conflicts:
-   - Resolve each conflict by understanding both sides of the change
-   - `git add <resolved files>` then `git rebase --continue`
-   - If a conflict is too complex to resolve safely, set decision = `request_changes`
-3. **Note:** In sandboxed worktrees, rebase may fail with lockfile permission errors (`REBASE_HEAD.lock`, `AUTO_MERGE.lock`). If you encounter such errors and the branch is already up to date (check with `git status`), treat the error as non-blocking and continue with the review.
+orch starts this review only after CI has run on the PR head. Before the merge, orch brings the branch up to date and waits for CI again. Do NOT rebase, do NOT push, and do NOT wait for CI.
 
-**Do NOT push** — orch handles pushing after review completes and before posting the review decision.
-
-### Step 2: Verify CI status
-
-GitHub CI is the authoritative test environment. Before running CI checks, run `git status` to verify the worktree is clean and not in a rebase state. If mid-rebase, resolve that first; if conflicts are too complex to resolve safely, set decision = `request_changes`.
-
-Check **required checks only**:
+Read the required checks once:
 
 ```bash
-timeout 300 gh pr checks {{PR_NUMBER}} --watch --fail-fast --required || true
+gh pr checks {{PR_NUMBER}} --required || true
 ```
 
-Run this command in the foreground and wait for it to complete — do NOT use a background/async task tool for this step. The review is not complete until this command has finished and you have interpreted its output.
-
-**Non-required checks** are informational — the `--required` flag filters to required checks only. The only non-required check orch installs is `review-gate`. Do NOT request changes based on non-required check failures.
+**Non-required checks** are informational. `review-gate` and `orch/review` report this review itself, so ignore them. Do NOT request changes based on non-required check failures.
 
 Follow this decision tree exactly:
 
 ```
 IF required checks PASS:
-  IF branch was NOT rebased in Step 1 (rebase was a no-op):
-    → proceed to Step 3 (skip local tests)
-  IF branch WAS rebased in Step 1 (new commits added):
-    → CI results are stale; note this in your review and proceed to Step 3
-      (orch will push the rebased branch before posting the decision;
-       CI will re-run before merging — do NOT request changes for stale CI)
+  → proceed to Step 2 (skip local tests)
 
 IF required checks FAIL:
   Are the failing checks related to files changed by this PR?
-    NO → failure is pre-existing; note it in your review and proceed to Step 3
+    NO → failure is pre-existing; note it in your review and proceed to Step 2
     YES → was this failure introduced by the default branch (not this PR)?
       YES (pre-existing on default branch) →
         auto-fixable? fix, commit, approve
@@ -59,7 +38,7 @@ IF required checks are NOT RUN or PENDING:
   → run the whole command CI runs, never a filtered subset of tests. A local FAIL counts as FAIL. A local PASS counts as PASS only when it is the full suite on the same OS as CI (read `runs-on` in the workflow): CI runs on Linux, and on macOS file watchers, paths and signals behave differently. If you cannot run that, do not approve, because a required check that never finished is not a pass
 ```
 
-Pending CI is never a terminal review state. Do not end your turn reporting that CI is still running or that you'll wait for a notification — the `--watch` command in this step already blocks in the foreground until CI settles or the timeout is hit. If it's still PENDING or NOT RUN after that, immediately run the local-checks fallback above and finish the review in this same turn.
+Pending CI is never a terminal review state. If the required checks are PENDING or NOT RUN, run the local-checks fallback above and finish the review in this same turn.
 
 **Definition of auto-fixable**: ONLY the following commands qualify as auto-fixable:
 - `cargo fmt` / `cargo clippy --fix`
@@ -69,9 +48,9 @@ Pending CI is never a terminal review state. Do not end your turn reporting that
 
 Anything requiring manual code changes — including logic fixes, API changes, test updates, or resolving clippy warnings that have no `--fix` — is **NOT auto-fixable** and must be treated as `request_changes` if it was introduced by this PR.
 
-**Self-fix procedure**: apply the fix, commit (`git add -A && git commit -m "style: run cargo fmt"`), re-run the check locally to confirm it passes, then approve.
+**Self-fix procedure**: apply the fix, commit (`git add -A && git commit -m "style: run cargo fmt"`), re-run the check locally to confirm it passes, then approve. orch pushes your commit, and CI runs on it before the merge.
 
-### Step 3: Check architecture alignment
+### Step 2: Check architecture alignment
 
 Before reviewing the diff, read any project spec, architecture or plan on `docs/` and `AGENTS.md`/`CLAUDE.md` if present.
 
@@ -80,7 +59,7 @@ Flag `request_changes` if the PR:
 - Reimplements something the plan says is already done or intentionally out of scope
 - Solves a problem that was deliberately designed to work a specific way
 
-### Step 4: Review the code
+### Step 3: Review the code
 
 1. **Requirements met** — does the code satisfy the task description?
 2. **Scope** — is it doing only what was asked? Reject unnecessary refactors or scope creep.
@@ -114,7 +93,7 @@ Flag `request_changes` if the PR:
 You MUST output the JSON block below even if you already ran this review earlier.
 Do NOT respond with prose summaries.
 Your turn must not end with a background task still running. If you started any background command, wait for it to finish before producing your final answer.
-Never end your turn with a CI-waiting status update. If CI is still PENDING or NOT RUN after the required `--watch` command completes, run the fallback local checks from Step 2 and output the JSON decision below using those results — in the same turn.
+Never end your turn with a CI-waiting status update. If CI is PENDING or NOT RUN, run the fallback local checks from Step 1 and output the JSON decision below using those results, in the same turn.
 
 ```json
 {
@@ -145,6 +124,6 @@ Never end your turn with a CI-waiting status update. If CI is still PENDING or N
 ```
 
 Decision rules:
-- **approve**: Required GitHub CI checks pass, branch is rebased, code meets requirements, no major issues
+- **approve**: Required GitHub CI checks pass, code meets requirements, no major issues
 - **request_changes**: Required GitHub CI checks fail on PR-related code, there are bugs, scope creep, or the code doesn't meet requirements
 - **Do NOT** request changes solely because non-required checks are failing

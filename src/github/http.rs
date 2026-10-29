@@ -2414,6 +2414,28 @@ impl GhHttp {
         parse_behind_by(&body)
     }
 
+    /// Parents, author and committer of a commit
+    pub async fn commit_meta(&self, repo: &str, sha: &str) -> anyhow::Result<CommitMeta> {
+        let url = format!("{GITHUB_API}/repos/{repo}/commits/{sha}");
+        let value: serde_json::Value = self.get_json(&url).await?;
+        Ok(parse_commit_meta(&value))
+    }
+
+    /// True when `branch` already contains the commit `sha`
+    pub async fn branch_contains(
+        &self,
+        repo: &str,
+        branch: &str,
+        sha: &str,
+    ) -> anyhow::Result<bool> {
+        let url = format!("{GITHUB_API}/repos/{repo}/compare/{branch}...{sha}");
+        let body: serde_json::Value = self.get_json(&url).await?;
+        body.get("ahead_by")
+            .and_then(|v| v.as_u64())
+            .map(|ahead| ahead == 0)
+            .ok_or_else(|| anyhow::anyhow!("compare response has no numeric ahead_by field"))
+    }
+
     /// Close a GitHub issue.
     pub async fn close_issue(&self, repo: &str, number: &str) -> anyhow::Result<()> {
         let url = format!("{GITHUB_API}/repos/{repo}/issues/{number}");
@@ -3313,6 +3335,37 @@ impl GhHttp {
 ///
 /// A missing field is an error, not zero: treating an unreadable response as
 /// "head is up to date" would let a stale PR merge
+/// A commit's parents, first parent first, and the GitHub accounts behind it
+#[derive(Debug, Default, PartialEq)]
+pub struct CommitMeta {
+    pub parents: Vec<String>,
+    pub author_login: Option<String>,
+    pub committer_login: Option<String>,
+}
+
+fn parse_commit_meta(commit: &serde_json::Value) -> CommitMeta {
+    let login = |field: &str| {
+        commit
+            .pointer(&format!("/{field}/login"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    };
+    CommitMeta {
+        parents: commit
+            .get("parents")
+            .and_then(|p| p.as_array())
+            .map(|parents| {
+                parents
+                    .iter()
+                    .filter_map(|p| p.get("sha").and_then(|s| s.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        author_login: login("author"),
+        committer_login: login("committer"),
+    }
+}
+
 fn parse_behind_by(body: &serde_json::Value) -> anyhow::Result<u64> {
     body.get("behind_by")
         .and_then(|v| v.as_u64())
@@ -3885,6 +3938,23 @@ mod tests {
                     integration_id: Some(42),
                 }
             ]
+        );
+    }
+
+    #[test]
+    fn parse_commit_meta_reads_parents_in_order_and_logins() {
+        let merge = serde_json::json!({
+            "parents": [{"sha": "approved"}, {"sha": "base"}],
+            "author": {"login": "owner"},
+            "committer": {"login": "web-flow"},
+        });
+        let meta = parse_commit_meta(&merge);
+        assert_eq!(meta.parents, vec!["approved", "base"]);
+        assert_eq!(meta.author_login.as_deref(), Some("owner"));
+        assert_eq!(meta.committer_login.as_deref(), Some("web-flow"));
+        assert_eq!(
+            parse_commit_meta(&serde_json::json!({})),
+            CommitMeta::default()
         );
     }
 
