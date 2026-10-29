@@ -239,7 +239,26 @@ impl TaskStore {
         &self,
         cmd: crate::cluster::Command,
     ) -> anyhow::Result<crate::cluster::Reply> {
-        let mut tx = self.pool.begin().await?;
+        let mut attempt = 0;
+        loop {
+            match self.apply_once(cmd.clone()).await {
+                // A dropped transaction rolls back, so running the command again is safe
+                Err(e) if attempt < WRITE_LOCK_RETRIES && is_write_lock_error(&e) => {
+                    attempt += 1;
+                    tracing::warn!(attempt, err = %e, "database is locked, retrying the write");
+                    tokio::time::sleep(std::time::Duration::from_millis(100 << (attempt - 1)))
+                        .await;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn apply_once(
+        &self,
+        cmd: crate::cluster::Command,
+    ) -> anyhow::Result<crate::cluster::Reply> {
+        let mut tx = self.begin_write().await?;
         let reply = cmd
             .apply(&mut tx, &crate::cluster::now_stamp(), false)
             .await?;
@@ -247,11 +266,36 @@ impl TaskStore {
         Ok(reply)
     }
 
+    /// Start a transaction that holds the write lock from its first statement.
+    ///
+    /// A deferred `BEGIN` that reads and then writes fails at once with `database is locked` when
+    /// another connection commits in between, and `busy_timeout` cannot wait that out. `BEGIN
+    /// IMMEDIATE` waits for the lock up front, where `busy_timeout` applies
+    pub(crate) async fn begin_write(
+        &self,
+    ) -> sqlx::Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+        self.pool.begin_with("BEGIN IMMEDIATE").await
+    }
+
     /// Get a reference to the underlying pool (for advanced queries).
     #[allow(dead_code)]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+}
+
+/// Retries for a write that still finds the database locked after `busy_timeout`
+const WRITE_LOCK_RETRIES: u32 = 4;
+
+/// `SQLITE_BUSY` (5) or `SQLITE_BUSY_SNAPSHOT` (517) anywhere in the error chain
+fn is_write_lock_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<sqlx::Error>()
+            .and_then(|e| e.as_database_error())
+            .and_then(|e| e.code())
+            .is_some_and(|code| code == "5" || code == "517")
+    })
 }
 
 fn reply_result(reply: crate::cluster::Reply) -> anyhow::Result<crate::cluster::Reply> {

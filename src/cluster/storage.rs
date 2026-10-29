@@ -295,7 +295,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
         &mut self,
         entries: &[Entry<TypeConfig>],
     ) -> Result<Vec<Reply>, Err> {
-        let mut tx = self.store.pool().begin().await.map_err(io)?;
+        let mut tx = self.store.begin_write().await.map_err(io)?;
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
             let reply = match &e.payload {
@@ -343,7 +343,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
     ) -> Result<(), Err> {
         let data = snapshot.into_inner();
         let snap: SnapshotData = serde_json::from_slice(&data).map_err(io)?;
-        let mut tx = self.store.pool().begin().await.map_err(io)?;
+        let mut tx = self.store.begin_write().await.map_err(io)?;
         tasks::replace_replicated(&mut tx, &snap.tasks)
             .await
             .map_err(io_any)?;

@@ -899,7 +899,7 @@ impl TaskStore {
             updates.retain(|(col, _)| !is_local_column(col));
 
             if !local.is_empty() {
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.begin_write().await?;
                 apply::set_fields(&mut tx, &crate::cluster::now_stamp(), id, &local, true).await?;
                 tx.commit().await?;
             }
@@ -1272,7 +1272,7 @@ impl TaskStore {
         let all = owned_updates(updates)?;
         // On one machine nothing is replicated, so the whole update stays one statement
         if !self.replicates() {
-            let mut tx = self.pool.begin().await?;
+            let mut tx = self.begin_write().await?;
             apply::set_fields(&mut tx, &crate::cluster::now_stamp(), id, &all, silent).await?;
             tx.commit().await?;
             return Ok(());
@@ -1281,7 +1281,7 @@ impl TaskStore {
         let (local, replicated): (Vec<_>, Vec<_>) =
             all.into_iter().partition(|(col, _)| is_local_column(col));
         if !local.is_empty() {
-            let mut tx = self.pool.begin().await?;
+            let mut tx = self.begin_write().await?;
             apply::set_fields(&mut tx, &crate::cluster::now_stamp(), id, &local, silent).await?;
             tx.commit().await?;
         }
@@ -1528,7 +1528,7 @@ impl TaskStore {
             }
         }
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         for (id, entry_updates) in updates {
             if entry_updates.is_empty() {
                 continue;
@@ -1569,7 +1569,7 @@ impl TaskStore {
             );
         }
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         for (id, field) in entries {
             let sql = format!(
                 "UPDATE tasks SET {field} = {field} + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?"
@@ -1595,7 +1595,7 @@ impl TaskStore {
         // IN-list into smaller batches to avoid exceeding the limit.
         const CHUNK_SIZE: usize = 500;
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
 
         for chunk in ids.chunks(CHUNK_SIZE) {
             // Build WHERE id IN (?, ?, ...) placeholders for this chunk
@@ -1641,7 +1641,7 @@ impl TaskStore {
         // Chunk updates to avoid exceeding SQLite's parameter limit.
         const CHUNK_SIZE: usize = 500;
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
 
         for chunk in ids.chunks(CHUNK_SIZE) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
