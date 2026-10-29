@@ -151,7 +151,7 @@ orch plan import docs/ROADMAP.md --milestone M4 --skip-unmet
 
 `orch plan import` reads a roadmap file and creates one GitHub issue per task. The title is the task id and the task title. The body holds the goal, scope and acceptance, a link to the heading on the default branch, and a hidden marker (`<!-- orch-plan: M1-03 -->`). A later import edits an issue only when the title, body or labels changed.
 
-A milestone starts at `## M1. Milestone title`. A task starts at `### M1-03 Task title`. A later milestone can be a table whose header has Task and Depends on columns.
+A milestone starts at `## M1. Milestone title`. A task starts at `### M1-03 Task title`. A later milestone can be a table whose header has Task and Depends on. The parser also reads Goal, Scope, Acceptance and Owner. A column outside that list is an error that names the column and the line. Write the Task cell as `M1-03 Task title`. A task with no title is an error that names the id and the line.
 
 `Depends on: M1-02, M1-05` is stored as GitHub blocked-by links. `Depends on: none` stores no link. An import drops a blocked-by link that the file no longer declares, and keeps a link to an issue outside the plan. An open blocked-by link holds the dependent task as waiting. `Owner: human` adds the `owner:human` and `no-agent` labels, so orch skips that issue. A task that leaves the file is listed and left open.
 
