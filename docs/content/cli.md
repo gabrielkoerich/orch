@@ -22,7 +22,7 @@ Visible top-level commands: `log`, `commit`, `stream`, `notify`, `chat`, `task`,
 
 ## Task Commands
 
-Task commands that take an id accept a bare number, `owner/repo#N`, or `internal:N`. Inside a project directory a bare number is that project's GitHub issue. If the same number matches more than one task and you are not in a project directory, the command lists the matches and stops.
+Task commands that take an id accept a bare number, `owner/repo#N`, `repo#N`, `internal:N`, or `internal-N`. Inside a project directory a bare number is that project's GitHub issue. If the same number matches more than one task and you are not in a project directory, the command names both forms and stops.
 
 ```bash
 orch task add "title" -b "body" -l label1 -l label2   # create a task

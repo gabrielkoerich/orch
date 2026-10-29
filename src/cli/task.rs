@@ -1268,16 +1268,17 @@ pub async fn close(id: &str, note: Option<&str>) -> anyhow::Result<()> {
 }
 
 /// Attach to a running agent's tmux session.
-pub fn attach(id: &str) -> anyhow::Result<()> {
+pub async fn attach(id: &str) -> anyhow::Result<()> {
+    let store = crate::cli::init_store().await?;
+    let task = crate::cli::task_ref::resolve(&store, id).await?;
     let tmux = TmuxManager::new();
-    let repo = crate::config::get_current_repo().unwrap_or_default();
-    let session = tmux.session_name(&repo, id);
+    let session = tmux.session_name(&task.repo, &task.external_id);
     let status = std::process::Command::new("tmux")
         .args(["attach-session", "-t", &session])
         .status_with_context()?;
 
     if !status.success() {
-        anyhow::bail!("no active session for task {}", id);
+        anyhow::bail!("no active session for task {}", task.display_spec());
     }
     Ok(())
 }
@@ -1327,22 +1328,17 @@ pub async fn live() -> anyhow::Result<()> {
 
 /// Kill a running agent tmux session.
 pub async fn kill(id: &str) -> anyhow::Result<()> {
+    let store = crate::cli::init_store().await?;
+    let task = crate::cli::task_ref::resolve(&store, id).await?;
     let tmux = TmuxManager::new();
-    let repo = crate::config::get_current_repo().unwrap_or_default();
-    let session = tmux.session_name(&repo, id);
-    let killed = tmux.kill_session(&session).await;
-
-    // Close the open run now so a following retry does not wait for silence detection
-    let store = crate::cli::init_store().await.ok().map(Arc::new);
-    if let Some(s) = &store {
-        if let Ok(Some(store_id)) = s.resolve_task_id(&repo, id).await {
-            s.finalize_incomplete_runs(store_id, "killed", "killed by orch task kill")
-                .await?;
-        }
+    let session = tmux.session_name(&task.repo, &task.external_id);
+    if let Some(store_id) = task.store_id {
+        store
+            .finalize_incomplete_runs(store_id, "killed", "killed by orch task kill")
+            .await?;
     }
-
-    killed?;
-    println!("Killed session for task #{}", id);
+    tmux.kill_session(&session).await?;
+    println!("Killed session for task {}", task.display_spec());
     Ok(())
 }
 

@@ -336,6 +336,33 @@ mod tests {
     }
 
     #[test]
+    fn in_progress_without_output_names_the_path() {
+        let watched = Watched {
+            id: "owner/repo#5".to_string(),
+            status: crate::store::TaskStatus::InProgress.as_str().to_string(),
+            dirs: vec![
+                PathBuf::from("/state/owner/repo/tasks/5-review"),
+                PathBuf::from("/state/owner/repo/tasks/5"),
+            ],
+        };
+        let msg = watched.nothing_yet();
+        assert!(msg.contains("in_progress"), "{msg}");
+        assert!(msg.contains("/state/owner/repo/tasks/5/attempts"), "{msg}");
+        assert!(
+            msg.contains("/state/owner/repo/tasks/5-review/attempts"),
+            "{msg}"
+        );
+
+        let waiting = Watched {
+            status: crate::store::TaskStatus::Routed.as_str().to_string(),
+            ..watched
+        };
+        let msg = waiting.nothing_yet();
+        assert!(msg.contains("waiting for it to start"), "{msg}");
+        assert!(!msg.contains("no output file was found"), "{msg}");
+    }
+
+    #[test]
     fn newest_output_picks_the_latest_attempt() {
         let dir = tempfile::tempdir().unwrap();
         let task = dir.path().join("tasks").join("5");

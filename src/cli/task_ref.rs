@@ -24,7 +24,7 @@ pub async fn resolve_in(
     id: &str,
     current_repo: Option<&str>,
 ) -> anyhow::Result<CliTaskRef> {
-    let spec = normalize(id);
+    let spec = expand_repo(store, &normalize(id), current_repo).await?;
     if let Some(task) = store.resolve_cli_id(&spec, current_repo).await? {
         return Ok(task);
     }
@@ -61,6 +61,43 @@ fn dirs_under(state: &Path, task: &CliTaskRef) -> (PathBuf, PathBuf) {
         .join("tasks");
     let name = &task.external_id;
     (tasks.join(format!("{name}-review")), tasks.join(name))
+}
+
+/// `repo#N` names a project without its owner. Expand it against the current project, then the
+/// repos the store knows, so the short form works wherever `owner/repo#N` does
+async fn expand_repo(
+    store: &TaskStore,
+    spec: &str,
+    current_repo: Option<&str>,
+) -> anyhow::Result<String> {
+    let Some((name, number)) = spec.rsplit_once('#') else {
+        return Ok(spec.to_string());
+    };
+    if name.is_empty() || name.contains('/') || number.parse::<i64>().is_err() {
+        return Ok(spec.to_string());
+    }
+
+    if let Some(repo) = current_repo {
+        if repo.rsplit_once('/').is_some_and(|(_, n)| n == name) {
+            return Ok(format!("{repo}#{number}"));
+        }
+    }
+
+    let owners: Vec<String> = store
+        .distinct_repos()
+        .await?
+        .into_iter()
+        .filter(|repo| repo.rsplit_once('/').is_some_and(|(_, n)| n == name))
+        .collect();
+    match owners.as_slice() {
+        [repo] => Ok(format!("{repo}#{number}")),
+        // Unknown name: leave it for `parse_cli_task_spec` to reject with the forms it accepts
+        [] => Ok(spec.to_string()),
+        many => anyhow::bail!(
+            "repo '{name}' matches {}, use owner/repo#{number} to pick one",
+            many.join(" and ")
+        ),
+    }
 }
 
 /// Session names cannot hold a `:`, so `internal-8` names the same task as `internal:8`
@@ -107,6 +144,7 @@ mod tests {
         let (store, internal) = store_with_tasks().await;
         let forms = [
             ("owner/repo#5", Some("owner/other")),
+            ("repo#5", Some("owner/other")),
             ("5", Some("owner/repo")),
             ("#5", Some("owner/repo")),
         ];
@@ -150,8 +188,11 @@ mod tests {
 
         // Outside a project the clash names both forms
         let err = resolve_in(&store, "5", None).await.unwrap_err().to_string();
-        assert!(err.contains("owner/repo#N"), "{err}");
-        assert!(err.contains("internal:N"), "{err}");
+        assert!(
+            err.contains("Use owner/repo#5 for the GitHub task"),
+            "{err}"
+        );
+        assert!(err.contains("or internal:5 for the internal one"), "{err}");
     }
 
     #[tokio::test]
@@ -175,6 +216,41 @@ mod tests {
             dirs_under(state, &task).1,
             PathBuf::from(format!("/state/owner/other/tasks/internal:{internal}"))
         );
+    }
+
+    #[tokio::test]
+    async fn bare_repo_name_needs_an_owner_only_when_two_owners_share_it() {
+        let (store, _) = store_with_tasks().await;
+        for repo in ["other/repo", "owner/repo"] {
+            store
+                .create(&NewTask {
+                    external_id: Some("9".to_string()),
+                    repo: repo.to_string(),
+                    origin: "github".to_string(),
+                    title: "Task 9".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+
+        let err = resolve_in(&store, "repo#9", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("owner/repo#9"), "{err}");
+
+        let task = resolve_in(&store, "repo#9", Some("owner/repo"))
+            .await
+            .unwrap();
+        assert_eq!(task.display_spec(), "owner/repo#9");
+
+        // A repo name no project uses is reported as an invalid id, not as a clash
+        let err = resolve_in(&store, "nosuch#9", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid task id"), "{err}");
     }
 
     #[tokio::test]
