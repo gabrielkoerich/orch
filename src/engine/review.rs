@@ -981,7 +981,7 @@ async fn invoke_review_agent(
         tokio::select! {
             result = tmux.wait_for_completion(&session, poll_interval) => result,
             // An agent can write its decision and still hold the session open
-            () = wait_for_review_decision(ctx, repo, poll_interval) => {
+            () = wait_for_review_decision(ctx, poll_interval) => {
                 tracing::info!(task_id = task.id.0, "review decision is in while the session is still open, ending it");
                 Ok(String::new())
             }
@@ -1055,7 +1055,7 @@ async fn invoke_review_agent(
         }
         Err(_) => {
             let _ = tmux.kill_session(&session).await;
-            if review_output_has_decision(ctx, repo).await {
+            if review_output_has_decision(ctx).await {
                 tracing::warn!(
                     task_id = task.id.0,
                     "review agent timed out after writing its decision, using it"
@@ -1083,9 +1083,12 @@ async fn invoke_review_agent(
     }
 }
 
-/// The decision is in when the agent's final result parses as a review, whatever the session does
-async fn review_output_has_decision(ctx: &ReviewContext, repo: &str) -> bool {
-    let raw = runner::response::read_output_file(&ctx.review_task_id, &ctx.output_file, repo).await;
+/// The decision is in when this attempt's final result parses as a review, whatever the session
+/// does. Only this attempt's file counts, an older attempt may have reviewed another commit
+async fn review_output_has_decision(ctx: &ReviewContext) -> bool {
+    let raw = tokio::fs::read_to_string(&ctx.output_file)
+        .await
+        .unwrap_or_default();
     output_has_review_decision(&ctx.review_agent, &raw)
 }
 
@@ -1096,14 +1099,10 @@ fn output_has_review_decision(agent: &str, raw: &str) -> bool {
         .is_some_and(|result| runner::response::parse_review_response(&result.result_text).is_ok())
 }
 
-async fn wait_for_review_decision(
-    ctx: &ReviewContext,
-    repo: &str,
-    poll_interval: std::time::Duration,
-) {
+async fn wait_for_review_decision(ctx: &ReviewContext, poll_interval: std::time::Duration) {
     loop {
         tokio::time::sleep(poll_interval).await;
-        if review_output_has_decision(ctx, repo).await {
+        if review_output_has_decision(ctx).await {
             return;
         }
     }
