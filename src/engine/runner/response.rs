@@ -696,22 +696,15 @@ fn infer_review_response_from_text(text: &str) -> Option<ReviewResponse> {
         });
     }
 
-    let positive_approval = lower.contains("lgtm")
-        || lower.contains("looks good")
-        || lower.contains("all checks passed")
-        || lower.contains("all tests passed")
-        || lower.contains("no issues found")
-        // "decision is `approve`" or "decision: `approve`" — LLMs often echo the JSON field value
+    // Approval only from an explicit decision token. "approved" and CI-evidence
+    // phrases ("all checks passed") are not a decision, a negation list cannot cover them
+    let positive_approval = lower
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .any(|word| word == "lgtm")
         || lower.contains("decision is `approve`")
         || lower.contains("decision: `approve`")
         || lower.contains("decision is approve")
-        || lower.contains("decision: approve")
-        || (lower.contains("approved")
-            && !lower.contains("not approved")
-            && !lower.contains("unapproved")
-            && !lower.contains("not approving")
-            && !lower.contains("cannot approve")
-            && !lower.contains("can't approve"));
+        || lower.contains("decision: approve");
     if positive_approval {
         return Some(ReviewResponse {
             decision: "approve".to_string(),
@@ -1281,7 +1274,7 @@ That's all."#;
     #[serial(cooldown_state)]
     #[test]
     fn parse_review_from_output_plain_text_fallback() {
-        let text = "The review is done — all tests passed and the PR was approved.";
+        let text = "The review is done. LGTM.";
         let resp = parse_review_plain(text).unwrap();
         assert_eq!(resp.decision, "approve");
         assert!(resp.issues.is_empty());
@@ -1447,6 +1440,52 @@ That's all."#;
         );
     }
 
+    #[serial(cooldown_state)]
+    #[test]
+    fn infer_review_response_negation_cannot_be_approved() {
+        assert!(
+            parse_review_plain("This PR cannot be approved until the race in tick.rs is fixed.")
+                .is_err(),
+            "\"cannot be approved\" should not infer approval"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn infer_review_response_negation_should_not_be_approved() {
+        assert!(
+            parse_review_plain("The diff breaks the build and should not be approved.").is_err(),
+            "\"should not be approved\" should not infer approval"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn infer_review_response_negation_not_yet_approved() {
+        assert!(
+            parse_review_plain("This change is not yet approved.").is_err(),
+            "\"not yet approved\" should not infer approval"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn infer_review_response_negation_wont_approve() {
+        assert!(
+            parse_review_plain("I won't approve this until tests cover the retry path.").is_err(),
+            "\"won't approve\" should not infer approval"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn infer_review_response_bare_approved() {
+        assert!(
+            parse_review_plain("The PR was approved.").is_err(),
+            "bare \"approved\" should not infer approval"
+        );
+    }
+
     /// Positive plain-text approval signals must still work.
     #[serial(cooldown_state)]
     #[test]
@@ -1455,44 +1494,53 @@ That's all."#;
         assert_eq!(resp.decision, "approve");
     }
 
+    /// Evidence phrases are not a decision token
     #[serial(cooldown_state)]
     #[test]
     fn infer_review_response_looks_good() {
-        let resp = parse_review_plain("Looks good to me!").unwrap();
-        assert_eq!(resp.decision, "approve");
+        assert!(
+            parse_review_plain("Looks good to me!").is_err(),
+            "\"looks good\" should not infer approval"
+        );
     }
 
-    /// "All checks passed" should infer approval (real failure observed in task 16393).
     #[serial(cooldown_state)]
     #[test]
     fn infer_review_response_all_checks_passed() {
-        let resp = parse_review_plain(
-            "The background task completed but I already got the CI results directly. All checks passed — no action needed.",
-        )
-        .unwrap();
-        assert_eq!(resp.decision, "approve");
+        assert!(
+            parse_review_plain(
+                "The background task completed but I already got the CI results directly. All checks passed — no action needed.",
+            )
+            .is_err(),
+            "\"all checks passed\" should not infer approval"
+        );
     }
 
     #[serial(cooldown_state)]
     #[test]
     fn infer_review_response_checks_passed() {
-        let resp = parse_review_plain("All checks passed (fmt ✓, clippy ✓, tests ✓).").unwrap();
-        assert_eq!(resp.decision, "approve");
+        assert!(
+            parse_review_plain("All checks passed (fmt ✓, clippy ✓, tests ✓).").is_err(),
+            "\"all checks passed\" should not infer approval"
+        );
     }
 
     #[serial(cooldown_state)]
     #[test]
     fn infer_review_response_all_tests_passed() {
-        let resp =
-            parse_review_plain("All tests passed and the implementation looks correct.").unwrap();
-        assert_eq!(resp.decision, "approve");
+        assert!(
+            parse_review_plain("All tests passed and the implementation looks correct.").is_err(),
+            "\"all tests passed\" should not infer approval"
+        );
     }
 
     #[serial(cooldown_state)]
     #[test]
     fn infer_review_response_no_issues_found() {
-        let resp = parse_review_plain("Review complete. No issues found in the diff.").unwrap();
-        assert_eq!(resp.decision, "approve");
+        assert!(
+            parse_review_plain("Review complete. No issues found in the diff.").is_err(),
+            "\"no issues found\" should not infer approval"
+        );
     }
 
     /// Partial "tests passed" mid-sentence must NOT infer approval without "all" prefix.
