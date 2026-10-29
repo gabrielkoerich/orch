@@ -70,6 +70,11 @@ const LEAK_PATTERN_SPECS: &[LeakPatternSpec] = &[
         pattern: r"\d{8,10}:[A-Za-z0-9_-]{35}",
         high_confidence: false,
     },
+    LeakPatternSpec {
+        rule: "jwt",
+        pattern: r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+        high_confidence: true,
+    },
     // Private keys
     LeakPatternSpec {
         rule: "private_key",

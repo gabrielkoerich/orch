@@ -473,7 +473,7 @@ pub async fn board_reconcile(repo: Option<&str>) -> anyhow::Result<()> {
         None => config::get_current_repo()?,
     };
     let config = crate::github::projects::label_status::LabelSyncConfig::from_config()?;
-    let gh = crate::github::http::GhHttp::new()?;
+    let gh = crate::github::http::GhHttp::owner()?;
     let updated = board_reconcile_with(&config, &gh, &repo).await?;
     println!("Updated {updated} project Status field(s) in this pass; skipped items are reported at debug level.");
     Ok(())

@@ -1,5 +1,5 @@
 # Orch Review Gate - installed by `orch init`
-# Checks PR issue comments for automated review decisions.
+# Checks the orch App's review on the head commit, then PR issue comments for automated review decisions.
 # "Automated Review - Approve" -> pass, "Automated Review - Changes Requested" -> fail.
 name: Orch Review Gate
 
@@ -55,6 +55,9 @@ jobs:
       - name: Check automated review status
         env:
           GH_TOKEN: ${{ github.token }}
+          # App login, e.g. `my-app[bot]`. Unset keeps the comment gate
+          ORCH_REVIEW_APP: ${{ vars.ORCH_REVIEW_APP }}
+          HEAD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
@@ -70,6 +73,20 @@ jobs:
           fi
 
           echo "Checking review status for PR #${PR_NUMBER} (branch: $BRANCH)"
+
+          # The App's latest review on this commit is the decision, a review on an older sha does not count
+          if [ -n "${ORCH_REVIEW_APP:-}" ]; then
+            APP_STATE=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews" --paginate \
+              | jq -rs --arg login "$ORCH_REVIEW_APP" --arg sha "$HEAD_SHA" \
+                '[add[] | select(.user.login == $login and .commit_id == $sha and (.state == "APPROVED" or .state == "CHANGES_REQUESTED"))] | sort_by(.submitted_at) | last | .state // empty')
+            if [ "$APP_STATE" = "APPROVED" ]; then
+              echo "App review on ${HEAD_SHA}: approved"
+              exit 0
+            elif [ "$APP_STATE" = "CHANGES_REQUESTED" ]; then
+              echo "App review on ${HEAD_SHA}: changes requested"
+              exit 1
+            fi
+          fi
 
           # Get the latest "Automated Review" comment body
           LATEST_BODY=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \

@@ -1963,9 +1963,16 @@ async fn post_review_comment(
         let footer =
             attribution_footer("Reviewed", &ctx.review_agent, Some(ctx.review_model_str()));
         let pr_comment_with_footer = format!("{}{}", pr_comment, footer);
-        if let Err(e) = gh
-            .add_comment(repo, &ctx.pr_number.to_string(), &pr_comment_with_footer)
-            .await
+        if let Err(e) = publish_review(
+            crate::github::app::shared().as_deref(),
+            &gh,
+            repo,
+            ctx.pr_number,
+            ctx.head_sha.as_deref(),
+            decision,
+            &pr_comment_with_footer,
+        )
+        .await
         {
             tracing::warn!(
                 task_id = task.id.0,
@@ -1977,6 +1984,34 @@ async fn post_review_comment(
     }
 
     Ok(())
+}
+
+/// Submit the decision as an App review on the sha the agent read, then post the comment the
+/// gate falls back to. Without an App only the comment goes out
+async fn publish_review(
+    app: Option<&crate::github::app::AppAuth>,
+    gh: &GhHttp,
+    repo: &str,
+    pr_number: u64,
+    head_sha: Option<&str>,
+    decision: &ReviewDecision,
+    comment: &str,
+) -> anyhow::Result<()> {
+    use crate::github::app::ReviewEvent;
+    let event = match decision {
+        ReviewDecision::Approve => Some(ReviewEvent::Approve),
+        ReviewDecision::RequestChanges { .. } => Some(ReviewEvent::RequestChanges),
+        _ => None,
+    };
+    if let (Some(app), Some(sha), Some(event)) = (app, head_sha, event) {
+        if let Err(e) = app
+            .submit_review(repo, pr_number, event, comment, sha)
+            .await
+        {
+            tracing::warn!(pr_number, sha, error = %e, "failed to submit App review, the comment stays the decision");
+        }
+    }
+    gh.add_comment(repo, &pr_number.to_string(), comment).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4264,5 +4299,95 @@ mod tests {
              intervening success (issue #3571); got {remaining}s, base is {}s",
             crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS
         );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn without_an_app_the_review_path_posts_only_the_comment() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let _env = crate::github::token::ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("GH_TOKEN");
+        std::env::set_var("GH_TOKEN", "owner-token");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/issues/9/comments"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 1})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let gh = GhHttp::for_test(server.uri(), None);
+        let result = publish_review(
+            None,
+            &gh,
+            "o/r",
+            9,
+            Some("abc123"),
+            &ReviewDecision::Approve,
+            "## Automated Review \u{2014} Approve\n\nok",
+        )
+        .await;
+        match prev {
+            Some(value) => std::env::set_var("GH_TOKEN", value),
+            None => std::env::remove_var("GH_TOKEN"),
+        }
+        result.expect("comment posted");
+        let requests = server.received_requests().await.expect("requests");
+        assert!(requests
+            .iter()
+            .all(|req| !req.url.path().contains("/reviews")));
+    }
+
+    #[tokio::test]
+    async fn with_an_app_the_review_is_submitted_on_the_reviewed_sha() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/app/installations/42/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "inst-1",
+                "expires_at": "2099-01-01T00:00:00Z",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/pulls/9/reviews"))
+            .and(body_partial_json(serde_json::json!({
+                "event": "REQUEST_CHANGES",
+                "commit_id": "abc123",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 1})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/issues/9/comments"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 2})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let app = Arc::new(crate::github::app::AppAuth::new(
+            "12345".to_string(),
+            Some(42),
+            crate::github::app::test_pem().to_string(),
+            server.uri(),
+        ));
+        let gh = GhHttp::for_test(server.uri(), Some(Arc::clone(&app)));
+        let decision = ReviewDecision::RequestChanges {
+            notes: "fix it".to_string(),
+            issues: vec![],
+        };
+        publish_review(
+            Some(&app),
+            &gh,
+            "o/r",
+            9,
+            Some("abc123"),
+            &decision,
+            "## Automated Review \u{2014} Changes Requested\n\nfix it",
+        )
+        .await
+        .expect("comment posted");
     }
 }

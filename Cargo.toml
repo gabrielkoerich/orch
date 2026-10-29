@@ -108,6 +108,7 @@ dashmap = "6"
 scopeguard = "1"
 openraft = { version = "0.9.25", features = ["serde"] }
 sandbox-jail = "0.4"
+jsonwebtoken = "9"
 
 [dev-dependencies]
 tempfile = "3"
@@ -115,6 +116,8 @@ tokio-test = "0.4"
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"
 serial_test = "3"
+rand = "0.8"
+rsa = "0.9"
 
 [profile.release]
 opt-level = 3

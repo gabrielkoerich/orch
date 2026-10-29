@@ -54,7 +54,7 @@ pub(crate) fn is_full_commit_sha(sha: &str) -> bool {
 }
 
 // Shared gate for every GitHub-posted body so a new call site cannot skip the scan
-fn redact_posted_body(body: &str) -> String {
+pub(crate) fn redact_posted_body(body: &str) -> String {
     if !crate::security::has_leaks(body) {
         return body.to_string();
     }
@@ -428,6 +428,8 @@ fn record_response_for_limiter(cell: &Mutex<RateLimit>, resp: &Response) {
 pub struct GhHttp {
     client: Client,
     token_resolver: Arc<token::TokenResolver>,
+    // orch's own calls go through the App installation token when the App is configured
+    app: Option<Arc<super::app::AppAuth>>,
     cached_username: OnceLock<String>,
     #[cfg(test)]
     api_base: Option<String>,
@@ -452,10 +454,30 @@ impl GhHttp {
         Ok(Self {
             client,
             token_resolver: token::shared(),
+            app: super::app::shared(),
             cached_username: OnceLock::new(),
             #[cfg(test)]
             api_base: None,
         })
+    }
+
+    /// A client that always uses the owner token, for calls the App cannot make, such as
+    /// `GET /user` and Projects V2 on a personal account
+    pub fn owner() -> anyhow::Result<Self> {
+        let mut gh = Self::new()?;
+        gh.app = None;
+        Ok(gh)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(api_base: String, app: Option<Arc<super::app::AppAuth>>) -> Self {
+        Self {
+            client: Client::new(),
+            token_resolver: Arc::new(token::TokenResolver::default_env()),
+            app,
+            cached_username: OnceLock::new(),
+            api_base: Some(api_base),
+        }
     }
 
     #[cfg_attr(not(test), allow(clippy::unused_self))]
@@ -514,6 +536,14 @@ impl GhHttp {
     // ── Low-level HTTP helpers ────────────────────────────────────
 
     async fn auth_header(&self) -> anyhow::Result<String> {
+        if let Some(app) = &self.app {
+            match app.installation_token().await {
+                Ok(token) => return Ok(format!("Bearer {token}")),
+                Err(e) => {
+                    tracing::warn!(error = %e, "GitHub App token unavailable, using the owner token");
+                }
+            }
+        }
         match self.token_resolver.get_token().await? {
             Some(token) if !token.is_empty() => Ok(format!("Bearer {token}")),
             _ => anyhow::bail!("No GitHub token available — run `gh auth login` or set GH_TOKEN"),
@@ -591,6 +621,9 @@ impl GhHttp {
                                 "GitHub API 401 Bad credentials — clearing cached token and re-resolving"
                             );
                             self.token_resolver.clear_cache().await;
+                            if let Some(app) = &self.app {
+                                app.invalidate();
+                            }
                             match self.auth_header().await {
                                 Ok(new_auth) => {
                                     auth_retried = true;
@@ -1881,7 +1914,10 @@ impl GhHttp {
             return Ok(cached.clone());
         }
 
-        let user: serde_json::Value = self.get_json(&format!("{GITHUB_API}/user")).await?;
+        // An installation token cannot read `GET /user`, and the owner is the identity mentions name
+        let mut owner = self.clone();
+        owner.app = None;
+        let user: serde_json::Value = owner.get_json(&format!("{GITHUB_API}/user")).await?;
         let username = user
             .get("login")
             .and_then(|v| v.as_str())
@@ -3118,6 +3154,11 @@ impl GhHttp {
                 n,
                 PrReviewBatchData {
                     merged,
+                    head_sha: pr_data
+                        .get("headRefOid")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
                     mergeable,
                     reviews,
                     review_comments,
@@ -3185,13 +3226,18 @@ impl GhHttp {
     ) -> anyhow::Result<Option<String>> {
         let comments = self.list_comments(repo, &pr_number.to_string()).await?;
 
-        // Find the most recent automated review comment authored by a collaborator.
+        // Find the most recent automated review comment authored by a collaborator or the App
+        let app_login = super::app::bot_login().await;
         let mut newest: Option<&crate::github::types::GitHubComment> = None;
         for c in &comments {
             if !c.body.starts_with("## Automated Review") {
                 continue;
             }
-            match self.is_collaborator(repo, &c.user.login).await {
+            let trusted = match app_login.as_deref() {
+                Some(app) if super::app::same_login(&c.user.login, app) => Ok(true),
+                _ => self.is_collaborator(repo, &c.user.login).await,
+            };
+            match trusted {
                 Ok(true) => match newest {
                     None => newest = Some(c),
                     Some(prev) => {
@@ -3428,6 +3474,8 @@ pub fn status_label_color(label: &str) -> &'static str {
 pub struct PrReviewBatchData {
     /// True when the pull request was merged.
     pub merged: bool,
+    /// Head commit of the pull request, empty when GitHub did not return it.
+    pub head_sha: String,
     /// `Some(true)` = MERGEABLE, `Some(false)` = CONFLICTING, `None` = UNKNOWN.
     pub mergeable: Option<bool>,
     /// All reviews submitted on the PR.
@@ -3445,6 +3493,7 @@ fn build_pr_review_alias(n: u64) -> String {
         r#"pr{n}: pullRequest(number: {n}) {{
   merged
   mergeable
+  headRefOid
   reviews(first: 50) {{
     nodes {{
       databaseId
@@ -3838,6 +3887,7 @@ mod tests {
         GhHttp {
             client: reqwest::Client::new(),
             token_resolver: Arc::new(crate::github::token::TokenResolver::default_env()),
+            app: None,
             cached_username: OnceLock::new(),
             api_base: None,
         }
@@ -4434,6 +4484,7 @@ mod tests {
             let client = GhHttp {
                 client: reqwest::Client::new(),
                 token_resolver: Arc::new(crate::github::token::TokenResolver::default_env()),
+                app: None,
                 cached_username: OnceLock::new(),
                 api_base: None,
             };

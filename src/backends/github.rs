@@ -792,8 +792,11 @@ impl ExternalBackend for GitHubBackend {
             Err(err) => return Err(err),
         };
         let default_branch = self.gh.get_default_branch(repo).await.unwrap_or_default();
+        let app_login = crate::github::app::bot_login().await;
         let reviews = match self.gh.get_pr_reviews(repo, pr_number as u64).await {
-            Ok(reviews) => reviews,
+            Ok(reviews) => {
+                crate::github::app::reviews_for_gate(&reviews, &pr.head.sha, app_login.as_deref())
+            }
             Err(err) => {
                 tracing::warn!(repo, pr_number, err = %err, "pull request reviews unreadable");
                 Vec::new()
@@ -822,8 +825,9 @@ impl ExternalBackend for GitHubBackend {
             })
             .collect();
         let comment_approved = reviewer
-            .as_deref()
-            .is_some_and(|login| latest_automated_review_approves(&comment_refs, login));
+            .iter()
+            .chain(app_login.iter())
+            .any(|login| latest_automated_review_approves(&comment_refs, login));
         let merged = pr.merged.unwrap_or(false);
         Ok(Some(crate::backends::PullRequestCompletion {
             merged,

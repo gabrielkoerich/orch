@@ -61,7 +61,7 @@ impl ProjectSync {
             .ok()
             .filter(|v| !v.is_empty());
 
-        let gh = match GhHttp::new() {
+        let gh = match GhHttp::owner() {
             Ok(gh) => gh,
             Err(e) => {
                 tracing::warn!(error = %e, "project sync disabled: failed to build HTTP client");
@@ -84,7 +84,7 @@ impl ProjectSync {
     /// "Status" field, returning a `ProjectSync` populated with field/option IDs.
     /// Also discovers the "Estimate" number field if present.
     pub async fn discover_fields(project_id: &str) -> anyhow::Result<Self> {
-        let gh = GhHttp::new()?;
+        let gh = GhHttp::owner()?;
         // Fetch all field types so we can find both Status (single-select) and Estimate (number).
         let query = r#"query($projectId: ID!) { node(id: $projectId) { ... on ProjectV2 { fields(first: 100) { nodes { ... on ProjectV2SingleSelectField { id name options { id name } } ... on ProjectV2Field { id name } ... on ProjectV2FieldNumber { id name } } } } } }"#;
 
@@ -165,7 +165,7 @@ impl ProjectSync {
 
     /// List all accessible projects for the authenticated user and their orgs.
     pub async fn list_projects() -> anyhow::Result<Vec<ProjectInfo>> {
-        let gh = GhHttp::new()?;
+        let gh = GhHttp::owner()?;
         let mut projects = Vec::new();
 
         // Get current user login
