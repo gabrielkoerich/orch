@@ -8,6 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use reqwest::{header, Client, StatusCode};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration as StdDuration;
 
@@ -60,9 +61,10 @@ struct AppInfo {
 
 pub(crate) struct AppAuth {
     app_id: String,
-    installation_id: Mutex<Option<u64>>,
     pem: String,
-    cache: Mutex<Option<CachedToken>>,
+    // `None` means the App is not installed on that repository, so it uses the owner token
+    installations: Mutex<HashMap<String, Option<u64>>>,
+    tokens: Mutex<HashMap<u64, CachedToken>>,
     login: Mutex<Option<String>>,
     refresh: tokio::sync::Mutex<()>,
     http: Client,
@@ -111,30 +113,13 @@ impl AppAuth {
         if !app_id.chars().all(|c| c.is_ascii_digit()) {
             anyhow::bail!("gh.app.id must be digits");
         }
-        let installation_id = match nonempty_config("gh.app.installation_id") {
-            Some(raw) => Some(
-                raw.parse::<u64>()
-                    .map_err(|_| anyhow::anyhow!("gh.app.installation_id must be a number"))?,
-            ),
-            None => None,
-        };
         let pem = read_key()?;
         // Fail at startup on a bad key, not on the first request
         sign_jwt(&app_id, &pem, Utc::now().timestamp())?;
-        Ok(Self::new(
-            app_id,
-            installation_id,
-            pem,
-            "https://api.github.com".to_string(),
-        ))
+        Ok(Self::new(app_id, pem, "https://api.github.com".to_string()))
     }
 
-    pub(crate) fn new(
-        app_id: String,
-        installation_id: Option<u64>,
-        pem: String,
-        api_base: String,
-    ) -> Self {
+    pub(crate) fn new(app_id: String, pem: String, api_base: String) -> Self {
         let http = Client::builder()
             .user_agent(USER_AGENT)
             .timeout(StdDuration::from_secs(30))
@@ -142,9 +127,9 @@ impl AppAuth {
             .unwrap_or_default();
         Self {
             app_id,
-            installation_id: Mutex::new(installation_id),
             pem,
-            cache: Mutex::new(None),
+            installations: Mutex::new(HashMap::new()),
+            tokens: Mutex::new(HashMap::new()),
             login: Mutex::new(None),
             refresh: tokio::sync::Mutex::new(()),
             http,
@@ -152,56 +137,71 @@ impl AppAuth {
         }
     }
 
-    /// Drop the cached installation token so the next request exchanges a new one
+    /// Drop the cached installation tokens so the next request exchanges new ones
     pub(crate) fn invalidate(&self) {
-        *lock(&self.cache) = None;
+        lock(&self.tokens).clear();
     }
 
-    pub(crate) async fn installation_token(&self) -> anyhow::Result<String> {
-        if let Some(token) = self.cached_fresh_token() {
+    /// The installation token for `repo`, `None` when the App is not installed on it
+    pub(crate) async fn token_for_repo(&self, repo: &str) -> anyhow::Result<Option<String>> {
+        let Some(id) = self.installation_for(repo).await? else {
+            return Ok(None);
+        };
+        self.installation_token(id).await.map(Some)
+    }
+
+    // An account and each organization are separate installations, so the lookup is per repo
+    async fn installation_for(&self, repo: &str) -> anyhow::Result<Option<u64>> {
+        if let Some(found) = lock(&self.installations).get(repo) {
+            return Ok(*found);
+        }
+        let jwt = sign_jwt(&self.app_id, &self.pem, Utc::now().timestamp())?;
+        let url = format!("{}/repos/{repo}/installation", self.api_base);
+        let found = match self.send_status(self.http.get(&url), &jwt).await? {
+            (status, body) if status.is_success() => {
+                let installation: Installation = serde_json::from_str(&body)
+                    .map_err(|_| anyhow::anyhow!("GitHub App installation could not be read"))?;
+                Some(installation.id)
+            }
+            (StatusCode::NOT_FOUND, _) => None,
+            (status, _) => {
+                anyhow::bail!("GitHub App installation lookup for {repo} failed: {status}")
+            }
+        };
+        lock(&self.installations).insert(repo.to_string(), found);
+        Ok(found)
+    }
+
+    async fn installation_token(&self, id: u64) -> anyhow::Result<String> {
+        if let Some(token) = self.cached_fresh_token(id) {
             return Ok(token);
         }
         let _guard = self.refresh.lock().await;
-        if let Some(token) = self.cached_fresh_token() {
+        if let Some(token) = self.cached_fresh_token(id) {
             return Ok(token);
         }
         let jwt = sign_jwt(&self.app_id, &self.pem, Utc::now().timestamp())?;
-        let installation_id = self.ensure_installation_id(&jwt).await?;
-        let url = format!(
-            "{}/app/installations/{installation_id}/access_tokens",
-            self.api_base
-        );
+        let url = format!("{}/app/installations/{id}/access_tokens", self.api_base);
         let body = self.send(self.http.post(&url), &jwt).await?;
         let parsed: AccessTokenResponse = serde_json::from_str(&body)
             .map_err(|_| anyhow::anyhow!("GitHub installation token response could not be read"))?;
         if parsed.token.is_empty() {
             anyhow::bail!("GitHub installation token response has no token");
         }
-        *lock(&self.cache) = Some(CachedToken {
-            token: parsed.token.clone(),
-            expires_at: parsed.expires_at,
-        });
+        lock(&self.tokens).insert(
+            id,
+            CachedToken {
+                token: parsed.token.clone(),
+                expires_at: parsed.expires_at,
+            },
+        );
         Ok(parsed.token)
     }
 
-    fn cached_fresh_token(&self) -> Option<String> {
-        let cache = lock(&self.cache);
-        let cached = cache.as_ref()?;
+    fn cached_fresh_token(&self, id: u64) -> Option<String> {
+        let tokens = lock(&self.tokens);
+        let cached = tokens.get(&id)?;
         token_is_fresh(cached.expires_at, Utc::now()).then(|| cached.token.clone())
-    }
-
-    async fn ensure_installation_id(&self, jwt: &str) -> anyhow::Result<u64> {
-        if let Some(id) = *lock(&self.installation_id) {
-            return Ok(id);
-        }
-        let url = format!("{}/app/installations", self.api_base);
-        let body = self.send(self.http.get(&url), jwt).await?;
-        let installations: Vec<Installation> = serde_json::from_str(&body)
-            .map_err(|_| anyhow::anyhow!("GitHub App installation list could not be read"))?;
-        let ids: Vec<u64> = installations.into_iter().map(|item| item.id).collect();
-        let id = select_installation(&ids)?;
-        *lock(&self.installation_id) = Some(id);
-        Ok(id)
     }
 
     /// The App's user login, `<slug>[bot]`. `GET /user` rejects installation tokens, so read
@@ -232,7 +232,9 @@ impl AppAuth {
         body: &str,
         commit_id: &str,
     ) -> anyhow::Result<()> {
-        let token = self.installation_token().await?;
+        let Some(token) = self.token_for_repo(repo).await? else {
+            anyhow::bail!("the GitHub App is not installed on {repo}");
+        };
         let url = format!("{}/repos/{repo}/pulls/{pr_number}/reviews", self.api_base);
         let payload = serde_json::json!({
             "event": event.as_str(),
@@ -250,6 +252,23 @@ impl AppAuth {
     }
 
     async fn send(&self, builder: reqwest::RequestBuilder, bearer: &str) -> anyhow::Result<String> {
+        let (status, body) = self.send_status(builder, bearer).await?;
+        if status.is_success() {
+            return Ok(body);
+        }
+        let message = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| value.get("message")?.as_str().map(str::to_owned))
+            .filter(|msg| !crate::security::has_leaks(msg))
+            .unwrap_or_default();
+        anyhow::bail!("GitHub App API {status}: {message}")
+    }
+
+    async fn send_status(
+        &self,
+        builder: reqwest::RequestBuilder,
+        bearer: &str,
+    ) -> anyhow::Result<(StatusCode, String)> {
         let resp = builder
             .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
             .header(header::ACCEPT, "application/vnd.github+json")
@@ -260,15 +279,7 @@ impl AppAuth {
             .map_err(|err| anyhow::anyhow!("GitHub App request failed to send: {err}"))?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        if status.is_success() {
-            return Ok(body);
-        }
-        let message = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|value| value.get("message")?.as_str().map(str::to_owned))
-            .filter(|msg| !crate::security::has_leaks(msg))
-            .unwrap_or_default();
-        anyhow::bail!("GitHub App API {status}: {message}")
+        Ok((status, body))
     }
 }
 
@@ -319,17 +330,6 @@ fn sign_jwt(app_id: &str, pem: &str, now: i64) -> anyhow::Result<String> {
         .map_err(|_| anyhow::anyhow!("GitHub App private key is not a usable RSA PEM"))?;
     encode(&Header::new(Algorithm::RS256), &claims, &key)
         .map_err(|_| anyhow::anyhow!("failed to sign GitHub App JWT"))
-}
-
-fn select_installation(ids: &[u64]) -> anyhow::Result<u64> {
-    match ids {
-        [id] => Ok(*id),
-        [] => anyhow::bail!("GitHub App has no installations"),
-        many => anyhow::bail!(
-            "GitHub App has {} installations, set gh.app.installation_id",
-            many.len()
-        ),
-    }
 }
 
 /// The App login, `None` when the App is not configured or its login cannot be read
@@ -426,13 +426,16 @@ mod tests {
     use wiremock::matchers::{body_partial_json, header as header_is, method, path};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-    fn app(server: &MockServer, installation_id: Option<u64>) -> AppAuth {
-        AppAuth::new(
-            "12345".to_string(),
-            installation_id,
-            test_pem().to_string(),
-            server.uri(),
-        )
+    fn app(server: &MockServer) -> AppAuth {
+        AppAuth::new("12345".to_string(), test_pem().to_string(), server.uri())
+    }
+
+    async fn installed(server: &MockServer, repo: &str, id: u64) {
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/{repo}/installation")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": id})))
+            .mount(server)
+            .await;
     }
 
     fn review(login: &str, state: &str, sha: &str, at: &str) -> GitHubReview {
@@ -490,17 +493,10 @@ mod tests {
         assert!(normalize_pem("   ").is_err());
     }
 
-    #[test]
-    fn select_installation_requires_exactly_one() {
-        assert_eq!(select_installation(&[42]).unwrap(), 42);
-        assert!(select_installation(&[]).is_err());
-        let many = select_installation(&[1, 2]).unwrap_err().to_string();
-        assert!(many.contains("gh.app.installation_id"), "{many}");
-    }
-
     #[tokio::test]
     async fn installation_token_is_cached_and_refreshed_before_expiry() {
         let server = MockServer::start().await;
+        installed(&server, "o/r", 42).await;
         let posts = Arc::new(AtomicUsize::new(0));
         let counter = posts.clone();
         Mock::given(method("POST"))
@@ -514,10 +510,16 @@ mod tests {
             })
             .mount(&server)
             .await;
-        let app = app(&server, Some(42));
+        let app = app(&server);
 
-        assert_eq!(app.installation_token().await.unwrap(), "inst-1");
-        assert_eq!(app.installation_token().await.unwrap(), "inst-1");
+        assert_eq!(
+            app.token_for_repo("o/r").await.unwrap().as_deref(),
+            Some("inst-1")
+        );
+        assert_eq!(
+            app.token_for_repo("o/r").await.unwrap().as_deref(),
+            Some("inst-1")
+        );
         assert_eq!(posts.load(Ordering::SeqCst), 1);
 
         let requests = server.received_requests().await.expect("requests");
@@ -530,32 +532,66 @@ mod tests {
         assert_eq!(claims.iss, "12345");
 
         // Inside the 10 minute window the token is refreshed
-        lock(&app.cache).as_mut().unwrap().expires_at = Utc::now() + Duration::minutes(9);
-        assert_eq!(app.installation_token().await.unwrap(), "inst-2");
+        lock(&app.tokens).get_mut(&42).unwrap().expires_at = Utc::now() + Duration::minutes(9);
+        assert_eq!(
+            app.token_for_repo("o/r").await.unwrap().as_deref(),
+            Some("inst-2")
+        );
         assert_eq!(posts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
-    async fn the_only_installation_is_found_when_config_omits_the_id() {
+    async fn a_repo_without_the_app_gets_no_token_and_is_looked_up_once() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/app/installations"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{"id": 7}])))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/app/installations/7/access_tokens"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
-                "token": "inst-found",
-                "expires_at": "2099-01-01T00:00:00Z",
-            })))
+            .and(path("/repos/other-org/x/installation"))
+            .respond_with(ResponseTemplate::new(404))
             .expect(1)
             .mount(&server)
             .await;
+        let app = app(&server);
+        assert_eq!(app.token_for_repo("other-org/x").await.unwrap(), None);
+        assert_eq!(app.token_for_repo("other-org/x").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn an_account_and_an_organization_get_their_own_installation_tokens() {
+        let server = MockServer::start().await;
+        installed(&server, "me/a", 42).await;
+        installed(&server, "org/b", 77).await;
+        for (id, token) in [(42, "inst-me"), (77, "inst-org")] {
+            Mock::given(method("POST"))
+                .and(path(format!("/app/installations/{id}/access_tokens")))
+                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "token": token,
+                    "expires_at": "2099-01-01T00:00:00Z",
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let app = app(&server);
         assert_eq!(
-            app(&server, None).installation_token().await.unwrap(),
-            "inst-found"
+            app.token_for_repo("me/a").await.unwrap().as_deref(),
+            Some("inst-me")
         );
+        assert_eq!(
+            app.token_for_repo("org/b").await.unwrap().as_deref(),
+            Some("inst-org")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_lookup_is_an_error_and_is_not_cached() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/installation"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let app = app(&server);
+        assert!(app.token_for_repo("o/r").await.is_err());
+        assert!(lock(&app.installations).get("o/r").is_none());
     }
 
     #[tokio::test]
@@ -569,7 +605,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let app = app(&server, Some(42));
+        let app = app(&server);
         assert_eq!(app.login().await.unwrap(), "orch-app[bot]");
         assert_eq!(app.login().await.unwrap(), "orch-app[bot]");
     }
@@ -577,6 +613,7 @@ mod tests {
     #[tokio::test]
     async fn a_review_is_submitted_on_the_head_sha_with_the_installation_token() {
         let server = MockServer::start().await;
+        installed(&server, "o/r", 42).await;
         Mock::given(method("POST"))
             .and(path("/app/installations/42/access_tokens"))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
@@ -597,10 +634,26 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        app(&server, Some(42))
+        app(&server)
             .submit_review("o/r", 9, ReviewEvent::Approve, "looks good", "abc123")
             .await
             .expect("review submitted");
+    }
+
+    #[tokio::test]
+    async fn a_review_on_a_repo_without_the_app_fails_clearly() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/org/b/installation"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let err = app(&server)
+            .submit_review("org/b", 9, ReviewEvent::Approve, "ok", "abc123")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not installed on org/b"), "{err}");
     }
 
     #[test]

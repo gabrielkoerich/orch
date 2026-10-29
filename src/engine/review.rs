@@ -4367,9 +4367,13 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/installation"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 42})))
+            .mount(&server)
+            .await;
         let app = Arc::new(crate::github::app::AppAuth::new(
             "12345".to_string(),
-            Some(42),
             crate::github::app::test_pem().to_string(),
             server.uri(),
         ));

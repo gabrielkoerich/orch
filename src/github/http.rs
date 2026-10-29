@@ -54,6 +54,15 @@ pub(crate) fn is_full_commit_sha(sha: &str) -> bool {
 }
 
 // Shared gate for every GitHub-posted body so a new call site cannot skip the scan
+/// `owner/repo` from a REST URL such as `https://api.github.com/repos/owner/repo/pulls`
+fn repo_from_url(url: &str) -> Option<String> {
+    let rest = url.split_once("/repos/")?.1;
+    let mut parts = rest.split(['/', '?']);
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let name = parts.next().filter(|s| !s.is_empty())?;
+    Some(format!("{owner}/{name}"))
+}
+
 pub(crate) fn redact_posted_body(body: &str) -> String {
     if !crate::security::has_leaks(body) {
         return body.to_string();
@@ -535,12 +544,15 @@ impl GhHttp {
 
     // ── Low-level HTTP helpers ────────────────────────────────────
 
-    async fn auth_header(&self) -> anyhow::Result<String> {
-        if let Some(app) = &self.app {
-            match app.installation_token().await {
-                Ok(token) => return Ok(format!("Bearer {token}")),
+    /// The App's token for a repository it is installed on, the owner token for anything else,
+    /// including GraphQL, whose URL names no repository
+    async fn auth_header(&self, url: &str) -> anyhow::Result<String> {
+        if let (Some(app), Some(repo)) = (&self.app, repo_from_url(url)) {
+            match app.token_for_repo(&repo).await {
+                Ok(Some(token)) => return Ok(format!("Bearer {token}")),
+                Ok(None) => {}
                 Err(e) => {
-                    tracing::warn!(error = %e, "GitHub App token unavailable, using the owner token");
+                    tracing::warn!(error = %e, repo, "GitHub App token unavailable, using the owner token");
                 }
             }
         }
@@ -614,6 +626,7 @@ impl GhHttp {
                     }
 
                     if resp.status() == StatusCode::UNAUTHORIZED {
+                        let resp_url = resp.url().to_string();
                         let status = resp.status();
                         let body = resp.text().await.unwrap_or_default();
                         if body.contains("Bad credentials") && !auth_retried {
@@ -624,7 +637,7 @@ impl GhHttp {
                             if let Some(app) = &self.app {
                                 app.invalidate();
                             }
-                            match self.auth_header().await {
+                            match self.auth_header(&resp_url).await {
                                 Ok(new_auth) => {
                                     auth_retried = true;
                                     auth_override = Some(new_auth);
@@ -741,7 +754,7 @@ impl GhHttp {
     /// GET request, returns deserialized JSON.
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> anyhow::Result<T> {
         Self::check_backoff(url)?;
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(url).await?;
         // Use send_with_retries to handle transient 5xx/network failures
         let make_req = || {
             Ok(self
@@ -766,7 +779,7 @@ impl GhHttp {
     /// GET raw bytes (for endpoints that return non-JSON or we parse manually).
     async fn get_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
         Self::check_backoff(url)?;
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(url).await?;
         let make_req = || {
             Ok(self
                 .client
@@ -792,7 +805,7 @@ impl GhHttp {
         query: &[(&str, &str)],
     ) -> anyhow::Result<T> {
         Self::check_backoff(url)?;
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(url).await?;
         let make_req = || {
             Ok(self
                 .client
@@ -817,7 +830,7 @@ impl GhHttp {
     /// POST with JSON body, returns raw response text.
     async fn post_json_raw(&self, url: &str, body: &serde_json::Value) -> anyhow::Result<String> {
         Self::check_backoff(url)?;
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(url).await?;
         let make_req = || {
             Ok(self
                 .client
@@ -852,7 +865,7 @@ impl GhHttp {
     /// PATCH with JSON body, returns raw response.
     async fn patch_json_raw(&self, url: &str, body: &serde_json::Value) -> anyhow::Result<String> {
         Self::check_backoff(url)?;
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(url).await?;
         let make_req = || {
             Ok(self
                 .client
@@ -877,7 +890,7 @@ impl GhHttp {
     /// DELETE request.
     async fn delete(&self, url: &str) -> anyhow::Result<StatusCode> {
         Self::check_backoff(url)?;
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(url).await?;
         let make_req = || {
             Ok(self
                 .client
@@ -925,7 +938,7 @@ impl GhHttp {
             let mut cached_etag = cache_key.as_deref().and_then(page_cache_etag);
             let mut decode_attempt = 0;
             let (page, next) = loop {
-                let auth = self.auth_header().await?;
+                let auth = self.auth_header(request_url).await?;
                 let mut req = self
                     .client
                     .get(request_url)
@@ -1044,7 +1057,7 @@ impl GhHttp {
         let mut current_url: String = url.to_string();
 
         loop {
-            let auth = self.auth_header().await?;
+            let auth = self.auth_header(&current_url).await?;
             let make_req = || {
                 self.client
                     .get(&current_url)
@@ -1127,7 +1140,7 @@ impl GhHttp {
         } else {
             serde_json::json!({ "query": query })
         };
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(url).await?;
         let mut req = self
             .client
             .post(url)
@@ -1406,7 +1419,7 @@ impl GhHttp {
         body: Option<serde_json::Value>,
     ) -> anyhow::Result<Response> {
         Self::check_backoff(url)?;
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(url).await?;
         let make_req = || {
             let mut req = self
                 .client
@@ -1993,7 +2006,7 @@ impl GhHttp {
             base,
         };
 
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(&url).await?;
         let make_req = || {
             Ok(self
                 .client
@@ -2406,7 +2419,7 @@ impl GhHttp {
     pub async fn is_collaborator(&self, repo: &str, username: &str) -> anyhow::Result<bool> {
         let url = format!("{GITHUB_API}/repos/{repo}/collaborators/{username}");
         Self::check_backoff(&url)?;
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(&url).await?;
         let make_req = || {
             Ok(self
                 .client
@@ -2658,7 +2671,7 @@ impl GhHttp {
         let url = format!("{GITHUB_API}/repos/{repo}/pulls/{pr_number}/merge");
         Self::check_backoff(&url)?;
         let payload = merge_pr_body(head_sha);
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(&url).await?;
         let make_req = || {
             Ok(self
                 .client
@@ -2708,7 +2721,7 @@ impl GhHttp {
     pub async fn update_pr_branch(&self, repo: &str, pr_number: u64) -> anyhow::Result<()> {
         let url = format!("{GITHUB_API}/repos/{repo}/pulls/{pr_number}/update-branch");
         Self::check_backoff(&url)?;
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(&url).await?;
         let make_req = || {
             Ok(self
                 .client
@@ -2984,7 +2997,7 @@ impl GhHttp {
 
         // POST rerun — no body needed
         let rerun_url = format!("{GITHUB_API}/repos/{repo}/actions/runs/{run_id}/rerun");
-        let auth = self.auth_header().await?;
+        let auth = self.auth_header(&rerun_url).await?;
         let make_req = || {
             Ok(self
                 .client
@@ -3705,6 +3718,26 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn repo_from_url_names_the_repository_or_nothing() {
+        let api = "https://api.github.com";
+        assert_eq!(
+            repo_from_url(&format!("{api}/repos/me/a/pulls/9")).as_deref(),
+            Some("me/a")
+        );
+        assert_eq!(
+            repo_from_url(&format!("{api}/repos/org/b?per_page=1")).as_deref(),
+            Some("org/b")
+        );
+        assert_eq!(
+            repo_from_url(&format!("{api}/repos/org/b")).as_deref(),
+            Some("org/b")
+        );
+        assert_eq!(repo_from_url(&format!("{api}/graphql")), None);
+        assert_eq!(repo_from_url(&format!("{api}/user")), None);
+        assert_eq!(repo_from_url(&format!("{api}/repos/only-owner")), None);
+    }
 
     #[test]
     fn no_branch_protection_errors() {

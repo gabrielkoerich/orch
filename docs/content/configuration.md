@@ -153,25 +153,22 @@ gh:
 
 ### GitHub App
 
-With an App configured, orch makes its own REST and GraphQL calls with an installation token, so they count against the App's quota. It also submits reviews as the App, because GitHub does not let an account approve its own pull request. Agents keep the owner's `gh`. `GET /user` and Projects V2 stay on the owner token, since an installation token cannot reach a personal account's projects. Without `gh.app.id`, orch behaves as before.
+With an App configured, orch makes its own REST calls to a repository with that repository's installation token, so they count against the App's quota. It also submits reviews as the App, because GitHub does not let an account approve its own pull request. Agents keep the owner's `gh`.
+
+orch looks up the installation per repository (`GET /repos/{repo}/installation`), since your account and each organization are separate installations. A repository the App is not installed on, GraphQL, `GET /user` and Projects V2 on a personal account use the owner token. Without `gh.app.id`, orch behaves as before.
 
 ```yaml
 # ~/.orch/config.yml
 gh:
   app:
     id: "123456"
-    installation_id: "7890"          # optional, found with GET /app/installations when there is only one
-    private_key_path: "/path/to/app.pem"  # absolute path, or
-    private_key_env: "ORCH_APP_KEY"       # name of a variable that holds the PEM
+    private_key_env: "ORCH_APP_KEY"       # name of a variable that holds the PEM, or
+    private_key_path: "/path/to/app.pem"  # absolute path
 ```
 
-orch signs an RS256 JWT, exchanges it for an installation token, and refreshes the token 10 minutes before it expires. If the token is unavailable, orch logs a warning and uses the owner token.
+Agents run as your user and can read any file you can, so prefer `private_key_env` with the key injected at launch over a `.pem` file. orch signs an RS256 JWT, exchanges it for an installation token per installation, and refreshes each token 10 minutes before it expires. If a token is unavailable, orch logs a warning and uses the owner token.
 
-The review gate counts an App review only when its `commit_id` is the current head. A review on an older sha does not count. The `## Automated Review` comment is still posted, and the gate reads it when the App has no review on the head. To make `.github/workflows/orch-review.yml` read App reviews, set the repository variable `ORCH_REVIEW_APP` to the App login, such as `my-app[bot]`.
-
-### Agent Session Tokens
-
-When spawning agents in tmux sessions, tokens are injected via the tmux session environment (`tmux set-environment`) rather than being embedded in runner scripts. This prevents token leakage to disk and enables centralized token rotation without restarting agents.
+The review gate counts an App review only when its `commit_id` is the current head. A review on an older sha does not count. The `## Automated Review` comment is still posted, and the gate reads it when the App has no review on the head.
 
 ## Cluster
 
