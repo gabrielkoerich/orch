@@ -810,9 +810,75 @@ fn may_merge_onto_base(behind_by: Option<u64>) -> bool {
     behind_by == Some(0)
 }
 
-/// `has_hooks` is `clean` on a server with pre-receive hooks, every other state waits
-fn mergeable_state_ready(state: &str) -> bool {
-    matches!(state, "clean" | "has_hooks")
+/// True when any check run or commit status has not finished
+fn any_check_pending(check_runs: &[GitHubCheckRun], statuses: &[(String, String)]) -> bool {
+    check_runs
+        .iter()
+        .any(|run| run.status != "completed" || run.conclusion.is_none())
+        || statuses.iter().any(|(_, state)| {
+            !matches!(
+                state.as_str(),
+                "success" | "failure" | "error" | "neutral" | "skipped"
+            )
+        })
+}
+
+/// Names of completed checks that failed and are not required
+fn failing_optional_check_names(
+    required: &[RequiredStatusCheck],
+    check_runs: &[GitHubCheckRun],
+    statuses: &[(String, String)],
+) -> Vec<String> {
+    let mut names = Vec::new();
+    for run in check_runs {
+        if required.iter().any(|r| required_check_run_matches(r, run)) {
+            continue;
+        }
+        let failed = run.status == "completed"
+            && matches!(
+                run.conclusion.as_deref(),
+                Some(conclusion) if !matches!(conclusion, "success" | "neutral" | "skipped")
+            );
+        if failed {
+            names.push(run.name.clone());
+        }
+    }
+    for (name, state) in statuses {
+        if !matches!(state.as_str(), "failure" | "error") {
+            continue;
+        }
+        if required
+            .iter()
+            .any(|r| r.integration_id.is_none() && r.context == *name)
+        {
+            continue;
+        }
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    names
+}
+
+/// `has_hooks` is `clean` on a server with pre-receive hooks
+/// `unstable` is ready when required checks passed, and waits while a repo with no required checks still has running CI
+fn mergeable_state_ready(
+    state: &str,
+    required: &[RequiredStatusCheck],
+    check_runs: &[GitHubCheckRun],
+    statuses: &[(String, String)],
+) -> bool {
+    match state {
+        "clean" | "has_hooks" => true,
+        "unstable" => {
+            if required.is_empty() {
+                !any_check_pending(check_runs, statuses)
+            } else {
+                required_checks_state(required, check_runs, statuses).0 == "success"
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Auto-merge a PR after review approval.
@@ -1610,9 +1676,11 @@ pub(crate) async fn auto_merge_pr(
 
     // Confirm every required check passed on this head SHA so an admin token
     // cannot merge through a ruleset bypass while a required check is missing
+    let mut check_runs = Vec::new();
+    let mut statuses = Vec::new();
     if !required_contexts.is_empty() {
-        let check_runs = gh.get_check_runs(repo, &head_sha).await?;
-        let statuses = gh.get_commit_status_contexts(repo, &head_sha).await?;
+        check_runs = gh.get_check_runs(repo, &head_sha).await?;
+        statuses = gh.get_commit_status_contexts(repo, &head_sha).await?;
         let (state, ..) = required_checks_state(&required_contexts, &check_runs, &statuses);
         if state != "success" {
             tracing::info!(
@@ -1626,10 +1694,14 @@ pub(crate) async fn auto_merge_pr(
     }
 
     // GitHub's own verdict must read ready too, so an admin bypass cannot merge
-    // a PR that is behind, blocked by a rule, or not yet computed (#3839)
+    // a PR that is behind, blocked, or uncomputed, `unstable` merges when required checks passed (#3839, #3847)
     let fresh_pr = gh.get_pr(repo, pr_number).await?;
     let mergeable_state = fresh_pr.mergeable_state.as_deref().unwrap_or("unknown");
-    if !mergeable_state_ready(mergeable_state) {
+    if mergeable_state == "unstable" && required_contexts.is_empty() {
+        check_runs = gh.get_check_runs(repo, &head_sha).await?;
+        statuses = gh.get_commit_status_contexts(repo, &head_sha).await?;
+    }
+    if !mergeable_state_ready(mergeable_state, &required_contexts, &check_runs, &statuses) {
         tracing::info!(
             task_id = task.id.0,
             pr_number,
@@ -1643,6 +1715,19 @@ pub(crate) async fn auto_merge_pr(
         }
 
         return Ok(());
+    }
+
+    if mergeable_state == "unstable" {
+        let failing_optional =
+            failing_optional_check_names(&required_contexts, &check_runs, &statuses);
+        if !failing_optional.is_empty() {
+            tracing::info!(
+                task_id = task.id.0,
+                pr_number,
+                failing_optional = %failing_optional.join(", "),
+                "merging with failing non-required checks"
+            );
+        }
     }
 
     tracing::info!(
@@ -2306,17 +2391,72 @@ mod tests {
     use crate::backends::{ExternalId, ExternalTask};
     use crate::github::types::{GitHubReview, GitHubUser};
 
-    /// Auto-merge refuses a PR whose head does not contain the current base
-    /// commit: its green checks ran against older code (#3780).
     #[test]
     fn mergeable_state_ready_accepts_only_clean_states() {
-        assert!(mergeable_state_ready("clean"));
-        assert!(mergeable_state_ready("has_hooks"));
-        for state in ["behind", "blocked", "unknown", "unstable", "dirty", "draft"] {
-            assert!(!mergeable_state_ready(state), "{state} must hold the merge");
+        assert!(mergeable_state_ready("clean", &[], &[], &[]));
+        assert!(mergeable_state_ready("has_hooks", &[], &[], &[]));
+        for state in ["behind", "blocked", "unknown", "dirty", "draft"] {
+            assert!(
+                !mergeable_state_ready(state, &[], &[], &[]),
+                "{state} must hold the merge"
+            );
         }
     }
 
+    #[test]
+    fn mergeable_state_ready_accepts_unstable_when_required_checks_passed() {
+        let required = vec![required_check("ci", None)];
+        let check_runs = vec![
+            check_run("ci", "completed", Some("success"), None),
+            check_run("lint", "completed", Some("failure"), None),
+        ];
+        assert!(mergeable_state_ready(
+            "unstable",
+            &required,
+            &check_runs,
+            &[]
+        ));
+        assert_eq!(
+            failing_optional_check_names(&required, &check_runs, &[]),
+            vec!["lint"]
+        );
+    }
+
+    #[test]
+    fn mergeable_state_ready_holds_unstable_when_a_required_check_failed() {
+        let required = vec![required_check("ci", None)];
+        let check_runs = vec![
+            check_run("ci", "completed", Some("failure"), None),
+            check_run("lint", "completed", Some("success"), None),
+        ];
+        assert!(!mergeable_state_ready(
+            "unstable",
+            &required,
+            &check_runs,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn mergeable_state_ready_holds_unstable_while_checks_are_pending_without_required() {
+        let check_runs = vec![check_run("ci", "in_progress", None, None)];
+        assert!(!mergeable_state_ready("unstable", &[], &check_runs, &[]));
+        let statuses = vec![("lint".to_string(), "pending".to_string())];
+        assert!(!mergeable_state_ready("unstable", &[], &[], &statuses));
+    }
+
+    #[test]
+    fn mergeable_state_ready_accepts_unstable_when_optional_checks_finished_without_required() {
+        let check_runs = vec![check_run("lint", "completed", Some("failure"), None)];
+        assert!(mergeable_state_ready("unstable", &[], &check_runs, &[]));
+        assert_eq!(
+            failing_optional_check_names(&[], &check_runs, &[]),
+            vec!["lint"]
+        );
+    }
+
+    /// Auto-merge refuses a PR whose head does not contain the current base
+    /// commit: its green checks ran against older code (#3780)
     #[test]
     fn may_merge_onto_base_refuses_a_head_behind_its_base() {
         assert!(
