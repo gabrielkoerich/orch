@@ -100,6 +100,14 @@ pub struct GitHubBranchRef {
     #[serde(rename = "ref")]
     pub ref_: String,
     pub sha: String,
+    /// The repository the branch lives in, a fork when the PR comes from one
+    #[serde(default)]
+    pub repo: Option<GitHubRepoRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubRepoRef {
+    pub full_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

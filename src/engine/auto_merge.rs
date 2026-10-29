@@ -105,34 +105,55 @@ enum WorktreeRebaseOutcome {
 }
 
 /// Rebase a PR that fell behind its base in the task's worktree and carry its approval to the
-/// rebased head. Without a worktree, or when the rebase or push fails, GitHub merges the base in
+/// rebased head. The worktree must sit on the PR head and the base must be the branch the rebase
+/// targets, or the push would carry other commits under the approval. Otherwise, or when the
+/// rebase or push fails, GitHub merges the base in
 async fn bring_branch_up_to_date(
     task: &ExternalTask,
     repo: &str,
     pr_number: u64,
-    head_sha: &str,
+    pr: &GitHubPullRequest,
     gh: &GhHttp,
     store: &Arc<TaskStore>,
 ) {
     let task_id = task.id.0.as_str();
-    let worktree = opt_store_get_task(&Some(Arc::clone(store)), repo, task_id)
+    let mut worktree = opt_store_get_task(&Some(Arc::clone(store)), repo, task_id)
         .await
         .map(|t| t.worktree)
         .filter(|wt| !wt.is_empty());
+    if let Some(wt) = worktree.as_deref() {
+        let path = std::path::Path::new(wt);
+        let same_repo = pr
+            .head
+            .repo
+            .as_ref()
+            .is_some_and(|r| r.full_name.eq_ignore_ascii_case(repo));
+        let on_head = crate::engine::review::worktree_head_sha(path)
+            .await
+            .as_deref()
+            == Some(pr.head.sha.as_str());
+        let on_branch = git_ops::get_current_branch(path).await == pr.head.ref_;
+        let same_base = worktree::detect_default_branch(path).await == pr.base.ref_;
+        if !(same_repo && on_head && on_branch && same_base) {
+            tracing::info!(
+                task_id,
+                pr_number,
+                same_repo,
+                on_head,
+                on_branch,
+                same_base,
+                "worktree does not match the PR, not rebasing it"
+            );
+            worktree = None;
+        }
+    }
+
     match attempt_worktree_rebase_and_force_push(task_id, worktree.clone()).await {
         WorktreeRebaseOutcome::RebasedAndPushed => {
-            if let Some(wt) = worktree {
-                crate::engine::review::carry_approval_after_rebase(
-                    store,
-                    gh,
-                    repo,
-                    task_id,
-                    pr_number,
-                    head_sha,
-                    std::path::Path::new(&wt),
-                )
-                .await;
-            }
+            crate::engine::review::carry_approval_after_rebase(
+                store, gh, repo, task_id, pr, pr_number,
+            )
+            .await;
             tracing::info!(
                 task_id,
                 pr_number,
@@ -1200,13 +1221,7 @@ pub(crate) async fn auto_merge_pr(
     let head_sha = pr.head.sha.clone();
     let base_branch = pr.base.ref_.clone();
     crate::engine::review::carry_approval_across_base_update(
-        store,
-        &gh,
-        repo,
-        &task.id.0,
-        pr_number,
-        &head_sha,
-        &base_branch,
+        store, &gh, repo, &task.id.0, &pr, pr_number,
     )
     .await;
     let required_contexts = gh
@@ -1746,7 +1761,7 @@ pub(crate) async fn auto_merge_pr(
             "PR head does not contain the base tip — updating branch and re-running checks before merge"
         );
         if behind_by.is_some() {
-            bring_branch_up_to_date(task, repo, pr_number, &head_sha, &gh, store).await;
+            bring_branch_up_to_date(task, repo, pr_number, &pr, &gh, store).await;
         }
         return Ok(());
     }
@@ -1786,7 +1801,7 @@ pub(crate) async fn auto_merge_pr(
             "PR is not ready to merge on GitHub, holding merge"
         );
         if mergeable_state == "behind" {
-            bring_branch_up_to_date(task, repo, pr_number, &head_sha, &gh, store).await;
+            bring_branch_up_to_date(task, repo, pr_number, &pr, &gh, store).await;
         }
 
         return Ok(());
@@ -3132,10 +3147,12 @@ mod tests {
             head: crate::github::types::GitHubBranchRef {
                 ref_: "feature/test".to_string(),
                 sha: "abc123".to_string(),
+                repo: None,
             },
             base: crate::github::types::GitHubBranchRef {
                 ref_: "main".to_string(),
                 sha: "def456".to_string(),
+                repo: None,
             },
             mergeable: Some(true),
             mergeable_state: Some("behind".to_string()),

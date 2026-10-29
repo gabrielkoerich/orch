@@ -227,7 +227,7 @@ fn review_timeout_secs(configured: Option<u64>) -> u64 {
 }
 
 /// Read `HEAD` of a worktree. `None` when the worktree is gone or not a repository
-async fn worktree_head_sha(dir: &std::path::Path) -> Option<String> {
+pub(crate) async fn worktree_head_sha(dir: &std::path::Path) -> Option<String> {
     let out = tokio::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(dir)
@@ -242,6 +242,60 @@ async fn worktree_head_sha(dir: &std::path::Path) -> Option<String> {
     (!sha.is_empty()).then_some(sha)
 }
 
+/// What an approving review approved: the commit and the PR it was on. A carried approval must
+/// match every field
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ApprovalEvent {
+    sha: String,
+    repo: String,
+    branch: String,
+    base: String,
+}
+
+impl ApprovalEvent {
+    /// A record from before events held only the sha, it approves that head and never carries
+    fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        serde_json::from_str(raw).ok().or_else(|| {
+            Some(Self {
+                sha: raw.to_string(),
+                repo: String::new(),
+                branch: String::new(),
+                base: String::new(),
+            })
+        })
+    }
+}
+
+async fn read_approval(
+    store: &Arc<TaskStore>,
+    repo: &str,
+    task_id: &str,
+    pr_number: u64,
+) -> anyhow::Result<Option<ApprovalEvent>> {
+    Ok(store
+        .kv_get(&approved_sha_key(repo, task_id, pr_number))
+        .await?
+        .as_deref()
+        .and_then(ApprovalEvent::parse))
+}
+
+async fn write_approval(
+    store: &Arc<TaskStore>,
+    task_id: &str,
+    pr_number: u64,
+    event: &ApprovalEvent,
+) {
+    let key = approved_sha_key(&event.repo, task_id, pr_number);
+    let value = serde_json::to_string(event).unwrap_or_default();
+    if let Err(e) = store.kv_set(&key, &value).await {
+        tracing::warn!(task_id, err = %e, "failed to record the approval");
+    }
+}
+
 /// Record that the commit just pushed to the PR carries an approving review, so a later
 /// NeedsReview event on the same commit skips the review agent
 async fn record_approved_sha(
@@ -250,16 +304,19 @@ async fn record_approved_sha(
     task_id: &str,
     pr_number: u64,
     dir: &std::path::Path,
+    branch: &str,
+    base: &str,
 ) {
     let Some(sha) = worktree_head_sha(dir).await else {
         return;
     };
-    if let Err(e) = store
-        .kv_set(&approved_sha_key(repo, task_id, pr_number), &sha)
-        .await
-    {
-        tracing::warn!(task_id, err = %e, "failed to record approved commit sha");
-    }
+    let event = ApprovalEvent {
+        sha,
+        repo: repo.to_string(),
+        branch: branch.to_string(),
+        base: base.to_string(),
+    };
+    write_approval(store, task_id, pr_number, &event).await;
 }
 
 /// Drop a recorded approval so the next NeedsReview event runs a real review
@@ -312,11 +369,8 @@ async fn pr_head_already_approved(
     task_id: &str,
     pr_number: u64,
 ) -> bool {
-    let approved = match store
-        .kv_get(&approved_sha_key(repo, task_id, pr_number))
-        .await
-    {
-        Ok(sha) => sha,
+    let approved = match read_approval(store, repo, task_id, pr_number).await {
+        Ok(event) => event.map(|e| e.sha),
         Err(e) => {
             tracing::warn!(task_id, err = %e, "failed to read approved commit sha");
             return false;
@@ -342,71 +396,276 @@ async fn pr_head_already_approved(
     approval_covers_head(approved.as_deref(), pr_head.as_deref())
 }
 
+/// The task, PR and approval a carried approval must all agree on
+struct CarryContext {
+    approval: ApprovalEvent,
+    worktree: std::path::PathBuf,
+}
+
+/**
+ * Checks shared by both ways an approval moves to a new head: an approval event is on record,
+ * and the PR still matches it. The head lives in the approved repository (not a fork) on the
+ * approved branch, which is the task's branch, it targets the approved base, and the task
+ * worktree tracks that branch and base. `None` means the approval stays where it was
+ **/
+async fn carry_context(
+    store: &Arc<TaskStore>,
+    repo: &str,
+    task_id: &str,
+    pr: &crate::github::types::GitHubPullRequest,
+    pr_number: u64,
+) -> Option<CarryContext> {
+    let approval = read_approval(store, repo, task_id, pr_number)
+        .await
+        .ok()
+        .flatten()?;
+    let task = opt_store_get_task(&Some(Arc::clone(store)), repo, task_id).await?;
+    if !pr_matches_approval(pr, &approval, &task.branch) || task.worktree.is_empty() {
+        tracing::warn!(
+            task_id,
+            pr_number,
+            "the PR does not match the approved repository, branch and base, approval not carried"
+        );
+        return None;
+    }
+    let worktree = std::path::PathBuf::from(&task.worktree);
+    if runner::git_ops::get_current_branch(&worktree).await != approval.branch
+        || crate::engine::runner::worktree::detect_default_branch(&worktree).await != approval.base
+    {
+        tracing::warn!(
+            task_id,
+            pr_number,
+            "the task worktree does not track the approved branch and base, approval not carried"
+        );
+        return None;
+    }
+    Some(CarryContext { approval, worktree })
+}
+
+/// The PR's head repository, head branch and base are the approved ones, and the head branch is
+/// the task's. A record without these fields (written before events) never matches
+fn pr_matches_approval(
+    pr: &crate::github::types::GitHubPullRequest,
+    approval: &ApprovalEvent,
+    task_branch: &str,
+) -> bool {
+    let same_repo = !approval.repo.is_empty()
+        && pr
+            .head
+            .repo
+            .as_ref()
+            .is_some_and(|r| r.full_name.eq_ignore_ascii_case(&approval.repo));
+    same_repo
+        && !approval.branch.is_empty()
+        && pr.head.ref_ == approval.branch
+        && approval.branch == task_branch
+        && !approval.base.is_empty()
+        && pr.base.ref_ == approval.base
+}
+
 /**
  * Carry an approval to a head that only merged the base branch in, as GitHub's update-branch
- * does: a merge commit whose first parent is the approved commit and whose second parent the
- * base branch already holds. The approval is recorded for the new head and published on it: in
- * app mode an App approval and the check run, in comment mode the commit status, so a required
- * `orch/review` or approving review does not hold the merge. Any other change keeps the approval
- * where it was
+ * does. On top of `carry_context`: the head is a merge whose first parent is the approved commit
+ * and whose second parent the base branch already holds, GitHub made it (committer `web-flow`)
+ * for a repository collaborator, and its tree is exactly the clean merge of the two, recomputed
+ * in the task worktree. Anything else keeps the approval where it was and the head gets a review
  **/
 pub(crate) async fn carry_approval_across_base_update(
     store: &Arc<TaskStore>,
     gh: &GhHttp,
     repo: &str,
     task_id: &str,
+    pr: &crate::github::types::GitHubPullRequest,
     pr_number: u64,
-    head_sha: &str,
-    base_branch: &str,
 ) {
-    let key = approved_sha_key(repo, task_id, pr_number);
-    let Ok(Some(approved)) = store.kv_get(&key).await else {
+    let head_sha = pr.head.sha.as_str();
+    let Ok(Some(recorded)) = read_approval(store, repo, task_id, pr_number).await else {
         return;
     };
-    if approved.is_empty() || approved == head_sha {
+    if recorded.sha == head_sha {
         return;
     }
-    let parents = match gh.commit_parents(repo, head_sha).await {
-        Ok(parents) => parents,
-        Err(e) => {
-            tracing::warn!(task_id, err = %e, "cannot read the PR head's parents to carry the approval");
-            return;
-        }
-    };
-    let Some(base_parent) = base_merge_parent(&approved, &parents) else {
+    let Some(ctx) = carry_context(store, repo, task_id, pr, pr_number).await else {
         return;
     };
-    match gh.branch_contains(repo, base_branch, base_parent).await {
-        Ok(true) => {}
-        Ok(false) => return,
+    let meta = match gh.commit_meta(repo, head_sha).await {
+        Ok(meta) => meta,
         Err(e) => {
-            tracing::warn!(task_id, err = %e, "cannot check the merged parent against the base branch");
+            tracing::warn!(task_id, err = %e, "cannot read the PR head commit to carry the approval");
             return;
         }
+    };
+    let Some(base_parent) = base_merge_parent(&ctx.approval.sha, &meta.parents) else {
+        return;
+    };
+    if meta.committer_login.as_deref() != Some("web-flow") {
+        tracing::warn!(
+            task_id,
+            pr_number,
+            head_sha,
+            "the base merge was not made by GitHub, approval not carried"
+        );
+        return;
+    }
+    let Some(author) = meta.author_login.as_deref() else {
+        return;
+    };
+    if !matches!(gh.is_collaborator(repo, author).await, Ok(true)) {
+        tracing::warn!(
+            task_id,
+            pr_number,
+            author,
+            "the base merge author is not a collaborator, approval not carried"
+        );
+        return;
+    }
+    if !matches!(
+        gh.branch_contains(repo, &pr.base.ref_, base_parent).await,
+        Ok(true)
+    ) {
+        return;
+    }
+    git_output(&ctx.worktree, &["fetch", "origin"]).await;
+    if !is_clean_merge(&ctx.worktree, &ctx.approval.sha, base_parent, head_sha).await {
+        tracing::warn!(
+            task_id,
+            pr_number,
+            head_sha,
+            "the PR head is not a clean merge of the base, approval not carried"
+        );
+        return;
     }
 
-    publish_carried_approval(store, gh, repo, task_id, pr_number, head_sha).await;
+    publish_carried_approval(store, gh, repo, task_id, pr_number, &ctx.approval, head_sha).await;
 }
 
-/// After orch rebased an approved branch onto the base with no conflict, the approval of the
-/// head it rebased moves to the rebased head
+/**
+ * After orch rebased the approved head onto the base, move the approval to the rebased head. On
+ * top of `carry_context`: the rebase started from the approved commit, the new head holds the same
+ * commits with the same patches and authors in the same order on top of the base tip, and GitHub
+ * shows the new head as the PR head
+ **/
 pub(crate) async fn carry_approval_after_rebase(
     store: &Arc<TaskStore>,
     gh: &GhHttp,
     repo: &str,
     task_id: &str,
+    pr: &crate::github::types::GitHubPullRequest,
     pr_number: u64,
-    rebased_from: &str,
-    worktree: &std::path::Path,
 ) {
-    let key = approved_sha_key(repo, task_id, pr_number);
-    if !matches!(store.kv_get(&key).await, Ok(Some(approved)) if approved == rebased_from) {
-        return;
-    }
-    let Some(new_head) = worktree_head_sha(worktree).await else {
+    let Some(ctx) = carry_context(store, repo, task_id, pr, pr_number).await else {
         return;
     };
-    publish_carried_approval(store, gh, repo, task_id, pr_number, &new_head).await;
+    let rebased_from = pr.head.sha.as_str();
+    if ctx.approval.sha != rebased_from {
+        return;
+    }
+    let Some(new_head) = worktree_head_sha(&ctx.worktree).await else {
+        return;
+    };
+    let base = format!("origin/{}", pr.base.ref_);
+    if !same_commits_rebased(&ctx.worktree, rebased_from, &base, &new_head).await {
+        tracing::warn!(
+            task_id,
+            pr_number,
+            "the rebased commits differ from the approved ones, approval not carried"
+        );
+        return;
+    }
+    let mut pushed = false;
+    for _ in 0..3 {
+        if gh
+            .get_pr(repo, pr_number)
+            .await
+            .is_ok_and(|p| p.head.sha == new_head)
+        {
+            pushed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    if !pushed {
+        tracing::warn!(
+            task_id,
+            pr_number,
+            "GitHub does not show the rebased head yet, approval not carried"
+        );
+        return;
+    }
+
+    publish_carried_approval(
+        store,
+        gh,
+        repo,
+        task_id,
+        pr_number,
+        &ctx.approval,
+        &new_head,
+    )
+    .await;
+}
+
+/// The commits from the merge base of `old_head` and `base` up to `old_head`, replayed onto `base`
+/// as `new_head`: same count, same patch ids, same authors, same order, and `new_head` sits on `base`
+async fn same_commits_rebased(
+    dir: &std::path::Path,
+    old_head: &str,
+    base: &str,
+    new_head: &str,
+) -> bool {
+    let Some(fork_point) = git_output(dir, &["merge-base", old_head, base]).await else {
+        return false;
+    };
+    let on_base = git_output(dir, &["merge-base", "--is-ancestor", base, new_head])
+        .await
+        .is_some();
+    let old = commit_fingerprints(dir, &format!("{fork_point}..{old_head}")).await;
+    let new = commit_fingerprints(dir, &format!("{base}..{new_head}")).await;
+    on_base && old.is_some() && !old.as_ref().is_some_and(Vec::is_empty) && old == new
+}
+
+/// `(patch id, author)` for each commit in `range`, oldest first. `None` for a merge commit or
+/// any git failure
+async fn commit_fingerprints(dir: &std::path::Path, range: &str) -> Option<Vec<(String, String)>> {
+    let log = git_output(
+        dir,
+        &["log", "--reverse", "--format=%H %P%x00%an <%ae>", range],
+    )
+    .await?;
+    let mut prints = Vec::new();
+    for line in log.lines().filter(|l| !l.is_empty()) {
+        let (shas, author) = line.split_once('\0')?;
+        let mut shas = shas.split(' ');
+        let sha = shas.next()?;
+        if shas.count() != 1 {
+            return None;
+        }
+        prints.push((patch_id(dir, sha).await?, author.to_string()));
+    }
+    Some(prints)
+}
+
+/// `git patch-id --stable` of one commit, identical for the same change on another base
+async fn patch_id(dir: &std::path::Path, sha: &str) -> Option<String> {
+    use tokio::io::AsyncWriteExt;
+    let diff = git_output(dir, &["show", "--format=", sha]).await?;
+    let mut child = tokio::process::Command::new("git")
+        .args(["patch-id", "--stable"])
+        .current_dir(dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    stdin.write_all(diff.as_bytes()).await.ok()?;
+    stdin.write_all(b"\n").await.ok()?;
+    drop(stdin);
+    let out = child.wait_with_output().await.ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .map(String::from)
 }
 
 /// Record `head_sha` as approved and publish the approval on it: in app mode an App approval
@@ -417,13 +676,14 @@ async fn publish_carried_approval(
     repo: &str,
     task_id: &str,
     pr_number: u64,
+    approval: &ApprovalEvent,
     head_sha: &str,
 ) {
-    let key = approved_sha_key(repo, task_id, pr_number);
-    if let Err(e) = store.kv_set(&key, head_sha).await {
-        tracing::warn!(task_id, err = %e, "failed to record the carried approval");
-        return;
-    }
+    let carried = ApprovalEvent {
+        sha: head_sha.to_string(),
+        ..approval.clone()
+    };
+    write_approval(store, task_id, pr_number, &carried).await;
     let note = "Approval carried across a base branch update";
     let app = review_app(repo).await;
     // A ruleset that dismisses stale approvals needs an App approval on the new head too
@@ -457,6 +717,35 @@ async fn publish_carried_approval(
         head_sha,
         "approval carried across a base branch update"
     );
+}
+
+/// Trimmed stdout of a git command, `None` when it fails
+async fn git_output(dir: &std::path::Path, args: &[&str]) -> Option<String> {
+    let out = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// True when `head` holds exactly the tree of a conflict-free merge of `approved` and `base_parent`
+async fn is_clean_merge(
+    dir: &std::path::Path,
+    approved: &str,
+    base_parent: &str,
+    head: &str,
+) -> bool {
+    let merged = git_output(dir, &["merge-tree", "--write-tree", approved, base_parent]).await;
+    let head_tree = git_output(dir, &["rev-parse", &format!("{head}^{{tree}}")]).await;
+    match (merged, head_tree) {
+        (Some(merged), Some(head_tree)) => merged.lines().next() == Some(head_tree.as_str()),
+        _ => false,
+    }
 }
 
 /// The second parent of a merge of `approved` with another commit, the commit to check against the base
@@ -2325,7 +2614,16 @@ async fn apply_review_decision(
 
     match &parsed.decision {
         ReviewDecision::Approve { .. } => {
-            record_approved_sha(store, repo, &task.id.0, ctx.pr_number, &ctx.worktree_path).await;
+            record_approved_sha(
+                store,
+                repo,
+                &task.id.0,
+                ctx.pr_number,
+                &ctx.worktree_path,
+                &ctx.branch_name,
+                &ctx.default_branch,
+            )
+            .await;
             // Always attempt auto-merge on approval. Tasks are only marked
             // Done when the PR is actually merged (detected by review_poll).
             // Never mark Done on approval alone — that closes the issue
@@ -3818,6 +4116,176 @@ mod tests {
         assert!(!approval_covers_head(Some(""), Some("")));
     }
 
+    fn pr_for(
+        head_repo: Option<&str>,
+        head: &str,
+        base: &str,
+    ) -> crate::github::types::GitHubPullRequest {
+        serde_json::from_value(serde_json::json!({
+            "number": 7,
+            "title": "t",
+            "state": "open",
+            "head": {"ref": head, "sha": "h", "repo": head_repo.map(|r| serde_json::json!({"full_name": r}))},
+            "base": {"ref": base, "sha": "b"},
+            "html_url": "https://github.com/owner/repo/pull/7",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_carried_approval_must_match_the_approved_repo_branch_and_base() {
+        let approval = ApprovalEvent {
+            sha: "a".into(),
+            repo: "owner/repo".into(),
+            branch: "gh-issue-1".into(),
+            base: "main".into(),
+        };
+        let ok = pr_for(Some("owner/repo"), "gh-issue-1", "main");
+        assert!(pr_matches_approval(&ok, &approval, "gh-issue-1"));
+        assert!(!pr_matches_approval(
+            &pr_for(Some("fork/repo"), "gh-issue-1", "main"),
+            &approval,
+            "gh-issue-1"
+        ));
+        assert!(!pr_matches_approval(
+            &pr_for(None, "gh-issue-1", "main"),
+            &approval,
+            "gh-issue-1"
+        ));
+        assert!(!pr_matches_approval(
+            &pr_for(Some("owner/repo"), "other", "main"),
+            &approval,
+            "gh-issue-1"
+        ));
+        assert!(!pr_matches_approval(
+            &pr_for(Some("owner/repo"), "gh-issue-1", "release"),
+            &approval,
+            "gh-issue-1"
+        ));
+        assert!(!pr_matches_approval(&ok, &approval, "another-task-branch"));
+
+        let legacy = ApprovalEvent::parse("abc123").unwrap();
+        assert_eq!(legacy.sha, "abc123");
+        assert!(!pr_matches_approval(&ok, &legacy, "gh-issue-1"));
+        let json = serde_json::to_string(&approval).unwrap();
+        assert_eq!(ApprovalEvent::parse(&json), Some(approval));
+        assert_eq!(ApprovalEvent::parse("  "), None);
+    }
+
+    #[tokio::test]
+    async fn only_the_same_commits_rebased_onto_the_base_carry_the_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=agent",
+                    "-c",
+                    "user.email=agent@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(path)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let write_commit = |file: &str, body: &str| {
+            std::fs::write(path.join(file), body).unwrap();
+            git(&["add", file]);
+            git(&["commit", "-q", "-m", body]);
+        };
+        git(&["init", "-q", "-b", "main"]);
+        write_commit("a", "base");
+        git(&["checkout", "-q", "-b", "pr"]);
+        write_commit("b", "first");
+        write_commit("c", "second");
+        let approved = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "main"]);
+        write_commit("d", "base moved");
+        git(&["checkout", "-q", "-b", "rebased", &approved]);
+        git(&["rebase", "-q", "main"]);
+        let rebased = git(&["rev-parse", "HEAD"]);
+        assert!(same_commits_rebased(path, &approved, "main", &rebased).await);
+
+        // A changed patch on top of the rebase is not the approved change
+        write_commit("c", "second, changed");
+        let changed = git(&["rev-parse", "HEAD"]);
+        assert!(!same_commits_rebased(path, &approved, "main", &changed).await);
+
+        // The same patches under another author are not the approved commits
+        git(&["checkout", "-q", "-b", "other-author", &rebased]);
+        git(&[
+            "-c",
+            "user.name=someone",
+            "-c",
+            "user.email=someone@t",
+            "commit",
+            "-q",
+            "--amend",
+            "--reset-author",
+            "--no-edit",
+        ]);
+        let reauthored = git(&["rev-parse", "HEAD"]);
+        assert!(!same_commits_rebased(path, &approved, "main", &reauthored).await);
+    }
+
+    #[tokio::test]
+    async fn only_a_clean_merge_of_the_base_counts_as_base_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(path)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let commit = |file: &str, msg: &str| {
+            std::fs::write(path.join(file), msg).unwrap();
+            git(&["add", file]);
+            git(&["commit", "-q", "-m", msg]);
+            git(&["rev-parse", "HEAD"])
+        };
+        git(&["init", "-q", "-b", "main"]);
+        commit("a", "base");
+        git(&["checkout", "-q", "-b", "pr"]);
+        let approved = commit("b", "approved change");
+        git(&["checkout", "-q", "main"]);
+        let base_tip = commit("c", "base moved");
+        git(&["checkout", "-q", "pr"]);
+        git(&["merge", "-q", "--no-edit", "main"]);
+        let clean = git(&["rev-parse", "HEAD"]);
+        assert!(is_clean_merge(path, &approved, &base_tip, &clean).await);
+
+        std::fs::write(path.join("d"), "unreviewed").unwrap();
+        git(&["add", "d"]);
+        git(&["commit", "-q", "--amend", "--no-edit"]);
+        let forged = git(&["rev-parse", "HEAD"]);
+        assert!(!is_clean_merge(path, &approved, &base_tip, &forged).await);
+    }
+
     #[test]
     fn only_a_merge_of_the_approved_commit_carries_the_approval() {
         let parents = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -3856,14 +4324,16 @@ mod tests {
         let repo = "owner/repo";
         let task_id = "3783";
 
-        record_approved_sha(&store, repo, task_id, 77, wt).await;
-        let recorded = store
-            .kv_get(&approved_sha_key(repo, task_id, 77))
+        record_approved_sha(&store, repo, task_id, 77, wt, "gh-issue-3783", "main").await;
+        let recorded = read_approval(&store, repo, task_id, 77)
             .await
             .unwrap()
             .expect("approval must be recorded");
+        assert_eq!(recorded.repo, repo);
+        assert_eq!(recorded.branch, "gh-issue-3783");
+        assert_eq!(recorded.base, "main");
         assert_eq!(
-            recorded,
+            recorded.sha,
             worktree_head_sha(wt).await.unwrap(),
             "the recorded sha must be the commit that was pushed to the PR"
         );
