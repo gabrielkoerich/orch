@@ -166,6 +166,8 @@ orch cooldown clear <key>   # clear one cooldown (claude or claude:sonnet) and t
 orch cooldown clear --all   # clear every cooldown and every agent's rate-limit window
 ```
 
+The running service picks a clear up on its next tick. That includes the GitHub 5xx circuit breaker: a cleared `cooldown:github:5xx` closes it and empties its error window.
+
 ## Codex Sandbox Notes
 
 Codex runs under the `exec` subcommand. The sandbox flag depends on `workflow.permissions.mode` and `workflow.permissions.sandbox`:

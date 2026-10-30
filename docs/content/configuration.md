@@ -152,6 +152,12 @@ Orch resolves GitHub tokens in this order — the first match wins:
 
 The simplest setup is just `gh auth login`. No extra config needed.
 
+### Git
+
+orch's own git calls (fetches, rebases, pushes, `ls-remote`, skill clones) all start from one helper, `git_ops::git()`. It reaches github.com over HTTPS with the same token, whether the remote is SSH or HTTPS, and sets `commit.gpgsign=false` and `tag.gpgsign=false`, so orch never asks for your SSH key or signing key. The settings are environment variables of that one process: no remote and no `.git/config` changes, and your own commits keep your signing.
+
+Agents commit as `git.name` / `git.email` (default `<agent>[bot]`), without signing. Their shell pushes over HTTPS with gh's credentials (`pushInsteadOf`), and agents may not change remotes or `url.*` rules, since a worktree shares `.git/config` with your checkout.
+
 ### Environment Variables
 
 ```bash
@@ -201,7 +207,7 @@ review:
 | `comment` | a `## Automated Review` comment | the `orch/review` commit status |
 | `app` | a real `APPROVE` or `REQUEST_CHANGES` review from the App, with each issue on a changed line as an inline comment | the `orch/review` check run from the App, `in_progress` while the review runs, then `success` or `failure` |
 
-Both modes post the `## Automated Review` comment, and the gate reads it when the App has no review on the head. A review and the check run belong to the head sha the agent reviewed, so a new push makes the PR pending again. Issues on lines outside the diff stay in the review body, since GitHub refuses an inline comment there. A project in `app` mode whose repository does not have the App installed, or a daemon whose App key is not read yet, reviews in `comment` mode.
+In `app` mode the App review is the decision and no comment is posted. The `## Automated Review` comment goes out only when GitHub refuses the App review, and the gate reads it when the App has no review on the head. A review and the check run belong to the head sha the agent reviewed, so a new push makes the PR pending again, except a base update orch makes in `approved`, which carries the approval (see [Review Agent](@/review-agent.md)). Issues on lines outside the diff stay in the review body, since GitHub refuses an inline comment there. A project in `app` mode whose repository does not have the App installed, or a daemon whose App key is not read yet, reviews in `comment` mode.
 
 ## Cluster
 
