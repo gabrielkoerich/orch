@@ -1,12 +1,12 @@
 # Ideas from infinity — Plan
 
-Status: plan, 2026-10-29. Six changes taken from [hydro-project/infinity](https://github.com/hydro-project/infinity), an agent runtime with its own model loop. Infinity solves a different problem, since orch drives CLI agents that run their own loops, so most of its design does not carry over. These six do. Line numbers are from `main` at v0.93.3.
+Status: plan, 2026-10-29. Six changes taken from [hydro-project/infinity](https://github.com/hydro-project/infinity), an agent runtime with its own model loop. Infinity solves a different problem, since orch drives CLI agents that run their own loops, so most of its design does not carry over. These six do. Line numbers are from `main` at v0.98.0.
 
 | # | Idea | Size | Files |
 |---|------|------|-------|
 | 1 | A re-run parent sees what its children did | Small | `src/engine/runner/context.rs`, `prompts/agent_system.md` |
 | 2 | A delegated task cannot delegate again | Tiny | `src/engine/runner/mod.rs`, `src/engine/runner/context.rs` |
-| 3 | Each instruction file is inlined once | Tiny | `src/engine/runner/context.rs` |
+| 3 | Each instruction file is inlined once | Done in #3871 | `src/engine/runner/context.rs` |
 | 4 | An agent asks for sandbox permission through the channels | Medium | `src/parser.rs`, `src/engine/runner/sandbox.rs`, `src/engine/runner/mod.rs`, `src/engine/channel_handler.rs`, a new migration |
 | 5 | A fatal agent error ends the run when it is printed | Medium | `src/engine/runner/session.rs`, `src/engine/runner/agents/mod.rs` |
 | 6 | A live diff for each running task | Small | `src/channels/capture.rs`, `src/engine/events.rs`, `src/cli/stream.rs` |
@@ -17,7 +17,7 @@ None of them adds a token or cost budget, a per-model case, a routing timer, an 
 
 **Infinity:** a child thread ends with `report_to_parent` or `close_thread(report)`, and the runtime puts the report into the parent's history as a tool result (`docs/docs/infinity-runtime/built-in/threading.md`).
 
-**Orch today:** `process_delegations` (`src/engine/runner/mod.rs:1595`) creates one issue per delegation and blocks the parent. The tick sets the parent back to `New` when every child is done (`src/engine/tick.rs:2674`). The prompt promises "you will be re-run after all subtasks complete" (`prompts/agent_system.md:128`). On that re-run, `build_full_context` (`context.rs:386`) gives a task its parent and siblings through `build_parent_context` (`context.rs:53`), but nothing gives a parent its children.
+**Orch today:** `process_delegations` (`src/engine/runner/mod.rs:1605`) creates one issue per delegation and blocks the parent. The tick sets the parent back to `New` when every child is done (`src/engine/tick.rs:2649`). The prompt promises "you will be re-run after all subtasks complete" (`prompts/agent_system.md:128`). On that re-run, `build_full_context` (`context.rs:396`) gives a task its parent and siblings through `build_parent_context` (`context.rs:53`), but nothing gives a parent its children.
 
 **Change:**
 
@@ -34,7 +34,7 @@ None of them adds a token or cost budget, a per-model case, a routing timer, an 
 
 **Infinity:** `spawn_thread` takes `child_of` and refuses the call unless it matches the caller's full thread stack, so a child that inherited its parent's plan cannot re-run the parent's spawns (`crates/infinity-agent-core/src/tools/thread.rs`).
 
-**Orch today:** `process_delegations` (`mod.rs:1595`) accepts delegations from any task. Its only guard is an exact title match against open tasks (`mod.rs:1609-1625`). A child can delegate again, and a reworded title passes the check.
+**Orch today:** `process_delegations` (`mod.rs:1605`) accepts delegations from any task. Its only guard is an exact title match against open tasks (`mod.rs:1626`). A child can delegate again, and a reworded title passes the check.
 
 **Change:**
 
@@ -51,9 +51,9 @@ None of them adds a token or cost budget, a per-model case, a routing timer, an 
 
 **Infinity:** a steering server lists the instruction files and the agent loads them on demand (`crates/rap-steering-server/src/lib.rs`).
 
-**Orch today:** `build_project_instructions` (`context.rs:127`) reads `CLAUDE.md`, `AGENTS.md` and `README.md` and inlines every one it finds. In this repository `CLAUDE.md` is a symlink to `AGENTS.md`, which is 45 KB, so every task prompt carries the same 45 KB twice.
+**Done in #3871.** `build_project_instructions` (`context.rs:127`) read `CLAUDE.md`, `AGENTS.md` and `README.md` and inlined every one it found. In this repository `CLAUDE.md` is a symlink to `AGENTS.md`, which is 45 KB, so every task prompt carried the same 45 KB twice. It now resolves each path with `canonicalize` and skips a real path it already included.
 
-**Change:** in `context.rs`, resolve each path with `canonicalize` and skip a file whose real path, or whose content, was already included. A test with a symlinked `CLAUDE.md` checks that the content appears once.
+**Left:** two separate files with the same content are both still inlined. Skipping a file whose content hash was already included would cover that, but no project is known to have such copies, so it waits until one does.
 
 **Why it is better:** the prompt stops repeating a 45 KB file for every task, and so does any project that symlinks one name to the other, a common setup.
 
@@ -73,7 +73,7 @@ None of them adds a token or cost budget, a per-model case, a routing timer, an 
 **Change:**
 
 - `src/parser.rs`: `AgentResponse` (`parser.rs:18`) gets an optional `sandbox_request` with the paths and a reason. `prompts/agent_system.md` tells a sandboxed agent to use it, with `blocked`, after a denied write it cannot work around.
-- A new migration, `030_sandbox_grants.sql`, with a `sandbox_grants` table (task, path, scope, granted_at), and its line in `migrations/checksums.txt`.
+- A new migration, `032_sandbox_grants.sql`, with a `sandbox_grants` table (task, path, scope, granted_at), and its line in `migrations/checksums.txt`.
 - `src/engine/runner/mod.rs`: a response with a `sandbox_request` blocks the task with the paths in `block_reason`, and posts the request to the task's channels.
 - `src/engine/channel_handler.rs`: buttons for approve once, approve for this task and deny, as `buttons_for_picker` builds for the repo picker. Approving saves the grant and sets the task back to `routed`.
 - `src/engine/runner/sandbox.rs`: `argv` reads the task's grants and adds the paths to `writable`. A grant cannot reach a hidden path, the git hooks or config, or `~/.orch`. Those stay refused, and the request says why.
@@ -88,7 +88,7 @@ None of them adds a token or cost budget, a per-model case, a routing timer, an 
 
 **Infinity:** observers get each event as it happens, typed: text, a tool call, usage, an error (`docs/docs/infinity-runtime/agent-systems/observers.md`).
 
-**Orch today:** `run_agent_session` (`src/engine/runner/session.rs:26`) waits for tmux to finish (`session.rs:67`), and only then parses the output with the agent's `classify_error` (`agents/mod.rs:887`). A CLI that prints a usage limit, an auth failure or `model not found` and then hangs is caught only by silence detection or the task timeout. Its slot and the time are spent until then.
+**Orch today:** `run_agent_session` (`src/engine/runner/session.rs:26`) waits for tmux to finish (`session.rs:67`), and only then parses the output with the agent's `classify_error` (`agents/mod.rs:893`). A CLI that prints a usage limit, an auth failure or `model not found` and then hangs is caught only by silence detection or the task timeout. Its slot and the time are spent until then.
 
 **Change:**
 
@@ -106,7 +106,7 @@ None of them adds a token or cost budget, a per-model case, a routing timer, an 
 
 **Infinity:** after each command the sandbox pushes a diff view of the thread's changes, keeps the latest one, and replays it to a client that attaches (`docs/docs/rap/spec/server/view-updates.md`).
 
-**Orch today:** an operator follows a running agent with `orch task watch <id>` (`src/main.rs:795`), `orch stream`, or tmux pane capture (`src/channels/capture.rs`). `orch task watch` runs the same code as `orch stream`, `cli::stream::run` (`main.rs:1268`), and also follows the review. `orch log watch` follows the service's own log with `tail -f` (`src/cli/mod.rs:152`). All of them show what the agent or orch prints. None of them shows the files an agent changed.
+**Orch today:** an operator follows a running agent with `orch task watch <id>` (`src/main.rs:842`), `orch stream`, or tmux pane capture (`src/channels/capture.rs`). `orch task watch` runs the same code as `orch stream`, `cli::stream::run` (`main.rs:1324`), and also follows the review. `orch log watch` follows the service's own log with `tail -f` (`src/cli/mod.rs:153`). All of them show what the agent or orch prints. None of them shows the files an agent changed.
 
 **Change:**
 
@@ -122,7 +122,7 @@ None of them adds a token or cost budget, a per-model case, a routing timer, an 
 
 ## Order
 
-1 to 3 first. They are small, independent and verified against the code. Then 5, then 4 and 6. 4 matters once `workflow.sandbox: os` is on for real projects, and 6 is a convenience.
+1 and 2 first. They are small, independent and verified against the code. 3 is done. Then 5, then 4 and 6. 4 matters once `workflow.sandbox: os` is on for real projects, and 6 is a convenience.
 
 ## Not taken
 
