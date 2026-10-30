@@ -533,7 +533,10 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
         String::new()
     };
     let agent_cmd = runner.build_command(
-        inv.model.as_deref(),
+        inv.model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty()),
         &timeout_cmd,
         &sys_file.to_string_lossy(),
         &msg_file.to_string_lossy(),
@@ -834,7 +837,10 @@ fn build_runner_script_in_dir(
         String::new()
     };
     let agent_cmd = runner.build_command(
-        inv.model.as_deref(),
+        inv.model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty()),
         &timeout_cmd,
         &sys_file.to_string_lossy(),
         &msg_file.to_string_lossy(),
