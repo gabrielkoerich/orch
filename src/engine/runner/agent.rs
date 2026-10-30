@@ -268,6 +268,8 @@ pub struct AgentInvocation {
     pub agent: String,
     /// Model override (e.g., "claude-sonnet-4-6", "o3", "gpt-4.1")
     pub model: Option<String>,
+    /// Optional native CLI effort from the selected route.
+    pub reasoning_effort: Option<String>,
     /// Working directory
     pub work_dir: PathBuf,
     /// System prompt content
@@ -532,11 +534,12 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
     } else {
         String::new()
     };
-    let agent_cmd = runner.build_command(
+    let agent_cmd = runner.build_command_with_effort(
         inv.model
             .as_deref()
             .map(str::trim)
             .filter(|m| !m.is_empty()),
+        inv.reasoning_effort.as_deref(),
         &timeout_cmd,
         &sys_file.to_string_lossy(),
         &msg_file.to_string_lossy(),
@@ -836,11 +839,12 @@ fn build_runner_script_in_dir(
     } else {
         String::new()
     };
-    let agent_cmd = runner.build_command(
+    let agent_cmd = runner.build_command_with_effort(
         inv.model
             .as_deref()
             .map(str::trim)
             .filter(|m| !m.is_empty()),
+        inv.reasoning_effort.as_deref(),
         &timeout_cmd,
         &sys_file.to_string_lossy(),
         &msg_file.to_string_lossy(),
@@ -883,6 +887,7 @@ mod tests {
         AgentInvocation {
             agent: "claude".to_string(),
             model: None,
+            reasoning_effort: None,
             work_dir: PathBuf::from("/tmp"),
             system_prompt: "test system prompt".to_string(),
             agent_message: "test message".to_string(),

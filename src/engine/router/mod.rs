@@ -15,6 +15,7 @@
 pub mod config;
 mod llm;
 mod ollama;
+pub mod profiles;
 mod selection;
 mod strategies;
 pub mod weights;
@@ -135,6 +136,9 @@ pub struct AgentProfile {
     pub tools: Vec<String>,
     /// Constraints for this task
     pub constraints: Vec<String>,
+    /// The model/effort choice associated with this route, cleared on failover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<profiles::NamedProfile>,
 }
 
 impl AgentProfile {
@@ -145,6 +149,7 @@ impl AgentProfile {
             skills: vec![],
             tools: config.allowed_tools.clone(),
             constraints: vec![],
+            execution: None,
         }
     }
 }
@@ -747,6 +752,15 @@ impl Router {
                 }
             };
 
+            // Named profiles select a route after dependencies and stored recovery.
+            if store_agent.is_none() {
+                if let Some(result) = self.route_profile(task)? {
+                    self.log_route_activity(store, repo, &task.id.0, &result, None)
+                        .await;
+                    return Ok(result);
+                }
+            }
+
             // 2. Fall back to explicit agent label
             let resolved_agent = store_agent.or_else(|| {
                 strategies::extract_agent_from_labels(&self.config.agents, &task.labels)
@@ -847,7 +861,7 @@ impl Router {
             }
 
             // 3. Round-robin mode — use stateful round-robin
-            if self.config.mode == "round_robin" {
+            if self.config.mode == "round_robin" || self.config.mode == "profile" {
                 tracing::debug!(task_id = %task.id.0, "routing via round-robin mode");
                 let result = strategies::route_via_round_robin_stateful(
                     &candidates,
@@ -1493,6 +1507,10 @@ impl Router {
                         ("complexity", serde_json::json!(result.complexity)),
                         ("route_reason", serde_json::json!(result.reason)),
                         (
+                            "agent_profile",
+                            serde_json::json!(serde_json::to_string(&result.profile)?),
+                        ),
+                        (
                             "model",
                             serde_json::json!(result.model.as_deref().unwrap_or("")),
                         ),
@@ -1535,6 +1553,10 @@ pub async fn get_route_result(
 
     let reason = task.route_reason.clone();
     let model = task.model.clone().filter(|m| !m.is_empty());
+    let mut profile: AgentProfile = serde_json::from_str(&task.agent_profile).unwrap_or_default();
+    profile.execution = profile
+        .execution
+        .filter(|p| p.matches_route(&agent, model.as_deref()));
 
     // Validate that the stored model is valid for the resolved agent.
     // Agent-specific aliases (e.g. "opus") can leak across agents during
@@ -1551,7 +1573,11 @@ pub async fn get_route_result(
         if all_pools.is_empty() {
             return true;
         }
-        let valid = all_pools.iter().any(|pool| pool.contains(m));
+        let valid = all_pools.iter().any(|pool| pool.contains(m))
+            || profile
+                .execution
+                .as_ref()
+                .is_some_and(|p| p.matches_route(&agent, Some(m)));
         if !valid {
             tracing::warn!(
                 task_id,
@@ -1598,7 +1624,7 @@ pub async fn get_route_result(
         complexity,
         estimate: 0,
         reason,
-        profile: AgentProfile::default(),
+        profile,
         selected_skills: vec![],
         warning: None,
     })
@@ -1801,6 +1827,7 @@ mod tests {
                 skills: vec!["rust".to_string()],
                 tools: vec!["git".to_string()],
                 constraints: vec![],
+                execution: None,
             },
             selected_skills: vec!["gh".to_string()],
             warning: None,
@@ -2266,6 +2293,7 @@ Hope that helps!"#;
             skills: vec!["api".to_string()],
             tools: vec![],
             constraints: vec![],
+            execution: None,
         };
         let warning = router.check_routing_sanity(&task, "claude", &profile);
         assert!(warning.is_some());

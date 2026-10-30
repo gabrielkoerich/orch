@@ -467,6 +467,7 @@ mod tests {
         let inv = AgentInvocation {
             agent: "claude".to_string(),
             model: None,
+            reasoning_effort: None,
             work_dir: PathBuf::from("/nonexistent/work"),
             system_prompt: String::new(),
             agent_message: String::new(),

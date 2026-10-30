@@ -339,6 +339,11 @@ pub async fn prepare_task(
     let invocation = agent::AgentInvocation {
         agent: agent_name.clone(),
         model: model_name.clone(),
+        reasoning_effort: route_result
+            .as_ref()
+            .and_then(|r| r.profile.execution.as_ref())
+            .filter(|p| p.matches_route(&agent_name, model_name.as_deref()))
+            .and_then(|p| p.effort.clone()),
         work_dir: wt.work_dir.clone(),
         system_prompt,
         agent_message,

@@ -158,6 +158,7 @@ impl OllamaRouter {
                 llm_response.profile.tools
             },
             constraints: llm_response.profile.constraints,
+            execution: None,
         };
         for tool in &config.allowed_tools {
             if !profile.tools.contains(tool) {

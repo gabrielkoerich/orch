@@ -237,6 +237,29 @@ impl AgentRunner for CodexRunner {
         msg_file: &str,
         permissions: &PermissionRules,
     ) -> String {
+        self.build_command_with_effort(model, None, timeout_cmd, sys_file, msg_file, permissions)
+    }
+
+    fn build_command_with_effort(
+        &self,
+        model: Option<&str>,
+        effort: Option<&str>,
+        timeout_cmd: &str,
+        sys_file: &str,
+        msg_file: &str,
+        permissions: &PermissionRules,
+    ) -> String {
+        let effort_flag = effort
+            .map(|e| {
+                format!(
+                    "-c {} ",
+                    super::shell_single_quote(&format!(
+                        "model_reasoning_effort={}",
+                        serde_json::json!(e)
+                    ))
+                )
+            })
+            .unwrap_or_default();
         let model_flag = model
             .map(|m| format!("--model {}", super::shell_single_quote(m)))
             .unwrap_or_default();
@@ -292,7 +315,7 @@ impl AgentRunner for CodexRunner {
         format!(
             r#"{timeout_cmd} codex {model_flag} \
   exec \
-  -c 'sandbox_workspace_write.network_access=true' \
+  {effort_flag}-c 'sandbox_workspace_write.network_access=true' \
   -c 'shell_environment_policy.inherit=all' \
   {permission_flags} {add_dir_flags} --json - < <(cat "{sys_file}" "{msg_file}")"#,
             sys_file = sys_file,

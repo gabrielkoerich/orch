@@ -858,6 +858,19 @@ pub trait AgentRunner: Send + Sync {
         permissions: &PermissionRules,
     ) -> String;
 
+    /// Build a routed invocation with an optional native reasoning effort.
+    fn build_command_with_effort(
+        &self,
+        model: Option<&str>,
+        _effort: Option<&str>,
+        timeout_cmd: &str,
+        sys_file: &str,
+        msg_file: &str,
+        permissions: &PermissionRules,
+    ) -> String {
+        self.build_command(model, timeout_cmd, sys_file, msg_file, permissions)
+    }
+
     /// Parse raw stdout into a ParsedResponse.
     ///
     /// Returns `Ok(ParsedResponse)` on success, `Err(AgentError)` if the
