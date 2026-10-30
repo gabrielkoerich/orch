@@ -33,7 +33,9 @@ pub(crate) async fn table_rows(
     let cols = columns(&mut conn, table).await?;
     let refs: Vec<&String> = cols.iter().collect();
     let sql = format!("SELECT {} FROM {table} ORDER BY rowid", json_row_sql(&refs));
-    let rows: Vec<(String,)> = sqlx::query_as(&sql).fetch_all(&mut *conn).await?;
+    let rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(&mut *conn)
+        .await?;
     rows.into_iter()
         .map(|(r,)| Ok(serde_json::from_str(&r)?))
         .collect()
@@ -45,7 +47,7 @@ pub(crate) async fn replace_table(
     rows: &[serde_json::Value],
 ) -> anyhow::Result<()> {
     let allowed = columns(conn, table).await?;
-    sqlx::query(&format!("DELETE FROM {table}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table}")))
         .execute(&mut *conn)
         .await?;
     for row in rows {
@@ -69,7 +71,7 @@ pub(crate) async fn replace_table(
             cols.join(", "),
             values.join(", ")
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(serde_json::to_string(row)?)
             .execute(&mut *conn)
             .await?;

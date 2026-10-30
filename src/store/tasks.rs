@@ -704,17 +704,17 @@ impl TaskStore {
     ) -> anyhow::Result<Vec<TaskActivity>> {
         let rows = if let Some(limit) = limit {
             let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SELECT {TASK_ACTIVITY_COLS} FROM task_activity WHERE task_id = ? ORDER BY timestamp ASC, id ASC LIMIT ?"
-            ))
+            )))
             .bind(task_id)
             .bind(limit_i64)
             .fetch_all(&self.pool)
             .await?
         } else {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SELECT {TASK_ACTIVITY_COLS} FROM task_activity WHERE task_id = ? ORDER BY timestamp ASC, id ASC"
-            ))
+            )))
             .bind(task_id)
             .fetch_all(&self.pool)
             .await?
@@ -766,11 +766,13 @@ impl TaskStore {
 
     /// Get a task by its internal ID.
     pub async fn get(&self, id: i64) -> anyhow::Result<Task> {
-        let row = sqlx::query(&format!("SELECT {TASK_COLS} FROM tasks WHERE id = ?"))
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?
-            .with_context(|| format!("task {id} not found"))?;
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {TASK_COLS} FROM tasks WHERE id = ?"
+        )))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .with_context(|| format!("task {id} not found"))?;
 
         Self::row_to_task(&row)
     }
@@ -781,9 +783,9 @@ impl TaskStore {
         repo: &str,
         ext_id: &str,
     ) -> anyhow::Result<Option<Task>> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND external_id = ?"
-        ))
+        )))
         .bind(repo)
         .bind(ext_id)
         .fetch_optional(&self.pool)
@@ -990,9 +992,9 @@ impl TaskStore {
         repo: &str,
         status: TaskStatus,
     ) -> anyhow::Result<Vec<Task>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND status = ? ORDER BY created_at DESC"
-        ))
+        )))
         .bind(repo)
         .bind(status.as_str())
         .fetch_all(&self.pool)
@@ -1003,9 +1005,9 @@ impl TaskStore {
 
     /// List tasks that are linked to the given parent task.
     pub async fn list_children(&self, repo: &str, parent_id: i64) -> anyhow::Result<Vec<Task>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND parent_id = ? ORDER BY created_at ASC"
-        ))
+        )))
         .bind(repo)
         .bind(parent_id)
         .fetch_all(&self.pool)
@@ -1021,7 +1023,7 @@ impl TaskStore {
         status: TaskStatus,
     ) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(
-            &format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND origin != 'internal' AND status = ? ORDER BY created_at DESC"),
+            sqlx::AssertSqlSafe(format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND origin != 'internal' AND status = ? ORDER BY created_at DESC")),
         )
         .bind(repo)
         .bind(status.as_str())
@@ -1043,7 +1045,7 @@ impl TaskStore {
         status: TaskStatus,
     ) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(
-        &format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND origin = 'internal' AND status = ? ORDER BY created_at DESC"),
+        sqlx::AssertSqlSafe(format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND origin = 'internal' AND status = ? ORDER BY created_at DESC")),
     )
     .bind(repo)
     .bind(status.as_str())
@@ -1056,7 +1058,7 @@ impl TaskStore {
     /// List all internal tasks for a repo (origin = 'internal').
     pub async fn list_all_internal(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(
-            &format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND origin = 'internal' ORDER BY created_at DESC"),
+            sqlx::AssertSqlSafe(format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND origin = 'internal' ORDER BY created_at DESC")),
         )
         .bind(repo)
         .fetch_all(&self.pool)
@@ -1073,7 +1075,7 @@ impl TaskStore {
         source: &str,
     ) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(
-            &format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND origin = 'internal' AND source = ? ORDER BY created_at DESC"),
+            sqlx::AssertSqlSafe(format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND origin = 'internal' AND source = ? ORDER BY created_at DESC")),
         )
         .bind(repo)
         .bind(source)
@@ -1117,7 +1119,7 @@ impl TaskStore {
     /// List all active (non-done) tasks for a repo.
     pub async fn list_active(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(
-            &format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND status != 'done' ORDER BY created_at DESC"),
+            sqlx::AssertSqlSafe(format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND status != 'done' ORDER BY created_at DESC")),
         )
         .bind(repo)
         .fetch_all(&self.pool)
@@ -1129,7 +1131,7 @@ impl TaskStore {
     /// List all external tasks for a repo (origin != 'internal').
     pub async fn list_all_external(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(
-            &format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND origin != 'internal' ORDER BY created_at DESC"),
+            sqlx::AssertSqlSafe(format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND origin != 'internal' ORDER BY created_at DESC")),
         )
         .bind(repo)
         .fetch_all(&self.pool)
@@ -1174,7 +1176,7 @@ impl TaskStore {
     /// Much cheaper than `list_all` on repos with many historical done tasks.
     pub async fn list_for_doctor(&self, repo: &str, cutoff_str: &str) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(
-            &format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND (status != 'done' OR updated_at >= ?) ORDER BY created_at DESC"),
+            sqlx::AssertSqlSafe(format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND (status != 'done' OR updated_at >= ?) ORDER BY created_at DESC")),
         )
         .bind(repo)
         .bind(cutoff_str)
@@ -1185,9 +1187,9 @@ impl TaskStore {
 
     /// List all tasks for a repo, ordered by creation time descending.
     pub async fn list_all(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {TASK_COLS} FROM tasks WHERE repo = ? ORDER BY created_at DESC"
-        ))
+        )))
         .bind(repo)
         .fetch_all(&self.pool)
         .await?;
@@ -1214,9 +1216,9 @@ impl TaskStore {
     /// Used by the CLI when no project context is available (e.g. running from
     /// a worktree without a `.orch.yml`). Does not require a repo argument.
     pub async fn list_all_active_global(&self) -> anyhow::Result<Vec<Task>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {TASK_COLS} FROM tasks WHERE status != 'done' ORDER BY created_at DESC"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(Self::row_to_task).collect()
@@ -1226,9 +1228,9 @@ impl TaskStore {
     ///
     /// Used by the CLI when `--status all` is passed.
     pub async fn list_all_global(&self) -> anyhow::Result<Vec<Task>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {TASK_COLS} FROM tasks ORDER BY created_at DESC"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(Self::row_to_task).collect()
@@ -1238,9 +1240,9 @@ impl TaskStore {
     ///
     /// Used by the CLI fallback path when no project context is available.
     pub async fn list_all_by_status_global(&self, status: TaskStatus) -> anyhow::Result<Vec<Task>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {TASK_COLS} FROM tasks WHERE status = ? ORDER BY created_at DESC"
-        ))
+        )))
         .bind(status.as_str())
         .fetch_all(&self.pool)
         .await?;
@@ -1548,7 +1550,7 @@ impl TaskStore {
             }
             set_parts.push("updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')".to_string());
             let sql = format!("UPDATE tasks SET {} WHERE id = ?", set_parts.join(", "));
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for v in &values {
                 query = query.bind(v.as_deref());
             }
@@ -1581,7 +1583,10 @@ impl TaskStore {
             let sql = format!(
                 "UPDATE tasks SET {field} = {field} + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?"
             );
-            sqlx::query(&sql).bind(*id).execute(&mut *tx).await?;
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+                .bind(*id)
+                .execute(&mut *tx)
+                .await?;
         }
         tx.commit().await?;
         Ok(())
@@ -1625,7 +1630,7 @@ impl TaskStore {
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          WHERE id IN ({placeholders})",
             );
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(*id);
             }
@@ -1656,7 +1661,7 @@ impl TaskStore {
             let sql = format!(
                 "UPDATE tasks SET worktree_cleaned = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id IN ({placeholders})",
             );
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(*id);
             }
@@ -1691,14 +1696,14 @@ impl TaskStore {
     /// Test-only helper and used by cleanup tests.
     #[cfg(test)]
     pub async fn list_cleanable(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {TASK_COLS} FROM tasks
          WHERE repo = ?
            AND worktree != ''
            AND worktree_cleaned = 0
            AND status IN ('done', 'blocked')
          ORDER BY updated_at ASC"
-        ))
+        )))
         .bind(repo)
         .fetch_all(&self.pool)
         .await?;
@@ -1950,9 +1955,9 @@ impl TaskStore {
 
     /// Get all runs for a task, ordered by attempt.
     pub async fn get_runs(&self, task_id: i64) -> anyhow::Result<Vec<TaskRun>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {TASK_RUN_COLS} FROM task_runs WHERE task_id = ? ORDER BY attempt ASC, run_type ASC"
-        ))
+        )))
         .bind(task_id)
         .fetch_all(&self.pool)
         .await?;
@@ -1981,7 +1986,7 @@ impl TaskStore {
             let sql = format!(
                 "SELECT {TASK_RUN_COLS} FROM task_runs WHERE task_id IN ({placeholders}) ORDER BY task_id ASC, attempt ASC, run_type ASC"
             );
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(*id);
             }
@@ -2012,7 +2017,7 @@ impl TaskStore {
         for chunk in ids.chunks(CHUNK_SIZE) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
             let sql = format!("SELECT {TASK_COLS} FROM tasks WHERE id IN ({placeholders})");
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(*id);
             }
@@ -2045,7 +2050,7 @@ impl TaskStore {
             let sql = format!(
                 "SELECT external_id, status FROM tasks WHERE repo = ? AND external_id IN ({placeholders})"
             );
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             query = query.bind(repo);
             for id in chunk {
                 query = query.bind(id);
@@ -2087,9 +2092,9 @@ impl TaskStore {
         task_id: i64,
         run_type: &str,
     ) -> anyhow::Result<Option<TaskRun>> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT {TASK_RUN_COLS} FROM task_runs WHERE task_id = ? AND run_type = ? ORDER BY attempt DESC LIMIT 1"
-    ))
+    )))
     .bind(task_id)
     .bind(run_type)
     .fetch_optional(&self.pool)
@@ -2664,7 +2669,9 @@ pub(crate) async fn replicated_rows(pool: &SqlitePool) -> anyhow::Result<Vec<ser
         super::replica::json_row_sql(&tomb),
         super::replica::json_row_sql(&full)
     );
-    let rows: Vec<(String,)> = sqlx::query_as(&sql).fetch_all(&mut *conn).await?;
+    let rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(&mut *conn)
+        .await?;
     rows.into_iter()
         .map(|(r,)| Ok(serde_json::from_str(&r)?))
         .collect()
@@ -2697,9 +2704,9 @@ pub(crate) async fn replace_replicated(
     }
 
     for table in ["task_runs", "task_activity"] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE task_id NOT IN (SELECT id FROM snapshot_ids)"
-        ))
+        )))
         .execute(&mut *conn)
         .await?;
     }
@@ -2732,7 +2739,7 @@ pub(crate) async fn replace_replicated(
             values.join(", "),
             updates.join(", ")
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(serde_json::to_string(row)?)
             .execute(&mut *conn)
             .await?;
@@ -2951,7 +2958,7 @@ pub(crate) mod apply {
         set_parts.push("updated_at = ?".to_string());
         values.push(Some(now.to_string()));
         let sql = format!("UPDATE tasks SET {} WHERE id = ?", set_parts.join(", "));
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
         for v in &values {
             query = query.bind(v.as_deref());
         }
@@ -2980,7 +2987,10 @@ pub(crate) mod apply {
         };
         let sql =
             format!("UPDATE tasks SET status = ?{clear_block}, updated_at = ? WHERE id = ?{guard}");
-        let mut query = sqlx::query(&sql).bind(status.as_str()).bind(now).bind(id);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(status.as_str())
+            .bind(now)
+            .bind(id);
         if let Some(expected) = expected {
             query = query.bind(expected.as_str());
         }
@@ -3064,7 +3074,7 @@ pub(crate) mod apply {
         }
 
         let sql = format!("UPDATE tasks SET {} WHERE id = ?", set_parts.join(", "));
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
         for v in &values {
             query = query.bind(v.as_deref());
         }
@@ -3085,7 +3095,11 @@ pub(crate) mod apply {
         let sql = format!(
             "UPDATE tasks SET {field} = {field} + 1, updated_at = ? WHERE id = ? RETURNING {field} AS val"
         );
-        let row = sqlx::query(&sql).bind(now).bind(id).fetch_one(conn).await?;
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(now)
+            .bind(id)
+            .fetch_one(conn)
+            .await?;
         let val: i32 = row.try_get("val")?;
         Ok(val.into())
     }
@@ -3121,7 +3135,11 @@ pub(crate) mod apply {
             updated_at = ?
          WHERE id = ?"
         );
-        sqlx::query(&sql).bind(now).bind(id).execute(conn).await?;
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(now)
+            .bind(id)
+            .execute(conn)
+            .await?;
         Ok(())
     }
 
@@ -3272,7 +3290,10 @@ mod row_to_task_tests {
             async fn $name() {
                 let (store, id) = store_with_task().await;
                 let sql = format!("{} WHERE id = {id}", $select);
-                let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+                let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+                    .fetch_one(store.pool())
+                    .await
+                    .unwrap();
                 let err = TaskStore::row_to_task(&row).unwrap_err();
                 assert!(
                     err.to_string().contains($col),
@@ -3339,7 +3360,10 @@ mod row_to_task_tests {
             "SELECT id, X'DEADBEEF' as repo, origin, title, body, status, \
              source, source_id, author, url FROM tasks WHERE id = {id}"
         );
-        let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
         let err = TaskStore::row_to_task(&row).unwrap_err();
         assert!(
             err.to_string().contains("repo"),
@@ -3371,7 +3395,10 @@ mod row_to_task_tests {
 
         // Inject an invalid UTF-8 BLOB as repo — try_get::<String> will fail.
         let sql = format!("UPDATE tasks SET repo = X'DEADBEEF' WHERE id = {id}");
-        sqlx::query(&sql).execute(store.pool()).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .execute(store.pool())
+            .await
+            .unwrap();
 
         let err = store.distinct_repos().await.unwrap_err();
         assert!(
@@ -3479,7 +3506,10 @@ mod row_to_task_tests {
             async fn $name() {
                 let (store, _task_id, run_id) = store_with_run().await;
                 let sql = format!($select, run_id = run_id);
-                let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+                let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+                    .fetch_one(store.pool())
+                    .await
+                    .unwrap();
                 let err = TaskStore::row_to_run(&row).unwrap_err();
                 assert!(
                     err.to_string().contains($col),
@@ -3541,7 +3571,10 @@ mod row_to_task_tests {
         let sql = format!(
             "SELECT X'DEADBEEF' as id, task_id, timestamp, event_type, from_status, to_status, agent, model, details FROM task_activity WHERE id = {activity_id}"
         );
-        let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
         let err = TaskStore::row_to_activity(&row).unwrap_err();
         assert!(
             err.to_string().contains("id"),
@@ -3555,7 +3588,10 @@ mod row_to_task_tests {
         let sql = format!(
             "SELECT id, X'DEADBEEF' as task_id, timestamp, event_type, from_status, to_status, agent, model, details FROM task_activity WHERE id = {activity_id}"
         );
-        let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
         let err = TaskStore::row_to_activity(&row).unwrap_err();
         assert!(
             err.to_string().contains("task_id"),
@@ -3569,7 +3605,10 @@ mod row_to_task_tests {
         let sql = format!(
             "SELECT id, task_id, X'DEADBEEF' as timestamp, event_type, from_status, to_status, agent, model, details FROM task_activity WHERE id = {activity_id}"
         );
-        let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
         let err = TaskStore::row_to_activity(&row).unwrap_err();
         assert!(
             err.to_string().contains("timestamp"),
@@ -3583,7 +3622,10 @@ mod row_to_task_tests {
         let sql = format!(
             "SELECT id, task_id, timestamp, X'DEADBEEF' as event_type, from_status, to_status, agent, model, details FROM task_activity WHERE id = {activity_id}"
         );
-        let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
         let err = TaskStore::row_to_activity(&row).unwrap_err();
         assert!(
             err.to_string().contains("event_type"),
@@ -3602,9 +3644,9 @@ mod row_to_task_tests {
             .execute(store.pool())
             .await
             .unwrap();
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {TASK_ACTIVITY_COLS} FROM task_activity WHERE task_id = {task_id} ORDER BY id DESC LIMIT 1"
-        ))
+        )))
         .fetch_one(store.pool())
         .await
         .unwrap();
@@ -3705,7 +3747,10 @@ mod row_to_task_tests {
              NULL as agent, NULL as model, details \
              FROM task_activity WHERE id = {activity_id}"
         );
-        let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
         let err = TaskStore::row_to_activity(&row).unwrap_err();
         assert!(
             err.to_string().contains("from_status"),
@@ -3722,7 +3767,10 @@ mod row_to_task_tests {
              NULL as agent, NULL as model, details \
              FROM task_activity WHERE id = {activity_id}"
         );
-        let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
         let err = TaskStore::row_to_activity(&row).unwrap_err();
         assert!(
             err.to_string().contains("to_status"),
@@ -3739,7 +3787,10 @@ mod row_to_task_tests {
              X'DeadbEEF' as agent, NULL as model, details \
              FROM task_activity WHERE id = {activity_id}"
         );
-        let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
         let err = TaskStore::row_to_activity(&row).unwrap_err();
         assert!(
             err.to_string().contains("agent"),
@@ -3756,7 +3807,10 @@ mod row_to_task_tests {
              NULL as agent, X'DeadbEEF' as model, details \
              FROM task_activity WHERE id = {activity_id}"
         );
-        let row = sqlx::query(&sql).fetch_one(store.pool()).await.unwrap();
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
         let err = TaskStore::row_to_activity(&row).unwrap_err();
         assert!(
             err.to_string().contains("model"),

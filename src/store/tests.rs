@@ -7515,3 +7515,18 @@ async fn a_store_write_waits_for_another_connection_lock() {
     release.await.unwrap();
     assert_eq!(store.get(id).await.unwrap().status, TaskStatus::Routed);
 }
+
+/// The bundled SQLite must stay at 3.54.0 or later, older releases have known memory-safety CVEs
+#[tokio::test]
+async fn bundled_sqlite_is_at_least_3_54() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let version: String = sqlx::query_scalar("select sqlite_version()")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    let parts: Vec<u32> = version.split('.').map(|p| p.parse().unwrap()).collect();
+    assert!(
+        (parts[0], parts[1]) >= (3, 54),
+        "bundled SQLite is {version}, need 3.54.0 or later"
+    );
+}
