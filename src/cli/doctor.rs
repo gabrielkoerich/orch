@@ -367,8 +367,9 @@ async fn run_checks(
                 }
             }
 
-            // Orphaned worktrees relative to active tasks only
-            check_orphaned_worktrees(&active_tasks, &mut findings).await;
+            // A done task still owns its worktree, so include every task here
+            let owners = store.list_all(repo).await?;
+            check_orphaned_worktrees(&owners, &mut findings).await;
         }
 
         if repos.len() > 1 && !findings.is_empty() {

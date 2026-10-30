@@ -1447,6 +1447,10 @@ pub(crate) async fn check_merged_prs(
             continue;
         }
 
+        if let Err(e) = cleanup_task_worktree(&task_id, repo, store).await {
+            tracing::warn!(task_id, err = %e, "worktree cleanup after merge failed");
+        }
+
         let comment = format!(
             "PR merged, marking task complete{}",
             crate::engine::orch_footer()

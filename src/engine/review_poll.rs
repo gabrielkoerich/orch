@@ -718,6 +718,10 @@ pub(crate) async fn review_open_prs(
                     .await
                 {
                     tracing::warn!(task_id, err = %e, "failed to update task status to done");
+                } else if let Err(e) =
+                    crate::engine::cleanup::cleanup_task_worktree(&task.id.0, repo, store).await
+                {
+                    tracing::warn!(task_id, err = %e, "worktree cleanup after merge failed");
                 }
             } else {
                 let is_conflicting = batch_data.mergeable == Some(false);
