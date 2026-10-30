@@ -264,6 +264,17 @@ pub async fn start_node(
     raft_db: &Path,
     cfg: NodeConfig,
 ) -> anyhow::Result<Node> {
+    let listener = tokio::net::TcpListener::bind(&cfg.addr).await?;
+    start_node_on(store, raft_db, cfg, listener).await
+}
+
+/// Like `start_node`, with a listener the caller already bound. `cfg.addr` is the address peers use
+pub async fn start_node_on(
+    store: &TaskStore,
+    raft_db: &Path,
+    cfg: NodeConfig,
+    listener: tokio::net::TcpListener,
+) -> anyhow::Result<Node> {
     let secret = Arc::new(cfg.secret);
     let raft_store = RaftStore::open(raft_db, store.clone()).await?;
     let (log, sm) = Adaptor::new(raft_store);
@@ -276,7 +287,6 @@ pub async fn start_node(
         secret: secret.clone(),
     };
     let raft = Raft::new(cfg.id, Arc::new(config), network, log, sm).await?;
-    let listener = tokio::net::TcpListener::bind(&cfg.addr).await?;
     let me = network::Hello {
         name: cfg.name,
         id: cfg.id,
