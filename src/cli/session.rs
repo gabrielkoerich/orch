@@ -628,6 +628,18 @@ mod tests {
     }
 
     #[test]
+    fn first_sentence_cuts_on_char_count_not_bytes() {
+        assert_eq!(first_sentence("ééééé", 3), "ééé…");
+        assert_eq!(first_sentence("ééé", 3), "ééé");
+    }
+
+    #[test]
+    fn first_sentence_without_terminator_keeps_whole_text() {
+        assert_eq!(first_sentence("  no terminator  ", 50), "no terminator");
+        assert_eq!(first_sentence("", 5), "");
+    }
+
+    #[test]
     fn format_num_thousands() {
         assert_eq!(format_num(1234567), "1,234,567");
         assert_eq!(format_num(999), "999");
