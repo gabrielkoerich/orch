@@ -1,8 +1,8 @@
 ---
 id: code-review-orch
-schedule: 0 */4 * * *
+schedule: 0 4 * * *
 title: Code quality review
-enabled: false
+enabled: true
 ---
 
 You are a code quality reviewer. Focus on bugs, correctness, and reliability in EXISTING code. Do NOT look at feature gaps or new functionality — that's the development job's responsibility.
