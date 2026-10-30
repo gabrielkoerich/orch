@@ -2077,24 +2077,24 @@ pub async fn serve() -> anyhow::Result<()> {
     let mut webhook_healthy: bool;
     let mut last_webhook_health_check = std::time::Instant::now();
     // Start webhook server if configured
-    let webhook_enabled = crate::config::get("webhook.enabled")
+    let webhook_enabled = crate::config::get_global("webhook.enabled")
         .map(|v| v == "true")
         .unwrap_or(false);
-    // A configured secret that cannot be read turns the webhook server off, never its signature check
-    let webhook_secret = match crate::config::get_global("webhook.secret") {
-        Ok(v) if webhook_enabled && !v.trim().is_empty() => {
-            crate::secret_ref::config_secret("webhook.secret")
-                .await
-                .ok()
-        }
-        _ => Some(String::new()),
+    // No readable secret keeps the webhook server off, it never accepts unsigned requests
+    let webhook_secret = if webhook_enabled {
+        crate::secret_ref::config_secret("webhook.secret")
+            .await
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    } else {
+        None
     };
-    let webhook_enabled = webhook_enabled && webhook_secret.is_some();
-    if webhook_secret.is_none() {
+    if webhook_enabled && webhook_secret.is_none() {
         tracing::error!(
-            "webhook.secret is set but could not be read, the webhook server stays off"
+            "webhook.enabled needs a readable webhook.secret, the webhook server stays off"
         );
     }
+    let webhook_enabled = webhook_enabled && webhook_secret.is_some();
     let webhook_secret = webhook_secret.unwrap_or_default();
 
     // Shared status updated by the server-spawn task and the health-check loop.

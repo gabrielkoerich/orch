@@ -58,7 +58,7 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `dispatch` | `degraded_rate_limit_threshold` | Rate-limit rows in that window that mark an agent degraded | `3` |
 | `dispatch` | `min_healthy_agents` | Below this many healthy agents, dispatch runs one task at a time | `2` |
 | `dispatch` | `sequential_delay_ms` | Delay between dispatches in that sequential mode | `1000` |
-| `webhook` | `enabled` | Start the local webhook receiver (HTTP) | `false` |
+| `webhook` | `enabled` | Start the local webhook receiver (HTTP). It needs a readable `webhook.secret`, without one the receiver stays off | `false` |
 | `webhook` | `port` | Webhook listener port | `8080` |
 | `webhook` | `secret` | HMAC secret for verifying GitHub webhook payloads | `""` |
 | `relay` | `url` | orch-relay base URL. orch connects out to `<url>/ws` and wakes the sync on each GitHub App event. Unset means off | `""` |
