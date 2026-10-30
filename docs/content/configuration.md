@@ -175,6 +175,8 @@ gh:
 
 ### GitHub App
 
+Creating the App, its permissions, installing it and the relay for events are in [GitHub App](@/github-app.md). This section is the config reference.
+
 The App posts reviews only: the `APPROVE` or `REQUEST_CHANGES` review with its inline comments, and the `orch/review` check run. Every other call, pushes, pull requests, comments, labels and reads, uses the owner's `gh` token, as agents do. GitHub refuses a review from a pull request's author, so the App must never open the pull requests it reviews.
 
 orch looks up the installation per repository (`GET /repos/{repo}/installation`), since your account and each organization are separate installations. On a repository the App is not installed on, reviews fall back to the `## Automated Review` comment. Without `gh.app.id`, orch behaves as before.

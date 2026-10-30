@@ -113,6 +113,24 @@ export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
 
 > **Important:** Orch never writes `GH_TOKEN` into runner scripts on disk. Tokens are injected into the tmux session environment at spawn time and exist only in process memory.
 
+### GitHub App (optional)
+
+A GitHub App gives orch real pull request reviews: an `APPROVE` or `REQUEST_CHANGES` review from the App's bot account, with inline comments and an `orch/review` check run. With a relay, the App's webhooks also reach orch as soon as GitHub sends them, so orch syncs at once instead of on the next 45 second poll. Everything else keeps using your `gh` token, and you stay the author of the pull requests.
+
+Short version: create the App (Pull requests and Checks, read and write), install it on your repositories, store its key in passbox, then:
+
+```yaml
+# ~/.orch/config.yml
+gh:
+  app:
+    id: "123456"
+    private_key: passbox:orch/github-app-pem
+review:
+  mode: app
+```
+
+The full setup, the permissions, the bot commit identity and the relay for events are in [docs/content/github-app.md](docs/content/github-app.md).
+
 ## CLI Reference
 
 ### Service Management
@@ -524,7 +542,7 @@ Install nextest: `cargo binstall cargo-nextest` (requires [cargo-binstall](https
 
 - [AGENTS.md](AGENTS.md) — Agent and developer notes (also exposed as `CLAUDE.md` via symlink)
 - [docs/architecture.md](docs/architecture.md) — System architecture and diagrams
-- [docs/content/](docs/content/) — User-facing reference: getting started, CLI, configuration, routing, jobs, channels, agents, alerting, GitHub sync, workflow
+- [docs/content/](docs/content/) — User-facing reference: getting started, CLI, configuration, routing, jobs, channels, agents, alerting, GitHub sync, GitHub App, workflow
 
 ## License
 

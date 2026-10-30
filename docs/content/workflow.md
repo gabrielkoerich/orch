@@ -65,7 +65,7 @@ The Rust engine ticks every `engine.tick_interval` seconds (default 10s). Each t
 5. **Unblock** — if all children of a blocked parent are `done`, resets parent to `new`
 6. **Jobs** — runs due scheduled jobs (cron, per-project)
 
-A separate **sync tick** (~45s) handles less-frequent operations. With `relay.url` set, each GitHub App event from orch-relay starts a sync at once (see [Configuration](@/configuration.md)):
+A separate **sync tick** (~45s) handles less-frequent operations. With `relay.url` set, each GitHub App event from the relay starts a sync at once (see [GitHub App](@/github-app.md#events)):
 
 1. **Cleanup** — removes worktrees for done tasks (runs in background), deletes orphaned remote branches, auto-prunes stale worktree metadata, pulls main once per cycle; remote branch is kept when a blocked task has an open PR
 2. **Merged PR detection** — marks tasks done when their PRs are merged, and merges `approved` PRs once CI passes
