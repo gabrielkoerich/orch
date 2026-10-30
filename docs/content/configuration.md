@@ -11,44 +11,53 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | Section | Key | Description | Default |
 |---------|-----|-------------|---------|
 | top-level | `project_dir` | Override project directory (auto-detected from CWD) | `""` |
-| top-level | `required_tools` | Tools that must exist on PATH before launching an agent | `[]` |
 | `engine` | `tick_interval` | Main engine tick interval in seconds | `10` |
 | `engine` | `sync_interval` | Sync tick interval in seconds (GitHub ingest, cleanup) | `45` |
 | `engine` | `max_parallel` | Max tasks dispatched concurrently | `4` |
 | `engine` | `stuck_timeout` | Timeout (seconds) for detecting stuck `in_progress` tasks | `1800` |
 | `engine` | `no_session_stuck_timeout` | Timeout (seconds) for `in_progress` tasks with no tmux session | `600` |
+| `engine` | `in_review_no_session_stuck_timeout` | Seconds an `in_review` task may have no review session before it goes back to `needs_review`. orch raises it to the review timeout plus 120 seconds when it is lower | `1920` |
 | `engine` | `webhook_health_check_interval` | Health check frequency for the local webhook server | `60` |
-| `engine` | `silence_grace_period` | Seconds of agent silence before warning | (see config.example.yml) |
-| `engine` | `silence_cooldown` | Seconds of agent silence before marking model unavailable | (see config.example.yml) |
+| `engine` | `silence_grace_period` | Seconds of agent silence before warning | `300` |
+| `engine` | `silence_cooldown` | Seconds a model detected as silent stays in cooldown | `3600` |
 | `engine` | `graceful_shutdown_timeout` | Seconds to wait for in-flight tasks on SIGTERM | `600` |
 | `engine` | `upgrade_check_interval` | How often to check for new orch versions and notify channels (seconds). Upgrading is operator-only — the service never runs `brew` itself | `3600` |
 | `engine` | `startup_failure_escalation_secs` | Seconds of continuous startup failure before escalating to ERROR log + push notification (0 disables) | `3600` |
 | `workflow` | `auto_close` | Auto-close GitHub issues when tasks are `done` | `true` |
-| `workflow` | `enable_review_agent` | Run a [review agent](@/review-agent.md) after task completion | `false` |
-| `workflow` | `max_attempts` | Max attempts before marking task as blocked | `10` |
+| `workflow` | `enable_review_agent` | Run a [review agent](@/review-agent.md) after task completion | `true` |
+| `workflow` | `max_attempts` | Max attempts before marking task as blocked | `5` |
 | `workflow` | `max_review_cycles` | Max PR review cycles before escalating to human | `2` |
-| `workflow` | `max_reroute_attempts` | Max times a task may be re-routed automatically | `3` |
-| `workflow` | `timeout_seconds` | Task execution timeout (0 disables timeout) | `1800` |
+| `workflow` | `max_reroute_attempts` | Max times a task may be re-routed automatically. Falls back to `max_attempts` when unset | `3` |
+| `workflow` | `timeout_seconds` | Task execution timeout in seconds. Values under 1800 are raised to 1800 | `1800` |
 | `workflow` | `review_timeout_seconds` | Review agent timeout, separate from the task timeout, never under 300 | `900` |
-| `workflow` | `timeout_by_complexity` | Per-complexity overrides (e.g. `complex: 7200`) | `{}` |
-| `workflow` | `required_skills` | Skills always injected into agent prompts | `[]` |
+| `workflow` | `timeout_by_complexity` | `medium` and `complex` overrides (e.g. `complex: 7200`), never under `timeout_seconds` | `{}` |
 | `workflow` | `allowed_tools` | Tool patterns the agent may use (allowlist) | `[]` |
 | `workflow` | `disallowed_tools` | Tool patterns blocked via `--disallowedTools` | `["Bash(rm *)","Bash(rm -*)"]` |
 | `workflow` | `permissions.mode` | Agent permission mode (`autonomous` / `supervised`) | `autonomous` |
 | `workflow` | `permissions.sandbox` | Sandbox level for Codex (`workspace-write` / `full-access`) | `workspace-write` |
 | `workflow` | `sandbox` | Run task and review agents in the OS sandbox (`os`), or not (`false`). A project's `.orch.yml` can set `false` to opt out. See [OS Sandbox](agents.md#os-sandbox) | `false` |
-| `workflow` | `worktree_janitor_ttl_hours` | Janitor TTL before pruning orphaned worktrees | (see config.example.yml) |
-| `workflow` | `auto_create_followup_on_changes` | Auto-create follow-up task when review requests changes | `false` |
-| `router` | `mode` | `llm`, `round_robin`, or `local` (Ollama) | `llm` |
+| `workflow` | `worktree_janitor_ttl_hours` | Janitor TTL before pruning orphaned worktrees | `24` |
+| `workflow` | `worktree_janitor_dry_run` | Log what the janitor would prune without removing anything | `false` |
+| `workflow` | `auto_create_followup_on_changes` | Auto-create follow-up task when review requests changes | `true` |
+| `workflow` | `ci_poll_max_wait_secs` | Max seconds the merge path waits for CI | `600` |
+| `workflow` | `ci_poll_interval_secs` | Base CI poll interval in seconds | `15` |
+| `workflow` | `ci_check_cooldown_secs` | Min seconds between CI checks of one task | `60` |
+| `workflow` | `mergeability_poll_secs` | Seconds to wait for GitHub to compute mergeability | `10` |
+| `router` | `mode` | `llm`, `round_robin`, or `local` (Ollama) | `round_robin` |
 | `router` | `agent` | Default router executor | `claude` |
 | `router` | `model` | Router model name | `haiku` |
-| `router` | `timeout_seconds` | Router timeout (0 disables timeout) | `60` |
+| `router` | `timeout_seconds` | Router call timeout in seconds. Values over 45 are lowered to 45 | `45` |
 | `router` | `max_route_attempts` | LLM failures before falling back to round-robin | `3` |
 | `router` | `max_tasks_per_tick` | Max routing decisions per engine tick (concurrency cap) | `1` |
+| `router` | `default_skills` | Skills selected for every task | `[gh, git-worktree]` |
 | `router` | `fallback_executor` | Fallback executor when router fails | `codex` |
 | `router` | `allowed_tools` | Default tool allowlist used in routing prompts | `[yq, jq, bash, ...]` |
 | `router` | `weighted_round_robin` | Use degraded-weight-aware round robin | `false` |
 | `router` | `pool` | Agents and models the router may pick from | (see config.example.yml) |
+| `dispatch` | `health_check_window_hours` | Lookback window for counting rate-limit rows toward degraded | `6` |
+| `dispatch` | `degraded_rate_limit_threshold` | Rate-limit rows in that window that mark an agent degraded | `3` |
+| `dispatch` | `min_healthy_agents` | Below this many healthy agents, dispatch runs one task at a time | `2` |
+| `dispatch` | `sequential_delay_ms` | Delay between dispatches in that sequential mode | `1000` |
 | `webhook` | `enabled` | Start the local webhook receiver (HTTP) | `false` |
 | `webhook` | `port` | Webhook listener port | `8080` |
 | `webhook` | `secret` | HMAC secret for verifying GitHub webhook payloads | `""` |
@@ -65,11 +74,14 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `gh` | `auth.token` | Explicit Personal Access Token | `""` |
 | `channels.discord` | `bot_token` | Discord bot token | `""` |
 | `channels.telegram` | `bot_token` / `chat_id` | Telegram bot credentials | `""` |
-| `notifications` | `level` | Minimum notification level (`info` / `warn` / `error`) | `info` |
+| `channels.slack` | `bot_token` / `channel_id` | Slack bot credentials | `""` |
+| `notifications` | `level` | Which status changes reach channels: `all` (done, in_review, approved, blocked, failed), `verbose` (every change), `errors_only` (blocked, failed) or `none` | `all` |
 | `agents` | (list of strings) | Agent CLIs to discover in `$PATH` (e.g. `[claude, codex, opencode, grok]`) | `[]` |
 | `model_map` | `simple/medium/complex/review` | Per-complexity model name per agent | `{}` |
+| `git` | `name` / `email` | Commit identity for task and review agents | `<agent>[bot]` |
+| `jobs` | `bash_timeout_seconds` | Timeout for a `bash` job | `300` |
 
-> Authoritative reference: `config.example.yml` in the orch repo. Run `orch config <key>` to read the live value for any dotted key (e.g. `orch config engine.tick_interval`).
+> `config.example.yml` in the orch repo is a short starting config. This table lists every key. Run `orch config <key>` to read the live value for any dotted key (e.g. `orch config engine.tick_interval`).
 
 ## Per-Project Config
 
@@ -77,13 +89,11 @@ Drop a `.orch.yml` (legacy `.orchestrator.yml` is still supported) in your proje
 
 ```yaml
 # ~/projects/my-app/.orch.yml
-required_tools: ["bun"]
 gh:
   repo: "myorg/my-app"
   project_id: "PVT_..."
 workflow:
   enable_review_agent: true
-  required_skills: []
 router:
   fallback_executor: "claude"
 ```
@@ -129,7 +139,7 @@ repositories:
 skills: []   # Reserved for inline skill definitions (rarely used)
 ```
 
-Skills listed in `workflow.required_skills` are always injected into agent prompts. Other skills are selected per-task by the router.
+Skills in `router.default_skills` (default `gh`, `git-worktree`) are always selected. In `llm` mode the router adds more per task.
 
 ## GitHub Authentication
 
@@ -141,6 +151,12 @@ Orch resolves GitHub tokens in this order — the first match wins:
 4. `gh auth token` CLI
 
 The simplest setup is just `gh auth login`. No extra config needed.
+
+### Git
+
+orch's own git calls (fetches, rebases, pushes, `ls-remote`, skill clones) all start from one helper, `git_ops::git()`. It reaches github.com over HTTPS with the same token, whether the remote is SSH or HTTPS, and sets `commit.gpgsign=false` and `tag.gpgsign=false`, so orch never asks for your SSH key or signing key. The settings are environment variables of that one process: no remote and no `.git/config` changes, and your own commits keep your signing.
+
+Agents commit as `git.name` / `git.email` (default `<agent>[bot]`), without signing. Their shell pushes over HTTPS with gh's credentials (`pushInsteadOf`), and agents may not change remotes or `url.*` rules, since a worktree shares `.git/config` with your checkout.
 
 ### Environment Variables
 
@@ -173,7 +189,7 @@ gh:
     private_key_path: "/path/to/app.pem"          # an absolute path
 ```
 
-Agents run as your user and can read any file you can, so keep the key in passbox. passbox returns the first line of an entry, so store the PEM on one line with `\n` for each newline, for example `awk '{printf "%s\\n", $0}' app.pem | passbox add orch/github-app-key`. orch reads the key once after it starts, in the background, and keeps it in memory for the life of the process. A passbox read waits on Touch ID, so until it succeeds orch posts comment reviews, logs one warning and retries every 5 minutes with at most one prompt pending. Debug builds and tests never load the App.
+Agents run as your user and can read any file you can, so keep the key in passbox. orch reads a `passbox:<name>` value with `passbox exec --stdin <name> -- /bin/cat` and keeps the first line of the output, so store the PEM on one line with `\n` for each newline, for example `awk '{printf "%s\\n", $0}' app.pem | passbox add orch/github-app-key`. orch reads the key once after it starts, in the background, and keeps it in memory for the life of the process. A passbox read waits on Touch ID, so until it succeeds orch posts comment reviews, logs one warning and retries every 5 minutes with at most one prompt pending. Debug builds and tests never load the App.
 
 orch signs an RS256 JWT, exchanges it for an installation token per installation, and refreshes each token 10 minutes before it expires. If the App review cannot be submitted, orch posts the decision as the `## Automated Review` comment instead.
 
@@ -191,7 +207,7 @@ review:
 | `comment` | a `## Automated Review` comment | the `orch/review` commit status |
 | `app` | a real `APPROVE` or `REQUEST_CHANGES` review from the App, with each issue on a changed line as an inline comment | the `orch/review` check run from the App, `in_progress` while the review runs, then `success` or `failure` |
 
-Both modes post the `## Automated Review` comment, and the gate reads it when the App has no review on the head. A review and the check run belong to the head sha the agent reviewed, so a new push makes the PR pending again. Issues on lines outside the diff stay in the review body, since GitHub refuses an inline comment there. A project in `app` mode whose repository does not have the App installed, or a daemon whose App key is not read yet, reviews in `comment` mode.
+In `app` mode the App review is the decision and no comment is posted. The `## Automated Review` comment goes out only when GitHub refuses the App review, and the gate reads it when the App has no review on the head. A review and the check run belong to the head sha the agent reviewed, so a new push makes the PR pending again, except a base update orch makes in `approved`, which carries the approval (see [Review Agent](@/review-agent.md)). Issues on lines outside the diff stay in the review body, since GitHub refuses an inline comment there. A project in `app` mode whose repository does not have the App installed, or a daemon whose App key is not read yet, reviews in `comment` mode.
 
 ## Cluster
 

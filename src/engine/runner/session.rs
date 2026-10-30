@@ -193,8 +193,6 @@ mod tests {
         //       .ok()
         //       .and_then(|s| s.parse().ok())
         //       .unwrap_or(1800)
-        //
-        // See the example config at config.example.yml line 13.
 
         let expected_default = 1800u64;
 
@@ -244,13 +242,12 @@ mod tests {
         //
         // This test documents the expected behavior.
 
-        // Configuration examples from config.example.yml:
+        // Configuration examples:
         // timeout_seconds: 1800  # 30 minutes
         //
         // Or with per-complexity overrides:
         // timeout_by_complexity:
-        //   simple: 600       # 10 minutes
-        //   medium: 1800      # 30 minutes
+        //   medium: 2700      # 45 minutes
         //   complex: 3600     # 1 hour
 
         let default_seconds = 1800u64;

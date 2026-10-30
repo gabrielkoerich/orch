@@ -4,7 +4,7 @@ description = "GitHub Issues as the native task backend"
 weight = 8
 +++
 
-Tasks are stored in a unified SQLite database (`~/.orch/orch.db`) and synced to GitHub Issues (when `gh.enabled: true`). External tasks from GitHub are ingested into the store on each sync tick, so the store always has the latest data. Orch centralizes GitHub API calls via the server and uses a native HTTP client (`reqwest`) or the `gh` CLI internally.
+Tasks are stored in a unified SQLite database (`~/.orch/orch.db`) and synced to GitHub Issues. External tasks from GitHub are ingested into the store on each sync tick, so the store always has the latest data. Orch centralizes GitHub API calls via the server and uses a native HTTP client (`reqwest`) or the `gh` CLI internally.
 
 ## Setup
 
@@ -24,7 +24,6 @@ gh auth login
 2. Configure in `config.yml`:
 ```yaml
 gh:
-  enabled: true
   repo: "owner/repo"
 ```
 
@@ -66,7 +65,7 @@ When an agent completes a task, orch posts a structured comment:
 
 ### Labels
 
-- `status:<status>` — task status (`new`, `routed`, `in_progress`, `done`, `needs_review`, `blocked`)
+- `status:<status>` — task status (`new`, `routed`, `in_progress`, `needs_review`, `in_review`, `approved`, `done`, `blocked`, `waiting`)
 - `agent:<agent>` — assigned agent
 - `complexity:<level>` — routing complexity
 - `blocked` (red) — applied when task is blocked, removed when unblocked
@@ -171,11 +170,13 @@ they gain no admission semantics from this feature.
 
 ## Owner Feedback
 
-When the repo owner comments on a GitHub issue linked to a completed task, orch detects the feedback and re-activates the task:
+The sync tick reads review feedback on the PRs of `in_review` and `approved` tasks:
 
-1. Tasks with status `done`, `in_review`, or `needs_review` are checked for new owner comments
-2. If new comments are found, the task is reset to `routed` (keeping its agent assignment)
-3. The feedback is appended to the task context so the agent sees it on re-run
+1. A `CHANGES_REQUESTED` review, its inline comments, or a new `## Automated Review — Changes Requested` comment counts as feedback
+2. orch stores the feedback in `pr_review_context`, increments `review_cycles`, and moves the task to `routed` with its agent, worktree and branch
+3. The agent sees the feedback on the next run. At `workflow.max_review_cycles` the task is blocked instead
+
+A `done` task is terminal. Comments on its issue do not reopen it.
 
 ### Slash Commands
 
@@ -189,6 +190,8 @@ Owner comments can also start with a slash command on the **first line** (case-i
 | `/block [reason]` | Mark the task blocked with an optional reason |
 | `/close` | Mark `status:done` and close the issue |
 | `/review` | Trigger / re-trigger the review agent on the linked PR |
+
+`/retry`, `/reroute` and `/unblock` refuse a `done` task.
 
 To change agent or complexity without using a slash command, add the corresponding label directly on the issue (`agent:claude`, `complexity:medium`, etc.) — the engine picks up label changes on the next sync.
 

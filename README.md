@@ -69,7 +69,7 @@ brew services start orch
 orch task add "Fix authentication bug" --body "Users can't login with OAuth"
 
 # Create a GitHub issue task
-orch task add "Update README" --labels "documentation,good-first-issue"
+orch task add "Update README" -l documentation -l good-first-issue
 ```
 
 ### 4. Watch the magic
@@ -96,7 +96,7 @@ Tokens are resolved in this order (first match wins):
 
 When running as a background service (e.g., `brew services start orch`), the service process does **not** inherit your shell environment. Pass the token securely:
 
-**Option A — `~/.private` file** (sourced automatically by runner scripts):
+**Option A — `~/.private` file**, loaded by orch at startup:
 ```bash
 # ~/.private  (chmod 600)
 export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
@@ -118,7 +118,7 @@ export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
 ### Service Management
 
 ```bash
-orch serve                    # Run orch service (foreground)
+orch serve                    # Run the service in the foreground (hidden, the service unit runs it)
 orch service install          # Write systemd user unit and enable it (Linux)
 orch service uninstall        # Disable and remove the systemd user unit (Linux)
 orch service start            # Start background service
@@ -134,7 +134,7 @@ orch task list                # List all tasks
 orch task list --status new   # Filter by status
 orch task get <id>            # Get task details
 orch task add "Title"         # Create internal task
-orch task add "Title" --labels "bug,urgent"  # Create GitHub issue
+orch task add "Title" -l bug -l urgent       # Create GitHub issue (labels or --depends-on)
 orch task route <id>          # Manually route a task to an agent
 orch task run <id>            # Manually run a task
 orch task run                 # Run next available routed task
@@ -148,6 +148,9 @@ orch task kill <id>           # Kill a running agent session
 orch task cost <id>           # Show token cost breakdown
 orch task close <id>          # Manually mark a task as done
 orch task close <id> --note "msg"  # Mark done with a comment
+orch task deps <id>           # Show what a task waits on, and what waits on it
+orch task watch <id>          # Follow the agent's output live, with its review
+orch task inspect <id>        # Status, agent, attempts, last error, PR, block reason
 ```
 
 ### Plan import
@@ -172,6 +175,7 @@ orch project add /path/to/repo           # Register a local path
 orch project add owner/repo              # Bare clone + import issues
 orch project add https://github.com/o/r  # Same, from a URL
 orch project remove /path                # Unregister a project
+orch project move old/slug new/slug      # Re-key stored tasks after a repo transfer or rename
 ```
 
 ### GitHub Projects V2 Board
@@ -180,6 +184,7 @@ orch project remove /path                # Unregister a project
 orch project board list               # List accessible GitHub Projects V2 boards
 orch project board link <id>          # Link current repo to a board by ID
 orch project board sync               # Re-discover field IDs and update config
+orch project board reconcile          # Reconcile label-managed board Status fields once
 orch project board info               # Show current board config
 ```
 
@@ -193,6 +198,7 @@ orch job remove <id>          # Remove a job
 orch job enable <id>          # Enable a job
 orch job disable <id>         # Disable a job
 orch job tick                 # Run one scheduler tick (for testing)
+orch job run <id>             # Run a job now, ignoring its schedule
 ```
 
 ### Utility Commands
@@ -217,12 +223,14 @@ orch service doctor           # Diagnose SQLite ↔ GitHub drift
 orch service prune            # Remove orphaned worktrees
 orch cooldown list            # Show active cooldowns and degraded agents
 orch cooldown clear <key>     # Clear a cooldown and that agent's degraded window
+orch cooldown clear --all     # Clear every cooldown and degraded window
+orch nodes                    # List the cluster's machines, their roles and the leader
 orch webhook status           # Show webhook server health (hidden, rare public-host use)
 orch task session export <id> # Export a task's session
 orch notify "message"         # Send a Telegram notification
 orch -V                       # Show CLI version
 orch config <key>             # Read config value (e.g., orch config gh.repo)
-orch completions <shell>      # Generate shell completions (bash, zsh, fish)
+orch completions <shell>      # Generate shell completions (hidden: bash, elvish, fish, powershell, zsh)
 ```
 
 ### Smart Commits
@@ -235,19 +243,9 @@ orch commit -m "fix: ..."           # Force a single commit with this exact mess
 orch commit --no-llm                # Use the path/hunk heuristic instead of an LLM call
 ```
 
-`orch commit` groups the working tree's staged + unstaged + untracked changes
-into one or more logical commits by path, then asks the current chat agent
-(`orch chat`'s sticky `/agent` + `/model`) to draft a Conventional Commits
-message for each group from the file list and unified diff. The diff is capped
-at `commit.max_diff_bytes` bytes per group (default 32 KB) so the call stays
-cheap and predictable. Edit, accept, or reject the drafts interactively; pass
-`--yes` to skip the prompt or `-m` to override entirely.
+`orch commit` groups the working tree's staged + unstaged + untracked changes into one or more logical commits by path, then asks the current chat agent (`orch chat`'s sticky `/agent` + `/model`) to draft a Conventional Commits message for each group from the file list and unified diff. The diff is capped at `commit.max_diff_bytes` bytes per group (default 32 KB) so the call stays cheap and predictable. Edit, accept, or reject the drafts interactively; pass `--yes` to skip the prompt or `-m` to override entirely.
 
-Fallback behaviour: if no agent is available (all cooled, no API key, offline)
-the heuristic message survives, a one-line warning is logged, and you still get
-the editor unless `--yes` was passed. Use `--no-llm` to force the heuristic
-path (handy for scripts and tests). The agent prompt lives at
-[`prompts/commit_message.md`](prompts/commit_message.md).
+Fallback behaviour: if no agent is available (all cooled, no API key, offline) the heuristic message survives, a one-line warning is logged, and you still get the editor unless `--yes` was passed. Use `--no-llm` to force the heuristic path (handy for scripts and tests). The agent prompt lives at [`prompts/commit_message.md`](prompts/commit_message.md).
 
 ### Control Session (Chat)
 
@@ -282,21 +280,21 @@ Shared defaults and project registry. All settings here apply to every project u
 # Project registry — list of local paths
 # Each path must contain a .orch.yml with gh.repo
 projects:
-  - /Users/me/Projects/my-app
-  - /Users/me/Projects/my-lib
+  - ~/Projects/my-app
+  - ~/Projects/my-lib
 
 workflow:
   auto_close: true
-  review_owner: "@owner"
-  enable_review_agent: false
-  max_attempts: 10
-  timeout_seconds: 1800
+  enable_review_agent: true    # default true
+  max_attempts: 5              # default 5, a task that runs out is blocked
+  timeout_seconds: 1800        # task limit, values under 1800 are raised to 1800
+  review_timeout_seconds: 900  # review limit, default 900, minimum 300
 
 router:
-  mode: "llm"              # "llm" | "round_robin" | "local" (Ollama)
+  mode: "llm"              # "llm" | "round_robin" | "local" (Ollama), default round_robin
   agent: "claude"          # which LLM performs routing
   model: "haiku"           # fast/cheap model for classification
-  timeout_seconds: 60
+  timeout_seconds: 45      # default 45, higher values are clamped to 45
   max_route_attempts: 3    # LLM failures before falling back to round-robin
   max_tasks_per_tick: 1    # max routing decisions per engine tick
   weighted_round_robin: false
@@ -355,10 +353,6 @@ workflow:
 router:
   fallback_executor: "codex"
 
-required_tools:
-  - cargo
-  - bun
-
 # Per-project scheduled jobs
 jobs:
   - id: code-review
@@ -378,9 +372,11 @@ jobs:
 | `routed` | Agent assigned, awaiting dispatch |
 | `in_progress` | Agent actively working in tmux session |
 | `needs_review` | Agent completed, awaiting review agent dispatch (automatic) |
-| `in_review` | Review agent actively reviewing the PR |
+| `in_review` | Review agent actively reviewing the PR. A review has a 15 minute limit (`workflow.review_timeout_seconds`) |
+| `approved` | The review approved the PR. orch waits for CI and merges with no agent. Merged goes to `done`, a conflict or red CI goes to `routed`, a PR closed unmerged goes to `blocked` |
 | `done` | PR merged, worktree cleaned up |
-| `blocked` | Requires human attention (max review cycles, agent failures) |
+| `blocked` | Requires human attention (max attempts, max review cycles, agent failures) |
+| `waiting` | An open blocker holds the task until its pull request merges |
 
 ## Label-Based Routing
 
@@ -441,7 +437,7 @@ src/
 │   ├── job.rs           # Job management
 │   └── service.rs       # Service lifecycle
 ├── github/              # GitHub API helpers
-│   ├── cli_wrapper.rs   # gh CLI wrapper
+│   ├── app.rs           # GitHub App installation tokens
 │   ├── http.rs          # Native HTTP client (reqwest, connection pooling)
 │   ├── token.rs         # Token resolution (env, config, gh CLI)
 │   ├── types.rs         # Issue, Comment, Label, PR review types
@@ -450,7 +446,12 @@ src/
     ├── mod.rs           # Main event loop, project init, struct defs
     ├── tick.rs          # Core tick phases (sessions, routing, dispatch, unblock)
     ├── sync.rs          # Periodic sync (cleanup, PR review, mentions, skills)
-    ├── review.rs        # PR review pipeline (review agent, auto-merge, re-route)
+    ├── review.rs        # PR review pipeline (review agent, decision, re-route)
+    ├── review_poll.rs   # Open PR polling, merges approved PRs
+    ├── auto_merge.rs    # CI checks and merge
+    ├── cooldown.rs      # Agent and model cooldowns, degraded agents
+    ├── relay.rs         # orch-relay client, wakes the sync on GitHub App events
+    ├── subscribers/     # Event subscribers (dispatch, review, notify, unblock)
     ├── cleanup.rs       # Worktree cleanup, merged-PR detection, store helpers
     ├── commands.rs      # Owner /slash commands in issue comments
     ├── tasks.rs         # Task manager (internal + external, unified store)

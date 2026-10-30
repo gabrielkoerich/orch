@@ -737,6 +737,26 @@ pub async fn record_persistent_model_failure(agent_name: &str, model: &str) {
     set_cooldown_async(&key, cooldown_until, "persistent_model_error").await;
 }
 
+/// Record a `ModelUnavailable` failure for an agent+model.
+///
+/// "Not found", "not supported" and region blocks never lift on their own, so they get the
+/// persistent backoff (4h base, 7d max). Any other message gets [`record_model_failure`]
+pub async fn record_model_unavailable(agent_name: &str, model: &str, message: &str) {
+    if is_model_permanently_gone(message) {
+        record_persistent_model_failure(agent_name, model).await;
+    } else {
+        record_model_failure(agent_name, model).await;
+    }
+}
+
+fn is_model_permanently_gone(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("not found")
+        || lower.contains("not supported")
+        || lower.contains("not available in your country")
+        || lower.contains("not available in your region")
+}
+
 /// Record a run that failed without showing the model is gone: empty or cut off output, an
 /// unparseable review, an opaque provider error.
 ///

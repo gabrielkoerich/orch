@@ -498,11 +498,11 @@ impl Router {
             return false;
         }
         // If weighted routing is used, consider the agent degraded when its
-        // weight has decayed below the configured threshold. This avoids
+        // weight has decayed below the threshold. This avoids
         // proactively routing to agents that recently hit many rate limits.
         if self.config.weighted_round_robin {
             let weight = self.weights.get_weight(agent);
-            if weight < self.config.skip_limited_threshold {
+            if weight < config::SKIP_LIMITED_THRESHOLD {
                 tracing::debug!(
                     agent,
                     weight,

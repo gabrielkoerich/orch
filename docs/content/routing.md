@@ -31,10 +31,10 @@ Orch uses an LLM-as-classifier to route each task to the best agent. This is a n
 
 ```yaml
 router:
-  mode: "llm"               # "llm" | "round_robin" | "local"
+  mode: "llm"               # "llm" | "round_robin" | "local", default round_robin
   agent: "claude"           # which LLM does the routing
   model: "haiku"            # fast/cheap model for classification
-  timeout_seconds: 60
+  timeout_seconds: 45       # values over 45 are lowered to 45
   max_route_attempts: 3     # LLM failures before falling back to round-robin
   max_tasks_per_tick: 1     # routing concurrency cap
   weighted_round_robin: false
@@ -85,11 +85,13 @@ model_map:
 
 The routing prompt is in `prompts/route.md`. The router only classifies — it never touches code or files.
 
+When a task's stored model is no longer in its agent's model pools, orch replaces it with the agent's model for the task's complexity and records the reason in `last_error`.
+
 ## Pre-emptive Routability
 
 The router performs a pre-emptive routability check before attempting to invoke agents or the router LLM. This does two things:
 
 - It excludes agents that are currently in cooldown or have been marked degraded by the health check (rate-limit signals). These checks are authoritative — if an agent is degraded, it will be skipped regardless of weight.
-- When `router.weighted_round_robin` is enabled, an additional weight-based threshold (`router.skip_limited_threshold`) is applied after the degraded check. Agents whose routing weight has decayed below this threshold are skipped proactively to avoid sending work to recently rate-limited agents. This weight-based exclusion only layers on top of existing cooldown/degraded logic and does not replace it.
+- When `router.weighted_round_robin` is enabled, an additional weight-based threshold is applied after the degraded check. Agents whose routing weight has decayed below this threshold are skipped proactively to avoid sending work to recently rate-limited agents. This weight-based exclusion only layers on top of existing cooldown/degraded logic and does not replace it.
 
-Configure the threshold in your `config.yml` under `router.skip_limited_threshold` (default: `0.3`).
+The threshold is fixed at `0.3`. No config key changes it.
