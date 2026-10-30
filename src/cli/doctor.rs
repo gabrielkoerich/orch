@@ -585,7 +585,8 @@ async fn describe_unrecovered_work(task: &Task) -> String {
     }
 
     // Branch pushed, no PR
-    let branch_on_remote = tokio::process::Command::new("git")
+    let branch_on_remote = crate::engine::runner::git_ops::git()
+        .await
         .args(["ls-remote", "--heads", "origin", &task.branch])
         .current_dir(wt)
         .output()

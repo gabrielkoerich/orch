@@ -113,8 +113,6 @@ pub(crate) fn find_stash_ref_by_hash(stash_list: &str, stash_hash: &str) -> Opti
 
 /// Options for [`stash_rebase_restore`].
 pub(crate) struct StashRebaseOpts {
-    /// Disable GPG commit signing during the rebase (passes `-c commit.gpgsign=false`).
-    pub disable_gpg_signing: bool,
     /// Abort the rebase (via `git rebase --abort`) and restore the stash when the
     /// rebase fails.  Set to `false` when the caller intentionally leaves the working
     /// tree in the in-progress-rebase state so an agent can resolve conflicts.
@@ -124,7 +122,6 @@ pub(crate) struct StashRebaseOpts {
 impl Default for StashRebaseOpts {
     fn default() -> Self {
         Self {
-            disable_gpg_signing: false,
             abort_on_failure: true,
         }
     }
@@ -242,14 +239,9 @@ pub(crate) async fn stash_rebase_restore(
         None
     };
 
-    let mut rebase_args: Vec<&str> = Vec::new();
-    if opts.disable_gpg_signing {
-        rebase_args.extend(["-c", "commit.gpgsign=false"]);
-    }
-    rebase_args.extend(["rebase", target_ref]);
-
-    let output = Command::new("git")
-        .args(&rebase_args)
+    let output = git()
+        .await
+        .args(["rebase", target_ref])
         .current_dir(dir)
         .output_with_context()
         .await;
@@ -431,7 +423,8 @@ pub async fn rebase_on_branch(dir: &Path, branch: &str) -> anyhow::Result<bool> 
     // 2-minute timeout mirrors the push timeout to prevent indefinite stalls.
     let fetch = tokio::time::timeout(
         std::time::Duration::from_secs(120),
-        Command::new("git")
+        git()
+            .await
             .args(["fetch", "origin", branch])
             .kill_on_drop(true)
             .current_dir(dir)
@@ -519,7 +512,8 @@ pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
 
     // Fetch current branch (for retries with existing remote commits)
     // and default branch (for rebase) in one call.
-    let _ = Command::new("git")
+    let _ = git()
+        .await
         .args(["fetch", "origin"])
         .current_dir(dir)
         .output_with_context()
@@ -594,6 +588,30 @@ async fn rebase_in_progress(dir: &Path) -> bool {
     false
 }
 
+/// Tool patterns no agent may run: a worktree shares `.git/config` with the operator's checkout,
+/// so a rewritten remote or URL rule would change the main repository
+pub(crate) fn remote_change_tools() -> Vec<String> {
+    [
+        "Bash(git remote set-url*)",
+        "Bash(git remote add*)",
+        "Bash(git remote remove*)",
+        "Bash(git remote rm*)",
+        "Bash(git remote rename*)",
+        "Bash(git config*remote.*)",
+        "Bash(git config*url.*)",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+/// A `git` command for every call orch makes: GitHub over HTTPS with the gh token, never SSH,
+/// and no commit or tag signing, whatever the owner's git config says
+pub(crate) async fn git() -> Command {
+    let mut cmd = Command::new("git");
+    cmd.envs(build_git_auth_env().await).kill_on_drop(true);
+    cmd
+}
+
 /// Build git config environment variables that inject GitHub token credentials.
 ///
 /// This handles two scenarios:
@@ -612,6 +630,8 @@ async fn rebase_in_progress(dir: &Path) -> bool {
 /// - `GIT_CONFIG_COUNT` — number of config entries
 /// - `GIT_CONFIG_KEY_N` — config key for entry N
 /// - `GIT_CONFIG_VALUE_N` — config value for entry N
+///
+/// Signing is switched off too, `commit.gpgsign=false` and `tag.gpgsign=false`
 pub(crate) async fn build_git_auth_env() -> Vec<(String, String)> {
     let token = crate::github::token::shared()
         .get_token()
@@ -622,28 +642,29 @@ pub(crate) async fn build_git_auth_env() -> Vec<(String, String)> {
 }
 
 fn build_git_auth_env_for_token(token: Option<String>) -> Vec<(String, String)> {
-    match token {
+    let mut config: Vec<(String, String)> = match token {
         Some(t) if !t.is_empty() => {
             let authed = format!("url.https://x-access-token:{t}@github.com/.insteadOf");
             vec![
-                ("GIT_CONFIG_COUNT".into(), "2".into()),
-                ("GIT_CONFIG_KEY_0".into(), authed.clone()),
-                ("GIT_CONFIG_VALUE_0".into(), "https://github.com/".into()),
-                ("GIT_CONFIG_KEY_1".into(), authed),
-                ("GIT_CONFIG_VALUE_1".into(), "git@github.com:".into()),
+                (authed.clone(), "https://github.com/".into()),
+                (authed, "git@github.com:".into()),
             ]
         }
-        _ => {
-            vec![
-                ("GIT_CONFIG_COUNT".into(), "1".into()),
-                (
-                    "GIT_CONFIG_KEY_0".into(),
-                    "url.https://github.com/.insteadOf".into(),
-                ),
-                ("GIT_CONFIG_VALUE_0".into(), "git@github.com:".into()),
-            ]
-        }
+        _ => vec![(
+            "url.https://github.com/.insteadOf".into(),
+            "git@github.com:".into(),
+        )],
+    };
+    // orch's git never signs, a signing key would ask the owner for a passphrase or a touch
+    config.push(("commit.gpgsign".into(), "false".into()));
+    config.push(("tag.gpgsign".into(), "false".into()));
+
+    let mut env = vec![("GIT_CONFIG_COUNT".to_string(), config.len().to_string())];
+    for (n, (key, value)) in config.into_iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{n}"), key));
+        env.push((format!("GIT_CONFIG_VALUE_{n}"), value));
     }
+    env
 }
 
 /// Returns `true` if the push error indicates that the GitHub token lacks the
@@ -995,8 +1016,8 @@ pub(crate) async fn force_push_leased(
     let expected = expected_force_sha(dir, branch, default_branch).await?;
     let lease = format!("--force-with-lease={branch}:{expected}");
     tracing::info!(branch, expected_sha = %expected, "force-pushing with an expected remote sha");
-    let auth_env = build_git_auth_env().await;
-    let output = Command::new("git")
+    let output = git()
+        .await
         .args([
             "-c",
             "lfs.locksverify=false",
@@ -1006,7 +1027,6 @@ pub(crate) async fn force_push_leased(
             "origin",
             branch,
         ])
-        .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .current_dir(dir)
         .kill_on_drop(true)
         .output_with_context()
@@ -1067,8 +1087,6 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
 
     tracing::info!(branch = branch_to_push, "pushing branch");
 
-    let auth_env = build_git_auth_env().await;
-
     // First attempt: normal push (no force).
     // lfs.locksverify=false skips the auxiliary LFS locks/verify roundtrip in
     // the pre-push hook; agents never hold LFS locks, and a transient timeout
@@ -1077,7 +1095,8 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
     // post-processing and triggering a stuck-task re-dispatch race.
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(120),
-        Command::new("git")
+        git()
+            .await
             .args([
                 "-c",
                 "lfs.locksverify=false",
@@ -1087,7 +1106,6 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
                 branch_to_push,
             ])
             .kill_on_drop(true)
-            .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .current_dir(dir)
             .output(),
     )
@@ -1112,7 +1130,8 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
         );
         let retry_output = tokio::time::timeout(
             std::time::Duration::from_secs(120),
-            Command::new("git")
+            git()
+                .await
                 .args([
                     "-c",
                     "lfs.locksverify=false",
@@ -1122,7 +1141,6 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
                     branch_to_push,
                 ])
                 .kill_on_drop(true)
-                .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .current_dir(dir)
                 .output(),
         )
@@ -1160,7 +1178,8 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
                 // Workflow files stripped, retry push
                 let retry_output = tokio::time::timeout(
                     std::time::Duration::from_secs(120),
-                    Command::new("git")
+                    git()
+                        .await
                         .args([
                             "-c",
                             "lfs.locksverify=false",
@@ -1170,7 +1189,6 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
                             branch_to_push,
                         ])
                         .kill_on_drop(true)
-                        .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                         .current_dir(dir)
                         .output(),
                 )
@@ -1272,7 +1290,8 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
         // The remote branch moved since the last fetch (GitHub's "Update branch", another
         // clone), so the lease no longer matches. Replay local commits on the new tip once
         if is_stale_lease_error(&stderr) && rebase_on_branch(dir, branch_to_push).await? {
-            let output = Command::new("git")
+            let output = git()
+                .await
                 .args([
                     "-c",
                     "lfs.locksverify=false",
@@ -1281,7 +1300,6 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
                     "origin",
                     branch_to_push,
                 ])
-                .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .current_dir(dir)
                 .output_with_context()
                 .await?;
@@ -2044,6 +2062,27 @@ mod tests {
         let anyhow_err = anyhow::anyhow!("source error");
         let pr_err: PrCreateError = anyhow_err.into();
         assert!(matches!(pr_err, PrCreateError::ApiError(_)));
+    }
+
+    #[test]
+    fn git_env_never_signs_with_or_without_a_token() {
+        for env in [
+            build_git_auth_env_for_token(None),
+            build_git_auth_env_for_token(Some("ghp_testtoken1234".into())),
+        ] {
+            let get = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+            let count: usize = get("GIT_CONFIG_COUNT").unwrap().parse().unwrap();
+            let config: Vec<(String, String)> = (0..count)
+                .map(|n| {
+                    (
+                        get(&format!("GIT_CONFIG_KEY_{n}")).unwrap(),
+                        get(&format!("GIT_CONFIG_VALUE_{n}")).unwrap(),
+                    )
+                })
+                .collect();
+            assert!(config.contains(&("commit.gpgsign".into(), "false".into())));
+            assert!(config.contains(&("tag.gpgsign".into(), "false".into())));
+        }
     }
 
     #[test]

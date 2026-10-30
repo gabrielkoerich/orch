@@ -525,7 +525,12 @@ pub(crate) async fn carry_approval_across_base_update(
     ) {
         return;
     }
-    git_output(&ctx.worktree, &["fetch", "origin"]).await;
+    let _ = runner::git_ops::git()
+        .await
+        .args(["fetch", "origin"])
+        .current_dir(&ctx.worktree)
+        .output()
+        .await;
     if !is_clean_merge(&ctx.worktree, &ctx.approval.sha, base_parent, head_sha).await {
         tracing::warn!(
             task_id,
@@ -772,6 +777,7 @@ fn build_review_disallowed_tools(worktree_path: &std::path::Path) -> Vec<String>
         // Pushing and opening the PR are orch's steps, never the agent's (#3783)
         "Bash(gh pr create*)".to_string(),
     ];
+    tools.extend(runner::git_ops::remote_change_tools());
     let orch_yml = worktree_path.join(".orch.yml");
     let orch_yml_str = orch_yml.to_string_lossy();
     tools.extend([
@@ -1113,7 +1119,7 @@ async fn build_review_context(
     {
         let fetch_timeout = std::time::Duration::from_secs(60);
         let fetch_future = async {
-            let mut cmd = Command::new("git");
+            let mut cmd = runner::git_ops::git().await;
             cmd.args(["fetch", "origin", "--prune"])
                 .current_dir(&worktree_path);
             // Ensure the child is killed if the timeout elapses
@@ -2889,7 +2895,6 @@ async fn ensure_pr_exists(
                     )
                 })?;
                 // Push first in case agent forgot (use token auth like git_ops::push_branch)
-                let auth_env = runner::git_ops::build_git_auth_env().await;
 
                 // Run a credentialed push and log any errors so failures are
                 // visible in logs instead of being silently discarded.
@@ -2898,9 +2903,9 @@ async fn ensure_pr_exists(
                 let push_timeout = std::time::Duration::from_secs(120);
                 match tokio::time::timeout(
                     push_timeout,
-                    tokio::process::Command::new("git")
+                    crate::engine::runner::git_ops::git()
+                        .await
                         .args(["-C", worktree_str, "push", "-u", "origin", branch_name])
-                        .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                         .output(),
                 )
                 .await
@@ -4358,6 +4363,14 @@ mod tests {
         git(&["commit", "-q", "--amend", "--no-edit"]);
         let forged = git(&["rev-parse", "HEAD"]);
         assert!(!is_clean_merge(path, &approved, &base_tip, &forged).await);
+    }
+
+    #[test]
+    fn a_review_agent_cannot_change_the_repository_remotes() {
+        let tools = build_review_disallowed_tools(std::path::Path::new("/tmp/wt"));
+        for guard in runner::git_ops::remote_change_tools() {
+            assert!(tools.contains(&guard), "missing {guard}");
+        }
     }
 
     #[test]

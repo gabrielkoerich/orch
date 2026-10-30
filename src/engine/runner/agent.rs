@@ -357,11 +357,17 @@ export GIT_AUTHOR_NAME={sq_git_name}
 export GIT_COMMITTER_NAME={sq_git_name}
 export GIT_AUTHOR_EMAIL={sq_git_email}
 export GIT_COMMITTER_EMAIL={sq_git_email}
-# Env config overrides the operator's global commit.gpgsign, the signing agent
-# (1Password etc) is often locked in unattended sessions and blocks `git commit`
-export GIT_CONFIG_COUNT="1"
+# Env config overrides the operator's git config for this process only, the remotes stay as they
+# are: agents never sign, and push over HTTPS with gh's credentials, not the operator's SSH agent
+export GIT_CONFIG_COUNT="4"
 export GIT_CONFIG_KEY_0="commit.gpgsign"
 export GIT_CONFIG_VALUE_0="false"
+export GIT_CONFIG_KEY_1="tag.gpgsign"
+export GIT_CONFIG_VALUE_1="false"
+export GIT_CONFIG_KEY_2="url.https://github.com/.pushInsteadOf"
+export GIT_CONFIG_VALUE_2="git@github.com:"
+export GIT_CONFIG_KEY_3="credential.https://github.com.helper"
+export GIT_CONFIG_VALUE_3="!gh auth git-credential"
 export TASK_ID={sq_task_id}
 export OUTPUT_FILE={sq_output_file}
 unset CLAUDECODE  # allow nested claude invocations from orch
@@ -976,6 +982,13 @@ mod tests {
 
         assert!(runner_script.contains("GIT_CONFIG_KEY_0=\"commit.gpgsign\""));
         assert!(runner_script.contains("GIT_CONFIG_VALUE_0=\"false\""));
+        assert!(runner_script.contains("GIT_CONFIG_KEY_1=\"tag.gpgsign\""));
+        // Only pushes go over HTTPS with gh's credentials, fetches keep the remote as it is
+        assert!(
+            runner_script.contains("GIT_CONFIG_KEY_2=\"url.https://github.com/.pushInsteadOf\"")
+        );
+        assert!(runner_script.contains("GIT_CONFIG_VALUE_2=\"git@github.com:\""));
+        assert!(runner_script.contains("GIT_CONFIG_VALUE_3=\"!gh auth git-credential\""));
     }
 
     #[test]

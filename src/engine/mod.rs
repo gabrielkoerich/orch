@@ -929,7 +929,8 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
 
         // Fetch refs once for all worktrees in this project, so rebase below
         // operates on up-to-date origin/* refs without N sequential fetches.
-        if let Err(e) = Command::new("git")
+        if let Err(e) = crate::engine::runner::git_ops::git()
+            .await
             .args(["-C", &repo_root.to_string_lossy(), "fetch", "origin"])
             .output_with_context()
             .await
