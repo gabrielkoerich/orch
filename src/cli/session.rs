@@ -178,7 +178,7 @@ fn parse_output(content: &str) -> ParsedOutput {
                             if (first_line.starts_with("git ") || first_line == "git")
                                 && git_commands.len() < 20
                             {
-                                git_commands.push(truncate_str(first_line, 120));
+                                git_commands.push(ndjson::truncate(first_line, 120));
                             }
                         }
                         _ => {}
@@ -235,7 +235,7 @@ fn record_file_or_command(
                 if (first_line.starts_with("git ") || first_line == "git")
                     && git_commands.len() < 20
                 {
-                    git_commands.push(truncate_str(first_line, 120));
+                    git_commands.push(ndjson::truncate(first_line, 120));
                 }
             }
         }
@@ -505,17 +505,7 @@ fn first_sentence(s: &str, max: usize) -> String {
         .map(|(i, _)| i + 1)
         .unwrap_or(s.len());
     let candidate = &s[..sentence_end.min(s.len())];
-    truncate_str(candidate.trim(), max)
-}
-
-/// Truncate a string to at most `max` chars, appending `…` if cut.
-fn truncate_str(s: &str, max: usize) -> String {
-    for (char_count, (byte_idx, _ch)) in s.char_indices().enumerate() {
-        if char_count >= max {
-            return format!("{}…", &s[..byte_idx]);
-        }
-    }
-    s.to_string()
+    ndjson::truncate(candidate.trim(), max)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -625,6 +615,18 @@ mod tests {
         let long = "abcdefghijklmnopqrstuvwxyz".repeat(10);
         let result = first_sentence(&long, 20);
         assert!(result.ends_with('…'));
+    }
+
+    #[test]
+    fn first_sentence_cuts_on_char_count_not_bytes() {
+        assert_eq!(first_sentence("ééééé", 3), "ééé…");
+        assert_eq!(first_sentence("ééé", 3), "ééé");
+    }
+
+    #[test]
+    fn first_sentence_without_terminator_keeps_whole_text() {
+        assert_eq!(first_sentence("  no terminator  ", 50), "no terminator");
+        assert_eq!(first_sentence("", 5), "");
     }
 
     #[test]

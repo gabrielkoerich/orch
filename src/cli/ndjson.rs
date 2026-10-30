@@ -319,7 +319,7 @@ fn capitalize(name: &str) -> String {
 }
 
 /// Truncate a string to at most `max` chars, appending `…` if cut
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     for (char_count, (byte_idx, _ch)) in s.char_indices().enumerate() {
         if char_count >= max {
             return format!("{}…", &s[..byte_idx]);
