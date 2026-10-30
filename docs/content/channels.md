@@ -77,9 +77,6 @@ To route a Telegram **forum topic** to a specific project, add to the project's 
 channels:
   telegram:
     topic_id: "42"        # forum thread ID for this project
-    # optional overrides (inherit global bot_token/chat_id if omitted):
-    bot_token: "${TELEGRAM_BOT_TOKEN}"
-    chat_id: "-100123456789"
 ```
 
 The engine reads these at startup and builds a `ChannelRouter`. Incoming messages whose `message_thread_id` matches a configured `topic_id` are automatically routed to that project — task creation, `/status`, and `/stats` commands will target the correct project without ambiguity.

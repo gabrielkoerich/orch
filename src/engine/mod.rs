@@ -1192,11 +1192,7 @@ fn read_project_channel_config(project_dir: &std::path::Path) -> ProjectChannelC
     };
     ProjectChannelConfig {
         telegram_topic_id: get_str("telegram", "topic_id"),
-        telegram_bot_token: get_str("telegram", "bot_token"),
-        telegram_chat_id: get_str("telegram", "chat_id"),
         discord_channel_id: get_str("discord", "channel_id"),
-        discord_bot_token: get_str("discord", "bot_token"),
-        discord_guild_id: get_str("discord", "guild_id"),
     }
 }
 
@@ -1376,7 +1372,7 @@ async fn send_startup_escalation_notification(elapsed_secs: u64) {
     );
 
     // Telegram
-    let tg_token = crate::config::get("channels.telegram.bot_token");
+    let tg_token = crate::secret_ref::config_secret("channels.telegram.bot_token").await;
     let tg_chat_id = crate::config::get("channels.telegram.chat_id");
     if let (Ok(token), Ok(chat_id)) = (&tg_token, &tg_chat_id) {
         if !token.is_empty() && !chat_id.is_empty() {
@@ -1398,7 +1394,7 @@ async fn send_startup_escalation_notification(elapsed_secs: u64) {
     }
 
     // Discord
-    if let Ok(token) = crate::config::get("channels.discord.bot_token") {
+    if let Ok(token) = crate::secret_ref::config_secret("channels.discord.bot_token").await {
         let channel_id = crate::config::get("channels.discord.channel_id")
             .or_else(|_| crate::config::get("channels.discord.general_channel_id"));
         if !token.is_empty() {
@@ -1430,7 +1426,7 @@ async fn send_startup_escalation_notification(elapsed_secs: u64) {
     }
 
     // Slack
-    if let Ok(token) = crate::config::get("channels.slack.bot_token") {
+    if let Ok(token) = crate::secret_ref::config_secret("channels.slack.bot_token").await {
         let channel_id = crate::config::get("channels.slack.channel_id");
         if !token.is_empty() {
             if let Ok(cid) = channel_id {
@@ -1648,7 +1644,7 @@ pub async fn serve() -> anyhow::Result<()> {
     let mut channel_registry = ChannelRegistry::new();
 
     // Try to initialize Telegram channel
-    if let Ok(token) = crate::config::get("channels.telegram.bot_token") {
+    if let Ok(token) = crate::secret_ref::config_secret("channels.telegram.bot_token").await {
         if !token.is_empty() {
             let chat_id = crate::config::get("channels.telegram.chat_id").ok();
             match TelegramChannel::new(token, chat_id) {
@@ -1668,7 +1664,7 @@ pub async fn serve() -> anyhow::Result<()> {
     }
 
     // Try to initialize Discord Gateway channel (websocket)
-    if let Ok(token) = crate::config::get("channels.discord.bot_token") {
+    if let Ok(token) = crate::secret_ref::config_secret("channels.discord.bot_token").await {
         if !token.is_empty() {
             let channel_id = crate::config::get("channels.discord.channel_id").ok();
             let shard_id = crate::config::get("channels.discord.shard_id")
@@ -1696,7 +1692,7 @@ pub async fn serve() -> anyhow::Result<()> {
     }
 
     // Try to initialize Slack channel
-    if let Ok(token) = crate::config::get("channels.slack.bot_token") {
+    if let Ok(token) = crate::secret_ref::config_secret("channels.slack.bot_token").await {
         if !token.is_empty() {
             let channel_id = crate::config::get("channels.slack.channel_id").ok();
             match SlackChannel::new(token, channel_id) {
@@ -2095,7 +2091,9 @@ pub async fn serve() -> anyhow::Result<()> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(8080);
         webhook_port = Some(port);
-        let secret = crate::config::get("webhook.secret").unwrap_or_default();
+        let secret = crate::secret_ref::config_secret("webhook.secret")
+            .await
+            .unwrap_or_default();
         let webhook_repo = project_engines
             .first()
             .map(|e| e.repo.clone())
