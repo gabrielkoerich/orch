@@ -292,8 +292,8 @@ pub async fn sync_from_kv(store: &Arc<crate::store::TaskStore>) {
             let mut open = github_5xx_circuit_open_lock();
             if open.take().is_some() {
                 tracing::info!("GitHub 5xx circuit breaker closed by KV clear");
+                github_5xx_timestamps_lock().clear();
             }
-            github_5xx_timestamps_lock().clear();
         }
         Some(Some((ts, _))) => {
             *github_5xx_circuit_open_lock() = Some(*ts);
@@ -2619,6 +2619,29 @@ mod tests {
 
         assert!(!is_github_circuit_open());
         assert!(github_5xx_timestamps_lock().is_empty());
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn sync_from_kv_keeps_5xx_window_when_expired_row_and_breaker_closed() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        let now = chrono::Utc::now().timestamp();
+        {
+            github_5xx_timestamps_lock().push(now);
+            github_5xx_timestamps_lock().push(now);
+        }
+
+        store
+            .kv_set("cooldown:github:5xx", &(now - 600).to_string())
+            .await
+            .expect("kv_set past");
+        sync_from_kv(&store).await;
+
+        assert!(!is_github_circuit_open());
+        assert_eq!(github_5xx_timestamps_lock().len(), 2);
+
+        github_5xx_timestamps_lock().clear();
     }
 
     #[serial(cooldown_state)]
