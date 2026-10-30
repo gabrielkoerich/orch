@@ -1,15 +1,14 @@
 # Ideas from infinity — Plan
 
-Status: plan, 2026-10-29. Six changes taken from [hydro-project/infinity](https://github.com/hydro-project/infinity), an agent runtime with its own model loop. Infinity solves a different problem, since orch drives CLI agents that run their own loops, so most of its design does not carry over. These six do. Line numbers are from `main` at v0.98.0.
+Status: plan, 2026-10-29. Five changes taken from [hydro-project/infinity](https://github.com/hydro-project/infinity), an agent runtime with its own model loop. Infinity solves a different problem, since orch drives CLI agents that run their own loops, so most of its design does not carry over. These five do. Line numbers are from `main` at v0.98.0.
 
 | # | Idea | Size | Files |
 |---|------|------|-------|
 | 1 | A re-run parent sees what its children did | Small | `src/engine/runner/context.rs`, `prompts/agent_system.md` |
-| 2 | A delegated task cannot delegate again | Tiny | `src/engine/runner/mod.rs`, `src/engine/runner/context.rs` |
-| 3 | Each instruction file is inlined once | Done in #3871 | `src/engine/runner/context.rs` |
-| 4 | An agent asks for sandbox permission through the channels | Medium | `src/parser.rs`, `src/engine/runner/sandbox.rs`, `src/engine/runner/mod.rs`, `src/engine/channel_handler.rs`, a new migration |
-| 5 | A fatal agent error ends the run when it is printed | Medium | `src/engine/runner/session.rs`, `src/engine/runner/agents/mod.rs` |
-| 6 | A live diff for each running task | Small | `src/channels/capture.rs`, `src/engine/events.rs`, `src/cli/stream.rs` |
+| 2 | Each instruction file is inlined once | Done in #3871 | `src/engine/runner/context.rs` |
+| 3 | An agent asks for sandbox permission through the channels | Medium | `src/parser.rs`, `src/engine/runner/sandbox.rs`, `src/engine/runner/mod.rs`, `src/engine/channel_handler.rs`, a new migration |
+| 4 | A fatal agent error ends the run when it is printed | Medium | `src/engine/runner/session.rs`, `src/engine/runner/agents/mod.rs` |
+| 5 | A live diff for each running task | Small | `src/channels/capture.rs`, `src/engine/events.rs`, `src/cli/stream.rs` |
 
 None of them adds a token or cost budget, a per-model case, a routing timer, an external endpoint or a config write by an agent.
 
@@ -17,7 +16,7 @@ None of them adds a token or cost budget, a per-model case, a routing timer, an 
 
 **Infinity:** a child thread ends with `report_to_parent` or `close_thread(report)`, and the runtime puts the report into the parent's history as a tool result (`docs/docs/infinity-runtime/built-in/threading.md`).
 
-**Orch today:** `process_delegations` (`src/engine/runner/mod.rs:1605`) creates one issue per delegation and blocks the parent. The tick sets the parent back to `New` when every child is done (`src/engine/tick.rs:2649`). The prompt promises "you will be re-run after all subtasks complete" (`prompts/agent_system.md:128`). On that re-run, `build_full_context` (`context.rs:396`) gives a task its parent and siblings through `build_parent_context` (`context.rs:53`), but nothing gives a parent its children.
+**Orch today:** `process_delegations` (`src/engine/runner/mod.rs:1605`) turns the agent's `delegations` into GitHub sub-issues of the task, blocks it, and posts a comment that lists their titles. The tick sets the parent back to `New` when every child is done (`src/engine/tick.rs:2649`). The prompt promises "you will be re-run after all subtasks complete" (`prompts/agent_system.md:128`). On that re-run, `build_full_context` (`context.rs:396`) gives it its parent and siblings through `build_parent_context` (`context.rs:53`), its last 10 issue comments, its memory and its task context, but nothing about its sub-issues beyond the titles in that comment.
 
 **Change:**
 
@@ -30,24 +29,7 @@ None of them adds a token or cost budget, a per-model case, a routing timer, an 
 
 **Rejected:** posting each child's summary as a comment on the parent issue. The agent would have to find and read them, and the comments add noise for people reading the issue.
 
-## 2. A delegated task cannot delegate again
-
-**Infinity:** `spawn_thread` takes `child_of` and refuses the call unless it matches the caller's full thread stack, so a child that inherited its parent's plan cannot re-run the parent's spawns (`crates/infinity-agent-core/src/tools/thread.rs`).
-
-**Orch today:** `process_delegations` (`mod.rs:1605`) accepts delegations from any task. Its only guard is an exact title match against open tasks (`mod.rs:1626`). A child can delegate again, and a reworded title passes the check.
-
-**Change:**
-
-- `mod.rs`: when the task has a `parent_id`, log the delegations, drop them and handle the response as a run without delegations.
-- `context.rs`: a child's prompt says that it cannot delegate, so it does the work or reports it blocked.
-
-**Why it is better:** it stops recursion and fan-out from a child that copies its parent's plan, which costs a run per issue and floods the tracker. A child exists to do one piece of work.
-
-**Cost:** a task that needs a second level of split cannot get one. Its agent reports blocked and a person splits it. That is rare, and a person should look at a tree that deep anyway.
-
-**Rejected:** a depth limit of N. It still allows fan-out at each level, and nothing so far needs more than one level.
-
-## 3. Each instruction file is inlined once
+## 2. Each instruction file is inlined once
 
 **Infinity:** a steering server lists the instruction files and the agent loads them on demand (`crates/rap-steering-server/src/lib.rs`).
 
@@ -64,7 +46,7 @@ None of them adds a token or cost budget, a per-model case, a routing timer, an 
 - Loading the files on demand, as infinity does. Orch's agents are CLIs without a tool for that, and the review agent reads `AGENTS.md` from the prompt.
 - Skipping the files that claude and codex load on their own. It needs a flag on each agent's runner, close to the rule against per-agent cases in the runner.
 
-## 4. An agent asks for sandbox permission through the channels
+## 3. An agent asks for sandbox permission through the channels
 
 **Infinity:** a command that needs to write outside its sandbox asks for `write-orig` or `write:/path`. The tool server sends the user a choice, scoped to this thread, an ancestor or once, and saves the grant for the thread (`crates/sandbox-core/src/server.rs:846-945`).
 
@@ -84,7 +66,7 @@ None of them adds a token or cost budget, a per-model case, a routing timer, an 
 
 **Rejected:** grants in `.orch.yml` or `config.yml`. Config is operator-only, a grant there applies to every task, and the agent's own request would be editing it.
 
-## 5. A fatal agent error ends the run when it is printed
+## 4. A fatal agent error ends the run when it is printed
 
 **Infinity:** observers get each event as it happens, typed: text, a tool call, usage, an error (`docs/docs/infinity-runtime/agent-systems/observers.md`).
 
@@ -102,7 +84,7 @@ None of them adds a token or cost budget, a per-model case, a routing timer, an 
 
 **Rejected:** a lower silence threshold. It would also end long, quiet builds.
 
-## 6. A live diff for each running task
+## 5. A live diff for each running task
 
 **Infinity:** after each command the sandbox pushes a diff view of the thread's changes, keeps the latest one, and replays it to a client that attaches (`docs/docs/rap/spec/server/view-updates.md`).
 
@@ -122,7 +104,7 @@ None of them adds a token or cost budget, a per-model case, a routing timer, an 
 
 ## Order
 
-1 and 2 first. They are small, independent and verified against the code. 3 is done. Then 5, then 4 and 6. 4 matters once `workflow.sandbox: os` is on for real projects, and 6 is a convenience.
+1 first. It is small and verified against the code. 2 is done. Then 4, then 3 and 5. 3 matters once `workflow.sandbox: os` is on for real projects, and 5 is a convenience.
 
 ## Not taken
 
@@ -133,3 +115,4 @@ None of them adds a token or cost budget, a per-model case, a routing timer, an 
 | Model providers as separate processes | Orch's agents are CLIs, and its per-agent runners already play this role |
 | Tool servers started lazily per session | Orch runs no tool servers |
 | A message injected into a running agent | Headless `-p` agents cannot take input. Orch already forwards channel text to tmux for interactive ones |
+| A child cannot re-run its parent's spawns (`child_of` in `crates/infinity-agent-core/src/tools/thread.rs`) | Infinity's child threads inherit the parent's conversation, plan included, so the check stops a child acting as its parent. Orch has nothing to guard: a task never spawns anything itself. Orch turns an agent's `delegations` into GitHub sub-issues and blocks the parent until they are done, and a sub-issue that delegates again is normal decomposition. Chains of tasks that need other tasks come from blocked-by links (`src/engine/dependencies.rs`, `orch task add --depends-on`, `orch plan import`), which keep a task `waiting` until its blockers merge. A limit on either would break how work is split |
