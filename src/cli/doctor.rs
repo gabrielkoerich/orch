@@ -775,8 +775,15 @@ async fn check_orphaned_worktrees(all_tasks: &[Task], findings: &mut Vec<Finding
         Ok(d) => d,
         Err(_) => return,
     };
+    check_orphaned_worktrees_in(&worktrees_dir, all_tasks, findings).await;
+}
 
-    let project_dirs = match std::fs::read_dir(&worktrees_dir) {
+async fn check_orphaned_worktrees_in(
+    worktrees_dir: &Path,
+    all_tasks: &[Task],
+    findings: &mut Vec<Finding>,
+) {
+    let project_dirs = match std::fs::read_dir(worktrees_dir) {
         Ok(d) => d,
         Err(_) => return,
     };
@@ -1404,6 +1411,29 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn done_task_worktree_is_not_reported_as_orphaned() {
+        let base = tempfile::tempdir().unwrap();
+        let wt = base.path().join("proj").join("branch-1");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        let mut done = task(1, Some("1"), "github");
+        done.status = TaskStatus::Done;
+        done.worktree = wt.to_string_lossy().to_string();
+
+        let mut findings = Vec::new();
+        super::check_orphaned_worktrees_in(base.path(), &[done], &mut findings).await;
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0]
+            .message
+            .contains("done but worktree not cleaned up"));
+        assert!(!findings[0].message.contains("orphaned"));
+
+        let mut findings = Vec::new();
+        super::check_orphaned_worktrees_in(base.path(), &[], &mut findings).await;
+        assert!(findings[0].message.contains("orphaned worktree"));
     }
 
     #[test]

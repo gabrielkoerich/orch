@@ -2076,6 +2076,17 @@ mod tests {
             .set_fields(task1, &[("branch", serde_json::json!("branch-1"))])
             .await
             .unwrap();
+        // No .git file, so cleanup force-removes the directory
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join("branch-1");
+        std::fs::create_dir_all(&wt_path).unwrap();
+        store
+            .set_fields(
+                task1,
+                &[("worktree", serde_json::json!(wt_path.to_string_lossy()))],
+            )
+            .await
+            .unwrap();
 
         let task2 = store
             .create(&NewTask {
@@ -2143,6 +2154,9 @@ mod tests {
         let updated_task1 = store.get(task1).await.unwrap();
         let updated_task2 = store.get(task2).await.unwrap();
         assert_eq!(updated_task1.status, crate::store::TaskStatus::Done);
+        assert!(updated_task1.worktree_cleaned);
+        assert!(!wt_path.exists());
+        assert!(!updated_task2.worktree_cleaned);
         assert_eq!(updated_task2.status, crate::store::TaskStatus::InReview);
 
         let comments = backend.posted_comments.lock().unwrap().clone();
