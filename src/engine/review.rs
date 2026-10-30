@@ -2442,7 +2442,7 @@ async fn post_review_comment(
     let mut pr_comment = build_pr_review_comment(decision, review_notes_for_comment);
     if ctx.same_agent_fallback && !pr_comment.is_empty() {
         pr_comment.push_str(
-            "\n> Note: no other agent was available, so this PR was reviewed by the same agent that wrote the code.\n",
+            "\n> Note: no other agent was available, so this PR was reviewed by the same agent in a new session.\n",
         );
     }
 
