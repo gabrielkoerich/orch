@@ -1373,16 +1373,19 @@ async fn invoke_review_agent(
         Ok(gh) => {
             let app = review_app(repo).await;
             post_review_started(app.as_deref(), &gh, repo, ctx.head_sha.as_deref()).await;
-            if let Err(e) = gh
-                .add_comment(repo, &ctx.pr_number.to_string(), &start_comment)
-                .await
-            {
-                tracing::debug!(
-                    task_id = task.id.0,
-                    pr_number = ctx.pr_number,
-                    error = %e,
-                    "failed to post review-started comment"
-                );
+            // The comment is comment mode's only start signal, the App's check run shows it already
+            if app.is_none() {
+                if let Err(e) = gh
+                    .add_comment(repo, &ctx.pr_number.to_string(), &start_comment)
+                    .await
+                {
+                    tracing::debug!(
+                        task_id = task.id.0,
+                        pr_number = ctx.pr_number,
+                        error = %e,
+                        "failed to post review-started comment"
+                    );
+                }
             }
         }
         Err(e) => {
