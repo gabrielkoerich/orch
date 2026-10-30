@@ -286,6 +286,21 @@ pub async fn sync_from_kv(store: &Arc<crate::store::TaskStore>) {
         }
     }
 
+    // The 5xx circuit breaker lives in its own statics, so mirror its KV row there
+    match explicit_kv.get("github:5xx") {
+        Some(None) => {
+            let mut open = github_5xx_circuit_open_lock();
+            if open.take().is_some() {
+                tracing::info!("GitHub 5xx circuit breaker closed by KV clear");
+                github_5xx_timestamps_lock().clear();
+            }
+        }
+        Some(Some((ts, _))) => {
+            *github_5xx_circuit_open_lock() = Some(*ts);
+        }
+        None => {}
+    }
+
     let mut map = cooldown_lock();
     let mut dropped = 0usize;
     let mut updated = 0usize;
@@ -2583,6 +2598,69 @@ mod tests {
             !is_agent_in_cooldown(agent),
             "sync_from_kv must drop in-memory entries the KV tombstoned"
         );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn sync_from_kv_closes_github_circuit_when_row_cleared() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        {
+            *github_5xx_circuit_open_lock() = Some(chrono::Utc::now().timestamp() + 600);
+            github_5xx_timestamps_lock().push(chrono::Utc::now().timestamp());
+        }
+        assert!(is_github_circuit_open());
+
+        store
+            .kv_set("cooldown:github:5xx", "0")
+            .await
+            .expect("kv_set tombstone");
+        sync_from_kv(&store).await;
+
+        assert!(!is_github_circuit_open());
+        assert!(github_5xx_timestamps_lock().is_empty());
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn sync_from_kv_keeps_5xx_window_when_expired_row_and_breaker_closed() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        let now = chrono::Utc::now().timestamp();
+        {
+            github_5xx_timestamps_lock().push(now);
+            github_5xx_timestamps_lock().push(now);
+        }
+
+        store
+            .kv_set("cooldown:github:5xx", &(now - 600).to_string())
+            .await
+            .expect("kv_set past");
+        sync_from_kv(&store).await;
+
+        assert!(!is_github_circuit_open());
+        assert_eq!(github_5xx_timestamps_lock().len(), 2);
+
+        github_5xx_timestamps_lock().clear();
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn sync_from_kv_keeps_github_circuit_open_for_future_row() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        let future = chrono::Utc::now().timestamp() + 600;
+        *github_5xx_circuit_open_lock() = Some(future);
+
+        store
+            .kv_set("cooldown:github:5xx", &future.to_string())
+            .await
+            .expect("kv_set future");
+        sync_from_kv(&store).await;
+
+        assert!(is_github_circuit_open());
+
+        *github_5xx_circuit_open_lock() = None;
     }
 
     #[serial(cooldown_state)]
