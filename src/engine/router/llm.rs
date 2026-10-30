@@ -604,6 +604,7 @@ impl LlmRouter {
                 llm_response.profile.tools
             },
             constraints: llm_response.profile.constraints,
+            execution: None,
         };
 
         // Ensure tools includes allowed_tools
@@ -1283,6 +1284,7 @@ mod tests {
             skills: skills.iter().map(|s| s.to_string()).collect(),
             tools: vec!["git".to_string()],
             constraints: vec![],
+            execution: None,
         }
     }
 

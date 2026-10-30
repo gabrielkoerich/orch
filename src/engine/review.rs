@@ -1223,6 +1223,7 @@ async fn build_review_context(
     let invocation = runner::agent::AgentInvocation {
         agent: review_agent.clone(),
         model: review_model.clone(),
+        reasoning_effort: None,
         work_dir: worktree_path.clone(),
         system_prompt: runner::agent::review_system_prompt(),
         agent_message: review_prompt,
@@ -4926,6 +4927,7 @@ mod tests {
             invocation: runner::agent::AgentInvocation {
                 agent: agent.to_string(),
                 model: Some(model.to_string()),
+                reasoning_effort: None,
                 work_dir: work_dir.to_path_buf(),
                 system_prompt: String::new(),
                 agent_message: String::new(),
