@@ -123,6 +123,7 @@ fn resolve_model_name(
     [param, routed, stored]
         .into_iter()
         .flatten()
+        .map(str::trim)
         .find(|m| !m.is_empty())
         .map(String::from)
 }

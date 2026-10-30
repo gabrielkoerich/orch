@@ -366,6 +366,8 @@ impl AgentRunner for ClaudeRunner {
         permissions: &PermissionRules,
     ) -> String {
         let model_flag = model
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
             .map(|m| format!("--model {}", super::shell_single_quote(m)))
             .unwrap_or_default();
 
@@ -527,7 +529,7 @@ impl AgentRunner for ClaudeRunner {
             .arg("stream-json")
             .arg("--verbose")
             .arg("--print");
-        if let Some(m) = model {
+        if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
             cmd.arg("--model").arg(m);
         }
         cmd.arg(prompt);
@@ -1244,6 +1246,24 @@ mod tests {
         let (input, output) = extract_usage(envelope);
         assert_eq!(input, Some(1000));
         assert_eq!(output, Some(500));
+    }
+
+    #[test]
+    fn build_command_skips_an_empty_model() {
+        let r = runner();
+        let perms = PermissionRules {
+            autonomous: true,
+            sandbox: SandboxLevel::WorkspaceWrite,
+            disallowed_tools: vec![],
+            allowed_tools: vec![],
+            allowed_edit_paths: vec![],
+            deny_read_only: false,
+            extra_writable_dirs: vec![],
+        };
+        for m in ["", "  "] {
+            let cmd = r.build_command(Some(m), "", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
+            assert!(!cmd.contains("--model"), "{cmd}");
+        }
     }
 
     #[test]
