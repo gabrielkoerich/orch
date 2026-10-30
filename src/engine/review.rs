@@ -673,8 +673,8 @@ async fn patch_id(dir: &std::path::Path, sha: &str) -> Option<String> {
         .map(String::from)
 }
 
-/// Record `head_sha` as approved and publish the approval on it: in app mode an App approval
-/// and the check run, in comment mode the commit status
+/// Record `head_sha` as approved and pass `orch/review` on it: the App check run in app mode, the
+/// commit status in comment mode. The App review stays on the PR, a second one would repeat it
 async fn publish_carried_approval(
     store: &Arc<TaskStore>,
     gh: &GhHttp,
@@ -691,22 +691,6 @@ async fn publish_carried_approval(
     write_approval(store, task_id, pr_number, &carried).await;
     let note = "Approval carried across a base branch update";
     let app = review_app(repo).await;
-    // A ruleset that dismisses stale approvals needs an App approval on the new head too
-    if let Some(app) = app.as_deref() {
-        if let Err(e) = app
-            .submit_review(
-                repo,
-                pr_number,
-                crate::github::app::ReviewEvent::Approve,
-                note,
-                head_sha,
-                &[],
-            )
-            .await
-        {
-            tracing::warn!(task_id, err = %e, "failed to carry the App approval to the new head");
-        }
-    }
     post_review_decision(
         app.as_deref(),
         gh,
