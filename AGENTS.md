@@ -135,7 +135,7 @@ engine:
 
 See also `## DO NOT TOUCH → No external endpoints`. In practice polling is the default — webhooks rarely work without a public endpoint.
 
-The relay client (`src/engine/relay.rs`) connects out to orch-relay at `<relay.url>/ws`, which receives the GitHub App's webhooks, so it needs no inbound endpoint. It keeps a cursor in the KV store, reconnects with a backoff up to 60 s, and is off when `relay.url` is unset. `relay.token` takes a `passbox:<name>` reference.
+The relay client (`src/engine/relay.rs`) connects out to orch-relay at `<relay.url>/ws`, which receives the GitHub App's webhooks, so it needs no inbound endpoint. It keeps a cursor in the KV store, reconnects with a backoff up to 5 minutes that only a session of a minute or more resets, and is off when `relay.url` is unset. `relay.token` takes a `passbox:<name>` reference.
 
 ## PR Review Integration
 
