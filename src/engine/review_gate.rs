@@ -139,7 +139,11 @@ fn ci_state(
         .collect();
     if !failed.is_empty() {
         CiState::Red(failed)
-    } else if checks.iter().any(|(_, _, finished, _)| !finished) {
+    } else if checks.iter().any(|(_, _, finished, _)| !finished)
+        || required
+            .iter()
+            .any(|r| !checks.iter().any(|(name, ..)| name == &r.context))
+    {
         CiState::Running
     } else {
         CiState::Green
@@ -223,6 +227,19 @@ mod tests {
         assert_eq!(
             ci_state(&[required("ci/legacy")], &runs, &statuses),
             CiState::Red(vec!["ci/legacy".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_required_check_that_has_not_reported_keeps_the_review_waiting() {
+        let runs = [run("test", "completed", Some("success"))];
+        let both = [required("test"), required("lint")];
+        assert_eq!(ci_state(&both, &runs, &[]), CiState::Running);
+        assert_eq!(ci_state(&both, &[], &[]), CiState::NotStarted);
+        let failed = [run("test", "completed", Some("failure"))];
+        assert_eq!(
+            ci_state(&both, &failed, &[]),
+            CiState::Red(vec!["test".to_string()])
         );
     }
 
