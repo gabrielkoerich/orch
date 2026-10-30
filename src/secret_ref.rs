@@ -14,7 +14,8 @@ pub async fn config_secret(key: &str) -> anyhow::Result<String> {
         std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
 
-    let value = crate::config::get(key)?;
+    // The global config only: a project file must never point a secret at its own endpoint
+    let value = crate::config::get_global(key)?;
     if let Some(secret) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&value) {
         return Ok(secret.clone());
     }

@@ -180,7 +180,8 @@ pub(crate) async fn reset_orphaned_reviews(
 /// Starts the relay client when `relay.url` is set. The token is read in the background, so a
 /// passbox prompt nobody answers never holds up the engine
 fn start_relay_client(project_engines: &[ProjectEngine], notify: &Arc<Notify>) {
-    let url = crate::config::get("relay.url").unwrap_or_default();
+    // The global config only: a project file must never point a secret at its own endpoint
+    let url = crate::config::get_global("relay.url").unwrap_or_default();
     let Some(store) = project_engines.first().map(|e| Arc::clone(&e.store)) else {
         return;
     };
@@ -189,7 +190,7 @@ fn start_relay_client(project_engines: &[ProjectEngine], notify: &Arc<Notify>) {
         return;
     }
 
-    let token_ref = crate::config::get("relay.token").unwrap_or_default();
+    let token_ref = crate::config::get_global("relay.token").unwrap_or_default();
     let notify = Arc::clone(notify);
     tokio::spawn(async move {
         let mut warned = false;
@@ -2079,6 +2080,22 @@ pub async fn serve() -> anyhow::Result<()> {
     let webhook_enabled = crate::config::get("webhook.enabled")
         .map(|v| v == "true")
         .unwrap_or(false);
+    // A configured secret that cannot be read turns the webhook server off, never its signature check
+    let webhook_secret = match crate::config::get_global("webhook.secret") {
+        Ok(v) if webhook_enabled && !v.trim().is_empty() => {
+            crate::secret_ref::config_secret("webhook.secret")
+                .await
+                .ok()
+        }
+        _ => Some(String::new()),
+    };
+    let webhook_enabled = webhook_enabled && webhook_secret.is_some();
+    if webhook_secret.is_none() {
+        tracing::error!(
+            "webhook.secret is set but could not be read, the webhook server stays off"
+        );
+    }
+    let webhook_secret = webhook_secret.unwrap_or_default();
 
     // Shared status updated by the server-spawn task and the health-check loop.
     let webhook_status = Arc::new(tokio::sync::Mutex::new(
@@ -2091,9 +2108,7 @@ pub async fn serve() -> anyhow::Result<()> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(8080);
         webhook_port = Some(port);
-        let secret = crate::secret_ref::config_secret("webhook.secret")
-            .await
-            .unwrap_or_default();
+        let secret = webhook_secret.clone();
         let webhook_repo = project_engines
             .first()
             .map(|e| e.repo.clone())
