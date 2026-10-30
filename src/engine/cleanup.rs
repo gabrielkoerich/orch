@@ -436,7 +436,8 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
             // not main) and would silently no-op on divergence.
             let fetch_result = timeout(
                 GIT_TIMEOUT,
-                Command::new("git")
+                crate::engine::runner::git_ops::git()
+                    .await
                     .args(["-C", &repo_root, "fetch", "--prune", "origin"])
                     .output_with_context(),
             )
@@ -491,7 +492,8 @@ pub(crate) async fn cleanup_task_worktree(
             const GIT_TIMEOUT: Duration = Duration::from_secs(60);
             let fetch_result = timeout(
                 GIT_TIMEOUT,
-                Command::new("git")
+                crate::engine::runner::git_ops::git()
+                    .await
                     .args(["-C", &repo_root, "fetch", "--prune", "origin"])
                     .output_with_context(),
             )
@@ -1036,9 +1038,8 @@ async fn delete_local_branch(task_id: &str, br: &str, repo_root: &std::path::Pat
  **/
 pub(crate) async fn delete_branches(task_id: &str, br: &str, repo_root: &std::path::Path) {
     let default_branch = crate::engine::runner::worktree::detect_default_branch(repo_root).await;
-    let auth_env = crate::engine::runner::git_ops::build_git_auth_env().await;
-    let _ = Command::new("git")
-        .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+    let _ = crate::engine::runner::git_ops::git()
+        .await
         .args([
             "-C",
             &repo_root.to_string_lossy(),
@@ -1066,8 +1067,8 @@ pub(crate) async fn delete_branches(task_id: &str, br: &str, repo_root: &std::pa
         }
     }
 
-    let remote_delete = Command::new("git")
-        .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+    let remote_delete = crate::engine::runner::git_ops::git()
+        .await
         .args([
             "-C",
             &repo_root.to_string_lossy(),

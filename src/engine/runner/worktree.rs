@@ -591,7 +591,8 @@ pub async fn setup_worktree(
         // the operator's checkout: branching from `origin/<default_branch>`
         // means unpushed local commits or in-progress work on `main` never
         // leak into the new worktree.
-        let _ = Command::new("git")
+        let _ = crate::engine::runner::git_ops::git()
+            .await
             .args([
                 "-C",
                 &main_dir.to_string_lossy(),

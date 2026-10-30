@@ -26,7 +26,6 @@ use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use dashmap::{DashMap, DashSet};
 use std::sync::Arc;
-use tokio::process::Command;
 use tokio::sync::RwLock;
 
 /// Read a KV value from the store.
@@ -2439,7 +2438,8 @@ async fn sync_one_skill(
         tracing::debug!(repo = %skill.repo, "pulling skill repo");
         let pull_result = tokio::time::timeout(
             git_timeout,
-            Command::new("git")
+            crate::engine::runner::git_ops::git()
+                .await
                 .args(["pull", "--ff-only", "--prune"])
                 .current_dir(&repo_dir)
                 .output_with_context(),
@@ -2479,7 +2479,8 @@ async fn sync_one_skill(
 
         let clone_result = tokio::time::timeout(
             git_timeout,
-            Command::new("git")
+            crate::engine::runner::git_ops::git()
+                .await
                 .args(["clone", "--depth", "1", &repo_url, repo_dir_str])
                 .output_with_context(),
         )

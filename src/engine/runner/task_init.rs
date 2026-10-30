@@ -275,6 +275,7 @@ pub async fn prepare_task(
         // permission prompt or a rejection and reports it as its own failure (#3783)
         "Bash(gh pr create*)".to_string(),
     ];
+    disallowed_tools.extend(git_ops::remote_change_tools());
 
     // Sandbox: block access to main project dir
     if wt.work_dir != wt.main_project_dir {

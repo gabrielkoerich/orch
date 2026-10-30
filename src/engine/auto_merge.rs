@@ -234,9 +234,11 @@ async fn attempt_worktree_rebase_and_force_push(
     // Lease the feature-branch tip before fetch moves the tracking ref
     git_ops::record_push_lease(&wt_path, &branch, &default_branch).await;
     let git_timeout = std::time::Duration::from_secs(120);
+    // Over HTTPS with the gh token, an SSH remote would ask the owner's SSH agent
     let fetch_result = tokio::time::timeout(
         git_timeout,
-        tokio::process::Command::new("git")
+        crate::engine::runner::git_ops::git()
+            .await
             .args(["fetch", "origin"])
             .current_dir(&wt_path)
             .kill_on_drop(true)
@@ -258,7 +260,6 @@ async fn attempt_worktree_rebase_and_force_push(
                 &wt_path,
                 &format!("origin/{default_branch}"),
                 git_ops::StashRebaseOpts {
-                    disable_gpg_signing: true,
                     abort_on_failure: false,
                 },
             )
