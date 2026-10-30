@@ -4253,6 +4253,10 @@ mod tests {
                     "commit.gpgsign=false",
                 ])
                 .args(args)
+                .env_remove("GIT_AUTHOR_NAME")
+                .env_remove("GIT_AUTHOR_EMAIL")
+                .env_remove("GIT_COMMITTER_NAME")
+                .env_remove("GIT_COMMITTER_EMAIL")
                 .current_dir(path)
                 .output()
                 .unwrap();
@@ -4318,6 +4322,10 @@ mod tests {
                     "commit.gpgsign=false",
                 ])
                 .args(args)
+                .env_remove("GIT_AUTHOR_NAME")
+                .env_remove("GIT_AUTHOR_EMAIL")
+                .env_remove("GIT_COMMITTER_NAME")
+                .env_remove("GIT_COMMITTER_EMAIL")
                 .current_dir(path)
                 .output()
                 .unwrap();
