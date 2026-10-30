@@ -437,7 +437,7 @@ fn record_response_for_limiter(cell: &Mutex<RateLimit>, resp: &Response) {
 pub struct GhHttp {
     client: Client,
     token_resolver: Arc<token::TokenResolver>,
-    // A fixed App for tests, otherwise the shared App, which a background loader may set later
+    // An App only tests set, production calls always use the gh token
     app: Option<Arc<super::app::AppAuth>>,
     // Calls the App cannot make, such as `GET /user` and Projects V2 on a personal account
     owner_only: bool,
@@ -553,7 +553,9 @@ impl GhHttp {
             return None;
         }
 
-        self.app.clone().or_else(super::app::shared)
+        // orch's own calls use the gh token, the App only reviews (src/engine/review.rs). The App
+        // must not open PRs, GitHub refuses a review from a PR's author
+        self.app.clone()
     }
 
     /// The App's token for a repository it is installed on, the owner token for anything else,

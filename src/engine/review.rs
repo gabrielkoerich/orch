@@ -2581,8 +2581,8 @@ async fn post_review_decision(
 }
 
 /// Submit the decision as an App review on the sha the agent read, with the issues on diff lines
-/// as inline comments, then post the comment the gate falls back to. Without an App only the
-/// comment goes out
+/// as inline comments. The `## Automated Review` comment goes out only without an App or when
+/// GitHub refuses the review, so the decision always lands somewhere
 async fn publish_review(
     app: Option<&crate::github::app::AppAuth>,
     gh: &GhHttp,
@@ -2600,11 +2600,14 @@ async fn publish_review(
     };
     if let (Some(app), Some(sha), Some(event)) = (app, head_sha, event) {
         let inline = inline_comments(app, repo, pr_number, decision).await;
-        if let Err(e) = app
+        match app
             .submit_review(repo, pr_number, event, comment, sha, &inline)
             .await
         {
-            tracing::warn!(pr_number, sha, error = %e, "failed to submit App review, the comment stays the decision");
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(pr_number, sha, error = %e, "failed to submit App review, posting the decision as a comment");
+            }
         }
     }
     gh.add_comment(repo, &pr_number.to_string(), comment).await
@@ -5479,7 +5482,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/repos/o/r/issues/9/comments"))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": 2})))
-            .expect(1)
+            .expect(0)
             .mount(&server)
             .await;
         Mock::given(method("GET"))

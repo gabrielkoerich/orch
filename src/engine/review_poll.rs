@@ -797,7 +797,7 @@ pub(crate) async fn review_open_prs(
                                 task_id = task_clone.id.0,
                                 pr_number,
                                 err = %e,
-                                "auto-merge failed, keeping task in_review for next tick"
+                                "auto-merge failed, retrying next tick"
                             );
                         }
                     });
