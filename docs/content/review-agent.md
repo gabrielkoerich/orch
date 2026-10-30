@@ -28,7 +28,7 @@ The review agent automatically reviews pull requests after an agent completes a 
 
    With `review.mode: app` and the GitHub App installed on the repository, the decision is a real App review with inline comments, and `orch/review` is a check run from the App. No comment is posted, unless GitHub refuses the App review. See [Review mode](@/configuration.md#review-mode).
 
-   A new commit moves the head SHA, so an approval does not cover it. The one exception is a base update in `approved`: when the PR falls behind, orch rebases it in the task worktree (or GitHub merges the base in when that fails), and carries the approval to the new head only if the repository, branch, base, commits, authors and tree all match what was approved. The carried approval is published like a decision.
+   A new commit moves the head SHA, so an approval does not cover it. The one exception is a base update in `approved`: when the PR falls behind, orch rebases it in the task worktree (or GitHub merges the base in when that fails), and carries the approval to the new head only if the repository, branch, base, commits, authors and tree all match what was approved. A carried approval posts no second review: orch passes `orch/review` on the new head (the App check run, or the commit status in comment mode) and the first review stays on the PR.
 
 ## Agent Selection
 
