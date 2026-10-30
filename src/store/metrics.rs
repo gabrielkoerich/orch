@@ -639,7 +639,7 @@ impl TaskStore {
     /// modifier argument cannot be parameterised via `?` bind.
     pub async fn get_cost_summary(&self) -> anyhow::Result<CostSummary> {
         // Each entry: (static SQL with the interval baked in, label)
-        let windows: &[(&str, &str)] = &[
+        let windows: &[(&'static str, &str)] = &[
             (
                 "SELECT COALESCE(SUM(input_tokens), 0) as input_tokens,
                     COALESCE(SUM(output_tokens), 0) as output_tokens,
@@ -677,7 +677,7 @@ impl TaskStore {
 
         let mut periods = Vec::new();
         for (query, label) in windows {
-            let row = sqlx::query(query).fetch_one(&self.pool).await?;
+            let row = sqlx::query(*query).fetch_one(&self.pool).await?;
             periods.push(CostPeriod {
                 label: label.to_string(),
                 input_tokens: row.try_get("input_tokens")?,

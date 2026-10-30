@@ -982,7 +982,7 @@ mod tests {
                 continue;
             }
             let sql = std::fs::read_to_string(path).unwrap();
-            sqlx::raw_sql(&sql)
+            sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_str()))
                 .execute(&pool)
                 .await
                 .unwrap_or_else(|err| panic!("migration {name} failed: {err}"));
@@ -992,7 +992,10 @@ mod tests {
             .await
             .unwrap();
         let sql = std::fs::read_to_string(dir.join("028_task_dependencies.sql")).unwrap();
-        sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_str()))
+            .execute(&pool)
+            .await
+            .unwrap();
         let (id, title): (i64, String) = sqlx::query_as("SELECT id, title FROM tasks")
             .fetch_one(&pool)
             .await

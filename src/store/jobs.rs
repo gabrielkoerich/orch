@@ -31,7 +31,7 @@ impl TaskStore {
             "SELECT {} FROM job_state WHERE repo = ? AND job_id = ?",
             JOB_STATE_COLS
         );
-        let row: Option<JobState> = sqlx::query_as(&sql)
+        let row: Option<JobState> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(repo)
             .bind(job_id)
             .fetch_optional(&self.pool)
@@ -49,7 +49,7 @@ impl TaskStore {
     /// List all job states for a repo.
     pub async fn list_job_states(&self, repo: &str) -> anyhow::Result<Vec<JobState>> {
         let sql = format!("SELECT {} FROM job_state WHERE repo = ?", JOB_STATE_COLS);
-        let rows: Vec<JobState> = sqlx::query_as(&sql)
+        let rows: Vec<JobState> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(repo)
             .fetch_all(&self.pool)
             .await?;

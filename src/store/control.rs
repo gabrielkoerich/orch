@@ -107,26 +107,26 @@ impl TaskStore {
     ) -> anyhow::Result<Vec<ControlMessage>> {
         // Subquery: get the N most recent, then re-sort chronologically
         let rows = if let Some(ts) = since {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SELECT {CONTROL_MESSAGE_COLS} FROM (
                 SELECT {CONTROL_MESSAGE_COLS} FROM control_messages
                 WHERE session_id = ? AND created_at >= ?
                 ORDER BY created_at DESC, id DESC LIMIT ?
             ) ORDER BY created_at ASC, id ASC"
-            ))
+            )))
             .bind(session_id)
             .bind(ts)
             .bind(limit)
             .fetch_all(&self.pool)
             .await?
         } else {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SELECT {CONTROL_MESSAGE_COLS} FROM (
                 SELECT {CONTROL_MESSAGE_COLS} FROM control_messages
                 WHERE session_id = ?
                 ORDER BY created_at DESC, id DESC LIMIT ?
             ) ORDER BY created_at ASC, id ASC"
-            ))
+            )))
             .bind(session_id)
             .bind(limit)
             .fetch_all(&self.pool)
@@ -164,11 +164,11 @@ impl TaskStore {
             .replace('_', "\\_");
         let pattern = format!("%{escaped}%");
         let rows = if let Some(ts) = since {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SELECT {CONTROL_MESSAGE_COLS} FROM control_messages \
                  WHERE session_id = ? AND content LIKE ? ESCAPE '\\' AND created_at >= ? \
                  ORDER BY created_at DESC LIMIT ?"
-            ))
+            )))
             .bind(session_id)
             .bind(&pattern)
             .bind(ts)
@@ -176,11 +176,11 @@ impl TaskStore {
             .fetch_all(&self.pool)
             .await?
         } else {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SELECT {CONTROL_MESSAGE_COLS} FROM control_messages \
                  WHERE session_id = ? AND content LIKE ? ESCAPE '\\' \
                  ORDER BY created_at DESC LIMIT ?"
-            ))
+            )))
             .bind(session_id)
             .bind(&pattern)
             .bind(limit)

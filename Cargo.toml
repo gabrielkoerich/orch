@@ -79,7 +79,7 @@ dirs = "6"
 notify = "7"
 
 # SQLite via sqlx — unified task store (async, compile-time checked queries)
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
 
 # Command discovery for agents
 which = "7"
@@ -123,3 +123,7 @@ rsa = "0.9"
 opt-level = 3
 lto = true
 strip = true
+
+# sqlx 0.9 caps libsqlite3-sys below 0.38, which bundles SQLite older than 3.54. The vendored copy only widens that range
+[patch.crates-io]
+sqlx-sqlite = { path = "vendor/sqlx-sqlite" }
