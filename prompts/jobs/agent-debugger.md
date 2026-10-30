@@ -1,6 +1,6 @@
 ---
 id: agent-debugger
-schedule: 0 21 * * *
+schedule: 0 3 * * *
 title: 'Self-improvement: debug agent errors and fix root causes'
 ---
 
@@ -13,6 +13,10 @@ Read `./SKILL.md` first — it contains the repo-tracked operational guidance an
 ## Step 1: Gather failure data
 
 1. Check recent task run logs for failures:
+   Read recent logs at:
+
+  `~/.orch/state/<owner>/<repo>/tasks/<id>/attempts/<n>/` -> Each task attempt's own files (runner.sh, output.json)
+
    ```
     sqlite3 ~/.orch/orch.db "SELECT id, external_id, status, agent, model, last_error, block_reason, updated_at FROM tasks WHERE status IN ('blocked', 'needs_review') AND datetime(updated_at) > datetime('now', '-12 hours') ORDER BY updated_at DESC LIMIT 20;"
    ```
@@ -26,6 +30,12 @@ Read `./SKILL.md` first — it contains the repo-tracked operational guidance an
    ```
    tail -500 /opt/homebrew/var/log/orch.log | grep -i 'error\|warn' | grep -v 'error sending request\|kill-session failed' | tail -30
    ```
+4. Read all logs and look for weird patterns, slowness or errors:
+  `/opt/homebrew/var/log/orch.log`  -> Main service log (stdout), set in the launchd plist 
+  `/opt/homebrew/var/log/orch.error.log`  -> stderr, emptied on every start (src/main.rs:132)
+  `/opt/homebrew/var/log/orch.log.1, .2, .3`  -> Older logs moved aside by rotation   
+
+  You can pipe the log files for with `grep -i 'error\|warn'`
 4. Inspect task-specific run history when a task needs more context:
    ```
    orch task runs <id>

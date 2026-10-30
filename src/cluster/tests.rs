@@ -489,12 +489,9 @@ async fn daemon_endpoint_refuses_a_wrong_token_and_a_foreign_host() {
     }
 }
 
-fn free_addr() -> String {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .to_string()
+async fn bound_listener() -> (String, tokio::net::TcpListener) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    (listener.local_addr().unwrap().to_string(), listener)
 }
 
 struct Member {
@@ -508,9 +505,10 @@ async fn start_member(
     voters: &BTreeMap<NodeId, String>,
     secret: &str,
     elect: bool,
+    listener: tokio::net::TcpListener,
 ) -> Member {
     let store = open(dir).await;
-    let node = start_node(
+    let node = start_node_on(
         &store,
         &dir.join("raft.db"),
         NodeConfig {
@@ -521,6 +519,7 @@ async fn start_member(
             voters: voters.clone(),
             elect,
         },
+        listener,
     )
     .await
     .unwrap();
@@ -553,17 +552,37 @@ async fn wait_for_task(store: &TaskStore, id: i64) -> crate::store::Task {
     panic!("task {id} never arrived");
 }
 
-fn voters(n: u64) -> BTreeMap<NodeId, String> {
-    (1..=n).map(|id| (id, free_addr())).collect()
+async fn voters(
+    n: u64,
+) -> (
+    BTreeMap<NodeId, String>,
+    BTreeMap<NodeId, tokio::net::TcpListener>,
+) {
+    let mut addrs = BTreeMap::new();
+    let mut listeners = BTreeMap::new();
+    for id in 1..=n {
+        let (addr, listener) = bound_listener().await;
+        addrs.insert(id, addr);
+        listeners.insert(id, listener);
+    }
+    (addrs, listeners)
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn three_voters_fail_over_and_catch_up() {
     let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let voters = voters(3);
+    let (voters, mut listeners) = voters(3).await;
     let mut members = BTreeMap::new();
     for id in 1..=3 {
-        let m = start_member(dirs[id as usize - 1].path(), id, &voters, "s3cret", true).await;
+        let m = start_member(
+            dirs[id as usize - 1].path(),
+            id,
+            &voters,
+            "s3cret",
+            true,
+            listeners.remove(&id).unwrap(),
+        )
+        .await;
         members.insert(id, m);
     }
 
@@ -591,6 +610,10 @@ async fn three_voters_fail_over_and_catch_up() {
         &voters,
         "s3cret",
         true,
+        // The stopped node released its port, so a restart binds it again
+        tokio::net::TcpListener::bind(&voters[&first])
+            .await
+            .unwrap(),
     )
     .await;
     assert_eq!(wait_for_task(&back.store, b).await.title, "b");
@@ -603,7 +626,7 @@ async fn three_voters_fail_over_and_catch_up() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_witness_votes_but_never_leads() {
     let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let voters = voters(3);
+    let (voters, mut listeners) = voters(3).await;
     let mut members = BTreeMap::new();
     for id in 1..=3 {
         let witness = id == 3;
@@ -613,6 +636,7 @@ async fn a_witness_votes_but_never_leads() {
             &voters,
             "s3cret",
             !witness,
+            listeners.remove(&id).unwrap(),
         )
         .await;
         members.insert(id, m);
@@ -641,11 +665,19 @@ async fn a_witness_votes_but_never_leads() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_with_the_wrong_secret_gets_nothing() {
     let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let voters = voters(3);
+    let (voters, mut listeners) = voters(3).await;
     let mut members = BTreeMap::new();
     for id in 1..=3 {
         let secret = if id == 3 { "other" } else { "s3cret" };
-        let m = start_member(dirs[id as usize - 1].path(), id, &voters, secret, id != 3).await;
+        let m = start_member(
+            dirs[id as usize - 1].path(),
+            id,
+            &voters,
+            secret,
+            id != 3,
+            listeners.remove(&id).unwrap(),
+        )
+        .await;
         members.insert(id, m);
     }
 
@@ -667,10 +699,18 @@ async fn a_node_with_the_wrong_secret_gets_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_learner_joins_through_any_node_and_catches_up() {
     let dirs: Vec<_> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
-    let voters = voters(3);
+    let (voters, mut listeners) = voters(3).await;
     let mut members = BTreeMap::new();
     for id in 1..=3 {
-        let m = start_member(dirs[id as usize - 1].path(), id, &voters, "s3cret", true).await;
+        let m = start_member(
+            dirs[id as usize - 1].path(),
+            id,
+            &voters,
+            "s3cret",
+            true,
+            listeners.remove(&id).unwrap(),
+        )
+        .await;
         members.insert(id, m);
     }
 
@@ -681,11 +721,11 @@ async fn a_learner_joins_through_any_node_and_catches_up() {
         .await
         .unwrap();
 
-    let addr = free_addr();
+    let (addr, learner_listener) = bound_listener().await;
     let mut all = voters.clone();
     all.insert(4, addr.clone());
     let learner_store = open(dirs[3].path()).await;
-    let learner = start_node(
+    let learner = start_node_on(
         &learner_store,
         &dirs[3].path().join("raft.db"),
         NodeConfig {
@@ -696,6 +736,7 @@ async fn a_learner_joins_through_any_node_and_catches_up() {
             voters: BTreeMap::new(),
             elect: true,
         },
+        learner_listener,
     )
     .await
     .unwrap();
@@ -920,10 +961,18 @@ async fn a_store_leads_alone_and_one_node_of_three_leads() {
 #[tokio::test(flavor = "multi_thread")]
 async fn exactly_one_of_three_nodes_leads() {
     let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let voters = voters(3);
+    let (voters, mut listeners) = voters(3).await;
     let mut members = BTreeMap::new();
     for id in 1..=3 {
-        let m = start_member(dirs[id as usize - 1].path(), id, &voters, "s3cret", true).await;
+        let m = start_member(
+            dirs[id as usize - 1].path(),
+            id,
+            &voters,
+            "s3cret",
+            true,
+            listeners.remove(&id).unwrap(),
+        )
+        .await;
         members.insert(id, m);
     }
 
@@ -953,10 +1002,18 @@ async fn exactly_one_of_three_nodes_leads() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_relayed_proof_is_rejected() {
     let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let voters = voters(3);
+    let (voters, mut listeners) = voters(3).await;
     let mut members = BTreeMap::new();
     for id in 1..=3 {
-        let m = start_member(dirs[id as usize - 1].path(), id, &voters, "s3cret", true).await;
+        let m = start_member(
+            dirs[id as usize - 1].path(),
+            id,
+            &voters,
+            "s3cret",
+            true,
+            listeners.remove(&id).unwrap(),
+        )
+        .await;
         members.insert(id, m);
     }
 
