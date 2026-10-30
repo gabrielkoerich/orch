@@ -4,13 +4,16 @@
 use crate::store::TaskStore;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
 const CURSOR_KEY: &str = "relay_cursor";
 const PING_EVERY: Duration = Duration::from_secs(300);
-const MAX_BACKOFF_SECS: u64 = 60;
+const MAX_BACKOFF_SECS: u64 = 300;
+// A shorter session keeps the backoff growing, so a relay that closes each socket at once is not
+// hit every second, every request counts toward its daily limit
+const STABLE_SESSION: Duration = Duration::from_secs(60);
 
 #[derive(serde::Deserialize)]
 struct Incoming {
@@ -33,28 +36,28 @@ pub async fn run(url: String, token: String, store: Arc<TaskStore>, notify: Arc<
     let mut backoff = 1;
 
     loop {
-        let mut connected = false;
-        match session(&url, &token, &store, &notify, &mut connected).await {
+        let started = Instant::now();
+        match session(&url, &token, &store, &notify).await {
             Ok(()) => tracing::warn!("relay stream closed, reconnecting"),
             Err(e) => tracing::warn!(err = %e, "relay stream failed, reconnecting"),
         }
 
-        if connected {
-            backoff = 1;
-        }
-
-        tokio::time::sleep(Duration::from_secs(backoff)).await;
-        backoff = (backoff * 2).min(MAX_BACKOFF_SECS);
+        let wait = retry_after(backoff, started.elapsed());
+        tokio::time::sleep(Duration::from_secs(wait)).await;
+        backoff = (wait * 2).min(MAX_BACKOFF_SECS);
     }
 }
 
-async fn session(
-    url: &str,
-    token: &str,
-    store: &TaskStore,
-    notify: &Notify,
-    connected: &mut bool,
-) -> anyhow::Result<()> {
+/// Seconds to wait before the next connect
+fn retry_after(backoff: u64, lasted: Duration) -> u64 {
+    if lasted >= STABLE_SESSION {
+        1
+    } else {
+        backoff
+    }
+}
+
+async fn session(url: &str, token: &str, store: &TaskStore, notify: &Notify) -> anyhow::Result<()> {
     let ws_url = format!("{}/ws", url.trim_end_matches('/'))
         .replacen("https://", "wss://", 1)
         .replacen("http://", "ws://", 1);
@@ -63,7 +66,6 @@ async fn session(
         .headers_mut()
         .insert("authorization", format!("Bearer {token}").parse()?);
     let (mut ws, _) = tokio_tungstenite::connect_async(request).await?;
-    *connected = true;
 
     let after = cursor(store).await;
     let hello = serde_json::json!({ "v": 1, "type": "hello", "after": after });
@@ -254,19 +256,11 @@ mod tests {
         let store = TaskStore::open_memory().await.unwrap();
         store.kv_set(CURSOR_KEY, "4").await.unwrap();
         let notify = Notify::new();
-        let mut connected = false;
-        session(
-            &format!("http://{addr}"),
-            "tok",
-            &store,
-            &notify,
-            &mut connected,
-        )
-        .await
-        .unwrap();
+        session(&format!("http://{addr}"), "tok", &store, &notify)
+            .await
+            .unwrap();
 
         let (auth, hello) = server.await.unwrap();
-        assert!(connected);
         assert_eq!(auth, "Bearer tok");
         let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
         assert_eq!(
@@ -275,5 +269,22 @@ mod tests {
         );
         assert_eq!(cursor(&store).await, 9);
         assert!(woke(&notify).await);
+    }
+
+    #[test]
+    fn a_socket_closed_at_once_keeps_the_backoff_growing() {
+        let quick = Duration::from_secs(1);
+        let mut backoff = 1;
+        let mut waits = Vec::new();
+
+        for _ in 0..12 {
+            let wait = retry_after(backoff, quick);
+            waits.push(wait);
+            backoff = (wait * 2).min(MAX_BACKOFF_SECS);
+        }
+
+        assert_eq!(waits[..9], [1, 2, 4, 8, 16, 32, 64, 128, 256]);
+        assert_eq!(waits[9..], [300, 300, 300]);
+        assert_eq!(retry_after(300, STABLE_SESSION), 1);
     }
 }
