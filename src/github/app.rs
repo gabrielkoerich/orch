@@ -448,11 +448,7 @@ impl AppAuth {
         if status.is_success() {
             return Ok(body);
         }
-        let message = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|value| value.get("message")?.as_str().map(str::to_owned))
-            .filter(|msg| !crate::security::has_leaks(msg))
-            .unwrap_or_default();
+        let message = error_message(&body);
         anyhow::bail!("GitHub App API {status}: {message}")
     }
 
@@ -473,6 +469,56 @@ impl AppAuth {
         let body = resp.text().await.unwrap_or_default();
         Ok((status, body))
     }
+}
+
+/// The `message` of an error body plus its `errors` entries, which hold the real reason of a 422
+fn error_message(body: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return String::new();
+    };
+    let safe = |text: String| (!crate::security::has_leaks(&text)).then_some(text);
+    let message = value
+        .get("message")
+        .and_then(|msg| msg.as_str())
+        .map(str::to_owned)
+        .and_then(safe)
+        .unwrap_or_default();
+    let details: Vec<String> = value
+        .get("errors")
+        .and_then(|errors| errors.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(error_entry)
+        .filter_map(safe)
+        .collect();
+
+    if details.is_empty() {
+        message
+    } else {
+        format!("{message} ({})", details.join("; "))
+    }
+}
+
+fn error_entry(entry: &serde_json::Value) -> Option<String> {
+    if let Some(text) = entry.as_str() {
+        return Some(text.to_owned());
+    }
+    let field = |name: &str| entry.get(name).and_then(|v| v.as_str());
+    if let Some(text) = field("message") {
+        return Some(text.to_owned());
+    }
+    let code = field("code")?;
+    let place = [field("resource"), field("field")]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(".");
+
+    Some(if place.is_empty() {
+        code.to_owned()
+    } else {
+        format!("{place}: {code}")
+    })
 }
 
 fn token_is_fresh(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
@@ -671,6 +717,37 @@ mod tests {
             crate::security::has_leaks(test_pem()),
             "a key must trip the leak scan"
         );
+    }
+
+    #[test]
+    fn error_message_includes_the_errors_entries() {
+        let body = serde_json::json!({
+            "message": "Unprocessable Entity",
+            "errors": [
+                "Can not approve your own pull request",
+                {"message": "line must be part of the diff"},
+                {"resource": "PullRequestReview", "field": "commit_id", "code": "invalid"}
+            ]
+        })
+        .to_string();
+        assert_eq!(
+            error_message(&body),
+            "Unprocessable Entity (Can not approve your own pull request; line must be part of \
+             the diff; PullRequestReview.commit_id: invalid)"
+        );
+    }
+
+    #[test]
+    fn error_message_drops_an_entry_that_trips_the_leak_scan() {
+        let body = serde_json::json!({
+            "message": "Unprocessable Entity",
+            "errors": ["still readable", test_pem()]
+        })
+        .to_string();
+        let message = error_message(&body);
+        assert_eq!(message, "Unprocessable Entity (still readable)");
+        assert!(!message.contains("PRIVATE"));
+        assert_eq!(error_message("not json"), "");
     }
 
     #[test]
