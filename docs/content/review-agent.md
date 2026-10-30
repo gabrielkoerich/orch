@@ -6,6 +6,14 @@ weight = 10
 
 The review agent automatically reviews pull requests after an agent completes a task. It picks a different agent from the one that wrote the code (and from any agents that previously reviewed the same task), and posts its decision on the PR, see [Review mode](@/configuration.md#review-mode). If no other agent is available, the authoring agent reviews and the fallback is logged as a `review_agent_fallback` task activity and noted in the review comment.
 
+How the decision shows on the PR depends on whether the [GitHub App](@/github-app.md) is set up:
+
+| | With the GitHub App (`review.mode: app`) | Without it (`comment`, the default) |
+|---|---|---|
+| Decision | A real GitHub PR review from the bot account, `APPROVE` or `REQUEST_CHANGES`, with each issue on a changed line as an inline comment | A PR comment with the `## Automated Review` header |
+| Status on the head commit | The `orch/review` check run from the App | The `orch/review` commit status |
+| GitHub counts it as an approval | Yes | No, orch reads the comment itself |
+
 ## How It Works
 
 1. Agent completes a task and returns `status: done`
