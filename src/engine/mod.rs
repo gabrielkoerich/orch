@@ -180,7 +180,8 @@ pub(crate) async fn reset_orphaned_reviews(
 /// Starts the relay client when `relay.url` is set. The token is read in the background, so a
 /// passbox prompt nobody answers never holds up the engine
 fn start_relay_client(project_engines: &[ProjectEngine], notify: &Arc<Notify>) {
-    let url = crate::config::get("relay.url").unwrap_or_default();
+    // The global config only: a project file must never point a secret at its own endpoint
+    let url = crate::config::get_global("relay.url").unwrap_or_default();
     let Some(store) = project_engines.first().map(|e| Arc::clone(&e.store)) else {
         return;
     };
@@ -189,7 +190,7 @@ fn start_relay_client(project_engines: &[ProjectEngine], notify: &Arc<Notify>) {
         return;
     }
 
-    let token_ref = crate::config::get("relay.token").unwrap_or_default();
+    let token_ref = crate::config::get_global("relay.token").unwrap_or_default();
     let notify = Arc::clone(notify);
     tokio::spawn(async move {
         let mut warned = false;
@@ -1192,11 +1193,7 @@ fn read_project_channel_config(project_dir: &std::path::Path) -> ProjectChannelC
     };
     ProjectChannelConfig {
         telegram_topic_id: get_str("telegram", "topic_id"),
-        telegram_bot_token: get_str("telegram", "bot_token"),
-        telegram_chat_id: get_str("telegram", "chat_id"),
         discord_channel_id: get_str("discord", "channel_id"),
-        discord_bot_token: get_str("discord", "bot_token"),
-        discord_guild_id: get_str("discord", "guild_id"),
     }
 }
 
@@ -1376,7 +1373,7 @@ async fn send_startup_escalation_notification(elapsed_secs: u64) {
     );
 
     // Telegram
-    let tg_token = crate::config::get("channels.telegram.bot_token");
+    let tg_token = crate::secret_ref::config_secret("channels.telegram.bot_token").await;
     let tg_chat_id = crate::config::get("channels.telegram.chat_id");
     if let (Ok(token), Ok(chat_id)) = (&tg_token, &tg_chat_id) {
         if !token.is_empty() && !chat_id.is_empty() {
@@ -1398,7 +1395,7 @@ async fn send_startup_escalation_notification(elapsed_secs: u64) {
     }
 
     // Discord
-    if let Ok(token) = crate::config::get("channels.discord.bot_token") {
+    if let Ok(token) = crate::secret_ref::config_secret("channels.discord.bot_token").await {
         let channel_id = crate::config::get("channels.discord.channel_id")
             .or_else(|_| crate::config::get("channels.discord.general_channel_id"));
         if !token.is_empty() {
@@ -1430,7 +1427,7 @@ async fn send_startup_escalation_notification(elapsed_secs: u64) {
     }
 
     // Slack
-    if let Ok(token) = crate::config::get("channels.slack.bot_token") {
+    if let Ok(token) = crate::secret_ref::config_secret("channels.slack.bot_token").await {
         let channel_id = crate::config::get("channels.slack.channel_id");
         if !token.is_empty() {
             if let Ok(cid) = channel_id {
@@ -1648,7 +1645,7 @@ pub async fn serve() -> anyhow::Result<()> {
     let mut channel_registry = ChannelRegistry::new();
 
     // Try to initialize Telegram channel
-    if let Ok(token) = crate::config::get("channels.telegram.bot_token") {
+    if let Ok(token) = crate::secret_ref::config_secret("channels.telegram.bot_token").await {
         if !token.is_empty() {
             let chat_id = crate::config::get("channels.telegram.chat_id").ok();
             match TelegramChannel::new(token, chat_id) {
@@ -1668,7 +1665,7 @@ pub async fn serve() -> anyhow::Result<()> {
     }
 
     // Try to initialize Discord Gateway channel (websocket)
-    if let Ok(token) = crate::config::get("channels.discord.bot_token") {
+    if let Ok(token) = crate::secret_ref::config_secret("channels.discord.bot_token").await {
         if !token.is_empty() {
             let channel_id = crate::config::get("channels.discord.channel_id").ok();
             let shard_id = crate::config::get("channels.discord.shard_id")
@@ -1696,7 +1693,7 @@ pub async fn serve() -> anyhow::Result<()> {
     }
 
     // Try to initialize Slack channel
-    if let Ok(token) = crate::config::get("channels.slack.bot_token") {
+    if let Ok(token) = crate::secret_ref::config_secret("channels.slack.bot_token").await {
         if !token.is_empty() {
             let channel_id = crate::config::get("channels.slack.channel_id").ok();
             match SlackChannel::new(token, channel_id) {
@@ -2080,9 +2077,25 @@ pub async fn serve() -> anyhow::Result<()> {
     let mut webhook_healthy: bool;
     let mut last_webhook_health_check = std::time::Instant::now();
     // Start webhook server if configured
-    let webhook_enabled = crate::config::get("webhook.enabled")
+    let webhook_enabled = crate::config::get_global("webhook.enabled")
         .map(|v| v == "true")
         .unwrap_or(false);
+    // No readable secret keeps the webhook server off, it never accepts unsigned requests
+    let webhook_secret = if webhook_enabled {
+        crate::secret_ref::config_secret("webhook.secret")
+            .await
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    } else {
+        None
+    };
+    if webhook_enabled && webhook_secret.is_none() {
+        tracing::error!(
+            "webhook.enabled needs a readable webhook.secret, the webhook server stays off"
+        );
+    }
+    let webhook_enabled = webhook_enabled && webhook_secret.is_some();
+    let webhook_secret = webhook_secret.unwrap_or_default();
 
     // Shared status updated by the server-spawn task and the health-check loop.
     let webhook_status = Arc::new(tokio::sync::Mutex::new(
@@ -2095,7 +2108,7 @@ pub async fn serve() -> anyhow::Result<()> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(8080);
         webhook_port = Some(port);
-        let secret = crate::config::get("webhook.secret").unwrap_or_default();
+        let secret = webhook_secret.clone();
         let webhook_repo = project_engines
             .first()
             .map(|e| e.repo.clone())

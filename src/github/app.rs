@@ -525,8 +525,9 @@ fn token_is_fresh(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     expires_at > now + Duration::minutes(10)
 }
 
+// The global config only: a project file must never point the App's key or id elsewhere
 fn nonempty_config(key: &str) -> Option<String> {
-    crate::config::get(key)
+    crate::config::get_global(key)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())

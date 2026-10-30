@@ -58,13 +58,13 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `dispatch` | `degraded_rate_limit_threshold` | Rate-limit rows in that window that mark an agent degraded | `3` |
 | `dispatch` | `min_healthy_agents` | Below this many healthy agents, dispatch runs one task at a time | `2` |
 | `dispatch` | `sequential_delay_ms` | Delay between dispatches in that sequential mode | `1000` |
-| `webhook` | `enabled` | Start the local webhook receiver (HTTP) | `false` |
+| `webhook` | `enabled` | Start the local webhook receiver (HTTP). It needs a readable `webhook.secret`, without one the receiver stays off | `false` |
 | `webhook` | `port` | Webhook listener port | `8080` |
 | `webhook` | `secret` | HMAC secret for verifying GitHub webhook payloads | `""` |
 | `relay` | `url` | orch-relay base URL. orch connects out to `<url>/ws` and wakes the sync on each GitHub App event. Unset means off | `""` |
-| `relay` | `token` | Bearer token for the relay. Write `passbox:<name>` to read it once from passbox at startup, so the config holds no secret | `""` |
+| `relay` | `token` | Bearer token for the relay, a secret value (see [Secret values](#secret-values)) | `""` |
 | `review` | `mode` | `comment` or `app`, see [Review mode](#review-mode). A project's `.orch.yml` overrides the global value | `comment` |
-| `gh.app` | `id` / `private_key` | GitHub App id and its key, `private_key` takes a `passbox:<name>` reference, see [GitHub App](#github-app) | `""` |
+| `gh.app` | `id` / `private_key` | GitHub App id and its key, `private_key` is a secret value, see [GitHub App](#github-app) | `""` |
 | `gh` | `repo` | Default repo (`owner/repo`) | `"owner/repo"` |
 | `gh` | `project_id` | GitHub Project v2 ID | `""` |
 | `gh` | `project_status_field_id` | Status field ID in Project v2 | `""` |
@@ -140,6 +140,26 @@ skills: []   # Reserved for inline skill definitions (rarely used)
 ```
 
 Skills in `router.default_skills` (default `gh`, `git-worktree`) are always selected. In `llm` mode the router adds more per task.
+
+## Secret values
+
+These keys hold secrets: `channels.telegram.bot_token`, `channels.discord.bot_token`, `channels.slack.bot_token`, `webhook.secret`, `relay.token` and `gh.app.private_key`. Each takes one of three forms, so the config file need not hold the secret:
+
+| Value | orch reads |
+|---|---|
+| `passbox:<name>` | the first line of that passbox entry, once per daemon start (one Touch ID prompt) |
+| `${NAME}` | the environment variable `NAME`. orch loads `~/.private` at startup, so a variable exported there reaches the service |
+| anything else | the value as written |
+
+A reference is the whole value: `${NAME}` alone, not inside a longer string. An unset variable or a failed passbox read logs a warning naming the key, and that feature stays off.
+
+```yaml
+channels:
+  telegram:
+    bot_token: passbox:orch/telegram-bot-token
+relay:
+  token: ${ORCH_RELAY_TOKEN}
+```
 
 ## GitHub Authentication
 

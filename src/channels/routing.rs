@@ -9,15 +9,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Default)]
 pub struct ProjectChannelConfig {
     pub telegram_topic_id: Option<String>,
-    #[allow(dead_code)]
-    pub telegram_bot_token: Option<String>,
-    #[allow(dead_code)]
-    pub telegram_chat_id: Option<String>,
     pub discord_channel_id: Option<String>,
-    #[allow(dead_code)]
-    pub discord_bot_token: Option<String>,
-    #[allow(dead_code)]
-    pub discord_guild_id: Option<String>,
 }
 
 /// Global channel configuration from `~/.orch/config.yml`.
@@ -147,7 +139,6 @@ mod tests {
                 ProjectChannelConfig {
                     telegram_topic_id: Some("42".to_string()),
                     discord_channel_id: Some("1111".to_string()),
-                    ..Default::default()
                 },
             ),
             (
@@ -155,7 +146,6 @@ mod tests {
                 ProjectChannelConfig {
                     telegram_topic_id: Some("87".to_string()),
                     discord_channel_id: Some("2222".to_string()),
-                    ..Default::default()
                 },
             ),
         ];
@@ -257,7 +247,6 @@ mod tests {
                 "owner/orch".into(),
                 ProjectChannelConfig {
                     telegram_topic_id: Some("42".into()),
-                    telegram_bot_token: Some("custom-token".into()),
                     ..Default::default()
                 },
             ),
