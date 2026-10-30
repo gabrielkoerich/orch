@@ -89,15 +89,53 @@ You still open the pull requests, so the App can review them.
 
 GitHub sends App webhooks to a URL, and orch has no public endpoint. A relay receives them instead: a small service, for example a Cloudflare Worker, that checks GitHub's signature, stores each event in order, and streams them to orch. orch connects out, so nothing listens on your machine.
 
-1. Deploy the relay, with the App's webhook secret and a long random bearer token.
-2. In the App: turn **Webhook** on, set the URL to the relay's endpoint and the secret, and subscribe to **Issues, Issue comment, Pull request, Pull request review, Check suite, Check run, Workflow run** and **Push**.
-3. Give orch the relay URL and the token:
+### Set up the relay
 
-```yaml
-relay:
-  url: https://relay.example.com
-  token: passbox:orch/relay-token
-```
+The relay is [orch-relay](https://github.com/gabrielkoerich/orch-relay): one Cloudflare Worker with one Durable Object that stores events in SQLite, which the Workers Free plan allows. Its endpoints:
+
+| Endpoint | Caller | Auth | Does |
+|---|---|---|---|
+| `POST /github` | GitHub, the App's webhook URL | the webhook signature, `X-Hub-Signature-256` | Checks the signature on the raw body, stores the event, answers `202` |
+| `GET /ws` | orch | `Authorization: Bearer <RELAY_TOKEN>` | Websocket: replays events after orch's cursor, then streams new ones |
+| `GET /events?after=<seq>` | orch | the same bearer token | The same events as JSON, the fallback when the websocket is down |
+| `GET /health` | anyone | none | `200 ok` |
+
+1. **Make two secrets.** A webhook secret for GitHub and a bearer token for orch, both long and random. Keep them in passbox, for example `orch/github-webhook-secret` and `orch/relay-token`:
+
+   ```bash
+   openssl rand -hex 32 | passbox add orch/github-webhook-secret
+   openssl rand -hex 32 | passbox add orch/relay-token
+   ```
+
+2. **Point the Worker at your domain.** Clone orch-relay and set the route in `wrangler.toml` to a host on a zone in your Cloudflare account:
+
+   ```toml
+   routes = [{ pattern = "relay.example.com", custom_domain = true }]
+   ```
+
+3. **Store the secrets in the Worker and deploy.** With a Cloudflare API token that can edit Workers (`CLOUDFLARE_API_TOKEN`):
+
+   ```bash
+   bun install
+   passbox exec --env VALUE=orch/github-webhook-secret -- sh -c 'printf %s "$VALUE" | bunx wrangler secret put GITHUB_WEBHOOK_SECRET'
+   passbox exec --env VALUE=orch/relay-token -- sh -c 'printf %s "$VALUE" | bunx wrangler secret put RELAY_TOKEN'
+   bunx wrangler deploy
+   curl https://relay.example.com/health    # ok
+   ```
+
+   The values go from passbox to Cloudflare and are never printed. orch-relay's `just secret` and `just deploy` do the same.
+
+4. **Send the App's webhooks to it.** On the App page, turn **Webhook** on, set the URL to `https://relay.example.com/github` and the secret to the webhook secret (`passbox copy orch/github-webhook-secret` puts it on the clipboard for a few seconds), and subscribe to **Issues, Issue comment, Pull request, Pull request review, Check suite, Check run, Workflow run** and **Push**. GitHub's **Recent Deliveries** tab should show `202` answers.
+
+5. **Point orch at it** in `~/.orch/config.yml`, then restart orch and approve the Touch ID prompt for the token:
+
+   ```yaml
+   relay:
+     url: https://relay.example.com
+     token: passbox:orch/relay-token
+   ```
+
+### What orch does with events
 
 orch opens a websocket to `<url>/ws` with the token and keeps a cursor, so it resumes where it stopped after a restart. On each event:
 

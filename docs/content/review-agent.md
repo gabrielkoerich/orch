@@ -14,6 +14,20 @@ How the decision shows on the PR depends on whether the [GitHub App](@/github-ap
 | Status on the head commit | The `orch/review` check run from the App | The `orch/review` commit status |
 | GitHub counts it as an approval | Yes | No, orch reads the comment itself |
 
+```yaml
+# With the GitHub App: real PR reviews from the bot
+review:
+  mode: app
+```
+
+```yaml
+# Without it: the review is a PR comment (the default)
+review:
+  mode: comment
+```
+
+Set it in `~/.orch/config.yml` for every project, or in one project's `.orch.yml`, which wins. A project in `app` mode whose repository does not have the App installed reviews in `comment` mode.
+
 ## How It Works
 
 1. Agent completes a task and returns `status: done`
