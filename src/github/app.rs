@@ -194,7 +194,7 @@ where
 
         match result {
             Ok(Some(app)) => {
-                tracing::info!(app_id = %app.app_id, "GitHub App loaded, App reviews and App quota are on");
+                tracing::info!(app_id = %app.app_id, "GitHub App loaded, App reviews are on");
                 publish(Arc::new(app));
                 return;
             }

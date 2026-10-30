@@ -159,9 +159,9 @@ gh:
 
 ### GitHub App
 
-With an App configured, orch makes its own REST calls to a repository with that repository's installation token, so they count against the App's quota. Agents keep the owner's `gh`.
+The App posts reviews only: the `APPROVE` or `REQUEST_CHANGES` review with its inline comments, and the `orch/review` check run. Every other call, pushes, pull requests, comments, labels and reads, uses the owner's `gh` token, as agents do. GitHub refuses a review from a pull request's author, so the App must never open the pull requests it reviews.
 
-orch looks up the installation per repository (`GET /repos/{repo}/installation`), since your account and each organization are separate installations. A repository the App is not installed on, GraphQL, `GET /user` and Projects V2 on a personal account use the owner token. Without `gh.app.id`, orch behaves as before.
+orch looks up the installation per repository (`GET /repos/{repo}/installation`), since your account and each organization are separate installations. On a repository the App is not installed on, reviews fall back to the `## Automated Review` comment. Without `gh.app.id`, orch behaves as before.
 
 ```yaml
 # ~/.orch/config.yml
@@ -173,9 +173,9 @@ gh:
     private_key_path: "/path/to/app.pem"          # an absolute path
 ```
 
-Agents run as your user and can read any file you can, so keep the key in passbox. passbox returns the first line of an entry, so store the PEM on one line with `\n` for each newline, for example `awk '{printf "%s\\n", $0}' app.pem | passbox add orch/github-app-key`. orch reads the key once after it starts, in the background, and keeps it in memory for the life of the process. A passbox read waits on Touch ID, so until it succeeds orch uses the owner token and comment reviews, logs one warning and retries every 5 minutes with at most one prompt pending. Debug builds and tests never load the App.
+Agents run as your user and can read any file you can, so keep the key in passbox. passbox returns the first line of an entry, so store the PEM on one line with `\n` for each newline, for example `awk '{printf "%s\\n", $0}' app.pem | passbox add orch/github-app-key`. orch reads the key once after it starts, in the background, and keeps it in memory for the life of the process. A passbox read waits on Touch ID, so until it succeeds orch posts comment reviews, logs one warning and retries every 5 minutes with at most one prompt pending. Debug builds and tests never load the App.
 
-orch signs an RS256 JWT, exchanges it for an installation token per installation, and refreshes each token 10 minutes before it expires. If a token is unavailable, orch logs a warning and uses the owner token.
+orch signs an RS256 JWT, exchanges it for an installation token per installation, and refreshes each token 10 minutes before it expires. If the App review cannot be submitted, orch posts the decision as the `## Automated Review` comment instead.
 
 ### Review mode
 
