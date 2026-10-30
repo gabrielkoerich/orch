@@ -708,17 +708,12 @@ pub(crate) async fn review_open_prs(
             let already_merged = batch_data.merged;
 
             if already_merged {
-                tracing::info!(
+                // check_merged_prs owns the transition to done and the cleanup
+                tracing::debug!(
                     task_id,
                     pr_number,
-                    "PR already merged, marking task as done"
+                    "PR already merged, left to check_merged_prs"
                 );
-                if let Err(e) = task_manager
-                    .update_task_status(&task.id, Status::Done)
-                    .await
-                {
-                    tracing::warn!(task_id, err = %e, "failed to update task status to done");
-                }
             } else {
                 let is_conflicting = batch_data.mergeable == Some(false);
 
