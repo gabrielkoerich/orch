@@ -408,13 +408,18 @@ pub(crate) async fn sweep_ci_timer_keys(
     repo: &str,
     finished_task_ids: &[String],
 ) -> anyhow::Result<()> {
-    for task_id in finished_task_ids {
-        store.kv_delete(&ci_check_ts_key(repo, task_id)).await?;
-        clear_ci_pending_since(store, repo, task_id, "task_finished").await?;
-    }
+    let finished: std::collections::HashSet<&str> =
+        finished_task_ids.iter().map(String::as_str).collect();
+    let repo_marker = format!("{repo}#");
     for prefix in ["ci_check_ts:", "ci_pending_since:"] {
         for (key, _) in store.kv_list_prefix(prefix).await? {
-            if !key[prefix.len()..].contains('#') {
+            let rest = &key[prefix.len()..];
+            let stale = match rest.strip_prefix(repo_marker.as_str()) {
+                // Pending keys carry a trailing `#{head_sha}`
+                Some(tail) => finished.contains(tail.split('#').next().unwrap_or(tail)),
+                None => !rest.contains('#'),
+            };
+            if stale {
                 store.kv_delete(&key).await?;
             }
         }
