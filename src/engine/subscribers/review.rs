@@ -5,6 +5,8 @@ use crate::engine::cooldown::AGENT_COOLDOWN_SECS;
 use crate::engine::dispatch_guard::DispatchGuard;
 use crate::engine::events::TaskEvent;
 use crate::engine::review::{review_and_merge, ReviewDecision, MAX_REVIEW_AGENT_FAILURES};
+use crate::engine::review_gate::CiGate;
+use crate::engine::review_shipcheck::Prerun;
 use crate::engine::router::Router;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
@@ -656,13 +658,17 @@ async fn ci_allows_review(
     task: &ExternalTask,
 ) -> bool {
     let task_id = task.id.0.as_str();
-    let Some(pr_number) = opt_store_get_task(&Some(store.clone()), repo, task_id)
-        .await
+    let stored = opt_store_get_task(&Some(store.clone()), repo, task_id).await;
+    let Some(pr_number) = stored
+        .as_ref()
         .and_then(|t| t.pr_number)
         .and_then(|n| u64::try_from(n).ok())
     else {
         return true;
     };
+    let worktree = stored
+        .map(|t| std::path::PathBuf::from(t.worktree))
+        .filter(|p| !p.as_os_str().is_empty() && p.exists());
     let gate = match GhHttp::new() {
         Ok(gh) => {
             crate::engine::review_gate::review_ci_gate(&gh, store, repo, task_id, pr_number).await
@@ -670,36 +676,62 @@ async fn ci_allows_review(
         Err(e) => Err(e),
     };
 
-    match gate {
-        Ok(crate::engine::review_gate::CiGate::Start) => true,
+    let hold = match gate {
+        Ok(CiGate::Start) => return true,
         // The merge still waits for green CI, so a lookup error does not hold the review
         Err(e) => {
             tracing::warn!(task_id, pr_number, err = %e, "CI gate lookup failed, starting the review");
-            true
+            return true;
         }
-        Ok(crate::engine::review_gate::CiGate::Wait) => {
-            tracing::info!(
-                task_id,
-                pr_number,
-                "CI still running on the PR head, review waits"
-            );
-            if let Err(e) = crate::store::store_set_result(
-                &Some(store.clone()),
-                repo,
-                task_id,
-                &[("needs_review_refires", serde_json::json!(0))],
-            )
-            .await
-            {
-                tracing::warn!(task_id, err = %e, "failed to reset needs_review_refires for a task held by the CI gate");
-            }
-            false
-        }
-        Ok(crate::engine::review_gate::CiGate::Red(failed)) => {
+        Ok(CiGate::Red(failed)) => {
             route_back_on_red_ci(store, task_manager, repo, task, pr_number, &failed).await;
-            false
+            return false;
         }
+        Ok(CiGate::Wait) => "CI still running on the PR head, review waits",
+        // The reviewer runs shipcheck when no check ran, so orch runs it first, outside the review's limit
+        Ok(CiGate::NotStarted { waited_out }) => match local_ci_worktree(repo, worktree).await {
+            Some(wt) => match crate::engine::review_shipcheck::prerun(&wt).await {
+                Prerun::Ready => return true,
+                Prerun::Running => "shipcheck running on the PR head, review waits",
+            },
+            None if waited_out => {
+                tracing::warn!(
+                    task_id,
+                    pr_number,
+                    "no CI ran on the PR head, starting the review anyway"
+                );
+                return true;
+            }
+            None => "no CI started on the PR head yet, review waits",
+        },
+    };
+
+    tracing::info!(task_id, pr_number, "{hold}");
+    if let Err(e) = crate::store::store_set_result(
+        &Some(store.clone()),
+        repo,
+        task_id,
+        &[("needs_review_refires", serde_json::json!(0))],
+    )
+    .await
+    {
+        tracing::warn!(task_id, err = %e, "failed to reset needs_review_refires for a task held by the CI gate");
     }
+
+    false
+}
+
+/// The task worktree, when the reviewer there would run `shipcheck run`
+async fn local_ci_worktree(
+    repo: &str,
+    worktree: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    let wt = worktree?;
+    let sandboxed = crate::engine::review::review_sandboxed(repo);
+    let shipcheck = crate::engine::runner::agent::Shipcheck::detect(&wt)
+        .await
+        .for_prompt(sandboxed);
+    (shipcheck == crate::engine::runner::agent::Shipcheck::Available).then_some(wt)
 }
 
 /// CI failed before the review, so the task agent fixes it without a review round

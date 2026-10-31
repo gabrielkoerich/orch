@@ -36,6 +36,7 @@ Set it in `~/.orch/config.yml` for every project, or in one project's `.orch.yml
    - Checks still running → the task waits in `needs_review`.
    - A check failed → the task goes back to `routed` with the failed checks in `last_error` and counts toward `ci_merge_failures`.
    - No check started after 15 minutes → the review starts anyway. The merge still waits for green CI.
+   - No check started and the repository uses shipcheck → orch runs `shipcheck run` in the task worktree once per head, and the task waits in `needs_review` until it ends (`src/engine/review_shipcheck.rs`). The reviewer's own `shipcheck run` then returns the stored result, so a suite that takes most of the review's time limit runs outside it. A sandboxed reviewer does not use shipcheck, so orch skips the run. A run that ends with no result, or takes over an hour, does not run again for that head.
    - `review-gate` and `orch/review` report the review itself and never hold it.
 3. If `enable_review_agent` is `true` (the default), the review agent runs, limited to `workflow.review_timeout_seconds` (default 900, never under 300):
    - Picks a reviewer via round-robin, excluding the task executor and all agents that have previously reviewed this task.

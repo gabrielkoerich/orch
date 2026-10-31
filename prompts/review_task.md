@@ -32,7 +32,7 @@ IF required checks FAIL:
         not auto-fixable? → decision = request_changes
 
 IF required checks are NOT RUN or PENDING:
-  → run local checks as fallback: {{#if SHIPCHECK}}run `shipcheck run`
+  → run local checks as fallback: {{#if SHIPCHECK}}run `shipcheck status` first, orch already ran the suite on this head when no check had started, and use its result for the working copy's tree. With no result, run `shipcheck run`
     (exit 0 = PASS, 1 = FAIL, read `shipcheck logs`){{/if}}{{#if NO_SHIPCHECK}}read .github/workflows/
     to identify what CI runs and execute those commands (do NOT hardcode language-specific commands){{/if}}
   → run the whole command CI runs, never a filtered subset of tests. A local FAIL counts as FAIL. A local PASS counts as PASS only when it is the full suite on the same OS as CI (read `runs-on` in the workflow): CI runs on Linux, and on macOS file watchers, paths and signals behave differently. If you cannot run that, do not approve, because a required check that never finished is not a pass
