@@ -2144,7 +2144,7 @@ async fn list_routable_returns_only_new() {
         .await
         .unwrap();
 
-    let _id2 = store
+    let id2 = store
         .create(&NewTask {
             external_id: None,
             repo: "owner/repo".to_string(),
@@ -2160,7 +2160,7 @@ async fn list_routable_returns_only_new() {
         })
         .await
         .unwrap();
-    store.update_status(_id2, TaskStatus::Done).await.unwrap();
+    store.update_status(id2, TaskStatus::Done).await.unwrap();
 
     let routable = store.list_routable("owner/repo").await.unwrap();
     assert_eq!(routable.len(), 1);
@@ -7321,7 +7321,7 @@ async fn task_cols_count_matches_schema() {
     let schema_count: i64 = row.try_get("cnt").unwrap();
 
     assert_eq!(
-        schema_count as usize,
+        usize::try_from(schema_count).unwrap(),
         super::tasks::TASK_COLS_COUNT,
         "tasks table has {schema_count} columns after migrations but \
          TASK_COLS_COUNT = {}. Add the new column(s) to TASK_COLS and \

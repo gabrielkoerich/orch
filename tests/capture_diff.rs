@@ -1,4 +1,9 @@
-#[expect(dead_code)]
+#[expect(
+    dead_code,
+    clippy::unused_async,
+    clippy::unused_async_trait_impl,
+    reason = "the mocks mirror the async api that capture.rs calls, and it uses only part of it"
+)]
 mod channels {
     pub(crate) mod tmux {
         pub(crate) async fn capture_pane(_session: &str) -> anyhow::Result<String> {
@@ -56,7 +61,6 @@ mod channels {
     }
 }
 
-#[expect(dead_code)]
 mod engine {
     pub(crate) mod suspend {
         use chrono::{DateTime, Duration, Utc};
@@ -86,7 +90,11 @@ mod engine {
     }
 }
 
-#[expect(dead_code)]
+#[expect(
+    dead_code,
+    unreachable_pub,
+    reason = "this test uses part of capture.rs, whose items stay pub for the crate"
+)]
 #[path = "../src/channels/capture.rs"]
 mod capture;
 

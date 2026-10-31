@@ -33,6 +33,14 @@ pub struct SlackChannel {
     pub last_ts: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
+impl std::fmt::Debug for SlackChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlackChannel")
+            .field("channel_id", &self.channel_id)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Deserialize)]
 struct SlackMessage {
     #[serde(rename = "type")]
@@ -86,7 +94,7 @@ impl SlackChannel {
         })
     }
 
-    fn api_url(&self, method: &str) -> String {
+    fn api_url(method: &str) -> String {
         format!("https://slack.com/api/{method}")
     }
 
@@ -119,7 +127,7 @@ impl SlackChannel {
 
             let response = self
                 .client
-                .get(self.api_url("conversations.history"))
+                .get(Self::api_url("conversations.history"))
                 .bearer_auth(&self.bot_token)
                 .query(&params)
                 .send()
@@ -158,7 +166,7 @@ impl SlackChannel {
     async fn send_message(&self, channel_id: &str, text: &str) -> anyhow::Result<()> {
         let response = self
             .client
-            .post(self.api_url("chat.postMessage"))
+            .post(Self::api_url("chat.postMessage"))
             .bearer_auth(&self.bot_token)
             .json(&serde_json::json!({
                 "channel": channel_id,
@@ -191,6 +199,8 @@ impl Channel for SlackChannel {
     }
 
     async fn start(&self) -> anyhow::Result<tokio::sync::mpsc::Receiver<IncomingMessage>> {
+        use std::fmt::Write as _;
+
         let (tx, rx) = tokio::sync::mpsc::channel(64);
 
         // If no channel_id configured we can't poll
@@ -212,7 +222,10 @@ impl Channel for SlackChannel {
             let mut hasher = Sha256::new();
             hasher.update(bot_token.as_bytes());
             let hash = hasher.finalize();
-            let hex: String = hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+            let hex = hash[..8].iter().fold(String::new(), |mut out, b| {
+                let _ = write!(out, "{b:02x}");
+                out
+            });
             format!("sha256:{hex}")
         };
 
@@ -319,7 +332,7 @@ impl Channel for SlackChannel {
     async fn health_check(&self) -> anyhow::Result<()> {
         let response = self
             .client
-            .get(self.api_url("auth.test"))
+            .get(Self::api_url("auth.test"))
             .bearer_auth(&self.bot_token)
             .send()
             .await?;
@@ -353,10 +366,12 @@ mod tests {
 
     #[test]
     fn slack_api_url() {
-        let ch = SlackChannel::new("xoxb-test".to_string(), None).unwrap();
-        assert_eq!(ch.api_url("auth.test"), "https://slack.com/api/auth.test");
         assert_eq!(
-            ch.api_url("chat.postMessage"),
+            SlackChannel::api_url("auth.test"),
+            "https://slack.com/api/auth.test"
+        );
+        assert_eq!(
+            SlackChannel::api_url("chat.postMessage"),
             "https://slack.com/api/chat.postMessage"
         );
     }

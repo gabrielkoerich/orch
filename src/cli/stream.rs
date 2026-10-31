@@ -314,14 +314,15 @@ mod tests {
             .unwrap();
         f.write_all(b"o\nthree\n").unwrap();
         assert_eq!(tail.read_lines(), vec!["two", "three"]);
-        assert!(tail.read_lines().is_empty());
+        assert_eq!(tail.read_lines(), [] as [String; 0]);
     }
 
     #[test]
     fn tail_skips_cut_line_in_backlog() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("output.json");
-        let long = "x".repeat(BACKLOG_BYTES as usize);
+        let long = "x".repeat(usize::try_from(BACKLOG_BYTES).unwrap());
+
         std::fs::write(&path, format!("{long}\nlast\n")).unwrap();
         assert_eq!(Tail::open(path, false).read_lines(), vec!["last"]);
     }

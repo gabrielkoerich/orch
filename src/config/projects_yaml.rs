@@ -25,8 +25,10 @@ pub fn add_project(content: &str, path: &str) -> anyhow::Result<ProjectsEdit> {
 /// Remove list entries whose value equals any of `candidates`
 pub fn remove_project(content: &str, candidates: &[&str]) -> anyhow::Result<ProjectsEdit> {
     match parsed_string_projects(content)? {
-        ParsedProjects::Missing => anyhow::bail!("no projects list in config"),
-        ParsedProjects::NotAList => anyhow::bail!("no projects list in config"),
+        ParsedProjects::Missing | ParsedProjects::NotAList => {
+            anyhow::bail!("no projects list in config")
+        }
+
         ParsedProjects::List(items) => {
             if !items.iter().any(|p| candidates.contains(&p.as_str())) {
                 return Ok(ProjectsEdit::Unchanged);

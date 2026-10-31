@@ -40,7 +40,10 @@ enum ReviewOutcome {
 /// This is the sole trigger for NeedsReview → InReview transitions. The sync tick
 /// no longer has a competing NeedsReview loop (removed in fix for issue #857 — both
 /// paths firing simultaneously caused double failure-counter increments).
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments have no natural grouping"
+)]
 pub fn spawn(
     mut rx: broadcast::Receiver<TaskEvent>,
     backend: Arc<dyn ExternalBackend>,
@@ -572,7 +575,7 @@ crate::store::TaskStatus::Routed | crate::store::TaskStatus::New)
                                     } else {
                                         let now = chrono::Utc::now().timestamp();
                                         r.earliest_cooldown_until(Some("review"))
-                                            .map_or(AGENT_COOLDOWN_SECS as u64, |until| ((until - now).max(1)) as u64)
+                                            .map_or(AGENT_COOLDOWN_SECS as u64, |until| u64::try_from((until - now).max(1)).unwrap_or(1))
                                     }
                                 };
                                 tracing::info!(
@@ -1511,7 +1514,10 @@ mod tests {
         let task = opt_store_get_task(&Some(std::sync::Arc::clone(&store)), repo, &task_id)
             .await
             .expect("task should exist");
-        assert_eq!(task.review_resets as u64, MAX_REVIEW_RESETS);
+        assert_eq!(
+            u64::try_from(task.review_resets).unwrap(),
+            MAX_REVIEW_RESETS
+        );
         assert_eq!(
             task.review_agent_failures, 0,
             "a reset must not count as a review failure"
@@ -1590,7 +1596,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             attempts.len(),
-            (MAX_REVIEW_AGENT_FAILURES as usize + 1) * error_messages.len(),
+            (usize::try_from(MAX_REVIEW_AGENT_FAILURES).unwrap() + 1) * error_messages.len(),
             "every failed attempt must be recorded for `orch task inspect`"
         );
         assert!(

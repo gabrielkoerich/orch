@@ -7,8 +7,6 @@
 //! 3. `gh.auth.token` config value
 //! 4. `gh auth token` CLI (via `allow_gh_fallback = true`)
 
-#[cfg(test)]
-use once_cell::sync::Lazy;
 use std::env;
 #[cfg(test)]
 use std::sync::Mutex;
@@ -43,7 +41,8 @@ impl TokenResolver {
     }
 
     /// Enable or disable `gh auth token` CLI fallback.
-    #[expect(dead_code)]
+    #[cfg(test)]
+    #[must_use]
     pub fn with_gh_fallback(mut self, enabled: bool) -> Self {
         self.allow_gh_fallback = enabled;
         self
@@ -150,6 +149,10 @@ impl TokenResolver {
     /// DO NOT replace this with `spawn_blocking` or `tokio::process::Command` —
     /// the added complexity is not justified and previous attempts to "fix" this
     /// broke the auth flow. See issues #418 and #421 (closed as invalid).
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the gh fallback is settled code, see issues 418 and 421"
+    )]
     fn try_gh_command(gh_path: &str) -> anyhow::Result<Option<String>> {
         match std::process::Command::new(gh_path)
             .args(["auth", "token"])
@@ -194,7 +197,7 @@ impl Default for TokenResolver {
 
 /// Serializes tests that mutate `GH_TOKEN`/`GITHUB_TOKEN`, shared with http.rs tests
 #[cfg(test)]
-pub(crate) static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -212,7 +215,10 @@ mod tests {
         assert!(!resolver.allow_gh_fallback);
     }
 
-    #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the guard keeps env var tests serial across awaits"
+    )]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_returns_none_when_no_env_set() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -226,7 +232,10 @@ mod tests {
         assert!(token.is_none());
     }
 
-    #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the guard keeps env var tests serial across awaits"
+    )]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_prefers_gh_token() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -245,7 +254,10 @@ mod tests {
         env::remove_var("GH_TOKEN");
     }
 
-    #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the guard keeps env var tests serial across awaits"
+    )]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_falls_back_to_github_token() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -262,7 +274,10 @@ mod tests {
         env::remove_var("GITHUB_TOKEN");
     }
 
-    #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the guard keeps env var tests serial across awaits"
+    )]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_prefers_gh_token_over_github_token() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -282,7 +297,10 @@ mod tests {
         env::remove_var("GITHUB_TOKEN");
     }
 
-    #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the guard keeps env var tests serial across awaits"
+    )]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_ignores_empty_env_vars() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -301,7 +319,10 @@ mod tests {
         env::remove_var("GITHUB_TOKEN");
     }
 
-    #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the guard keeps env var tests serial across awaits"
+    )]
     #[tokio::test(flavor = "current_thread")]
     async fn clear_cache_clears_token() {
         let _guard = ENV_LOCK.lock().unwrap();

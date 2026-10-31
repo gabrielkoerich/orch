@@ -237,6 +237,7 @@ async fn test_invoke(agent: &str, model: &str) -> Result<()> {
 }
 
 /// Assembled context for a chat invocation.
+#[derive(Debug)]
 pub struct ChatContext {
     /// System prompt (instructions, role, commands)
     pub system: String,
@@ -423,7 +424,9 @@ async fn handle_control_command(
     command: ControlCommand,
 ) -> Result<String> {
     match command {
-        ControlCommand::Model(None) => Ok(format_current_spec(&get_current_spec(store).await?)),
+        ControlCommand::Model(None) | ControlCommand::Agent(None) => {
+            Ok(format_current_spec(&get_current_spec(store).await?))
+        }
         ControlCommand::Model(Some(new_spec)) => {
             let spec = parse_model_spec(&new_spec);
             validate_model(&spec).await?;
@@ -432,7 +435,6 @@ async fn handle_control_command(
             reset_session_uuid(store, session_id).await?;
             Ok(format_switched_spec(&spec))
         }
-        ControlCommand::Agent(None) => Ok(format_current_spec(&get_current_spec(store).await?)),
         ControlCommand::Agent(Some(agent)) => {
             validate_agent(&agent)?;
             let spec = set_agent_spec(store, &agent).await?;
@@ -538,6 +540,7 @@ async fn persist_memories(
 }
 
 /// Result of an agent invocation, including response text and token usage.
+#[derive(Debug)]
 pub struct InvokeResult {
     pub text: String,
     pub input_tokens: Option<u64>,
@@ -722,7 +725,7 @@ pub async fn send_message(
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
         )
     };
-    let _guard = session_lock.lock().await;
+    let guard = session_lock.lock().await;
 
     // Store user message
     store
@@ -1046,10 +1049,10 @@ pub async fn send_message(
     };
 
     // Release the per-session lock before eviction check.
-    drop(_guard);
+    drop(guard);
 
     // Evict the session lock entry if no concurrent waiters are holding a reference.
-    // After drop(_guard) above the remaining strong references are:
+    // After drop(guard) above the remaining strong references are:
     // - the map entry
     // - the local `session_lock` clone held by this function.
     // That sums to 2 when there are no other waiters. If another waiter entered
@@ -1630,7 +1633,8 @@ mod tests {
     #[test]
     fn chunk_text_respects_utf8_boundaries() {
         // 4-byte emoji placed at the split boundary
-        let content = "x".repeat(97) + "😀"; // 101 bytes; limit=100 cuts inside emoji
+        let content = format!("{}😀", "x".repeat(97)); // 101 bytes; limit=100 cuts inside emoji
+
         let chunks = chunk_text(&content, 100);
         let reassembled: String = chunks.join("");
         assert_eq!(reassembled, content);

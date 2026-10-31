@@ -38,7 +38,7 @@ const DEFAULT_MAX_SEEN_DELIVERIES: usize = 50_000;
 // ---------------------------------------------------------------------------
 
 /// Metrics snapshot from the dedup store.
-#[derive(serde::Serialize, Clone, Copy)]
+#[derive(Debug, serde::Serialize, Clone, Copy)]
 pub struct DedupMetrics {
     /// Number of entries currently in the store.
     pub seen_count: usize,
@@ -73,6 +73,17 @@ pub struct DedupStore {
     window_secs: u64,
     max_size: usize,
     metrics_enabled: bool,
+}
+
+impl std::fmt::Debug for DedupStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DedupStore")
+            .field("file_path", &self.file_path)
+            .field("window_secs", &self.window_secs)
+            .field("max_size", &self.max_size)
+            .field("metrics_enabled", &self.metrics_enabled)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DedupStore {
@@ -144,6 +155,8 @@ impl DedupStore {
     /// Returns `true` if the delivery is new (should be processed) or
     /// `false` if it is a duplicate (should be silently ACKed).
     pub async fn check_and_insert(&self, delivery_id: &str) -> bool {
+        const MAX_FLUSH_ATTEMPTS: u32 = 3;
+
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -194,7 +207,6 @@ impl DedupStore {
             let path = path.clone();
             let path_for_log = path.clone();
             let entries = Arc::new(entries);
-            const MAX_FLUSH_ATTEMPTS: u32 = 3;
             let mut attempt = 0u32;
             loop {
                 attempt += 1;
@@ -288,6 +300,11 @@ fn prune_dedup_inner(inner: &mut DedupInner, now_secs: u64, window_secs: u64, ma
 
 /// Load dedup state from a JSON file, filtering out entries older than `window_secs`.
 fn load_dedup_file(path: &Path, window_secs: u64) -> HashMap<String, u64> {
+    #[derive(serde::Deserialize)]
+    struct FileFormat {
+        entries: HashMap<String, u64>,
+    }
+
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
@@ -296,11 +313,6 @@ fn load_dedup_file(path: &Path, window_secs: u64) -> HashMap<String, u64> {
             return HashMap::new();
         }
     };
-
-    #[derive(serde::Deserialize)]
-    struct FileFormat {
-        entries: HashMap<String, u64>,
-    }
 
     let parsed: FileFormat = match serde_json::from_str(&content) {
         Ok(p) => p,
@@ -428,7 +440,7 @@ fn verify_signature(secret: &str, payload: &[u8], signature: &str) -> bool {
 }
 
 fn parse_github_event(
-    payload: WebhookPayload,
+    payload: &WebhookPayload,
     event_type: &str,
     _repo: &str,
 ) -> Option<IncomingMessage> {
@@ -584,7 +596,7 @@ async fn handle_webhook(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if let Some(msg) = parse_github_event(payload, event_type, &state.repo) {
+    if let Some(msg) = parse_github_event(&payload, event_type, &state.repo) {
         if state.tx.send(msg).await.is_err() {
             tracing::warn!("webhook event channel receiver dropped");
         }
@@ -823,7 +835,7 @@ mod tests {
             review: None,
         };
 
-        let msg = parse_github_event(payload, "issues", "owner/repo");
+        let msg = parse_github_event(&payload, "issues", "owner/repo");
         assert!(msg.is_some());
 
         let msg = msg.unwrap();
@@ -854,7 +866,7 @@ mod tests {
             review: None,
         };
 
-        let msg = parse_github_event(payload, "issues", "owner/repo");
+        let msg = parse_github_event(&payload, "issues", "owner/repo");
         assert!(msg.is_some());
 
         let msg = msg.unwrap();
@@ -878,7 +890,7 @@ mod tests {
             review: None,
         };
 
-        let msg = parse_github_event(payload, "pull_request", "owner/repo");
+        let msg = parse_github_event(&payload, "pull_request", "owner/repo");
         assert!(msg.is_some());
 
         let msg = msg.unwrap();
@@ -902,7 +914,7 @@ mod tests {
             review: None,
         };
 
-        let msg = parse_github_event(payload, "pull_request", "owner/repo");
+        let msg = parse_github_event(&payload, "pull_request", "owner/repo");
         assert!(msg.is_some());
 
         let msg = msg.unwrap();
@@ -923,7 +935,7 @@ mod tests {
             review: None,
         };
 
-        let msg = parse_github_event(payload, "issues", "owner/repo");
+        let msg = parse_github_event(&payload, "issues", "owner/repo");
         assert!(msg.is_none(), "closed action should be ignored");
     }
 
@@ -937,7 +949,7 @@ mod tests {
             review: None,
         };
 
-        let msg = parse_github_event(payload, "unknown_event", "owner/repo");
+        let msg = parse_github_event(&payload, "unknown_event", "owner/repo");
         assert!(msg.is_none());
     }
 
@@ -966,7 +978,7 @@ mod tests {
             review: None,
         };
 
-        let msg = parse_github_event(payload, "issue_comment", "owner/repo");
+        let msg = parse_github_event(&payload, "issue_comment", "owner/repo");
         assert!(msg.is_some());
 
         let msg = msg.unwrap();
@@ -997,7 +1009,7 @@ mod tests {
             review: None,
         };
 
-        let msg = parse_github_event(payload, "issue_comment", "owner/repo");
+        let msg = parse_github_event(&payload, "issue_comment", "owner/repo");
         assert!(msg.is_none(), "comment without issue should be ignored");
     }
 
@@ -1023,7 +1035,7 @@ mod tests {
             }),
         };
 
-        let msg = parse_github_event(payload, "pull_request_review", "owner/repo");
+        let msg = parse_github_event(&payload, "pull_request_review", "owner/repo");
         assert!(msg.is_some());
 
         let msg = msg.unwrap();
@@ -1059,7 +1071,7 @@ mod tests {
             }),
         };
 
-        let msg = parse_github_event(payload, "pull_request_review", "owner/repo");
+        let msg = parse_github_event(&payload, "pull_request_review", "owner/repo");
         assert!(msg.is_none(), "dismissed review should be ignored");
     }
 

@@ -170,8 +170,16 @@ fn config() -> anyhow::Result<openraft::Config> {
 pub struct Node {
     pub raft: Raft,
     /// None on a single node, which has no peers to forward to
-    secret: Option<Arc<String>>,
+    secret: Option<Arc<str>>,
     server: Option<Arc<tokio::sync::Notify>>,
+}
+
+impl std::fmt::Debug for Node {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Node")
+            .field("server", &self.server.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Node {
@@ -233,6 +241,18 @@ pub struct NodeConfig {
     pub elect: bool,
 }
 
+impl std::fmt::Debug for NodeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeConfig")
+            .field("name", &self.name)
+            .field("id", &self.id)
+            .field("addr", &self.addr)
+            .field("voters", &self.voters)
+            .field("elect", &self.elect)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Start a one-node cluster over `store`, with its log in `raft_db`, and route the store's
 /// replicated writes through it
 pub async fn start_single(store: &TaskStore, raft_db: &Path) -> anyhow::Result<Node> {
@@ -275,7 +295,7 @@ pub async fn start_node_on(
     cfg: NodeConfig,
     listener: tokio::net::TcpListener,
 ) -> anyhow::Result<Node> {
-    let secret = Arc::new(cfg.secret);
+    let secret: Arc<str> = Arc::from(cfg.secret);
     let raft_store = RaftStore::open(raft_db, store.clone()).await?;
     let (log, sm) = Adaptor::new(raft_store);
     let config = openraft::Config {
@@ -339,6 +359,10 @@ struct NoNetwork;
 impl RaftNetworkFactory<TypeConfig> for NoNetwork {
     type Network = NoNetwork;
 
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the RaftNetworkFactory trait requires async"
+    )]
     async fn new_client(&mut self, _target: NodeId, _node: &BasicNode) -> NoNetwork {
         NoNetwork
     }
@@ -350,6 +374,10 @@ fn unreachable<E: std::error::Error>() -> RPCError<NodeId, BasicNode, E> {
     )))
 }
 
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "the RaftNetwork trait requires async"
+)]
 impl RaftNetwork<TypeConfig> for NoNetwork {
     async fn append_entries(
         &mut self,

@@ -71,7 +71,7 @@ async fn is_ci_check_in_cooldown(
         if let Ok(last_time) = chrono::DateTime::parse_from_rfc3339(&last_ts) {
             let elapsed =
                 chrono::Utc::now().signed_duration_since(last_time.with_timezone(&chrono::Utc));
-            if elapsed.num_seconds() < cooldown_secs as i64 {
+            if elapsed.num_seconds() < i64::try_from(cooldown_secs).unwrap_or(i64::MAX) {
                 return Ok(true);
             }
         }
@@ -426,7 +426,10 @@ pub(crate) async fn sweep_ci_timer_keys(
     Ok(())
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments have no natural grouping"
+)]
 /// Handle a detected merge conflict by attempting a worktree rebase.
 ///
 /// Both the `poll_mergeable_until` conflict path and the `gh.merge_pr()` failure
@@ -450,7 +453,7 @@ async fn handle_pr_rebase_recovery(
 ) -> anyhow::Result<()> {
     let retries = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
         .await
-        .map_or(0, |t| t.merge_conflict_retries.max(0) as u64);
+        .map_or(0, |t| u64::try_from(t.merge_conflict_retries).unwrap_or(0));
     if retries >= MAX_MERGE_CONFLICT_RETRIES {
         tracing::error!(
             task_id = task.id.0,
@@ -984,7 +987,10 @@ fn mergeable_state_ready(
 /// Checks that the automated review comment says "approve" and that CI checks
 /// are green before merging. If CI fails, sets task back to routed so the
 /// agent is re-dispatched to fix the issues.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments have no natural grouping"
+)]
 pub(crate) async fn auto_merge_pr(
     task: &ExternalTask,
     branch: &str,
@@ -2117,7 +2123,10 @@ async fn required_ci_checks_pass(gh: &GhHttp, repo: &str, pr_number: u64) -> Opt
 }
 
 /// Handle review changes request — re-dispatch the original agent.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments have no natural grouping"
+)]
 pub(crate) async fn handle_review_changes(
     task: &ExternalTask,
     notes: &str,
@@ -2131,11 +2140,13 @@ pub(crate) async fn handle_review_changes(
     store: &Arc<TaskStore>,
     router_config: &crate::engine::router::config::RouterConfig,
 ) -> anyhow::Result<()> {
+    use std::fmt::Write as _;
+
     // 1. Check review cycle count (max 2 review rounds)
     let task_store_record = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0).await;
     let review_cycles: u32 = task_store_record
         .as_ref()
-        .map_or(0, |t| t.review_cycles.max(0) as u32);
+        .map_or(0, |t| u32::try_from(t.review_cycles).unwrap_or(0));
 
     let max_cycles: u32 = config::get("workflow.max_review_cycles")
         .ok()
@@ -2327,15 +2338,16 @@ pub(crate) async fn handle_review_changes(
     if !issues.is_empty() {
         comment.push_str("\n\n**Issues Found:**\n");
         for issue in issues {
-            comment.push_str(&format!(
-                "- `{}` line {}: {} [{}]\n",
+            let _ = writeln!(
+                comment,
+                "- `{}` line {}: {} [{}]",
                 issue.file,
                 issue
                     .line
                     .map_or_else(|| "?".to_string(), |l| l.to_string()),
                 issue.description,
                 issue.severity
-            ));
+            );
         }
     }
 
@@ -3432,11 +3444,14 @@ mod tests {
         clear_ci_pending_since(&store, REPO, "7", "test")
             .await
             .unwrap();
-        assert!(store
-            .kv_list_prefix(&ci_pending_since_prefix(REPO, "7"))
-            .await
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            store
+                .kv_list_prefix(&ci_pending_since_prefix(REPO, "7"))
+                .await
+                .unwrap(),
+            [] as [(String, String); 0]
+        );
+
         assert!(store
             .kv_get(&ci_pending_since_key("other/repo", "7", SHA))
             .await
@@ -3477,11 +3492,14 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        assert!(store
-            .kv_list_prefix(&ci_pending_since_prefix(REPO, "7"))
-            .await
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            store
+                .kv_list_prefix(&ci_pending_since_prefix(REPO, "7"))
+                .await
+                .unwrap(),
+            [] as [(String, String); 0]
+        );
+
         assert!(store.kv_get("ci_check_ts:7").await.unwrap().is_none());
         assert!(store.kv_get("ci_pending_since:7").await.unwrap().is_none());
         assert!(store

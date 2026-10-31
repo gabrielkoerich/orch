@@ -18,6 +18,14 @@ pub struct TmuxChannel {
     transport: Option<Arc<crate::channels::transport::Transport>>,
 }
 
+impl std::fmt::Debug for TmuxChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TmuxChannel")
+            .field("has_transport", &self.transport.is_some())
+            .finish()
+    }
+}
+
 impl TmuxChannel {
     pub fn with_transport(transport: Arc<crate::channels::transport::Transport>) -> Self {
         Self {

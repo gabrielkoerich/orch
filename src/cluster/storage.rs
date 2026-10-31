@@ -1,5 +1,7 @@
-// openraft's trait methods return its own StorageError, so its size is not ours to change
-#![allow(clippy::result_large_err)]
+#![expect(
+    clippy::result_large_err,
+    reason = "openraft's trait methods return its own StorageError, so its size is not ours to change"
+)]
 
 use std::fmt::Debug;
 use std::io::Cursor;
@@ -28,6 +30,10 @@ fn io<E: std::error::Error + 'static>(e: E) -> Err {
     StorageIOError::read(&e).into()
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "map_err passes the error by value"
+)]
 fn io_any(e: anyhow::Error) -> Err {
     io(std::io::Error::other(format!("{e:#}")))
 }
@@ -57,6 +63,14 @@ struct StoredSnapshot {
 pub struct RaftStore {
     log: SqlitePool,
     store: TaskStore,
+}
+
+impl Debug for RaftStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RaftStore")
+            .field("log", &self.log)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RaftStore {
@@ -133,8 +147,8 @@ impl RaftLogReader<TypeConfig> for RaftStore {
         // SQLite integers are i64, so the open end is clamped
         let rows: Vec<(String,)> =
             sqlx::query_as("SELECT entry FROM log WHERE idx >= ? AND idx < ? ORDER BY idx")
-                .bind(start as i64)
-                .bind(end.min(i64::MAX as u64) as i64)
+                .bind(i64::try_from(start).unwrap_or(i64::MAX))
+                .bind(i64::try_from(end).unwrap_or(i64::MAX))
                 .fetch_all(&self.log)
                 .await
                 .map_err(io)?;
@@ -233,6 +247,10 @@ impl RaftStorage<TypeConfig> for RaftStore {
         })
     }
 
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the RaftStorage trait requires async"
+    )]
     async fn get_log_reader(&mut self) -> Self::LogReader {
         self.clone()
     }
@@ -245,7 +263,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
             .into_iter()
             .map(|e| {
                 Ok((
-                    e.log_id.index as i64,
+                    i64::try_from(e.log_id.index).map_err(io)?,
                     serde_json::to_string(&e).map_err(io)?,
                 ))
             })
@@ -265,7 +283,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
 
     async fn delete_conflict_logs_since(&mut self, log_id: LogId<NodeId>) -> Result<(), Err> {
         sqlx::query("DELETE FROM log WHERE idx >= ?")
-            .bind(log_id.index as i64)
+            .bind(i64::try_from(log_id.index).map_err(io)?)
             .execute(&self.log)
             .await
             .map_err(io)?;
@@ -275,7 +293,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
     async fn purge_logs_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), Err> {
         self.put("purged", &Some(log_id)).await?;
         sqlx::query("DELETE FROM log WHERE idx <= ?")
-            .bind(log_id.index as i64)
+            .bind(i64::try_from(log_id.index).map_err(io)?)
             .execute(&self.log)
             .await
             .map_err(io)?;
@@ -328,10 +346,18 @@ impl RaftStorage<TypeConfig> for RaftStore {
         Ok(out)
     }
 
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the RaftStorage trait requires async"
+    )]
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         self.clone()
     }
 
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the RaftStorage trait requires async"
+    )]
     async fn begin_receiving_snapshot(&mut self) -> Result<Box<Cursor<Vec<u8>>>, Err> {
         Ok(Box::new(Cursor::new(Vec::new())))
     }

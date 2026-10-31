@@ -41,7 +41,10 @@ use super::sync::ReviewTaskSnapshot;
 /// Abstraction over the GitHub HTTP calls used by `review_open_prs`.
 ///
 /// Allows tests to inject a mock without needing a real GitHub token.
-#[expect(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait marks its boxed futures must_use twice"
+)]
 #[async_trait]
 pub(crate) trait GhReviewClient: Send + Sync {
     async fn get_pr_number(&self, repo: &str, branch: &str) -> anyhow::Result<Option<u64>>;
@@ -162,7 +165,6 @@ async fn handle_merge_conflict(
         }
         return ConflictAction::BlockForHuman;
     }
-    let _repo = "TEMP"; // will use store_id-based path below
     if let Err(e) = store_set_result_by_id(
         &Some(Arc::clone(store)),
         store_id,
@@ -201,7 +203,10 @@ async fn handle_merge_conflict(
     ConflictAction::RerouteToAgent
 }
 
-#[expect(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait marks its boxed futures must_use twice"
+)]
 #[async_trait]
 trait ReviewBatchFailCounterStore: Send + Sync {
     async fn kv_delete(&self, key: &str) -> anyhow::Result<()>;
@@ -263,7 +268,10 @@ async fn reset_batch_fail_counter(
 /// Lists tasks in review, fetches PR reviews, and re-dispatches the agent
 /// when a reviewer requests changes. The review context is stored in the
 /// store and injected into the agent prompt.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments have no natural grouping"
+)]
 pub(crate) async fn review_open_prs(
     backend: &Arc<dyn ExternalBackend>,
     repo: &str,
@@ -276,6 +284,19 @@ pub(crate) async fn review_open_prs(
     gh: &dyn GhReviewClient,
     router_config: &crate::engine::router::config::RouterConfig,
 ) -> anyhow::Result<()> {
+    use std::fmt::Write as _;
+
+    const MAX_REVIEW_CONTEXT_BYTES: usize = 16 * 1024;
+
+    struct ReadyTask {
+        task: crate::backends::ExternalTask,
+        store_id: i64,
+        stored: crate::store::Task,
+        branch: String,
+        /// `Some` = already stored in DB, `None` = needs REST lookup.
+        pr_number: Option<u64>,
+    }
+
     if in_review_tasks.is_empty() {
         tracing::debug!(count = 0, "checking in_review tasks for PR reviews");
         return Ok(());
@@ -287,15 +308,6 @@ pub(crate) async fn review_open_prs(
     );
 
     // ─── Phase 1: Validate tasks and separate by PR number availability ───────
-
-    struct ReadyTask {
-        task: crate::backends::ExternalTask,
-        store_id: i64,
-        stored: crate::store::Task,
-        branch: String,
-        /// `Some` = already stored in DB, `None` = needs REST lookup.
-        pr_number: Option<u64>,
-    }
 
     let mut ready_tasks: Vec<ReadyTask> = Vec::new();
 
@@ -332,7 +344,7 @@ pub(crate) async fn review_open_prs(
             stored.branch.clone()
         };
 
-        let stored_pr_number = stored.pr_number.map(|n| n as u64);
+        let stored_pr_number = stored.pr_number.and_then(|n| u64::try_from(n).ok());
         ready_tasks.push(ReadyTask {
             task,
             store_id,
@@ -374,7 +386,7 @@ pub(crate) async fn review_open_prs(
                     if let Err(e) = store_set_result_by_id(
                         &Some(Arc::clone(store)),
                         ready_tasks[task_idx].store_id,
-                        &[("pr_number", serde_json::json!(*n as i64))],
+                        &[("pr_number", serde_json::json!(*n))],
                     )
                     .await
                     {
@@ -509,7 +521,6 @@ pub(crate) async fn review_open_prs(
                         .await
                     {
                         tracing::error!(task_id, err = %e, "update_task_status_and_result(Blocked) failed — skipping block to avoid silent auto-unblock loop");
-                        continue;
                     }
                 } else {
                     tracing::warn!(
@@ -524,11 +535,6 @@ pub(crate) async fn review_open_prs(
                         .await
                     {
                         tracing::warn!(task_id, err = %e, "failed to update status to routed — will retry next tick");
-                        // Do not consume the persistent no_code_reroutes counter when the
-                        // status update fails (e.g. transient DB error). Retry on the
-                        // next tick so the counter only increments after a successful
-                        // re-dispatch.
-                        continue;
                     }
                 }
             }
@@ -638,11 +644,11 @@ pub(crate) async fn review_open_prs(
         };
 
         // Skip a rewrite of the same number, set_fields would bump updated_at
-        if stored_task.pr_number.map(|n| n as u64) != Some(pr_number) {
+        if stored_task.pr_number.and_then(|n| u64::try_from(n).ok()) != Some(pr_number) {
             if let Err(e) = store_set_result_by_id(
                 &Some(Arc::clone(store)),
                 task_info.store_id,
-                &[("pr_number", serde_json::json!(pr_number as i64))],
+                &[("pr_number", serde_json::json!(pr_number))],
             )
             .await
             {
@@ -714,12 +720,12 @@ pub(crate) async fn review_open_prs(
                 let is_conflicting = batch_data.mergeable == Some(false);
 
                 if is_conflicting {
-                    let retries = stored_task.merge_conflict_retries.max(0) as u64;
+                    let retries = u64::try_from(stored_task.merge_conflict_retries).unwrap_or(0);
                     match handle_merge_conflict(
                         &task.id,
                         pr_number,
                         retries,
-                        stored_task.attempts.max(0) as u64,
+                        u64::try_from(stored_task.attempts).unwrap_or(0),
                         task_manager,
                         store,
                         task_info.store_id,
@@ -836,14 +842,15 @@ pub(crate) async fn review_open_prs(
                 comments: review_comments.clone(),
             };
 
-            review_context.push_str(&format!(
-                "### Review by @{} (CHANGES REQUESTED)\n",
+            let _ = writeln!(
+                review_context,
+                "### Review by @{} (CHANGES REQUESTED)",
                 pr_review.review.user.login
-            ));
+            );
 
             if let Some(ref body) = pr_review.review.body {
                 if !body.trim().is_empty() {
-                    review_context.push_str(&format!("**Overall Feedback:** {body}\n\n"));
+                    let _ = write!(review_context, "**Overall Feedback:** {body}\n\n");
                 }
             }
 
@@ -851,11 +858,12 @@ pub(crate) async fn review_open_prs(
             if !actionable.is_empty() {
                 review_context.push_str("**Comments to address:**\n\n");
                 for comment in actionable {
-                    review_context.push_str(&format!(
-                        "#### File: `{}` (line {})\n",
+                    let _ = writeln!(
+                        review_context,
+                        "#### File: `{}` (line {})",
                         comment.path,
                         comment.line.map(|l| l.to_string()).unwrap_or_default()
-                    ));
+                    );
 
                     if let Some(ref diff_hunk) = comment.diff_hunk {
                         review_context.push_str("```diff\n");
@@ -863,7 +871,7 @@ pub(crate) async fn review_open_prs(
                         review_context.push_str("\n```\n\n");
                     }
 
-                    review_context.push_str(&format!("> {}\n\n", comment.body));
+                    let _ = write!(review_context, "> {}\n\n", comment.body);
                 }
             }
         }
@@ -912,7 +920,6 @@ pub(crate) async fn review_open_prs(
         }
 
         // Cap review context to avoid oversized values.
-        const MAX_REVIEW_CONTEXT_BYTES: usize = 16 * 1024;
         if review_context.len() > MAX_REVIEW_CONTEXT_BYTES {
             let mut boundary = MAX_REVIEW_CONTEXT_BYTES;
             while !review_context.is_char_boundary(boundary) {
@@ -936,7 +943,8 @@ pub(crate) async fn review_open_prs(
                 .model
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
-            let review_cycles = stored_task.review_cycles.max(0) as u32;
+            let review_cycles = u32::try_from(stored_task.review_cycles).unwrap_or(0);
+
             let max_cycles: u32 = crate::config::get("workflow.max_review_cycles")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -1443,7 +1451,7 @@ mod tests {
         let in_flight = Arc::new(DashSet::new());
         let gh = MockGh::default();
 
-        let result = review_open_prs(
+        let result = Box::pin(review_open_prs(
             &backend,
             "owner/repo",
             &default_config(),
@@ -1454,7 +1462,7 @@ mod tests {
             &[],
             &gh,
             &crate::engine::router::RouterConfig::default(),
-        )
+        ))
         .await;
 
         assert!(result.is_ok());
@@ -1513,7 +1521,7 @@ mod tests {
         // The important invariant is that the store status remains InReview.
 
         let in_flight = Arc::new(DashSet::new());
-        let result = review_open_prs(
+        let result = Box::pin(review_open_prs(
             &backend,
             "owner/repo",
             &default_config(),
@@ -1524,7 +1532,7 @@ mod tests {
             &[snapshot],
             &gh,
             &crate::engine::router::RouterConfig::default(),
-        )
+        ))
         .await;
 
         assert!(result.is_ok());
@@ -1577,7 +1585,7 @@ mod tests {
 
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let in_flight = Arc::new(DashSet::new());
-        review_open_prs(
+        Box::pin(review_open_prs(
             &backend,
             "owner/repo",
             &default_config(),
@@ -1588,7 +1596,7 @@ mod tests {
             &[snapshot],
             &gh,
             &crate::engine::router::RouterConfig::default(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -1638,7 +1646,7 @@ mod tests {
 
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let in_flight = Arc::new(DashSet::new());
-        review_open_prs(
+        Box::pin(review_open_prs(
             &backend,
             "owner/repo",
             &default_config(),
@@ -1649,7 +1657,7 @@ mod tests {
             &[snapshot],
             &gh,
             &crate::engine::router::RouterConfig::default(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -1697,7 +1705,7 @@ mod tests {
 
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let in_flight = Arc::new(DashSet::new());
-        review_open_prs(
+        Box::pin(review_open_prs(
             &backend,
             "owner/repo",
             &default_config(),
@@ -1708,7 +1716,7 @@ mod tests {
             &[snapshot],
             &MockGh::default(),
             &crate::engine::router::RouterConfig::default(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -1774,7 +1782,7 @@ mod tests {
         let gh = MockGh::default();
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let in_flight = Arc::new(DashSet::new());
-        review_open_prs(
+        Box::pin(review_open_prs(
             &backend,
             "owner/repo",
             &default_config(),
@@ -1785,7 +1793,7 @@ mod tests {
             &[snapshot],
             &gh,
             &crate::engine::router::RouterConfig::default(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -1862,7 +1870,7 @@ mod tests {
 
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let in_flight = Arc::new(DashSet::new());
-        review_open_prs(
+        Box::pin(review_open_prs(
             &backend,
             "owner/repo",
             &default_config(),
@@ -1873,7 +1881,7 @@ mod tests {
             &[snapshot],
             &TransientGh,
             &crate::engine::router::RouterConfig::default(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -1933,7 +1941,7 @@ mod tests {
         };
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let in_flight = Arc::new(DashSet::new());
-        let result = review_open_prs(
+        let result = Box::pin(review_open_prs(
             &backend,
             "owner/repo",
             &default_config(),
@@ -1944,7 +1952,7 @@ mod tests {
             &[snapshot],
             &gh,
             &crate::engine::router::RouterConfig::default(),
-        )
+        ))
         .await;
 
         // Must return Ok (graceful skip) even though batch fetch failed.
@@ -2014,7 +2022,7 @@ mod tests {
 
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let in_flight = Arc::new(DashSet::new());
-        review_open_prs(
+        Box::pin(review_open_prs(
             &backend,
             "owner/repo",
             &default_config(),
@@ -2025,7 +2033,7 @@ mod tests {
             &[snapshot],
             &gh,
             &crate::engine::router::RouterConfig::default(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -2164,7 +2172,7 @@ mod tests {
 
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let in_flight = Arc::new(DashSet::new());
-        review_open_prs(
+        Box::pin(review_open_prs(
             &backend,
             "owner/repo",
             &default_config(),
@@ -2175,7 +2183,7 @@ mod tests {
             &[snapshot],
             &gh,
             &crate::engine::router::RouterConfig::default(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -2229,7 +2237,7 @@ mod tests {
 
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let in_flight = Arc::new(DashSet::new());
-        review_open_prs(
+        Box::pin(review_open_prs(
             &backend,
             "owner/repo",
             &default_config(),
@@ -2240,7 +2248,7 @@ mod tests {
             &[snapshot],
             &MockGh::default(),
             &crate::engine::router::RouterConfig::default(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -2319,7 +2327,7 @@ mod tests {
 
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let in_flight = Arc::new(DashSet::new());
-        review_open_prs(
+        Box::pin(review_open_prs(
             &backend,
             "owner/repo",
             &default_config(),
@@ -2330,7 +2338,7 @@ mod tests {
             &[snapshot],
             &gh,
             &crate::engine::router::RouterConfig::default(),
-        )
+        ))
         .await
         .unwrap();
 

@@ -132,6 +132,13 @@ pub struct MiniMaxClaudeRunner {
     inner: ClaudeRunner,
 }
 
+impl std::fmt::Debug for MiniMaxClaudeRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MiniMaxClaudeRunner")
+            .finish_non_exhaustive()
+    }
+}
+
 impl MiniMaxClaudeRunner {
     pub fn new(binary: &str) -> Self {
         Self {

@@ -42,6 +42,10 @@ fn print_summary_table(
     println!("── {title} ──────────────────────────────────");
 
     let total = summary.tasks_completed_24h + summary.tasks_failed_24h;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a display percentage of task counts far below 2^52"
+    )]
     let success_rate = if total > 0 {
         summary.tasks_completed_24h as f64 / total as f64 * 100.0
     } else {

@@ -172,7 +172,7 @@ pub fn kill_other_orch_serve_processes(timeout: std::time::Duration) -> u32 {
         tracing::error!(pid, "stale orch serve survived SIGKILL");
     }
 
-    (others.len() - remaining.len()) as u32
+    u32::try_from(others.len() - remaining.len()).unwrap_or(u32::MAX)
 }
 
 fn process_args(pid: u32) -> Option<String> {

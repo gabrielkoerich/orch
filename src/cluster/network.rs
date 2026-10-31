@@ -1,8 +1,10 @@
 //! Raft RPCs and forwarded writes between nodes, JSON over HTTP like `../agents-coordination`.
 //! Every request carries the cluster secret, so reaching the port is not enough to join
 
-// openraft's RPC errors are its own types, so their size is not ours to change
-#![allow(clippy::result_large_err)]
+#![expect(
+    clippy::result_large_err,
+    reason = "openraft's RPC errors are its own types, so their size is not ours to change"
+)]
 
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -41,10 +43,10 @@ static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 #[derive(Clone)]
 struct App {
     raft: Raft,
-    secret: Arc<String>,
+    secret: Arc<str>,
     me: Arc<Hello>,
     /// The address peers dial, bound into every proof so a proof relayed through another host fails
-    addr: Arc<String>,
+    addr: Arc<str>,
 }
 
 /// What a node says about itself to a peer that found it on the tailnet
@@ -65,6 +67,8 @@ pub struct Hello {
 /// HMAC-SHA256 under the cluster secret, in hex. Proves the secret without sending it
 fn mac(secret: &str, parts: &[&str]) -> String {
     use hmac::{Hmac, Mac};
+    use std::fmt::Write as _;
+
     let mut m =
         Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key");
     for part in parts {
@@ -72,11 +76,12 @@ fn mac(secret: &str, parts: &[&str]) -> String {
         m.update(b"\0");
     }
 
-    m.finalize()
-        .into_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    let bytes = m.finalize().into_bytes();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// A node asking the leader to add it as a learner
@@ -94,7 +99,7 @@ fn authorized(app: &App, headers: &HeaderMap) -> bool {
     given.ct_eq(app.secret.as_bytes()).into()
 }
 
-pub(crate) fn router(raft: Raft, secret: Arc<String>, me: Hello, addr: String) -> Router {
+pub(crate) fn router(raft: Raft, secret: Arc<str>, me: Hello, addr: String) -> Router {
     Router::new()
         .route("/raft/append", post(append))
         .route("/raft/snapshot", post(snapshot))
@@ -106,7 +111,7 @@ pub(crate) fn router(raft: Raft, secret: Arc<String>, me: Hello, addr: String) -
             raft,
             secret,
             me: Arc::new(me),
-            addr: Arc::new(addr),
+            addr: Arc::from(addr),
         })
 }
 
@@ -304,12 +309,16 @@ pub(crate) async fn forward(
 }
 
 pub(crate) struct HttpNetwork {
-    pub secret: Arc<String>,
+    pub secret: Arc<str>,
 }
 
 impl RaftNetworkFactory<TypeConfig> for HttpNetwork {
     type Network = Peer;
 
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the RaftNetworkFactory trait requires async"
+    )]
     async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Peer {
         Peer {
             target,
@@ -322,7 +331,7 @@ impl RaftNetworkFactory<TypeConfig> for HttpNetwork {
 pub(crate) struct Peer {
     target: NodeId,
     addr: String,
-    secret: Arc<String>,
+    secret: Arc<str>,
 }
 
 impl Peer {
@@ -339,7 +348,7 @@ impl Peer {
     {
         let res = CLIENT
             .post(format!("http://{}/raft/{path}", self.addr))
-            .header(SECRET_HEADER, self.secret.as_str())
+            .header(SECRET_HEADER, &*self.secret)
             .timeout(option.hard_ttl())
             .json(&req)
             .send()

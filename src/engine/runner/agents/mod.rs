@@ -42,7 +42,6 @@ pub struct PermissionRules {
     /// Restrict to orchestration-only operations — denies Read, Glob, Grep,
     /// and Bash commands for browsing/reading files (ls, cat, find, etc.).
     /// Agents translate this into their native permission model.
-    #[expect(dead_code)]
     pub deny_read_only: bool,
     /// Additional directories that must be writable (e.g. the git common dir
     /// when running inside a worktree whose `.git` metadata lives outside the
@@ -158,7 +157,6 @@ impl PermissionRules {
 /// functions parse agent-specific envelopes and return a unified `AgentResult`
 /// so callers (review pipeline, response handler) don't need format knowledge.
 #[derive(Debug, Clone)]
-#[expect(dead_code)] // fields read by tests and future phases
 pub struct AgentResult {
     /// Whether the agent reported an error (e.g. `is_error: true` in Claude).
     pub is_error: bool,
@@ -194,10 +192,10 @@ pub fn collect_assistant_messages_text(_agent: &str, ndjson: &str) -> String {
 /// (e.g. plain text, empty output, or unrecognized format).
 pub fn find_agent_result(agent: &str, ndjson: &str) -> Option<AgentResult> {
     match agent {
-        "claude" | "kimi" | "minimax" => claude::find_claude_result(ndjson),
         "grok" => grok::find_grok_result(ndjson),
         "opencode" => opencode::find_opencode_result(ndjson),
         "codex" => codex::find_codex_result(ndjson),
+        // claude, kimi, minimax and unknown agents all emit the claude format
         _ => claude::find_claude_result(ndjson),
     }
 }
@@ -516,6 +514,26 @@ fn looks_like_ndjson_event_stream(text: &str) -> bool {
 /// Returns `None` for empty/whitespace-only text so callers can preserve the
 /// original `InvalidResponse` behavior.
 pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
+    // Returns true when `word` appears as a whole word in `text`
+    // (not preceded or followed by an ASCII alphanumeric character).
+    fn contains_word(text: &str, word: &str) -> bool {
+        let mut start = 0;
+        while let Some(pos) = text[start..].find(word) {
+            let abs = start + pos;
+            let before_ok = abs == 0 || !text.as_bytes()[abs - 1].is_ascii_alphanumeric();
+            let after_ok = abs + word.len() >= text.len()
+                || !text.as_bytes()[abs + word.len()].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+            start = abs + 1;
+            if start >= text.len() {
+                break;
+            }
+        }
+        false
+    }
+
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;
@@ -546,25 +564,6 @@ pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
     // creation, comments, etc.) as a successful "done" signal. This prevents
     // tasks from being retried when an agent reports success in free-form
     // text instead of returning structured JSON.
-    // Returns true when `word` appears as a whole word in `text`
-    // (not preceded or followed by an ASCII alphanumeric character).
-    fn contains_word(text: &str, word: &str) -> bool {
-        let mut start = 0;
-        while let Some(pos) = text[start..].find(word) {
-            let abs = start + pos;
-            let before_ok = abs == 0 || !text.as_bytes()[abs - 1].is_ascii_alphanumeric();
-            let after_ok = abs + word.len() >= text.len()
-                || !text.as_bytes()[abs + word.len()].is_ascii_alphanumeric();
-            if before_ok && after_ok {
-                return true;
-            }
-            start = abs + 1;
-            if start >= text.len() {
-                break;
-            }
-        }
-        false
-    }
 
     // Negation phrases that override a "done/completed" match.
     let looks_negative = [
@@ -878,7 +877,6 @@ pub trait AgentRunner: Send + Sync {
     ///
     /// Returns `Err(AgentError)` only for terminal errors (rate limit, auth, etc.)
     /// that should abort the review pipeline entirely.
-    #[expect(dead_code)] // used by per-agent unit tests; production uses find_agent_result
     fn extract_text(&self, raw: &str) -> Result<String, AgentError> {
         Ok(raw.to_string())
     }
@@ -1941,8 +1939,7 @@ pub(crate) mod patterns {
                 // Priority (highest wins): RateLimit / Auth / other > NetworkError > AgentFailed
                 // A transient reconnect mid-stream must not obscure a subsequent billing/rate error.
                 let upgrade = match &best {
-                    None => true,
-                    Some(AgentError::AgentFailed { .. }) => true,
+                    None | Some(AgentError::AgentFailed { .. }) => true,
                     Some(AgentError::NetworkError { .. }) => !matches!(
                         err,
                         AgentError::NetworkError { .. } | AgentError::AgentFailed { .. }
@@ -2021,9 +2018,6 @@ mod tests {
         use tracing_subscriber::util::SubscriberInitExt;
         use tracing_subscriber::EnvFilter;
 
-        let output: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let output_clone = std::sync::Arc::clone(&output);
-
         struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for CaptureWriter {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -2040,6 +2034,9 @@ mod tests {
                 CaptureWriter(std::sync::Arc::clone(&self.0))
             }
         }
+
+        let output: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let output_clone = std::sync::Arc::clone(&output);
 
         tracing_subscriber::fmt()
             .with_env_filter(EnvFilter::from_default_env().add_directive(Level::WARN.into()))
@@ -2285,8 +2282,8 @@ mod tests {
         // Simulate real agent output: auth error appears early, NDJSON session
         // metadata at the end. Stored message must be the error line, not the
         // trailing JSON that agents emit at exit.
-        let text = "some output\nunauthorized: your api key has expired\nx".repeat(400)
-            + r#","outputTokens":744,"cacheReadInputTokens":344785,"uuid":"86d13b1f-..."#;
+        let mut text = "some output\nunauthorized: your api key has expired\nx".repeat(400);
+        text.push_str(r#","outputTokens":744,"cacheReadInputTokens":344785,"uuid":"86d13b1f-..."#);
         let err = patterns::detect_auth_error(&text).expect("should detect auth error");
         let AgentError::Auth { message } = err else {
             panic!("expected Auth, got {err:?}");
@@ -2325,8 +2322,8 @@ mod tests {
     fn network_error_message_contains_match_not_tail() {
         // Simulate real agent output: error appears early, unrelated stats JSON at the end.
         let prefix = "connection refused connecting to api.anthropic.com:443 ";
-        let suffix = "x".repeat(2000)
-            + r#"":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0}"#;
+        let mut suffix = "x".repeat(2000);
+        suffix.push_str(r#"":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0}"#);
         let text = format!("{prefix}{suffix}");
 
         let err = patterns::detect_network_error(&text).expect("should detect network error");
@@ -3554,7 +3551,7 @@ world"}"#;
     /// Integration test: verify from_config() loads real config and agents
     /// translate it correctly. Requires ~/.orch/config.yml to exist.
     #[test]
-    #[ignore]
+    #[ignore = "reads the operator config"]
     fn integration_from_config_to_agent_commands() {
         let perms = PermissionRules::from_config();
 
@@ -3583,7 +3580,7 @@ world"}"#;
     /// Integration test: verify from_config() handles supervised mode.
     /// Requires config with workflow.permissions.mode = "supervised".
     #[test]
-    #[ignore]
+    #[ignore = "reads the operator config"]
     fn integration_supervised_config_translates_correctly() {
         // This test requires config to have:
         // workflow:

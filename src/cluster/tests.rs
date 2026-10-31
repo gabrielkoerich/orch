@@ -385,11 +385,10 @@ async fn dependency_job_and_channel_writes_go_through_the_log_and_the_snapshot()
             .len(),
         1
     );
-    assert!(b
-        .list_subscribers_for_repo("other/repo")
-        .await
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        b.list_subscribers_for_repo("other/repo").await.unwrap(),
+        [] as [(String, String, String); 0]
+    );
 }
 
 #[tokio::test]
@@ -575,7 +574,7 @@ async fn three_voters_fail_over_and_catch_up() {
     let mut members = BTreeMap::new();
     for id in 1..=3 {
         let m = start_member(
-            dirs[id as usize - 1].path(),
+            dirs[usize::try_from(id - 1).unwrap()].path(),
             id,
             &voters,
             "s3cret",
@@ -605,7 +604,7 @@ async fn three_voters_fail_over_and_catch_up() {
     assert_eq!(b, a + 1);
 
     let back = start_member(
-        dirs[first as usize - 1].path(),
+        dirs[usize::try_from(first - 1).unwrap()].path(),
         first,
         &voters,
         "s3cret",
@@ -631,7 +630,7 @@ async fn a_witness_votes_but_never_leads() {
     for id in 1..=3 {
         let witness = id == 3;
         let m = start_member(
-            dirs[id as usize - 1].path(),
+            dirs[usize::try_from(id - 1).unwrap()].path(),
             id,
             &voters,
             "s3cret",
@@ -670,7 +669,7 @@ async fn a_node_with_the_wrong_secret_gets_nothing() {
     for id in 1..=3 {
         let secret = if id == 3 { "other" } else { "s3cret" };
         let m = start_member(
-            dirs[id as usize - 1].path(),
+            dirs[usize::try_from(id - 1).unwrap()].path(),
             id,
             &voters,
             secret,
@@ -703,7 +702,7 @@ async fn a_learner_joins_through_any_node_and_catches_up() {
     let mut members = BTreeMap::new();
     for id in 1..=3 {
         let m = start_member(
-            dirs[id as usize - 1].path(),
+            dirs[usize::try_from(id - 1).unwrap()].path(),
             id,
             &voters,
             "s3cret",
@@ -968,7 +967,7 @@ async fn exactly_one_of_three_nodes_leads() {
     let mut members = BTreeMap::new();
     for id in 1..=3 {
         let m = start_member(
-            dirs[id as usize - 1].path(),
+            dirs[usize::try_from(id - 1).unwrap()].path(),
             id,
             &voters,
             "s3cret",
@@ -1009,7 +1008,7 @@ async fn a_relayed_proof_is_rejected() {
     let mut members = BTreeMap::new();
     for id in 1..=3 {
         let m = start_member(
-            dirs[id as usize - 1].path(),
+            dirs[usize::try_from(id - 1).unwrap()].path(),
             id,
             &voters,
             "s3cret",

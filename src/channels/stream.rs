@@ -333,7 +333,7 @@ mod tests {
         // 4-byte emoji: each "😀" is 4 bytes. With max=3, the first chunk boundary
         // falls in the middle of the character — the old code would panic here.
         // Build content so the cut at byte 2000 falls inside the trailing 4-byte emoji.
-        let content = "x".repeat(1997) + "😀"; // 2001 bytes, discord limit is 2000
+        let content = format!("{}😀", "x".repeat(1997)); // 2001 bytes, discord limit is 2000
         let parts = split_for_platform(&content, "discord");
         // Must not panic and reassembled content must equal original
         assert_eq!(parts.join(""), content);
@@ -366,7 +366,7 @@ mod tests {
     fn split_telegram_html_content_escaped_before_split() {
         // Build content where the 4096-byte boundary falls inside an HTML tag.
         // After escaping, each chunk (computed on escaped content) must be ≤ 4096.
-        let raw = "a".repeat(4096) + "<code>123</code>"; // 4096 + 16 = 4112 bytes raw
+        let raw = format!("{}<code>123</code>", "a".repeat(4096)); // 4096 + 16 = 4112 bytes raw
         assert_eq!(raw.len(), 4112);
         let escaped = html_escape(&raw);
         // 2 `<` + 2 `>` each gain 3 bytes when escaped (4 vs 1)
@@ -407,7 +407,8 @@ mod tests {
         // becomes `&lt;` / `&gt;`, a +3 byte expansion).
         // If the boundary splits in the middle of `</code>`, the raw chunk end
         // (containing `>`) expands by 3 bytes when escaped — enough to overflow.
-        let raw = "a".repeat(4093) + html_tag; // 4093 + 16 = 4109 bytes
+        let raw = format!("{}{html_tag}", "a".repeat(4093));
+        // 4093 + 16 = 4109 bytes
         assert_eq!(raw.len(), 4109);
 
         // Old buggy approach: split raw, then escape each
