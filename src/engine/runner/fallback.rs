@@ -21,6 +21,8 @@ use super::{agents, response};
 /// summariser as the task runner. Without this, review runs persisted raw
 /// api_retry JSON fragments into `task_runs.error` (issue #3149).
 pub(crate) fn summarize_rate_limit_error(raw_output: &str) -> String {
+    // Byte cap for the first-line fallback summary below
+    const FIRST_LINE_CAP: usize = 120;
     // Find the last line containing "subtype":"api_retry"
     // This handles both complete JSON objects and truncated fragments that begin
     // mid-object (e.g. `,"subtype":"api_retry","attempt":5...`).
@@ -50,7 +52,6 @@ pub(crate) fn summarize_rate_limit_error(raw_output: &str) -> String {
     // No api_retry JSON or field markers found — emit a compact first-line
     // summary, never raw passthrough. Truncate to a tight byte cap so even
     // long single-line provider payloads cannot bloat `task_runs.error`.
-    const FIRST_LINE_CAP: usize = 120;
     let first_line = raw_output.lines().next().unwrap_or(raw_output);
     if first_line.len() > FIRST_LINE_CAP {
         let cutoff = agents::truncate_at_char_boundary(first_line, FIRST_LINE_CAP);
@@ -78,16 +79,18 @@ fn summarise_api_retry_line(line: &str) -> String {
 
     if has_field {
         let retry_delay_s = retry_delay_ms.parse::<f64>().unwrap_or(0.0) / 1000.0;
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the saturating cast floors the delay to whole seconds"
+        )]
         let retry_delay_s = retry_delay_s as u64;
-        format!(
-            "status={} after {} attempts (last delay {}s)",
-            error_status, attempt, retry_delay_s
-        )
+        format!("status={error_status} after {attempt} attempts (last delay {retry_delay_s}s)")
     } else {
         let status_hint = extract_json_field(line, "\"status\":")
             .or_else(|| extract_json_field(line, "\"error\":"))
             .unwrap_or_else(|| "429".to_string());
-        format!("status={} (api_retry fragment)", status_hint)
+        format!("status={status_hint} (api_retry fragment)")
     }
 }
 
@@ -110,13 +113,14 @@ fn extract_json_field(json: &str, field: &str) -> Option<String> {
             let num_str = &value_str[..end];
             num_str
                 .strip_suffix(',')
-                .map(|s| s.to_string())
+                .map(std::string::ToString::to_string)
                 .or_else(|| Some(num_str.to_string()))
         }
     })
 }
 
 /// How `run()` should proceed after error handling.
+#[derive(Debug)]
 pub enum ErrorHandleResult {
     /// Task was rerouted — `run()` should record metrics then return early.
     EarlyReturn { status: String },
@@ -138,7 +142,14 @@ pub enum ErrorHandleResult {
 /// - `set_agent`: if `Some`, also overwrite the task's `agent` field
 /// - `apply_backoff`: whether to pace the reroute with `wait_for_fallback_backoff`
 /// - `reason_prefix`: prefix for the `last_error` message (free model name is appended)
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each caller picks a different mix of reroute options"
+)]
+#[expect(
+    clippy::ref_option,
+    reason = "the store helpers it calls take the store as &Option"
+)]
 async fn try_free_model_reroute(
     task_id: &str,
     agent_name: &str,
@@ -176,7 +187,7 @@ async fn try_free_model_reroute(
     };
     let msg = format!("{reason_prefix} {next_free}");
     let mut fields: Vec<(&str, serde_json::Value)> = vec![
-        ("model", serde_json::json!(next_free.to_string())),
+        ("model", serde_json::json!(next_free.clone())),
         ("model_reroute_chain", serde_json::json!(new_tried)),
         ("last_error", serde_json::json!(msg)),
     ];
@@ -226,7 +237,10 @@ async fn apply_vendor_reset_date(
 /// Returns `Ok(ErrorHandleResult::EarlyReturn)` when the task was rerouted and
 /// `run()` should record metrics and return immediately (skipping tmux cleanup).
 /// Returns `Ok(ErrorHandleResult::Continue)` when `run()` should proceed to cleanup.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the error path needs the task, agent, model and store context together"
+)]
 pub async fn handle_error(
     task_id: &str,
     agent_err: &agents::AgentError,
@@ -439,7 +453,7 @@ pub async fn handle_error(
                     repo,
                     task_id,
                     &[
-                        ("model", serde_json::json!(next.to_string())),
+                        ("model", serde_json::json!(next.clone())),
                         ("last_error", serde_json::json!(msg)),
                     ],
                 )
@@ -689,8 +703,7 @@ pub async fn handle_error(
             let error_message = if *exit_code != 0 && message.contains("\"costUSD\":") {
                 // Extract just the essential info: exit code and that cost telemetry was present
                 format!(
-                    "{} exited with non-zero status (cost telemetry in stdout, no error message)",
-                    agent_name
+                    "{agent_name} exited with non-zero status (cost telemetry in stdout, no error message)"
                 )
             } else {
                 format!("{agent_name} exit {exit_code}: {message}")
@@ -837,7 +850,7 @@ mod tests {
             vec![]
         }
 
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "opencode"
         }
 
@@ -900,7 +913,7 @@ mod tests {
             vec![]
         }
 
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "opencode"
         }
 
@@ -1113,7 +1126,7 @@ mod tests {
                 .await
                 .expect("in-memory store"),
         );
-        crate::engine::cooldown::init_cooldown_store(store.clone()).await;
+        crate::engine::cooldown::init_cooldown_store(std::sync::Arc::clone(&store)).await;
 
         let runner = MockRunner { free: vec![] };
         let agent = "test-agent-3652-credit-no-bump";
@@ -1130,7 +1143,7 @@ mod tests {
             None,
             Some("simple"),
             1,
-            &Some(store.clone()),
+            &Some(std::sync::Arc::clone(&store)),
             "owner/repo",
         )
         .await
@@ -1165,14 +1178,14 @@ mod tests {
                 .await
                 .expect("in-memory store"),
         );
-        crate::engine::cooldown::init_cooldown_store(store.clone()).await;
+        crate::engine::cooldown::init_cooldown_store(std::sync::Arc::clone(&store)).await;
 
         let runner = MockRunner { free: vec![] };
         let agent = "opencode";
         let model = "opencode/nemotron-3-ultra-free";
 
         let err = AgentError::Timeout {
-            elapsed: std::time::Duration::from_secs(1800),
+            elapsed: std::time::Duration::from_mins(30),
         };
 
         for i in 1..=2 {
@@ -1184,7 +1197,7 @@ mod tests {
                 Some(model),
                 Some("simple"),
                 i,
-                &Some(store.clone()),
+                &Some(std::sync::Arc::clone(&store)),
                 "owner/repo",
             )
             .await
@@ -1218,7 +1231,7 @@ mod tests {
                 .await
                 .expect("in-memory store"),
         );
-        crate::engine::cooldown::init_cooldown_store(store.clone()).await;
+        crate::engine::cooldown::init_cooldown_store(std::sync::Arc::clone(&store)).await;
 
         let runner = MockRunner { free: vec![] };
         let agent = "claude";
@@ -1235,7 +1248,7 @@ mod tests {
             Some(model),
             Some("medium"),
             1,
-            &Some(store.clone()),
+            &Some(std::sync::Arc::clone(&store)),
             "owner/repo",
         )
         .await
@@ -1375,7 +1388,7 @@ mod tests {
         .unwrap();
 
         // The persistent backoff base is ~4h; ensure cooldown exists and is at least that long minus a margin
-        let key = format!("{}:{}", agent, model);
+        let key = format!("{agent}:{model}");
         let now = chrono::Utc::now().timestamp();
         let until =
             crate::engine::cooldown::cooldown_until(&key).expect("model cooldown should be set");
@@ -1914,7 +1927,7 @@ more context"#;
             "summarized output must not contain raw 'subtype' JSON fragment"
         );
         assert!(
-            !summarized.contains("{"),
+            !summarized.contains('{'),
             "summarized output must not contain JSON braces"
         );
         assert!(

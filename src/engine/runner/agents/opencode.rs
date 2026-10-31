@@ -78,7 +78,9 @@ fn update_discovered_models_cache(
     empty_reason: &'static str,
 ) {
     let now = chrono::Utc::now().timestamp();
-    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     if discovered.is_empty() && !guard.1.is_empty() {
         tracing::warn!(
@@ -103,6 +105,7 @@ fn update_discovered_models_cache(
 }
 
 /// Runner for OpenCode agent.
+#[derive(Debug)]
 pub struct OpenCodeRunner;
 
 pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String> {
@@ -372,20 +375,20 @@ impl OpenCodeRunner {
     /// Handles two text event formats emitted by different opencode versions:
     /// - Format 1 (current): `{"type":"text","part":{"type":"text","text":"..."}}`
     /// - Format 2 (newer):   `{"type":"text","text":"..."}`
-    fn extract_text_from_events(&self, events: &[serde_json::Value]) -> Option<String> {
+    fn extract_text_from_events(events: &[serde_json::Value]) -> Option<String> {
         extract_ndjson_text(events)
     }
 
     /// Extract token usage from `step_finish` events.
-    fn extract_tokens(&self, events: &[serde_json::Value]) -> (Option<u64>, Option<u64>) {
+    fn extract_tokens(events: &[serde_json::Value]) -> (Option<u64>, Option<u64>) {
         for event in events.iter().rev() {
             let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
             if event_type == "step_finish" {
                 if let Some(part) = event.get("part") {
                     if let Some(tokens) = part.get("tokens").and_then(|v| v.as_object()) {
-                        let input = tokens.get("input").and_then(|v| v.as_u64());
-                        let output = tokens.get("output").and_then(|v| v.as_u64());
+                        let input = tokens.get("input").and_then(serde_json::Value::as_u64);
+                        let output = tokens.get("output").and_then(serde_json::Value::as_u64);
                         return (input, output);
                     }
                 }
@@ -396,7 +399,7 @@ impl OpenCodeRunner {
     }
 
     /// Check for error events in the stream.
-    fn detect_error(&self, events: &[serde_json::Value]) -> Option<AgentError> {
+    fn detect_error(events: &[serde_json::Value]) -> Option<AgentError> {
         super::patterns::detect_ndjson_error(
             events,
             |event| {
@@ -409,8 +412,7 @@ impl OpenCodeRunner {
                         if reason == "error" || reason == "failed" {
                             Some(
                                 part.get("error")
-                                    .map(error_value_text)
-                                    .unwrap_or_else(|| "step failed".to_string()),
+                                    .map_or_else(|| "step failed".to_string(), error_value_text),
                             )
                         } else {
                             None
@@ -434,8 +436,7 @@ fn error_value_text(v: &serde_json::Value) -> String {
         .and_then(|m| m.as_str())
         .or_else(|| v.get("message").and_then(|m| m.as_str()))
         .or_else(|| v.get("name").and_then(|n| n.as_str()))
-        .map(str::to_string)
-        .unwrap_or_else(|| v.to_string())
+        .map_or_else(|| v.to_string(), str::to_string)
 }
 
 /// Extract the message from an opencode `error` event, keeping the raw JSON when no shape matches
@@ -443,24 +444,21 @@ fn opencode_error_text(event: &serde_json::Value) -> String {
     if let Some(s) = event.get("message").and_then(|v| v.as_str()) {
         return s.to_string();
     }
-    match event.get("error") {
-        Some(e) => {
-            let text = error_value_text(e);
-            if e.is_object() && text == *e {
-                tracing::warn!(event = %event, "unrecognized opencode error event shape");
-            }
-            text
-        }
-        None => {
+    if let Some(e) = event.get("error") {
+        let text = error_value_text(e);
+        if e.is_object() && text == *e {
             tracing::warn!(event = %event, "unrecognized opencode error event shape");
-            event.to_string()
         }
+        text
+    } else {
+        tracing::warn!(event = %event, "unrecognized opencode error event shape");
+        event.to_string()
     }
 }
 
 impl AgentRunner for OpenCodeRunner {
     #[cfg(test)]
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "opencode"
     }
 
@@ -484,7 +482,7 @@ impl AgentRunner for OpenCodeRunner {
         }
 
         // Propagate terminal errors so the review pipeline records cooldowns.
-        if let Some(err) = self.detect_error(&events) {
+        if let Some(err) = Self::detect_error(&events) {
             return Err(err);
         }
 
@@ -579,12 +577,12 @@ impl AgentRunner for OpenCodeRunner {
         }
 
         // Check for errors first
-        if let Some(err) = self.detect_error(&events) {
+        if let Some(err) = Self::detect_error(&events) {
             return Err(err);
         }
 
         // Extract tokens (needed for both the text path and the tool-only fallback)
-        let (input_tokens, output_tokens) = self.extract_tokens(&events);
+        let (input_tokens, output_tokens) = Self::extract_tokens(&events);
 
         // Extract text — when opencode emits only tool_use/step events with no
         // text content, synthesize a human-readable summary from the event
@@ -592,17 +590,14 @@ impl AgentRunner for OpenCodeRunner {
         // upstream `synthesize_response_from_text` heuristic gets handed the
         // entire raw NDJSON, matches a "completed" substring inside tool state
         // JSON, and emits 500 bytes of raw NDJSON as the task summary.
-        let text = match self.extract_text_from_events(&events) {
-            Some(t) => t,
-            None => {
-                let response = synthesize_response_from_events(&events);
-                return Ok(ParsedResponse {
-                    response,
-                    input_tokens,
-                    output_tokens,
-                    duration_ms: None,
-                });
-            }
+        let Some(text) = Self::extract_text_from_events(&events) else {
+            let response = synthesize_response_from_events(&events);
+            return Ok(ParsedResponse {
+                response,
+                input_tokens,
+                output_tokens,
+                duration_ms: None,
+            });
         };
 
         // Parse the text through standard parser
@@ -627,7 +622,7 @@ impl AgentRunner for OpenCodeRunner {
     fn classify_error(&self, exit_code: i32, stdout: &str, stderr: &str) -> AgentError {
         // Try parsing NDJSON events from stdout for structured errors
         let events = super::parse_ndjson(stdout);
-        if let Some(err) = self.detect_error(&events) {
+        if let Some(err) = Self::detect_error(&events) {
             return err;
         }
 
@@ -820,7 +815,9 @@ pub fn discover_free_opencode_models() -> Vec<String> {
     let now = chrono::Utc::now().timestamp();
     // Fast path: return cached data if still fresh (1-hour TTL).
     {
-        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (ts, models) = &*guard;
         if *ts != 0 && now.saturating_sub(*ts) < 3600 {
             return models.clone();
@@ -831,7 +828,7 @@ pub fn discover_free_opencode_models() -> Vec<String> {
     // Only one refresh runs at a time.
     if !FREE_MODELS_REFRESH_IN_PROGRESS.swap(true, Ordering::AcqRel) {
         let refresh = async {
-            let _guard = scopeguard::guard((), |_| {
+            let _guard = scopeguard::guard((), |()| {
                 FREE_MODELS_REFRESH_IN_PROGRESS.store(false, Ordering::Release);
             });
             let (models, empty_reason) = run_opencode_models_discovery_async().await;
@@ -864,7 +861,9 @@ pub fn discover_free_opencode_models() -> Vec<String> {
     }
 
     // Return whatever is in cache (may be empty on first call).
-    let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard.1.clone()
 }
 
@@ -880,7 +879,9 @@ pub fn discover_opencode_models() -> Vec<String> {
     let now = chrono::Utc::now().timestamp();
 
     {
-        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (ts, models) = &*guard;
         if *ts != 0 && now.saturating_sub(*ts) < 3600 {
             return models.clone();
@@ -889,7 +890,7 @@ pub fn discover_opencode_models() -> Vec<String> {
 
     if !ALL_MODELS_REFRESH_IN_PROGRESS.swap(true, Ordering::AcqRel) {
         let refresh = async {
-            let _guard = scopeguard::guard((), |_| {
+            let _guard = scopeguard::guard((), |()| {
                 ALL_MODELS_REFRESH_IN_PROGRESS.store(false, Ordering::Release);
             });
             let (discovered, empty_reason) = run_opencode_models_discovery_async().await;
@@ -907,7 +908,9 @@ pub fn discover_opencode_models() -> Vec<String> {
         }
     }
 
-    let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard.1.clone()
 }
 
@@ -992,7 +995,10 @@ fn raw_kill(pid: i32, sig: i32) -> i32 {
 #[cfg(unix)]
 fn kill_process_group(pgid: u32) {
     const SIGKILL: i32 = 9;
-    let _ = raw_kill(-(pgid as i32), SIGKILL);
+    let Ok(pgid) = i32::try_from(pgid) else {
+        return;
+    };
+    let _ = raw_kill(-pgid, SIGKILL);
 }
 
 async fn run_opencode_models_cli_inner(
@@ -1182,8 +1188,7 @@ pub fn find_opencode_result(ndjson: &str) -> Option<super::AgentResult> {
     // Check for errors first
     let is_error;
     let error_text;
-    let runner = OpenCodeRunner::new();
-    if let Some(err) = runner.detect_error(&events) {
+    if let Some(err) = OpenCodeRunner::detect_error(&events) {
         is_error = true;
         error_text = Some(err.to_string());
     } else {
@@ -1199,7 +1204,7 @@ pub fn find_opencode_result(ndjson: &str) -> Option<super::AgentResult> {
     };
 
     // Extract tokens from step_finish
-    let (input_tokens, output_tokens) = runner.extract_tokens(&events);
+    let (input_tokens, output_tokens) = OpenCodeRunner::extract_tokens(&events);
 
     // The model was cut off for exceeding its output/reasoning token budget,
     // not because it produced malformed prose. Distinguish this from a
@@ -1236,7 +1241,7 @@ pub fn find_opencode_result(ndjson: &str) -> Option<super::AgentResult> {
             event
                 .get("part")
                 .and_then(|p| p.get("cost"))
-                .and_then(|c| c.as_f64())
+                .and_then(serde_json::Value::as_f64)
                 .filter(|&c| c > 0.0)
         } else {
             None
@@ -1415,11 +1420,10 @@ mod tests {
 
     #[test]
     fn extract_tokens_from_step_finish() {
-        let r = runner();
         let events: Vec<serde_json::Value> = vec![
             serde_json::json!({"type":"step_finish","part":{"type":"step-finish","tokens":{"input":1000,"output":500,"total":1500}}}),
         ];
-        let (input, output) = r.extract_tokens(&events);
+        let (input, output) = OpenCodeRunner::extract_tokens(&events);
         assert_eq!(input, Some(1000));
         assert_eq!(output, Some(500));
     }
@@ -1674,16 +1678,19 @@ mod tests {
     fn free_models_discovery_returns_vec() {
         // discover_free_opencode_models returns empty in test/debug builds
         let models = discover_free_opencode_models();
-        assert!(models.is_empty());
+        assert!(models.is_empty(), "{models:?}");
     }
 
     #[test]
     fn live_opencode_discovery_is_skipped_in_test_builds() {
         assert!(skip_live_opencode_discovery());
-        assert!(discover_opencode_models().is_empty());
-        assert!(discover_free_opencode_models().is_empty());
+        let models = discover_opencode_models();
+        assert!(models.is_empty(), "{models:?}");
+        let models = discover_free_opencode_models();
+        assert!(models.is_empty(), "{models:?}");
         prime_free_model_cache();
-        assert!(discover_opencode_models().is_empty());
+        let models = discover_opencode_models();
+        assert!(models.is_empty(), "{models:?}");
     }
 
     /// The stub stands in for opencode 2.2.1, which starts `opencode serve --service`
@@ -1734,7 +1741,7 @@ mod tests {
     #[cfg(unix)]
     fn pid_is_alive(pid: u32) -> bool {
         // Signal 0 is the POSIX existence probe
-        super::raw_kill(pid as i32, 0) == 0
+        i32::try_from(pid).is_ok_and(|pid| super::raw_kill(pid, 0) == 0)
     }
 
     #[test]
@@ -1742,13 +1749,17 @@ mod tests {
         reset_model_caches_for_test();
         let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
         {
-            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             *guard = (123, vec!["opencode/model-free".to_string()]);
         }
 
         update_discovered_models_cache(cache, Vec::new(), "free", "empty_output");
 
-        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Timestamp must advance on a failed refresh so the TTL provides a
         // real backoff window instead of retrying on every subsequent call.
         assert!(guard.0 > 123);
@@ -1760,7 +1771,9 @@ mod tests {
         reset_model_caches_for_test();
         let cache = ALL_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
         {
-            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             *guard = (
                 456,
                 vec![
@@ -1772,7 +1785,9 @@ mod tests {
 
         update_discovered_models_cache(cache, Vec::new(), "all", "exit_status_failure");
 
-        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(guard.0 > 456);
         assert_eq!(
             guard.1,
@@ -1790,9 +1805,11 @@ mod tests {
 
         update_discovered_models_cache(cache, Vec::new(), "free", "command_not_found");
 
-        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(guard.0 > 0);
-        assert!(guard.1.is_empty());
+        assert!(guard.1.is_empty(), "{:?}", guard.1);
     }
 
     // ── Fixture-based tests ─────────────────────────────────────
@@ -1930,7 +1947,7 @@ mod tests {
     #[test]
     fn extract_text_empty_input_returns_empty_ok() {
         let text = runner().extract_text("").unwrap();
-        assert!(text.is_empty());
+        assert_eq!(text, "");
     }
 
     // ── find_opencode_result ────────────────────────────────────
@@ -1994,7 +2011,7 @@ mod tests {
         let result = find_opencode_result(ndjson).expect("should find result, not None");
         assert!(result.truncated_by_length);
         assert!(!result.is_error);
-        assert!(result.result_text.is_empty());
+        assert_eq!(result.result_text, "");
     }
 
     /// opencode also emits reason="unknown" with all-zero tokens for the same
@@ -2009,7 +2026,7 @@ mod tests {
         let result = find_opencode_result(ndjson).expect("should find result, not None");
         assert!(result.truncated_by_length);
         assert!(!result.is_error);
-        assert!(result.result_text.is_empty());
+        assert_eq!(result.result_text, "");
     }
 
     /// reason="unknown" with nonzero output tokens means the model did
@@ -2184,12 +2201,14 @@ mod stream_tests {
 
     #[test]
     fn only_final_step_is_done() {
-        assert!(events(r#"{"type":"step_finish","part":{"reason":"tool-calls"}}"#).is_empty());
+        let dropped = events(r#"{"type":"step_finish","part":{"reason":"tool-calls"}}"#);
+        assert!(dropped.is_empty(), "{dropped:?}");
         assert_eq!(
             events(r#"{"type":"step_finish","part":{"reason":"stop"}}"#),
             vec![StreamEvent::Done(String::new())]
         );
-        assert!(events(r#"{"type":"step_start"}"#).is_empty());
+        let dropped = events(r#"{"type":"step_start"}"#);
+        assert!(dropped.is_empty(), "{dropped:?}");
     }
 
     #[test]

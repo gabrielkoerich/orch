@@ -16,7 +16,6 @@
 //! used to set a model-specific cooldown matching the advertised window.
 
 use chrono::TimeZone;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -136,7 +135,7 @@ const RATE_LIMITS_CLEARED_AT_PREFIX: &str = "rate_limits_cleared_at:";
 
 /// Agent name from a cooldown key (`claude:sonnet` -> `claude`)
 fn agent_from_key(key: &str) -> &str {
-    key.split_once(':').map(|(agent, _)| agent).unwrap_or(key)
+    key.split_once(':').map_or(key, |(agent, _)| agent)
 }
 
 struct CooldownEntry {
@@ -145,6 +144,7 @@ struct CooldownEntry {
     reason: String,
 }
 
+#[derive(Debug)]
 pub struct SilenceCountResult {
     pub count: usize,
     pub extended_cooldown_applied: bool,
@@ -318,23 +318,20 @@ pub async fn sync_from_kv(store: &Arc<crate::store::TaskStore>) {
     // Adopt KV's authoritative timestamp for active cooldowns.
     for (key, normalized) in explicit_kv {
         if let Some((ts, reason)) = normalized {
-            match map.get_mut(&key) {
-                Some(entry) => {
-                    if entry.cooldown_until != ts {
-                        entry.cooldown_until = ts;
-                        updated += 1;
-                    }
-                }
-                None => {
-                    map.insert(
-                        key,
-                        CooldownEntry {
-                            cooldown_until: ts,
-                            reason,
-                        },
-                    );
+            if let Some(entry) = map.get_mut(&key) {
+                if entry.cooldown_until != ts {
+                    entry.cooldown_until = ts;
                     updated += 1;
                 }
+            } else {
+                map.insert(
+                    key,
+                    CooldownEntry {
+                        cooldown_until: ts,
+                        reason,
+                    },
+                );
+                updated += 1;
             }
         }
     }
@@ -386,7 +383,7 @@ pub fn compute_backoff(count: u64, base: i64, max: i64, allow_extended: bool) ->
     if count <= 1 {
         return base;
     }
-    let exp = count.saturating_sub(1).min(u32::MAX as u64) as u32;
+    let exp = u32::try_from(count.saturating_sub(1)).unwrap_or(u32::MAX);
     let factor = 3_i64.saturating_pow(exp);
     let standard = base.saturating_mul(factor).min(max);
 
@@ -436,7 +433,7 @@ pub fn compute_backoff(count: u64, base: i64, max: i64, allow_extended: bool) ->
 /// Returns `u64::MAX` on store errors (e.g. lock contention) so backoff applies the cap duration
 /// instead of resetting to the base, preventing rapid re-dispatch during store outages.
 async fn read_and_increment_failure_count(
-    store_opt: &Option<Arc<crate::store::TaskStore>>,
+    store_opt: Option<&Arc<crate::store::TaskStore>>,
     key: &str,
 ) -> u64 {
     read_and_increment_failure_count_with_prefix(store_opt, FAILURE_COUNT_PREFIX, key).await
@@ -447,7 +444,7 @@ async fn read_and_increment_failure_count(
 /// Credit exhaustion uses [`CREDIT_FAILURE_COUNT_PREFIX`] so its backoff escalation
 /// is independent of generic agent failures (which use [`FAILURE_COUNT_PREFIX`]).
 async fn read_and_increment_failure_count_with_prefix(
-    store_opt: &Option<Arc<crate::store::TaskStore>>,
+    store_opt: Option<&Arc<crate::store::TaskStore>>,
     prefix: &str,
     key: &str,
 ) -> u64 {
@@ -514,7 +511,7 @@ pub async fn record_agent_failure_with_message(agent_name: &str, error_message: 
     }
 
     let store_opt = cooldown_store().lock().await.clone();
-    let count = read_and_increment_failure_count(&store_opt, agent_name).await;
+    let count = read_and_increment_failure_count(store_opt.as_ref(), agent_name).await;
     let base = crate::engine::router::config::get_agent_backoff_base(agent_name);
     let cooldown_until =
         chrono::Utc::now().timestamp() + compute_backoff(count, base, BACKOFF_MAX_SECS, true);
@@ -633,7 +630,7 @@ pub async fn record_credit_exhaustion(agent_name: &str, reason: CreditExhaustion
     // Previously both paths shared FAILURE_COUNT_PREFIX, causing generic failures
     // to inflate credit-exhaustion backoff (and vice versa).
     let count = read_and_increment_failure_count_with_prefix(
-        &store_opt,
+        store_opt.as_ref(),
         CREDIT_FAILURE_COUNT_PREFIX,
         agent_name,
     )
@@ -671,7 +668,7 @@ pub async fn record_credit_exhaustion(agent_name: &str, reason: CreditExhaustion
 pub async fn record_model_failure(agent_name: &str, model: &str) {
     let key = format!("{agent_name}:{model}");
     let store_opt = cooldown_store().lock().await.clone();
-    let count = read_and_increment_failure_count(&store_opt, &key).await;
+    let count = read_and_increment_failure_count(store_opt.as_ref(), &key).await;
     let base = crate::engine::router::config::get_agent_backoff_base(agent_name);
     let cooldown_until =
         chrono::Utc::now().timestamp() + compute_backoff(count, base, BACKOFF_MAX_SECS, true);
@@ -688,7 +685,9 @@ pub async fn record_model_failure(agent_name: &str, model: &str) {
 pub async fn record_rate_limit(agent_name: &str, model: Option<&str>, error_message: &str) {
     if let Some(window_secs) = parse_relative_usage_window(error_message) {
         if let Some(m) = model {
-            let cooldown_until = chrono::Utc::now().timestamp() + window_secs as i64;
+            let cooldown_until = chrono::Utc::now()
+                .timestamp()
+                .saturating_add(i64::try_from(window_secs).unwrap_or(i64::MAX));
             set_model_cooldown(agent_name, m, window_secs, "rate_limit_usage_window").await;
             tracing::info!(
                 agent = agent_name,
@@ -722,7 +721,7 @@ pub async fn record_persistent_model_failure(agent_name: &str, model: &str) {
     let key = format!("{agent_name}:{model}");
     let store_opt = cooldown_store().lock().await.clone();
     let count = read_and_increment_failure_count_with_prefix(
-        &store_opt,
+        store_opt.as_ref(),
         PERSISTENT_FAILURE_COUNT_PREFIX,
         &key,
     )
@@ -765,7 +764,7 @@ fn is_model_permanently_gone(message: &str) -> bool {
 pub async fn record_transient_model_failure(agent_name: &str, model: &str) {
     let key = format!("{agent_name}:{model}");
     let store_opt = cooldown_store().lock().await.clone();
-    let count = read_and_increment_failure_count(&store_opt, &key).await;
+    let count = read_and_increment_failure_count(store_opt.as_ref(), &key).await;
     let cooldown_secs = compute_backoff(
         count,
         TRANSIENT_MODEL_BACKOFF_BASE_SECS,
@@ -784,7 +783,9 @@ pub async fn record_transient_model_failure(agent_name: &str, model: &str) {
 /// apart in `orch cooldown list`.
 pub async fn set_model_cooldown(agent_name: &str, model: &str, duration_secs: u64, reason: &str) {
     let key = format!("{agent_name}:{model}");
-    let cooldown_until = chrono::Utc::now().timestamp() + duration_secs as i64;
+    let cooldown_until = chrono::Utc::now()
+        .timestamp()
+        .saturating_add(i64::try_from(duration_secs).unwrap_or(i64::MAX));
     set_cooldown_async(&key, cooldown_until, reason).await;
 }
 
@@ -801,7 +802,9 @@ pub async fn set_model_cooldown_until(agent_name: &str, model: &str, until: i64)
 /// (exponential backoff), this uses a short duration (typically 120s) —
 /// just enough to force one re-route cycle to a different agent.
 pub async fn set_agent_cooldown(agent_name: &str, duration_secs: u64) {
-    let cooldown_until = chrono::Utc::now().timestamp() + duration_secs as i64;
+    let cooldown_until = chrono::Utc::now()
+        .timestamp()
+        .saturating_add(i64::try_from(duration_secs).unwrap_or(i64::MAX));
     set_cooldown_async(agent_name, cooldown_until, "silence_agent_cooldown").await;
 }
 
@@ -809,16 +812,13 @@ pub async fn set_agent_cooldown(agent_name: &str, duration_secs: u64) {
 /// when repeated silences exceed the threshold within the rolling window.
 pub async fn record_silence_detection(agent_name: &str, model: &str) -> Option<SilenceCountResult> {
     let store_opt = cooldown_store().lock().await.clone();
-    let store = match store_opt {
-        Some(store) => store,
-        None => {
-            tracing::debug!(
-                agent = agent_name,
-                model,
-                "skipping silence count record (no KV store)"
-            );
-            return None;
-        }
+    let Some(store) = store_opt else {
+        tracing::debug!(
+            agent = agent_name,
+            model,
+            "skipping silence count record (no KV store)"
+        );
+        return None;
     };
 
     let key = format!("{SILENCE_COUNT_PREFIX}{agent_name}:{model}");
@@ -1458,7 +1458,7 @@ pub fn github_circuit_remaining_secs() -> u64 {
         if let Some(until) = *open {
             let now = chrono::Utc::now().timestamp();
             if now < until {
-                return (until - now) as u64;
+                return u64::try_from(until - now).unwrap_or(0);
             }
             return 0;
         }
@@ -1468,7 +1468,7 @@ pub fn github_circuit_remaining_secs() -> u64 {
     if let Some(until) = cooldown_until("github:5xx") {
         let now = chrono::Utc::now().timestamp();
         if now < until {
-            return (until - now) as u64;
+            return u64::try_from(until - now).unwrap_or(0);
         }
     }
     0
@@ -1554,11 +1554,7 @@ pub(crate) fn parse_retry_at(error_message: &str) -> Option<i64> {
             // attempt to parse a time-only and interpret it as the next
             // occurrence of that time in the local timezone.
             // Strip parenthesised timezone hints like "(America/Sao_Paulo)".
-            let time_only = date_str
-                .split_once('(')
-                .map(|(t, _)| t)
-                .unwrap_or(date_str)
-                .trim();
+            let time_only = date_str.split_once('(').map_or(date_str, |(t, _)| t).trim();
             // Hour-only values like "8am" have no minute field, which chrono needs, so insert ":00"
             let mut compact = time_only.replace(" am", "am").replace(" pm", "pm");
             let split = compact.rfind(' ').map_or(0, |i| i + 1);
@@ -1650,6 +1646,13 @@ pub(crate) fn parse_retry_at(error_message: &str) -> Option<i64> {
 /// same window-detection the `needs_review` call site
 /// (`record_rate_limit()`, below) already uses — see issue #3580.
 pub(crate) fn parse_relative_usage_window(error_message: &str) -> Option<u64> {
+    static WINDOW_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(
+            r"(?i)(?:^|\s|[\(\)\.,;:!?])(?:(\d+)\s*-?\s*(hour|hours|hr|hrs|minute|minutes|min|mins|day|days)|(hourly|daily|weekly|monthly))(?:$|\s|[\(\)\.,;:!?])"
+        )
+        .expect("usage window regex is valid")
+    });
+
     if error_message.is_empty() {
         return None;
     }
@@ -1662,13 +1665,6 @@ pub(crate) fn parse_relative_usage_window(error_message: &str) -> Option<u64> {
     if !has_context {
         return None;
     }
-
-    static WINDOW_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(
-            r"(?i)(?:^|\s|[\(\)\.,;:!?])(?:(\d+)\s*-?\s*(hour|hours|hr|hrs|minute|minutes|min|mins|day|days)|(hourly|daily|weekly|monthly))(?:$|\s|[\(\)\.,;:!?])"
-        )
-        .expect("usage window regex is valid")
-    });
 
     let mut max_secs: Option<u64> = None;
     for caps in WINDOW_RE.captures_iter(&lower) {
@@ -1686,8 +1682,8 @@ pub(crate) fn parse_relative_usage_window(error_message: &str) -> Option<u64> {
             match word.as_str().to_lowercase().as_str() {
                 "hourly" => 3600,
                 "daily" => 86400,
-                "weekly" => 604800,
-                "monthly" => 2592000,
+                "weekly" => 604_800,
+                "monthly" => 2_592_000,
                 _ => return None,
             }
         } else {
@@ -1776,7 +1772,7 @@ mod tests {
         super::reset_global_state().await;
         let store = test_store().await;
 
-        *cooldown_store().lock().await = Some(store.clone());
+        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
 
         record_model_failure("testagent_persist", "testmodel_persist").await;
 
@@ -1801,7 +1797,7 @@ mod tests {
         let agent = "test_reason_restart";
         let future = chrono::Utc::now().timestamp() + 600;
 
-        init_cooldown_store(store.clone()).await;
+        init_cooldown_store(std::sync::Arc::clone(&store)).await;
         set_cooldown_async(agent, future, "billing_cycle_exhausted").await;
 
         // Simulate a service restart: drop the in-memory map, reload from KV.
@@ -1825,7 +1821,7 @@ mod tests {
     async fn record_persistent_model_failure_escalates_and_increments_failure_count() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(store.clone());
+        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
 
         let agent = "testagent_persistent";
         let model = "testmodel_persistent";
@@ -1865,7 +1861,7 @@ mod tests {
     async fn record_agent_success_does_not_reset_persistent_failure_count() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(store.clone());
+        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
 
         let agent = "testagent_persistent_success";
         let model = "testmodel_persistent_success";
@@ -1914,7 +1910,7 @@ mod tests {
     async fn record_persistent_model_failure_stays_capped_at_7_days() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(store.clone());
+        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
 
         let agent = "testagent_persistent_capped";
         let model = "testmodel_persistent_capped";
@@ -1940,13 +1936,15 @@ mod tests {
     #[serial(cooldown_state)]
     #[test]
     fn parse_retry_at_codex_format() {
+        use chrono::Datelike;
+        use chrono::TimeZone;
+
         let msg = "You've hit your usage limit. Upgrade to Pro, visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Mar 26th, 2026 5:55 AM.";
         let ts = parse_retry_at(msg);
         assert!(ts.is_some(), "should parse codex retry-at date");
 
         // The parsed timestamp must equal "Mar 26 2026 05:55 local" in UTC.
         // We reconstruct what the function should produce and compare directly.
-        use chrono::TimeZone;
         let naive = chrono::NaiveDateTime::new(
             chrono::NaiveDate::from_ymd_opt(2026, 3, 26).unwrap(),
             chrono::NaiveTime::from_hms_opt(5, 55, 0).unwrap(),
@@ -1964,7 +1962,6 @@ mod tests {
 
         // Sanity: the UTC date must still be March 26 (true for all timezones within ±14h)
         let dt = chrono::DateTime::from_timestamp(ts.unwrap(), 0).unwrap();
-        use chrono::Datelike;
         assert_eq!(dt.month(), 3);
         assert_eq!(dt.day(), 26);
     }
@@ -2012,10 +2009,11 @@ mod tests {
     #[serial(cooldown_state)]
     #[test]
     fn parse_retry_at_glm_reset_format_with_seconds() {
+        use chrono::TimeZone;
+
         let msg = "Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-04-23 18:33:48";
         let ts = parse_retry_at(msg).expect("should parse GLM reset-at date");
 
-        use chrono::TimeZone;
         let naive = chrono::NaiveDateTime::new(
             chrono::NaiveDate::from_ymd_opt(2026, 4, 23).expect("valid date"),
             chrono::NaiveTime::from_hms_opt(18, 33, 48).expect("valid time"),
@@ -2069,7 +2067,7 @@ mod tests {
         );
         assert_eq!(
             parse_relative_usage_window("You've reached your weekly limit."),
-            Some(604800)
+            Some(604_800)
         );
         assert_eq!(
             parse_relative_usage_window("You've reached your 30-minute usage limit."),
@@ -2077,7 +2075,7 @@ mod tests {
         );
         assert_eq!(
             parse_relative_usage_window("You've reached your 2-day quota."),
-            Some(172800)
+            Some(172_800)
         );
     }
 
@@ -2096,7 +2094,7 @@ mod tests {
     async fn record_rate_limit_uses_model_specific_window_cooldown() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(store.clone());
+        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
 
         let agent = "test_record_rl_window_agent";
         let model = "test_record_rl_window_model";
@@ -2133,7 +2131,7 @@ mod tests {
     async fn record_rate_limit_without_window_falls_back_to_agent_and_model() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(store.clone());
+        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
 
         let agent = "test_record_rl_fallback_agent";
         let model = "test_record_rl_fallback_model";
@@ -2204,7 +2202,7 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
         let remaining = entry.cooldown_until - now;
         assert!(
-            remaining <= SILENCE_AGENT_COOLDOWN_SECS as i64,
+            remaining <= i64::try_from(SILENCE_AGENT_COOLDOWN_SECS).unwrap(),
             "silence agent cooldown should be <= {SILENCE_AGENT_COOLDOWN_SECS}s, got {remaining}s"
         );
         assert!(remaining > 0, "cooldown should still be active");
@@ -2215,7 +2213,7 @@ mod tests {
     async fn record_silence_detection_applies_extended_cooldown() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(store.clone());
+        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
 
         let agent = "test_silence_count_agent";
         let model = "test_silence_count_model";
@@ -2234,7 +2232,7 @@ mod tests {
             entry.cooldown_until - chrono::Utc::now().timestamp()
         };
         assert!(
-            remaining >= SILENCE_EXTENDED_COOLDOWN_SECS as i64 - 5,
+            remaining >= i64::try_from(SILENCE_EXTENDED_COOLDOWN_SECS).unwrap() - 5,
             "extended cooldown should be applied, got {remaining}s"
         );
 
@@ -2415,7 +2413,7 @@ mod tests {
     async fn record_credit_exhaustion_billing_cycle_applies_24h() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(store.clone());
+        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
 
         let agent = "test_billing_cycle_agent";
         assert!(!is_agent_in_cooldown(agent));
@@ -2444,7 +2442,7 @@ mod tests {
     async fn record_credit_exhaustion_billing_cycle_escalates() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(store.clone());
+        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
 
         let agent = "test_billing_cycle_escalation";
 
@@ -2508,7 +2506,7 @@ mod tests {
     async fn record_credit_exhaustion_billing_cycle_stays_capped_after_repeats() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(store.clone());
+        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
 
         let agent = "test_billing_cycle_agent_capped";
 
@@ -2596,7 +2594,7 @@ mod tests {
         let future = chrono::Utc::now().timestamp() + 600;
 
         // Register the store and put a cooldown in both memory and KV.
-        init_cooldown_store(store.clone()).await;
+        init_cooldown_store(std::sync::Arc::clone(&store)).await;
         set_cooldown_async(agent, future, "test").await;
         assert!(is_agent_in_cooldown(agent));
 
@@ -2717,7 +2715,7 @@ mod tests {
         let original = chrono::Utc::now().timestamp() + 600;
         let updated = chrono::Utc::now().timestamp() + 1200;
 
-        init_cooldown_store(store.clone()).await;
+        init_cooldown_store(std::sync::Arc::clone(&store)).await;
         set_cooldown_async(agent, original, "initial").await;
 
         store
@@ -2930,17 +2928,17 @@ mod tests {
         );
         assert_eq!(
             compute_backoff(10, 300, 14400, true),
-            172800,
+            172_800,
             "times_at_max=5, extended 12x"
         );
         assert_eq!(
             compute_backoff(15, 300, 14400, true),
-            172800,
+            172_800,
             "times_at_max=10, still tier 2"
         );
         assert_eq!(
             compute_backoff(20, 300, 14400, true),
-            172800,
+            172_800,
             "times_at_max=15, still tier 2"
         );
     }
@@ -2971,14 +2969,14 @@ mod tests {
         // count=21 → times_at_max=16 (first_max=5), extended tier 2: 12x = 48h
         assert_eq!(
             compute_backoff(21, 300, 14400, true),
-            172800,
+            172_800,
             "21 failures should get 48h extended cooldown"
         );
 
         // kimi:haiku with 36 failures
         assert_eq!(
             compute_backoff(36, 300, 14400, true),
-            172800,
+            172_800,
             "36 failures should also get 48h extended cooldown"
         );
     }
@@ -3184,7 +3182,7 @@ mod tests {
         super::reset_global_state().await;
         let store = test_store().await;
         let agent = "test_refresh_reason_change";
-        *cooldown_store().lock().await = Some(store.clone());
+        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
 
         set_agent_cooldown(agent, 600).await;
         let agents = vec![agent.to_string()];
@@ -3301,7 +3299,7 @@ mod tests {
     async fn repeated_agent_failures_escalate_backoff() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(store.clone());
+        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
 
         let agent = "test_escalation_agent";
 
@@ -3344,7 +3342,7 @@ mod tests {
         // code must NOT early-return and must instead apply the normal
         // exponential backoff (increment failure count and set a future cooldown).
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(store.clone());
+        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
 
         let agent = "test_vendor_past_retry";
 
@@ -3393,14 +3391,14 @@ mod tests {
     async fn record_agent_success_resets_backoff() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(store.clone());
+        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
 
         let agent = "test_success_reset_agent";
         let model = "test_model";
 
         // Accumulate 3 failures to escalate the backoff
         for _ in 0..3 {
-            let _ = read_and_increment_failure_count(&Some(store.clone()), agent).await;
+            let _ = read_and_increment_failure_count(Some(&store), agent).await;
         }
         // Verify count is 3
         let kv_key = format!("{FAILURE_COUNT_PREFIX}{agent}");
@@ -3445,7 +3443,7 @@ mod tests {
     async fn record_agent_success_without_model_skips_empty_model_key() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(store.clone());
+        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
 
         let agent = "test_success_without_model";
 
@@ -3472,13 +3470,13 @@ mod tests {
     async fn clear_cooldown_resets_failure_counts() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(store.clone());
+        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
 
         let agent = "test_clear_fc_agent";
 
         // Accumulate failures
         for _ in 0..5 {
-            let _ = read_and_increment_failure_count(&Some(store.clone()), agent).await;
+            let _ = read_and_increment_failure_count(Some(&store), agent).await;
         }
         // Set a cooldown so clear_cooldown has something to clear
         set_agent_cooldown(agent, 3600).await;
@@ -3522,11 +3520,11 @@ mod tests {
     async fn clear_all_cooldowns_resets_all_failure_counts() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(store.clone());
+        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
 
         let agents = ["test_clear_all_a", "test_clear_all_b"];
         for agent in &agents {
-            let _ = read_and_increment_failure_count(&Some(store.clone()), agent).await;
+            let _ = read_and_increment_failure_count(Some(&store), agent).await;
             set_agent_cooldown(agent, 3600).await;
         }
 
@@ -3557,8 +3555,11 @@ mod tests {
             compute_backoff(100, BACKOFF_BASE_SECS, BACKOFF_MAX_SECS, true),
             BACKOFF_MAX_SECS * 12
         );
-        assert_eq!(compute_backoff(u32::MAX as u64, 300, 14400, true), 172800);
-        assert_eq!(compute_backoff(u64::MAX, 300, 14400, true), 172800);
+        assert_eq!(
+            compute_backoff(u64::from(u32::MAX), 300, 14400, true),
+            172_800
+        );
+        assert_eq!(compute_backoff(u64::MAX, 300, 14400, true), 172_800);
     }
 
     #[serial(cooldown_state)]

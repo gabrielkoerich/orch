@@ -165,7 +165,7 @@ pub fn validate_agent(agent: &str) -> Result<()> {
         );
     }
     if !crate::cmd_cache::command_exists(agent) {
-        anyhow::bail!("agent '{}' not found in PATH. Is it installed?", agent);
+        anyhow::bail!("agent '{agent}' not found in PATH. Is it installed?");
     }
     Ok(())
 }
@@ -174,6 +174,7 @@ pub fn validate_agent(agent: &str) -> Result<()> {
 ///
 /// Sends "hello" to the agent with the specified model to verify
 /// the agent binary exists and the model is available.
+#[expect(clippy::print_stderr, reason = "progress line for `orch chat /model`")]
 pub async fn validate_model(spec: &ModelSpec) -> Result<()> {
     // 1. Check agent is known and installed
     validate_agent(&spec.agent)?;
@@ -206,7 +207,7 @@ pub async fn validate_model(spec: &ModelSpec) -> Result<()> {
     eprintln!("Testing {}:{} ...", spec.agent, spec.model);
     let result = test_invoke(&spec.agent, &spec.model).await;
     match result {
-        Ok(_) => Ok(()),
+        Ok(()) => Ok(()),
         Err(e) => anyhow::bail!(
             "model '{}' on agent '{}' is not available: {e}",
             spec.model,
@@ -236,6 +237,7 @@ async fn test_invoke(agent: &str, model: &str) -> Result<()> {
 }
 
 /// Assembled context for a chat invocation.
+#[derive(Debug)]
 pub struct ChatContext {
     /// System prompt (instructions, role, commands)
     pub system: String,
@@ -422,7 +424,9 @@ async fn handle_control_command(
     command: ControlCommand,
 ) -> Result<String> {
     match command {
-        ControlCommand::Model(None) => Ok(format_current_spec(&get_current_spec(store).await?)),
+        ControlCommand::Model(None) | ControlCommand::Agent(None) => {
+            Ok(format_current_spec(&get_current_spec(store).await?))
+        }
         ControlCommand::Model(Some(new_spec)) => {
             let spec = parse_model_spec(&new_spec);
             validate_model(&spec).await?;
@@ -431,7 +435,6 @@ async fn handle_control_command(
             reset_session_uuid(store, session_id).await?;
             Ok(format_switched_spec(&spec))
         }
-        ControlCommand::Agent(None) => Ok(format_current_spec(&get_current_spec(store).await?)),
         ControlCommand::Agent(Some(agent)) => {
             validate_agent(&agent)?;
             let spec = set_agent_spec(store, &agent).await?;
@@ -493,7 +496,7 @@ static MEMORY_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static SUMMARY_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(?s)<summary>(.+?)</summary>"#).expect("valid summary regex"));
+    LazyLock::new(|| Regex::new(r"(?s)<summary>(.+?)</summary>").expect("valid summary regex"));
 
 /// Parse an agent response, extracting optional `<summary>` and `<memory>` tags.
 pub fn parse_response(raw: &str) -> ParsedResponse {
@@ -537,6 +540,7 @@ async fn persist_memories(
 }
 
 /// Result of an agent invocation, including response text and token usage.
+#[derive(Debug)]
 pub struct InvokeResult {
     pub text: String,
     pub input_tokens: Option<u64>,
@@ -713,13 +717,15 @@ pub async fn send_message(
     // Acquire per-session lock — serializes concurrent invocations for the same session.
     // Messages that arrive while an invocation is running will queue here and execute in order.
     let session_lock = {
-        let mut map = SESSION_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = SESSION_LOCKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Arc::clone(
             map.entry(session_id.to_string())
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
         )
     };
-    let _guard = session_lock.lock().await;
+    let guard = session_lock.lock().await;
 
     // Store user message
     store
@@ -795,7 +801,7 @@ pub async fn send_message(
             let mut is_first_chunk = !is_new;
             let mut last_result: Option<InvokeResult> = None;
 
-            for chunk in chunks.iter() {
+            for chunk in &chunks {
                 let r = invoke_agent_with_session(
                     &agent,
                     &model,
@@ -990,9 +996,8 @@ pub async fn send_message(
                             active_uuid = fresh_uuid;
                             is_first_chunk = false;
                             continue;
-                        } else {
-                            return Err(e);
                         }
+                        return Err(e);
                     }
                 }
             };
@@ -1044,17 +1049,19 @@ pub async fn send_message(
     };
 
     // Release the per-session lock before eviction check.
-    drop(_guard);
+    drop(guard);
 
     // Evict the session lock entry if no concurrent waiters are holding a reference.
-    // After drop(_guard) above the remaining strong references are:
+    // After drop(guard) above the remaining strong references are:
     // - the map entry
     // - the local `session_lock` clone held by this function.
     // That sums to 2 when there are no other waiters. If another waiter entered
     // concurrently the count will be > 2 and we should not evict. Only remove the
     // map entry when the strong_count == 2.
     if Arc::strong_count(&session_lock) == 2 {
-        let mut map = SESSION_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = SESSION_LOCKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Re-check under the map lock: a concurrent caller may have cloned the Arc
         // between our strong_count check above and acquiring the map lock.
         if map
@@ -1138,7 +1145,7 @@ fn build_control_chunks(state: &str, message: &str, agent_has_sessions: bool) ->
         let prefixed = if agent_has_sessions {
             chunk.clone()
         } else if msg_chunks.len() == 1 {
-            format!("[Context complete. User question:]\n{}", chunk)
+            format!("[Context complete. User question:]\n{chunk}")
         } else {
             format!(
                 "[User question chunk {}/{}]\n{}",
@@ -1626,7 +1633,8 @@ mod tests {
     #[test]
     fn chunk_text_respects_utf8_boundaries() {
         // 4-byte emoji placed at the split boundary
-        let content = "x".repeat(97) + "😀"; // 101 bytes; limit=100 cuts inside emoji
+        let content = format!("{}😀", "x".repeat(97)); // 101 bytes; limit=100 cuts inside emoji
+
         let chunks = chunk_text(&content, 100);
         let reassembled: String = chunks.join("");
         assert_eq!(reassembled, content);
@@ -1656,7 +1664,7 @@ mod tests {
     #[test]
     fn chunk_text_empty_string() {
         let chunks = chunk_text("", 32);
-        assert!(chunks.is_empty() || chunks == vec!["".to_string()]);
+        assert!(chunks.is_empty() || chunks == vec![String::new()]);
     }
 
     // ── build_control_chunks ────────────────────────────────────────────────
@@ -1714,7 +1722,7 @@ mod tests {
             assert!(chunk.starts_with("[User question chunk"));
         }
         // Verify reassembly (without headers)
-        let reassembled_state = chunks[0].split_once('\n').map(|(_, r)| r).unwrap_or("");
+        let reassembled_state = chunks[0].split_once('\n').map_or("", |(_, r)| r);
         assert_eq!(reassembled_state, "state");
     }
 
@@ -1731,10 +1739,7 @@ mod tests {
                 assert!(chunk.contains("line"));
             } else {
                 assert!(chunk.starts_with("[Context complete. User question:]"));
-                assert_eq!(
-                    chunk.split_once('\n').map(|(_, r)| r).unwrap_or(""),
-                    "question"
-                );
+                assert_eq!(chunk.split_once('\n').map_or("", |(_, r)| r), "question");
             }
         }
     }

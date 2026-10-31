@@ -239,7 +239,7 @@ mod tests {
         }"#;
 
         let comment: GitHubReviewComment = serde_json::from_str(json).unwrap();
-        assert_eq!(comment.id, 101112);
+        assert_eq!(comment.id, 101_112);
         assert_eq!(comment.user.login, "reviewer");
         assert_eq!(comment.body, "This line needs fixing");
         assert_eq!(comment.path, "src/main.rs");
@@ -364,7 +364,7 @@ mod tests {
                     user: GitHubUser {
                         login: "reviewer".to_string(),
                     },
-                    body: "".to_string(), // Empty - not actionable
+                    body: String::new(), // Empty - not actionable
                     path: "src/lib.rs".to_string(),
                     line: Some(20),
                     original_line: Some(20),

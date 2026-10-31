@@ -29,7 +29,7 @@ use super::sync::ReviewTaskSnapshot;
 const RECONCILIATION_LIST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Closed-issue reconciliation is a best-effort cleanup fallback, not a per-sync requirement.
 /// Run it on a slower cadence so repeated GitHub slowness does not consume 30 s every sync.
-const RECONCILIATION_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const RECONCILIATION_INTERVAL: Duration = Duration::from_mins(15);
 
 /// Per-repo in-flight guard for closed-issue reconciliation/cleanup.
 /// Prevents overlapping cleanup runs from piling up across sync cycles.
@@ -108,10 +108,8 @@ impl JanitorOptions {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(24);
 
-        let dry_run = crate::config::get("workflow.worktree_janitor_dry_run")
-            .ok()
-            .map(|v| v == "true")
-            .unwrap_or(false);
+        let dry_run =
+            crate::config::get("workflow.worktree_janitor_dry_run").is_ok_and(|v| v == "true");
 
         Self { ttl_hours, dry_run }
     }
@@ -140,6 +138,8 @@ async fn reconcile_closed_tasks(
     all_tasks: &[ExternalTask],
     task_manager: &TaskManager,
 ) {
+    const MAX_RECONCILE_PER_CYCLE: usize = 10;
+
     let done_set: std::collections::HashSet<String> = task_ids.iter().cloned().collect();
     let closed_not_in_store: Vec<_> = all_tasks
         .iter()
@@ -169,7 +169,6 @@ async fn reconcile_closed_tasks(
 
     // Reconcile issues missing the done label — cap to avoid rate-limit
     // exhaustion. Remaining issues will be picked up in subsequent cycles.
-    const MAX_RECONCILE_PER_CYCLE: usize = 10;
     if needs_reconcile.len() > MAX_RECONCILE_PER_CYCLE {
         tracing::info!(
             total = needs_reconcile.len(),
@@ -369,9 +368,8 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
         // Scan all branch directories and remove orphaned ones.
         if let Ok(mut entries) = tokio::fs::read_dir(&repo_worktrees).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
-                let entry_meta = match entry.metadata().await {
-                    Ok(m) => m,
-                    Err(_) => continue,
+                let Ok(entry_meta) = entry.metadata().await else {
+                    continue;
                 };
                 if !entry_meta.is_dir() {
                     continue;
@@ -538,14 +536,13 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
     let (worktree, branch, keep_remote_branch, merged) =
         store::opt_store_get_task(&Some(Arc::clone(store)), repo, task_id)
             .await
-            .map(|t| {
+            .map_or((None, None, false, false), |t| {
                 // Blocked tasks with a PR should keep their remote branch so the
                 // PR stays open for human review.
                 let keep = t.status == TaskStatus::Blocked && t.pr_number.is_some();
                 let merged = t.status == TaskStatus::Done;
                 (Some(t.worktree), Some(t.branch), keep, merged)
-            })
-            .unwrap_or((None, None, false, false));
+            });
 
     let worktree_path = worktree.as_ref().map(std::path::PathBuf::from);
 
@@ -817,13 +814,13 @@ pub(crate) async fn remove_worktree_and_branch(
 
     match remove_result {
         Ok(output) if output.status.success() => {
+            const MAX_RETRIES: usize = 3;
+            const RETRY_DELAY_MS: u64 = 2000;
             tracing::info!(task_id, "worktree removed (git metadata)");
             // `git worktree remove` only removes git metadata — the physical directory
             // with working files may remain. Clean it up with retry logic, since macOS
             // sometimes needs a moment to release file handles from a recently-exited
             // process. Retrying with a delay addresses "Directory not empty" errors.
-            const MAX_RETRIES: usize = 3;
-            const RETRY_DELAY_MS: u64 = 2000;
             let mut removed = false;
             for attempt in 0..MAX_RETRIES {
                 match tokio::fs::remove_dir_all(wt).await {
@@ -1118,7 +1115,7 @@ async fn is_worktree_in_active_session(worktree: &std::path::Path) -> bool {
                 let pane_path = line.trim();
                 // Match exact path or any path that starts with worktree + separator.
                 pane_path == worktree_str.as_ref()
-                    || pane_path.starts_with(&format!("{}/", worktree_str))
+                    || pane_path.starts_with(&format!("{worktree_str}/"))
             })
         }
         // tmux not running or no sessions — treat as safe to clean.
@@ -1209,9 +1206,8 @@ pub(crate) async fn resolve_repo_root_for_orphaned_worktree(
                     .unwrap_or_default()
             } else {
                 return Err(anyhow::anyhow!(
-                    "cannot determine owner for single-segment project name '{}' — \
-                     bare repo location is ambiguous; register the project with 'owner/repo' format",
-                    project_name
+                    "cannot determine owner for single-segment project name '{project_name}' — \
+                     bare repo location is ambiguous; register the project with 'owner/repo' format"
                 ));
             };
             if tokio::fs::try_exists(&bare).await.unwrap_or(false) {
@@ -1768,15 +1764,14 @@ mod tests {
         // resolve_repo_root will fail for synthetic repo — that's OK, the point is
         // that when nothing needs cleaning the function should not report true.
         // In production this means no git pull is triggered.
-        match result {
-            Ok(cleaned) => assert!(
+        if let Ok(cleaned) = result {
+            assert!(
                 !cleaned,
                 "cleanup should return false when there is no worktree or branch to clean"
-            ),
-            Err(_) => {
-                // resolve_repo_root fails for test repo — acceptable.
-                // The bug was that even with no worktree/branch, Ok(true) was returned.
-            }
+            );
+        } else {
+            // resolve_repo_root fails for test repo — acceptable.
+            // The bug was that even with no worktree/branch, Ok(true) was returned.
         }
     }
 
@@ -1967,7 +1962,7 @@ mod tests {
 
     #[async_trait]
     impl ExternalBackend for MergeCheckMockBackend {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "mock"
         }
 
@@ -2059,7 +2054,7 @@ mod tests {
             anyhow::anyhow!("missing /data/repository in GraphQL response: no error details"),
             single_results,
         ));
-        let backend_dyn: Arc<dyn ExternalBackend> = backend.clone();
+        let backend_dyn: Arc<dyn ExternalBackend> = Arc::<MergeCheckMockBackend>::clone(&backend);
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let task1 = store
@@ -2112,8 +2107,8 @@ mod tests {
             .unwrap();
 
         let task_manager = Arc::new(TaskManager::with_store(
-            backend_dyn.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend_dyn),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
 
@@ -2175,7 +2170,7 @@ mod tests {
 
     #[async_trait]
     impl ExternalBackend for ReconciliationMockBackend {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "mock"
         }
 
@@ -2244,11 +2239,12 @@ mod tests {
         let backend = Arc::new(ReconciliationMockBackend {
             reconciliation_calls: Arc::new(AtomicUsize::new(0)),
         });
-        let backend_dyn: Arc<dyn ExternalBackend> = backend.clone();
+        let backend_dyn: Arc<dyn ExternalBackend> =
+            Arc::<ReconciliationMockBackend>::clone(&backend);
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let task_manager = Arc::new(TaskManager::with_store(
-            backend_dyn.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend_dyn),
+            std::sync::Arc::clone(&store),
             repo.to_string(),
         ));
         let opts = JanitorOptions {
@@ -2283,8 +2279,8 @@ mod tests {
         });
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let task_manager = Arc::new(TaskManager::with_store(
-            backend_dyn.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend_dyn),
+            std::sync::Arc::clone(&store),
             repo.to_string(),
         ));
 

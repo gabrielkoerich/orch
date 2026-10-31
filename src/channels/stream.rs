@@ -97,12 +97,9 @@ pub async fn fanout_output(
     transport: Arc<Transport>,
     channels: Arc<ChannelRegistry>,
 ) {
-    let mut rx = match transport.subscribe(&repo, &task_id).await {
-        Some(r) => r,
-        None => {
-            tracing::debug!(task_id, "fanout: no binding for task, cannot subscribe");
-            return;
-        }
+    let Some(mut rx) = transport.subscribe(&repo, &task_id).await else {
+        tracing::debug!(task_id, "fanout: no binding for task, cannot subscribe");
+        return;
     };
 
     tracing::debug!(task_id, "fanout: started output streaming");
@@ -124,11 +121,11 @@ pub async fn fanout_output(
                         let now = Instant::now();
 
                         for thread_key in &binding.connected_threads {
-                            let (ch_name, thread_id, topic_id) =
-                                match parse_conversation_key(thread_key) {
-                                    Some(p) => p,
-                                    None => continue,
-                                };
+                            let Some((ch_name, thread_id, topic_id)) =
+                                parse_conversation_key(thread_key)
+                            else {
+                                continue;
+                            };
 
                             // Append new content to this thread's buffer
                             buffers
@@ -140,8 +137,7 @@ pub async fn fanout_output(
                             let rate = platform_rate(ch_name);
                             let can_send = last_send
                                 .get(ch_name)
-                                .map(|t| now.duration_since(*t) >= rate)
-                                .unwrap_or(true);
+                                .is_none_or(|t| now.duration_since(*t) >= rate);
 
                             if can_send {
                                 if let Some(buffered) = buffers.remove(thread_key) {
@@ -174,11 +170,11 @@ pub async fn fanout_output(
                             if buffered.is_empty() {
                                 continue;
                             }
-                            let (ch_name, thread_id, topic_id) =
-                                match parse_conversation_key(&thread_key) {
-                                    Some(p) => p,
-                                    None => continue,
-                                };
+                            let Some((ch_name, thread_id, topic_id)) =
+                                parse_conversation_key(&thread_key)
+                            else {
+                                continue;
+                            };
                             // Escape HTML for Telegram before splitting (same as above).
                             let to_send = if ch_name == "telegram" {
                                 html_escape(&buffered)
@@ -249,16 +245,15 @@ pub async fn fanout_output(
                     let keys: Vec<String> = buffers.keys().cloned().collect();
                     for thread_key in keys {
                         if let Some(buffered) = buffers.remove(&thread_key) {
-                            let (ch_name, thread_id, topic_id) =
-                                match parse_conversation_key(&thread_key) {
-                                    Some(p) => p,
-                                    None => continue,
-                                };
+                            let Some((ch_name, thread_id, topic_id)) =
+                                parse_conversation_key(&thread_key)
+                            else {
+                                continue;
+                            };
                             let rate = platform_rate(ch_name);
                             let can_send = last_send
                                 .get(ch_name)
-                                .map(|t| now.duration_since(*t) >= rate)
-                                .unwrap_or(true);
+                                .is_none_or(|t| now.duration_since(*t) >= rate);
                             if can_send {
                                 // Escape HTML for Telegram before splitting (same as above).
                                 let to_send = if ch_name == "telegram" {
@@ -338,7 +333,7 @@ mod tests {
         // 4-byte emoji: each "😀" is 4 bytes. With max=3, the first chunk boundary
         // falls in the middle of the character — the old code would panic here.
         // Build content so the cut at byte 2000 falls inside the trailing 4-byte emoji.
-        let content = "x".repeat(1997) + "😀"; // 2001 bytes, discord limit is 2000
+        let content = format!("{}😀", "x".repeat(1997)); // 2001 bytes, discord limit is 2000
         let parts = split_for_platform(&content, "discord");
         // Must not panic and reassembled content must equal original
         assert_eq!(parts.join(""), content);
@@ -371,7 +366,7 @@ mod tests {
     fn split_telegram_html_content_escaped_before_split() {
         // Build content where the 4096-byte boundary falls inside an HTML tag.
         // After escaping, each chunk (computed on escaped content) must be ≤ 4096.
-        let raw = "a".repeat(4096) + "<code>123</code>"; // 4096 + 16 = 4112 bytes raw
+        let raw = format!("{}<code>123</code>", "a".repeat(4096)); // 4096 + 16 = 4112 bytes raw
         assert_eq!(raw.len(), 4112);
         let escaped = html_escape(&raw);
         // 2 `<` + 2 `>` each gain 3 bytes when escaped (4 vs 1)
@@ -412,7 +407,8 @@ mod tests {
         // becomes `&lt;` / `&gt;`, a +3 byte expansion).
         // If the boundary splits in the middle of `</code>`, the raw chunk end
         // (containing `>`) expands by 3 bytes when escaped — enough to overflow.
-        let raw = "a".repeat(4093) + html_tag; // 4093 + 16 = 4109 bytes
+        let raw = format!("{}{html_tag}", "a".repeat(4093));
+        // 4093 + 16 = 4109 bytes
         assert_eq!(raw.len(), 4109);
 
         // Old buggy approach: split raw, then escape each
@@ -515,12 +511,12 @@ mod tests {
             .await;
 
         // Spawn the fanout_output task
-        let transport_clone = transport.clone();
-        let registry_clone = registry.clone();
+        let transport_clone = std::sync::Arc::clone(&transport);
+        let registry_clone = std::sync::Arc::clone(&registry);
         let task_id_str = task_id.to_string();
         let repo_str = repo.to_string();
         tokio::spawn(async move {
-            fanout_output(repo_str, task_id_str, transport_clone, registry_clone).await
+            fanout_output(repo_str, task_id_str, transport_clone, registry_clone).await;
         });
 
         // Give fanout time to subscribe to the broadcast
@@ -544,7 +540,7 @@ mod tests {
                 repo,
                 task_id,
                 crate::channels::OutputChunk {
-                    content: "".to_string(),
+                    content: String::new(),
                     is_final: true,
                 },
             )
@@ -603,12 +599,12 @@ mod tests {
             )
             .await;
 
-        let transport_clone = transport.clone();
-        let registry_clone = registry.clone();
+        let transport_clone = std::sync::Arc::clone(&transport);
+        let registry_clone = std::sync::Arc::clone(&registry);
         let task_id_str = task_id.to_string();
         let repo_str = repo.to_string();
         tokio::spawn(async move {
-            fanout_output(repo_str, task_id_str, transport_clone, registry_clone).await
+            fanout_output(repo_str, task_id_str, transport_clone, registry_clone).await;
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

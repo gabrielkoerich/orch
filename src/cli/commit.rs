@@ -286,7 +286,7 @@ fn diff_for_untracked(path: &str) -> anyhow::Result<String> {
         ])
         .output_with_context()?;
     let code = out.status.code();
-    if !matches!(code, Some(0) | Some(1)) {
+    if !matches!(code, Some(0 | 1)) {
         anyhow::bail!(
             "git diff --no-index -- /dev/null {path} failed (exit {:?}): {}",
             code,
@@ -429,7 +429,7 @@ fn print_plan_summary(plans: &[CommitPlan]) {
         }
         if plan.message.lines().count() > 1 {
             for body_line in plan.message.lines().skip(1) {
-                println!("   {}", body_line);
+                println!("   {body_line}");
             }
         }
         println!();
@@ -550,15 +550,14 @@ fn infer_scope(paths: &[&str]) -> Option<String> {
         .parent()
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
-        .map(|s| s.to_string());
+        .map(std::string::ToString::to_string);
 
     if paths.iter().all(|p| {
         Path::new(p)
             .parent()
             .and_then(|pp| pp.file_name())
             .and_then(|n| n.to_str())
-            .map(|s| Some(s.to_string()) == parent)
-            .unwrap_or(false)
+            .is_some_and(|s| Some(s.to_string()) == parent)
     }) {
         parent
     } else {
@@ -567,7 +566,10 @@ fn infer_scope(paths: &[&str]) -> Option<String> {
 }
 
 fn is_doc(path: &str) -> bool {
-    path.ends_with(".md") || path.starts_with("docs/")
+    std::path::Path::new(path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+        || path.starts_with("docs/")
 }
 
 fn is_test(path: &str) -> bool {

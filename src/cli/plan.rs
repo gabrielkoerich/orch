@@ -33,10 +33,10 @@ pub async fn import(
     let repo = config::get_current_repo()
         .context("'repo' not set — run `orch init` or set gh.repo in .orch.yml")?;
     let rel_path = repo_relative(path).unwrap_or_else(|| {
-        let name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| file.to_string());
+        let name = path.file_name().map_or_else(
+            || file.to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
         eprintln!("warning: {file} is outside the git checkout, the issue link uses {name}");
         name
     });
@@ -52,7 +52,7 @@ pub async fn import(
     let unmet = unmet_externals(&selected_all, &roadmap, &known)?;
     let extras = extras_by_task(&unmet);
     let body_for = |task: &Task| {
-        let extra = extras.get(&task.id).map(Vec::as_slice).unwrap_or(&[]);
+        let extra = extras.get(&task.id).map_or(&[][..], Vec::as_slice);
         issue_body_with(task, &repo, &branch, &rel_path, extra)
     };
     let mut diff = diff_import(&roadmap, &existing, milestone, body_for)?;
@@ -196,8 +196,8 @@ async fn load_blocked_by(
             blocked
                 .into_iter()
                 .map(|item| DepRef {
-                    number: item.number as u64,
-                    database_id: item.github_id as u64,
+                    number: u64::try_from(item.number).unwrap_or(0),
+                    database_id: u64::try_from(item.github_id).unwrap_or(0),
                 })
                 .collect(),
         );
@@ -235,8 +235,7 @@ async fn apply(
                 let title = issue_title(&plan.task);
                 let extra = blocked_external
                     .get(&plan.task.id)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
+                    .map_or(&[][..], Vec::as_slice);
                 let body = issue_body_with(&plan.task, repo, branch, rel_path, extra);
                 let labels = labels_for(&[], plan.task.owner_human);
                 let issue = http.create_issue(repo, &title, &body, &labels).await?;
@@ -253,8 +252,7 @@ async fn apply(
                 let title = issue_title(&plan.task);
                 let extra = blocked_external
                     .get(&plan.task.id)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
+                    .map_or(&[][..], Vec::as_slice);
                 let body = issue_body_with(&plan.task, repo, branch, rel_path, extra);
                 let labels = labels_for(&plan.existing_labels, plan.task.owner_human);
                 let issue = http
@@ -292,8 +290,9 @@ async fn apply(
                 let Some(blocking_id) = blocking_id else {
                     anyhow::bail!("{task_id} depends on {blocking_task_id}, which has no issue id");
                 };
-                http.add_blocked_by(repo, *number, blocking_id as i64)
-                    .await?;
+                let blocking_id =
+                    i64::try_from(blocking_id).context("issue database id is out of range")?;
+                http.add_blocked_by(repo, *number, blocking_id).await?;
             }
             LinkEdit::Remove {
                 issue_number,

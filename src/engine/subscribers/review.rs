@@ -40,7 +40,10 @@ enum ReviewOutcome {
 /// This is the sole trigger for NeedsReview → InReview transitions. The sync tick
 /// no longer has a competing NeedsReview loop (removed in fix for issue #857 — both
 /// paths firing simultaneously caused double failure-counter increments).
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments have no natural grouping"
+)]
 pub fn spawn(
     mut rx: broadcast::Receiver<TaskEvent>,
     backend: Arc<dyn ExternalBackend>,
@@ -58,14 +61,13 @@ pub fn spawn(
                 Ok(event) if event.new_status == "needs_review" && event.repo == repo => {
                     // Check if review agent is enabled (read fresh each time).
                     let enable_review = crate::config::get("workflow.enable_review_agent")
-                        .map(|v| v != "false")
-                        .unwrap_or(true);
+                        .map_or(true, |v| v != "false");
                     if !enable_review {
                         continue;
                     }
 
                     let task_id = &event.task_id;
-                    let dispatch_key = format!("{}/{}", repo, task_id);
+                    let dispatch_key = format!("{repo}/{task_id}");
 
                     // Atomically claim the task before any async work so concurrent
                     // review events cannot double-spawn the same review flow.
@@ -99,8 +101,10 @@ pub fn spawn(
                     }
 
                     // Create guard IMMEDIATELY after inserting the key — owns removal for all subsequent exit paths
-                    let dispatch_guard =
-                        DispatchGuard::new(dispatching.clone(), dispatch_key.clone());
+                    let dispatch_guard = DispatchGuard::new(
+                        std::sync::Arc::clone(&dispatching),
+                        dispatch_key.clone(),
+                    );
 
                     tracing::info!(task_id, "event-driven review triggered");
 
@@ -170,7 +174,8 @@ pub fn spawn(
                     };
 
                     if let Some(stored) =
-                        opt_store_get_task(&Some(store.clone()), &repo, &task.id.0).await
+                        opt_store_get_task(&Some(std::sync::Arc::clone(&store)), &repo, &task.id.0)
+                            .await
                     {
                         let no_code_review = stored.worktree.trim().is_empty()
                             && stored.branch.trim().is_empty()
@@ -181,13 +186,13 @@ pub fn spawn(
                                 "no worktree/branch/pr for needs_review task — skipping review dispatch and marking done"
                             );
                             crate::store::store_reset_failure_counters(
-                                &Some(store.clone()),
+                                &Some(std::sync::Arc::clone(&store)),
                                 &repo,
                                 &task.id.0,
                             )
                             .await;
                             if let Err(e) = crate::store::store_set_result(
-                                &Some(store.clone()),
+                                &Some(std::sync::Arc::clone(&store)),
                                 &repo,
                                 &task.id.0,
                                 &[("needs_review_refires", serde_json::json!(0))],
@@ -239,12 +244,12 @@ pub fn spawn(
                     }
 
                     // Try to acquire a semaphore permit.
-                    let permit = match semaphore.clone().try_acquire_owned() {
-                        Ok(p) => p,
-                        Err(_) => {
-                            tracing::debug!(task_id, "all parallel slots busy; sync catch-up will re-fire when a slot opens");
-                            continue;
-                        }
+                    let Ok(permit) = std::sync::Arc::clone(&semaphore).try_acquire_owned() else {
+                        tracing::debug!(
+                            task_id,
+                            "all parallel slots busy; sync catch-up will re-fire when a slot opens"
+                        );
+                        continue;
                     };
 
                     // Transition to InReview — this IS the atomic guard against duplicates.
@@ -257,11 +262,11 @@ pub fn spawn(
                         continue;
                     }
 
-                    let backend_c = backend.clone();
-                    let task_manager_c = task_manager.clone();
-                    let tmux_c = tmux.clone();
-                    let router_c = router.clone();
-                    let store_c = store.clone();
+                    let backend_c = std::sync::Arc::clone(&backend);
+                    let task_manager_c = std::sync::Arc::clone(&task_manager);
+                    let tmux_c = std::sync::Arc::clone(&tmux);
+                    let router_c = std::sync::Arc::clone(&router);
+                    let store_c = std::sync::Arc::clone(&store);
                     let repo_s = repo.clone();
                     tokio::spawn(REPO_CONTEXT.scope(repo_s.clone(), async move {
                         let _dispatch_guard = dispatch_guard; // released on drop (normal or panic)
@@ -293,7 +298,7 @@ pub fn spawn(
                             return;
                         }
 
-                        let outcome = match review_and_merge(
+                        let outcome = match Box::pin(review_and_merge(
                             &task,
                             &backend_c,
                             &tmux_c,
@@ -301,7 +306,7 @@ pub fn spawn(
                             &router_c,
                             &task_manager_c,
                             &store_c,
-                        )
+                        ))
                         .await
                         {
                             Ok(ReviewDecision::Blocked(reason)) => {
@@ -333,14 +338,14 @@ pub fn spawn(
                                 // tracks how many times the PR has requested
                                 // changes and is used as a circuit-breaker.
                                 crate::store::store_reset_failure_counters(
-                                    &Some(store_c.clone()),
+                                    &Some(std::sync::Arc::clone(&store_c)),
                                     &repo_s,
                                     &tid,
                                 )
                                 .await;
                                 // Also reset needs_review_refires so the sync backoff doesn't persist across a successful review
                                 if let Err(e) = crate::store::store_set_result(
-                                    &Some(store_c.clone()),
+                                    &Some(std::sync::Arc::clone(&store_c)),
                                     &repo_s,
                                     &tid,
                                     &[("needs_review_refires", serde_json::json!(0))],
@@ -365,13 +370,13 @@ pub fn spawn(
                                 // Skipped indicates there's nothing to review (no PR etc.).
                                 // Clear transient failure counters but preserve review_cycles.
                                 crate::store::store_reset_failure_counters(
-                                    &Some(store_c.clone()),
+                                    &Some(std::sync::Arc::clone(&store_c)),
                                     &repo_s,
                                     &tid,
                                 )
                                 .await;
                                 if let Err(e) = crate::store::store_set_result(
-                                    &Some(store_c.clone()),
+                                    &Some(std::sync::Arc::clone(&store_c)),
                                     &repo_s,
                                     &tid,
                                     &[("needs_review_refires", serde_json::json!(0))],
@@ -386,13 +391,13 @@ pub fn spawn(
                                 // handle_review_changes already incremented review_cycles —
                                 // only reset transient per-attempt counters.
                                 crate::store::store_reset_failure_counters(
-                                    &Some(store_c.clone()),
+                                    &Some(std::sync::Arc::clone(&store_c)),
                                     &repo_s,
                                     &tid,
                                 )
                                 .await;
                                 if let Err(e) = crate::store::store_set_result(
-                                    &Some(store_c.clone()),
+                                    &Some(std::sync::Arc::clone(&store_c)),
                                     &repo_s,
                                     &tid,
                                     &[("needs_review_refires", serde_json::json!(0))],
@@ -454,27 +459,25 @@ pub fn spawn(
                             let expected = ci_blocked
                                 || matches!(
                                     current_status,
-                                    Some(crate::store::TaskStatus::Done)
-                                        | Some(crate::store::TaskStatus::Approved)
-                                        | Some(crate::store::TaskStatus::Routed)
-                                        | Some(crate::store::TaskStatus::New)
+                                    Some(crate::store::TaskStatus::Done | crate::store::TaskStatus::Approved |
+crate::store::TaskStatus::Routed | crate::store::TaskStatus::New)
                                 );
                             if expected {
                                 tracing::debug!(
                                     task_id = tid,
-                                    current_status = current_status.as_ref().map(|s| s.as_str()).unwrap_or("unknown"),
+                                    current_status = current_status.as_ref().map_or("unknown", crate::store::tasks::TaskStatus::as_str),
                                     "review outcome discarded — task transitioned away from in_review (expected)"
                                 );
                             } else {
                                 tracing::warn!(
                                     task_id = tid,
-                                    current_status = current_status.as_ref().map(|s| s.as_str()).unwrap_or("unknown"),
+                                    current_status = current_status.as_ref().map_or("unknown", crate::store::tasks::TaskStatus::as_str),
                                     "review outcome discarded — task is no longer in_review (stale review agent result)"
                                 );
                             }
 
                             // Kill the orphaned review session
-                            let stale_session = tmux_c.session_name(&repo_s, &format!("{}-review", tid));
+                            let stale_session = tmux_c.session_name(&repo_s, &format!("{tid}-review"));
                             if let Err(e) = tmux_c.kill_session(&stale_session).await {
                                 tracing::debug!(task_id = tid, error = %e, "failed to kill stale review session");
                             }
@@ -492,7 +495,7 @@ pub fn spawn(
                                 // returned an error before reaching its own cleanup.
                                 // Killing a non-existent session is a harmless no-op.
                                 let stale_session =
-                                    tmux_c.session_name(&repo_s, &format!("{}-review", tid));
+                                    tmux_c.session_name(&repo_s, &format!("{tid}-review"));
                                 tmux_c.kill_session(&stale_session).await.ok();
                                 // Backoff before re-queuing to prevent rapid spin
                                 // if the review agent keeps failing instantly.
@@ -511,7 +514,7 @@ pub fn spawn(
                                 // Merge conflict or similar — route back to the
                                 // task agent so it can fix the issue.
                                 let stale_session =
-                                    tmux_c.session_name(&repo_s, &format!("{}-review", tid));
+                                    tmux_c.session_name(&repo_s, &format!("{tid}-review"));
                                 tmux_c.kill_session(&stale_session).await.ok();
                                 tracing::info!(
                                     task_id = tid,
@@ -531,7 +534,7 @@ pub fn spawn(
                                 // The review is over, so its session goes. The merge may have
                                 // landed already, or CI sent the task back, so only in_review moves
                                 let stale_session =
-                                    tmux_c.session_name(&repo_s, &format!("{}-review", tid));
+                                    tmux_c.session_name(&repo_s, &format!("{tid}-review"));
                                 tmux_c.kill_session(&stale_session).await.ok();
                                 match task_manager_c
                                     .update_task_status_if(
@@ -559,7 +562,7 @@ pub fn spawn(
                             ReviewOutcome::RateLimited => {
                                 // Kill stale tmux session — same as Reset.
                                 let stale_session =
-                                    tmux_c.session_name(&repo_s, &format!("{}-review", tid));
+                                    tmux_c.session_name(&repo_s, &format!("{tid}-review"));
                                 tmux_c.kill_session(&stale_session).await.ok();
 
                                 // Compute wait duration: if any agent is available right now,
@@ -572,8 +575,7 @@ pub fn spawn(
                                     } else {
                                         let now = chrono::Utc::now().timestamp();
                                         r.earliest_cooldown_until(Some("review"))
-                                            .map(|until| ((until - now).max(1)) as u64)
-                                            .unwrap_or(AGENT_COOLDOWN_SECS as u64)
+                                            .map_or(AGENT_COOLDOWN_SECS as u64, |until| u64::try_from((until - now).max(1)).unwrap_or(1))
                                     }
                                 };
                                 tracing::info!(
@@ -658,7 +660,7 @@ async fn ci_allows_review(
     task: &ExternalTask,
 ) -> bool {
     let task_id = task.id.0.as_str();
-    let stored = opt_store_get_task(&Some(store.clone()), repo, task_id).await;
+    let stored = opt_store_get_task(&Some(std::sync::Arc::clone(store)), repo, task_id).await;
     let Some(pr_number) = stored
         .as_ref()
         .and_then(|t| t.pr_number)
@@ -708,7 +710,7 @@ async fn ci_allows_review(
 
     tracing::info!(task_id, pr_number, "{hold}");
     if let Err(e) = crate::store::store_set_result(
-        &Some(store.clone()),
+        &Some(std::sync::Arc::clone(store)),
         repo,
         task_id,
         &[("needs_review_refires", serde_json::json!(0))],
@@ -745,7 +747,7 @@ async fn route_back_on_red_ci(
 ) {
     let task_id = task.id.0.as_str();
     let failures = match crate::store::store_increment(
-        &Some(store.clone()),
+        &Some(std::sync::Arc::clone(store)),
         repo,
         task_id,
         "ci_merge_failures",
@@ -873,16 +875,20 @@ async fn reset_or_block(
     external: bool,
     context: &str,
 ) -> ReviewOutcome {
-    let resets =
-        match crate::store::store_increment(&Some(store.clone()), repo, task_id, "review_resets")
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(task_id, err = %e, "failed to increment review_resets");
-                0
-            }
-        };
+    let resets = match crate::store::store_increment(
+        &Some(std::sync::Arc::clone(store)),
+        repo,
+        task_id,
+        "review_resets",
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(task_id, err = %e, "failed to increment review_resets");
+            0
+        }
+    };
     let outcome = if resets >= MAX_REVIEW_RESETS {
         tracing::error!(
             task_id,
@@ -1125,7 +1131,7 @@ async fn classify_review_failure(
     }
 
     let failures = match crate::store::store_increment(
-        &Some(store.clone()),
+        &Some(std::sync::Arc::clone(store)),
         repo,
         task_id,
         "review_agent_failures",
@@ -1189,13 +1195,14 @@ async fn post_review_failure_comment(
     failures: u64,
     blocking: bool,
 ) {
-    let pr_number = match opt_store_get_task(&Some(store.clone()), repo, task_id).await {
-        Some(t) => match t.pr_number {
-            Some(n) => n,
-            None => return, // No PR to comment on
-        },
-        _ => return, // No PR to comment on
-    };
+    let pr_number =
+        match opt_store_get_task(&Some(std::sync::Arc::clone(store)), repo, task_id).await {
+            Some(t) => match t.pr_number {
+                Some(n) => n,
+                None => return, // No PR to comment on
+            },
+            _ => return, // No PR to comment on
+        };
 
     let status = if blocking {
         "Task blocked for human review."
@@ -1212,10 +1219,7 @@ async fn post_review_failure_comment(
         crate::engine::orch_footer()
     );
 
-    let gh = match GhHttp::new() {
-        Ok(gh) => gh,
-        Err(_) => return,
-    };
+    let Ok(gh) = GhHttp::new() else { return };
     if let Err(e) = gh.add_comment(repo, &pr_number.to_string(), &comment).await {
         tracing::debug!(
             task_id,
@@ -1249,7 +1253,7 @@ mod tests {
             .unwrap();
         let task_id = format!("internal:{store_id}");
 
-        for _ in 0..(MAX_REVIEW_AGENT_FAILURES + 1) {
+        for _ in 0..=MAX_REVIEW_AGENT_FAILURES {
             let outcome = classify_review_failure(
                 &store,
                 repo,
@@ -1264,7 +1268,7 @@ mod tests {
             );
         }
 
-        let task = opt_store_get_task(&Some(store.clone()), repo, &task_id)
+        let task = opt_store_get_task(&Some(std::sync::Arc::clone(&store)), repo, &task_id)
             .await
             .expect("task should exist");
         assert_eq!(
@@ -1294,7 +1298,7 @@ mod tests {
             .unwrap();
         let task_id = format!("internal:{store_id}");
 
-        for _ in 0..(MAX_REVIEW_AGENT_FAILURES + 1) {
+        for _ in 0..=MAX_REVIEW_AGENT_FAILURES {
             let outcome = classify_review_failure(
                 &store,
                 repo,
@@ -1310,7 +1314,7 @@ mod tests {
             );
         }
 
-        let task = opt_store_get_task(&Some(store.clone()), repo, &task_id)
+        let task = opt_store_get_task(&Some(std::sync::Arc::clone(&store)), repo, &task_id)
             .await
             .expect("task should exist");
         assert_eq!(
@@ -1340,7 +1344,7 @@ mod tests {
             "merge failed: required status check still pending",
         ];
 
-        for _ in 0..(MAX_REVIEW_AGENT_FAILURES + 1) {
+        for _ in 0..=MAX_REVIEW_AGENT_FAILURES {
             for msg in &error_messages {
                 let outcome =
                     classify_review_failure(&store, repo, &task_id, msg, "review agent").await;
@@ -1351,7 +1355,7 @@ mod tests {
             }
         }
 
-        let task = opt_store_get_task(&Some(store.clone()), repo, &task_id)
+        let task = opt_store_get_task(&Some(std::sync::Arc::clone(&store)), repo, &task_id)
             .await
             .expect("task should exist");
         assert_eq!(
@@ -1427,7 +1431,7 @@ mod tests {
             );
         }
 
-        let task = opt_store_get_task(&Some(store.clone()), repo, &task_id)
+        let task = opt_store_get_task(&Some(std::sync::Arc::clone(&store)), repo, &task_id)
             .await
             .expect("task should exist");
         assert_eq!(
@@ -1461,7 +1465,7 @@ mod tests {
             "review model missing for task internal:123 after agent selection — refusing to dispatch",
         ];
 
-        for _ in 0..(MAX_REVIEW_AGENT_FAILURES + 1) {
+        for _ in 0..=MAX_REVIEW_AGENT_FAILURES {
             for msg in &error_messages {
                 let outcome =
                     classify_review_failure(&store, repo, &task_id, msg, "review_and_merge").await;
@@ -1472,7 +1476,7 @@ mod tests {
             }
         }
 
-        let task = opt_store_get_task(&Some(store.clone()), repo, &task_id)
+        let task = opt_store_get_task(&Some(std::sync::Arc::clone(&store)), repo, &task_id)
             .await
             .expect("task should exist");
         assert_eq!(
@@ -1507,10 +1511,13 @@ mod tests {
             "reset {MAX_REVIEW_RESETS} must block the task"
         );
 
-        let task = opt_store_get_task(&Some(store.clone()), repo, &task_id)
+        let task = opt_store_get_task(&Some(std::sync::Arc::clone(&store)), repo, &task_id)
             .await
             .expect("task should exist");
-        assert_eq!(task.review_resets as u64, MAX_REVIEW_RESETS);
+        assert_eq!(
+            u64::try_from(task.review_resets).unwrap(),
+            MAX_REVIEW_RESETS
+        );
         assert_eq!(
             task.review_agent_failures, 0,
             "a reset must not count as a review failure"
@@ -1552,7 +1559,7 @@ mod tests {
             .await
             .unwrap();
 
-        for _ in 0..(MAX_REVIEW_AGENT_FAILURES + 1) {
+        for _ in 0..=MAX_REVIEW_AGENT_FAILURES {
             for msg in &error_messages {
                 let outcome =
                     classify_review_failure(&store, repo, &task_id, msg, "review agent").await;
@@ -1563,7 +1570,7 @@ mod tests {
             }
         }
 
-        let task = opt_store_get_task(&Some(store.clone()), repo, &task_id)
+        let task = opt_store_get_task(&Some(std::sync::Arc::clone(&store)), repo, &task_id)
             .await
             .expect("task should exist");
         assert_eq!(
@@ -1589,13 +1596,15 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             attempts.len(),
-            (MAX_REVIEW_AGENT_FAILURES as usize + 1) * error_messages.len(),
+            (usize::try_from(MAX_REVIEW_AGENT_FAILURES).unwrap() + 1) * error_messages.len(),
             "every failed attempt must be recorded for `orch task inspect`"
         );
         assert!(
-            attempts
-                .iter()
-                .all(|a| a.details.get("external").and_then(|v| v.as_bool()) == Some(true)),
+            attempts.iter().all(|a| a
+                .details
+                .get("external")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)),
             "rate limits must be recorded as an external cause"
         );
         assert!(

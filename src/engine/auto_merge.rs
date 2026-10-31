@@ -71,7 +71,7 @@ async fn is_ci_check_in_cooldown(
         if let Ok(last_time) = chrono::DateTime::parse_from_rfc3339(&last_ts) {
             let elapsed =
                 chrono::Utc::now().signed_duration_since(last_time.with_timezone(&chrono::Utc));
-            if elapsed.num_seconds() < cooldown_secs as i64 {
+            if elapsed.num_seconds() < i64::try_from(cooldown_secs).unwrap_or(i64::MAX) {
                 return Ok(true);
             }
         }
@@ -363,17 +363,16 @@ async fn ci_pending_elapsed(
     // clock. `kv_insert_if_absent` performs the check-and-set in one SQL
     // statement so only the first writer's timestamp survives.
     let stored = store.kv_insert_if_absent(&key, &now.to_rfc3339()).await?;
-    match chrono::DateTime::parse_from_rfc3339(&stored) {
-        Ok(dt) => Ok(now.signed_duration_since(dt.with_timezone(&chrono::Utc))),
-        Err(_) => {
-            tracing::warn!(
-                task_id,
-                stored,
-                "ci_pending_since value unparseable — resetting"
-            );
-            store.kv_set(&key, &now.to_rfc3339()).await?;
-            Ok(chrono::Duration::zero())
-        }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&stored) {
+        Ok(now.signed_duration_since(dt.with_timezone(&chrono::Utc)))
+    } else {
+        tracing::warn!(
+            task_id,
+            stored,
+            "ci_pending_since value unparseable — resetting"
+        );
+        store.kv_set(&key, &now.to_rfc3339()).await?;
+        Ok(chrono::Duration::zero())
     }
 }
 
@@ -427,7 +426,10 @@ pub(crate) async fn sweep_ci_timer_keys(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments have no natural grouping"
+)]
 /// Handle a detected merge conflict by attempting a worktree rebase.
 ///
 /// Both the `poll_mergeable_until` conflict path and the `gh.merge_pr()` failure
@@ -451,8 +453,7 @@ async fn handle_pr_rebase_recovery(
 ) -> anyhow::Result<()> {
     let retries = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
         .await
-        .map(|t| t.merge_conflict_retries.max(0) as u64)
-        .unwrap_or(0);
+        .map_or(0, |t| u64::try_from(t.merge_conflict_retries).unwrap_or(0));
     if retries >= MAX_MERGE_CONFLICT_RETRIES {
         tracing::error!(
             task_id = task.id.0,
@@ -484,11 +485,7 @@ async fn handle_pr_rebase_recovery(
         let footer =
             crate::engine::attribution_footer("Commented", review_agent, Some(review_model));
         if let Err(e) = gh
-            .add_comment(
-                repo,
-                &pr_number.to_string(),
-                &format!("{}{}", comment, footer),
-            )
+            .add_comment(repo, &pr_number.to_string(), &format!("{comment}{footer}"))
             .await
         {
             tracing::warn!(
@@ -523,7 +520,7 @@ async fn handle_pr_rebase_recovery(
                 return Ok(());
             }
             match gh.enable_auto_merge(repo, pr_number).await {
-                Ok(_) => {
+                Ok(()) => {
                     tracing::info!(
                         task_id = task.id.0,
                         "auto-merge enabled — task stays in InReview until GitHub merges"
@@ -615,11 +612,7 @@ async fn handle_pr_rebase_recovery(
                 stderr.trim()
             );
             if let Err(e) = gh
-                .add_comment(
-                    repo,
-                    &pr_number.to_string(),
-                    &format!("{}{}", comment, footer),
-                )
+                .add_comment(repo, &pr_number.to_string(), &format!("{comment}{footer}"))
                 .await
             {
                 tracing::warn!(
@@ -633,13 +626,9 @@ async fn handle_pr_rebase_recovery(
         }
         WorktreeRebaseOutcome::PushFailed(push_err_msg) => {
             let comment = format!(
-                "Auto-merge failed (rebase succeeded but force-push failed): {}",
-                push_err_msg
+                "Auto-merge failed (rebase succeeded but force-push failed): {push_err_msg}"
             );
-            let block_reason = format!(
-                "auto-merge force-push failed after rebase: {}",
-                push_err_msg
-            );
+            let block_reason = format!("auto-merge force-push failed after rebase: {push_err_msg}");
             let fields = [("block_reason", serde_json::json!(block_reason))];
             if let Err(e) = task_manager
                 .update_task_status_and_result(&task.id, Status::Blocked, &fields)
@@ -651,11 +640,7 @@ async fn handle_pr_rebase_recovery(
             let footer =
                 crate::engine::attribution_footer("Commented", review_agent, Some(review_model));
             if let Err(e) = gh
-                .add_comment(
-                    repo,
-                    &pr_number.to_string(),
-                    &format!("{}{}", comment, footer),
-                )
+                .add_comment(repo, &pr_number.to_string(), &format!("{comment}{footer}"))
                 .await
             {
                 tracing::warn!(
@@ -1002,7 +987,10 @@ fn mergeable_state_ready(
 /// Checks that the automated review comment says "approve" and that CI checks
 /// are green before merging. If CI fails, sets task back to routed so the
 /// agent is re-dispatched to fix the issues.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments have no natural grouping"
+)]
 pub(crate) async fn auto_merge_pr(
     task: &ExternalTask,
     branch: &str,
@@ -1031,153 +1019,150 @@ pub(crate) async fn auto_merge_pr(
 
     // 1. Get PR number from branch
     let gh = GhHttp::new()?;
-    let pr_number = match gh.get_pr_number(repo, branch).await? {
-        Some(n) => n,
-        None => {
-            // No open PR — check if the branch was already merged/closed.
-            // Treat a closed/merged PR as idempotent success rather than a
-            // retryable failure so the review-agent failure counter is not
-            // incremented when the work is already done.
-            match gh.get_closed_pr_state(repo, branch).await {
-                Ok(Some((closed_pr_number, true, _))) => {
-                    // Validate the PR's head ref matches our branch before treating as merged
-                    match gh.get_pr(repo, closed_pr_number).await {
-                        Ok(pr) if pr.head.ref_ == branch => {
-                            tracing::info!(
-                                task_id = task.id.0,
-                                branch,
-                                pr_number = closed_pr_number,
-                                "PR already merged — marking task done (idempotent)"
-                            );
-                            task_manager
-                                .update_task_status(&task.id, Status::Done)
-                                .await?;
-                            if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
-                                tracing::warn!(
-                                    task_id = task.id.0,
-                                    err = %e,
-                                    "post-merge cleanup failed"
-                                );
-                            }
-                            return Ok(());
-                        }
-                        Ok(_) => {
+    let Some(pr_number) = gh.get_pr_number(repo, branch).await? else {
+        // No open PR — check if the branch was already merged/closed.
+        // Treat a closed/merged PR as idempotent success rather than a
+        // retryable failure so the review-agent failure counter is not
+        // incremented when the work is already done.
+        match gh.get_closed_pr_state(repo, branch).await {
+            Ok(Some((closed_pr_number, true, _))) => {
+                // Validate the PR's head ref matches our branch before treating as merged
+                match gh.get_pr(repo, closed_pr_number).await {
+                    Ok(pr) if pr.head.ref_ == branch => {
+                        tracing::info!(
+                            task_id = task.id.0,
+                            branch,
+                            pr_number = closed_pr_number,
+                            "PR already merged — marking task done (idempotent)"
+                        );
+                        task_manager
+                            .update_task_status(&task.id, Status::Done)
+                            .await?;
+                        if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
                             tracing::warn!(
                                 task_id = task.id.0,
-                                branch,
-                                pr_number = closed_pr_number,
-                                "closed PR head ref does not match branch — may be wrong PR"
-                            );
-                            anyhow::bail!("no matching merged PR found for branch {}", branch);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                task_id = task.id.0,
-                                branch,
-                                pr_number = closed_pr_number,
                                 err = %e,
-                                "failed to verify PR details, assuming merged"
+                                "post-merge cleanup failed"
                             );
-                            // Fall through to marking done since get_closed_pr_state said it was merged
-                            task_manager
-                                .update_task_status(&task.id, Status::Done)
-                                .await?;
-                            if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
-                                tracing::warn!(
-                                    task_id = task.id.0,
-                                    err = %e,
-                                    "post-merge cleanup failed"
-                                );
-                            }
-                            return Ok(());
                         }
+                        return Ok(());
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            task_id = task.id.0,
+                            branch,
+                            pr_number = closed_pr_number,
+                            "closed PR head ref does not match branch — may be wrong PR"
+                        );
+                        anyhow::bail!("no matching merged PR found for branch {branch}");
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            task_id = task.id.0,
+                            branch,
+                            pr_number = closed_pr_number,
+                            err = %e,
+                            "failed to verify PR details, assuming merged"
+                        );
+                        // Fall through to marking done since get_closed_pr_state said it was merged
+                        task_manager
+                            .update_task_status(&task.id, Status::Done)
+                            .await?;
+                        if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
+                            tracing::warn!(
+                                task_id = task.id.0,
+                                err = %e,
+                                "post-merge cleanup failed"
+                            );
+                        }
+                        return Ok(());
                     }
                 }
-                Ok(Some((closed_pr_number, false, state))) => {
-                    // Validate the PR's head ref matches our branch before treating as closed
-                    match gh.get_pr(repo, closed_pr_number).await {
-                        Ok(pr) if pr.head.ref_ == branch => {
-                            let approved = crate::store::opt_store_get_task(
-                                &Some(store.clone()),
-                                repo,
-                                &task.id.0,
+            }
+            Ok(Some((closed_pr_number, false, state))) => {
+                // Validate the PR's head ref matches our branch before treating as closed
+                match gh.get_pr(repo, closed_pr_number).await {
+                    Ok(pr) if pr.head.ref_ == branch => {
+                        let approved = crate::store::opt_store_get_task(
+                            &Some(std::sync::Arc::clone(store)),
+                            repo,
+                            &task.id.0,
+                        )
+                        .await
+                        .is_some_and(|t| t.status == crate::store::TaskStatus::Approved);
+                        if approved {
+                            crate::engine::review_poll::block_closed_approved_pr(
+                                task_manager,
+                                &task.id,
                             )
-                            .await
-                            .is_some_and(|t| t.status == crate::store::TaskStatus::Approved);
-                            if approved {
-                                crate::engine::review_poll::block_closed_approved_pr(
-                                    task_manager,
-                                    &task.id,
-                                )
-                                .await;
-                                return Ok(());
-                            }
+                            .await;
+                            return Ok(());
+                        }
 
-                            tracing::info!(
-                                task_id = task.id.0,
-                                branch,
-                                pr_number = closed_pr_number,
-                                pr_state = %state,
-                                "PR was closed without merge — marking task done"
-                            );
-                            task_manager
-                                .update_task_status(&task.id, Status::Done)
-                                .await?;
-                            if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
-                                tracing::warn!(
-                                    task_id = task.id.0,
-                                    err = %e,
-                                    "post-close cleanup failed"
-                                );
-                            }
-                            return Ok(());
-                        }
-                        Ok(_) => {
+                        tracing::info!(
+                            task_id = task.id.0,
+                            branch,
+                            pr_number = closed_pr_number,
+                            pr_state = %state,
+                            "PR was closed without merge — marking task done"
+                        );
+                        task_manager
+                            .update_task_status(&task.id, Status::Done)
+                            .await?;
+                        if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
                             tracing::warn!(
                                 task_id = task.id.0,
-                                branch,
-                                pr_number = closed_pr_number,
-                                "closed PR head ref does not match branch — may be wrong PR"
-                            );
-                            anyhow::bail!("no matching closed PR found for branch {}", branch);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                task_id = task.id.0,
-                                branch,
-                                pr_number = closed_pr_number,
                                 err = %e,
-                                "failed to verify PR details, assuming closed"
+                                "post-close cleanup failed"
                             );
-                            // Fall through to marking done since get_closed_pr_state said it was closed
-                            task_manager
-                                .update_task_status(&task.id, Status::Done)
-                                .await?;
-                            if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
-                                tracing::warn!(
-                                    task_id = task.id.0,
-                                    err = %e,
-                                    "post-close cleanup failed"
-                                );
-                            }
-                            return Ok(());
                         }
+                        return Ok(());
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            task_id = task.id.0,
+                            branch,
+                            pr_number = closed_pr_number,
+                            "closed PR head ref does not match branch — may be wrong PR"
+                        );
+                        anyhow::bail!("no matching closed PR found for branch {branch}");
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            task_id = task.id.0,
+                            branch,
+                            pr_number = closed_pr_number,
+                            err = %e,
+                            "failed to verify PR details, assuming closed"
+                        );
+                        // Fall through to marking done since get_closed_pr_state said it was closed
+                        task_manager
+                            .update_task_status(&task.id, Status::Done)
+                            .await?;
+                        if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
+                            tracing::warn!(
+                                task_id = task.id.0,
+                                err = %e,
+                                "post-close cleanup failed"
+                            );
+                        }
+                        return Ok(());
                     }
                 }
-                Ok(None) => {
-                    // No closed PR found either — this is a genuine error
-                    anyhow::bail!("no open PR found for branch {}", branch);
-                }
-                Err(e) => {
-                    // Error checking closed PR state — fail gracefully
-                    tracing::warn!(
-                        task_id = task.id.0,
-                        branch,
-                        err = %e,
-                        "failed to check closed PR state"
-                    );
-                    anyhow::bail!("no open PR found for branch {}", branch);
-                }
+            }
+            Ok(None) => {
+                // No closed PR found either — this is a genuine error
+                anyhow::bail!("no open PR found for branch {branch}");
+            }
+            Err(e) => {
+                // Error checking closed PR state — fail gracefully
+                tracing::warn!(
+                    task_id = task.id.0,
+                    branch,
+                    err = %e,
+                    "failed to check closed PR state"
+                );
+                anyhow::bail!("no open PR found for branch {branch}");
             }
         }
     };
@@ -1307,7 +1292,9 @@ pub(crate) async fn auto_merge_pr(
         // that is_billing_failure can reuse them without a redundant API call.
         let mut prefetched_check_runs: Option<Vec<GitHubCheckRun>> = None;
         let (state, total, passing, failing, pending) = {
-            let _permit = ci_poll_semaphore().clone().acquire_owned().await;
+            let _permit = std::sync::Arc::clone(ci_poll_semaphore())
+                .acquire_owned()
+                .await;
             if required_contexts.is_empty() {
                 gh.get_combined_status(
                     repo,
@@ -1406,7 +1393,7 @@ pub(crate) async fn auto_merge_pr(
                                 }
 
                                 match gh.enable_auto_merge(repo, pr_number).await {
-                                    Ok(_) => {
+                                    Ok(()) => {
                                         tracing::info!(
                                             task_id = task.id.0,
                                             "behind-branch rebase succeeded — auto-merge re-enabled"
@@ -1501,7 +1488,7 @@ pub(crate) async fn auto_merge_pr(
                                     .add_comment(
                                         repo,
                                         &pr_number.to_string(),
-                                        &format!("{}{}", comment, footer),
+                                        &format!("{comment}{footer}"),
                                     )
                                     .await
                                 {
@@ -1516,12 +1503,10 @@ pub(crate) async fn auto_merge_pr(
                             }
                             WorktreeRebaseOutcome::PushFailed(push_err_msg) => {
                                 let comment = format!(
-                                    "Auto-merge failed (behind-branch rebase succeeded but force-push failed): {}",
-                                    push_err_msg
+                                    "Auto-merge failed (behind-branch rebase succeeded but force-push failed): {push_err_msg}"
                                 );
                                 let block_reason = format!(
-                                    "auto-merge force-push failed after behind-branch rebase: {}",
-                                    push_err_msg
+                                    "auto-merge force-push failed after behind-branch rebase: {push_err_msg}"
                                 );
                                 let fields = [("block_reason", serde_json::json!(block_reason))];
                                 if let Err(e) = task_manager
@@ -1544,7 +1529,7 @@ pub(crate) async fn auto_merge_pr(
                                     .add_comment(
                                         repo,
                                         &pr_number.to_string(),
-                                        &format!("{}{}", comment, footer),
+                                        &format!("{comment}{footer}"),
                                     )
                                     .await
                                 {
@@ -1930,15 +1915,11 @@ pub(crate) async fn auto_merge_pr(
             tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason and set Blocked");
             return Ok(());
         }
-        let comment = format!("Auto-merge failed: {}", e);
+        let comment = format!("Auto-merge failed: {e}");
         let footer =
             crate::engine::attribution_footer("Commented", review_agent, Some(review_model));
         if let Err(e) = gh
-            .add_comment(
-                repo,
-                &pr_number.to_string(),
-                &format!("{}{}", comment, footer),
-            )
+            .add_comment(repo, &pr_number.to_string(), &format!("{comment}{footer}"))
             .await
         {
             tracing::warn!(
@@ -1982,11 +1963,7 @@ pub(crate) async fn auto_merge_pr(
     let comment = "✅ PR reviewed, approved, and merged.";
     let footer = crate::engine::attribution_footer("Reviewed", review_agent, Some(review_model));
     if let Err(e) = gh
-        .add_comment(
-            repo,
-            &pr_number.to_string(),
-            &format!("{}{}", comment, footer),
-        )
+        .add_comment(repo, &pr_number.to_string(), &format!("{comment}{footer}"))
         .await
     {
         tracing::warn!(
@@ -2146,7 +2123,10 @@ async fn required_ci_checks_pass(gh: &GhHttp, repo: &str, pr_number: u64) -> Opt
 }
 
 /// Handle review changes request — re-dispatch the original agent.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments have no natural grouping"
+)]
 pub(crate) async fn handle_review_changes(
     task: &ExternalTask,
     notes: &str,
@@ -2160,12 +2140,13 @@ pub(crate) async fn handle_review_changes(
     store: &Arc<TaskStore>,
     router_config: &crate::engine::router::config::RouterConfig,
 ) -> anyhow::Result<()> {
+    use std::fmt::Write as _;
+
     // 1. Check review cycle count (max 2 review rounds)
     let task_store_record = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0).await;
     let review_cycles: u32 = task_store_record
         .as_ref()
-        .map(|t| t.review_cycles.max(0) as u32)
-        .unwrap_or(0);
+        .map_or(0, |t| u32::try_from(t.review_cycles).unwrap_or(0));
 
     let max_cycles: u32 = config::get("workflow.max_review_cycles")
         .ok()
@@ -2221,8 +2202,7 @@ pub(crate) async fn handle_review_changes(
         // the review cycle counter and re-trigger the review agent.
         let ci_recovery_count: i32 = task_store_record
             .as_ref()
-            .map(|t| t.ci_recovery_count)
-            .unwrap_or(0);
+            .map_or(0, |t| t.ci_recovery_count);
 
         if ci_recovery_count < 1 {
             match required_ci_checks_pass(&gh, repo, pr_number).await {
@@ -2334,13 +2314,12 @@ pub(crate) async fn handle_review_changes(
             return Ok(());
         }
         let escalation = format!(
-            "🔍 Review agent requested changes after {} cycles. Escalating to human.\n\n**Review Notes:**\n{}",
-            review_cycles, notes
+            "🔍 Review agent requested changes after {review_cycles} cycles. Escalating to human.\n\n**Review Notes:**\n{notes}"
         );
         let footer =
             crate::engine::attribution_footer("Commented", review_agent, Some(review_model));
         if let Err(e) = gh
-            .add_comment(repo, &pr_num_str, &format!("{}{}", escalation, footer))
+            .add_comment(repo, &pr_num_str, &format!("{escalation}{footer}"))
             .await
         {
             tracing::warn!(task_id = task.id.0, pr_number, err = %e, "failed to post escalation comment on PR");
@@ -2359,16 +2338,16 @@ pub(crate) async fn handle_review_changes(
     if !issues.is_empty() {
         comment.push_str("\n\n**Issues Found:**\n");
         for issue in issues {
-            comment.push_str(&format!(
-                "- `{}` line {}: {} [{}]\n",
+            let _ = writeln!(
+                comment,
+                "- `{}` line {}: {} [{}]",
                 issue.file,
                 issue
                     .line
-                    .map(|l| l.to_string())
-                    .unwrap_or_else(|| "?".to_string()),
+                    .map_or_else(|| "?".to_string(), |l| l.to_string()),
                 issue.description,
                 issue.severity
-            ));
+            );
         }
     }
 
@@ -2397,124 +2376,120 @@ pub(crate) async fn handle_review_changes(
     let previous_agent = task_store_record
         .as_ref()
         .and_then(|t| t.agent.as_ref())
-        .map(|a| a.as_str())
-        .unwrap_or("");
-    let complexity = task_store_record
-        .as_ref()
-        .map(|t| {
+        .map_or("", std::string::String::as_str);
+    let complexity = task_store_record.as_ref().map_or_else(
+        || "medium".to_string(),
+        |t| {
             if t.complexity.is_empty() {
                 "medium".to_string()
             } else {
                 t.complexity.clone()
             }
-        })
-        .unwrap_or_else(|| "medium".to_string());
+        },
+    );
 
     let new_model = router_config.model_for_complexity(previous_agent, &complexity, &task.id.0);
 
-    match new_model {
-        Some(model) => {
-            // Got a valid model for this agent — update the store and set Routed.
-            if let Err(e) = store_set_result(
-                &Some(Arc::clone(store)),
-                repo,
-                &task.id.0,
-                &[
-                    ("model", serde_json::json!(model)),
-                    (
-                        "route_reason",
-                        serde_json::json!("re-dispatch after review changes"),
-                    ),
-                ],
-            )
-            .await
-            {
-                tracing::warn!(task_id = task.id.0, err = %e, "model update failed — will retry on next tick");
-                return Ok(());
-            }
-
-            let fields = [
+    if let Some(model) = new_model {
+        // Got a valid model for this agent — update the store and set Routed.
+        if let Err(e) = store_set_result(
+            &Some(Arc::clone(store)),
+            repo,
+            &task.id.0,
+            &[
+                ("model", serde_json::json!(model)),
                 (
-                    "review_cycles",
-                    serde_json::json!((review_cycles + 1) as i64),
+                    "route_reason",
+                    serde_json::json!("re-dispatch after review changes"),
                 ),
-                (
-                    "review_agent_failures",
-                    serde_json::json!(0), // reset failures for the new review round
-                ),
-                ("review_resets", serde_json::json!(0)),
-            ];
-            if let Err(e) = task_manager
-                .update_task_status_and_result(&task.id, Status::Routed, &fields)
-                .await
-            {
-                tracing::warn!(
-                    task_id = task.id.0,
-                    err = %e,
-                    "Routed transition failed — will retry on next tick"
-                );
-                return Ok(());
-            }
-
-            tracing::info!(
-                task_id = task.id.0,
-                review_cycles = review_cycles + 1,
-                pr_number,
-                agent = previous_agent,
-                model = %model,
-                complexity = %complexity,
-                "re-dispatching task (new model via model_for_complexity) to address review feedback on same PR"
-            );
+            ],
+        )
+        .await
+        {
+            tracing::warn!(task_id = task.id.0, err = %e, "model update failed — will retry on next tick");
+            return Ok(());
         }
-        None => {
-            // All models for this agent are cooled — fall back to full re-route.
-            // Clear agent/model/route_reason so Phase 3a picks the best available combo.
-            if let Err(e) = store_set_result(
-                &Some(Arc::clone(store)),
-                repo,
-                &task.id.0,
-                &[
-                    ("agent", serde_json::json!(null)),
-                    ("model", serde_json::json!(null)),
-                    ("route_reason", serde_json::json!("")),
-                ],
-            )
+
+        let fields = [
+            (
+                "review_cycles",
+                serde_json::json!(i64::from(review_cycles + 1)),
+            ),
+            (
+                "review_agent_failures",
+                serde_json::json!(0), // reset failures for the new review round
+            ),
+            ("review_resets", serde_json::json!(0)),
+        ];
+        if let Err(e) = task_manager
+            .update_task_status_and_result(&task.id, Status::Routed, &fields)
             .await
-            {
-                tracing::warn!(task_id = task.id.0, err = %e, "store write failed");
-            }
-
-            let fields = [
-                (
-                    "review_cycles",
-                    serde_json::json!((review_cycles + 1) as i64),
-                ),
-                (
-                    "review_agent_failures",
-                    serde_json::json!(0), // reset failures for the new review round
-                ),
-                ("review_resets", serde_json::json!(0)),
-            ];
-            if let Err(e) = task_manager
-                .update_task_status_and_result(&task.id, Status::New, &fields)
-                .await
-            {
-                tracing::warn!(
-                    task_id = task.id.0,
-                    err = %e,
-                    "all models cooled for agent {previous_agent} — New transition failed, will retry on next tick"
-                );
-                return Ok(());
-            }
-
-            tracing::info!(
+        {
+            tracing::warn!(
                 task_id = task.id.0,
-                review_cycles = review_cycles + 1,
-                pr_number,
-                agent = previous_agent,
-                "all models cooled for agent — falling back to full re-route (Status::New)"
+                err = %e,
+                "Routed transition failed — will retry on next tick"
             );
+            return Ok(());
         }
+
+        tracing::info!(
+            task_id = task.id.0,
+            review_cycles = review_cycles + 1,
+            pr_number,
+            agent = previous_agent,
+            model = %model,
+            complexity = %complexity,
+            "re-dispatching task (new model via model_for_complexity) to address review feedback on same PR"
+        );
+    } else {
+        // All models for this agent are cooled — fall back to full re-route.
+        // Clear agent/model/route_reason so Phase 3a picks the best available combo.
+        if let Err(e) = store_set_result(
+            &Some(Arc::clone(store)),
+            repo,
+            &task.id.0,
+            &[
+                ("agent", serde_json::json!(null)),
+                ("model", serde_json::json!(null)),
+                ("route_reason", serde_json::json!("")),
+            ],
+        )
+        .await
+        {
+            tracing::warn!(task_id = task.id.0, err = %e, "store write failed");
+        }
+
+        let fields = [
+            (
+                "review_cycles",
+                serde_json::json!(i64::from(review_cycles + 1)),
+            ),
+            (
+                "review_agent_failures",
+                serde_json::json!(0), // reset failures for the new review round
+            ),
+            ("review_resets", serde_json::json!(0)),
+        ];
+        if let Err(e) = task_manager
+            .update_task_status_and_result(&task.id, Status::New, &fields)
+            .await
+        {
+            tracing::warn!(
+                task_id = task.id.0,
+                err = %e,
+                "all models cooled for agent {previous_agent} — New transition failed, will retry on next tick"
+            );
+            return Ok(());
+        }
+
+        tracing::info!(
+            task_id = task.id.0,
+            review_cycles = review_cycles + 1,
+            pr_number,
+            agent = previous_agent,
+            "all models cooled for agent — falling back to full re-route (Status::New)"
+        );
     }
 
     Ok(())
@@ -2836,8 +2811,8 @@ mod tests {
                 body: "body".to_string(),
                 source: "cron".to_string(),
                 source_id: "daily".to_string(),
-                author: "".to_string(),
-                url: "".to_string(),
+                author: String::new(),
+                url: String::new(),
                 labels: vec![],
                 parent_id: None,
             })
@@ -2862,10 +2837,10 @@ mod tests {
             body: "body".to_string(),
             state: "open".to_string(),
             labels: vec![],
-            author: "".to_string(),
+            author: String::new(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            url: "".to_string(),
+            url: String::new(),
         };
 
         let result = handle_review_changes(
@@ -2946,8 +2921,8 @@ mod tests {
                 body: "body".to_string(),
                 source: "cron".to_string(),
                 source_id: "daily".to_string(),
-                author: "".to_string(),
-                url: "".to_string(),
+                author: String::new(),
+                url: String::new(),
                 labels: vec![],
                 parent_id: None,
             })
@@ -2991,10 +2966,10 @@ mod tests {
             body: "body".to_string(),
             state: "open".to_string(),
             labels: vec![],
-            author: "".to_string(),
+            author: String::new(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            url: "".to_string(),
+            url: String::new(),
         };
 
         let result = handle_review_changes(
@@ -3023,11 +2998,7 @@ mod tests {
         // When all models are cooled → falls back to New, agent cleared for full re-route.
         // In test env with no model_map configured, model_for_complexity returns None → New.
         // This is the expected fallback behavior.
-        let model_was_resolved = updated
-            .model
-            .as_deref()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false);
+        let model_was_resolved = updated.model.as_deref().is_some_and(|m| !m.is_empty());
         if model_was_resolved {
             // Got a valid model → should be Routed, agent preserved
             assert_eq!(
@@ -3086,8 +3057,8 @@ mod tests {
                 body: "body".to_string(),
                 source: "cron".to_string(),
                 source_id: "daily".to_string(),
-                author: "".to_string(),
-                url: "".to_string(),
+                author: String::new(),
+                url: String::new(),
                 labels: vec![],
                 parent_id: None,
             })
@@ -3116,10 +3087,10 @@ mod tests {
             body: "body".to_string(),
             state: "open".to_string(),
             labels: vec![],
-            author: "".to_string(),
+            author: String::new(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            url: "".to_string(),
+            url: String::new(),
         };
 
         // The status transition will fail (wrong repo), but handle_review_changes
@@ -3279,8 +3250,8 @@ mod tests {
                 body: "body".to_string(),
                 source: "cron".to_string(),
                 source_id: "daily".to_string(),
-                author: "".to_string(),
-                url: "".to_string(),
+                author: String::new(),
+                url: String::new(),
                 labels: vec![],
                 parent_id: None,
             })
@@ -3311,10 +3282,10 @@ mod tests {
             body: "body".to_string(),
             state: "open".to_string(),
             labels: vec![],
-            author: "".to_string(),
+            author: String::new(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            url: "".to_string(),
+            url: String::new(),
         };
 
         // With no real GitHub token the stale check will fail gracefully and
@@ -3473,11 +3444,14 @@ mod tests {
         clear_ci_pending_since(&store, REPO, "7", "test")
             .await
             .unwrap();
-        assert!(store
-            .kv_list_prefix(&ci_pending_since_prefix(REPO, "7"))
-            .await
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            store
+                .kv_list_prefix(&ci_pending_since_prefix(REPO, "7"))
+                .await
+                .unwrap(),
+            [] as [(String, String); 0]
+        );
+
         assert!(store
             .kv_get(&ci_pending_since_key("other/repo", "7", SHA))
             .await
@@ -3518,11 +3492,14 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        assert!(store
-            .kv_list_prefix(&ci_pending_since_prefix(REPO, "7"))
-            .await
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            store
+                .kv_list_prefix(&ci_pending_since_prefix(REPO, "7"))
+                .await
+                .unwrap(),
+            [] as [(String, String); 0]
+        );
+
         assert!(store.kv_get("ci_check_ts:7").await.unwrap().is_none());
         assert!(store.kv_get("ci_pending_since:7").await.unwrap().is_none());
         assert!(store

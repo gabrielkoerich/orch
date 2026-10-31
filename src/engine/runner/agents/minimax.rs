@@ -103,11 +103,17 @@ fn extract_stream_usage(raw: &str) -> (Option<u64>, Option<u64>) {
             continue;
         }
         if let Some(usage) = val.get("message").and_then(|m| m.get("usage")) {
-            if let Some(inp) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+            if let Some(inp) = usage
+                .get("input_tokens")
+                .and_then(serde_json::Value::as_u64)
+            {
                 total_input = total_input.max(inp); // take max (cumulative reported)
                 found = true;
             }
-            if let Some(out) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+            if let Some(out) = usage
+                .get("output_tokens")
+                .and_then(serde_json::Value::as_u64)
+            {
                 total_output = total_output.max(out);
                 found = true;
             }
@@ -124,6 +130,13 @@ fn extract_stream_usage(raw: &str) -> (Option<u64>, Option<u64>) {
 /// Named `MiniMaxClaudeRunner` to distinguish from a future native MiniMax CLI runner.
 pub struct MiniMaxClaudeRunner {
     inner: ClaudeRunner,
+}
+
+impl std::fmt::Debug for MiniMaxClaudeRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MiniMaxClaudeRunner")
+            .finish_non_exhaustive()
+    }
 }
 
 impl MiniMaxClaudeRunner {

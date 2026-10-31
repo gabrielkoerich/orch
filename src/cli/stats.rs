@@ -39,9 +39,13 @@ fn print_summary_table(
     summary: &crate::store::MetricsSummary,
     cost: Option<&crate::store::CostSummary>,
 ) {
-    println!("── {} ──────────────────────────────────", title);
+    println!("── {title} ──────────────────────────────────");
 
     let total = summary.tasks_completed_24h + summary.tasks_failed_24h;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a display percentage of task counts far below 2^52"
+    )]
     let success_rate = if total > 0 {
         summary.tasks_completed_24h as f64 / total as f64 * 100.0
     } else {
@@ -52,7 +56,7 @@ fn print_summary_table(
         "  Tasks ({}):  {} completed, {} failed",
         window_label, summary.tasks_completed_24h, summary.tasks_failed_24h
     );
-    println!("  Success rate: {:.1}%", success_rate);
+    println!("  Success rate: {success_rate:.1}%");
 
     // Duration by complexity
     let mut durations = Vec::new();

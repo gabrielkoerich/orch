@@ -78,7 +78,7 @@ pub async fn opt_store_get_task(
 ///
 /// `store` may be None if the store isn't initialized yet.
 pub async fn store_set_by_id(
-    store: &Option<&Arc<TaskStore>>,
+    store: Option<&Arc<TaskStore>>,
     store_id: i64,
     store_fields: &[(&str, serde_json::Value)],
 ) -> anyhow::Result<()> {
@@ -143,7 +143,7 @@ pub async fn store_set_result(
         let store_id = store
             .resolve_task_id(repo, task_id)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("task {} not found in store", task_id))?;
+            .ok_or_else(|| anyhow::anyhow!("task {task_id} not found in store"))?;
         store.set_fields(store_id, store_fields).await?;
     }
     Ok(())
@@ -174,7 +174,10 @@ pub async fn store_touch_updated_at(store: &Option<Arc<TaskStore>>, repo: &str, 
 }
 
 /// Append a lifecycle activity event to a task timeline.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments are the activity row columns"
+)]
 pub async fn store_log_activity(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
@@ -228,8 +231,8 @@ pub async fn store_increment_by_id(
         .as_ref()
         .ok_or_else(|| anyhow!("task store unavailable"))?;
     match s.increment(store_id, field).await {
-        Ok(new_val) => Ok(new_val as u64),
-        Err(e) => Err(anyhow!("store.increment failed: {}", e)),
+        Ok(new_val) => Ok(u64::try_from(new_val).unwrap_or(0)),
+        Err(e) => Err(anyhow!("store.increment failed: {e}")),
     }
 }
 
@@ -251,10 +254,10 @@ pub async fn store_increment(
         .ok_or_else(|| anyhow!("task store unavailable"))?;
     match s.resolve_task_id(repo, task_id).await {
         Ok(Some(store_id)) => store_increment_by_id(store, store_id, field).await,
-        Ok(None) => Err(anyhow!("task not present in store: {}/{}", repo, task_id)),
+        Ok(None) => Err(anyhow!("task not present in store: {repo}/{task_id}")),
         Err(e) => {
             tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
-            Err(anyhow!("resolve_task_id failed: {}", e))
+            Err(anyhow!("resolve_task_id failed: {e}"))
         }
     }
 }
@@ -267,12 +270,11 @@ pub async fn get_task_field(
     field: &str,
 ) -> Option<String> {
     let task = opt_store_get_task(store, repo, task_id).await?;
-    match field {
-        "no_code_last_agent" => Some(task.no_code_last_agent),
-        _ => {
-            tracing::warn!(task_id, field, "get_task_field: unknown field");
-            None
-        }
+    if field == "no_code_last_agent" {
+        Some(task.no_code_last_agent)
+    } else {
+        tracing::warn!(task_id, field, "get_task_field: unknown field");
+        None
     }
 }
 
@@ -283,7 +285,7 @@ pub async fn get_task_field_direct(
     task_id: &str,
     field: &str,
 ) -> Option<String> {
-    let store_opt: &Option<Arc<TaskStore>> = &Some(store.clone());
+    let store_opt: &Option<Arc<TaskStore>> = &Some(std::sync::Arc::clone(store));
     get_task_field(store_opt, repo, task_id, field).await
 }
 
@@ -340,7 +342,7 @@ pub async fn get_token_usage_result(
     let store_id = s
         .resolve_task_id(repo, task_id)
         .await?
-        .ok_or_else(|| anyhow!("task {}/{} not found in store", repo, task_id))?;
+        .ok_or_else(|| anyhow!("task {repo}/{task_id} not found in store"))?;
     let task = s.get(store_id).await?;
     Ok(Some(TokenUsage {
         input_tokens: token_i64_to_u64_non_negative(task.input_tokens),
@@ -379,7 +381,7 @@ pub async fn get_cost_estimate_result(
     let store_id = s
         .resolve_task_id(repo, task_id)
         .await?
-        .ok_or_else(|| anyhow!("task {}/{} not found in store", repo, task_id))?;
+        .ok_or_else(|| anyhow!("task {repo}/{task_id} not found in store"))?;
     let task = s.get(store_id).await?;
     Ok(Some(CostEstimate {
         input_cost_usd: task.input_cost_usd,
@@ -420,7 +422,7 @@ pub async fn get_recent_memory_result(
     let store_id = s
         .resolve_task_id(repo, task_id)
         .await?
-        .ok_or_else(|| anyhow!("task {}/{} not found in store", repo, task_id))?;
+        .ok_or_else(|| anyhow!("task {repo}/{task_id} not found in store"))?;
     let entries = s.recent_memory(store_id, max).await?;
     Ok(Some(entries))
 }

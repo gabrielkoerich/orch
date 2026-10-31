@@ -37,7 +37,7 @@ fn read_file_with_limit<P: AsRef<Path>>(path: P, max_bytes: u64) -> anyhow::Resu
 
     // If file is within limits, read the whole thing
     if file_size <= max_bytes {
-        return std::fs::read_to_string(path).map_err(|e| e.into());
+        return std::fs::read_to_string(path).map_err(std::convert::Into::into);
     }
 
     // File is too large - read from the end to get the most recent output
@@ -45,7 +45,7 @@ fn read_file_with_limit<P: AsRef<Path>>(path: P, max_bytes: u64) -> anyhow::Resu
     let start_pos = file_size.saturating_sub(max_bytes);
     file.seek(SeekFrom::Start(start_pos))?;
 
-    let mut buffer = Vec::with_capacity(max_bytes as usize);
+    let mut buffer = Vec::with_capacity(usize::try_from(max_bytes).unwrap_or(0));
     file.read_to_end(&mut buffer)?;
 
     // Try to convert to UTF-8, replacing invalid sequences
@@ -71,13 +71,20 @@ pub(crate) fn calculate_backoff_delay(retry_count: usize) -> u64 {
     let max_delay = crate::engine::router::config::retry_max_delay_ms();
 
     // Exponential: base * 2^retry_count
-    let exponential = base_delay * (2_u64.saturating_pow(retry_count as u32));
+    let exponential =
+        base_delay * (2_u64.saturating_pow(u32::try_from(retry_count).unwrap_or(u32::MAX)));
     let capped = exponential.min(max_delay);
 
     // Add jitter: ±30% using a hash-based pseudo-random value.
     // Mix system time (nanoseconds) with thread ID so concurrent retries on
     // different threads get different delays even when called in the same
     // microsecond, avoiding the thundering-herd problem.
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a jitter range in milliseconds, far below 2^52 and never negative"
+    )]
     let jitter_range = (capped as f64 * JITTER_FACTOR) as u64;
     let jitter = {
         use std::collections::hash_map::DefaultHasher;
@@ -92,16 +99,15 @@ pub(crate) fn calculate_backoff_delay(retry_count: usize) -> u64 {
 }
 
 fn fallback_retry_count(task: Option<&crate::store::Task>) -> usize {
-    task.map(|t| {
+    task.map_or(0, |t| {
         let chain_retry_count = t
             .limit_reroute_chain
             .split(',')
             .filter(|entry| !entry.is_empty())
             .count();
-        let network_retry_count = t.network_retries.max(0) as usize;
+        let network_retry_count = usize::try_from(t.network_retries).unwrap_or(0);
         chain_retry_count.max(network_retry_count)
     })
-    .unwrap_or(0)
 }
 
 /// Wait with exponential backoff before retrying with a fallback agent.
@@ -163,7 +169,7 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
     })
     .await
     .ok()
-    .and_then(|r| r.ok())
+    .and_then(std::result::Result::ok)
     {
         if !content.is_empty() {
             return content;
@@ -176,8 +182,7 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
         // Use async metadata for is_dir check
         if tokio::fs::metadata(&attempts_dir)
             .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false)
+            .is_ok_and(|m| m.is_dir())
         {
             let mut attempt_nums: Vec<u32> = tokio::task::spawn_blocking({
                 let a = attempts_dir.clone();
@@ -222,7 +227,7 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
                 })
                 .await
                 .ok()
-                .and_then(|r| r.ok())
+                .and_then(std::result::Result::ok)
                 {
                     if !content.is_empty() {
                         tracing::info!(task_id, path = %p.display(), "read output from attempt dir");
@@ -254,7 +259,7 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
         })
         .await
         .ok()
-        .and_then(|r| r.ok())
+        .and_then(std::result::Result::ok)
         {
             if !content.is_empty() {
                 tracing::info!(task_id, path = %path.display(), "read output from legacy fallback");
@@ -333,7 +338,6 @@ pub enum RetryableError {
 impl RetryableError {
     /// Return a short classified string for this error type.
     /// Used in DB rate-limit metrics and test assertions.
-    #[allow(dead_code)]
     pub fn type_str(self) -> &'static str {
         match self {
             RetryableError::Timeout => "timeout",
@@ -812,7 +816,10 @@ fn extract_review_response_object(text: &str) -> Option<ReviewResponse> {
 }
 
 /// Extract learnings and store as memory for future attempts.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a memory entry records the task, attempt, agent, model and outcome"
+)]
 pub async fn store_learnings_from_response(
     task_id: &str,
     attempt: u32,
@@ -911,6 +918,12 @@ mod tests {
 
         // retry_count=0 → exponential = base, capped = base (assuming base < max)
         let capped = base.min(max);
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "mirrors the jitter range in calculate_backoff_delay"
+        )]
         let jitter_range = (capped as f64 * JITTER_FACTOR) as u64;
         let lo = capped.saturating_sub(jitter_range);
         let hi = capped + jitter_range;
@@ -1163,7 +1176,7 @@ mod tests {
         let resp = parse_review_response(json).unwrap();
         assert_eq!(resp.decision, "approve");
         assert_eq!(resp.notes, "LGTM");
-        assert!(resp.issues.is_empty());
+        assert!(resp.issues.is_empty(), "{:?}", resp.issues);
     }
 
     #[serial(cooldown_state)]
@@ -1281,7 +1294,7 @@ That's all."#;
         let text = "The review is done. LGTM.";
         let resp = parse_review_plain(text).unwrap();
         assert_eq!(resp.decision, "approve");
-        assert!(resp.issues.is_empty());
+        assert!(resp.issues.is_empty(), "{:?}", resp.issues);
     }
 
     /// opencode NDJSON stream — text events use the `part.text` format.
@@ -1807,7 +1820,7 @@ That's all."#;
 
         let read_content = result.unwrap();
         // from_utf8_lossy should handle invalid sequences
-        assert!(!read_content.is_empty());
+        assert_ne!(read_content, "");
 
         let _ = std::fs::remove_file(&file_path);
     }
@@ -1837,7 +1850,7 @@ That's all."#;
         assert_eq!(resp.decision, "approve");
         assert_eq!(resp.notes, "All checks pass");
         assert_eq!(resp.test_results.as_deref(), Some("pass"));
-        assert!(resp.issues.is_empty());
+        assert!(resp.issues.is_empty(), "{:?}", resp.issues);
     }
 
     #[serial(cooldown_state)]
@@ -1879,7 +1892,7 @@ That's all."#;
         let resp = parse_review_via_agent("opencode", raw).unwrap();
         assert_eq!(resp.decision, "approve");
         assert_eq!(resp.notes, "All checks pass");
-        assert!(resp.issues.is_empty());
+        assert!(resp.issues.is_empty(), "{:?}", resp.issues);
     }
 
     #[serial(cooldown_state)]
@@ -1913,7 +1926,7 @@ That's all."#;
         let resp = parse_review_via_agent("codex", raw).unwrap();
         assert_eq!(resp.decision, "approve");
         assert_eq!(resp.notes, "Clean implementation");
-        assert!(resp.issues.is_empty());
+        assert!(resp.issues.is_empty(), "{:?}", resp.issues);
     }
 
     #[serial(cooldown_state)]
@@ -1947,7 +1960,7 @@ That's all."#;
         assert_eq!(resp.decision, "approve");
         assert_eq!(resp.notes, "LGTM");
         assert_eq!(resp.test_results.as_deref(), Some("pass"));
-        assert!(resp.issues.is_empty());
+        assert!(resp.issues.is_empty(), "{:?}", resp.issues);
     }
 
     // ── MiniMax review fixtures ────────────────────────────────────────────────

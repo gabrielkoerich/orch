@@ -16,24 +16,20 @@ pub fn status() -> anyhow::Result<()> {
             } else {
                 "no"
             };
-            let port_str = s
-                .port
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "—".to_string());
+            let port_str = s.port.map_or_else(|| "—".to_string(), |p| p.to_string());
             let last_check = s
                 .last_check_utc
-                .map(|t| t.to_rfc3339())
-                .unwrap_or_else(|| "never".to_string());
+                .map_or_else(|| "never".to_string(), |t| t.to_rfc3339());
             let failure = s.last_failure_reason.as_deref().unwrap_or("none");
 
             println!("Webhook status:");
             println!("  Configured:       {}", s.configured);
-            println!("  Port:             {}", port_str);
-            println!("  Health:           {}", health_str);
-            println!("  Fallback mode:    {}", fallback_str);
-            println!("  Last check (UTC): {}", last_check);
+            println!("  Port:             {port_str}");
+            println!("  Health:           {health_str}");
+            println!("  Fallback mode:    {fallback_str}");
+            println!("  Last check (UTC): {last_check}");
             println!("  Startup attempts: {}", s.startup_attempts);
-            println!("  Last failure:     {}", failure);
+            println!("  Last failure:     {failure}");
         }
     }
     Ok(())

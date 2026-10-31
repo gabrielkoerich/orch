@@ -1,3 +1,9 @@
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "the CLI writes its output to the terminal"
+)]
+
 use orch::{cli, config, cron, engine, home, parser, template};
 
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
@@ -170,7 +176,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("orch.log");
 
-        std::fs::write(&path, vec![b'a'; (MAX_SERVICE_LOG_BYTES + 1) as usize]).unwrap();
+        std::fs::write(
+            &path,
+            vec![b'a'; usize::try_from(MAX_SERVICE_LOG_BYTES + 1).unwrap()],
+        )
+        .unwrap();
         std::fs::write(path.with_file_name("orch.log.1"), b"one").unwrap();
         std::fs::write(path.with_file_name("orch.log.2"), b"two").unwrap();
         std::fs::write(path.with_file_name("orch.log.3"), b"three").unwrap();
@@ -200,7 +210,11 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("orch.log");
-        std::fs::write(&path, vec![b'a'; (MAX_SERVICE_LOG_BYTES + 1) as usize]).unwrap();
+        std::fs::write(
+            &path,
+            vec![b'a'; usize::try_from(MAX_SERVICE_LOG_BYTES + 1).unwrap()],
+        )
+        .unwrap();
 
         let mut live = std::fs::OpenOptions::new()
             .append(true)
@@ -1193,7 +1207,7 @@ async fn async_main() -> anyhow::Result<()> {
         Commands::Cron { expression, since } => {
             eprintln!("warning: `orch cron` is deprecated; use `orch job cron` instead");
             let matches = cron::check(&expression, since.as_deref())?;
-            std::process::exit(if matches { 0 } else { 1 });
+            std::process::exit(i32::from(!matches));
         }
         Commands::Config { key, action } => match (action, key) {
             (Some(ConfigAction::Agents), _) => cli::agents(),
@@ -1275,10 +1289,7 @@ async fn async_main() -> anyhow::Result<()> {
             TaskAction::Run { id } => {
                 cli::task::run(id).await?;
             }
-            TaskAction::Retry { id, agent, model } => {
-                cli::task::retry(&id, agent, model).await?;
-            }
-            TaskAction::Reroute { id, agent, model } => {
+            TaskAction::Retry { id, agent, model } | TaskAction::Reroute { id, agent, model } => {
                 cli::task::retry(&id, agent, model).await?;
             }
             TaskAction::Unblock { id } => {
@@ -1379,7 +1390,7 @@ async fn async_main() -> anyhow::Result<()> {
             }
             JobAction::Cron { expression, since } => {
                 let matches = cron::check(&expression, since.as_deref())?;
-                std::process::exit(if matches { 0 } else { 1 });
+                std::process::exit(i32::from(!matches));
             }
         },
         Commands::Plan { action } => match action {
@@ -1421,10 +1432,7 @@ async fn async_main() -> anyhow::Result<()> {
         Commands::Metrics { details, since } => {
             eprintln!("warning: `orch metrics` is deprecated; use `orch stats metrics` instead");
             let hours = cli::parse_since(&since).unwrap_or_else(|| {
-                eprintln!(
-                    "Warning: unrecognised --since value {:?}, defaulting to 24h",
-                    since
-                );
+                eprintln!("Warning: unrecognised --since value {since:?}, defaulting to 24h");
                 24
             });
             cli::metrics(details, hours).await?;

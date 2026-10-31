@@ -24,15 +24,13 @@ fn is_trusted_author(issue: &crate::github::types::GitHubIssue) -> bool {
     issue
         .author_association
         .as_deref()
-        .map(|a| ALLOWED_ASSOCIATIONS.contains(&a))
-        .unwrap_or(false) // missing field = untrusted
+        .is_some_and(|a| ALLOWED_ASSOCIATIONS.contains(&a)) // missing field = untrusted
 }
 
 fn is_trusted_comment_author(c: &crate::github::types::GitHubComment) -> bool {
     c.author_association
         .as_deref()
-        .map(|a| ALLOWED_ASSOCIATIONS.contains(&a))
-        .unwrap_or(false)
+        .is_some_and(|a| ALLOWED_ASSOCIATIONS.contains(&a))
 }
 
 fn trusted_mentions(
@@ -99,6 +97,7 @@ fn classify_active_open_issue(
     Some((task, status))
 }
 
+#[derive(Debug)]
 pub struct GitHubBackend {
     repo: String,
     gh: GhHttp,
@@ -148,7 +147,7 @@ impl GitHubBackend {
 
 #[async_trait]
 impl ExternalBackend for GitHubBackend {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "github"
     }
 
@@ -207,9 +206,8 @@ impl ExternalBackend for GitHubBackend {
         status: Status,
     ) -> anyhow::Result<Option<String>> {
         // Only sync if project integration is configured
-        let project = match ProjectSync::from_config() {
-            Some(p) => p,
-            None => return Ok(None),
+        let Some(project) = ProjectSync::from_config() else {
+            return Ok(None);
         };
 
         // Fetch the issue to get its node_id
@@ -239,9 +237,8 @@ impl ExternalBackend for GitHubBackend {
     }
 
     async fn sync_estimate_to_project(&self, id: &ExternalId, estimate: u8) -> anyhow::Result<()> {
-        let project = match ProjectSync::from_config() {
-            Some(p) => p,
-            None => return Ok(()),
+        let Some(project) = ProjectSync::from_config() else {
+            return Ok(());
         };
 
         // If the estimate field ID is missing from config, try to discover it
@@ -302,9 +299,8 @@ impl ExternalBackend for GitHubBackend {
         &self,
         issue_node_ids: &[String],
     ) -> anyhow::Result<std::collections::HashMap<String, u8>> {
-        let project = match ProjectSync::from_config() {
-            Some(p) => p,
-            None => return Ok(std::collections::HashMap::new()),
+        let Some(project) = ProjectSync::from_config() else {
+            return Ok(std::collections::HashMap::new());
         };
 
         if issue_node_ids.is_empty() {
@@ -319,6 +315,7 @@ impl ExternalBackend for GitHubBackend {
 
     /// Override default update_status to add project board sync after label update.
     async fn update_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
+        const MAX_RETRIES: u32 = 3;
         // Internal tasks (e.g. "internal:63857") are not GitHub issues — skip silently.
         if !is_github_issue_id(id) {
             return Ok(());
@@ -331,7 +328,6 @@ impl ExternalBackend for GitHubBackend {
             tracing::warn!(label, err = %e, "ensure_status_label failed, continuing");
         }
 
-        const MAX_RETRIES: u32 = 3;
         let mut last_err =
             anyhow::anyhow!("update_status({label}) failed: all {MAX_RETRIES} attempts exhausted");
 
@@ -394,9 +390,8 @@ impl ExternalBackend for GitHubBackend {
 
                     // Auto-close issue when status → Done (if auto_close enabled)
                     if status == Status::Done {
-                        let auto_close = crate::config::get("workflow.auto_close")
-                            .map(|v| v == "true")
-                            .unwrap_or(true);
+                        let auto_close =
+                            crate::config::get("workflow.auto_close").map_or(true, |v| v == "true");
                         if auto_close {
                             if let Err(e) = self.gh.close_issue(&self.repo, &id.0).await {
                                 tracing::warn!(
@@ -690,7 +685,9 @@ impl ExternalBackend for GitHubBackend {
         if issue_number <= 0 {
             return Ok(crate::backends::BlockedByFetch::Unavailable);
         }
-        self.gh.list_blocked_by(repo, issue_number as u64).await
+        self.gh
+            .list_blocked_by(repo, issue_number.cast_unsigned())
+            .await
     }
 
     async fn issue_close_state(
@@ -728,14 +725,18 @@ impl ExternalBackend for GitHubBackend {
         if pr_number <= 0 {
             return Ok(None);
         }
-        let pr = match self.gh.get_pr(repo, pr_number as u64).await {
+        let pr = match self.gh.get_pr(repo, pr_number.cast_unsigned()).await {
             Ok(pr) => pr,
             Err(err) if is_missing_issue(&err) => return Ok(None),
             Err(err) => return Err(err),
         };
         let default_branch = self.gh.get_default_branch(repo).await.unwrap_or_default();
         let app_login = crate::github::app::bot_login().await;
-        let reviews = match self.gh.get_pr_reviews(repo, pr_number as u64).await {
+        let reviews = match self
+            .gh
+            .get_pr_reviews(repo, pr_number.cast_unsigned())
+            .await
+        {
             Ok(reviews) => {
                 crate::github::app::reviews_for_gate(&reviews, &pr.head.sha, app_login.as_deref())
             }
@@ -803,7 +804,11 @@ impl ExternalBackend for GitHubBackend {
             anyhow::bail!("blocking issue {blocking_repo}#{blocking_number} has no database id");
         }
         self.gh
-            .add_blocked_by(&self.repo, issue_number as u64, blocker.id as i64)
+            .add_blocked_by(
+                &self.repo,
+                issue_number.cast_unsigned(),
+                blocker.id.cast_signed(),
+            )
             .await
     }
 }
@@ -992,7 +997,7 @@ mod tests {
 
     #[test]
     fn is_github_issue_id_rejects_empty_and_non_numeric() {
-        assert!(!is_github_issue_id(&ExternalId("".to_string())));
+        assert!(!is_github_issue_id(&ExternalId(String::new())));
         assert!(!is_github_issue_id(&ExternalId("abc".to_string())));
         assert!(!is_github_issue_id(&ExternalId("1.0".to_string())));
     }
@@ -1016,9 +1021,9 @@ mod tests {
             user: GitHubUser {
                 login: "u".to_string(),
             },
-            created_at: "".to_string(),
-            updated_at: "".to_string(),
-            html_url: "".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            html_url: String::new(),
             node_id: None,
             pull_request: None,
             state_reason: None,
@@ -1039,9 +1044,9 @@ mod tests {
             user: GitHubUser {
                 login: "u".to_string(),
             },
-            created_at: "".to_string(),
-            updated_at: "".to_string(),
-            html_url: "".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            html_url: String::new(),
             node_id: None,
             pull_request: None,
             state_reason: None,
@@ -1062,9 +1067,9 @@ mod tests {
             user: GitHubUser {
                 login: "u".to_string(),
             },
-            created_at: "".to_string(),
-            updated_at: "".to_string(),
-            html_url: "".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            html_url: String::new(),
             node_id: None,
             pull_request: None,
             state_reason: None,
@@ -1085,9 +1090,9 @@ mod tests {
             user: GitHubUser {
                 login: "u".to_string(),
             },
-            created_at: "".to_string(),
-            updated_at: "".to_string(),
-            html_url: "".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            html_url: String::new(),
             node_id: None,
             pull_request: None,
             state_reason: None,
@@ -1105,7 +1110,7 @@ mod tests {
             user: crate::github::types::GitHubUser {
                 login: "u".to_string(),
             },
-            created_at: "".to_string(),
+            created_at: String::new(),
             updated_at: None,
             html_url: None,
             issue_url: None,
@@ -1123,7 +1128,7 @@ mod tests {
             user: crate::github::types::GitHubUser {
                 login: "u".to_string(),
             },
-            created_at: "".to_string(),
+            created_at: String::new(),
             updated_at: None,
             html_url: None,
             issue_url: None,
@@ -1168,9 +1173,9 @@ mod tests {
             user: GitHubUser {
                 login: "owner".to_string(),
             },
-            created_at: "".to_string(),
-            updated_at: "".to_string(),
-            html_url: "".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            html_url: String::new(),
             node_id: None,
             pull_request: None,
             state_reason: None,
@@ -1182,7 +1187,10 @@ mod tests {
         assert!(mentions.is_empty());
     }
 
-    #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the env lock stays held across the awaits so tests do not race on GH_TOKEN"
+    )]
     #[tokio::test]
     async fn get_mentions_and_list_issue_comments_exclude_contributor_on_owner_issue() {
         use crate::github::http::GhHttp;
@@ -1268,9 +1276,9 @@ mod tests {
             user: GitHubUser {
                 login: "u".to_string(),
             },
-            created_at: "".to_string(),
-            updated_at: "".to_string(),
-            html_url: "".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            html_url: String::new(),
             node_id: None,
             pull_request: None,
             state_reason: None,

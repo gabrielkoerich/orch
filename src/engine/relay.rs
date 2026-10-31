@@ -126,7 +126,7 @@ pub(crate) async fn handle(text: &str, store: &TaskStore, notify: &Notify) {
                     .payload
                     .as_ref()
                     .and_then(|p| p.pointer("/issue/number"))
-                    .and_then(|v| v.as_i64());
+                    .and_then(serde_json::Value::as_i64);
 
                 if let Some(number) = number {
                     let key = format!("dep_blocker_read_at:{}#{number}", msg.repo);
@@ -223,8 +223,10 @@ mod tests {
         assert!(!woke(&notify).await);
     }
 
-    // The handshake callback's error type is tungstenite's, too large for the lint
-    #[allow(clippy::result_large_err)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "the handshake callback returns tungstenite's large error type"
+    )]
     #[tokio::test]
     async fn a_session_says_hello_with_the_cursor_and_applies_events() {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};

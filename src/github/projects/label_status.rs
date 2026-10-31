@@ -133,7 +133,6 @@ impl LabelSyncConfig {
     }
 }
 
-#[allow(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
 #[async_trait]
 pub(crate) trait ProjectApi: Sync {
     async fn query(&self, query: &str, variables: Value) -> Result<Value>;
@@ -159,7 +158,7 @@ fn check_response(response: &Value) -> Result<()> {
     Ok(())
 }
 
-const BOARD_QUERY: &str = r#"
+const BOARD_QUERY: &str = r"
 query ProjectLabelStatus($project: ID!, $field: String!, $cursor: String) {
   node(id: $project) {
     ... on ProjectV2 {
@@ -191,17 +190,17 @@ query ProjectLabelStatus($project: ID!, $field: String!, $cursor: String) {
       }
     }
   }
-}"#;
+}";
 
-const UPDATE_STATUS: &str = r#"
+const UPDATE_STATUS: &str = r"
 mutation ProjectLabelStatusUpdate($project: ID!, $item: ID!, $field: ID!, $option: String!) {
   updateProjectV2ItemFieldValue(input: {
     projectId: $project, itemId: $item, fieldId: $field,
     value: { singleSelectOptionId: $option }
   }) { projectV2Item { id } }
-}"#;
+}";
 
-const FIELDS_QUERY: &str = r#"
+const FIELDS_QUERY: &str = r"
 query ProjectLabelStatusFields($node: ID!, $cursor: String!) {
   node(id: $node) { ... on ProjectV2 {
     id fields(first: 100, after: $cursor) {
@@ -212,16 +211,16 @@ query ProjectLabelStatusFields($node: ID!, $cursor: String!) {
         }
     }
   } }
-}"#;
+}";
 
-const LABELS_QUERY: &str = r#"
+const LABELS_QUERY: &str = r"
 query ProjectLabelStatusLabels($node: ID!, $cursor: String!) {
   node(id: $node) { ... on Issue {
     id labels(first: 100, after: $cursor) {
       pageInfo { hasNextPage endCursor } nodes { name }
     }
   } }
-}"#;
+}";
 
 // A safety ceiling above GitHub's maximum Project item count. Detect both
 // repeated and endlessly advancing malformed cursors without unbounded reads.
@@ -550,7 +549,7 @@ mod tests {
 
     fn config() -> LabelSyncConfig {
         LabelSyncConfig::parse(
-            r#"
+            r"
 enabled: true
 projects:
   - repo: example/work
@@ -559,7 +558,7 @@ projects:
       board:todo: Todo
       board:held: Held
       board:done: Done
-"#,
+",
         )
         .unwrap()
     }
@@ -577,7 +576,7 @@ projects:
         })
     }
 
-    fn page(items: Vec<Value>, next: Option<&str>) -> Value {
+    fn page(items: &[Value], next: Option<&str>) -> Value {
         json!({"data":{"node":{
             "id":"PVT_A", "closed":false,
             "fields":{"nodes":[{"id":"FIELD_A","name":"Status","options":[
@@ -595,7 +594,7 @@ projects:
     async fn repairs_missing_and_drifted_status_then_next_poll_is_noop() {
         let api = FakeApi::new(vec![
             page(
-                vec![
+                &[
                     item(
                         "ONE",
                         &[
@@ -614,7 +613,7 @@ projects:
             ack("ONE"),
             ack("TWO"),
             page(
-                vec![
+                &[
                     item("ONE", &["board:todo", "execution:held"], Some("TODO_A")),
                     item("TWO", &["board:held"], Some("HELD_A")),
                 ],
@@ -643,9 +642,9 @@ projects:
     #[tokio::test]
     async fn label_change_moves_existing_item_without_local_task_transition() {
         let api = FakeApi::new(vec![
-            page(vec![item("ONE", &["board:todo"], Some("TODO_A"))], None),
+            page(&[item("ONE", &["board:todo"], Some("TODO_A"))], None),
             page(
-                vec![item(
+                &[item(
                     "ONE",
                     &["board:held", "execution:held"],
                     Some("TODO_A"),
@@ -653,7 +652,7 @@ projects:
                 None,
             ),
             ack("ONE"),
-            page(vec![item("ONE", &["board:done"], Some("HELD_A"))], None),
+            page(&[item("ONE", &["board:done"], Some("HELD_A"))], None),
             ack("ONE"),
         ]);
         let config = config();
@@ -667,10 +666,10 @@ projects:
     #[tokio::test]
     async fn traverses_pages_and_does_not_write_duplicate_item() {
         let api = FakeApi::new(vec![
-            page(vec![item("ONE", &["board:held"], None)], Some("PAGE2")),
+            page(&[item("ONE", &["board:held"], None)], Some("PAGE2")),
             ack("ONE"),
             page(
-                vec![
+                &[
                     item("ONE", &["board:held"], None),
                     item("TWO", &["board:todo"], None),
                 ],
@@ -687,7 +686,7 @@ projects:
     #[tokio::test]
     async fn ignores_missing_ambiguous_unknown_and_nonworkflow_labels() {
         let api = FakeApi::new(vec![page(
-            vec![
+            &[
                 item(
                     "ONE",
                     &[
@@ -705,7 +704,7 @@ projects:
             None,
         )]);
         assert_eq!(config().reconcile(&api, "example/work").await.unwrap(), 0);
-        assert!(api.mutations().is_empty());
+        assert_eq!(api.mutations(), Vec::<Value>::new());
     }
 
     #[tokio::test]
@@ -717,7 +716,7 @@ projects:
         let mut pr = item("PR", &["board:todo"], None);
         pr["content"]["__typename"] = json!("PullRequest");
         let api = FakeApi::new(vec![page(
-            vec![
+            &[
                 foreign,
                 archived,
                 pr,
@@ -726,7 +725,7 @@ projects:
             None,
         )]);
         assert_eq!(config().reconcile(&api, "example/work").await.unwrap(), 0);
-        assert!(api.mutations().is_empty());
+        assert_eq!(api.mutations(), Vec::<Value>::new());
     }
 
     #[tokio::test]
@@ -735,9 +734,9 @@ projects:
         incomplete["content"]["labels"]["nodes"] = json!([{}]);
         let mut wrong_field = item("TWO", &["board:todo"], Some("DONE_A"));
         wrong_field["fieldValueByName"]["field"]["id"] = json!("OTHER_FIELD");
-        let api = FakeApi::new(vec![page(vec![incomplete, wrong_field], None)]);
+        let api = FakeApi::new(vec![page(&[incomplete, wrong_field], None)]);
         assert_eq!(config().reconcile(&api, "example/work").await.unwrap(), 0);
-        assert!(api.mutations().is_empty());
+        assert_eq!(api.mutations(), Vec::<Value>::new());
     }
 
     #[tokio::test]
@@ -749,28 +748,28 @@ projects:
                 {"id":"C","name":"Held"}, {"id":"D","name":"Done"}
             ]),
         ] {
-            let mut response = page(vec![item("ONE", &["board:todo"], None)], None);
+            let mut response = page(&[item("ONE", &["board:todo"], None)], None);
             response["data"]["node"]["fields"]["nodes"][0]["options"] = options;
             let api = FakeApi::new(vec![response]);
             assert!(config().reconcile(&api, "example/work").await.is_err());
-            assert!(api.mutations().is_empty());
+            assert_eq!(api.mutations(), Vec::<Value>::new());
         }
     }
 
     #[tokio::test]
     async fn partial_graphql_error_prevents_writes() {
-        let mut response = page(vec![item("ONE", &["board:todo"], None)], None);
+        let mut response = page(&[item("ONE", &["board:todo"], None)], None);
         response["errors"] = json!([{"message":"partial label permission failure"}]);
         let api = FakeApi::new(vec![response]);
         assert!(config().reconcile(&api, "example/work").await.is_err());
-        assert!(api.mutations().is_empty());
+        assert_eq!(api.mutations(), Vec::<Value>::new());
     }
 
     #[tokio::test]
     async fn incomplete_field_or_option_nodes_cannot_hide_ambiguity() {
         for incomplete in [Value::Null, json!({"id":"OTHER"}), json!({"name":"Status"})] {
             for connection in ["fields", "options"] {
-                let mut response = page(vec![item("ONE", &["board:todo"], None)], None);
+                let mut response = page(&[item("ONE", &["board:todo"], None)], None);
                 let nodes = if connection == "fields" {
                     &mut response["data"]["node"]["fields"]["nodes"]
                 } else {
@@ -779,7 +778,7 @@ projects:
                 nodes.as_array_mut().unwrap().push(incomplete.clone());
                 let api = FakeApi::new(vec![response]);
                 assert!(config().reconcile(&api, "example/work").await.is_err());
-                assert!(api.mutations().is_empty());
+                assert_eq!(api.mutations(), Vec::<Value>::new());
             }
         }
     }
@@ -788,7 +787,7 @@ projects:
     async fn unknown_mutation_outcome_stops_and_next_poll_reconciles() {
         let api = FakeApi::new(vec![
             page(
-                vec![
+                &[
                     item("ONE", &["board:todo"], None),
                     item("TWO", &["board:todo"], None),
                 ],
@@ -796,7 +795,7 @@ projects:
             ),
             json!({"data":{"updateProjectV2ItemFieldValue":null}}),
             page(
-                vec![
+                &[
                     item("ONE", &["board:todo"], Some("TODO_A")),
                     item("TWO", &["board:todo"], None),
                 ],
@@ -821,12 +820,12 @@ projects:
             label_prefix: default_label_prefix(),
             options: BTreeMap::from([("board:todo".into(), "Todo".into())]),
         });
-        let mut second = page(vec![item("TWO", &["board:todo"], None)], None);
+        let mut second = page(&[item("TWO", &["board:todo"], None)], None);
         second["data"]["node"]["id"] = json!("PVT_B");
         second["data"]["node"]["fields"]["nodes"][0]["id"] = json!("FIELD_B");
         second["data"]["node"]["fields"]["nodes"][0]["options"][0]["id"] = json!("TODO_B");
         let api = FakeApi::new(vec![
-            page(vec![item("ONE", &["board:todo"], None)], None),
+            page(&[item("ONE", &["board:todo"], None)], None),
             ack("ONE"),
             second,
             ack("TWO"),
@@ -850,24 +849,24 @@ projects:
         config.enabled = true;
         assert_eq!(config.reconcile(&no_calls, "other/repo").await.unwrap(), 0);
         assert!(no_calls.calls.lock().unwrap().is_empty());
-        let mut closed = page(vec![item("ONE", &["board:todo"], None)], None);
+        let mut closed = page(&[item("ONE", &["board:todo"], None)], None);
         closed["data"]["node"]["closed"] = json!(true);
         let api = FakeApi::new(vec![closed]);
         assert_eq!(config.reconcile(&api, "example/work").await.unwrap(), 0);
-        assert!(api.mutations().is_empty());
+        assert_eq!(api.mutations(), Vec::<Value>::new());
     }
 
     #[tokio::test]
     async fn invalid_cursor_stops_instead_of_looping() {
-        let api = FakeApi::new(vec![page(vec![], Some("SAME")), page(vec![], Some("SAME"))]);
+        let api = FakeApi::new(vec![page(&[], Some("SAME")), page(&[], Some("SAME"))]);
         assert!(config().reconcile(&api, "example/work").await.is_err());
         assert_eq!(api.calls.lock().unwrap().len(), 2);
-        assert!(api.mutations().is_empty());
+        assert_eq!(api.mutations(), Vec::<Value>::new());
     }
 
     #[tokio::test]
     async fn paginates_fields_and_labels_before_resolving_status() {
-        let mut first = page(vec![item("ONE", &["execution:held"], None)], None);
+        let mut first = page(&[item("ONE", &["execution:held"], None)], None);
         let field = first["data"]["node"]["fields"]["nodes"][0].take();
         first["data"]["node"]["fields"] =
             json!({"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"FIELDS2"}});
@@ -888,7 +887,7 @@ projects:
 
     #[tokio::test]
     async fn second_page_status_label_makes_ambiguous_issue_a_noop() {
-        let mut first = page(vec![item("ONE", &["board:todo"], None)], None);
+        let mut first = page(&[item("ONE", &["board:todo"], None)], None);
         first["data"]["node"]["items"]["nodes"][0]["content"]["labels"]["pageInfo"] =
             json!({"hasNextPage":true,"endCursor":"LABELS2"});
         let api = FakeApi::new(vec![
@@ -896,12 +895,12 @@ projects:
             json!({"data":{"node":{"id":"ISSUE_ONE","labels":{"nodes":[{"name":"board:held"}],"pageInfo":{"hasNextPage":false}}}}}),
         ]);
         assert_eq!(config().reconcile(&api, "example/work").await.unwrap(), 0);
-        assert!(api.mutations().is_empty());
+        assert_eq!(api.mutations(), Vec::<Value>::new());
     }
 
     #[tokio::test]
     async fn duplicate_field_names_across_pages_are_not_guessed() {
-        let mut first = page(vec![item("ONE", &["board:todo"], None)], None);
+        let mut first = page(&[item("ONE", &["board:todo"], None)], None);
         let mut field = first["data"]["node"]["fields"]["nodes"][0].clone();
         field["id"] = json!("OTHER_FIELD");
         first["data"]["node"]["fields"]["pageInfo"] =
@@ -911,7 +910,7 @@ projects:
             json!({"data":{"node":{"id":"PVT_A","fields":{"nodes":[field],"pageInfo":{"hasNextPage":false}}}}}),
         ]);
         assert!(config().reconcile(&api, "example/work").await.is_err());
-        assert!(api.mutations().is_empty());
+        assert_eq!(api.mutations(), Vec::<Value>::new());
     }
 
     #[tokio::test]
@@ -921,12 +920,12 @@ projects:
             json!({"data":{"node":{"id":"OTHER_ISSUE","labels":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}),
             json!({"data":{"node":{"id":"ISSUE_ONE","labels":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"LABELS2"}}}}}),
         ] {
-            let mut first = page(vec![item("ONE", &["board:todo"], None)], None);
+            let mut first = page(&[item("ONE", &["board:todo"], None)], None);
             first["data"]["node"]["items"]["nodes"][0]["content"]["labels"]["pageInfo"] =
                 json!({"hasNextPage":true,"endCursor":"LABELS2"});
             let api = FakeApi::new(vec![first, response]);
             assert!(config().reconcile(&api, "example/work").await.is_err());
-            assert!(api.mutations().is_empty());
+            assert_eq!(api.mutations(), Vec::<Value>::new());
         }
     }
 
@@ -934,7 +933,7 @@ projects:
     async fn board_reconcile_cli_uses_same_display_only_path_and_truthful_result() {
         let api = FakeApi::new(vec![
             page(
-                vec![item("ONE", &["board:held", "execution:held"], None)],
+                &[item("ONE", &["board:held", "execution:held"], None)],
                 None,
             ),
             ack("ONE"),
@@ -967,7 +966,7 @@ projects:
         );
         assert!(no_calls.calls.lock().unwrap().is_empty());
         let noop = FakeApi::new(vec![page(
-            vec![item("ONE", &["board:todo"], Some("TODO_A"))],
+            &[item("ONE", &["board:todo"], Some("TODO_A"))],
             None,
         )]);
         assert_eq!(
@@ -977,7 +976,7 @@ projects:
             0
         );
         let unknown = FakeApi::new(vec![
-            page(vec![item("ONE", &["board:held"], None)], None),
+            page(&[item("ONE", &["board:held"], None)], None),
             json!({"data":null}),
         ]);
         assert!(
@@ -993,7 +992,7 @@ projects:
         config.projects[0].label_prefix = "workflow:".into();
         config.projects[0].options = BTreeMap::from([("workflow:held".into(), "Held".into())]);
         let mut replies = vec![page(
-            (0..6)
+            &(0..6)
                 .map(|id| {
                     item(
                         &id.to_string(),
@@ -1001,7 +1000,7 @@ projects:
                         None,
                     )
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
             None,
         )];
         replies.extend((0..6).map(|id| ack(&id.to_string())));
@@ -1018,11 +1017,11 @@ projects:
     async fn failed_update_can_converge_on_a_later_pass_without_suspension() {
         let mut replies = Vec::new();
         for _ in 0..4 {
-            replies.push(Ok(page(vec![item("ONE", &["board:todo"], None)], None)));
+            replies.push(Ok(page(&[item("ONE", &["board:todo"], None)], None)));
             replies.push(Err("shared client request failed".into()));
         }
         replies.extend([
-            Ok(page(vec![item("ONE", &["board:todo"], None)], None)),
+            Ok(page(&[item("ONE", &["board:todo"], None)], None)),
             Ok(ack("ONE")),
         ]);
         let api = FakeApi::with_errors(replies);

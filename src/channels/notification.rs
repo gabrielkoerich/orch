@@ -31,7 +31,6 @@ impl NotificationLevel {
     pub fn from_config() -> Self {
         match crate::config::get("notifications.level") {
             Ok(val) => match val.as_str() {
-                "all" => Self::All,
                 "verbose" => Self::Verbose,
                 "errors_only" => Self::ErrorsOnly,
                 "none" => Self::None,
@@ -194,7 +193,6 @@ impl TaskNotification {
     ///
     /// Prepends `[project_name]` to the channel-specific formatted message
     /// so recipients of multi-project channels can identify the source.
-    #[allow(dead_code)]
     pub fn format_with_project(&self, channel: &str) -> String {
         let project_name = self
             .repo
@@ -203,10 +201,9 @@ impl TaskNotification {
             .unwrap_or("unknown");
 
         let base = match channel {
-            "telegram" => self.format_telegram(),
             "discord" => self.format_discord(),
             "slack" => self.format_slack(),
-            _ => self.format_telegram(), // fallback
+            _ => self.format_telegram(),
         };
 
         let project_name = if channel == "telegram" {
@@ -234,13 +231,13 @@ fn status_emoji(status: &str) -> &'static str {
 /// Format seconds into human-readable duration.
 pub fn format_duration(seconds: f64) -> String {
     if seconds < 60.0 {
-        format!("{:.0}s", seconds)
+        format!("{seconds:.0}s")
     } else if seconds < 3600.0 {
         format!("{:.0}m {:.0}s", (seconds / 60.0).floor(), seconds % 60.0)
     } else {
         let hours = (seconds / 3600.0).floor();
         let mins = ((seconds % 3600.0) / 60.0).floor();
-        format!("{:.0}h {:.0}m", hours, mins)
+        format!("{hours:.0}h {mins:.0}m")
     }
 }
 

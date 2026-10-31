@@ -14,7 +14,10 @@ use std::time::Duration;
 const TELEGRAM_LONG_POLL_TIMEOUT_SECS: u64 = 30;
 const TELEGRAM_HTTP_TIMEOUT_SECS: u64 = TELEGRAM_LONG_POLL_TIMEOUT_SECS + 15;
 const TELEGRAM_MAX_RETRIES: u32 = 3;
-const _: () = assert!(TELEGRAM_HTTP_TIMEOUT_SECS > TELEGRAM_LONG_POLL_TIMEOUT_SECS);
+const _: () = assert!(
+    TELEGRAM_HTTP_TIMEOUT_SECS > TELEGRAM_LONG_POLL_TIMEOUT_SECS,
+    "the HTTP timeout must outlast the long poll"
+);
 
 /// Escape text for Telegram HTML parse_mode.
 ///
@@ -57,7 +60,7 @@ fn split_for_telegram(text: &str, max: usize) -> Vec<String> {
 fn is_preformatted_html(msg: &OutgoingMessage) -> bool {
     msg.metadata
         .get("preformatted_html")
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
 }
 
@@ -66,6 +69,14 @@ pub struct TelegramChannel {
     pub client: Client,
     pub chat_id: Option<String>,
     pub offset: std::sync::Arc<tokio::sync::Mutex<i64>>,
+}
+
+impl std::fmt::Debug for TelegramChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelegramChannel")
+            .field("chat_id", &self.chat_id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Deserialize)]
@@ -101,7 +112,8 @@ struct CallbackQuery {
 
 #[derive(Deserialize)]
 struct Update {
-    update_id: i64,
+    #[serde(rename = "update_id")]
+    id: i64,
     message: Option<TelegramMessage>,
     callback_query: Option<CallbackQuery>,
 }
@@ -149,15 +161,14 @@ impl TelegramChannel {
                         continue;
                     }
                     anyhow::bail!(
-                        "telegram getUpdates failed after {} attempts: {e}",
-                        TELEGRAM_MAX_RETRIES,
+                        "telegram getUpdates failed after {TELEGRAM_MAX_RETRIES} attempts: {e}",
                     );
                 }
             };
 
             if !response.status().is_success() {
                 let body = response.text().await.unwrap_or_default();
-                anyhow::bail!("telegram API error: {}", body);
+                anyhow::bail!("telegram API error: {body}");
             }
 
             let updates: GetUpdatesResponse = response.json().await?;
@@ -169,10 +180,7 @@ impl TelegramChannel {
             return Ok(updates.result);
         }
 
-        anyhow::bail!(
-            "telegram getUpdates failed after {} attempts",
-            TELEGRAM_MAX_RETRIES,
-        );
+        anyhow::bail!("telegram getUpdates failed after {TELEGRAM_MAX_RETRIES} attempts");
     }
 
     async fn send_message(
@@ -212,13 +220,12 @@ impl TelegramChannel {
 
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("telegram API error: {}", body);
+            anyhow::bail!("telegram API error: {body}");
         }
 
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub async fn send_inline_keyboard(
         &self,
         chat_id: i64,
@@ -249,14 +256,13 @@ impl TelegramChannel {
         let response = self.client.post(&url).json(&params).send().await?;
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("telegram API error: {}", body);
+            anyhow::bail!("telegram API error: {body}");
         }
         let result: serde_json::Value = response.json().await?;
         let message_id = result["result"]["message_id"].as_i64().unwrap_or(0);
         Ok(message_id)
     }
 
-    #[allow(dead_code)]
     pub async fn answer_callback_query(
         &self,
         callback_query_id: &str,
@@ -270,7 +276,7 @@ impl TelegramChannel {
         let response = self.client.post(&url).json(&params).send().await?;
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("telegram API error: {}", body);
+            anyhow::bail!("telegram API error: {body}");
         }
         Ok(())
     }
@@ -278,22 +284,27 @@ impl TelegramChannel {
 
 #[async_trait]
 impl Channel for TelegramChannel {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "telegram"
     }
 
     async fn start(&self) -> anyhow::Result<tokio::sync::mpsc::Receiver<IncomingMessage>> {
+        use std::fmt::Write as _;
+
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let token = self.token.clone();
         let client = self.client.clone();
         let chat_id = self.chat_id.clone();
-        let offset = self.offset.clone();
+        let offset = std::sync::Arc::clone(&self.offset);
 
         let token_fingerprint = {
             let mut hasher = Sha256::new();
             hasher.update(token.as_bytes());
             let hash = hasher.finalize();
-            let hex: String = hash[..8].iter().map(|b| format!("{:02x}", b)).collect();
+            let hex = hash[..8].iter().fold(String::new(), |mut hex, b| {
+                let _ = write!(hex, "{b:02x}");
+                hex
+            });
             format!("sha256:{hex}")
         };
 
@@ -301,10 +312,10 @@ impl Channel for TelegramChannel {
 
         // Create a single TelegramChannel instance to reuse for all API calls
         let channel = TelegramChannel {
-            token: token.clone(),
-            client: client.clone(),
-            chat_id: chat_id.clone(),
-            offset: offset.clone(),
+            token,
+            client,
+            chat_id,
+            offset: std::sync::Arc::clone(&offset),
         };
 
         tokio::spawn(async move {
@@ -339,8 +350,8 @@ impl Channel for TelegramChannel {
                     // Update offset
                     {
                         let mut off = offset.lock().await;
-                        if update.update_id + 1 > *off {
-                            *off = update.update_id + 1;
+                        if update.id + 1 > *off {
+                            *off = update.id + 1;
                         }
                     }
 
@@ -367,7 +378,7 @@ impl Channel for TelegramChannel {
                             .as_ref()
                             .map(|m| m.message_id.to_string())
                             .unwrap_or_default();
-                        let msg_date = cb.message.as_ref().map(|m| m.date).unwrap_or(0);
+                        let msg_date = cb.message.as_ref().map_or(0, |m| m.date);
 
                         let incoming = IncomingMessage {
                             channel: "telegram".to_string(),
@@ -392,16 +403,12 @@ impl Channel for TelegramChannel {
                     }
 
                     // Handle regular messages
-                    let msg = match update.message {
-                        Some(m) => m,
-                        None => continue,
-                    };
+                    let Some(msg) = update.message else { continue };
 
-                    let author = msg
-                        .from
-                        .as_ref()
-                        .map(|u| u.username.clone().unwrap_or(u.first_name.clone()))
-                        .unwrap_or_else(|| "unknown".to_string());
+                    let author = msg.from.as_ref().map_or_else(
+                        || "unknown".to_string(),
+                        |u| u.username.clone().unwrap_or(u.first_name.clone()),
+                    );
 
                     let body = msg.text.unwrap_or_default();
 
@@ -499,7 +506,7 @@ impl Channel for TelegramChannel {
 
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("telegram health check failed: {}", body);
+            anyhow::bail!("telegram health check failed: {body}");
         }
 
         tracing::info!("telegram bot health check passed");
@@ -519,9 +526,12 @@ mod tests {
 
     #[test]
     fn a_long_message_splits_at_line_ends_and_loses_nothing() {
-        let text: String = (0..400)
-            .map(|i| format!("line {i} with some text\n"))
-            .collect();
+        use std::fmt::Write as _;
+
+        let text = (0..400).fold(String::new(), |mut text, i| {
+            let _ = writeln!(text, "line {i} with some text");
+            text
+        });
         let parts = split_for_telegram(&text, 4000);
         assert!(parts.len() > 1);
         assert_eq!(parts.concat(), text);

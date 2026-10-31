@@ -70,7 +70,7 @@ pub async fn dashboard(global: bool, project: Option<String>) -> anyhow::Result<
         }
     }
 
-    println!("Tasks ({} total)", total);
+    println!("Tasks ({total} total)");
 
     for (s, ext, int) in &counts {
         let count = ext + int;
@@ -80,7 +80,7 @@ pub async fn dashboard(global: bool, project: Option<String>) -> anyhow::Result<
                 s.as_label().replace("status:", ""),
                 count,
                 if *int > 0 {
-                    format!(" ({} internal)", int)
+                    format!(" ({int} internal)")
                 } else {
                     String::new()
                 }
@@ -94,7 +94,7 @@ pub async fn dashboard(global: bool, project: Option<String>) -> anyhow::Result<
     println!("\nActive Sessions");
     let tmux = TmuxManager::new();
     let sessions = tmux.list_sessions().await.unwrap_or_default();
-    for s in sessions.iter() {
+    for s in &sessions {
         let agent = store::opt_store_get_task(&store, &repo, &s.task_id)
             .await
             .and_then(|t| t.agent)
@@ -127,12 +127,11 @@ pub async fn dashboard(global: bool, project: Option<String>) -> anyhow::Result<
 
 /// Dashboard using the global store — works from any directory, across all projects.
 async fn dashboard_from_global_store(project: Option<&str>) -> anyhow::Result<()> {
-    let store = match crate::cli::init_store().await {
-        Ok(s) => Arc::new(s),
-        Err(_) => {
-            println!("Tasks (0 total)\n\nActive Sessions\n\nRecent (last 24h)");
-            return Ok(());
-        }
+    let store = if let Ok(s) = crate::cli::init_store().await {
+        Arc::new(s)
+    } else {
+        println!("Tasks (0 total)\n\nActive Sessions\n\nRecent (last 24h)");
+        return Ok(());
     };
 
     // Load all active tasks and recent done tasks from the store.
@@ -172,7 +171,7 @@ async fn dashboard_from_global_store(project: Option<&str>) -> anyhow::Result<()
 
     let done_count = done.len();
     let total = active.len() + done_count;
-    println!("Tasks ({} total)", total);
+    println!("Tasks ({total} total)");
 
     for ts in &status_order {
         let count = if *ts == TaskStatus::Done {
@@ -188,7 +187,7 @@ async fn dashboard_from_global_store(project: Option<&str>) -> anyhow::Result<()
     println!("\nActive Sessions");
     let tmux = TmuxManager::new();
     let sessions = tmux.list_sessions().await.unwrap_or_default();
-    for s in sessions.iter() {
+    for s in &sessions {
         let agent = agent_by_ext_id
             .get(&s.task_id)
             .map(String::as_str)

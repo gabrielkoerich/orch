@@ -446,6 +446,14 @@ pub struct GhHttp {
     api_base: Option<String>,
 }
 
+impl std::fmt::Debug for GhHttp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GhHttp")
+            .field("owner_only", &self.owner_only)
+            .finish_non_exhaustive()
+    }
+}
+
 impl GhHttp {
     /// Create a new client backed by the process-wide shared [`TokenResolver`].
     ///
@@ -493,7 +501,13 @@ impl GhHttp {
         }
     }
 
-    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "only the test build reads the api base override"
+        )
+    )]
     fn api_root(&self) -> &str {
         #[cfg(test)]
         if let Some(base) = &self.api_base {
@@ -591,13 +605,9 @@ impl GhHttp {
             if let Some(until) = engine_cooldown::cooldown_until("github:5xx") {
                 let now = chrono::Utc::now().timestamp();
                 let remaining = if until > now { until - now } else { 0 };
-                anyhow::bail!(
-                    "GitHub API transient 5xx circuit-breaker active for {}s",
-                    remaining
-                );
-            } else {
-                anyhow::bail!("GitHub API transient 5xx circuit-breaker active");
+                anyhow::bail!("GitHub API transient 5xx circuit-breaker active for {remaining}s");
             }
+            anyhow::bail!("GitHub API transient 5xx circuit-breaker active");
         }
 
         // Configurable retry params (defaults chosen conservatively)
@@ -695,9 +705,7 @@ impl GhHttp {
                         );
 
                         last_err = Some(anyhow::anyhow!(
-                            "GitHub API server error ({status}) request_id={}: {}",
-                            req_id,
-                            snippet
+                            "GitHub API server error ({status}) request_id={req_id}: {snippet}"
                         ));
 
                         if attempt + 1 < attempts {
@@ -709,7 +717,7 @@ impl GhHttp {
                                 backoff = max_secs;
                             }
                             // Add small linear jitter to avoid synchronized retries
-                            let jitter_ms = attempt as u64 * 100;
+                            let jitter_ms = u64::from(attempt) * 100;
                             let sleep_dur = Duration::from_secs(backoff)
                                 + Duration::from_millis(jitter_ms.min(1000));
                             tokio::time::sleep(sleep_dur).await;
@@ -738,15 +746,14 @@ impl GhHttp {
                     // throttling) key off that breaker as a signal about GitHub's health.
                     tracing::warn!(err = %e, attempt, "HTTP request failed to send (transport error, GitHub not reached), will retry if attempts remain");
                     last_err = Some(anyhow::anyhow!(
-                        "HTTP request failed to send (transport error): {}",
-                        e
+                        "HTTP request failed to send (transport error): {e}"
                     ));
                     if attempt + 1 < attempts {
                         // Cap exponent at 63 (max valid shift for u64) to prevent overflow
                         let exp = 1u64.checked_shl(attempt.min(63)).unwrap_or(u64::MAX);
                         let backoff = base_secs.saturating_mul(exp);
                         let sleep_dur = Duration::from_secs(backoff)
-                            + Duration::from_millis((attempt as u64 * 100).min(1000));
+                            + Duration::from_millis((u64::from(attempt) * 100).min(1000));
                         tokio::time::sleep(sleep_dur).await;
                         continue;
                     }
@@ -932,12 +939,12 @@ impl GhHttp {
         url: &str,
         query: &[(&str, &str)],
     ) -> anyhow::Result<Vec<T>> {
+        const MAX_JSON_DECODE_RETRIES: u32 = 2;
+        const JSON_DECODE_RETRY_BACKOFF_MS: u64 = 200;
         Self::check_backoff(url)?;
         let mut all: Vec<T> = Vec::new();
         let mut next_url: Option<String> = None;
         let mut is_first = true;
-        const MAX_JSON_DECODE_RETRIES: u32 = 2;
-        const JSON_DECODE_RETRY_BACKOFF_MS: u64 = 200;
 
         loop {
             let (request_url, request_query) = if is_first {
@@ -977,26 +984,23 @@ impl GhHttp {
                     .headers()
                     .get(header::ETAG)
                     .and_then(|v| v.to_str().ok())
-                    .map(|v| v.to_string());
+                    .map(std::string::ToString::to_string);
                 let content_type = resp
                     .headers()
                     .get(header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "<missing>".to_string());
+                    .map_or_else(|| "<missing>".to_string(), std::string::ToString::to_string);
 
                 if status == StatusCode::NOT_MODIFIED {
-                    match cache_key.as_deref().and_then(page_cache_hit) {
-                        Some((body, next)) => break (serde_json::from_str::<Vec<T>>(&body)?, next),
-                        None => {
-                            // The entry is normally there, since If-None-Match is only sent
-                            // when it is, but the size cap can clear the map in between.
-                            // Dropping the ETag makes the retry unconditional, so the loop
-                            // cannot see a second 304
-                            cached_etag = None;
-                            continue;
-                        }
+                    if let Some((body, next)) = cache_key.as_deref().and_then(page_cache_hit) {
+                        break (serde_json::from_str::<Vec<T>>(&body)?, next);
                     }
+                    // The entry is normally there, since If-None-Match is only sent
+                    // when it is, but the size cap can clear the map in between.
+                    // Dropping the ETag makes the retry unconditional, so the loop
+                    // cannot see a second 304
+                    cached_etag = None;
+                    continue;
                 }
 
                 if !status.is_success() {
@@ -1459,12 +1463,10 @@ impl GhHttp {
     pub async fn is_pull_request(&self, repo: &str, number: &str) -> bool {
         self.get_issue(repo, number)
             .await
-            .map(|i| i.pull_request.is_some())
-            .unwrap_or(false)
+            .is_ok_and(|i| i.pull_request.is_some())
     }
 
     /// List issues filtered by a label (paginated).
-    #[allow(dead_code)]
     pub async fn list_issues(&self, repo: &str, label: &str) -> anyhow::Result<Vec<GitHubIssue>> {
         self.list_issues_with_state(repo, label, "open").await
     }
@@ -1495,7 +1497,6 @@ impl GhHttp {
     /// List closed issues updated since `since` (ISO 8601), filtered by label.
     ///
     /// Used for dedup checks — prevents re-creating issues that were recently closed.
-    #[allow(dead_code)]
     pub async fn list_issues_closed_since(
         &self,
         repo: &str,
@@ -1729,8 +1730,8 @@ impl GhHttp {
         let owner = repo
             .split('/')
             .next()
-            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {}", repo))?;
-        let head = format!("{}:{}", owner, branch);
+            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {repo}"))?;
+        let head = format!("{owner}:{branch}");
 
         let url = format!("{GITHUB_API}/repos/{repo}/pulls");
         let prs: Vec<serde_json::Value> = self
@@ -1744,7 +1745,7 @@ impl GhHttp {
             return Ok(false);
         }
         let merged_at = prs[0].get("merged_at");
-        Ok(merged_at.map(|v| !v.is_null()).unwrap_or(false))
+        Ok(merged_at.is_some_and(|v| !v.is_null()))
     }
 
     /// Get the state of a closed PR for the given branch.
@@ -1767,8 +1768,8 @@ impl GhHttp {
         let owner = repo
             .split('/')
             .next()
-            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {}", repo))?;
-        let head = format!("{}:{}", owner, branch);
+            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {repo}"))?;
+        let head = format!("{owner}:{branch}");
 
         let url = format!("{GITHUB_API}/repos/{repo}/pulls");
         let prs: Vec<serde_json::Value> = self
@@ -1803,11 +1804,11 @@ impl GhHttp {
 
             let pr_number = pr
                 .get("number")
-                .and_then(|n| n.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| anyhow::anyhow!("PR missing number field"))?;
 
             let merged_at = pr.get("merged_at");
-            let merged = merged_at.map(|v| !v.is_null()).unwrap_or(false);
+            let merged = merged_at.is_some_and(|v| !v.is_null());
             let state = pr
                 .get("state")
                 .and_then(|v| v.as_str())
@@ -1830,13 +1831,15 @@ impl GhHttp {
         repo: &str,
         branches: &[String],
     ) -> anyhow::Result<std::collections::HashMap<String, bool>> {
+        use std::fmt::Write as _;
+
         if branches.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
 
         let (owner, name) = repo
             .split_once('/')
-            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {}", repo))?;
+            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {repo}"))?;
 
         // Build one alias per branch using positional index to avoid GraphQL
         // alias restrictions on branch names that contain non-identifier chars.
@@ -1845,17 +1848,18 @@ impl GhHttp {
         let mut aliases = String::new();
         let mut vars = serde_json::json!({ "owner": owner, "name": name });
         for (i, branch) in branches.iter().enumerate() {
-            var_defs.push_str(&format!(", $b{i}: String!"));
-            aliases.push_str(&format!(
-                r#"b{i}: pullRequests(headRefName: $b{i}, states: [MERGED], last: 1) {{ nodes {{ merged }} }} "#
-            ));
+            let _ = write!(var_defs, ", $b{i}: String!");
+            let _ = write!(
+                aliases,
+                r"b{i}: pullRequests(headRefName: $b{i}, states: [MERGED], last: 1) {{ nodes {{ merged }} }} "
+            );
             vars[format!("b{i}")] = serde_json::Value::String(branch.clone());
         }
 
         let query = format!(
-            r#"query($owner: String!, $name: String!{var_defs}) {{
+            r"query($owner: String!, $name: String!{var_defs}) {{
                 repository(owner: $owner, name: $name) {{ {aliases} }}
-            }}"#
+            }}"
         );
 
         let resp = self.graphql_with_vars(&query, vars).await?;
@@ -1891,10 +1895,7 @@ impl GhHttp {
                 .and_then(|e| e.get("message"))
                 .and_then(|m| m.as_str())
                 .unwrap_or("no error details");
-            anyhow::anyhow!(
-                "missing /data/repository in GraphQL response: {}",
-                error_msg
-            )
+            anyhow::anyhow!("missing /data/repository in GraphQL response: {error_msg}")
         })?;
 
         let mut result = std::collections::HashMap::new();
@@ -1906,7 +1907,7 @@ impl GhHttp {
                 .and_then(|nodes| nodes.as_array())
                 .and_then(|arr| arr.first())
                 .and_then(|node| node.get("merged"))
-                .and_then(|v| v.as_bool())
+                .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             result.insert(branch.clone(), merged);
         }
@@ -1963,8 +1964,8 @@ impl GhHttp {
         let owner = repo
             .split('/')
             .next()
-            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {}", repo))?;
-        let head = format!("{}:{}", owner, branch);
+            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {repo}"))?;
+        let head = format!("{owner}:{branch}");
 
         let url = format!("{GITHUB_API}/repos/{repo}/pulls");
         let prs: Vec<serde_json::Value> = self
@@ -1979,7 +1980,7 @@ impl GhHttp {
         }
         prs[0]
             .get("number")
-            .and_then(|n| n.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| anyhow::anyhow!("PR missing number field"))
             .map(Some)
     }
@@ -2004,10 +2005,6 @@ impl GhHttp {
     ) -> anyhow::Result<String> {
         use reqwest::header;
 
-        let body = redact_posted_body(body);
-        let url = format!("{}/repos/{repo}/pulls", self.api_root());
-        Self::check_backoff(&url)?;
-
         #[derive(Serialize)]
         struct CreatePullRequest<'a> {
             title: &'a str,
@@ -2015,6 +2012,10 @@ impl GhHttp {
             head: &'a str,
             base: &'a str,
         }
+
+        let body = redact_posted_body(body);
+        let url = format!("{}/repos/{repo}/pulls", self.api_root());
+        Self::check_backoff(&url)?;
 
         let payload = CreatePullRequest {
             title,
@@ -2046,7 +2047,7 @@ impl GhHttp {
         pr.get("html_url")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .ok_or_else(|| anyhow::anyhow!("failed to get PR URL from response: {:?}", pr))
+            .ok_or_else(|| anyhow::anyhow!("failed to get PR URL from response: {pr:?}"))
     }
 
     /// Get the repository's default branch from the GitHub API.
@@ -2078,16 +2079,17 @@ impl GhHttp {
         repo: &str,
         pr_numbers: &[u64],
     ) -> anyhow::Result<std::collections::HashMap<u64, (bool, String)>> {
+        // GitHub GraphQL complexity limit: chunk at 50 to avoid slow/rejected queries.
+        const CHUNK_SIZE: usize = 50;
+
         if pr_numbers.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
 
         let (owner, name) = repo
             .split_once('/')
-            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {}", repo))?;
+            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {repo}"))?;
 
-        // GitHub GraphQL complexity limit: chunk at 50 to avoid slow/rejected queries.
-        const CHUNK_SIZE: usize = 50;
         let mut result = std::collections::HashMap::new();
 
         for chunk in pr_numbers.chunks(CHUNK_SIZE) {
@@ -2098,7 +2100,7 @@ impl GhHttp {
                 .join("\n  ");
 
             let query = format!(
-                r#"query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {aliases} }} }}"#
+                r"query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {aliases} }} }}"
             );
 
             let resp = self
@@ -2110,7 +2112,10 @@ impl GhHttp {
 
             for n in chunk {
                 if let Some(pr) = repo_data.get(format!("pr{n}")) {
-                    let merged = pr.get("merged").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let merged = pr
+                        .get("merged")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
                     let state = pr
                         .get("state")
                         .and_then(|v| v.as_str())
@@ -2134,6 +2139,9 @@ impl GhHttp {
         issue_numbers: &[u64],
         caller_context: &str,
     ) -> anyhow::Result<std::collections::HashMap<String, (String, Vec<String>)>> {
+        // GitHub GraphQL complexity limit: chunk at 50 to avoid slow/rejected queries.
+        const CHUNK_SIZE: usize = 50;
+
         if issue_numbers.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -2155,10 +2163,8 @@ impl GhHttp {
 
         let (owner, name) = repo
             .split_once('/')
-            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {}", repo))?;
+            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {repo}"))?;
 
-        // GitHub GraphQL complexity limit: chunk at 50 to avoid slow/rejected queries.
-        const CHUNK_SIZE: usize = 50;
         let mut result = std::collections::HashMap::new();
 
         for chunk in valid_issue_numbers.chunks(CHUNK_SIZE) {
@@ -2171,7 +2177,7 @@ impl GhHttp {
                 .join(" ");
 
             let query = format!(
-                r#"query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {aliases} }} }}"#
+                r"query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {aliases} }} }}"
             );
 
             let resp = self
@@ -2305,8 +2311,7 @@ impl GhHttp {
             Ok(value) => Ok(value
                 .get("workflows")
                 .and_then(|v| v.as_array())
-                .map(|workflows| !workflows.is_empty())
-                .unwrap_or(false)),
+                .is_some_and(|workflows| !workflows.is_empty())),
             Err(e) => {
                 let err = e.to_string();
                 if err.contains("404") {
@@ -2375,7 +2380,7 @@ impl GhHttp {
         value
             .pointer("/commit/committer/date")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .ok_or_else(|| anyhow::anyhow!("commit {sha} has no committer date"))
     }
 
@@ -2433,7 +2438,7 @@ impl GhHttp {
         let url = format!("{GITHUB_API}/repos/{repo}/compare/{branch}...{sha}");
         let body: serde_json::Value = self.get_json(&url).await?;
         body.get("ahead_by")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .map(|ahead| ahead == 0)
             .ok_or_else(|| anyhow::anyhow!("compare response has no numeric ahead_by field"))
     }
@@ -2487,12 +2492,11 @@ impl GhHttp {
     ) -> anyhow::Result<()> {
         let query = format!(
             r#"mutation {{
-                addSubIssue(input: {{issueId: "{}", subIssueId: "{}"}}) {{
+                addSubIssue(input: {{issueId: "{parent_node_id}", subIssueId: "{child_node_id}"}}) {{
                     issue {{ number }}
                     subIssue {{ number }}
                 }}
-            }}"#,
-            parent_node_id, child_node_id
+            }}"#
         );
         self.graphql_with_headers(&query, &["GraphQL-Features:sub_issues"])
             .await?;
@@ -2518,19 +2522,19 @@ impl GhHttp {
     ) -> anyhow::Result<String> {
         let parts: Vec<&str> = repo.split('/').collect();
         if parts.len() != 2 {
-            anyhow::bail!("invalid repo format: expected 'owner/repo', got '{}'", repo);
+            anyhow::bail!("invalid repo format: expected 'owner/repo', got '{repo}'");
         }
         let (owner, repo_name) = (parts[0], parts[1]);
 
         // First, get the repository and issue node IDs
-        let query = r#"query($owner: String!, $name: String!, $number: Int!) {
+        let query = r"query($owner: String!, $name: String!, $number: Int!) {
                 repository(owner: $owner, name: $name) {
                     id
                     issue(number: $number) {
                         id
                     }
                 }
-            }"#;
+            }";
         let vars = serde_json::json!({
             "owner": owner,
             "name": repo_name,
@@ -2550,7 +2554,7 @@ impl GhHttp {
             .ok_or_else(|| anyhow::anyhow!("failed to get issue node ID"))?;
 
         // Fetch branch ref to get the commit OID required by createLinkedBranch
-        let branch_query = r#"query($owner: String!, $name: String!, $ref: String!) {
+        let branch_query = r"query($owner: String!, $name: String!, $ref: String!) {
                 repository(owner: $owner, name: $name) {
                     ref(qualifiedName: $ref) {
                         target {
@@ -2558,7 +2562,7 @@ impl GhHttp {
                         }
                     }
                 }
-            }"#;
+            }";
         let branch_vars = serde_json::json!({
             "owner": owner,
             "name": repo_name,
@@ -2572,47 +2576,46 @@ impl GhHttp {
 
         // If branch doesn't exist yet, use the default branch OID.
         // createLinkedBranch will create the branch at that OID AND link it.
-        let branch_oid = match branch_oid {
-            Some(oid) => oid.to_string(),
-            None => {
-                // Get default branch OID as the base for the new branch
-                let default_query = r#"query($owner: String!, $name: String!) {
-                        repository(owner: $owner, name: $name) {
-                            defaultBranchRef {
-                                target {
-                                    oid
-                                }
+        let branch_oid = if let Some(oid) = branch_oid {
+            oid.to_string()
+        } else {
+            // Get default branch OID as the base for the new branch
+            let default_query = r"query($owner: String!, $name: String!) {
+                    repository(owner: $owner, name: $name) {
+                        defaultBranchRef {
+                            target {
+                                oid
                             }
                         }
-                    }"#;
-                let default_vars = serde_json::json!({
-                    "owner": owner,
-                    "name": repo_name,
-                });
-                let default_result = self.graphql_with_vars(default_query, default_vars).await?;
-                match default_result
-                    .pointer("/data/repository/defaultBranchRef/target/oid")
-                    .and_then(|v| v.as_str())
-                {
-                    Some(oid) => {
-                        tracing::debug!(
-                            repo,
-                            issue_number,
-                            branch,
-                            "branch not found, using default branch OID to create and link"
-                        );
-                        oid.to_string()
                     }
-                    None => {
-                        return Ok(format!("unlinked:{}", branch));
-                    }
+                }";
+            let default_vars = serde_json::json!({
+                "owner": owner,
+                "name": repo_name,
+            });
+            let default_result = self.graphql_with_vars(default_query, default_vars).await?;
+            match default_result
+                .pointer("/data/repository/defaultBranchRef/target/oid")
+                .and_then(|v| v.as_str())
+            {
+                Some(oid) => {
+                    tracing::debug!(
+                        repo,
+                        issue_number,
+                        branch,
+                        "branch not found, using default branch OID to create and link"
+                    );
+                    oid.to_string()
+                }
+                None => {
+                    return Ok(format!("unlinked:{branch}"));
                 }
             }
         };
 
         // Use createLinkedBranch mutation to link the issue to the existing branch.
         // Required fields: issueId, repositoryId, name (branch name), oid (commit SHA).
-        let mutation = r#"mutation($issueId: ID!, $repositoryId: ID!, $name: String!, $oid: GitObjectID!) {
+        let mutation = r"mutation($issueId: ID!, $repositoryId: ID!, $name: String!, $oid: GitObjectID!) {
                 createLinkedBranch(input: {
                     issueId: $issueId
                     repositoryId: $repositoryId
@@ -2626,7 +2629,7 @@ impl GhHttp {
                         }
                     }
                 }
-            }"#;
+            }";
         let mutation_vars = serde_json::json!({
             "issueId": issue_id,
             "repositoryId": repo_id,
@@ -2662,8 +2665,7 @@ impl GhHttp {
                     if errors.iter().any(|e| {
                         e.get("message")
                             .and_then(|m| m.as_str())
-                            .map(|m| m.contains("already"))
-                            .unwrap_or(false)
+                            .is_some_and(|m| m.contains("already"))
                     }) {
                         tracing::debug!(
                             repo,
@@ -2671,15 +2673,15 @@ impl GhHttp {
                             branch,
                             "issue already linked to branch"
                         );
-                        Ok(format!("already_linked:{}", branch))
+                        Ok(format!("already_linked:{branch}"))
                     } else {
-                        anyhow::bail!("failed to link issue to branch: {:?}", result)
+                        anyhow::bail!("failed to link issue to branch: {result:?}")
                     }
                 }
             }
             Err(e) => {
                 // Check if it's a "already exists" type error
-                let err_str = format!("{}", e);
+                let err_str = format!("{e}");
                 if err_str.contains("already") || err_str.contains("existing") {
                     tracing::debug!(
                         repo,
@@ -2687,7 +2689,7 @@ impl GhHttp {
                         branch,
                         "issue already linked to branch (error check)"
                     );
-                    Ok(format!("already_linked:{}", branch))
+                    Ok(format!("already_linked:{branch}"))
                 } else {
                     Err(e)
                 }
@@ -2791,11 +2793,11 @@ impl GhHttp {
         let (owner, repo_name) = (parts[0], parts[1]);
 
         // First get the PR node ID
-        let pr_query = r#"query($owner: String!, $name: String!, $number: Int!) {
+        let pr_query = r"query($owner: String!, $name: String!, $number: Int!) {
             repository(owner: $owner, name: $name) {
                 pullRequest(number: $number) { id }
             }
-        }"#;
+        }";
         let body = self
             .graphql_with_vars(
                 pr_query,
@@ -2813,11 +2815,11 @@ impl GhHttp {
             .to_string();
 
         // Enable auto-merge with squash
-        let mutation = r#"mutation($prId: ID!) {
+        let mutation = r"mutation($prId: ID!) {
             enablePullRequestAutoMerge(input: {pullRequestId: $prId, mergeMethod: SQUASH}) {
                 pullRequest { autoMergeRequest { enabledAt } }
             }
-        }"#;
+        }";
         let body = self
             .graphql_with_vars(mutation, serde_json::json!({ "prId": pr_id }))
             .await?;
@@ -2833,7 +2835,7 @@ impl GhHttp {
     pub async fn get_sub_issues(&self, repo: &str, number: &str) -> anyhow::Result<Vec<u64>> {
         let parts: Vec<&str> = repo.split('/').collect();
         if parts.len() != 2 {
-            anyhow::bail!("invalid repo format: expected 'owner/repo', got '{}'", repo);
+            anyhow::bail!("invalid repo format: expected 'owner/repo', got '{repo}'");
         }
         let (owner, repo_name) = (parts[0], parts[1]);
         let number = match parse_positive_issue_number(number) {
@@ -2863,7 +2865,7 @@ impl GhHttp {
 
             let (query, vars) = if let Some(ref c) = cursor {
                 (
-                    r#"query($owner: String!, $name: String!, $number: Int!, $first: Int!, $after: String!) {
+                    r"query($owner: String!, $name: String!, $number: Int!, $first: Int!, $after: String!) {
                     repository(owner: $owner, name: $name) {
                         issue(number: $number) {
                             subIssues(first: $first, after: $after) {
@@ -2872,7 +2874,7 @@ impl GhHttp {
                             }
                         }
                     }
-                }"#,
+                }",
                     serde_json::json!({
                         "owner": owner,
                         "name": repo_name,
@@ -2883,7 +2885,7 @@ impl GhHttp {
                 )
             } else {
                 (
-                    r#"query($owner: String!, $name: String!, $number: Int!, $first: Int!) {
+                    r"query($owner: String!, $name: String!, $number: Int!, $first: Int!) {
                     repository(owner: $owner, name: $name) {
                         issue(number: $number) {
                             subIssues(first: $first) {
@@ -2892,7 +2894,7 @@ impl GhHttp {
                             }
                         }
                     }
-                }"#,
+                }",
                     serde_json::json!({
                         "owner": owner,
                         "name": repo_name,
@@ -2920,7 +2922,7 @@ impl GhHttp {
                 Some(nodes) => {
                     let numbers: Vec<u64> = nodes
                         .iter()
-                        .filter_map(|n| n.get("number").and_then(|num| num.as_u64()))
+                        .filter_map(|n| n.get("number").and_then(serde_json::Value::as_u64))
                         .collect();
                     all_numbers.extend(numbers);
                 }
@@ -2930,7 +2932,7 @@ impl GhHttp {
             let page_info = sub_issues_data.and_then(|s| s.get("pageInfo"));
             let has_next = page_info
                 .and_then(|p| p.get("hasNextPage"))
-                .and_then(|h| h.as_bool())
+                .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
 
             if !has_next {
@@ -2940,7 +2942,7 @@ impl GhHttp {
             cursor = page_info
                 .and_then(|p| p.get("endCursor"))
                 .and_then(|c| c.as_str())
-                .map(|s| s.to_string());
+                .map(std::string::ToString::to_string);
         }
 
         Ok(all_numbers)
@@ -3020,17 +3022,12 @@ impl GhHttp {
             .iter()
             .find(|r| {
                 r["name"].as_str() == Some(workflow_name)
-                    && matches!(
-                        r["conclusion"].as_str(),
-                        Some("failure") | Some("cancelled")
-                    )
+                    && matches!(r["conclusion"].as_str(), Some("failure" | "cancelled"))
             })
             .and_then(|r| r["id"].as_u64())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "no failed run found for workflow '{}' on branch '{}'",
-                    workflow_name,
-                    branch
+                    "no failed run found for workflow '{workflow_name}' on branch '{branch}'"
                 )
             })?;
 
@@ -3072,7 +3069,7 @@ impl GhHttp {
 
         let (owner, name) = repo
             .split_once('/')
-            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {}", repo))?;
+            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {repo}"))?;
 
         // Build one GraphQL alias per PR number.
         let aliases: String = pr_numbers
@@ -3082,7 +3079,7 @@ impl GhHttp {
             .join("\n");
 
         let query = format!(
-            r#"query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {aliases} }} }}"#
+            r"query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {aliases} }} }}"
         );
 
         let resp = self
@@ -3100,7 +3097,7 @@ impl GhHttp {
 
             let merged = pr_data
                 .get("merged")
-                .and_then(|v| v.as_bool())
+                .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             let mergeable = match pr_data.get("mergeable").and_then(|v| v.as_str()) {
                 Some("MERGEABLE") => Some(true),
@@ -3155,7 +3152,7 @@ impl GhHttp {
                     fetched_threads = pr_data
                         .pointer("/reviewThreads/nodes")
                         .and_then(|v| v.as_array())
-                        .map_or(0, |threads| threads.len()),
+                        .map_or(0, std::vec::Vec::len),
                     "batch review fetch truncated reviewThreads connection at first page"
                 );
             }
@@ -3304,7 +3301,6 @@ impl GhHttp {
                         pr_number,
                         "ignoring automated review comment from non-collaborator"
                     );
-                    continue;
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -3312,7 +3308,6 @@ impl GhHttp {
                         error = %e,
                         "failed to check collaborator status, skipping comment"
                     );
-                    continue;
                 }
             }
         }
@@ -3370,7 +3365,7 @@ fn parse_commit_meta(commit: &serde_json::Value) -> CommitMeta {
 
 fn parse_behind_by(body: &serde_json::Value) -> anyhow::Result<u64> {
     body.get("behind_by")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| anyhow::anyhow!("compare response has no numeric behind_by field"))
 }
 
@@ -3416,7 +3411,7 @@ fn parse_classic_check(check: &serde_json::Value) -> Option<RequiredStatusCheck>
     let context = check.get("context")?.as_str()?.to_string();
     let integration_id = check
         .get("app_id")
-        .and_then(|v| v.as_i64())
+        .and_then(serde_json::Value::as_i64)
         .filter(|&id| id > 0);
     Some(RequiredStatusCheck {
         context,
@@ -3444,7 +3439,7 @@ fn parse_ruleset_required_status_checks(rules: &[serde_json::Value]) -> Vec<Requ
             };
             let integration_id = check
                 .get("integration_id")
-                .and_then(|v| v.as_i64())
+                .and_then(serde_json::Value::as_i64)
                 .filter(|&id| id > 0);
             out.push(RequiredStatusCheck {
                 context: context.to_string(),
@@ -3502,8 +3497,7 @@ pub fn rate_limit_metrics() -> RateLimitMetrics {
     let (rest_remaining, rest_reset_at) = REST_RATE_LIMIT
         .lock()
         .ok()
-        .map(|rl| (rl.remaining, rl.reset_at))
-        .unwrap_or((None, None));
+        .map_or((None, None), |rl| (rl.remaining, rl.reset_at));
     let graphql_remaining = GRAPHQL_RATE_LIMIT.lock().ok().and_then(|rl| rl.remaining);
     RateLimitMetrics {
         hits: METRIC_RATE_LIMIT_HITS.load(Ordering::Relaxed),
@@ -3574,7 +3568,7 @@ pub struct PrReviewBatchData {
 /// needed by the review poll loop in a single batch request.
 fn build_pr_review_alias(n: u64) -> String {
     format!(
-        r#"pr{n}: pullRequest(number: {n}) {{
+        r"pr{n}: pullRequest(number: {n}) {{
   merged
   mergeable
   headRefOid
@@ -3624,7 +3618,7 @@ fn build_pr_review_alias(n: u64) -> String {
     }}
     pageInfo {{ hasNextPage endCursor }}
   }}
-}}"#
+}}"
     )
 }
 
@@ -3634,7 +3628,7 @@ fn build_pr_issue_comments_page_query(
     pr_number: u64,
     after_cursor: &str,
 ) -> (String, serde_json::Value) {
-    let query = r#"query($owner: String!, $name: String!, $number: Int!, $after: String!) {
+    let query = r"query($owner: String!, $name: String!, $number: Int!, $after: String!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       comments(first: 100, after: $after) {
@@ -3650,7 +3644,7 @@ fn build_pr_issue_comments_page_query(
       }
     }
   }
-}"#
+}"
     .to_string();
     let vars = serde_json::json!({
         "owner": owner,
@@ -3664,7 +3658,7 @@ fn build_pr_issue_comments_page_query(
 fn connection_has_next_page(page_info: Option<&serde_json::Value>) -> bool {
     page_info
         .and_then(|v| v.get("hasNextPage"))
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
 }
 
@@ -3682,7 +3676,7 @@ fn connection_end_cursor(page_info: Option<&serde_json::Value>) -> Option<String
 fn parse_graphql_review(node: &serde_json::Value) -> Option<GitHubReview> {
     use super::types::GitHubUser;
     Some(GitHubReview {
-        id: node.get("databaseId").and_then(|v| v.as_u64())?,
+        id: node.get("databaseId").and_then(serde_json::Value::as_u64)?,
         user: GitHubUser {
             login: node
                 .pointer("/author/login")
@@ -3707,7 +3701,7 @@ fn parse_graphql_review(node: &serde_json::Value) -> Option<GitHubReview> {
 fn parse_graphql_review_comment(node: &serde_json::Value) -> Option<GitHubReviewComment> {
     use super::types::GitHubUser;
     Some(GitHubReviewComment {
-        id: node.get("databaseId").and_then(|v| v.as_u64())?,
+        id: node.get("databaseId").and_then(serde_json::Value::as_u64)?,
         user: GitHubUser {
             login: node
                 .pointer("/author/login")
@@ -3720,11 +3714,14 @@ fn parse_graphql_review_comment(node: &serde_json::Value) -> Option<GitHubReview
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        line: node.get("line").and_then(|v| v.as_u64()).map(|v| v as u32),
+        line: node
+            .get("line")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok()),
         original_line: node
             .get("originalLine")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32),
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok()),
         commit_id: node
             .pointer("/commit/oid")
             .and_then(|v| v.as_str())
@@ -3750,7 +3747,9 @@ fn parse_graphql_review_comment(node: &serde_json::Value) -> Option<GitHubReview
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        in_reply_to_id: node.pointer("/replyTo/databaseId").and_then(|v| v.as_u64()),
+        in_reply_to_id: node
+            .pointer("/replyTo/databaseId")
+            .and_then(serde_json::Value::as_u64),
         diff_hunk: node
             .get("diffHunk")
             .and_then(|v| v.as_str())
@@ -3761,7 +3760,7 @@ fn parse_graphql_review_comment(node: &serde_json::Value) -> Option<GitHubReview
 fn parse_graphql_issue_comment(node: &serde_json::Value) -> Option<GitHubComment> {
     use super::types::GitHubUser;
     Some(GitHubComment {
-        id: node.get("databaseId").and_then(|v| v.as_u64())?,
+        id: node.get("databaseId").and_then(serde_json::Value::as_u64)?,
         body: node.get("body").and_then(|v| v.as_str())?.to_string(),
         user: GitHubUser {
             login: node
@@ -3863,7 +3862,8 @@ mod tests {
 
     #[test]
     fn parse_classic_required_status_checks_empty_when_unprotected() {
-        assert!(parse_classic_required_status_checks(&serde_json::json!({})).is_empty());
+        let checks = parse_classic_required_status_checks(&serde_json::json!({}));
+        assert!(checks.is_empty(), "{checks:?}");
     }
 
     #[test]
@@ -4042,7 +4042,7 @@ mod tests {
             .join(" ");
 
         let query = format!(
-            r#"query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {aliases} }} }}"#
+            r"query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {aliases} }} }}"
         );
         assert!(query.contains("$owner"));
         assert!(query.contains("$name"));
@@ -4759,8 +4759,7 @@ mod tests {
             let err = result.unwrap_err().to_string();
             assert!(
                 err.contains("JSON decode failed") || err.contains("expected ident"),
-                "error should mention JSON decode or serde error: {}",
-                err
+                "error should mention JSON decode or serde error: {err}"
             );
         }
 
@@ -5017,7 +5016,10 @@ mod tests {
             }))
         }
 
-        #[allow(clippy::await_holding_lock)]
+        #[expect(
+            clippy::await_holding_lock,
+            reason = "the env lock stays held across the awaits so tests do not race on GH_TOKEN"
+        )]
         #[tokio::test]
         async fn retries_once_with_fresh_token_after_401() {
             let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
@@ -5026,7 +5028,7 @@ mod tests {
 
             let server = MockServer::start().await;
             let hits = Arc::new(AtomicUsize::new(0));
-            let hits_in_handler = hits.clone();
+            let hits_in_handler = std::sync::Arc::clone(&hits);
             Mock::given(method("GET"))
                 .respond_with(move |_req: &Request| {
                     if hits_in_handler.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -5058,7 +5060,10 @@ mod tests {
             assert_eq!(hits.load(Ordering::SeqCst), 2, "exactly one retry expected");
         }
 
-        #[allow(clippy::await_holding_lock)]
+        #[expect(
+            clippy::await_holding_lock,
+            reason = "the env lock stays held across the awaits so tests do not race on GH_TOKEN"
+        )]
         #[tokio::test]
         async fn double_401_bails_with_distinct_auth_error() {
             let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
@@ -5067,7 +5072,7 @@ mod tests {
 
             let server = MockServer::start().await;
             let hits = Arc::new(AtomicUsize::new(0));
-            let hits_in_handler = hits.clone();
+            let hits_in_handler = std::sync::Arc::clone(&hits);
             Mock::given(method("GET"))
                 .respond_with(move |_req: &Request| {
                     hits_in_handler.fetch_add(1, Ordering::SeqCst);
@@ -5144,7 +5149,10 @@ mod tests {
             );
         }
 
-        #[allow(clippy::await_holding_lock)]
+        #[expect(
+            clippy::await_holding_lock,
+            reason = "the env lock stays held across the awaits so tests do not race on GH_TOKEN"
+        )]
         #[tokio::test]
         async fn add_comment_redacts_github_token() {
             let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
@@ -5153,7 +5161,7 @@ mod tests {
 
             let server = MockServer::start().await;
             let captured = Arc::new(Mutex::new(None::<String>));
-            let captured_in_handler = captured.clone();
+            let captured_in_handler = std::sync::Arc::clone(&captured);
             Mock::given(method("POST"))
                 .and(path("/repos/owner/repo/issues/1/comments"))
                 .respond_with(move |req: &Request| {
@@ -5183,7 +5191,10 @@ mod tests {
             assert_token_redacted(&raw);
         }
 
-        #[allow(clippy::await_holding_lock)]
+        #[expect(
+            clippy::await_holding_lock,
+            reason = "the env lock stays held across the awaits so tests do not race on GH_TOKEN"
+        )]
         #[tokio::test]
         async fn create_pr_redacts_github_token() {
             let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
@@ -5192,7 +5203,7 @@ mod tests {
 
             let server = MockServer::start().await;
             let captured = Arc::new(Mutex::new(None::<String>));
-            let captured_in_handler = captured.clone();
+            let captured_in_handler = std::sync::Arc::clone(&captured);
             Mock::given(method("POST"))
                 .and(path("/repos/owner/repo/pulls"))
                 .respond_with(move |req: &Request| {
@@ -5224,7 +5235,10 @@ mod tests {
             assert_token_redacted(&raw);
         }
 
-        #[allow(clippy::await_holding_lock)]
+        #[expect(
+            clippy::await_holding_lock,
+            reason = "the env lock stays held across the awaits so tests do not race on GH_TOKEN"
+        )]
         #[tokio::test]
         async fn update_pr_body_redacts_github_token() {
             let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
@@ -5233,7 +5247,7 @@ mod tests {
 
             let server = MockServer::start().await;
             let captured = Arc::new(Mutex::new(None::<String>));
-            let captured_in_handler = captured.clone();
+            let captured_in_handler = std::sync::Arc::clone(&captured);
             Mock::given(method("PATCH"))
                 .and(path("/repos/owner/repo/pulls/7"))
                 .respond_with(move |req: &Request| {

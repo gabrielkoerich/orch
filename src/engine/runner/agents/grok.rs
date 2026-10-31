@@ -25,6 +25,7 @@ use super::{
 };
 
 /// Runner for the `grok` CLI
+#[derive(Debug)]
 pub struct GrokRunner;
 
 impl GrokRunner {
@@ -35,7 +36,7 @@ impl GrokRunner {
 
 impl AgentRunner for GrokRunner {
     #[cfg(test)]
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "grok"
     }
 
@@ -141,7 +142,9 @@ pub fn find_grok_result(ndjson: &str) -> Option<super::AgentResult> {
         return Some(result);
     };
     if result.cost_usd.is_none() {
-        result.cost_usd = val.get("total_cost_usd").and_then(|v| v.as_f64());
+        result.cost_usd = val
+            .get("total_cost_usd")
+            .and_then(serde_json::Value::as_f64);
     }
     if val.get("stop_reason").and_then(|v| v.as_str()) == Some("max_tokens") {
         result.truncated_by_length = true;

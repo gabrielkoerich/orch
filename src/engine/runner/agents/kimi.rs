@@ -19,6 +19,12 @@ pub struct KimiClaudeRunner {
     inner: MiniMaxClaudeRunner,
 }
 
+impl std::fmt::Debug for KimiClaudeRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KimiClaudeRunner").finish_non_exhaustive()
+    }
+}
+
 impl KimiClaudeRunner {
     pub fn new() -> Self {
         Self {

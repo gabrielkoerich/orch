@@ -1,3 +1,8 @@
+#![expect(
+    clippy::print_stderr,
+    reason = "helpers log progress of live agent runs"
+)]
+
 //! Integration tests that invoke real agent CLIs.
 //!
 //! These tests are `#[ignore]`d by default — they need real API keys,
@@ -49,7 +54,7 @@ fn assert_claude_envelope(stdout: &str) -> String {
 
     let is_error = val
         .get("is_error")
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     assert!(!is_error, "Claude envelope has is_error=true: {val}");
 
@@ -111,7 +116,7 @@ fn kimi_has_quota_error(stdout: &str) -> bool {
 
     let is_error = val
         .get("is_error")
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let result = val.get("result").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -124,7 +129,7 @@ fn kimi_has_quota_error(stdout: &str) -> bool {
 // ── Claude ────────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
+#[ignore = "runs the real claude CLI"]
 fn claude_responds_with_json_envelope() {
     if !is_available("claude") {
         eprintln!("SKIP: claude not in PATH");
@@ -172,7 +177,7 @@ fn claude_responds_with_json_envelope() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "runs the real claude CLI"]
 fn claude_stdin_pipe_mode() {
     if !is_available("claude") {
         eprintln!("SKIP: claude not in PATH");
@@ -221,7 +226,7 @@ fn claude_stdin_pipe_mode() {
 // ── Codex ─────────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
+#[ignore = "runs the real codex CLI"]
 fn codex_responds_with_ndjson() {
     if !is_available("codex") {
         eprintln!("SKIP: codex not in PATH");
@@ -285,7 +290,7 @@ fn codex_responds_with_ndjson() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "runs the real codex CLI"]
 fn codex_stdin_pipe_mode() {
     if !is_available("codex") {
         eprintln!("SKIP: codex not in PATH");
@@ -352,7 +357,7 @@ fn codex_stdin_pipe_mode() {
 // ── OpenCode ──────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
+#[ignore = "runs the real opencode CLI"]
 fn opencode_responds_with_ndjson() {
     if !is_available("opencode") {
         eprintln!("SKIP: opencode not in PATH");
@@ -393,7 +398,7 @@ fn opencode_responds_with_ndjson() {
 /// prompt that fails with "user rejected permission" without the config
 /// should succeed when permissions are pre-allowed (as orch's runner does).
 #[test]
-#[ignore]
+#[ignore = "runs the real opencode CLI"]
 fn opencode_with_permission_config_succeeds() {
     if !is_available("opencode") {
         eprintln!("SKIP: opencode not in PATH");
@@ -465,7 +470,7 @@ fn opencode_with_permission_config_succeeds() {
 // ── Kimi ──────────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
+#[ignore = "runs the real kimi CLI"]
 fn kimi_responds_like_claude() {
     if !is_available("kimi") {
         eprintln!("SKIP: kimi not in PATH");
@@ -514,7 +519,7 @@ fn kimi_responds_like_claude() {
 // ── MiniMax ───────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
+#[ignore = "runs the real minimax CLI"]
 fn minimax_responds_like_claude() {
     if !is_available("minimax") {
         eprintln!("SKIP: minimax not in PATH");
@@ -558,7 +563,7 @@ fn minimax_responds_like_claude() {
 // ── Router LLM ───────────────────────────────────────────────────
 
 #[test]
-#[ignore]
+#[ignore = "runs the real claude CLI"]
 fn router_claude_haiku_returns_valid_routing() {
     if !is_available("claude") {
         eprintln!("SKIP: claude not in PATH");

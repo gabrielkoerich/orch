@@ -132,6 +132,7 @@ fn insert_session_flag(
     mut shell_cmd: String,
     session: SessionContinuation<'_>,
 ) -> String {
+    use std::fmt::Write as _;
     if !supports_session(agent) {
         return shell_cmd;
     }
@@ -144,7 +145,7 @@ fn insert_session_flag(
     if let Some(pos) = shell_cmd.rfind("< \"") {
         shell_cmd.insert_str(pos, &format!("{flag} {quoted} \\\n  "));
     } else if agent == "grok" {
-        shell_cmd.push_str(&format!(" \\\n  {flag} {quoted}"));
+        let _ = write!(shell_cmd, " \\\n  {flag} {quoted}");
     } else {
         tracing::warn!(
             agent,
@@ -194,7 +195,7 @@ pub async fn run_direct_command_raw(
 }
 
 /// Shared output-handling logic: parse stdout, classify errors.
-fn finish_output(output: std::process::Output, agent: &str) -> Result<DirectResult> {
+fn finish_output(output: &std::process::Output, agent: &str) -> Result<DirectResult> {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let exit_code = output.status.code().unwrap_or(-1);
@@ -208,10 +209,10 @@ fn finish_output(output: std::process::Output, agent: &str) -> Result<DirectResu
 
     match runner.parse_response(&stdout) {
         Ok(parsed) => {
-            let text = if !parsed.response.summary.is_empty() {
-                parsed.response.summary.clone()
-            } else {
+            let text = if parsed.response.summary.is_empty() {
                 stdout.clone()
+            } else {
+                parsed.response.summary.clone()
             };
             Ok(DirectResult {
                 text,
@@ -247,7 +248,7 @@ async fn run_shell_command(
         .map_err(|_| anyhow::anyhow!("agent timed out after {}s", timeout.as_secs()))?
         .map_err(|e| anyhow::anyhow!("spawning agent: {e}"))?;
 
-    finish_output(output, agent)
+    finish_output(&output, agent)
 }
 
 /// Extract text and token usage from a Claude JSON envelope or raw output.
@@ -283,11 +284,11 @@ pub(crate) fn extract_from_envelope(raw: &str) -> (String, Option<u64>, Option<u
                 let input_tokens = obj
                     .get("usage")
                     .and_then(|u| u.get("input_tokens"))
-                    .and_then(|v| v.as_u64());
+                    .and_then(serde_json::Value::as_u64);
                 let output_tokens = obj
                     .get("usage")
                     .and_then(|u| u.get("output_tokens"))
-                    .and_then(|v| v.as_u64());
+                    .and_then(serde_json::Value::as_u64);
                 return (text, input_tokens, output_tokens);
             }
         }
@@ -422,7 +423,7 @@ mod tests {
         );
         assert_eq!(
             DirectCommandError::EmptyResponse {
-                stderr: "".to_string()
+                stderr: String::new()
             }
             .to_string(),
             "agent returned empty response"

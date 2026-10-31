@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     fn parses_multi_file_hunks() {
-        let diff = r#"diff --git a/src/a.rs b/src/a.rs
+        let diff = r"diff --git a/src/a.rs b/src/a.rs
 index 1111111..2222222 100644
 --- a/src/a.rs
 +++ b/src/a.rs
@@ -87,7 +87,7 @@ index 3333333..4444444 100644
 @@ -5 +5 @@
 -old
 +new
-"#;
+";
 
         let files = parse_unified_diff_hunks(diff);
         assert_eq!(files.len(), 2);

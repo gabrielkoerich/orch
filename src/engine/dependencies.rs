@@ -33,7 +33,7 @@ fn blocker_refresh_ttl_secs(repo: &str, number: i64) -> i64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     repo.hash(&mut hasher);
     number.hash(&mut hasher);
-    let offset = (hasher.finish() % BLOCKER_REFRESH_SPREAD_SECS as u64) as i64;
+    let offset = i64::try_from(hasher.finish() % BLOCKER_REFRESH_SPREAD_SECS as u64).unwrap_or(0);
     BLOCKER_REFRESH_TTL_SECS + offset
 }
 
@@ -152,7 +152,7 @@ fn extract_refs(text: &str, default_repo: &str) -> Vec<DepRef> {
         }
         let digits: String = text[index + 1..]
             .chars()
-            .take_while(|ch| ch.is_ascii_digit())
+            .take_while(char::is_ascii_digit)
             .collect();
         if digits.is_empty() {
             index += 1;
@@ -701,19 +701,16 @@ async fn failure_notices(store: &TaskStore) -> anyhow::Result<Vec<DepNotice>> {
             &edge.depends_on_repo,
             edge.depends_on_number,
         );
-        let (comment, summary) = match kind {
-            "not_planned" => {
-                let text = format!(
-                    "Blocked by {label}, which was closed as not planned. This task stays waiting."
-                );
-                (format!("{text}{}", crate::engine::orch_footer()), text)
-            }
-            _ => {
-                let text = format!(
-                    "Blocked by {label}, which is blocked and needs a person. This task stays waiting."
-                );
-                (format!("{text}{}", crate::engine::orch_footer()), text)
-            }
+        let (comment, summary) = if kind == "not_planned" {
+            let text = format!(
+                "Blocked by {label}, which was closed as not planned. This task stays waiting."
+            );
+            (format!("{text}{}", crate::engine::orch_footer()), text)
+        } else {
+            let text = format!(
+                "Blocked by {label}, which is blocked and needs a person. This task stays waiting."
+            );
+            (format!("{text}{}", crate::engine::orch_footer()), text)
         };
         let issue_number = edge
             .task_external_id
@@ -903,7 +900,7 @@ See #4 in the notes
 
     #[async_trait]
     impl ExternalBackend for ScriptedBackend {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "scripted"
         }
 
@@ -1277,7 +1274,7 @@ See #4 in the notes
         let second = emit_dependency_notices(&backend, &store, None)
             .await
             .unwrap();
-        assert!(second.is_empty());
+        assert!(second.is_empty(), "{second:?}");
         assert_eq!(backend.comments.lock().unwrap().len(), 2);
     }
 
@@ -1307,7 +1304,7 @@ See #4 in the notes
         let again = emit_dependency_notices(&backend, &store, Some(&transport))
             .await
             .unwrap();
-        assert!(again.is_empty());
+        assert!(again.is_empty(), "{again:?}");
         let note = rx.try_recv().unwrap();
         assert_eq!(note.status, "failed");
         assert!(rx.try_recv().is_err());
@@ -1339,8 +1336,8 @@ See #4 in the notes
         let backend: Arc<dyn ExternalBackend> =
             Arc::new(crate::backends::test_helpers::NoopBackend);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".into(),
         ));
         let mut tier = HashMap::new();
@@ -1570,8 +1567,8 @@ See #4 in the notes
         assert!(first > 0, "the first refresh has to read the blocker");
 
         let task_manager = TaskManager::with_store(
-            backend.clone() as Arc<dyn ExternalBackend>,
-            store.clone(),
+            std::sync::Arc::clone(&backend) as Arc<dyn ExternalBackend>,
+            std::sync::Arc::clone(&store),
             "owner/repo".into(),
         );
         task_manager
@@ -1598,8 +1595,8 @@ See #4 in the notes
 
         // `#1` has no task row here, so finishing the dependent must not clear its entry
         let task_manager = TaskManager::with_store(
-            backend.clone() as Arc<dyn ExternalBackend>,
-            store.clone(),
+            std::sync::Arc::clone(&backend) as Arc<dyn ExternalBackend>,
+            std::sync::Arc::clone(&store),
             "owner/repo".into(),
         );
         task_manager
@@ -1886,8 +1883,8 @@ See #4 in the notes
             model_map,
             ..Default::default()
         };
-        let left_store = store.clone();
-        let right_store = store.clone();
+        let left_store = std::sync::Arc::clone(&store);
+        let right_store = std::sync::Arc::clone(&store);
         let left_task = ext.clone();
         let right_task = ext;
         let right_config = config.clone();

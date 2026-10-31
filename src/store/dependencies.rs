@@ -99,6 +99,10 @@ struct BlockerView {
 /// The store does not talk to GitHub. The engine fills this and the snapshot
 /// decides whether the blocker is done
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool mirrors a github field and the struct is stored as json"
+)]
 pub struct ObservedPullRequest {
     pub merged: bool,
     pub base_is_default: bool,
@@ -110,6 +114,10 @@ pub struct ObservedPullRequest {
 ///
 /// Missing JSON fails closed: the dependency stays open
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool mirrors a github field and the struct is stored as json"
+)]
 pub struct BlockerSnapshot {
     pub issue_state: String,
     pub state_reason: Option<String>,
@@ -181,7 +189,7 @@ impl BlockerSnapshot {
 /// Map a GitHub issue `state` and `state_reason` onto the values stored in KV.
 ///
 /// A classic close with no reason counts as completed. An open issue counts as open
-pub fn normalize_close_reason(state: &str, state_reason: Option<&str>) -> &'static str {
+pub(crate) fn normalize_close_reason(state: &str, state_reason: Option<&str>) -> &'static str {
     if !state.eq_ignore_ascii_case("closed") {
         return "open";
     }
@@ -490,7 +498,7 @@ impl TaskStore {
 }
 
 /// Plan-import note that a blocker outside the milestone has no GitHub issue yet
-pub fn blocked_external_from_body(body: &str) -> Vec<String> {
+pub(crate) fn blocked_external_from_body(body: &str) -> Vec<String> {
     let mut ids = Vec::new();
     let mut push = |token: &str| {
         let token = token.trim();
@@ -652,8 +660,8 @@ mod tests {
         assert_eq!(released, None);
         let task = store.get(b).await.unwrap();
         assert_eq!(task.status, TaskStatus::New);
-        assert!(task.branch.is_empty());
-        assert!(task.worktree.is_empty());
+        assert_eq!(task.branch, "");
+        assert_eq!(task.worktree, "");
         assert_eq!(
             store
                 .kv_get(&worktree_refresh_key(b))
@@ -826,8 +834,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let left = store.clone();
-        let right = store.clone();
+        let left = std::sync::Arc::clone(&store);
+        let right = std::sync::Arc::clone(&store);
         let (a, c) = tokio::join!(
             left.block_claim_if_waiting(b),
             right.block_claim_if_waiting(b)
@@ -911,8 +919,8 @@ mod tests {
         store.block_claim_if_waiting(b).await.unwrap();
         let task = store.get(b).await.unwrap();
         assert_eq!(task.status, TaskStatus::Waiting);
-        assert!(task.branch.is_empty());
-        assert!(task.worktree.is_empty());
+        assert_eq!(task.branch, "");
+        assert_eq!(task.worktree, "");
     }
 
     #[test]
@@ -926,7 +934,8 @@ mod tests {
             blocked_external_from_body(body),
             vec!["M1-05".to_string(), "M1-01".to_string()]
         );
-        assert!(blocked_external_from_body("<!-- orch-plan: M6-01 -->").is_empty());
+        let blocked = blocked_external_from_body("<!-- orch-plan: M6-01 -->");
+        assert!(blocked.is_empty(), "{blocked:?}");
     }
 
     #[tokio::test]
@@ -1019,7 +1028,10 @@ mod tests {
 
 /// The SQL behind each replicated dependency write
 pub(crate) mod apply {
-    use super::*;
+    use super::{
+        blocked_external_from_body, load_blockers, worktree_refresh_key, Context, NewDependency,
+        Row, SqliteConnection,
+    };
 
     pub(crate) async fn move_repo(
         conn: &mut SqliteConnection,

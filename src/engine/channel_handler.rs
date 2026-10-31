@@ -31,6 +31,7 @@ const PICK_TIMEOUT: Duration = Duration::from_secs(60);
 ///
 /// Stored in-memory with a 60-second TTL. If the user does not pick within
 /// that window the entry is silently discarded on next access.
+#[derive(Debug)]
 pub struct PendingPick {
     /// Original free-text body that will become the task title/body.
     pub original_body: String,
@@ -210,9 +211,8 @@ async fn ack_channel_interaction(
     if channel_name != "telegram" {
         return;
     }
-    let cb_id = match metadata["callback_query_id"].as_str() {
-        Some(id) => id,
-        None => return,
+    let Some(cb_id) = metadata["callback_query_id"].as_str() else {
+        return;
     };
     for ch in channels.iter() {
         if ch.name() == channel_name {
@@ -229,7 +229,10 @@ async fn ack_channel_interaction(
 /// Used both by the direct `NewTask` path and by the project-picker callback path.
 ///
 /// `forced_repo` overrides project resolution and ALWAYS shows the `in [repo]` label.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared by two call paths that each hold these pieces separately"
+)]
 async fn create_and_announce_task(
     body: &str,
     forced_repo: Option<&str>,
@@ -265,7 +268,7 @@ async fn create_and_announce_task(
 
     let title = if body.chars().count() > 80 {
         let truncated: String = body.chars().take(80).collect();
-        format!("{}…", truncated)
+        format!("{truncated}…")
     } else {
         body.to_string()
     };
@@ -290,10 +293,10 @@ async fn create_and_announce_task(
             capture
                 .register_session(repo, &task_id, &session_name)
                 .await;
-            let transport_clone = transport.clone();
-            let channels_clone = channels.clone();
+            let transport_clone = std::sync::Arc::clone(transport);
+            let channels_clone = std::sync::Arc::clone(channels);
             let task_id_clone = task_id.clone();
-            let repo_clone = repo.to_string();
+            let repo_clone = repo.clone();
             tokio::spawn(async move {
                 fanout_output(repo_clone, task_id_clone, transport_clone, channels_clone).await;
             });
@@ -328,7 +331,10 @@ async fn create_and_announce_task(
 ///
 /// When a free-text message arrives on the General channel with multiple projects
 /// configured, a project picker is shown instead of silently using the first project.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the channel loop passes each engine handle separately"
+)]
 pub(super) async fn handle_channel_message(
     msg: IncomingMessage,
     transport: &Arc<Transport>,
@@ -376,11 +382,9 @@ pub(super) async fn handle_channel_message(
                     // Falls back to the first project when no binding / no match is found.
                     let repos: Vec<&str> =
                         engine_refs.iter().map(|(r, _, _, _)| r.as_str()).collect();
-                    let idx = transport
-                        .get_binding(repo, task_id)
-                        .await
-                        .map(|b| engine_ref_idx_for_session(&repos, tmux, task_id, &b.tmux_session))
-                        .unwrap_or(0);
+                    let idx = transport.get_binding(repo, task_id).await.map_or(0, |b| {
+                        engine_ref_idx_for_session(&repos, tmux, task_id, &b.tmux_session)
+                    });
                     if let Some((repo, backend, task_manager, store)) = engine_refs.get(idx) {
                         let gh = match GhHttp::new() {
                             Ok(gh) => gh,
@@ -773,14 +777,12 @@ pub(super) async fn handle_stats_command(
             .find(|(r, _, _, _)| r == repo)
             .and_then(|(_, _, _, s)| s.as_ref());
 
-        let store = match store {
-            Some(s) => s,
-            None => continue,
-        };
+        let Some(store) = store else { continue };
 
         match store.get_metrics_summary_by_repo(repo, 24).await {
             Ok(summary) => {
                 let total = summary.tasks_completed_24h + summary.tasks_failed_24h;
+                #[expect(clippy::cast_precision_loss, reason = "a display percentage")]
                 let rate = if total > 0 {
                     (summary.tasks_completed_24h as f64 / total as f64) * 100.0
                 } else {
@@ -811,7 +813,7 @@ pub(super) async fn handle_stats_command(
             }
             Err(e) => {
                 tracing::warn!(repo, err = %e, "failed to query metrics");
-                lines.push(format!("**{}**: error fetching metrics", repo));
+                lines.push(format!("**{repo}**: error fetching metrics"));
             }
         }
     }
@@ -836,7 +838,7 @@ pub(super) async fn handle_subscribe_command(
         let projects: Vec<&str> = channel_router
             .projects()
             .iter()
-            .map(|s| s.as_str())
+            .map(std::string::String::as_str)
             .collect();
         return format!(
             "Usage: `/subscribe <project>`\nAvailable projects: {}",
@@ -852,7 +854,7 @@ pub(super) async fn handle_subscribe_command(
             channel_router
                 .projects()
                 .iter()
-                .map(|s| s.as_str())
+                .map(std::string::String::as_str)
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -984,7 +986,9 @@ mod tests {
     fn pending_pick_is_expired_when_deadline_in_past() {
         let pick = PendingPick {
             original_body: "fix the login button".to_string(),
-            expires_at: Instant::now() - Duration::from_secs(1),
+            expires_at: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("the clock is past one second"),
         };
         assert!(pick.is_expired());
     }

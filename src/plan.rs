@@ -345,6 +345,8 @@ pub fn issue_body_with(
     rel_path: &str,
     blocked_external: &[String],
 ) -> String {
+    use std::fmt::Write as _;
+
     let mut out = String::new();
     if !task.goal.is_empty() {
         out.push_str("## Goal\n\n");
@@ -381,7 +383,7 @@ pub fn issue_body_with(
         path = encode_git_path(rel_path),
         anchor = urlencoding::encode(&task_anchor(task)),
     );
-    out.push_str(&format!("[{rel_path}]({url})\n\n"));
+    let _ = write!(out, "[{rel_path}]({url})\n\n");
     if !blocked_external.is_empty() {
         out.push_str("<!-- orch-blocked-external: ");
         out.push_str(&blocked_external.join(", "));
@@ -501,10 +503,10 @@ pub fn diff_import(
 /// Dependencies outside the selected set that have no GitHub issue yet.
 ///
 /// An id that is not in the roadmap is an error. An id in the roadmap is reported
-pub fn unmet_externals(
+pub fn unmet_externals<S: std::hash::BuildHasher>(
     tasks: &[Task],
     roadmap: &Roadmap,
-    known_ids: &HashSet<String>,
+    known_ids: &HashSet<String, S>,
 ) -> Result<Vec<UnmetExternal>, PlanError> {
     let selected: HashSet<&str> = tasks.iter().map(|task| task.id.as_str()).collect();
     let roadmap_ids: HashSet<&str> = roadmap.tasks.iter().map(|task| task.id.as_str()).collect();
@@ -561,10 +563,10 @@ pub fn blocked_external_ids<'a>(unmet: &'a [UnmetExternal], task_id: &str) -> Ve
         .collect()
 }
 
-pub fn diff_links(
+pub fn diff_links<S: std::hash::BuildHasher>(
     tasks: &[Task],
     bindings: &[Binding],
-    current: &HashMap<u64, Vec<DepRef>>,
+    current: &HashMap<u64, Vec<DepRef>, S>,
 ) -> Result<Vec<LinkEdit>, PlanError> {
     let mut edits = Vec::new();
     let mut errors = Vec::new();
@@ -641,17 +643,20 @@ pub fn render_report(
 }
 
 fn render_unmet(unmet: &[UnmetExternal], skipped: &[String]) -> String {
+    use std::fmt::Write as _;
+
     let skip: HashSet<&str> = skipped.iter().map(String::as_str).collect();
     let mut out = String::new();
     for id in skipped {
         let deps = blocked_external_ids(unmet, id);
         if deps.is_empty() {
-            out.push_str(&format!("skip {id}\n"));
+            let _ = writeln!(out, "skip {id}");
         } else {
-            out.push_str(&format!(
-                "skip {id} depends on {}, which has no issue yet\n",
+            let _ = writeln!(
+                out,
+                "skip {id} depends on {}, which has no issue yet",
                 deps.join(", ")
-            ));
+            );
         }
     }
     let mut seen = HashSet::new();
@@ -660,16 +665,19 @@ fn render_unmet(unmet: &[UnmetExternal], skipped: &[String]) -> String {
             continue;
         }
         let deps = blocked_external_ids(unmet, &item.task_id);
-        out.push_str(&format!(
-            "blocked-external {} depends on {}, which has no issue yet\n",
+        let _ = writeln!(
+            out,
+            "blocked-external {} depends on {}, which has no issue yet",
             item.task_id,
             deps.join(", ")
-        ));
+        );
     }
     out
 }
 
 pub fn render_tasks(diff: &PlanDiff) -> String {
+    use std::fmt::Write as _;
+
     let mut out = String::new();
     for plan in &diff.tasks {
         let human = if plan.task.owner_human {
@@ -682,22 +690,26 @@ pub fn render_tasks(diff: &PlanDiff) -> String {
         } else {
             plan.task.depends_on.join(", ")
         };
-        out.push_str(&format!(
-            "{kind} {title}{human}\n  depends on: {deps}\n",
+        let _ = writeln!(
+            out,
+            "{kind} {title}{human}\n  depends on: {deps}",
             kind = kind_word(plan.kind),
             title = issue_title(&plan.task),
-        ));
+        );
     }
     for removed in &diff.removed {
-        out.push_str(&format!(
-            "removed {} issue #{} ({}), not closed\n",
+        let _ = writeln!(
+            out,
+            "removed {} issue #{} ({}), not closed",
             removed.task_id, removed.number, removed.state
-        ));
+        );
     }
     out
 }
 
 pub fn render_links(links: &[LinkEdit]) -> String {
+    use std::fmt::Write as _;
+
     let mut out = String::new();
     for link in links {
         match link {
@@ -708,18 +720,19 @@ pub fn render_links(links: &[LinkEdit]) -> String {
                 blocking_number,
                 ..
             } => {
-                out.push_str(&format!(
-                    "link {task_id}{issue} blocked by {blocking_task_id}{blocking}\n",
+                let _ = writeln!(
+                    out,
+                    "link {task_id}{issue} blocked by {blocking_task_id}{blocking}",
                     issue = number_suffix(*issue_number),
                     blocking = number_suffix(*blocking_number),
-                ));
+                );
             }
             LinkEdit::Remove {
                 task_id,
                 blocking_number,
                 ..
             } => {
-                out.push_str(&format!("unlink {task_id} blocked by #{blocking_number}\n"));
+                let _ = writeln!(out, "unlink {task_id} blocked by #{blocking_number}");
             }
         }
     }
@@ -995,9 +1008,7 @@ fn is_milestone_id(token: &str) -> bool {
     for ch in chars {
         if ch.is_ascii_digit() {
             saw_digit = true;
-        } else if ch.is_ascii_alphabetic() {
-            continue;
-        } else {
+        } else if !ch.is_ascii_alphabetic() {
             return false;
         }
     }
@@ -1074,8 +1085,7 @@ fn split_cells(line: &str) -> Vec<String> {
 fn cell(cells: &[String], index: Option<usize>) -> &str {
     index
         .and_then(|index| cells.get(index))
-        .map(String::as_str)
-        .unwrap_or("")
+        .map_or("", String::as_str)
 }
 
 fn task_from_row(
@@ -1169,7 +1179,7 @@ impl Draft {
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = r#"
+    const SAMPLE: &str = r"
 ## M1. Content model and pack format
 
 ### M1-01 Set up the workspace
@@ -1229,7 +1239,7 @@ mod tests {
 |---|---|---|---|
 | M6-01 Units 4 to 10 | Write the rest of the year | Each pack validates | M1-05, M1-01 |
 | M6-02 Festival modules | Attach modules | Each shows in Hoje | M6-01 |
-"#;
+";
 
     fn roadmap() -> Roadmap {
         parse_roadmap(SAMPLE).unwrap()
@@ -1275,12 +1285,16 @@ mod tests {
                 "- CI fails on a formatting error.".to_string(),
             ]
         );
-        assert!(first.depends_on.is_empty());
+        assert!(first.depends_on.is_empty(), "{:?}", first.depends_on);
         assert_eq!(first.goal, "a Rust workspace that builds.");
         assert_eq!(first.scope, "the `api/` workspace.");
 
         let scheduler = task(&roadmap, "M1-05");
-        assert!(scheduler.depends_on.is_empty());
+        assert!(
+            scheduler.depends_on.is_empty(),
+            "{:?}",
+            scheduler.depends_on
+        );
         assert_eq!(
             scheduler.acceptance,
             vec!["- At least 15 fixtures.".to_string()]
@@ -1290,7 +1304,7 @@ mod tests {
     #[test]
     fn none_with_trailing_prose_adds_no_dependency() {
         let roadmap = roadmap();
-        assert!(task(&roadmap, "M1-04").depends_on.is_empty());
+        assert_eq!(task(&roadmap, "M1-04").depends_on, [] as [String; 0]);
     }
 
     #[test]
@@ -1311,7 +1325,7 @@ mod tests {
             task(&roadmap, "M6-02").depends_on,
             vec!["M6-01".to_string()]
         );
-        assert!(task(&roadmap, "M6-01").anchor_heading.is_empty());
+        assert_eq!(task(&roadmap, "M6-01").anchor_heading, "");
         assert_eq!(task(&roadmap, "M6-01").milestone_id, "M6");
     }
 
@@ -1345,13 +1359,13 @@ mod tests {
 
     #[test]
     fn unknown_table_column_is_an_error() {
-        let markdown = r#"
+        let markdown = r"
 ## M3. Session
 
 | Task | Title | Depends on |
 |---|---|---|
 | M3-01 Session backfill | ignored | none |
-"#;
+";
         let err = parse_roadmap(markdown).unwrap_err();
         assert!(err.message.contains("Title"), "{}", err.message);
         assert!(err.message.contains("line 4"), "{}", err.message);
@@ -1364,13 +1378,13 @@ mod tests {
 
     #[test]
     fn table_row_with_only_an_id_has_no_title() {
-        let markdown = r#"
+        let markdown = r"
 ## M3. Session
 
 | Task | Depends on |
 |---|---|
 | M3-01 | none |
-"#;
+";
         let err = parse_roadmap(markdown).unwrap_err();
         assert!(err.message.contains("M3-01"), "{}", err.message);
         assert!(err.message.contains("no title"), "{}", err.message);
@@ -1379,14 +1393,14 @@ mod tests {
 
     #[test]
     fn heading_task_with_no_title_is_an_error() {
-        let markdown = r#"
+        let markdown = r"
 ## M3. Session
 
 ### M3-01
 
 - Goal: backfill.
 - Depends on: none.
-"#;
+";
         let err = parse_roadmap(markdown).unwrap_err();
         assert!(err.message.contains("M3-01"), "{}", err.message);
         assert!(err.message.contains("no title"), "{}", err.message);
@@ -1395,19 +1409,19 @@ mod tests {
 
     #[test]
     fn table_owner_column_keeps_title_in_the_task_cell() {
-        let markdown = r#"
+        let markdown = r"
 ## M3. Session
 
 | Task | Owner | Depends on |
 |---|---|---|
 | M3-01 Session backfill | human | none |
 | M3-02 Follow up | | M3-01 |
-"#;
+";
         let roadmap = parse_roadmap(markdown).unwrap();
         let first = task(&roadmap, "M3-01");
         assert_eq!(first.title, "Session backfill");
         assert!(first.owner_human);
-        assert!(first.depends_on.is_empty());
+        assert!(first.depends_on.is_empty(), "{:?}", first.depends_on);
         let second = task(&roadmap, "M3-02");
         assert_eq!(second.title, "Follow up");
         assert!(!second.owner_human);
@@ -1416,21 +1430,21 @@ mod tests {
 
     #[test]
     fn depends_on_without_a_task_id_is_an_error() {
-        let markdown = r#"
+        let markdown = r"
 ## M1. Content model
 
 ### M1-01 First
 
 - Goal: one.
 - Depends on: later today.
-"#;
+";
         let err = parse_roadmap(markdown).unwrap_err();
         assert!(err.message.contains("no task id"), "{}", err.message);
     }
 
     #[test]
     fn unknown_dependency_is_an_error() {
-        let markdown = r#"
+        let markdown = r"
 ## M1. Content model
 
 ### M1-01 First
@@ -1439,7 +1453,7 @@ mod tests {
 - Acceptance:
   - done.
 - Depends on: M1-99.
-"#;
+";
         let err = parse_roadmap(markdown).unwrap_err();
         assert!(
             err.message.contains("unknown task M1-99"),
@@ -1509,7 +1523,7 @@ mod tests {
             .tasks
             .iter()
             .all(|plan| plan.kind == ChangeKind::Unchanged));
-        assert!(diff.removed.is_empty());
+        assert!(diff.removed.is_empty(), "{:?}", diff.removed);
         let current = current_links(&roadmap);
         let links =
             diff_links(&roadmap.tasks, &bindings_from_existing(&existing), &current).unwrap();
@@ -1611,9 +1625,11 @@ mod tests {
             .into_iter()
             .cloned()
             .collect();
-        assert!(unmet_externals(&selected, &roadmap, &known)
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            unmet_externals(&selected, &roadmap, &known).unwrap(),
+            [] as [UnmetExternal; 0]
+        );
+
         let diff = diff_import(&roadmap, &existing, Some("M6"), |task| {
             issue_body(task, "acme/app", "main", "docs/ROADMAP.md")
         })
@@ -1709,9 +1725,10 @@ mod tests {
         let mut known = HashSet::new();
         known.insert("M1-05".to_string());
         known.insert("M1-01".to_string());
-        assert!(unmet_externals(&selected, &roadmap, &known)
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            unmet_externals(&selected, &roadmap, &known).unwrap(),
+            [] as [UnmetExternal; 0]
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ struct MockBackend;
 
 #[async_trait]
 impl ExternalBackend for MockBackend {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "mock"
     }
 
@@ -37,13 +37,13 @@ impl ExternalBackend for MockBackend {
         Ok(ExternalTask {
             id: id.clone(),
             title: "mock task".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             state: "open".to_string(),
             labels: vec![],
             author: "test".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            url: "".to_string(),
+            url: String::new(),
         })
     }
 
@@ -177,7 +177,7 @@ fn temp_db(label: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("orch-integ-{label}-{}-{n}.db", std::process::id(),))
+    std::env::temp_dir().join(format!("orch-integ-{label}-{}-{n}.db", std::process::id()))
 }
 
 /// Helper: remove a temp DB and its WAL/SHM files.
@@ -203,12 +203,14 @@ async fn project_engine_constructs() {
     let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
 
     let task_manager = Arc::new(TaskManager::with_store(
-        backend.clone(),
-        store.clone(),
+        std::sync::Arc::clone(&backend),
+        std::sync::Arc::clone(&store),
         "test/repo".to_string(),
     ));
 
-    let runner = Arc::new(TaskRunner::new("test/repo".to_string()).with_store(store.clone()));
+    let runner = Arc::new(
+        TaskRunner::new("test/repo".to_string()).with_store(std::sync::Arc::clone(&store)),
+    );
 
     let engine = ProjectEngine {
         repo: "test/repo".to_string(),
@@ -216,7 +218,7 @@ async fn project_engine_constructs() {
         backend,
         task_manager,
         runner,
-        store: store.clone(),
+        store: std::sync::Arc::clone(&store),
     };
 
     assert_eq!(engine.repo, "test/repo");
@@ -234,7 +236,11 @@ async fn task_manager_creates_internal_task() {
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
     let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
 
-    let tm = TaskManager::with_store(backend, store.clone(), "test/repo".to_string());
+    let tm = TaskManager::with_store(
+        backend,
+        std::sync::Arc::clone(&store),
+        "test/repo".to_string(),
+    );
 
     // Create an internal task via the store directly (TaskManager.create_task
     // requires more setup; the store method is what the engine uses internally).
@@ -486,7 +492,7 @@ async fn router_round_robin_routes_task() {
         author: "test".to_string(),
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-01-01T00:00:00Z".to_string(),
-        url: "".to_string(),
+        url: String::new(),
     };
 
     let result = router.route(&task, &store, "test/repo").await;
@@ -849,9 +855,7 @@ async fn router_healthy_agent_count() {
 
     assert!(
         healthy <= available,
-        "healthy count ({}) should be <= available ({})",
-        healthy,
-        available
+        "healthy count ({healthy}) should be <= available ({available})"
     );
 
     // Test is_degraded with various thresholds

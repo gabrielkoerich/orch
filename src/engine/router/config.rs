@@ -228,7 +228,10 @@ impl Default for RouterConfig {
             router_model: "haiku".to_string(),
             timeout_seconds: 45,
             fallback_executor: "codex".to_string(),
-            agents: DEFAULT_AGENTS.iter().map(|s| s.to_string()).collect(),
+            agents: DEFAULT_AGENTS
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             max_route_attempts: 3,
             pool: vec![],
             fallback: String::new(),
@@ -449,7 +452,7 @@ impl RouterConfig {
                         .model_map
                         .entry(complexity.to_string())
                         .or_default()
-                        .insert(agent.to_string(), models.clone());
+                        .insert(agent.clone(), models.clone());
                 }
             }
         }
@@ -466,7 +469,7 @@ impl RouterConfig {
                         .model_map
                         .entry(complexity.to_string())
                         .or_default()
-                        .insert(agent.to_string(), models);
+                        .insert(agent.clone(), models);
                 }
             }
         }
@@ -550,19 +553,19 @@ impl RouterConfig {
 
     /// Return the effective pool — the configured pool, or a single-entry pool from `router_agent:router_model`.
     pub fn effective_pool(&self) -> Vec<String> {
-        if !self.pool.is_empty() {
-            self.pool.clone()
-        } else {
+        if self.pool.is_empty() {
             vec![format!("{}:{}", self.router_agent, self.router_model)]
+        } else {
+            self.pool.clone()
         }
     }
 
     /// Return the effective fallback entry — the configured fallback, or `router_agent:router_model`.
     pub fn effective_fallback(&self) -> String {
-        if !self.fallback.is_empty() {
-            self.fallback.clone()
-        } else {
+        if self.fallback.is_empty() {
             format!("{}:{}", self.router_agent, self.router_model)
+        } else {
+            self.fallback.clone()
         }
     }
 
@@ -907,8 +910,8 @@ mod tests {
     #[test]
     fn default_self_routing_penalty_is_one() {
         let config = RouterConfig::default();
-        assert_eq!(
-            config.self_routing_penalty, 1.0,
+        assert!(
+            (config.self_routing_penalty - 1.0).abs() < f64::EPSILON,
             "default penalty must be 1.0 (no penalty = full self-routing allowed)"
         );
     }
@@ -926,7 +929,7 @@ mod tests {
         let _guard = CurrentDirGuard::set(dir.path());
 
         let config = RouterConfig::from_config();
-        assert_eq!(config.self_routing_penalty, 0.5);
+        assert!((config.self_routing_penalty - 0.5).abs() < f64::EPSILON);
     }
 
     #[serial(cooldown_state)]
@@ -1047,7 +1050,7 @@ mod tests {
         // Simulate a config with a custom agent (olm) in both agents and model_map
         std::fs::write(
             dir.path().join(".orch.yml"),
-            r#"
+            r"
 agents:
   - claude
   - olm
@@ -1061,7 +1064,7 @@ model_map:
   complex:
     claude: opus
     olm: gemma4
-"#,
+",
         )
         .unwrap();
         let _guard = CurrentDirGuard::set(dir.path());
@@ -1093,14 +1096,14 @@ model_map:
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".orch.yml"),
-            r#"
+            r"
 agents:
   - shorthand
 models:
   shorthand:
     - gpt-5.2
     - gpt-5.5
-"#,
+",
         )
         .unwrap();
         let _guard = CurrentDirGuard::set(dir.path());
@@ -1123,12 +1126,12 @@ models:
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".orch.yml"),
-            r#"
+            r"
 agents:
   - shorthand
 models:
   shorthand: gpt-5.2
-"#,
+",
         )
         .unwrap();
         let _guard = CurrentDirGuard::set(dir.path());
@@ -1151,7 +1154,7 @@ models:
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".orch.yml"),
-            r#"
+            r"
 agents:
   - shorthand
 models:
@@ -1161,7 +1164,7 @@ models:
 model_map:
   review:
     shorthand: gpt-5.6-review
-"#,
+",
         )
         .unwrap();
         let _guard = CurrentDirGuard::set(dir.path());
@@ -1215,14 +1218,12 @@ model_map:
         // The model returned should be one of the normalized versions
         assert!(
             model == "opus" || model == "sonnet" || model == "github-copilot/gpt-5-mini",
-            "returned model should be normalized (no trailing slash), got: {}",
-            model
+            "returned model should be normalized (no trailing slash), got: {model}"
         );
         // Verify no trailing slashes in the returned model
         assert!(
             !model.ends_with('/'),
-            "returned model should not have trailing slash, got: {}",
-            model
+            "returned model should not have trailing slash, got: {model}"
         );
     }
 
@@ -1279,7 +1280,7 @@ model_map:
 
         let discovered: HashSet<String> = ["model-a", "model-b"]
             .iter()
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
 
         let pruned = RouterConfig::prune_unavailable_opencode_models(&mut model_map, &discovered);
@@ -1385,8 +1386,7 @@ model_map:
         for tier in ["simple", "medium", "complex", "review"] {
             assert!(
                 model_map[tier]["opencode"].is_empty(),
-                "all entries for {} should be removed",
-                tier
+                "all entries for {tier} should be removed"
             );
         }
     }

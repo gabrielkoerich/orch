@@ -48,12 +48,10 @@ pub fn orch_footer() -> &'static str {
 pub fn attribution_footer(verb: &str, agent: &str, model: Option<&str>) -> String {
     match model {
         Some(m) => format!(
-            "\n\n---\n*{} by {}[bot] via [Orch](https://github.com/gabrielkoerich/orch) using `{}`*",
-            verb, agent, m
+            "\n\n---\n*{verb} by {agent}[bot] via [Orch](https://github.com/gabrielkoerich/orch) using `{m}`*"
         ),
         None => format!(
-            "\n\n---\n*{} by {}[bot] via [Orch](https://github.com/gabrielkoerich/orch)*",
-            verb, agent
+            "\n\n---\n*{verb} by {agent}[bot] via [Orch](https://github.com/gabrielkoerich/orch)*"
         ),
     }
 }
@@ -110,6 +108,15 @@ pub struct ProjectEngine {
     pub task_manager: Arc<TaskManager>,
     pub runner: Arc<runner::TaskRunner>,
     pub store: Arc<TaskStore>,
+}
+
+impl std::fmt::Debug for ProjectEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProjectEngine")
+            .field("repo", &self.repo)
+            .field("project_dir", &self.project_dir)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A restart ends every review session, so an `in_review` task with no session has no reviewer.
@@ -227,7 +234,10 @@ fn start_relay_client(project_engines: &[ProjectEngine], notify: &Arc<Notify>) {
  * in a spawned task. Sync time is the slowest project instead of the sum of all of them
  * (#3864). The caller must already hold `sync_in_progress`; this releases it when done
  **/
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the spawned task takes its own handle to each piece of engine state"
+)]
 fn spawn_sync_pass(
     project_engines: &[ProjectEngine],
     tmux: &Arc<TmuxManager>,
@@ -267,7 +277,7 @@ fn spawn_sync_pass(
         sync::sync_shared_tail(&router, engines.first().map(|e| &e.store)).await;
         tracing::info!(
             trigger,
-            elapsed_ms = started.elapsed().as_millis() as u64,
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "sync tick complete"
         );
         guard.store(false, std::sync::atomic::Ordering::Release);
@@ -282,7 +292,7 @@ async fn sync_one_project(
     dispatching: &Arc<dashmap::DashMap<String, String>>,
     auto_merge_in_flight: &Arc<dashmap::DashSet<String>>,
 ) {
-    if let Err(e) = sync::sync_tick(
+    if let Err(e) = Box::pin(sync::sync_tick(
         &engine.backend,
         tmux,
         &engine.repo,
@@ -292,7 +302,7 @@ async fn sync_one_project(
         &engine.store,
         dispatching,
         auto_merge_in_flight,
-    )
+    ))
     .await
     {
         tracing::error!(repo = %engine.repo, ?e, "sync tick failed for project");
@@ -347,12 +357,12 @@ pub fn configured_agents() -> Vec<String> {
     }
     router::config::DEFAULT_AGENTS
         .iter()
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect()
 }
 
 /// Engine configuration.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct EngineConfig {
     /// Main tick interval
     pub tick_interval: std::time::Duration,
@@ -566,13 +576,14 @@ pub const RATE_LIMITED_UNTIL_KEY: &str = "github:rate_limited_until";
 
 /// Format an epoch second as a local `HH:MM:SS` for operator-facing output.
 pub fn format_rate_limited_until(reset_at: i64) -> String {
-    chrono::DateTime::from_timestamp(reset_at, 0)
-        .map(|t| {
+    chrono::DateTime::from_timestamp(reset_at, 0).map_or_else(
+        || reset_at.to_string(),
+        |t| {
             t.with_timezone(&chrono::Local)
                 .format("%H:%M:%S %Z")
                 .to_string()
-        })
-        .unwrap_or_else(|| reset_at.to_string())
+        },
+    )
 }
 
 /// Announce a GitHub rate-limit window on every operator surface: the log (`orch log`),
@@ -705,8 +716,7 @@ fn should_run_upgrade_check(
     }
 
     last_upgrade_check
-        .map(|last| last.elapsed() >= std::time::Duration::from_secs(upgrade_check_interval))
-        .unwrap_or(true)
+        .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(upgrade_check_interval))
 }
 
 /// Connect one project's backend and build its task manager and runner over
@@ -737,10 +747,20 @@ async fn connect_project_engine(
     }
 
     let task_manager = Arc::new(match event_tx {
-        Some(tx) => TaskManager::with_events(backend.clone(), store.clone(), repo.clone(), tx),
-        None => TaskManager::with_store(backend.clone(), store.clone(), repo.clone()),
+        Some(tx) => TaskManager::with_events(
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
+            repo.clone(),
+            tx,
+        ),
+        None => TaskManager::with_store(
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
+            repo.clone(),
+        ),
     });
-    let runner = Arc::new(runner::TaskRunner::new(repo.clone()).with_store(store.clone()));
+    let runner =
+        Arc::new(runner::TaskRunner::new(repo.clone()).with_store(std::sync::Arc::clone(&store)));
 
     Ok(ProjectEngine {
         repo,
@@ -784,7 +804,10 @@ fn diff_configured_projects(
 ///
 /// A removed project keeps running until the next restart: its subscriber
 /// tasks and any agent it already dispatched outlive the config read
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a new project engine needs every shared engine handle"
+)]
 async fn sync_project_engines(
     project_engines: &mut Vec<ProjectEngine>,
     active_repos: &mut std::collections::HashSet<String>,
@@ -804,7 +827,10 @@ async fn sync_project_engines(
             return;
         }
     };
-    let Some(store) = project_engines.first().map(|e| e.store.clone()) else {
+    let Some(store) = project_engines
+        .first()
+        .map(|e| std::sync::Arc::clone(&e.store))
+    else {
         return;
     };
 
@@ -821,7 +847,7 @@ async fn sync_project_engines(
         let engine = match connect_project_engine(
             repo.clone(),
             project_dir,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             Some(event_bus.sender()),
         )
         .await
@@ -841,34 +867,34 @@ async fn sync_project_engines(
 
         subscribers::dispatch::spawn(
             event_bus.subscribe(),
-            engine.backend.clone(),
-            tmux.clone(),
-            engine.runner.clone(),
-            capture.clone(),
-            semaphore.clone(),
-            engine.task_manager.clone(),
+            std::sync::Arc::clone(&engine.backend),
+            std::sync::Arc::clone(tmux),
+            std::sync::Arc::clone(&engine.runner),
+            std::sync::Arc::clone(capture),
+            std::sync::Arc::clone(semaphore),
+            std::sync::Arc::clone(&engine.task_manager),
             weight_tx.clone(),
-            router.clone(),
-            dispatching.clone(),
-            engine.store.clone(),
+            std::sync::Arc::clone(router),
+            std::sync::Arc::clone(dispatching),
+            std::sync::Arc::clone(&engine.store),
             engine.repo.clone(),
         );
         subscribers::review::spawn(
             event_bus.subscribe(),
-            engine.backend.clone(),
-            tmux.clone(),
-            semaphore.clone(),
-            engine.task_manager.clone(),
-            router.clone(),
-            dispatching.clone(),
-            engine.store.clone(),
+            std::sync::Arc::clone(&engine.backend),
+            std::sync::Arc::clone(tmux),
+            std::sync::Arc::clone(semaphore),
+            std::sync::Arc::clone(&engine.task_manager),
+            std::sync::Arc::clone(router),
+            std::sync::Arc::clone(dispatching),
+            std::sync::Arc::clone(&engine.store),
             engine.repo.clone(),
         );
         subscribers::unblock::spawn(
             event_bus.subscribe(),
-            engine.backend.clone(),
-            engine.task_manager.clone(),
-            engine.store.clone(),
+            std::sync::Arc::clone(&engine.backend),
+            std::sync::Arc::clone(&engine.task_manager),
+            std::sync::Arc::clone(&engine.store),
             engine.repo.clone(),
         );
 
@@ -887,13 +913,11 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
     tracing::info!(repos = ?repos, "loading projects from config");
 
     if projects.is_empty() {
-        let config_path = crate::home::config_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "~/.orch/config.yml".to_string());
-        anyhow::bail!(
-            "no projects configured — add repos under `projects:` in {}",
-            config_path
+        let config_path = crate::home::config_path().map_or_else(
+            |_| "~/.orch/config.yml".to_string(),
+            |p| p.display().to_string(),
         );
+        anyhow::bail!("no projects configured — add repos under `projects:` in {config_path}");
     }
 
     let mut engines = Vec::new();
@@ -908,13 +932,15 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
 
     // Load persisted model cooldowns and register store for future writes.
     // Runs once here so the global cooldown store is not overwritten per project.
-    crate::engine::cooldown::init_cooldown_store(store.clone()).await;
+    crate::engine::cooldown::init_cooldown_store(std::sync::Arc::clone(&store)).await;
 
     for (repo, project_dir) in projects {
         tracing::info!(repo = %repo, "initializing project engine");
         config::watch(&project_dir.join(".orch.yml"));
 
-        engines.push(connect_project_engine(repo, project_dir, store.clone(), None).await?);
+        engines.push(
+            connect_project_engine(repo, project_dir, std::sync::Arc::clone(&store), None).await?,
+        );
     }
 
     Ok(engines)
@@ -1181,9 +1207,8 @@ fn read_project_channel_config(project_dir: &std::path::Path) -> ProjectChannelC
             return ProjectChannelConfig::default();
         }
     };
-    let channels = match val.get("channels") {
-        Some(c) => c,
-        None => return ProjectChannelConfig::default(),
+    let Some(channels) = val.get("channels") else {
+        return ProjectChannelConfig::default();
     };
     let get_str = |section: &str, key: &str| -> Option<String> {
         channels
@@ -1246,7 +1271,7 @@ async fn check_and_notify_upgrade(
     let now = chrono::Utc::now().timestamp();
     if let Ok(Some(last_check_str)) = store.kv_get(last_check_key).await {
         if let Ok(last_check) = last_check_str.parse::<i64>() {
-            if now - last_check < check_interval.as_secs() as i64 {
+            if now - last_check < i64::try_from(check_interval.as_secs()).unwrap_or(i64::MAX) {
                 return;
             }
         }
@@ -1255,12 +1280,9 @@ async fn check_and_notify_upgrade(
     // Record check timestamp (best-effort).
     let _ = store.kv_set(last_check_key, &now.to_string()).await;
 
-    let latest = match fetch_latest_release_version().await {
-        Some(v) => v,
-        None => {
-            tracing::debug!("upgrade check: failed to fetch latest release version");
-            return;
-        }
+    let Some(latest) = fetch_latest_release_version().await else {
+        tracing::debug!("upgrade check: failed to fetch latest release version");
+        return;
     };
 
     if latest == current_version {
@@ -1347,30 +1369,28 @@ async fn check_and_notify_upgrade(
 /// config — mirroring the approach used during normal channel registration, but
 /// without relying on `ChannelRegistry`.
 async fn send_startup_escalation_notification(elapsed_secs: u64) {
+    #[expect(clippy::cast_precision_loss, reason = "a display duration")]
     let duration = crate::channels::notification::format_duration(elapsed_secs as f64);
 
     let msg_telegram = format!(
         "🚨 <b>Orch startup blocked — GitHub unreachable</b>\n\n\
-         The engine has been retrying backend connections for {}\n\
+         The engine has been retrying backend connections for {duration}\n\
          without success. All task processing, routing, and scheduled\n\
-         jobs are paused. Check service logs with `orch log -f`.",
-        duration
+         jobs are paused. Check service logs with `orch log -f`."
     );
 
     let msg_discord = format!(
         "🚨 **Orch startup blocked — GitHub unreachable**\n\n\
-         The engine has been retrying backend connections for {}\n\
+         The engine has been retrying backend connections for {duration}\n\
          without success. All task processing, routing, and scheduled\n\
-         jobs are paused. Check service logs with `orch log -f`.",
-        duration
+         jobs are paused. Check service logs with `orch log -f`."
     );
 
     let msg_slack = format!(
         "🚨 *Orch startup blocked — GitHub unreachable*\n\n\
-         The engine has been retrying backend connections for {}\n\
+         The engine has been retrying backend connections for {duration}\n\
          without success. All task processing, routing, and scheduled\n\
-         jobs are paused. Check service logs with `orch log -f`.",
-        duration
+         jobs are paused. Check service logs with `orch log -f`."
     );
 
     // Telegram
@@ -1510,13 +1530,14 @@ pub async fn serve() -> anyhow::Result<()> {
                         && elapsed >= startup_escalation_secs
                     {
                         escalated = true;
+                        #[expect(clippy::cast_precision_loss, reason = "a display duration")]
+                        let outage = crate::channels::notification::format_duration(elapsed as f64);
                         tracing::error!(
                             delay_secs,
                             attempt,
                             elapsed_secs = elapsed,
                             threshold_secs = startup_escalation_secs,
-                            "project backends unavailable for {} — escalating startup failure: {e}",
-                            crate::channels::notification::format_duration(elapsed as f64)
+                            "project backends unavailable for {outage} — escalating startup failure: {e}",
                         );
                         // Send one-time notification to configured channels.
                         // Channels aren't registered yet at this stage, so we
@@ -1578,8 +1599,8 @@ pub async fn serve() -> anyhow::Result<()> {
     // Re-create task managers with shared store and event bus
     for engine in &mut project_engines {
         engine.task_manager = Arc::new(TaskManager::with_events(
-            engine.backend.clone(),
-            engine.store.clone(),
+            std::sync::Arc::clone(&engine.backend),
+            std::sync::Arc::clone(&engine.store),
             engine.repo.clone(),
             event_bus.sender(),
         ));
@@ -1636,8 +1657,8 @@ pub async fn serve() -> anyhow::Result<()> {
     let transport = Arc::new(Transport::new());
 
     // Initialize capture service and start background loop
-    let capture = Arc::new(CaptureService::new(transport.clone()));
-    let capture_for_tick = capture.clone();
+    let capture = Arc::new(CaptureService::new(std::sync::Arc::clone(&transport)));
+    let capture_for_tick = std::sync::Arc::clone(&capture);
     tokio::spawn(async move {
         capture.start().await;
     });
@@ -1714,7 +1735,7 @@ pub async fn serve() -> anyhow::Result<()> {
     }
 
     // Initialize tmux channel with transport for output streaming
-    let tmux_channel = TmuxChannel::with_transport(transport.clone());
+    let tmux_channel = TmuxChannel::with_transport(std::sync::Arc::clone(&transport));
     channel_registry.register(Box::new(tmux_channel));
     tracing::info!("tmux channel registered");
 
@@ -1736,34 +1757,34 @@ pub async fn serve() -> anyhow::Result<()> {
     let channel_registry = Arc::new(channel_registry);
 
     // Spawn tasks to handle incoming channel messages (if any channels are active)
-    let transport_for_messages = transport.clone();
-    let tmux_for_messages = tmux.clone();
-    let capture_for_messages = capture_for_tick.clone();
-    let channels_for_messages = channel_registry.clone();
+    let transport_for_messages = std::sync::Arc::clone(&transport);
+    let tmux_for_messages = std::sync::Arc::clone(&tmux);
+    let capture_for_messages = std::sync::Arc::clone(&capture_for_tick);
+    let channels_for_messages = std::sync::Arc::clone(&channel_registry);
     // Lightweight engine references for command execution and task creation
     let engine_refs: Vec<EngineRef> = project_engines
         .iter()
         .map(|e| {
             (
                 e.repo.clone(),
-                e.backend.clone(),
-                e.task_manager.clone(),
-                Some(e.store.clone()),
+                std::sync::Arc::clone(&e.backend),
+                std::sync::Arc::clone(&e.task_manager),
+                Some(std::sync::Arc::clone(&e.store)),
             )
         })
         .collect();
     // Shared in-memory map for pending project picks (General channel multi-project picker).
     let pending_picks: channel_handler::PendingPicks =
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-    let router_for_messages = channel_router.clone();
+    let router_for_messages = std::sync::Arc::clone(&channel_router);
     for mut rx in channel_receivers {
-        let transport = transport_for_messages.clone();
-        let tmux = tmux_for_messages.clone();
-        let capture = capture_for_messages.clone();
-        let channels = channels_for_messages.clone();
+        let transport = std::sync::Arc::clone(&transport_for_messages);
+        let tmux = std::sync::Arc::clone(&tmux_for_messages);
+        let capture = std::sync::Arc::clone(&capture_for_messages);
+        let channels = std::sync::Arc::clone(&channels_for_messages);
         let engine_refs = engine_refs.clone();
-        let ch_router = router_for_messages.clone();
-        let picks = pending_picks.clone();
+        let ch_router = std::sync::Arc::clone(&router_for_messages);
+        let picks = std::sync::Arc::clone(&pending_picks);
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 tracing::debug!(channel = %msg.channel, thread = %msg.thread_id, "received message from channel");
@@ -1786,8 +1807,10 @@ pub async fn serve() -> anyhow::Result<()> {
     // a KV marker was stored before shutdown. Send a confirmation to the originating channel now
     // that we're back online. Use a short delay to let the channel connections re-establish.
     {
-        let restart_channels = channel_registry.clone();
-        let restart_store = project_engines.first().map(|e| e.store.clone());
+        let restart_channels = std::sync::Arc::clone(&channel_registry);
+        let restart_store = project_engines
+            .first()
+            .map(|e| std::sync::Arc::clone(&e.store));
         if let Some(store) = restart_store {
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -1803,7 +1826,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                         body: "orch restarted successfully.".to_string(),
                                         reply_to: None,
                                         metadata: serde_json::json!({}),
-                                        topic_id: topic_id.map(|t| t.to_string()),
+                                        topic_id: topic_id.map(std::string::ToString::to_string),
                                     };
                                     if let Err(e) = ch.send(&msg).await {
                                         tracing::warn!(
@@ -1841,10 +1864,12 @@ pub async fn serve() -> anyhow::Result<()> {
     //    channels without a topic_id (legacy behaviour).
     {
         let mut notification_rx = transport.subscribe_notifications();
-        let channels = channel_registry.clone();
-        let notif_router = channel_router.clone();
+        let channels = std::sync::Arc::clone(&channel_registry);
+        let notif_router = std::sync::Arc::clone(&channel_router);
         // Grab a store reference for subscription lookups.
-        let notif_store: Option<Arc<TaskStore>> = project_engines.first().map(|e| e.store.clone());
+        let notif_store: Option<Arc<TaskStore>> = project_engines
+            .first()
+            .map(|e| std::sync::Arc::clone(&e.store));
         tokio::spawn(async move {
             loop {
                 match notification_rx.recv().await {
@@ -2078,9 +2103,7 @@ pub async fn serve() -> anyhow::Result<()> {
     let mut webhook_healthy: bool;
     let mut last_webhook_health_check = std::time::Instant::now();
     // Start webhook server if configured
-    let webhook_enabled = crate::config::get_global("webhook.enabled")
-        .map(|v| v == "true")
-        .unwrap_or(false);
+    let webhook_enabled = crate::config::get_global("webhook.enabled").is_ok_and(|v| v == "true");
     // No readable secret keeps the webhook server off, it never accepts unsigned requests
     let webhook_secret = if webhook_enabled {
         crate::secret_ref::config_secret("webhook.secret")
@@ -2104,6 +2127,10 @@ pub async fn serve() -> anyhow::Result<()> {
     ));
 
     if webhook_enabled {
+        // Spawn the HTTP server with exponential-backoff retry on transient
+        // bind errors (e.g. EADDRINUSE).  After MAX_ATTEMPTS the engine falls
+        // back to polling and updates the shared status accordingly.
+        const WEBHOOK_MAX_ATTEMPTS: u32 = 5;
         let port: u16 = crate::config::get("webhook.port")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -2128,11 +2155,7 @@ pub async fn serve() -> anyhow::Result<()> {
         };
         to_save.save().await;
 
-        // Spawn the HTTP server with exponential-backoff retry on transient
-        // bind errors (e.g. EADDRINUSE).  After MAX_ATTEMPTS the engine falls
-        // back to polling and updates the shared status accordingly.
-        const WEBHOOK_MAX_ATTEMPTS: u32 = 5;
-        let status_for_spawn = webhook_status.clone();
+        let status_for_spawn = std::sync::Arc::clone(&webhook_status);
         tokio::spawn(async move {
             use crate::channels::github::{is_transient_bind_error, webhook_backoff_delay};
             let mut attempt = 0u32;
@@ -2142,7 +2165,7 @@ pub async fn serve() -> anyhow::Result<()> {
                 match start_webhook_server(port, secret.clone(), webhook_repo.clone(), tx.clone())
                     .await
                 {
-                    Ok(_) => {
+                    Ok(()) => {
                         tracing::info!(attempt, "webhook server exited cleanly");
                         break;
                     }
@@ -2196,8 +2219,8 @@ pub async fn serve() -> anyhow::Result<()> {
         });
 
         // Spawn the message forwarding task (reads from webhook channel)
-        let notify = webhook_notify.clone();
-        let transport_for_webhook = transport.clone();
+        let notify = std::sync::Arc::clone(&webhook_notify);
+        let transport_for_webhook = std::sync::Arc::clone(&transport);
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 tracing::info!(
@@ -2316,16 +2339,16 @@ pub async fn serve() -> anyhow::Result<()> {
     for engine in &project_engines {
         subscribers::dispatch::spawn(
             event_bus.subscribe(),
-            engine.backend.clone(),
-            tmux.clone(),
-            engine.runner.clone(),
-            capture_for_tick.clone(),
-            semaphore.clone(),
-            engine.task_manager.clone(),
+            std::sync::Arc::clone(&engine.backend),
+            std::sync::Arc::clone(&tmux),
+            std::sync::Arc::clone(&engine.runner),
+            std::sync::Arc::clone(&capture_for_tick),
+            std::sync::Arc::clone(&semaphore),
+            std::sync::Arc::clone(&engine.task_manager),
             weight_tx.clone(),
-            router.clone(),
-            dispatching.clone(),
-            engine.store.clone(),
+            std::sync::Arc::clone(&router),
+            std::sync::Arc::clone(&dispatching),
+            std::sync::Arc::clone(&engine.store),
             engine.repo.clone(),
         );
     }
@@ -2335,13 +2358,13 @@ pub async fn serve() -> anyhow::Result<()> {
     for engine in &project_engines {
         subscribers::review::spawn(
             event_bus.subscribe(),
-            engine.backend.clone(),
-            tmux.clone(),
-            semaphore.clone(),
-            engine.task_manager.clone(),
-            router.clone(),
-            dispatching.clone(),
-            engine.store.clone(),
+            std::sync::Arc::clone(&engine.backend),
+            std::sync::Arc::clone(&tmux),
+            std::sync::Arc::clone(&semaphore),
+            std::sync::Arc::clone(&engine.task_manager),
+            std::sync::Arc::clone(&router),
+            std::sync::Arc::clone(&dispatching),
+            std::sync::Arc::clone(&engine.store),
             engine.repo.clone(),
         );
     }
@@ -2351,9 +2374,9 @@ pub async fn serve() -> anyhow::Result<()> {
     for engine in &project_engines {
         subscribers::unblock::spawn(
             event_bus.subscribe(),
-            engine.backend.clone(),
-            engine.task_manager.clone(),
-            engine.store.clone(),
+            std::sync::Arc::clone(&engine.backend),
+            std::sync::Arc::clone(&engine.task_manager),
+            std::sync::Arc::clone(&engine.store),
             engine.repo.clone(),
         );
     }
@@ -2361,7 +2384,7 @@ pub async fn serve() -> anyhow::Result<()> {
 
     // Spawn notify subscriber — reacts to ALL events, pushes to transport.
     // Spawned once (not per-project) since the transport handles all repos.
-    subscribers::notify::spawn(event_bus.subscribe(), transport.clone());
+    subscribers::notify::spawn(event_bus.subscribe(), std::sync::Arc::clone(&transport));
     tracing::info!("notify subscriber started");
 
     // Main loop
@@ -2431,7 +2454,7 @@ pub async fn serve() -> anyhow::Result<()> {
                         (None, None) => None,
                     };
                     if let Some(gap) = gap {
-                        let gap_secs = gap.num_seconds() as u64;
+                        let gap_secs = u64::try_from(gap.num_seconds()).unwrap_or(0);
                         if gap_secs >= stale_secs {
                             tracing::info!(
                                 stale_secs,
@@ -2627,8 +2650,8 @@ pub async fn serve() -> anyhow::Result<()> {
 
                 // Periodic upgrade check — notify channels when a newer release is available.
                 if should_run_upgrade_check(last_upgrade_check, config.upgrade_check_interval) {
-                    if let Some(store) = project_engines.first().map(|e| e.store.clone()) {
-                        let channels = channel_registry.clone();
+                    if let Some(store) = project_engines.first().map(|e| std::sync::Arc::clone(&e.store)) {
+                        let channels = std::sync::Arc::clone(&channel_registry);
                         let current = env!("ORCH_VERSION").to_string();
                         let check_interval =
                             std::time::Duration::from_secs(config.upgrade_check_interval);
@@ -2643,9 +2666,15 @@ pub async fn serve() -> anyhow::Result<()> {
                 // Update watchdog timestamp + log tick duration.
                 let tick_elapsed = tick_start.elapsed();
                 if tick_elapsed.as_secs() > 30 {
-                    tracing::warn!(elapsed_ms = tick_elapsed.as_millis() as u64, "slow tick");
+                    tracing::warn!(
+                        elapsed_ms = u64::try_from(tick_elapsed.as_millis()).unwrap_or(u64::MAX),
+                        "slow tick"
+                    );
                 } else {
-                    tracing::debug!(elapsed_ms = tick_elapsed.as_millis() as u64, "tick complete");
+                    tracing::debug!(
+                        elapsed_ms = u64::try_from(tick_elapsed.as_millis()).unwrap_or(u64::MAX),
+                        "tick complete"
+                    );
                 }
                 last_tick_epoch.store(
                     std::time::SystemTime::now()
@@ -2656,7 +2685,7 @@ pub async fn serve() -> anyhow::Result<()> {
                 );
             }
             // Webhook events trigger an immediate tick (bypass polling interval)
-            _ = webhook_notify.notified() => {
+            () = webhook_notify.notified() => {
                 if let Some(remaining) = GhHttp::is_rate_limited() {
                     tracing::warn!(
                         remaining_secs = remaining.as_secs(),
@@ -3038,8 +3067,11 @@ mod tests {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> =
             Arc::new(crate::backends::test_helpers::NoopBackend);
-        let task_manager =
-            TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+        let task_manager = TaskManager::with_store(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
         let tmux = TmuxManager::isolated();
         let orphaned = in_review_task(&store, "11").await;
         let live = in_review_task(&store, "12").await;
@@ -3066,10 +3098,16 @@ mod tests {
     fn growing_max_parallel_lets_more_tasks_run_without_a_restart() {
         let semaphore = Arc::new(Semaphore::new(4));
         let held: Vec<_> = (0..4)
-            .map(|_| semaphore.clone().try_acquire_owned().unwrap())
+            .map(|_| {
+                std::sync::Arc::clone(&semaphore)
+                    .try_acquire_owned()
+                    .unwrap()
+            })
             .collect();
         assert!(
-            semaphore.clone().try_acquire_owned().is_err(),
+            std::sync::Arc::clone(&semaphore)
+                .try_acquire_owned()
+                .is_err(),
             "pool is full"
         );
 
@@ -3077,11 +3115,17 @@ mod tests {
         assert_eq!(in_force, 8);
 
         let grown: Vec<_> = (0..4)
-            .map(|_| semaphore.clone().try_acquire_owned().unwrap())
+            .map(|_| {
+                std::sync::Arc::clone(&semaphore)
+                    .try_acquire_owned()
+                    .unwrap()
+            })
             .collect();
         assert_eq!(held.len() + grown.len(), 8, "8 tasks run at once");
         assert!(
-            semaphore.clone().try_acquire_owned().is_err(),
+            std::sync::Arc::clone(&semaphore)
+                .try_acquire_owned()
+                .is_err(),
             "pool is full"
         );
     }
@@ -3090,7 +3134,11 @@ mod tests {
     fn shrinking_max_parallel_never_cancels_a_running_task() {
         let semaphore = Arc::new(Semaphore::new(8));
         let mut held: Vec<_> = (0..8)
-            .map(|_| semaphore.clone().try_acquire_owned().unwrap())
+            .map(|_| {
+                std::sync::Arc::clone(&semaphore)
+                    .try_acquire_owned()
+                    .unwrap()
+            })
             .collect();
 
         // Nothing is free, so all 8 tasks keep their permits and keep running.
@@ -3102,17 +3150,23 @@ mod tests {
         held.truncate(5);
         in_force = resize_dispatch_pool(&semaphore, in_force, 4);
         assert_eq!(in_force, 5);
-        assert!(semaphore.clone().try_acquire_owned().is_err());
+        assert!(std::sync::Arc::clone(&semaphore)
+            .try_acquire_owned()
+            .is_err());
 
         // One more finishes and the pool settles at the new limit.
         held.truncate(4);
         in_force = resize_dispatch_pool(&semaphore, in_force, 4);
         assert_eq!(in_force, 4);
-        assert!(semaphore.clone().try_acquire_owned().is_err());
+        assert!(std::sync::Arc::clone(&semaphore)
+            .try_acquire_owned()
+            .is_err());
 
         // A slot freed after that is handed out, since 4 is now the real limit.
         held.truncate(3);
-        assert!(semaphore.clone().try_acquire_owned().is_ok());
+        assert!(std::sync::Arc::clone(&semaphore)
+            .try_acquire_owned()
+            .is_ok());
     }
 
     #[test]
@@ -3139,7 +3193,7 @@ mod tests {
             )],
             "only the new project is started, so owner/one keeps its single set of subscribers"
         );
-        assert!(removed.is_empty());
+        assert!(removed.is_empty(), "{removed:?}");
     }
 
     #[test]
@@ -3307,7 +3361,7 @@ mod tests {
     /// create sessions on CI runners, but capture-pane output is empty or
     /// delayed, causing the assertion to fail after a 10s timeout.
     #[tokio::test]
-    #[ignore]
+    #[ignore = "capture-pane timing is unreliable on CI runners"]
     async fn integration_channel_to_tmux_to_capture() {
         use crate::channels::capture::CaptureService;
         use crate::channels::transport::Transport;
@@ -3316,11 +3370,11 @@ mod tests {
 
         // Create transport and capture service
         let transport = Arc::new(Transport::new());
-        let capture = Arc::new(CaptureService::new(transport.clone()));
+        let capture = Arc::new(CaptureService::new(std::sync::Arc::clone(&transport)));
         let tmux = TmuxManager::new();
 
         let task_id = "testtask1".to_string();
-        let session_name = format!("orch-test-{}", task_id);
+        let session_name = format!("orch-test-{task_id}");
 
         // Start a detached tmux session
         let _ = tmux
@@ -3349,7 +3403,7 @@ mod tests {
             .await;
 
         // Spawn capture.run() which exits when session is unregistered
-        let capture_clone = capture.clone();
+        let capture_clone = std::sync::Arc::clone(&capture);
         let capture_handle = tokio::spawn(async move { capture_clone.run().await });
 
         // Subscribe to transport output for this task

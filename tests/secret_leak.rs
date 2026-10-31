@@ -62,15 +62,18 @@ fn assert_no_secrets_in_files(files: &[(PathBuf, String)]) {
     }
 
     if !all_violations.is_empty() {
+        use std::fmt::Write as _;
+
         let mut msg = String::from("Secret leakage detected in task artifacts:\n\n");
         for (path, line, pattern, snippet) in all_violations {
-            msg.push_str(&format!(
+            let _ = write!(
+                msg,
                 "  File: {}\n  Line: {}\n  Pattern: {}\n  Snippet: {}\n\n",
                 path.display(),
                 line,
                 pattern,
                 &snippet[..snippet.len().min(100)]
-            ));
+            );
         }
         panic!("{}", msg);
     }
@@ -102,11 +105,11 @@ export GH_TOKEN="ghp_abcdefghijklmnopqrstuvwxyz1234"
     /// Test that scan_for_secrets detects private keys.
     #[test]
     fn test_scan_detects_private_key() {
-        let content = r#"
+        let content = r"
 -----BEGIN RSA PRIVATE KEY-----
 MIIEpAIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF8PbnGy0AHB7MqK8k7f5l2EckKlw
 -----END RSA PRIVATE KEY-----
-"#;
+";
         let findings = scan_for_secrets(content);
         assert!(!findings.is_empty(), "Should detect private key");
         assert!(findings
@@ -117,11 +120,11 @@ MIIEpAIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF8PbnGy0AHB7MqK8k7f5l2EckKlw
     /// Test that scan_for_secrets ignores safe content.
     #[test]
     fn test_scan_ignores_safe_content() {
-        let content = r#"
+        let content = r"
 # Normal task instructions
 Fix the bug in src/main.rs
 Add tests for the new feature
-"#;
+";
         let findings = scan_for_secrets(content);
         assert!(findings.is_empty(), "Should not flag safe content");
     }
@@ -130,10 +133,10 @@ Add tests for the new feature
     /// This simulates the actual artifact generation process.
     #[test]
     fn test_prompt_files_no_secrets() {
-        let (_temp, _home) = setup_temp_home();
+        let (_temp, home) = setup_temp_home();
 
         // Simulate the content that would be written to prompt files
-        let sys_prompt = r#"# Task Instructions
+        let sys_prompt = r"# Task Instructions
 
 You are an AI assistant helping with a software engineering task.
 
@@ -143,9 +146,9 @@ You are an AI assistant helping with a software engineering task.
 - Add tests for new functionality
 
 ## Task
-Fix the bug in the authentication module."#;
+Fix the bug in the authentication module.";
 
-        let msg_prompt = r#"# Task #123: Fix auth bug
+        let msg_prompt = r"# Task #123: Fix auth bug
 
 The authentication module has a bug where tokens are not validated correctly.
 
@@ -153,10 +156,10 @@ The authentication module has a bug where tokens are not validated correctly.
 Tokens should be validated against the database.
 
 ## Current Behavior
-Tokens are accepted without validation."#;
+Tokens are accepted without validation.";
 
         // Create temp files to test
-        let attempt_dir = _home.join(".orch/state/owner/repo/tasks/123/attempts/1");
+        let attempt_dir = home.join(".orch/state/owner/repo/tasks/123/attempts/1");
         std::fs::create_dir_all(&attempt_dir).unwrap();
 
         let sys_file = attempt_dir.join("prompt-sys.md");
@@ -200,8 +203,7 @@ claude -p --system prompt-sys.md < prompt-msg.md
         let findings = scan_for_secrets(content);
         assert!(
             findings.is_empty(),
-            "Should not flag safe patterns: {:?}",
-            findings
+            "Should not flag safe patterns: {findings:?}"
         );
     }
 }
@@ -246,21 +248,17 @@ mod integration_tests {
             r#"#!/usr/bin/env bash
 set -euo pipefail
 
-export GH_TOKEN="{}"
+export GH_TOKEN="{test_token}"
 export GIT_AUTHOR_NAME="Test User"
 export GIT_AUTHOR_EMAIL="test@example.com"
-"#,
-            test_token
+"#
         );
 
         let runner_file = attempt_dir.join("runner.sh");
         std::fs::write(&runner_file, &runner_script).unwrap();
 
         // Verify prompt files have no secrets
-        let prompt_files = vec![
-            (sys_file.clone(), sys_prompt),
-            (msg_file.clone(), msg_prompt),
-        ];
+        let prompt_files = vec![(sys_file, sys_prompt), (msg_file, msg_prompt)];
         assert_no_secrets_in_files(&prompt_files);
 
         // Clean up env var
@@ -313,18 +311,18 @@ export GIT_AUTHOR_EMAIL="test@example.com"
         let files = vec![
             (
                 "prompt-sys.md",
-                r#"# System Prompt
+                r"# System Prompt
 
 You are a helpful AI assistant.
 
 ## Task
-Fix the authentication bug in src/auth.rs."#,
+Fix the authentication bug in src/auth.rs.",
             ),
             (
                 "prompt-msg.md",
-                r#"# Task #999
+                r"# Task #999
 
-The auth module needs fixing."#,
+The auth module needs fixing.",
             ),
             (
                 "runner.sh",
@@ -377,10 +375,10 @@ exit $CMD_STATUS
 
         // These should never contain actual secrets
         let template_output = format!(
-            r#"Role: {}
+            r"Role: {}
 Task: {} - {}
 Description: {}
-"#,
+",
             vars.get("ROLE").unwrap(),
             vars.get("TASK_ID").unwrap(),
             vars.get("TASK_TITLE").unwrap(),
@@ -402,17 +400,17 @@ fn test_security_module_integration() {
     // Import the crate's security module
     // Note: This requires the crate to expose security module or we run as integration test
 
-    let content_with_secrets = r#"
+    let content_with_secrets = r"
 export GH_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz123456
 -----BEGIN RSA PRIVATE KEY-----
 MIIEpAIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF8PbnGy0AHB7MqK8k7f5l2EckKlw
-"#;
+";
 
-    let clean_content = r#"
+    let clean_content = r"
 # Normal task instructions
 Fix the bug in src/main.rs
 Add tests for the new feature
-"#;
+";
 
     // Our scanner should detect secrets
     let secret_findings = scan_for_secrets(content_with_secrets);
