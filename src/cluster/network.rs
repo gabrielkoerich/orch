@@ -1,11 +1,6 @@
 //! Raft RPCs and forwarded writes between nodes, JSON over HTTP like `../agents-coordination`.
 //! Every request carries the cluster secret, so reaching the port is not enough to join
 
-#![expect(
-    clippy::result_large_err,
-    reason = "openraft's RPC errors are its own types, so their size is not ours to change"
-)]
-
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -315,10 +310,6 @@ pub(crate) struct HttpNetwork {
 impl RaftNetworkFactory<TypeConfig> for HttpNetwork {
     type Network = Peer;
 
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the RaftNetworkFactory trait requires async"
-    )]
     async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Peer {
         Peer {
             target,

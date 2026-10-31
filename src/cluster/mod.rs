@@ -359,10 +359,6 @@ struct NoNetwork;
 impl RaftNetworkFactory<TypeConfig> for NoNetwork {
     type Network = NoNetwork;
 
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the RaftNetworkFactory trait requires async"
-    )]
     async fn new_client(&mut self, _target: NodeId, _node: &BasicNode) -> NoNetwork {
         NoNetwork
     }
@@ -374,10 +370,6 @@ fn unreachable<E: std::error::Error>() -> RPCError<NodeId, BasicNode, E> {
     )))
 }
 
-#[expect(
-    clippy::unused_async_trait_impl,
-    reason = "the RaftNetwork trait requires async"
-)]
 impl RaftNetwork<TypeConfig> for NoNetwork {
     async fn append_entries(
         &mut self,

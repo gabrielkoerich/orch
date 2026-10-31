@@ -247,10 +247,6 @@ impl RaftStorage<TypeConfig> for RaftStore {
         })
     }
 
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the RaftStorage trait requires async"
-    )]
     async fn get_log_reader(&mut self) -> Self::LogReader {
         self.clone()
     }
@@ -346,18 +342,10 @@ impl RaftStorage<TypeConfig> for RaftStore {
         Ok(out)
     }
 
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the RaftStorage trait requires async"
-    )]
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         self.clone()
     }
 
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the RaftStorage trait requires async"
-    )]
     async fn begin_receiving_snapshot(&mut self) -> Result<Box<Cursor<Vec<u8>>>, Err> {
         Ok(Box::new(Cursor::new(Vec::new())))
     }

@@ -41,10 +41,6 @@ use super::sync::ReviewTaskSnapshot;
 /// Abstraction over the GitHub HTTP calls used by `review_open_prs`.
 ///
 /// Allows tests to inject a mock without needing a real GitHub token.
-#[expect(
-    clippy::double_must_use,
-    reason = "async_trait marks its boxed futures must_use twice"
-)]
 #[async_trait]
 pub(crate) trait GhReviewClient: Send + Sync {
     async fn get_pr_number(&self, repo: &str, branch: &str) -> anyhow::Result<Option<u64>>;
@@ -203,10 +199,6 @@ async fn handle_merge_conflict(
     ConflictAction::RerouteToAgent
 }
 
-#[expect(
-    clippy::double_must_use,
-    reason = "async_trait marks its boxed futures must_use twice"
-)]
 #[async_trait]
 trait ReviewBatchFailCounterStore: Send + Sync {
     async fn kv_delete(&self, key: &str) -> anyhow::Result<()>;

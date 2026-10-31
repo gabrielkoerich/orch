@@ -151,7 +151,11 @@ async fn notify_done_event_pushes_notification() {
     assert_eq!(notification.status, "done");
     assert_eq!(notification.title, "Test task title");
     assert_eq!(notification.agent, "claude");
-    assert_eq!(notification.duration_seconds, 42.0);
+    assert!(
+        (notification.duration_seconds - 42.0).abs() < f64::EPSILON,
+        "{}",
+        notification.duration_seconds
+    );
     assert_eq!(notification.summary, "Test summary");
     assert_eq!(notification.repo, Some("owner/repo".to_string()));
     // Drop sender to close channel; subscriber exits cleanly.

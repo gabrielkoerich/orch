@@ -1,7 +1,6 @@
 #[expect(
     dead_code,
     clippy::unused_async,
-    clippy::unused_async_trait_impl,
     reason = "the mocks mirror the async api that capture.rs calls, and it uses only part of it"
 )]
 mod channels {

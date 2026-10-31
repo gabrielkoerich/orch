@@ -1619,6 +1619,10 @@ pub async fn get_route_result(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::float_cmp,
+    reason = "the weights are stored constants, so they compare exactly"
+)]
 mod tests {
     use super::config::DEFAULT_AGENTS;
     use super::llm::LlmRouteResponse;

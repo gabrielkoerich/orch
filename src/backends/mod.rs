@@ -131,10 +131,6 @@ pub enum BlockedByFetch {
 ///
 /// Each implementation talks to a different issue tracker.
 /// The engine calls these methods without knowing which backend is active.
-#[expect(
-    clippy::double_must_use,
-    reason = "async_trait marks its boxed futures must_use twice"
-)]
 #[async_trait]
 pub trait ExternalBackend: Send + Sync {
     /// Human-readable name (e.g. "github", "linear", "jira")

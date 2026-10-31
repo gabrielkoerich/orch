@@ -298,7 +298,7 @@ pub fn spawn(
                             return;
                         }
 
-                        let outcome = match review_and_merge(
+                        let outcome = match Box::pin(review_and_merge(
                             &task,
                             &backend_c,
                             &tmux_c,
@@ -306,7 +306,7 @@ pub fn spawn(
                             &router_c,
                             &task_manager_c,
                             &store_c,
-                        )
+                        ))
                         .await
                         {
                             Ok(ReviewDecision::Blocked(reason)) => {

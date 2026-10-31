@@ -1,0 +1,5 @@
+# Matches the toolchain the CI and release workflows pin, clippy lints change between releases
+[toolchain]
+channel = "1.94.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

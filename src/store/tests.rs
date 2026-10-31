@@ -1,3 +1,8 @@
+#![expect(
+    clippy::float_cmp,
+    reason = "the prices and costs are stored constants, so they compare exactly"
+)]
+
 use super::*;
 use sqlx::Row;
 use std::sync::Arc;

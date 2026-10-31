@@ -15,10 +15,6 @@ use std::sync::Arc;
 ///
 /// Exists so tests can inject a mock that simulates DB failures without
 /// coupling the test harness to a real SQLite pool.
-#[expect(
-    clippy::double_must_use,
-    reason = "async_trait marks its boxed futures must_use twice"
-)]
 #[async_trait]
 pub trait CommandStoreOps: Send + Sync {
     async fn resolve_task_id(&self, repo: &str, task_id: &str) -> anyhow::Result<Option<i64>>;
@@ -59,10 +55,6 @@ impl CommandStoreOps for crate::store::TaskStore {
 ///
 /// Exists so tests can inject a mock that simulates transient API failures
 /// without reaching the network.
-#[expect(
-    clippy::double_must_use,
-    reason = "async_trait marks its boxed futures must_use twice"
-)]
 #[async_trait]
 pub trait CommandGh: Send + Sync {
     async fn get_issue(&self, repo: &str, number: &str) -> anyhow::Result<GitHubIssue>;

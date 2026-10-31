@@ -910,8 +910,8 @@ mod tests {
     #[test]
     fn default_self_routing_penalty_is_one() {
         let config = RouterConfig::default();
-        assert_eq!(
-            config.self_routing_penalty, 1.0,
+        assert!(
+            (config.self_routing_penalty - 1.0).abs() < f64::EPSILON,
             "default penalty must be 1.0 (no penalty = full self-routing allowed)"
         );
     }
@@ -929,7 +929,7 @@ mod tests {
         let _guard = CurrentDirGuard::set(dir.path());
 
         let config = RouterConfig::from_config();
-        assert_eq!(config.self_routing_penalty, 0.5);
+        assert!((config.self_routing_penalty - 0.5).abs() < f64::EPSILON);
     }
 
     #[serial(cooldown_state)]
