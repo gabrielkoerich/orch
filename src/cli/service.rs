@@ -218,10 +218,10 @@ fn run_systemctl(systemctl: &Path, args: &[&str]) -> anyhow::Result<()> {
 
 #[cfg(not(target_os = "macos"))]
 fn systemd_user_dir() -> anyhow::Result<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
-            return Ok(PathBuf::from(xdg).join("systemd").join("user"));
-        }
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+        && !xdg.is_empty()
+    {
+        return Ok(PathBuf::from(xdg).join("systemd").join("user"));
     }
     let home = dirs::home_dir().context("cannot determine home directory")?;
     Ok(home.join(".config").join("systemd").join("user"))
