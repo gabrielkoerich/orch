@@ -78,46 +78,23 @@ pub fn expand_alias(s: &str) -> anyhow::Result<String> {
             if param.is_empty() {
                 return Ok("0 * * * *".to_string());
             }
-            let min: u8 = param
-                .parse()
-                .with_context(|| format!("invalid minute in @hourly alias: '{param}'"))?;
-            anyhow::ensure!(
-                min <= 59,
-                "minute out of range in @hourly alias: {min} (must be 0-59)"
-            );
+            let min = parse_field(param, "minute", alias)?;
+            check_range(min, "minute", alias, 0, 59)?;
             Ok(format!("{min} * * * *"))
         }
         "@daily" => {
             if param.is_empty() {
                 return Ok("0 0 * * *".to_string());
             }
-            if param.contains(':') {
-                let (h, m) = param
-                    .split_once(':')
-                    .context("invalid time format in @daily alias")?;
-                let hour: u8 = h
-                    .parse()
-                    .with_context(|| format!("invalid hour in @daily alias: '{h}'"))?;
-                let min: u8 = m
-                    .parse()
-                    .with_context(|| format!("invalid minute in @daily alias: '{m}'"))?;
-                anyhow::ensure!(
-                    hour <= 23,
-                    "hour out of range in @daily alias: {hour} (must be 0-23)"
-                );
-                anyhow::ensure!(
-                    min <= 59,
-                    "minute out of range in @daily alias: {min} (must be 0-59)"
-                );
+            if let Some((h, m)) = param.split_once(':') {
+                let hour = parse_field(h, "hour", alias)?;
+                let min = parse_field(m, "minute", alias)?;
+                check_range(hour, "hour", alias, 0, 23)?;
+                check_range(min, "minute", alias, 0, 59)?;
                 Ok(format!("{min} {hour} * * *"))
             } else {
-                let hour: u8 = param
-                    .parse()
-                    .with_context(|| format!("invalid hour in @daily alias: '{param}'"))?;
-                anyhow::ensure!(
-                    hour <= 23,
-                    "hour out of range in @daily alias: {hour} (must be 0-23)"
-                );
+                let hour = parse_field(param, "hour", alias)?;
+                check_range(hour, "hour", alias, 0, 23)?;
                 Ok(format!("0 {hour} * * *"))
             }
         }
@@ -125,50 +102,27 @@ pub fn expand_alias(s: &str) -> anyhow::Result<String> {
             if param.is_empty() {
                 return Ok("0 0 * * 0".to_string());
             }
-            let day: u8 = param
-                .parse()
-                .with_context(|| format!("invalid day-of-week in @weekly alias: '{param}'"))?;
-            anyhow::ensure!(
-                day <= 7,
-                "day-of-week out of range in @weekly alias: {day} (must be 0-7)"
-            );
+            let day = parse_field(param, "day-of-week", alias)?;
+            check_range(day, "day-of-week", alias, 0, 7)?;
             Ok(format!("0 0 * * {day}"))
         }
         "@monthly" => {
             if param.is_empty() {
                 return Ok("0 0 1 * *".to_string());
             }
-            let dom: u8 = param
-                .parse()
-                .with_context(|| format!("invalid day-of-month in @monthly alias: '{param}'"))?;
-            anyhow::ensure!(
-                (1..=31).contains(&dom),
-                "day-of-month out of range in @monthly alias: {dom} (must be 1-31)"
-            );
+            let dom = parse_field(param, "day-of-month", alias)?;
+            check_range(dom, "day-of-month", alias, 1, 31)?;
             Ok(format!("0 0 {dom} * *"))
         }
         "@yearly" => {
             if param.is_empty() {
                 return Ok("0 0 1 1 *".to_string());
             }
-            if param.contains('-') {
-                let (m, d) = param
-                    .split_once('-')
-                    .context("invalid date format in @yearly alias")?;
-                let month: u8 = m
-                    .parse()
-                    .with_context(|| format!("invalid month in @yearly alias: '{m}'"))?;
-                let dom: u8 = d
-                    .parse()
-                    .with_context(|| format!("invalid day-of-month in @yearly alias: '{d}'"))?;
-                anyhow::ensure!(
-                    (1..=12).contains(&month),
-                    "month out of range in @yearly alias: {month} (must be 1-12)"
-                );
-                anyhow::ensure!(
-                    (1..=31).contains(&dom),
-                    "day-of-month out of range in @yearly alias: {dom} (must be 1-31)"
-                );
+            if let Some((m, d)) = param.split_once('-') {
+                let month = parse_field(m, "month", alias)?;
+                let dom = parse_field(d, "day-of-month", alias)?;
+                check_range(month, "month", alias, 1, 12)?;
+                check_range(dom, "day-of-month", alias, 1, 31)?;
                 Ok(format!("0 0 {dom} {month} *"))
             } else {
                 anyhow::bail!(
@@ -178,6 +132,19 @@ pub fn expand_alias(s: &str) -> anyhow::Result<String> {
         }
         _ => Ok(s.to_string()),
     }
+}
+
+fn parse_field(raw: &str, field: &str, alias: &str) -> anyhow::Result<u8> {
+    raw.parse()
+        .with_context(|| format!("invalid {field} in {alias} alias: '{raw}'"))
+}
+
+fn check_range(value: u8, field: &str, alias: &str, lo: u8, hi: u8) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        (lo..=hi).contains(&value),
+        "{field} out of range in {alias} alias: {value} (must be {lo}-{hi})"
+    );
+    Ok(())
 }
 
 /// Check if a cron expression matches now, or (with `since`) has matched
