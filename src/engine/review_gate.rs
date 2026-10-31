@@ -19,6 +19,9 @@ pub(crate) enum CiGate {
     Wait,
     /// CI failed on the PR head, these checks failed
     Red(Vec<String>),
+    /// No check started on the PR head. `waited_out` once the head waited 15 minutes, or at once
+    /// when the repository has no CI
+    NotStarted { waited_out: bool },
 }
 
 #[derive(Debug, PartialEq)]
@@ -47,7 +50,7 @@ pub(crate) async fn review_ci_gate(
         .filter(|r| !is_own_check(&r.context))
         .collect();
     if required.is_empty() && !gh.has_workflows(repo).await? {
-        return Ok(CiGate::Start);
+        return Ok(CiGate::NotStarted { waited_out: true });
     }
 
     let runs = gh.get_check_runs(repo, &sha).await?;
@@ -80,19 +83,15 @@ pub(crate) async fn review_ci_gate(
                     now
                 }
             };
-            if now - since >= NO_CHECKS_WAIT_SECS {
-                tracing::warn!(
-                    task_id,
-                    pr_number,
-                    "no CI ran on the PR head for 15 minutes, starting the review anyway"
-                );
-                CiGate::Start
-            } else {
-                CiGate::Wait
+            CiGate::NotStarted {
+                waited_out: now - since >= NO_CHECKS_WAIT_SECS,
             }
         }
     };
-    if gate != CiGate::Wait {
+    if !matches!(
+        gate,
+        CiGate::Wait | CiGate::NotStarted { waited_out: false }
+    ) {
         store.kv_delete(&wait_key).await.ok();
     }
 

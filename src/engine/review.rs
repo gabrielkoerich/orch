@@ -1145,15 +1145,8 @@ async fn build_review_context(
     let git_log = runner::context::build_git_log(&worktree_path, &default_branch).await;
     // An unknown project falls back to the global config, never to the worktree's .orch.yml,
     // which the task agent may have written
-    let project_dir = crate::config::get_projects_with_paths()
-        .unwrap_or_default()
-        .into_iter()
-        .find(|(candidate, _)| candidate == repo)
-        .map(|(_, dir)| dir);
-    let sandboxed = match &project_dir {
-        Some(dir) => runner::sandbox::enabled(dir),
-        None => runner::sandbox::enabled_globally(),
-    };
+    let project_dir = review_project_dir(repo);
+    let sandboxed = sandboxed_in(project_dir.as_deref());
     let main_project_dir = project_dir.unwrap_or_else(|| worktree_path.clone());
     let review_prompt = runner::agent::build_review_prompt(
         task,
@@ -3538,6 +3531,26 @@ async fn ensure_pr_exists(
             )))
         }
     }
+}
+
+fn review_project_dir(repo: &str) -> Option<std::path::PathBuf> {
+    crate::config::get_projects_with_paths()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(candidate, _)| candidate == repo)
+        .map(|(_, dir)| dir)
+}
+
+fn sandboxed_in(project_dir: Option<&std::path::Path>) -> bool {
+    match project_dir {
+        Some(dir) => runner::sandbox::enabled(dir),
+        None => runner::sandbox::enabled_globally(),
+    }
+}
+
+/// Whether the review agent for `repo` runs in the OS sandbox
+pub(crate) fn review_sandboxed(repo: &str) -> bool {
+    sandboxed_in(review_project_dir(repo).as_deref())
 }
 
 /// The review agent's own time limit, as configured.
