@@ -272,47 +272,46 @@ impl RouterConfig {
         let mut config = Self::default();
 
         // Try to load from config
-        if let Ok(mode) = crate::config::get("router.mode") {
-            if mode == "round_robin" || mode == "llm" || mode == "local" {
-                config.mode = mode;
-            }
+        if let Ok(mode) = crate::config::get("router.mode")
+            && (mode == "round_robin" || mode == "llm" || mode == "local")
+        {
+            config.mode = mode;
         }
 
-        if let Ok(agent) = crate::config::get("router.agent") {
-            if !agent.is_empty() {
-                config.router_agent = agent;
-            }
+        if let Ok(agent) = crate::config::get("router.agent")
+            && !agent.is_empty()
+        {
+            config.router_agent = agent;
         }
 
-        if let Ok(model) = crate::config::get("router.model") {
-            if !model.is_empty() {
-                config.router_model = RouterConfig::normalize_model_identifier(&model);
-            }
+        if let Ok(model) = crate::config::get("router.model")
+            && !model.is_empty()
+        {
+            config.router_model = RouterConfig::normalize_model_identifier(&model);
         }
 
-        if let Ok(timeout) = crate::config::get("router.timeout_seconds") {
-            if let Ok(secs) = timeout.parse::<u64>() {
-                let clamped = secs.min(MAX_ROUTER_TIMEOUT_SECS);
-                if clamped != secs {
-                    static TIMEOUT_CLAMP_WARNED: std::sync::OnceLock<()> =
-                        std::sync::OnceLock::new();
-                    TIMEOUT_CLAMP_WARNED.get_or_init(|| {
-                        tracing::warn!(
-                            configured_secs = secs,
-                            applied_secs = clamped,
-                            max_secs = MAX_ROUTER_TIMEOUT_SECS,
-                            "router.timeout_seconds is too high; clamping to keep routing responsive"
-                        );
-                    });
-                }
-                config.timeout_seconds = clamped;
+        if let Ok(timeout) = crate::config::get("router.timeout_seconds")
+            && let Ok(secs) = timeout.parse::<u64>()
+        {
+            let clamped = secs.min(MAX_ROUTER_TIMEOUT_SECS);
+            if clamped != secs {
+                static TIMEOUT_CLAMP_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                TIMEOUT_CLAMP_WARNED.get_or_init(|| {
+                    tracing::warn!(
+                        configured_secs = secs,
+                        applied_secs = clamped,
+                        max_secs = MAX_ROUTER_TIMEOUT_SECS,
+                        "router.timeout_seconds is too high; clamping to keep routing responsive"
+                    );
+                });
             }
+            config.timeout_seconds = clamped;
         }
 
-        if let Ok(fallback) = crate::config::get("router.fallback_executor") {
-            if !fallback.is_empty() {
-                config.fallback_executor = fallback;
-            }
+        if let Ok(fallback) = crate::config::get("router.fallback_executor")
+            && !fallback.is_empty()
+        {
+            config.fallback_executor = fallback;
         }
 
         // Parse agents list from top-level `agents:` config key
@@ -344,26 +343,27 @@ impl RouterConfig {
             }
         }
 
-        if let Ok(max_attempts) = crate::config::get("router.max_route_attempts") {
-            if let Ok(n) = max_attempts.parse::<u32>() {
-                config.max_route_attempts = n;
-            }
+        if let Ok(max_attempts) = crate::config::get("router.max_route_attempts")
+            && let Ok(n) = max_attempts.parse::<u32>()
+        {
+            config.max_route_attempts = n;
         }
 
         // Parse allowed_tools as comma-separated or YAML array
-        if let Ok(tools_str) = crate::config::get("router.allowed_tools") {
-            if !tools_str.is_empty() && tools_str != "[]" {
-                // Try to parse as JSON/YAML array first
-                if let Ok(tools_arr) = serde_json::from_str::<Vec<String>>(&tools_str) {
-                    config.allowed_tools = tools_arr;
-                } else {
-                    // Fall back to comma-separated
-                    config.allowed_tools = tools_str
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                }
+        if let Ok(tools_str) = crate::config::get("router.allowed_tools")
+            && !tools_str.is_empty()
+            && tools_str != "[]"
+        {
+            // Try to parse as JSON/YAML array first
+            if let Ok(tools_arr) = serde_json::from_str::<Vec<String>>(&tools_str) {
+                config.allowed_tools = tools_arr;
+            } else {
+                // Fall back to comma-separated
+                config.allowed_tools = tools_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
             }
         }
 
@@ -373,39 +373,38 @@ impl RouterConfig {
         }
 
         // Parse self_routing_penalty
-        if let Ok(val) = crate::config::get("router.self_routing_penalty") {
-            if let Ok(penalty) = val.parse::<f64>() {
-                config.self_routing_penalty = penalty.clamp(0.0, 1.0);
-            }
+        if let Ok(val) = crate::config::get("router.self_routing_penalty")
+            && let Ok(penalty) = val.parse::<f64>()
+        {
+            config.self_routing_penalty = penalty.clamp(0.0, 1.0);
         }
 
         // Parse per-agent weights from router.weights.<agent>
         for agent in &config.agents {
             let key = format!("router.weights.{agent}");
-            if let Ok(val) = crate::config::get(&key) {
-                if let Ok(w) = val.parse::<f64>() {
-                    config.weights.insert(agent.clone(), w.max(0.0));
-                }
+            if let Ok(val) = crate::config::get(&key)
+                && let Ok(w) = val.parse::<f64>()
+            {
+                config.weights.insert(agent.clone(), w.max(0.0));
             }
         }
 
         // Parse per-agent backoff base seconds from router.backoff_base.<agent>
         for agent in &config.agents {
             let key = format!("router.backoff_base.{agent}");
-            if let Ok(val) = crate::config::get(&key) {
-                if let Ok(secs) = val.parse::<i64>() {
-                    config.agent_backoff_bases.insert(agent.clone(), secs);
-                }
+            if let Ok(val) = crate::config::get(&key)
+                && let Ok(secs) = val.parse::<i64>()
+            {
+                config.agent_backoff_bases.insert(agent.clone(), secs);
             }
         }
 
         // Parse max_tasks_per_tick
-        if let Ok(val) = crate::config::get("router.max_tasks_per_tick") {
-            if let Ok(n) = val.parse::<usize>() {
-                if n > 0 {
-                    config.max_tasks_per_tick = n;
-                }
-            }
+        if let Ok(val) = crate::config::get("router.max_tasks_per_tick")
+            && let Ok(n) = val.parse::<usize>()
+            && n > 0
+        {
+            config.max_tasks_per_tick = n;
         }
 
         // Parse pool: list of "agent:model" entries.
@@ -431,10 +430,10 @@ impl RouterConfig {
         }
 
         // Parse fallback: single "agent:model" entry
-        if let Ok(fallback) = crate::config::get("router.fallback") {
-            if !fallback.is_empty() {
-                config.fallback = fallback;
-            }
+        if let Ok(fallback) = crate::config::get("router.fallback")
+            && !fallback.is_empty()
+        {
+            config.fallback = fallback;
         }
 
         // Load top-level model shorthand from config (models.{agent}).
@@ -490,16 +489,16 @@ impl RouterConfig {
             let discovered: std::collections::HashSet<String> =
                 discovered_opencode.into_iter().collect();
             for complexity in known_complexities {
-                if let Some(agent_models) = config.model_map.get(complexity) {
-                    if let Some(models) = agent_models.get("opencode") {
-                        for model in models {
-                            if model != "opencode:free" && !discovered.contains(model) {
-                                tracing::warn!(
-                                    complexity,
-                                    model,
-                                    "opencode model from config not present in provider model list; pruning from dispatch pool"
-                                );
-                            }
+                if let Some(agent_models) = config.model_map.get(complexity)
+                    && let Some(models) = agent_models.get("opencode")
+                {
+                    for model in models {
+                        if model != "opencode:free" && !discovered.contains(model) {
+                            tracing::warn!(
+                                complexity,
+                                model,
+                                "opencode model from config not present in provider model list; pruning from dispatch pool"
+                            );
                         }
                     }
                 }
@@ -515,37 +514,37 @@ impl RouterConfig {
         }
 
         // Parse default_skills
-        if let Ok(skills_str) = crate::config::get("router.default_skills") {
-            if !skills_str.is_empty() && skills_str != "[]" {
-                if let Ok(skills_arr) = serde_json::from_str::<Vec<String>>(&skills_str) {
-                    config.default_skills = skills_arr;
-                } else {
-                    config.default_skills = skills_str
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                }
+        if let Ok(skills_str) = crate::config::get("router.default_skills")
+            && !skills_str.is_empty()
+            && skills_str != "[]"
+        {
+            if let Ok(skills_arr) = serde_json::from_str::<Vec<String>>(&skills_str) {
+                config.default_skills = skills_arr;
+            } else {
+                config.default_skills = skills_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
             }
         }
 
         // Parse Ollama-specific config for local routing mode
-        if let Ok(url) = crate::config::get("router.ollama_url") {
-            if !url.is_empty() {
-                config.ollama_url = url;
-            }
+        if let Ok(url) = crate::config::get("router.ollama_url")
+            && !url.is_empty()
+        {
+            config.ollama_url = url;
         }
-        if let Ok(model) = crate::config::get("router.ollama_model") {
-            if !model.is_empty() {
-                config.ollama_model = model;
-            }
+        if let Ok(model) = crate::config::get("router.ollama_model")
+            && !model.is_empty()
+        {
+            config.ollama_model = model;
         }
-        if let Ok(timeout) = crate::config::get("router.ollama_timeout_seconds") {
-            if let Ok(secs) = timeout.parse::<u64>() {
-                if secs > 0 {
-                    config.ollama_timeout_seconds = secs;
-                }
-            }
+        if let Ok(timeout) = crate::config::get("router.ollama_timeout_seconds")
+            && let Ok(secs) = timeout.parse::<u64>()
+            && secs > 0
+        {
+            config.ollama_timeout_seconds = secs;
         }
 
         config
@@ -602,17 +601,22 @@ impl RouterConfig {
     }
 
     fn read_model_pool_from_config(key: &str) -> Option<Vec<String>> {
-        if let Ok(list) = crate::config::get_list(key) {
-            if !list.is_empty() {
-                return Some(
-                    list.iter()
-                        .map(|m| RouterConfig::normalize_model_identifier(m))
-                        .collect(),
-                );
+        match crate::config::get_list(key) {
+            Ok(list) => {
+                if !list.is_empty() {
+                    return Some(
+                        list.iter()
+                            .map(|m| RouterConfig::normalize_model_identifier(m))
+                            .collect(),
+                    );
+                }
             }
-        } else if let Ok(val) = crate::config::get(key) {
-            if !val.is_empty() {
-                return Some(vec![RouterConfig::normalize_model_identifier(&val)]);
+            _ => {
+                if let Ok(val) = crate::config::get(key)
+                    && !val.is_empty()
+                {
+                    return Some(vec![RouterConfig::normalize_model_identifier(&val)]);
+                }
             }
         }
 
@@ -763,7 +767,7 @@ impl RouterConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{RouterConfig, MAX_ROUTER_TIMEOUT_SECS};
+    use super::{MAX_ROUTER_TIMEOUT_SECS, RouterConfig};
     use serial_test::serial;
     use std::sync::{Mutex, OnceLock};
 

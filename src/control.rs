@@ -27,7 +27,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result};
 use regex::Regex;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
 const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -180,27 +180,26 @@ pub async fn validate_model(spec: &ModelSpec) -> Result<()> {
     validate_agent(&spec.agent)?;
 
     // 3. For opencode, pre-check against `opencode models` list (fast rejection)
-    if spec.agent == "opencode" {
-        if let Ok(models) = list_opencode_models().await {
-            if !models.iter().any(|m| m == &spec.model) {
-                let suggestions: Vec<_> = models
-                    .iter()
-                    .filter(|m| m.contains(&spec.model) || spec.model.contains(m.as_str()))
-                    .take(10)
-                    .cloned()
-                    .collect();
-                let shown = if suggestions.is_empty() {
-                    models.iter().take(20).cloned().collect()
-                } else {
-                    suggestions
-                };
-                anyhow::bail!(
-                    "model '{}' not found in opencode. Available models:\n{}",
-                    spec.model,
-                    shown.join("\n")
-                );
-            }
-        }
+    if spec.agent == "opencode"
+        && let Ok(models) = list_opencode_models().await
+        && !models.iter().any(|m| m == &spec.model)
+    {
+        let suggestions: Vec<_> = models
+            .iter()
+            .filter(|m| m.contains(&spec.model) || spec.model.contains(m.as_str()))
+            .take(10)
+            .cloned()
+            .collect();
+        let shown = if suggestions.is_empty() {
+            models.iter().take(20).cloned().collect()
+        } else {
+            suggestions
+        };
+        anyhow::bail!(
+            "model '{}' not found in opencode. Available models:\n{}",
+            spec.model,
+            shown.join("\n")
+        );
     }
 
     // 4. Test invocation — always run to verify the model actually works
@@ -398,11 +397,7 @@ pub async fn set_agent_spec(store: &TaskStore, agent: &str) -> Result<ModelSpec>
 }
 
 fn display_model(model: &str) -> &str {
-    if model.is_empty() {
-        "default"
-    } else {
-        model
-    }
+    if model.is_empty() { "default" } else { model }
 }
 
 fn format_current_spec(spec: &ModelSpec) -> String {
@@ -844,7 +839,8 @@ pub async fn send_message(
                                 false,
                             )
                             .await?;
-                            let result = if is_timeout {
+
+                            if is_timeout {
                                 InvokeResult {
                                     text: format!(
                                         "_(New session started.)_\n\n{}",
@@ -854,8 +850,7 @@ pub async fn send_message(
                                 }
                             } else {
                                 fresh_result
-                            };
-                            result
+                            }
                         } else {
                             return Err(e);
                         }
@@ -1100,10 +1095,10 @@ fn chunk_text(text: &str, max_bytes: usize) -> Vec<String> {
             }
         }
         // Prefer splitting at a newline within the chunk
-        if end < total {
-            if let Some(nl_offset) = text[start..end].rfind('\n') {
-                end = start + nl_offset + 1;
-            }
+        if end < total
+            && let Some(nl_offset) = text[start..end].rfind('\n')
+        {
+            end = start + nl_offset + 1;
         }
         chunks.push(text[start..end].to_string());
         start = end;
@@ -1465,7 +1460,7 @@ mod tests {
 
     #[test]
     fn cost_usd_computed_from_token_counts() {
-        use crate::store::{pricing_for_model, TokenUsage};
+        use crate::store::{TokenUsage, pricing_for_model};
 
         let model = "sonnet";
         let input_tokens: u64 = 1_000_000;
@@ -1508,7 +1503,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_control_message_stores_cost_usd() {
-        use crate::store::{pricing_for_model, TokenUsage};
+        use crate::store::{TokenUsage, pricing_for_model};
 
         let store = crate::store::TaskStore::open_memory().await.unwrap();
 

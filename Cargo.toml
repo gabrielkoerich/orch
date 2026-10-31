@@ -2,7 +2,7 @@
 # The crate name orch is taken on crates.io, the binary and the library keep the name orch
 name = "orch-cli"
 version = "0.98.5"
-edition = "2021"
+edition = "2024"
 description = "Orch, the agent orchestration engine: runs coding agents on tasks and cron jobs"
 license = "MIT"
 repository = "https://github.com/gabrielkoerich/orch"

@@ -180,14 +180,18 @@ async fn task_writes_go_through_the_log() {
         Some("internal:2")
     );
 
-    assert!(store
-        .update_status_if(a, TaskStatus::Routed, TaskStatus::New)
-        .await
-        .unwrap());
-    assert!(!store
-        .update_status_if(a, TaskStatus::InProgress, TaskStatus::New)
-        .await
-        .unwrap());
+    assert!(
+        store
+            .update_status_if(a, TaskStatus::Routed, TaskStatus::New)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .update_status_if(a, TaskStatus::InProgress, TaskStatus::New)
+            .await
+            .unwrap()
+    );
     assert_eq!(store.get(a).await.unwrap().status, TaskStatus::Routed);
     assert_eq!(store.increment(a, "attempts").await.unwrap(), 1);
 
@@ -752,9 +756,11 @@ async fn a_learner_joins_through_any_node_and_catches_up() {
         (hello.name.as_str(), hello.leader),
         (format!("node{follower}").as_str(), Some(leader))
     );
-    assert!(network::probe(&voters[&follower], "wrong", None)
-        .await
-        .is_none());
+    assert!(
+        network::probe(&voters[&follower], "wrong", None)
+            .await
+            .is_none()
+    );
     assert!(
         network::probe(&voters[&follower], "s3cret", Some("impostor"))
             .await
@@ -1045,9 +1051,11 @@ async fn a_relayed_proof_is_rejected() {
     let relay_addr = listener.local_addr().unwrap().to_string();
     tokio::spawn(async move { axum::serve(listener, relay).await.ok() });
 
-    assert!(network::probe(&voters[&1], "s3cret", Some("node1"))
-        .await
-        .is_some());
+    assert!(
+        network::probe(&voters[&1], "s3cret", Some("node1"))
+            .await
+            .is_some()
+    );
     assert!(network::probe(&relay_addr, "s3cret", None).await.is_none());
     for (_, m) in members {
         m.node.stop().await;
@@ -1087,15 +1095,19 @@ async fn a_replicated_write_never_touches_local_state() {
         key: "raft:vote".into(),
         value: "forged".into(),
     };
-    assert!(raft_key
-        .clone()
-        .apply(&mut conn, "2026-01-02T03:04:05Z", true)
-        .await
-        .is_err());
-    assert!(raft_key
-        .apply(&mut conn, "2026-01-02T03:04:05Z", false)
-        .await
-        .is_ok());
+    assert!(
+        raft_key
+            .clone()
+            .apply(&mut conn, "2026-01-02T03:04:05Z", true)
+            .await
+            .is_err()
+    );
+    assert!(
+        raft_key
+            .apply(&mut conn, "2026-01-02T03:04:05Z", false)
+            .await
+            .is_ok()
+    );
 
     let worktree = Command::TaskSetFields {
         id: 1,

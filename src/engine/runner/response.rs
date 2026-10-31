@@ -170,10 +170,9 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
     .await
     .ok()
     .and_then(std::result::Result::ok)
+        && !content.is_empty()
     {
-        if !content.is_empty() {
-            return content;
-        }
+        return content;
     }
 
     // Fallback: check all attempt dirs for this task (newest first)
@@ -228,11 +227,10 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
                 .await
                 .ok()
                 .and_then(std::result::Result::ok)
+                    && !content.is_empty()
                 {
-                    if !content.is_empty() {
-                        tracing::info!(task_id, path = %p.display(), "read output from attempt dir");
-                        return content;
-                    }
+                    tracing::info!(task_id, path = %p.display(), "read output from attempt dir");
+                    return content;
                 }
             }
         }
@@ -246,10 +244,10 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
         state_dir.join(format!("output-{task_id}.json")),
     ];
 
-    if let Ok(legacy_path) = crate::home::state_file(&format!("output-{task_id}.json")) {
-        if !fallbacks.contains(&legacy_path) {
-            fallbacks.push(legacy_path);
-        }
+    if let Ok(legacy_path) = crate::home::state_file(&format!("output-{task_id}.json"))
+        && !fallbacks.contains(&legacy_path)
+    {
+        fallbacks.push(legacy_path);
     }
 
     for path in &fallbacks {
@@ -260,11 +258,10 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
         .await
         .ok()
         .and_then(std::result::Result::ok)
+            && !content.is_empty()
         {
-            if !content.is_empty() {
-                tracing::info!(task_id, path = %path.display(), "read output from legacy fallback");
-                return content;
-            }
+            tracing::info!(task_id, path = %path.display(), "read output from legacy fallback");
+            return content;
         }
     }
 
@@ -677,10 +674,10 @@ fn parse_review_json(text: &str) -> anyhow::Result<ReviewResponse> {
     }
 
     // Try extracting JSON from markdown code blocks
-    if let Some(json_str) = extract_json_block(text) {
-        if let Ok(resp) = serde_json::from_str::<ReviewResponse>(&json_str) {
-            return Ok(resp);
-        }
+    if let Some(json_str) = extract_json_block(text)
+        && let Ok(resp) = serde_json::from_str::<ReviewResponse>(&json_str)
+    {
+        return Ok(resp);
     }
 
     if let Some(resp) = extract_review_response_object(text) {
@@ -858,11 +855,14 @@ pub async fn store_learnings_from_response(
         timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     };
 
-    if let Some(ref st) = store {
-        if let Ok(Some(store_id)) = st.resolve_task_id(repo, task_id).await {
-            if let Err(e) = st.append_memory(store_id, &entry).await {
+    if let Some(st) = store
+        && let Ok(Some(store_id)) = st.resolve_task_id(repo, task_id).await
+    {
+        match st.append_memory(store_id, &entry).await {
+            Err(e) => {
                 tracing::warn!(task_id, error = ?e, "failed to store memory");
-            } else {
+            }
+            _ => {
                 tracing::debug!(task_id, attempt, "stored memory for attempt");
             }
         }
@@ -890,11 +890,14 @@ pub async fn store_failure_memory(
         timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     };
 
-    if let Some(ref st) = store {
-        if let Ok(Some(store_id)) = st.resolve_task_id(repo, task_id).await {
-            if let Err(e) = st.append_memory(store_id, &entry).await {
+    if let Some(st) = store
+        && let Ok(Some(store_id)) = st.resolve_task_id(repo, task_id).await
+    {
+        match st.append_memory(store_id, &entry).await {
+            Err(e) => {
                 tracing::warn!(task_id, error = ?e, "failed to store failure memory");
-            } else {
+            }
+            _ => {
                 tracing::debug!(task_id, attempt, "stored failure memory");
             }
         }
@@ -904,7 +907,7 @@ pub async fn store_failure_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::runner::agents::{find_agent_result, patterns, AgentError};
+    use crate::engine::runner::agents::{AgentError, find_agent_result, patterns};
     use serial_test::serial;
 
     #[serial(cooldown_state)]

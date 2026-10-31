@@ -641,19 +641,19 @@ fn collect_all_changed_files() -> anyhow::Result<Vec<ChangedFile>> {
 
     let staged = git_output(["diff", "--cached", "--name-status", "--find-renames"])?;
     for line in staged.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        if let Some(cf) = parse_name_status_line(line) {
-            if seen.insert(cf.path.clone()) {
-                files.push(cf);
-            }
+        if let Some(cf) = parse_name_status_line(line)
+            && seen.insert(cf.path.clone())
+        {
+            files.push(cf);
         }
     }
 
     let unstaged = git_output(["diff", "--name-status", "--find-renames"])?;
     for line in unstaged.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        if let Some(cf) = parse_name_status_line(line) {
-            if seen.insert(cf.path.clone()) {
-                files.push(cf);
-            }
+        if let Some(cf) = parse_name_status_line(line)
+            && seen.insert(cf.path.clone())
+        {
+            files.push(cf);
         }
     }
 

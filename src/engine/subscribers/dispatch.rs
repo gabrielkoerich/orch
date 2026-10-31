@@ -11,7 +11,7 @@ use crate::tmux::TmuxManager;
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{RwLock, Semaphore, mpsc};
 
 type SessionMap = std::collections::HashMap<String, bool>;
 
@@ -99,7 +99,7 @@ mod tests {
     use super::*;
     use crate::engine::router::{Router, RouterConfig};
     use std::time::Duration;
-    use tokio::sync::{oneshot, Notify};
+    use tokio::sync::{Notify, oneshot};
 
     #[tokio::test]
     async fn prepare_dispatch_context_drops_read_lock_before_awaiting_session_map() {

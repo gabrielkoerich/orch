@@ -9,9 +9,9 @@
 //! Sessions are registered when tasks are dispatched and unregistered
 //! when they complete.
 
-use crate::channels::tmux;
-use crate::channels::transport::{session_key, Transport};
 use crate::channels::OutputChunk;
+use crate::channels::tmux;
+use crate::channels::transport::{Transport, session_key};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;

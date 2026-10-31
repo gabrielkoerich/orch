@@ -205,20 +205,20 @@ pub async fn init_cooldown_store(store: Arc<crate::store::TaskStore>) {
             let mut loaded = 0;
             for (key, value) in rows {
                 let cooldown_key = key.trim_start_matches(KV_PREFIX);
-                if let Some((cooldown_until, reason)) = parse_cooldown_value(&value) {
-                    if now < cooldown_until {
-                        map.insert(
-                            cooldown_key.to_string(),
-                            CooldownEntry {
-                                cooldown_until,
-                                reason,
-                            },
-                        );
-                        loaded += 1;
-                    }
-                    // Expired entries are simply not loaded — they'll be overwritten
-                    // on the next failure or cleaned up by future writes.
+                if let Some((cooldown_until, reason)) = parse_cooldown_value(&value)
+                    && now < cooldown_until
+                {
+                    map.insert(
+                        cooldown_key.to_string(),
+                        CooldownEntry {
+                            cooldown_until,
+                            reason,
+                        },
+                    );
+                    loaded += 1;
                 }
+                // Expired entries are simply not loaded — they'll be overwritten
+                // on the next failure or cleaned up by future writes.
             }
             if loaded > 0 {
                 tracing::info!(loaded, "loaded persisted cooldowns from KV store");
@@ -230,18 +230,18 @@ pub async fn init_cooldown_store(store: Arc<crate::store::TaskStore>) {
     }
 
     // Load GitHub 5xx circuit breaker state if it was persisted before restart.
-    if let Ok(Some(raw)) = store.kv_get("cooldown:github:5xx").await {
-        if let Ok(cooldown_until) = raw.parse::<i64>() {
-            let now = chrono::Utc::now().timestamp();
-            if now < cooldown_until {
-                let mut open = github_5xx_circuit_open_lock();
-                *open = Some(cooldown_until);
-                let remaining = cooldown_until - now;
-                tracing::warn!(
-                    remaining_secs = remaining,
-                    "GitHub 5xx circuit breaker restored from KV (still open)"
-                );
-            }
+    if let Ok(Some(raw)) = store.kv_get("cooldown:github:5xx").await
+        && let Ok(cooldown_until) = raw.parse::<i64>()
+    {
+        let now = chrono::Utc::now().timestamp();
+        if now < cooldown_until {
+            let mut open = github_5xx_circuit_open_lock();
+            *open = Some(cooldown_until);
+            let remaining = cooldown_until - now;
+            tracing::warn!(
+                remaining_secs = remaining,
+                "GitHub 5xx circuit breaker restored from KV (still open)"
+            );
         }
     }
 
@@ -683,21 +683,21 @@ pub async fn record_model_failure(agent_name: &str, model: &str) {
 /// cooled. If no window is detected, fall back to the generic agent+model
 /// exponential backoff path.
 pub async fn record_rate_limit(agent_name: &str, model: Option<&str>, error_message: &str) {
-    if let Some(window_secs) = parse_relative_usage_window(error_message) {
-        if let Some(m) = model {
-            let cooldown_until = chrono::Utc::now()
-                .timestamp()
-                .saturating_add(i64::try_from(window_secs).unwrap_or(i64::MAX));
-            set_model_cooldown(agent_name, m, window_secs, "rate_limit_usage_window").await;
-            tracing::info!(
-                agent = agent_name,
-                model = m,
-                window_secs,
-                cooldown_until,
-                "relative usage window detected: applying model-specific cooldown"
-            );
-            return;
-        }
+    if let Some(window_secs) = parse_relative_usage_window(error_message)
+        && let Some(m) = model
+    {
+        let cooldown_until = chrono::Utc::now()
+            .timestamp()
+            .saturating_add(i64::try_from(window_secs).unwrap_or(i64::MAX));
+        set_model_cooldown(agent_name, m, window_secs, "rate_limit_usage_window").await;
+        tracing::info!(
+            agent = agent_name,
+            model = m,
+            window_secs,
+            cooldown_until,
+            "relative usage window detected: applying model-specific cooldown"
+        );
+        return;
     }
 
     record_agent_failure_with_message(agent_name, error_message).await;
@@ -1576,10 +1576,10 @@ pub(crate) fn parse_retry_at(error_message: &str) -> Option<i64> {
                     chrono::NaiveDateTime::parse_from_str(&with_year, "%Y %b %d %I:%M%p")
                 {
                     use chrono::TimeZone;
-                    if let Some(local_dt) = chrono::Local.from_local_datetime(&dt).earliest() {
-                        if local_dt > now_local {
-                            return Some(local_dt.timestamp());
-                        }
+                    if let Some(local_dt) = chrono::Local.from_local_datetime(&dt).earliest()
+                        && local_dt > now_local
+                    {
+                        return Some(local_dt.timestamp());
                     }
                 }
             }
@@ -2350,10 +2350,10 @@ mod tests {
         assert!(detect_credit_exhaustion("too many requests").is_none());
         assert!(detect_credit_exhaustion("429 Too Many Requests").is_none());
         assert!(detect_credit_exhaustion("you've hit your usage limit").is_none());
-        assert!(detect_credit_exhaustion(
-            "You've hit your usage limit, try again in a few minutes."
-        )
-        .is_none());
+        assert!(
+            detect_credit_exhaustion("You've hit your usage limit, try again in a few minutes.")
+                .is_none()
+        );
     }
 
     #[serial(cooldown_state)]

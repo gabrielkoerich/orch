@@ -192,15 +192,15 @@ pub fn parse_roadmap_for(
 
         if let Some(cols) = table {
             if line.trim().starts_with('|') {
-                if !is_separator_row(line) {
-                    if let Some(milestone) = current.as_ref() {
-                        match task_from_row(line, &cols, milestone, line_no) {
-                            Ok(Some(task)) => {
-                                push_task(task, &mut tasks, &mut seen, &mut errors);
-                            }
-                            Ok(None) => {}
-                            Err(err) => errors.push(err),
+                if !is_separator_row(line)
+                    && let Some(milestone) = current.as_ref()
+                {
+                    match task_from_row(line, &cols, milestone, line_no) {
+                        Ok(Some(task)) => {
+                            push_task(task, &mut tasks, &mut seen, &mut errors);
                         }
+                        Ok(None) => {}
+                        Err(err) => errors.push(err),
                     }
                 }
                 continue;
@@ -1519,10 +1519,11 @@ mod tests {
             issue_body(task, "acme/app", "main", "docs/ROADMAP.md")
         })
         .unwrap();
-        assert!(diff
-            .tasks
-            .iter()
-            .all(|plan| plan.kind == ChangeKind::Unchanged));
+        assert!(
+            diff.tasks
+                .iter()
+                .all(|plan| plan.kind == ChangeKind::Unchanged)
+        );
         assert!(diff.removed.is_empty(), "{:?}", diff.removed);
         let current = current_links(&roadmap);
         let links =
@@ -1536,9 +1537,11 @@ mod tests {
                 .count(),
             8
         );
-        assert!(!text
-            .lines()
-            .any(|line| line.starts_with("link ") || line.starts_with("unlink ")));
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.starts_with("link ") || line.starts_with("unlink "))
+        );
         assert!(text.contains("create 0, update 0, unchanged 8, link 0, removed 0\n"));
     }
 
@@ -1561,9 +1564,11 @@ mod tests {
         })
         .unwrap();
         assert_eq!(diff.tasks[0].kind, ChangeKind::Update);
-        assert!(diff.tasks[1..]
-            .iter()
-            .all(|plan| plan.kind == ChangeKind::Unchanged));
+        assert!(
+            diff.tasks[1..]
+                .iter()
+                .all(|plan| plan.kind == ChangeKind::Unchanged)
+        );
         assert_eq!(diff.removed.len(), 1);
         assert_eq!(diff.removed[0].task_id, "M1-99");
         assert!(render_tasks(&diff).contains("removed M1-99 issue #99 (open), not closed"));
@@ -1580,7 +1585,9 @@ mod tests {
         .unwrap();
         assert_eq!(diff.tasks[0].kind, ChangeKind::Update);
         assert_eq!(diff.tasks[0].number, Some(1));
-        assert!(labels_for(&diff.tasks[0].existing_labels, false).contains(&PLAN_LABEL.to_string()));
+        assert!(
+            labels_for(&diff.tasks[0].existing_labels, false).contains(&PLAN_LABEL.to_string())
+        );
     }
 
     #[test]
@@ -1700,10 +1707,11 @@ mod tests {
         })
         .unwrap();
         assert_eq!(diff.tasks.len(), 2);
-        assert!(diff
-            .tasks
-            .iter()
-            .all(|plan| plan.kind == ChangeKind::Create));
+        assert!(
+            diff.tasks
+                .iter()
+                .all(|plan| plan.kind == ChangeKind::Create)
+        );
         let links = diff_links(&selected, &bindings_for(&diff), &HashMap::new()).unwrap();
         assert!(
             !links.iter().any(|edit| matches!(

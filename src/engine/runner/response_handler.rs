@@ -266,18 +266,17 @@ impl StoreCtx<'_> {
         details: Option<&serde_json::Value>,
     ) {
         if let Some(store_id) = self.store_id_opt {
-            if let Some(ref s) = self.store {
-                if let Err(e) = s
+            if let Some(s) = self.store
+                && let Err(e) = s
                     .append_activity(store_id, event_type, None, None, agent, model, details)
                     .await
-                {
-                    tracing::warn!(
-                        task_id = self.task_id,
-                        event_type,
-                        error = %e,
-                        "store append_activity failed"
-                    );
-                }
+            {
+                tracing::warn!(
+                    task_id = self.task_id,
+                    event_type,
+                    error = %e,
+                    "store append_activity failed"
+                );
             }
         } else {
             store::store_log_activity(
@@ -1353,7 +1352,8 @@ async fn apply_post_decision_effects(
                     no_code_reroutes,
                     max_reroutes,
                     "blocking no-code reroute: reached max reroute attempts ({}/{}) for no-code-result",
-                    no_code_reroutes, max_reroutes
+                    no_code_reroutes,
+                    max_reroutes
                 );
                 format!(
                     "agent completed without code changes after {no_code_reroutes}/{max_reroutes} reroute attempts on external task requiring PR"
@@ -1407,15 +1407,15 @@ async fn store_token_usage(
         return;
     };
     let model = model_name.unwrap_or("haiku");
-    if let Some(ref st) = ctx.store {
+    if let Some(st) = ctx.store {
         if let Some(store_id) = ctx.store_id_opt {
             if let Err(e) = st.store_tokens(store_id, input, output, model).await {
                 tracing::warn!(task_id = ctx.task_id, ?e, "failed to store token usage");
             }
-        } else if let Ok(Some(store_id)) = st.resolve_task_id(ctx.repo, ctx.task_id).await {
-            if let Err(e) = st.store_tokens(store_id, input, output, model).await {
-                tracing::warn!(task_id = ctx.task_id, ?e, "failed to store token usage");
-            }
+        } else if let Ok(Some(store_id)) = st.resolve_task_id(ctx.repo, ctx.task_id).await
+            && let Err(e) = st.store_tokens(store_id, input, output, model).await
+        {
+            tracing::warn!(task_id = ctx.task_id, ?e, "failed to store token usage");
         }
     }
 }

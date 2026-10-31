@@ -76,7 +76,7 @@ use crate::engine::runner::worktree::{
     task_id_from_worktree_name, validate_worktree_gitdir,
 };
 use crate::engine::tasks::TaskManager;
-use crate::github::http::{rate_limit_metrics, GhHttp};
+use crate::github::http::{GhHttp, rate_limit_metrics};
 use crate::repo_context::REPO_CONTEXT;
 use crate::store::{TaskStatus, TaskStore};
 use crate::tmux::TmuxManager;
@@ -84,7 +84,7 @@ use runner::WeightSignal;
 // AtomicBool/Ordering removed — shutdown is now immediate (reset tasks + break)
 use std::sync::Arc;
 use tokio::process::Command;
-use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
+use tokio::sync::{Notify, RwLock, Semaphore, mpsc};
 
 use crate::backends::Status;
 
@@ -338,21 +338,22 @@ pub(crate) fn log_phase_timings(group: &str, repo: &str, phases: &[(&str, u128)]
 /// because `config::get` serializes nested YAML arrays via `serde_norway::to_string`
 /// which produces YAML block format, not JSON — breaking downstream parsing.
 pub fn configured_agents() -> Vec<String> {
-    if let Ok(agents_str) = crate::config::get("agents") {
-        if !agents_str.is_empty() && agents_str != "[]" {
-            // config::get returns serde_norway::to_string for arrays, which is
-            // YAML block format ("- claude\n- codex\n..."). Parse as YAML first.
-            if let Ok(agents_arr) = serde_norway::from_str::<Vec<String>>(&agents_str) {
-                if !agents_arr.is_empty() {
-                    return agents_arr;
-                }
-            }
-            // Fallback: try JSON (inline arrays) or comma-separated
-            if let Ok(agents_arr) = serde_json::from_str::<Vec<String>>(&agents_str) {
-                if !agents_arr.is_empty() {
-                    return agents_arr;
-                }
-            }
+    if let Ok(agents_str) = crate::config::get("agents")
+        && !agents_str.is_empty()
+        && agents_str != "[]"
+    {
+        // config::get returns serde_norway::to_string for arrays, which is
+        // YAML block format ("- claude\n- codex\n..."). Parse as YAML first.
+        if let Ok(agents_arr) = serde_norway::from_str::<Vec<String>>(&agents_str)
+            && !agents_arr.is_empty()
+        {
+            return agents_arr;
+        }
+        // Fallback: try JSON (inline arrays) or comma-separated
+        if let Ok(agents_arr) = serde_json::from_str::<Vec<String>>(&agents_str)
+            && !agents_arr.is_empty()
+        {
+            return agents_arr;
         }
     }
     router::config::DEFAULT_AGENTS
@@ -605,13 +606,12 @@ async fn report_rate_limited(
         "GitHub API rate limited until {until} — skipping GitHub calls, local work continues"
     );
 
-    if let Some(store) = store {
-        if let Err(e) = store
+    if let Some(store) = store
+        && let Err(e) = store
             .kv_set(RATE_LIMITED_UNTIL_KEY, &reset_at.to_string())
             .await
-        {
-            tracing::warn!(err = %e, "failed to persist GitHub rate-limit flag");
-        }
+    {
+        tracing::warn!(err = %e, "failed to persist GitHub rate-limit flag");
     }
 
     if let Some(transport) = transport {
@@ -1022,53 +1022,54 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
                 | TaskStatus::NeedsReview
                 | TaskStatus::InReview => {
                     tracing::info!(repo = %engine.repo, task_id = %task_id, worktree = %worktree_dir.display(), "rebasing startup worktree");
-                    if let Err(e) =
-                        rebase_worktree_on_origin_main(&worktree_dir, &default_branch).await
-                    {
-                        // If rebase failed we already made efforts to stash and
-                        // restore changes safely. Log the error and reset the
-                        // task as before. The worktree removal path is used
-                        // to avoid leaving corrupted worktrees around.
-                        tracing::warn!(repo = %engine.repo, task_id = %task_id, err = %e, "startup rebase failed, resetting task");
-                        abort_worktree_rebase(&worktree_dir).await;
-                        let keep_remote = task.pr_number.is_some();
-                        remove_worktree_and_branch(
-                            &task_id,
-                            &worktree_dir,
-                            Some(branch_name),
-                            &repo_root_path,
-                            keep_remote,
-                        )
-                        .await;
-                        match engine.store.resolve_task_id(&engine.repo, &task_id).await {
-                            Ok(Some(reset_id)) => {
-                                if let Err(e) = engine.store.reset_to_new(reset_id).await {
-                                    tracing::warn!(task_id, err = %e, "failed to reset task to new after rebase failure");
+                    match rebase_worktree_on_origin_main(&worktree_dir, &default_branch).await {
+                        Err(e) => {
+                            // If rebase failed we already made efforts to stash and
+                            // restore changes safely. Log the error and reset the
+                            // task as before. The worktree removal path is used
+                            // to avoid leaving corrupted worktrees around.
+                            tracing::warn!(repo = %engine.repo, task_id = %task_id, err = %e, "startup rebase failed, resetting task");
+                            abort_worktree_rebase(&worktree_dir).await;
+                            let keep_remote = task.pr_number.is_some();
+                            remove_worktree_and_branch(
+                                &task_id,
+                                &worktree_dir,
+                                Some(branch_name),
+                                &repo_root_path,
+                                keep_remote,
+                            )
+                            .await;
+                            match engine.store.resolve_task_id(&engine.repo, &task_id).await {
+                                Ok(Some(reset_id)) => {
+                                    if let Err(e) = engine.store.reset_to_new(reset_id).await {
+                                        tracing::warn!(task_id, err = %e, "failed to reset task to new after rebase failure");
+                                    }
+                                }
+                                Ok(None) => {
+                                    tracing::warn!(
+                                        task_id,
+                                        "task not found in store during reconciliation"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(task_id, err = %e, "failed to resolve task ID during reconciliation");
                                 }
                             }
-                            Ok(None) => {
-                                tracing::warn!(
-                                    task_id,
-                                    "task not found in store during reconciliation"
-                                );
+                            if let Err(e) = engine
+                                .task_manager
+                                .update_task_status(
+                                    &ExternalId(task_id.clone()),
+                                    crate::backends::Status::New,
+                                )
+                                .await
+                            {
+                                tracing::warn!(task_id, err = %e, "failed to update backend status during reconciliation");
                             }
-                            Err(e) => {
-                                tracing::warn!(task_id, err = %e, "failed to resolve task ID during reconciliation");
-                            }
+                            cleaned += 1;
                         }
-                        if let Err(e) = engine
-                            .task_manager
-                            .update_task_status(
-                                &ExternalId(task_id.clone()),
-                                crate::backends::Status::New,
-                            )
-                            .await
-                        {
-                            tracing::warn!(task_id, err = %e, "failed to update backend status during reconciliation");
+                        _ => {
+                            valid_kept += 1;
                         }
-                        cleaned += 1;
-                    } else {
-                        valid_kept += 1;
                     }
                 }
                 // A blocked or waiting task resumes from this work, and without a PR the branch
@@ -1269,12 +1270,11 @@ async fn check_and_notify_upgrade(
 
     // Throttle: only check once per interval.
     let now = chrono::Utc::now().timestamp();
-    if let Ok(Some(last_check_str)) = store.kv_get(last_check_key).await {
-        if let Ok(last_check) = last_check_str.parse::<i64>() {
-            if now - last_check < i64::try_from(check_interval.as_secs()).unwrap_or(i64::MAX) {
-                return;
-            }
-        }
+    if let Ok(Some(last_check_str)) = store.kv_get(last_check_key).await
+        && let Ok(last_check) = last_check_str.parse::<i64>()
+        && now - last_check < i64::try_from(check_interval.as_secs()).unwrap_or(i64::MAX)
+    {
+        return;
     }
 
     // Record check timestamp (best-effort).
@@ -1300,11 +1300,11 @@ async fn check_and_notify_upgrade(
     // upgrade on their own schedule. The service never runs brew itself.
 
     // Deduplicate: don't re-notify for the same latest version.
-    if let Ok(Some(last_notified)) = store.kv_get(last_notified_key).await {
-        if last_notified == latest {
-            tracing::debug!(latest = %latest, "upgrade already notified");
-            return;
-        }
+    if let Ok(Some(last_notified)) = store.kv_get(last_notified_key).await
+        && last_notified == latest
+    {
+        tracing::debug!(latest = %latest, "upgrade already notified");
+        return;
     }
 
     let msg_telegram = format!(
@@ -1396,21 +1396,24 @@ async fn send_startup_escalation_notification(elapsed_secs: u64) {
     // Telegram
     let tg_token = crate::secret_ref::config_secret("channels.telegram.bot_token").await;
     let tg_chat_id = crate::config::get("channels.telegram.chat_id");
-    if let (Ok(token), Ok(chat_id)) = (&tg_token, &tg_chat_id) {
-        if !token.is_empty() && !chat_id.is_empty() {
-            if let Ok(channel) = TelegramChannel::new(token.clone(), Some(chat_id.clone())) {
-                let msg = OutgoingMessage {
-                    thread_id: "startup_escalation".to_string(),
-                    body: msg_telegram.clone(),
-                    reply_to: None,
-                    metadata: serde_json::json!({ "preformatted_html": true }),
-                    topic_id: crate::config::get("channels.telegram.general_topic_id").ok(),
-                };
-                if let Err(e) = channel.send(&msg).await {
-                    tracing::warn!(?e, "failed to send startup escalation via telegram");
-                } else {
-                    tracing::info!("startup escalation notification sent to telegram");
-                }
+    if let (Ok(token), Ok(chat_id)) = (&tg_token, &tg_chat_id)
+        && !token.is_empty()
+        && !chat_id.is_empty()
+        && let Ok(channel) = TelegramChannel::new(token.clone(), Some(chat_id.clone()))
+    {
+        let msg = OutgoingMessage {
+            thread_id: "startup_escalation".to_string(),
+            body: msg_telegram.clone(),
+            reply_to: None,
+            metadata: serde_json::json!({ "preformatted_html": true }),
+            topic_id: crate::config::get("channels.telegram.general_topic_id").ok(),
+        };
+        match channel.send(&msg).await {
+            Err(e) => {
+                tracing::warn!(?e, "failed to send startup escalation via telegram");
+            }
+            _ => {
+                tracing::info!("startup escalation notification sent to telegram");
             }
         }
     }
@@ -1419,27 +1422,30 @@ async fn send_startup_escalation_notification(elapsed_secs: u64) {
     if let Ok(token) = crate::secret_ref::config_secret("channels.discord.bot_token").await {
         let channel_id = crate::config::get("channels.discord.channel_id")
             .or_else(|_| crate::config::get("channels.discord.general_channel_id"));
-        if !token.is_empty() {
-            if let Some(cid) = channel_id.ok().filter(|s| !s.is_empty()) {
-                let shard_id = crate::config::get("channels.discord.shard_id")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(0);
-                let shard_count = crate::config::get("channels.discord.shard_count")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(1);
-                if let Ok(gateway) = DiscordGateway::new(token, Some(cid), shard_id, shard_count) {
-                    let msg = OutgoingMessage {
-                        thread_id: "startup_escalation".to_string(),
-                        body: msg_discord.clone(),
-                        reply_to: None,
-                        metadata: serde_json::Value::Null,
-                        topic_id: None,
-                    };
-                    if let Err(e) = gateway.send(&msg).await {
+        if !token.is_empty()
+            && let Some(cid) = channel_id.ok().filter(|s| !s.is_empty())
+        {
+            let shard_id = crate::config::get("channels.discord.shard_id")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let shard_count = crate::config::get("channels.discord.shard_count")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(1);
+            if let Ok(gateway) = DiscordGateway::new(token, Some(cid), shard_id, shard_count) {
+                let msg = OutgoingMessage {
+                    thread_id: "startup_escalation".to_string(),
+                    body: msg_discord.clone(),
+                    reply_to: None,
+                    metadata: serde_json::Value::Null,
+                    topic_id: None,
+                };
+                match gateway.send(&msg).await {
+                    Err(e) => {
                         tracing::warn!(?e, "failed to send startup escalation via discord");
-                    } else {
+                    }
+                    _ => {
                         tracing::info!("startup escalation notification sent to discord");
                     }
                 }
@@ -1450,21 +1456,23 @@ async fn send_startup_escalation_notification(elapsed_secs: u64) {
     // Slack
     if let Ok(token) = crate::secret_ref::config_secret("channels.slack.bot_token").await {
         let channel_id = crate::config::get("channels.slack.channel_id");
-        if !token.is_empty() {
-            if let Ok(cid) = channel_id {
-                if let Ok(channel) = SlackChannel::new(token, Some(cid)) {
-                    let msg = OutgoingMessage {
-                        thread_id: "startup_escalation".to_string(),
-                        body: msg_slack.clone(),
-                        reply_to: None,
-                        metadata: serde_json::Value::Null,
-                        topic_id: None,
-                    };
-                    if let Err(e) = channel.send(&msg).await {
-                        tracing::warn!(?e, "failed to send startup escalation via slack");
-                    } else {
-                        tracing::info!("startup escalation notification sent to slack");
-                    }
+        if !token.is_empty()
+            && let Ok(cid) = channel_id
+            && let Ok(channel) = SlackChannel::new(token, Some(cid))
+        {
+            let msg = OutgoingMessage {
+                thread_id: "startup_escalation".to_string(),
+                body: msg_slack.clone(),
+                reply_to: None,
+                metadata: serde_json::Value::Null,
+                topic_id: None,
+            };
+            match channel.send(&msg).await {
+                Err(e) => {
+                    tracing::warn!(?e, "failed to send startup escalation via slack");
+                }
+                _ => {
+                    tracing::info!("startup escalation notification sent to slack");
                 }
             }
         }
@@ -1584,14 +1592,14 @@ pub async fn serve() -> anyhow::Result<()> {
     {
         let current = env!("ORCH_VERSION").to_string();
         tokio::spawn(async move {
-            if let Some(latest) = fetch_latest_release_version().await {
-                if latest != current {
-                    tracing::warn!(
-                        current_version = %current,
-                        latest_version = %latest,
-                        "orch service is behind the latest release — run: brew update && brew upgrade orch && brew services restart orch"
-                    );
-                }
+            if let Some(latest) = fetch_latest_release_version().await
+                && latest != current
+            {
+                tracing::warn!(
+                    current_version = %current,
+                    latest_version = %latest,
+                    "orch service is behind the latest release — run: brew update && brew upgrade orch && brew services restart orch"
+                );
             }
         });
     }
@@ -1608,10 +1616,8 @@ pub async fn serve() -> anyhow::Result<()> {
 
     // Startup reconciliation decides task status, so only the leader runs it
     let leads = project_engines.first().is_none_or(|e| e.store.is_leader());
-    if leads {
-        if let Err(e) = reconcile_startup_worktrees(&project_engines).await {
-            tracing::warn!(err = %e, "startup worktree reconciliation failed");
-        }
+    if leads && let Err(e) = reconcile_startup_worktrees(&project_engines).await {
+        tracing::warn!(err = %e, "startup worktree reconciliation failed");
     }
 
     if leads {
@@ -1667,69 +1673,69 @@ pub async fn serve() -> anyhow::Result<()> {
     let mut channel_registry = ChannelRegistry::new();
 
     // Try to initialize Telegram channel
-    if let Ok(token) = crate::secret_ref::config_secret("channels.telegram.bot_token").await {
-        if !token.is_empty() {
-            let chat_id = crate::config::get("channels.telegram.chat_id").ok();
-            match TelegramChannel::new(token, chat_id) {
-                Ok(telegram) => {
-                    if let Err(e) = telegram.health_check().await {
-                        tracing::warn!(?e, "telegram channel health check failed, skipping");
-                    } else {
-                        channel_registry.register(Box::new(telegram));
-                        tracing::info!("telegram channel registered");
-                    }
+    if let Ok(token) = crate::secret_ref::config_secret("channels.telegram.bot_token").await
+        && !token.is_empty()
+    {
+        let chat_id = crate::config::get("channels.telegram.chat_id").ok();
+        match TelegramChannel::new(token, chat_id) {
+            Ok(telegram) => {
+                if let Err(e) = telegram.health_check().await {
+                    tracing::warn!(?e, "telegram channel health check failed, skipping");
+                } else {
+                    channel_registry.register(Box::new(telegram));
+                    tracing::info!("telegram channel registered");
                 }
-                Err(e) => {
-                    tracing::warn!(?e, "failed to create telegram channel, skipping");
-                }
+            }
+            Err(e) => {
+                tracing::warn!(?e, "failed to create telegram channel, skipping");
             }
         }
     }
 
     // Try to initialize Discord Gateway channel (websocket)
-    if let Ok(token) = crate::secret_ref::config_secret("channels.discord.bot_token").await {
-        if !token.is_empty() {
-            let channel_id = crate::config::get("channels.discord.channel_id").ok();
-            let shard_id = crate::config::get("channels.discord.shard_id")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0);
-            let shard_count = crate::config::get("channels.discord.shard_count")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(1);
-            match DiscordGateway::new(token, channel_id, shard_id, shard_count) {
-                Ok(discord) => {
-                    if let Err(e) = discord.health_check().await {
-                        tracing::warn!(?e, "discord gateway health check failed, skipping");
-                    } else {
-                        channel_registry.register(Box::new(discord));
-                        tracing::info!(shard_id, shard_count, "discord gateway registered");
-                    }
+    if let Ok(token) = crate::secret_ref::config_secret("channels.discord.bot_token").await
+        && !token.is_empty()
+    {
+        let channel_id = crate::config::get("channels.discord.channel_id").ok();
+        let shard_id = crate::config::get("channels.discord.shard_id")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let shard_count = crate::config::get("channels.discord.shard_count")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1);
+        match DiscordGateway::new(token, channel_id, shard_id, shard_count) {
+            Ok(discord) => {
+                if let Err(e) = discord.health_check().await {
+                    tracing::warn!(?e, "discord gateway health check failed, skipping");
+                } else {
+                    channel_registry.register(Box::new(discord));
+                    tracing::info!(shard_id, shard_count, "discord gateway registered");
                 }
-                Err(e) => {
-                    tracing::warn!(?e, "failed to create discord gateway, skipping");
-                }
+            }
+            Err(e) => {
+                tracing::warn!(?e, "failed to create discord gateway, skipping");
             }
         }
     }
 
     // Try to initialize Slack channel
-    if let Ok(token) = crate::secret_ref::config_secret("channels.slack.bot_token").await {
-        if !token.is_empty() {
-            let channel_id = crate::config::get("channels.slack.channel_id").ok();
-            match SlackChannel::new(token, channel_id) {
-                Ok(slack) => {
-                    if let Err(e) = slack.health_check().await {
-                        tracing::warn!(?e, "slack channel health check failed, skipping");
-                    } else {
-                        channel_registry.register(Box::new(slack));
-                        tracing::info!("slack channel registered");
-                    }
+    if let Ok(token) = crate::secret_ref::config_secret("channels.slack.bot_token").await
+        && !token.is_empty()
+    {
+        let channel_id = crate::config::get("channels.slack.channel_id").ok();
+        match SlackChannel::new(token, channel_id) {
+            Ok(slack) => {
+                if let Err(e) = slack.health_check().await {
+                    tracing::warn!(?e, "slack channel health check failed, skipping");
+                } else {
+                    channel_registry.register(Box::new(slack));
+                    tracing::info!("slack channel registered");
                 }
-                Err(e) => {
-                    tracing::warn!(?e, "failed to create slack channel, skipping");
-                }
+            }
+            Err(e) => {
+                tracing::warn!(?e, "failed to create slack channel, skipping");
             }
         }
     }
@@ -1912,15 +1918,18 @@ pub async fn serve() -> anyhow::Result<()> {
                                     metadata,
                                     topic_id: None,
                                 };
-                                if let Err(e) = channel.send(&msg).await {
-                                    tracing::warn!(
-                                        task_id = %notification.task_id,
-                                        target,
-                                        ?e,
-                                        "failed to send to notify_target"
-                                    );
-                                } else {
-                                    routed = true;
+                                match channel.send(&msg).await {
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            task_id = %notification.task_id,
+                                            target,
+                                            ?e,
+                                            "failed to send to notify_target"
+                                        );
+                                    }
+                                    _ => {
+                                        routed = true;
+                                    }
                                 }
                             }
                         }
@@ -2859,8 +2868,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                     } else {
                                         if let Ok(Some(store_id)) =
                                             engine.store.resolve_task_id(&engine.repo, &task.id.0).await
-                                        {
-                                            if let Err(e) = engine
+                                            && let Err(e) = engine
                                                 .store
                                                 .finalize_incomplete_runs(
                                                     store_id,
@@ -2875,7 +2883,6 @@ pub async fn serve() -> anyhow::Result<()> {
                                                     "failed to finalize incomplete runs on shutdown"
                                                 );
                                             }
-                                        }
                                         reset_count += 1;
                                     }
                                 }
@@ -2917,8 +2924,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                     } else {
                                         if let Ok(Some(store_id)) =
                                             engine.store.resolve_task_id(&engine.repo, &task.id.0).await
-                                        {
-                                            if let Err(e) = engine
+                                            && let Err(e) = engine
                                                 .store
                                                 .finalize_incomplete_runs(
                                                     store_id,
@@ -2933,7 +2939,6 @@ pub async fn serve() -> anyhow::Result<()> {
                                                     "failed to finalize incomplete review runs on shutdown"
                                                 );
                                             }
-                                        }
                                         review_reset_count += 1;
                                     }
                                 }
@@ -2981,11 +2986,11 @@ pub async fn serve() -> anyhow::Result<()> {
                         if let Ok(sessions) = tmux.list_sessions().await {
                             for session in &sessions {
                                 if session.name.starts_with("orch-") {
-                                    if let Err(e) = tmux.kill_session(&session.name).await {
+                                    match tmux.kill_session(&session.name).await { Err(e) => {
                                         tracing::warn!(session = %session.name, error = %e, "failed to kill tmux session");
-                                    } else {
+                                    } _ => {
                                         killed_sessions.push(session.name.clone());
-                                    }
+                                    }}
                                 }
                             }
                             if !killed_sessions.is_empty() {
@@ -3150,23 +3155,29 @@ mod tests {
         held.truncate(5);
         in_force = resize_dispatch_pool(&semaphore, in_force, 4);
         assert_eq!(in_force, 5);
-        assert!(std::sync::Arc::clone(&semaphore)
-            .try_acquire_owned()
-            .is_err());
+        assert!(
+            std::sync::Arc::clone(&semaphore)
+                .try_acquire_owned()
+                .is_err()
+        );
 
         // One more finishes and the pool settles at the new limit.
         held.truncate(4);
         in_force = resize_dispatch_pool(&semaphore, in_force, 4);
         assert_eq!(in_force, 4);
-        assert!(std::sync::Arc::clone(&semaphore)
-            .try_acquire_owned()
-            .is_err());
+        assert!(
+            std::sync::Arc::clone(&semaphore)
+                .try_acquire_owned()
+                .is_err()
+        );
 
         // A slot freed after that is handed out, since 4 is now the real limit.
         held.truncate(3);
-        assert!(std::sync::Arc::clone(&semaphore)
-            .try_acquire_owned()
-            .is_ok());
+        assert!(
+            std::sync::Arc::clone(&semaphore)
+                .try_acquire_owned()
+                .is_ok()
+        );
     }
 
     #[test]
@@ -3432,11 +3443,10 @@ mod tests {
         for _ in 0..20 {
             if let Ok(Ok(c)) =
                 tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
+                && c.content.contains("from-channel")
             {
-                if c.content.contains("from-channel") {
-                    got = true;
-                    break;
-                }
+                got = true;
+                break;
             }
         }
 

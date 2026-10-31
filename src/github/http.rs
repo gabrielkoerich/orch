@@ -15,11 +15,11 @@ use super::types::{
 };
 use crate::engine::cooldown as engine_cooldown;
 use anyhow::Context;
-use reqwest::{header, Client, Response, StatusCode};
+use reqwest::{Client, Response, StatusCode, header};
 use serde::Serialize;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc, Mutex, OnceLock,
+    atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 use urlencoding;
@@ -221,17 +221,16 @@ impl RateLimit {
         if self.backoff_remaining().is_some() {
             return None;
         }
-        if let Some(remaining) = self.remaining {
-            if remaining < self.throttle_threshold {
-                if let Some(reset_epoch) = self.reset_at {
-                    let now_epoch = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    if now_epoch < reset_epoch {
-                        return Some(Duration::from_secs(reset_epoch - now_epoch + 1));
-                    }
-                }
+        if let Some(remaining) = self.remaining
+            && remaining < self.throttle_threshold
+            && let Some(reset_epoch) = self.reset_at
+        {
+            let now_epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if now_epoch < reset_epoch {
+                return Some(Duration::from_secs(reset_epoch - now_epoch + 1));
             }
         }
         None
@@ -392,13 +391,12 @@ fn page_cache_store(key: String, etag: String, body: String, next: Option<String
 fn maybe_record_body_rate_limit(cell: &Mutex<RateLimit>, status: StatusCode, body: &str) {
     if status == StatusCode::FORBIDDEN {
         let lower = body.to_lowercase();
-        if lower.contains("rate limit")
+        if (lower.contains("rate limit")
             || lower.contains("abuse detection")
-            || lower.contains("secondary rate")
+            || lower.contains("secondary rate"))
+            && let Ok(mut rl) = cell.lock()
         {
-            if let Ok(mut rl) = cell.lock() {
-                rl.record_rate_limit();
-            }
+            rl.record_rate_limit();
         }
     }
 }
@@ -1187,19 +1185,19 @@ impl GhHttp {
         let text = text_res?;
         let json: serde_json::Value = serde_json::from_str(&text)?;
         // GraphQL always returns 200 even for errors; check the errors field explicitly.
-        if let Some(errors) = json.get("errors").and_then(|e| e.as_array()) {
-            if !errors.is_empty() {
-                let messages: Vec<&str> = errors
-                    .iter()
-                    .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
-                    .collect();
-                if json.get("data").is_none() || json["data"].is_null() {
-                    // No data at all — surface the errors as a proper error.
-                    anyhow::bail!("GitHub GraphQL errors: {}", messages.join("; "));
-                }
-                // Partial data alongside errors — log and continue.
-                tracing::warn!(errors = ?messages, "GitHub GraphQL returned partial errors");
+        if let Some(errors) = json.get("errors").and_then(|e| e.as_array())
+            && !errors.is_empty()
+        {
+            let messages: Vec<&str> = errors
+                .iter()
+                .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+                .collect();
+            if json.get("data").is_none() || json["data"].is_null() {
+                // No data at all — surface the errors as a proper error.
+                anyhow::bail!("GitHub GraphQL errors: {}", messages.join("; "));
             }
+            // Partial data alongside errors — log and continue.
+            tracing::warn!(errors = ?messages, "GitHub GraphQL returned partial errors");
         }
         Ok(json)
     }
@@ -1865,18 +1863,18 @@ impl GhHttp {
         let resp = self.graphql_with_vars(&query, vars).await?;
 
         // Surface GraphQL partial errors before checking data structure
-        if let Some(errors) = resp.get("errors").and_then(|e| e.as_array()) {
-            if !errors.is_empty() {
-                let messages: Vec<&str> = errors
-                    .iter()
-                    .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
-                    .collect();
-                tracing::warn!(
-                    repo,
-                    errors = ?messages,
-                    "GraphQL returned errors in batch PR merge check"
-                );
-            }
+        if let Some(errors) = resp.get("errors").and_then(|e| e.as_array())
+            && !errors.is_empty()
+        {
+            let messages: Vec<&str> = errors
+                .iter()
+                .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+                .collect();
+            tracing::warn!(
+                repo,
+                errors = ?messages,
+                "GraphQL returned errors in batch PR merge check"
+            );
         }
 
         Self::parse_batch_pr_merged_response(&resp, branches)
@@ -4260,11 +4258,13 @@ mod tests {
     /// `since` is derived from the clock, so the key would never recur.
     #[test]
     fn page_cache_key_skips_since_filtered_requests() {
-        assert!(page_cache_key::<GitHubIssue>(
-            "/issues",
-            Some(&[("state", "closed"), ("since", "2026-10-01T00:00:00Z")])
-        )
-        .is_none());
+        assert!(
+            page_cache_key::<GitHubIssue>(
+                "/issues",
+                Some(&[("state", "closed"), ("since", "2026-10-01T00:00:00Z")])
+            )
+            .is_none()
+        );
         // Also when it arrives embedded in a Link: next URL.
         assert!(
             page_cache_key::<GitHubIssue>("/issues?since=2026-10-01T00:00:00Z&page=2", None)
@@ -4404,7 +4404,8 @@ mod tests {
     #[tokio::test]
     async fn send_with_retries_propagates_make_req_error() {
         let guard = std::env::var_os("GH_TOKEN");
-        std::env::set_var("GH_TOKEN", "test_token");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("GH_TOKEN", "test_token") };
         let gh = test_client();
         let result = gh
             .send_with_retries(
@@ -4416,8 +4417,10 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert_eq!(err, "simulated request clone failure");
         match guard {
-            Some(v) => std::env::set_var("GH_TOKEN", v),
-            None => std::env::remove_var("GH_TOKEN"),
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            Some(v) => unsafe { std::env::set_var("GH_TOKEN", v) },
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            None => unsafe { std::env::remove_var("GH_TOKEN") },
         }
     }
 
@@ -4429,7 +4432,8 @@ mod tests {
     #[tokio::test]
     async fn send_with_retries_transport_error_does_not_trip_5xx_breaker() {
         let guard = std::env::var_os("GH_TOKEN");
-        std::env::set_var("GH_TOKEN", "test_token");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("GH_TOKEN", "test_token") };
 
         // Bind then immediately drop a listener to get a port nothing is
         // listening on, so connecting reliably fails with "connection refused"
@@ -4452,15 +4456,18 @@ mod tests {
         assert!(crate::engine::cooldown::cooldown_until("github:5xx").is_none());
 
         match guard {
-            Some(v) => std::env::set_var("GH_TOKEN", v),
-            None => std::env::remove_var("GH_TOKEN"),
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            Some(v) => unsafe { std::env::set_var("GH_TOKEN", v) },
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            None => unsafe { std::env::remove_var("GH_TOKEN") },
         }
     }
 
     #[tokio::test]
     async fn post_json_raw_propagates_body_read_errors_on_success() {
         let guard = std::env::var_os("GH_TOKEN");
-        std::env::set_var("GH_TOKEN", "test_token");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("GH_TOKEN", "test_token") };
         let server_url = spawn_truncated_body_server("{").await;
         let gh = test_client();
 
@@ -4484,15 +4491,18 @@ mod tests {
         );
 
         match guard {
-            Some(v) => std::env::set_var("GH_TOKEN", v),
-            None => std::env::remove_var("GH_TOKEN"),
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            Some(v) => unsafe { std::env::set_var("GH_TOKEN", v) },
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            None => unsafe { std::env::remove_var("GH_TOKEN") },
         }
     }
 
     #[tokio::test]
     async fn patch_json_raw_propagates_body_read_errors_on_success() {
         let guard = std::env::var_os("GH_TOKEN");
-        std::env::set_var("GH_TOKEN", "test_token");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("GH_TOKEN", "test_token") };
         let server_url = spawn_truncated_body_server("{").await;
         let gh = test_client();
 
@@ -4516,15 +4526,18 @@ mod tests {
         );
 
         match guard {
-            Some(v) => std::env::set_var("GH_TOKEN", v),
-            None => std::env::remove_var("GH_TOKEN"),
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            Some(v) => unsafe { std::env::set_var("GH_TOKEN", v) },
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            None => unsafe { std::env::remove_var("GH_TOKEN") },
         }
     }
 
     #[tokio::test]
     async fn graphql_request_propagates_body_read_errors_on_success() {
         let guard = std::env::var_os("GH_TOKEN");
-        std::env::set_var("GH_TOKEN", "test_token");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("GH_TOKEN", "test_token") };
         let server_url = spawn_truncated_body_server("{").await;
         let gh = test_client();
         let query = "query { viewer { login } }";
@@ -4551,8 +4564,10 @@ mod tests {
         );
 
         match guard {
-            Some(v) => std::env::set_var("GH_TOKEN", v),
-            None => std::env::remove_var("GH_TOKEN"),
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            Some(v) => unsafe { std::env::set_var("GH_TOKEN", v) },
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            None => unsafe { std::env::remove_var("GH_TOKEN") },
         }
     }
 
@@ -4564,7 +4579,7 @@ mod tests {
         use std::ffi::OsString;
         use std::sync::Arc;
         use wiremock::matchers::{method, path};
-        use wiremock::{matchers, Match, Mock, MockServer, Request, ResponseTemplate};
+        use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate, matchers};
 
         /// wiremock has no negated matcher, and the first poll must be matched on the
         /// absence of `If-None-Match` to tell it apart from the conditional one.
@@ -4584,7 +4599,8 @@ mod tests {
         impl EnvVarGuard {
             fn set(key: &'static str, value: &str) -> Self {
                 let previous = std::env::var_os(key);
-                std::env::set_var(key, value);
+                // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                unsafe { std::env::set_var(key, value) };
                 Self { key, previous }
             }
         }
@@ -4592,8 +4608,10 @@ mod tests {
         impl Drop for EnvVarGuard {
             fn drop(&mut self) {
                 match self.previous.take() {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
+                    // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                    Some(value) => unsafe { std::env::set_var(self.key, value) },
+                    // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                    None => unsafe { std::env::remove_var(self.key) },
                 }
             }
         }
@@ -5004,8 +5022,8 @@ mod tests {
     #[cfg(test)]
     mod auth_retry {
         use super::test_client;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -5024,7 +5042,8 @@ mod tests {
         async fn retries_once_with_fresh_token_after_401() {
             let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
             let prev = std::env::var_os("GH_TOKEN");
-            std::env::set_var("GH_TOKEN", "bad_token");
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::set_var("GH_TOKEN", "bad_token") };
 
             let server = MockServer::start().await;
             let hits = Arc::new(AtomicUsize::new(0));
@@ -5034,7 +5053,8 @@ mod tests {
                     if hits_in_handler.fetch_add(1, Ordering::SeqCst) == 0 {
                         // The 401 handler clears the cache and re-resolves; simulate the
                         // operator having fixed the env var in the meantime
-                        std::env::set_var("GH_TOKEN", "good_token");
+                        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                        unsafe { std::env::set_var("GH_TOKEN", "good_token") };
                         bad_credentials()
                     } else {
                         ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ok": true }))
@@ -5048,8 +5068,10 @@ mod tests {
                 gh.get_json(&format!("{}/x", server.uri())).await;
 
             match prev {
-                Some(v) => std::env::set_var("GH_TOKEN", v),
-                None => std::env::remove_var("GH_TOKEN"),
+                // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                Some(v) => unsafe { std::env::set_var("GH_TOKEN", v) },
+                // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                None => unsafe { std::env::remove_var("GH_TOKEN") },
             }
 
             assert!(
@@ -5068,7 +5090,8 @@ mod tests {
         async fn double_401_bails_with_distinct_auth_error() {
             let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
             let prev = std::env::var_os("GH_TOKEN");
-            std::env::set_var("GH_TOKEN", "bad_token");
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::set_var("GH_TOKEN", "bad_token") };
 
             let server = MockServer::start().await;
             let hits = Arc::new(AtomicUsize::new(0));
@@ -5086,8 +5109,10 @@ mod tests {
                 gh.get_json(&format!("{}/x", server.uri())).await;
 
             match prev {
-                Some(v) => std::env::set_var("GH_TOKEN", v),
-                None => std::env::remove_var("GH_TOKEN"),
+                // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                Some(v) => unsafe { std::env::set_var("GH_TOKEN", v) },
+                // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                None => unsafe { std::env::remove_var("GH_TOKEN") },
             }
 
             let err = result.expect_err("persisting 401 must fail").to_string();
@@ -5106,8 +5131,8 @@ mod tests {
     // ── secret redaction on posted bodies (wiremock) ─────────────────────
 
     mod leak_redaction {
-        use super::test_client;
         use super::GhHttp;
+        use super::test_client;
         use std::sync::{Arc, Mutex};
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -5157,7 +5182,8 @@ mod tests {
         async fn add_comment_redacts_github_token() {
             let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
             let prev = std::env::var_os("GH_TOKEN");
-            std::env::set_var("GH_TOKEN", "test_token");
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::set_var("GH_TOKEN", "test_token") };
 
             let server = MockServer::start().await;
             let captured = Arc::new(Mutex::new(None::<String>));
@@ -5179,8 +5205,10 @@ mod tests {
                 .expect("add_comment should succeed");
 
             match prev {
-                Some(v) => std::env::set_var("GH_TOKEN", v),
-                None => std::env::remove_var("GH_TOKEN"),
+                // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                Some(v) => unsafe { std::env::set_var("GH_TOKEN", v) },
+                // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                None => unsafe { std::env::remove_var("GH_TOKEN") },
             }
 
             let raw = captured
@@ -5199,7 +5227,8 @@ mod tests {
         async fn create_pr_redacts_github_token() {
             let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
             let prev = std::env::var_os("GH_TOKEN");
-            std::env::set_var("GH_TOKEN", "test_token");
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::set_var("GH_TOKEN", "test_token") };
 
             let server = MockServer::start().await;
             let captured = Arc::new(Mutex::new(None::<String>));
@@ -5223,8 +5252,10 @@ mod tests {
                 .expect("create_pr should succeed");
 
             match prev {
-                Some(v) => std::env::set_var("GH_TOKEN", v),
-                None => std::env::remove_var("GH_TOKEN"),
+                // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                Some(v) => unsafe { std::env::set_var("GH_TOKEN", v) },
+                // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                None => unsafe { std::env::remove_var("GH_TOKEN") },
             }
 
             let raw = captured
@@ -5243,7 +5274,8 @@ mod tests {
         async fn update_pr_body_redacts_github_token() {
             let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
             let prev = std::env::var_os("GH_TOKEN");
-            std::env::set_var("GH_TOKEN", "test_token");
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::set_var("GH_TOKEN", "test_token") };
 
             let server = MockServer::start().await;
             let captured = Arc::new(Mutex::new(None::<String>));
@@ -5265,8 +5297,10 @@ mod tests {
                 .expect("update_pr_body should succeed");
 
             match prev {
-                Some(v) => std::env::set_var("GH_TOKEN", v),
-                None => std::env::remove_var("GH_TOKEN"),
+                // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                Some(v) => unsafe { std::env::set_var("GH_TOKEN", v) },
+                // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                None => unsafe { std::env::remove_var("GH_TOKEN") },
             }
 
             let raw = captured

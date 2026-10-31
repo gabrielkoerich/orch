@@ -1,7 +1,7 @@
 //! The `cluster:` section of the global config
 
 use super::discovery::Tailnet;
-use super::{discovery, NodeId};
+use super::{NodeId, discovery};
 use std::collections::BTreeMap;
 
 pub const DEFAULT_PORT: u16 = 7420;

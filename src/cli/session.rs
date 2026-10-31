@@ -107,10 +107,11 @@ fn parse_output(content: &str) -> ParsedOutput {
         match event_type {
             // ── Claude ────────────────────────────────────────────────────
             "assistant" => {
-                if let Some(text) = extract_claude_text(&v) {
-                    if text.len() > 40 && key_messages.len() < 10 {
-                        key_messages.push(first_sentence(&text, 160));
-                    }
+                if let Some(text) = extract_claude_text(&v)
+                    && text.len() > 40
+                    && key_messages.len() < 10
+                {
+                    key_messages.push(first_sentence(&text, 160));
                 }
             }
 
@@ -478,11 +479,7 @@ fn extract_claude_text(v: &serde_json::Value) -> Option<String> {
             }
         })
         .collect::<String>();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
+    if text.is_empty() { None } else { Some(text) }
 }
 
 /// Get a string field from a JSON object.
@@ -551,9 +548,10 @@ mod tests {
         let p = parse_output(content);
         assert_eq!(p.git_commands.len(), 2);
         assert!(p.git_commands.contains(&"git status".to_string()));
-        assert!(p
-            .git_commands
-            .contains(&"git commit -m \"fix\"".to_string()));
+        assert!(
+            p.git_commands
+                .contains(&"git commit -m \"fix\"".to_string())
+        );
         assert_eq!(p.tool_counts["Bash"], 3);
     }
 

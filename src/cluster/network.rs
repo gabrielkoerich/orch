@@ -9,6 +9,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use openraft::BasicNode;
 use openraft::error::{
     InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Unreachable,
 };
@@ -17,9 +18,8 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use openraft::BasicNode;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use subtle::ConstantTimeEq;
 
 use super::{NodeId, Raft, Reply, Request, TypeConfig};

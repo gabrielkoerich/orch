@@ -97,7 +97,7 @@ mod engine {
 #[path = "../src/channels/capture.rs"]
 mod capture;
 
-use capture::{CaptureService, OutputBuffer, MAX_OUTPUT_BUFFER_BYTES};
+use capture::{CaptureService, MAX_OUTPUT_BUFFER_BYTES, OutputBuffer};
 use channels::transport::Transport;
 use std::sync::Arc;
 

@@ -14,7 +14,7 @@ use crate::channels::routing::ChannelRouter;
 use crate::channels::transport::conversation_key;
 use crate::channels::transport::{MessageRoute, Transport};
 use crate::channels::{ChannelRegistry, IncomingMessage, OutgoingMessage};
-use crate::engine::commands::{execute_command, parse_command, CommandStoreOps};
+use crate::engine::commands::{CommandStoreOps, execute_command, parse_command};
 use crate::engine::tasks::{CreateTaskRequest, Task, TaskType};
 use crate::github::http::GhHttp;
 use crate::store::TaskStatus;
@@ -161,23 +161,29 @@ pub(super) async fn forward_to_tmux(
     task_id: &str,
     text: &str,
 ) {
-    if let Some(binding) = transport.get_binding(repo, task_id).await {
-        if let Err(e) = crate::channels::tmux::send_keys(&binding.tmux_session, text).await {
-            tracing::warn!(
-                task_id,
-                session = %binding.tmux_session,
-                ?e,
-                "failed to forward message to tmux session"
-            );
-        } else {
-            tracing::debug!(
-                task_id,
-                session = %binding.tmux_session,
-                "forwarded message to tmux"
-            );
+    match transport.get_binding(repo, task_id).await {
+        Some(binding) => {
+            match crate::channels::tmux::send_keys(&binding.tmux_session, text).await {
+                Err(e) => {
+                    tracing::warn!(
+                        task_id,
+                        session = %binding.tmux_session,
+                        ?e,
+                        "failed to forward message to tmux session"
+                    );
+                }
+                _ => {
+                    tracing::debug!(
+                        task_id,
+                        session = %binding.tmux_session,
+                        "forwarded message to tmux"
+                    );
+                }
+            }
         }
-    } else {
-        tracing::warn!(task_id, "no tmux binding found, cannot forward message");
+        _ => {
+            tracing::warn!(task_id, "no tmux binding found, cannot forward message");
+        }
     }
 }
 
@@ -717,10 +723,10 @@ pub(super) async fn handle_status_command(
     let mut lines = vec!["**Active tasks:**".to_string()];
     for (repo, _, task_manager, _) in engine_refs {
         // If a specific project was resolved, only show that project
-        if let Some(target) = resolved_repo {
-            if repo != target {
-                continue;
-            }
+        if let Some(target) = resolved_repo
+            && repo != target
+        {
+            continue;
         }
         match task_manager
             .list_external_by_status(Status::InProgress)

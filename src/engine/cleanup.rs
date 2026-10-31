@@ -8,9 +8,9 @@ use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::cmd::CommandErrorContext;
 use crate::engine::tasks::TaskManager;
 use crate::store;
-use crate::store::store_log_activity;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
+use crate::store::store_log_activity;
 use dashmap::{DashMap, DashSet};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -355,13 +355,12 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
         }
 
         // Also include active worktrees (in case task is in-memory but has a dir).
-        if let Ok(project_dir) = resolve_project_dir_for_repo(repo) {
-            if let Ok(active_wts) =
+        if let Ok(project_dir) = resolve_project_dir_for_repo(repo)
+            && let Ok(active_wts) =
                 crate::engine::runner::worktree::list_project_worktrees(&project_dir).await
-            {
-                for wt in active_wts {
-                    combined.insert(wt.to_string_lossy().to_string());
-                }
+        {
+            for wt in active_wts {
+                combined.insert(wt.to_string_lossy().to_string());
             }
         }
 
@@ -404,60 +403,61 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     }
 
     // Prune stale worktree metadata and pull main after cleanup.
-    if cleaned_any && !opts.dry_run {
-        if let Ok(repo_root) = resolve_repo_root(repo).await {
-            const GIT_TIMEOUT: Duration = Duration::from_secs(60);
+    if cleaned_any
+        && !opts.dry_run
+        && let Ok(repo_root) = resolve_repo_root(repo).await
+    {
+        const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
-            // Prune stale .git/worktrees/ entries whose directories no longer exist.
-            let prune_result = timeout(
-                GIT_TIMEOUT,
-                Command::new("git")
-                    .args(["-C", &repo_root, "worktree", "prune"])
-                    .output_with_context(),
-            )
-            .await;
-            match prune_result {
-                Ok(Ok(output)) if output.status.success() => {
-                    tracing::debug!(%repo, "pruned stale worktree metadata");
-                }
-                Ok(Ok(output)) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    tracing::warn!(%repo, err = %stderr, "git worktree prune failed");
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(%repo, err = %e, "git worktree prune failed");
-                }
-                Err(_) => {
-                    tracing::warn!(%repo, "git worktree prune timed out after 60s");
-                }
+        // Prune stale .git/worktrees/ entries whose directories no longer exist.
+        let prune_result = timeout(
+            GIT_TIMEOUT,
+            Command::new("git")
+                .args(["-C", &repo_root, "worktree", "prune"])
+                .output_with_context(),
+        )
+        .await;
+        match prune_result {
+            Ok(Ok(output)) if output.status.success() => {
+                tracing::debug!(%repo, "pruned stale worktree metadata");
             }
+            Ok(Ok(output)) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!(%repo, err = %stderr, "git worktree prune failed");
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(%repo, err = %e, "git worktree prune failed");
+            }
+            Err(_) => {
+                tracing::warn!(%repo, "git worktree prune timed out after 60s");
+            }
+        }
 
-            // Fetch instead of pull: refresh `origin/*` refs without touching
-            // the operator's checked-out branch or working tree. `pull` would
-            // operate on whatever HEAD happens to be (often a feature branch,
-            // not main) and would silently no-op on divergence.
-            let fetch_result = timeout(
-                GIT_TIMEOUT,
-                crate::engine::runner::git_ops::git()
-                    .await
-                    .args(["-C", &repo_root, "fetch", "--prune", "origin"])
-                    .output_with_context(),
-            )
-            .await;
-            match fetch_result {
-                Ok(Ok(output)) if output.status.success() => {
-                    tracing::info!(%repo, "fetched origin after worktree cleanup");
-                }
-                Ok(Ok(output)) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    tracing::debug!(%repo, err = %stderr, "git fetch skipped after cleanup");
-                }
-                Ok(Err(e)) => {
-                    tracing::debug!(%repo, err = %e, "git fetch failed after cleanup");
-                }
-                Err(_) => {
-                    tracing::debug!(%repo, "git fetch timed out after 60s");
-                }
+        // Fetch instead of pull: refresh `origin/*` refs without touching
+        // the operator's checked-out branch or working tree. `pull` would
+        // operate on whatever HEAD happens to be (often a feature branch,
+        // not main) and would silently no-op on divergence.
+        let fetch_result = timeout(
+            GIT_TIMEOUT,
+            crate::engine::runner::git_ops::git()
+                .await
+                .args(["-C", &repo_root, "fetch", "--prune", "origin"])
+                .output_with_context(),
+        )
+        .await;
+        match fetch_result {
+            Ok(Ok(output)) if output.status.success() => {
+                tracing::info!(%repo, "fetched origin after worktree cleanup");
+            }
+            Ok(Ok(output)) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::debug!(%repo, err = %stderr, "git fetch skipped after cleanup");
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(%repo, err = %e, "git fetch failed after cleanup");
+            }
+            Err(_) => {
+                tracing::debug!(%repo, "git fetch timed out after 60s");
             }
         }
     }
@@ -489,31 +489,29 @@ pub(crate) async fn cleanup_task_worktree(
     // Only fetch if cleanup actually happened (not skipped due to active session).
     // Fetch (not pull) so the operator's checked-out branch and working tree
     // are never touched — see the matching comment in cleanup_orphaned_worktrees.
-    if cleaned {
-        if let Ok(repo_root) = resolve_repo_root(repo).await {
-            const GIT_TIMEOUT: Duration = Duration::from_secs(60);
-            let fetch_result = timeout(
-                GIT_TIMEOUT,
-                crate::engine::runner::git_ops::git()
-                    .await
-                    .args(["-C", &repo_root, "fetch", "--prune", "origin"])
-                    .output_with_context(),
-            )
-            .await;
-            match fetch_result {
-                Ok(Ok(output)) if output.status.success() => {
-                    tracing::debug!(%repo, "fetched origin after task cleanup");
-                }
-                Ok(Ok(output)) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    tracing::debug!(%repo, err = %stderr, "git fetch skipped after task cleanup");
-                }
-                Ok(Err(e)) => {
-                    tracing::debug!(%repo, err = %e, "git fetch failed after task cleanup");
-                }
-                Err(_) => {
-                    tracing::debug!(%repo, "git fetch timed out after 60s");
-                }
+    if cleaned && let Ok(repo_root) = resolve_repo_root(repo).await {
+        const GIT_TIMEOUT: Duration = Duration::from_secs(60);
+        let fetch_result = timeout(
+            GIT_TIMEOUT,
+            crate::engine::runner::git_ops::git()
+                .await
+                .args(["-C", &repo_root, "fetch", "--prune", "origin"])
+                .output_with_context(),
+        )
+        .await;
+        match fetch_result {
+            Ok(Ok(output)) if output.status.success() => {
+                tracing::debug!(%repo, "fetched origin after task cleanup");
+            }
+            Ok(Ok(output)) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::debug!(%repo, err = %stderr, "git fetch skipped after task cleanup");
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(%repo, err = %e, "git fetch failed after task cleanup");
+            }
+            Err(_) => {
+                tracing::debug!(%repo, "git fetch timed out after 60s");
             }
         }
     }
@@ -634,10 +632,10 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
                 worktree = ?worktree_path,
                 "stored worktree path no longer exists on disk — marking cleaned"
             );
-            if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
-                if let Err(e) = store.mark_cleaned(store_id).await {
-                    tracing::warn!(task_id, err = %e, "failed to mark worktree cleaned in store — will retry");
-                }
+            if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await
+                && let Err(e) = store.mark_cleaned(store_id).await
+            {
+                tracing::warn!(task_id, err = %e, "failed to mark worktree cleaned in store — will retry");
             }
         }
         return Ok(false);
@@ -645,17 +643,17 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
 
     if let Some(wt) = worktree_to_remove {
         // TTL guard: skip if the worktree directory is too young.
-        if let Some(age_hours) = worktree_age_hours(&wt).await {
-            if age_hours < opts.ttl_hours {
-                tracing::debug!(
-                    task_id,
-                    worktree = %wt.display(),
-                    age_hours,
-                    ttl_hours = opts.ttl_hours,
-                    "worktree too young for cleanup, skipping"
-                );
-                return Ok(false);
-            }
+        if let Some(age_hours) = worktree_age_hours(&wt).await
+            && age_hours < opts.ttl_hours
+        {
+            tracing::debug!(
+                task_id,
+                worktree = %wt.display(),
+                age_hours,
+                ttl_hours = opts.ttl_hours,
+                "worktree too young for cleanup, skipping"
+            );
+            return Ok(false);
         }
 
         // Tmux guard: skip if any active pane still has its cwd inside this worktree.
@@ -754,12 +752,12 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
         // Mark as cleaned in store so we don't retry next tick.
         // If resolve_task_id returns None the task is not (or no longer) in
         // the store; that is fine — we already did the on-disk work.
-        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
-            if let Err(e) = store.mark_cleaned(store_id).await {
-                tracing::warn!(task_id, err = %e, "failed to mark worktree cleaned — will retry");
-                // Don't log activity; retry next tick will do the actual cleanup
-                return Ok(did_clean);
-            }
+        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await
+            && let Err(e) = store.mark_cleaned(store_id).await
+        {
+            tracing::warn!(task_id, err = %e, "failed to mark worktree cleaned — will retry");
+            // Don't log activity; retry next tick will do the actual cleanup
+            return Ok(did_clean);
         }
         store_log_activity(
             &Some(Arc::clone(store)),
@@ -1164,17 +1162,17 @@ pub(crate) async fn resolve_repo_root_for_orphaned_worktree(
     wt: &std::path::Path,
 ) -> anyhow::Result<String> {
     let git_file = wt.join(".git");
-    if tokio::fs::try_exists(&git_file).await.unwrap_or(false) {
-        if let Ok(content) = tokio::fs::read_to_string(&git_file).await {
-            for line in content.lines() {
-                if let Some(gitdir) = line.strip_prefix("gitdir: ") {
-                    // gitdir points to: <repo>/.git/worktrees/<name> (non-bare)
-                    //                or <repo>.git/worktrees/<name>   (bare)
-                    // Two levels up reaches the .git dir / bare repo root.
-                    let gitdir_path = std::path::PathBuf::from(gitdir);
-                    if let Some(repo_root) = gitdir_path.parent().and_then(|p| p.parent()) {
-                        return Ok(repo_root.display().to_string());
-                    }
+    if tokio::fs::try_exists(&git_file).await.unwrap_or(false)
+        && let Ok(content) = tokio::fs::read_to_string(&git_file).await
+    {
+        for line in content.lines() {
+            if let Some(gitdir) = line.strip_prefix("gitdir: ") {
+                // gitdir points to: <repo>/.git/worktrees/<name> (non-bare)
+                //                or <repo>.git/worktrees/<name>   (bare)
+                // Two levels up reaches the .git dir / bare repo root.
+                let gitdir_path = std::path::PathBuf::from(gitdir);
+                if let Some(repo_root) = gitdir_path.parent().and_then(|p| p.parent()) {
+                    return Ok(repo_root.display().to_string());
                 }
             }
         }
@@ -1183,36 +1181,36 @@ pub(crate) async fn resolve_repo_root_for_orphaned_worktree(
     // Fallback: look up registered projects by the project-name component of the
     // worktree path (format: ~/.orch/worktrees/<project>/<branch>).
     let worktrees_dir = crate::home::worktrees_dir()?;
-    if let Ok(relative) = wt.strip_prefix(&worktrees_dir) {
-        if let Some(project_name) = relative.components().next() {
-            let project_name = project_name.as_os_str().to_string_lossy();
+    if let Ok(relative) = wt.strip_prefix(&worktrees_dir)
+        && let Some(project_name) = relative.components().next()
+    {
+        let project_name = project_name.as_os_str().to_string_lossy();
 
-            if let Ok(paths) = crate::config::get_project_paths() {
-                for path_str in &paths {
-                    let path = std::path::Path::new(path_str);
-                    if let Some(name) = path.file_name() {
-                        if name.to_string_lossy() == project_name {
-                            return Ok(path_str.clone());
-                        }
-                    }
+        if let Ok(paths) = crate::config::get_project_paths() {
+            for path_str in &paths {
+                let path = std::path::Path::new(path_str);
+                if let Some(name) = path.file_name()
+                    && name.to_string_lossy() == project_name
+                {
+                    return Ok(path_str.clone());
                 }
             }
+        }
 
-            // Try bare clone at ~/.orch/projects/<owner>/<project>.git
-            let parts: Vec<&str> = project_name.split('/').collect();
-            let bare = if parts.len() == 2 {
-                crate::home::projects_dir()
-                    .map(|d| d.join(parts[0]).join(format!("{}.git", parts[1])))
-                    .unwrap_or_default()
-            } else {
-                return Err(anyhow::anyhow!(
-                    "cannot determine owner for single-segment project name '{project_name}' — \
+        // Try bare clone at ~/.orch/projects/<owner>/<project>.git
+        let parts: Vec<&str> = project_name.split('/').collect();
+        let bare = if parts.len() == 2 {
+            crate::home::projects_dir()
+                .map(|d| d.join(parts[0]).join(format!("{}.git", parts[1])))
+                .unwrap_or_default()
+        } else {
+            return Err(anyhow::anyhow!(
+                "cannot determine owner for single-segment project name '{project_name}' — \
                      bare repo location is ambiguous; register the project with 'owner/repo' format"
-                ));
-            };
-            if tokio::fs::try_exists(&bare).await.unwrap_or(false) {
-                return Ok(bare.display().to_string());
-            }
+            ));
+        };
+        if tokio::fs::try_exists(&bare).await.unwrap_or(false) {
+            return Ok(bare.display().to_string());
         }
     }
 
@@ -1282,18 +1280,15 @@ pub(crate) async fn resolve_repo_root(repo: &str) -> anyhow::Result<String> {
         } else {
             continue;
         };
-        if let Ok(content) = tokio::fs::read_to_string(&config_file).await {
-            if let Ok(doc) = serde_norway::from_str::<serde_norway::Value>(&content) {
-                if let Some(r) = doc
-                    .get("gh")
-                    .and_then(|gh| gh.get("repo"))
-                    .and_then(|r| r.as_str())
-                {
-                    if r == repo {
-                        return Ok(path_str.clone());
-                    }
-                }
-            }
+        if let Ok(content) = tokio::fs::read_to_string(&config_file).await
+            && let Ok(doc) = serde_norway::from_str::<serde_norway::Value>(&content)
+            && let Some(r) = doc
+                .get("gh")
+                .and_then(|gh| gh.get("repo"))
+                .and_then(|r| r.as_str())
+            && r == repo
+        {
+            return Ok(path_str.clone());
         }
     }
 
@@ -1324,10 +1319,10 @@ pub(crate) async fn resolve_repo_root(repo: &str) -> anyhow::Result<String> {
 /// a Runner instance. Used by the orphan scanner to enumerate active worktrees.
 fn resolve_project_dir_for_repo(repo: &str) -> anyhow::Result<std::path::PathBuf> {
     // Check PROJECT_DIR env var first
-    if let Ok(dir) = std::env::var("PROJECT_DIR") {
-        if !dir.is_empty() {
-            return Ok(std::path::PathBuf::from(dir));
-        }
+    if let Ok(dir) = std::env::var("PROJECT_DIR")
+        && !dir.is_empty()
+    {
+        return Ok(std::path::PathBuf::from(dir));
     }
 
     // Look up registered projects in config
@@ -1343,18 +1338,15 @@ fn resolve_project_dir_for_repo(repo: &str) -> anyhow::Result<std::path::PathBuf
             } else {
                 continue;
             };
-            if let Ok(content) = std::fs::read_to_string(&config_file) {
-                if let Ok(doc) = serde_norway::from_str::<serde_norway::Value>(&content) {
-                    if let Some(r) = doc
-                        .get("gh")
-                        .and_then(|gh| gh.get("repo"))
-                        .and_then(|r| r.as_str())
-                    {
-                        if r == repo {
-                            return Ok(path_str.clone().into());
-                        }
-                    }
-                }
+            if let Ok(content) = std::fs::read_to_string(&config_file)
+                && let Ok(doc) = serde_norway::from_str::<serde_norway::Value>(&content)
+                && let Some(r) = doc
+                    .get("gh")
+                    .and_then(|gh| gh.get("repo"))
+                    .and_then(|r| r.as_str())
+                && r == repo
+            {
+                return Ok(path_str.clone().into());
             }
         }
     }
@@ -1501,8 +1493,8 @@ mod tests {
     use crate::store::{NewTask, TaskStore};
     use async_trait::async_trait;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // worktree_age_hours
 

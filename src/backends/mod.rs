@@ -627,10 +627,10 @@ mod tests {
         }
 
         async fn remove_label(&self, _id: &ExternalId, label: &str) -> anyhow::Result<()> {
-            if let Some(ref err_label) = self.remove_err {
-                if label == err_label {
-                    return Err(anyhow::anyhow!("rate limit (429)"));
-                }
+            if let Some(ref err_label) = self.remove_err
+                && label == err_label
+            {
+                return Err(anyhow::anyhow!("rate limit (429)"));
             }
             self.labels.lock().unwrap().retain(|l| l != label);
             Ok(())

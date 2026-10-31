@@ -17,23 +17,23 @@ use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::channels::capture::CaptureService;
 use crate::config;
 use crate::engine::cooldown::{
-    github_circuit_remaining_secs, is_agent_in_cooldown, is_github_circuit_open,
-    is_model_in_cooldown, record_agent_failure_with_message, record_silence_detection,
-    set_agent_cooldown, set_model_cooldown, SILENCE_AGENT_COOLDOWN_SECS,
-    SILENCE_EXTENDED_COOLDOWN_SECS,
+    SILENCE_AGENT_COOLDOWN_SECS, SILENCE_EXTENDED_COOLDOWN_SECS, github_circuit_remaining_secs,
+    is_agent_in_cooldown, is_github_circuit_open, is_model_in_cooldown,
+    record_agent_failure_with_message, record_silence_detection, set_agent_cooldown,
+    set_model_cooldown,
 };
 use crate::engine::dispatch_guard::DispatchGuard;
 use crate::engine::jobs;
-use crate::engine::router::{get_route_result, AllAgentsCooledError, RouteResultError, Router};
+use crate::engine::router::{AllAgentsCooledError, RouteResultError, Router, get_route_result};
 use crate::engine::runner::{TaskRunner, WeightSignal};
-use crate::engine::tasks::{is_internal_id, TaskManager};
+use crate::engine::tasks::{TaskManager, is_internal_id};
 use crate::repo_context::REPO_CONTEXT;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use dashmap::{DashMap, DashSet};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{Semaphore, mpsc};
 
 /// Per outer engine-loop quota for expensive routing calls.
 ///
@@ -470,13 +470,13 @@ pub(crate) async fn tick_detect_silent_agents(
                 "silence_detected",
             )
             .await;
-            if let Some(result) = record_silence_detection(&agent_name, &model_name).await {
-                if result.extended_cooldown_applied {
-                    extended_note = format!(
-                        " ({} silences in 24h -> extended cooldown {}s)",
-                        result.count, SILENCE_EXTENDED_COOLDOWN_SECS
-                    );
-                }
+            if let Some(result) = record_silence_detection(&agent_name, &model_name).await
+                && result.extended_cooldown_applied
+            {
+                extended_note = format!(
+                    " ({} silences in 24h -> extended cooldown {}s)",
+                    result.count, SILENCE_EXTENDED_COOLDOWN_SECS
+                );
             }
         }
 
@@ -531,31 +531,28 @@ pub(crate) async fn tick_detect_silent_agents(
             (Status::New, None)
         };
 
-        if use_backend {
-            if let Some(ref st) = store_task {
-                // Fire-and-forget: label removals are cosmetic — tick should not block on them.
-                let stale_labels: Vec<String> = st
-                    .labels
-                    .iter()
-                    .filter(|l| {
-                        l.starts_with("agent:")
-                            || l.starts_with("complexity:")
-                            || l.starts_with("model:")
-                    })
-                    .cloned()
-                    .collect();
-                if !stale_labels.is_empty() {
-                    let backend_clone = Arc::clone(backend);
-                    let task_eid_clone = task_eid.clone();
-                    tokio::spawn(async move {
-                        for label in &stale_labels {
-                            if let Err(e) = backend_clone.remove_label(&task_eid_clone, label).await
-                            {
-                                tracing::warn!(task_id = task_eid_clone.0, label, error = %e, "failed to remove label during silence detection re-route");
-                            }
+        if use_backend && let Some(ref st) = store_task {
+            // Fire-and-forget: label removals are cosmetic — tick should not block on them.
+            let stale_labels: Vec<String> = st
+                .labels
+                .iter()
+                .filter(|l| {
+                    l.starts_with("agent:")
+                        || l.starts_with("complexity:")
+                        || l.starts_with("model:")
+                })
+                .cloned()
+                .collect();
+            if !stale_labels.is_empty() {
+                let backend_clone = Arc::clone(backend);
+                let task_eid_clone = task_eid.clone();
+                tokio::spawn(async move {
+                    for label in &stale_labels {
+                        if let Err(e) = backend_clone.remove_label(&task_eid_clone, label).await {
+                            tracing::warn!(task_id = task_eid_clone.0, label, error = %e, "failed to remove label during silence detection re-route");
                         }
-                    });
-                }
+                    }
+                });
             }
         }
 
@@ -1663,15 +1660,13 @@ pub(crate) async fn tick_route_tasks(
                     tokio::spawn(async move {
                         // Remove old agent/complexity/model labels
                         for label in &task_labels {
-                            if label.starts_with("agent:")
+                            if (label.starts_with("agent:")
                                 || label.starts_with("complexity:")
-                                || label.starts_with("model:")
-                            {
-                                if let Err(e) =
+                                || label.starts_with("model:"))
+                                && let Err(e) =
                                     backend_clone.remove_label(&task_id_clone, label).await
-                                {
-                                    tracing::warn!(task_id = task_id_clone.0, label, error = %e, "failed to remove stale routing label during re-route");
-                                }
+                            {
+                                tracing::warn!(task_id = task_id_clone.0, label, error = %e, "failed to remove stale routing label during re-route");
                             }
                         }
                         // Add new labels
@@ -1886,21 +1881,24 @@ pub(crate) async fn route_new_tasks_global(
                     );
                     continue;
                 }
-                if let Err(e) = store.update_status(task.id, TaskStatus::Routed).await {
-                    tracing::warn!(
-                        task_id = %ext_task.id.0,
-                        repo = %task.repo,
-                        err = %e,
-                        "global sweep: failed to set status:routed"
-                    );
-                } else {
-                    tracing::info!(
-                        task_id = %ext_task.id.0,
-                        repo = %task.repo,
-                        agent = %result.agent,
-                        complexity = %result.complexity,
-                        "global sweep: task routed"
-                    );
+                match store.update_status(task.id, TaskStatus::Routed).await {
+                    Err(e) => {
+                        tracing::warn!(
+                            task_id = %ext_task.id.0,
+                            repo = %task.repo,
+                            err = %e,
+                            "global sweep: failed to set status:routed"
+                        );
+                    }
+                    _ => {
+                        tracing::info!(
+                            task_id = %ext_task.id.0,
+                            repo = %task.repo,
+                            agent = %result.agent,
+                            complexity = %result.complexity,
+                            "global sweep: task routed"
+                        );
+                    }
                 }
                 if let Some(ref warning) = result.warning {
                     tracing::warn!(task_id = %ext_task.id.0, warning, "global sweep: routing sanity warning");
@@ -2610,19 +2608,19 @@ pub(crate) async fn tick_unblock_parents(
                 let child_exts: Vec<&str> =
                     child_ext_strs.iter().map(std::string::String::as_str).collect();
                 // Query store for statuses of any children present locally
-                if let Ok(map) = store_clone
+                match store_clone
                     .get_statuses_by_external_ids(&repo_owned, &child_exts)
                     .await
-                {
+                { Ok(map) => {
                     for (k, v) in map {
                         child_statuses.insert(k, v);
                     }
-                } else {
+                } _ => {
                     tracing::debug!(
                         task_id = task_id.0,
                         "failed to batch-query store for child statuses; falling back to per-child lookups"
                     );
-                }
+                }}
 
                 for child_id in &children {
                     // Check store first
@@ -4896,7 +4894,9 @@ mod tests {
             session_map = tmux.batch_session_active().await;
         }
         if session_map.get(&session_name).copied().unwrap_or(false) {
-            eprintln!("Skipping test: session still alive in batch_session_active after retries (CI tmux lag)");
+            eprintln!(
+                "Skipping test: session still alive in batch_session_active after retries (CI tmux lag)"
+            );
             return;
         }
 

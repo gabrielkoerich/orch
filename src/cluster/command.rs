@@ -5,7 +5,7 @@ use crate::store::control::MemoryEntry;
 use crate::store::dependencies::{self, NewDependency};
 use crate::store::jobs::{self, JobState};
 use crate::store::kv;
-use crate::store::tasks::{apply, NewTask, StoreRouteCmd, TaskStatus, UpsertExternalCmd};
+use crate::store::tasks::{NewTask, StoreRouteCmd, TaskStatus, UpsertExternalCmd, apply};
 
 type Updates = Vec<(String, serde_json::Value)>;
 

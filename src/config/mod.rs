@@ -126,10 +126,10 @@ fn reload_file(path: &PathBuf) -> bool {
             if let Ok(mut cache) = CACHE.write() {
                 cache.insert(path.clone(), value);
             }
-            if let Ok(mut bad) = BAD_FILES.write() {
-                if bad.remove(path) {
-                    tracing::info!(path = %path.display(), "config file parses again, reloaded");
-                }
+            if let Ok(mut bad) = BAD_FILES.write()
+                && bad.remove(path)
+            {
+                tracing::info!(path = %path.display(), "config file parses again, reloaded");
             }
             tracing::debug!("config cache refreshed for: {}", path.display());
             // Notify subscribers (ignore error if no active receivers)
@@ -213,22 +213,22 @@ fn watch_file(path: &PathBuf) {
     ensure_watcher();
 
     // Track that we want to watch this file
-    if let Ok(mut watched) = WATCHER.write() {
-        if !watched.contains(path) {
-            watched.insert(path.clone());
+    if let Ok(mut watched) = WATCHER.write()
+        && !watched.contains(path)
+    {
+        watched.insert(path.clone());
 
-            // Add to notify watcher
-            if let Ok(mut guard) = FILE_WATCHER.lock() {
-                if let Some(ref mut watcher) = *guard {
-                    match watcher.watch(path, RecursiveMode::NonRecursive) {
-                        Ok(()) => tracing::debug!("now watching config file: {}", path.display()),
-                        Err(e) => tracing::warn!(
-                            "failed to register config file watcher for {}: {}",
-                            path.display(),
-                            e
-                        ),
-                    }
-                }
+        // Add to notify watcher
+        if let Ok(mut guard) = FILE_WATCHER.lock()
+            && let Some(ref mut watcher) = *guard
+        {
+            match watcher.watch(path, RecursiveMode::NonRecursive) {
+                Ok(()) => tracing::debug!("now watching config file: {}", path.display()),
+                Err(e) => tracing::warn!(
+                    "failed to register config file watcher for {}: {}",
+                    path.display(),
+                    e
+                ),
             }
         }
     }
@@ -246,10 +246,10 @@ fn read_file_to_string(path: &Path) -> anyhow::Result<String> {
 }
 
 fn load_cached_root(path: &PathBuf) -> anyhow::Result<serde_norway::Value> {
-    if let Ok(cache) = CACHE.read() {
-        if let Some(cached) = cache.get(path) {
-            return Ok(cached.clone());
-        }
+    if let Ok(cache) = CACHE.read()
+        && let Some(cached) = cache.get(path)
+    {
+        return Ok(cached.clone());
     }
 
     let content =
@@ -293,12 +293,11 @@ pub fn get_list(key: &str) -> anyhow::Result<Vec<String>> {
     let project_path = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".orch.yml");
-    if project_path.exists() {
-        if let Ok(val) = resolve_list(&project_path, key) {
-            if !val.is_empty() {
-                return Ok(val);
-            }
-        }
+    if project_path.exists()
+        && let Ok(val) = resolve_list(&project_path, key)
+        && !val.is_empty()
+    {
+        return Ok(val);
     }
 
     // Fall back to global config
@@ -360,10 +359,10 @@ pub fn get(key: &str) -> anyhow::Result<String> {
     let project_path = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".orch.yml");
-    if project_path.exists() {
-        if let Ok(val) = resolve_key(&project_path, key) {
-            return Ok(val);
-        }
+    if project_path.exists()
+        && let Ok(val) = resolve_key(&project_path, key)
+    {
+        return Ok(val);
     }
 
     // Fall back to global config
@@ -378,10 +377,10 @@ pub fn get(key: &str) -> anyhow::Result<String> {
 /// Like [`get`], but reads the `.orch.yml` in `project_dir`, since the service runs from `/`
 pub fn get_for_project(project_dir: &std::path::Path, key: &str) -> anyhow::Result<String> {
     let project_path = project_dir.join(".orch.yml");
-    if project_path.exists() {
-        if let Ok(val) = resolve_key(&project_path, key) {
-            return Ok(val);
-        }
+    if project_path.exists()
+        && let Ok(val) = resolve_key(&project_path, key)
+    {
+        return Ok(val);
     }
 
     let global_path = global_config_path()?;
@@ -419,12 +418,11 @@ pub fn get_global(key: &str) -> anyhow::Result<String> {
 pub fn get_project_paths() -> anyhow::Result<Vec<String>> {
     let global_path = global_config_path()?;
 
-    if global_path.exists() {
-        if let Ok(paths) = resolve_projects_list(&global_path, "projects") {
-            if !paths.is_empty() {
-                return Ok(paths);
-            }
-        }
+    if global_path.exists()
+        && let Ok(paths) = resolve_projects_list(&global_path, "projects")
+        && !paths.is_empty()
+    {
+        return Ok(paths);
     }
 
     Ok(vec![])
@@ -454,16 +452,14 @@ pub fn get_projects_with_paths() -> anyhow::Result<Vec<(String, std::path::PathB
                 }
             };
 
-            if let Ok(content) = std::fs::read_to_string(&config_file) {
-                if let Ok(doc) = serde_norway::from_str::<serde_norway::Value>(&content) {
-                    if let Some(repo) = doc
-                        .get("gh")
-                        .and_then(|gh| gh.get("repo"))
-                        .and_then(|r| r.as_str())
-                    {
-                        results.push((repo.to_string(), path));
-                    }
-                }
+            if let Ok(content) = std::fs::read_to_string(&config_file)
+                && let Ok(doc) = serde_norway::from_str::<serde_norway::Value>(&content)
+                && let Some(repo) = doc
+                    .get("gh")
+                    .and_then(|gh| gh.get("repo"))
+                    .and_then(|r| r.as_str())
+            {
+                results.push((repo.to_string(), path));
             }
         }
 
@@ -473,10 +469,10 @@ pub fn get_projects_with_paths() -> anyhow::Result<Vec<(String, std::path::PathB
     }
 
     // Fall back to global gh.repo (no project dir available)
-    if let Ok(repo) = get("gh.repo") {
-        if !repo.is_empty() {
-            return Ok(vec![(repo, std::path::PathBuf::from("."))]);
-        }
+    if let Ok(repo) = get("gh.repo")
+        && !repo.is_empty()
+    {
+        return Ok(vec![(repo, std::path::PathBuf::from("."))]);
     }
 
     Ok(vec![])
@@ -533,24 +529,24 @@ pub fn find_project_root() -> anyhow::Result<std::path::PathBuf> {
 /// Falls back to global `gh.repo` for backward compatibility.
 pub fn get_current_repo() -> anyhow::Result<String> {
     // Try to find project root from CWD
-    if let Ok(project_root) = find_project_root() {
-        if let Ok(repo) = get_repo_for_project(&project_root) {
-            return Ok(repo);
-        }
+    if let Ok(project_root) = find_project_root()
+        && let Ok(repo) = get_repo_for_project(&project_root)
+    {
+        return Ok(repo);
     }
 
     // Fall back to per-project config in CWD (.orch.yml)
-    if let Ok(repo) = get("gh.repo") {
-        if !repo.is_empty() {
-            return Ok(repo);
-        }
+    if let Ok(repo) = get("gh.repo")
+        && !repo.is_empty()
+    {
+        return Ok(repo);
     }
 
     // Legacy fallback
-    if let Ok(repo) = get("repo") {
-        if !repo.is_empty() {
-            return Ok(repo);
-        }
+    if let Ok(repo) = get("repo")
+        && !repo.is_empty()
+    {
+        return Ok(repo);
     }
 
     anyhow::bail!("could not determine repo — ensure .orch.yml has gh.repo set")
@@ -977,13 +973,15 @@ mod tests {
         );
         write_yaml(home.path(), "config.yml", "workflow:\n  sandbox: os\n");
         write_yaml(with.path(), ".orch.yml", "workflow:\n  sandbox: false\n");
-        std::env::set_var("ORCH_HOME", home.path());
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", home.path()) };
 
         let got = (
             get_for_project(with.path(), "workflow.sandbox").unwrap(),
             get_for_project(without.path(), "workflow.sandbox").unwrap(),
         );
-        std::env::remove_var("ORCH_HOME");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::remove_var("ORCH_HOME") };
         assert_eq!(got, ("false".to_string(), "os".to_string()));
     }
 

@@ -119,12 +119,12 @@ fn delete_project(content: &str, candidates: &[&str]) -> anyhow::Result<Projects
         if is_section_end(&lines[idx]) {
             break;
         }
-        if let Some(item) = block_item_value(&lines[idx]) {
-            if candidates.contains(&item.as_str()) {
-                lines.remove(idx);
-                removed = true;
-                continue;
-            }
+        if let Some(item) = block_item_value(&lines[idx])
+            && candidates.contains(&item.as_str())
+        {
+            lines.remove(idx);
+            removed = true;
+            continue;
         }
         idx += 1;
     }

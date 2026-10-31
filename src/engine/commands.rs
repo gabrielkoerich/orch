@@ -278,7 +278,7 @@ pub async fn execute_command(
         }
 
         OwnerCommand::Block(reason) => {
-            if let Some(ref store) = store {
+            if let Some(store) = store {
                 let store_id = store.resolve_task_id(repo, &task_id.0).await?;
                 if let Some(store_id) = store_id {
                     store.set_block_reason(store_id, reason.as_deref()).await?;
@@ -295,7 +295,7 @@ pub async fn execute_command(
 
         OwnerCommand::Unblock => {
             refuse_if_done(store.as_ref(), repo, &task_id.0, command).await?;
-            if let Some(ref store) = store {
+            if let Some(store) = store {
                 let store_id = store.resolve_task_id(repo, &task_id.0).await?;
                 if let Some(store_id) = store_id {
                     store.set_block_reason(store_id, None).await?;

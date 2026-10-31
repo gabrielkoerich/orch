@@ -25,8 +25,8 @@
 //! Discovered dynamically at startup with 1-hour cache.
 
 use super::{
-    json_error_message, json_str, AgentError, AgentRunner, ParsedResponse, PermissionRules,
-    StreamEvent,
+    AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent, json_error_message,
+    json_str,
 };
 use crate::parser;
 
@@ -45,15 +45,15 @@ static ALL_MODELS_REFRESH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]
 pub(crate) fn reset_model_caches_for_test() {
-    if let Some(cache) = FREE_MODELS_CACHE.get() {
-        if let Ok(mut guard) = cache.lock() {
-            *guard = (0, Vec::new());
-        }
+    if let Some(cache) = FREE_MODELS_CACHE.get()
+        && let Ok(mut guard) = cache.lock()
+    {
+        *guard = (0, Vec::new());
     }
-    if let Some(cache) = ALL_MODELS_CACHE.get() {
-        if let Ok(mut guard) = cache.lock() {
-            *guard = (0, Vec::new());
-        }
+    if let Some(cache) = ALL_MODELS_CACHE.get()
+        && let Ok(mut guard) = cache.lock()
+    {
+        *guard = (0, Vec::new());
     }
     FREE_MODELS_REFRESH_IN_PROGRESS.store(false, Ordering::Release);
     ALL_MODELS_REFRESH_IN_PROGRESS.store(false, Ordering::Release);
@@ -130,15 +130,15 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
             }
 
             // Handle Claude-like assistant messages: message.content -> [{type:"text", text:...}]
-            if let Some(message) = event.get("message") {
-                if let Some(items) = message.get("content").and_then(|v| v.as_array()) {
-                    for item in items {
-                        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                        if item_type == "text" {
-                            if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                                texts.push(text.to_string());
-                            }
-                        }
+            if let Some(message) = event.get("message")
+                && let Some(items) = message.get("content").and_then(|v| v.as_array())
+            {
+                for item in items {
+                    let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if item_type == "text"
+                        && let Some(text) = item.get("text").and_then(|v| v.as_str())
+                    {
+                        texts.push(text.to_string());
                     }
                 }
             }
@@ -177,10 +177,10 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
             }
 
             // Some events include direct text payloads outside of `part`
-            if let Some(text) = event.get("text").and_then(|v| v.as_str()) {
-                if !text.trim().is_empty() {
-                    return Some(text.to_string());
-                }
+            if let Some(text) = event.get("text").and_then(|v| v.as_str())
+                && !text.trim().is_empty()
+            {
+                return Some(text.to_string());
             }
         }
 
@@ -196,16 +196,14 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
 
         // Also accept JSON that looks like a router decision / agent envelope
         // even when it's not a full AgentResponse (e.g. {"executor":"opencode"}).
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json) {
-            if let Some(obj) = val.as_object() {
-                if obj.contains_key("executor")
-                    || obj.contains_key("status")
-                    || obj.contains_key("complexity")
-                    || obj.contains_key("decision")
-                {
-                    return Some(json);
-                }
-            }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json)
+            && let Some(obj) = val.as_object()
+            && (obj.contains_key("executor")
+                || obj.contains_key("status")
+                || obj.contains_key("complexity")
+                || obj.contains_key("decision"))
+        {
+            return Some(json);
         }
         // Otherwise fall through and try per-event heuristics below
     }
@@ -222,12 +220,11 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
 
             // Also accept routing-style JSON objects that don't match the
             // AgentResponse schema (router decisions, etc.).
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json) {
-                if let Some(obj) = val.as_object() {
-                    if obj.contains_key("executor") || obj.contains_key("status") {
-                        return Some(json);
-                    }
-                }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json)
+                && let Some(obj) = val.as_object()
+                && (obj.contains_key("executor") || obj.contains_key("status"))
+            {
+                return Some(json);
             }
         }
         // As a conservative fallback, if the trimmed chunk contains a '{' and
@@ -242,15 +239,13 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
                 return Some(trimmed.to_string());
             }
 
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                if let Some(obj) = val.as_object() {
-                    if obj.contains_key("executor")
-                        || obj.contains_key("status")
-                        || obj.contains_key("complexity")
-                    {
-                        return Some(trimmed.to_string());
-                    }
-                }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
+                && let Some(obj) = val.as_object()
+                && (obj.contains_key("executor")
+                    || obj.contains_key("status")
+                    || obj.contains_key("complexity"))
+            {
+                return Some(trimmed.to_string());
             }
         }
     }
@@ -269,10 +264,10 @@ fn extract_text_from_part(part: &serde_json::Value) -> Vec<String> {
     if let Some(items) = part.get("content").and_then(|v| v.as_array()) {
         for item in items {
             let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if item_type == "text" {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    out.push(text.to_string());
-                }
+            if item_type == "text"
+                && let Some(text) = item.get("text").and_then(|v| v.as_str())
+            {
+                out.push(text.to_string());
             }
         }
     }
@@ -384,14 +379,13 @@ impl OpenCodeRunner {
         for event in events.iter().rev() {
             let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-            if event_type == "step_finish" {
-                if let Some(part) = event.get("part") {
-                    if let Some(tokens) = part.get("tokens").and_then(|v| v.as_object()) {
-                        let input = tokens.get("input").and_then(serde_json::Value::as_u64);
-                        let output = tokens.get("output").and_then(serde_json::Value::as_u64);
-                        return (input, output);
-                    }
-                }
+            if event_type == "step_finish"
+                && let Some(part) = event.get("part")
+                && let Some(tokens) = part.get("tokens").and_then(|v| v.as_object())
+            {
+                let input = tokens.get("input").and_then(serde_json::Value::as_u64);
+                let output = tokens.get("output").and_then(serde_json::Value::as_u64);
+                return (input, output);
             }
         }
 
@@ -845,18 +839,21 @@ pub fn discover_free_opencode_models() -> Vec<String> {
             let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
             update_discovered_models_cache(cache, discovered, "free", empty_reason);
         };
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            // Use the current tokio runtime's handle to spawn the async discovery task,
-            // avoiding the overhead of a std::thread + new tokio runtime.
-            handle.spawn(refresh);
-        } else {
-            // No tokio runtime (e.g. called from a plain unit test). Spawn a thread
-            // with a dedicated runtime — this is the fallback path.
-            std::thread::spawn(move || {
-                if let Ok(rt) = tokio::runtime::Runtime::new() {
-                    rt.block_on(refresh);
-                }
-            });
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                // Use the current tokio runtime's handle to spawn the async discovery task,
+                // avoiding the overhead of a std::thread + new tokio runtime.
+                handle.spawn(refresh);
+            }
+            _ => {
+                // No tokio runtime (e.g. called from a plain unit test). Spawn a thread
+                // with a dedicated runtime — this is the fallback path.
+                std::thread::spawn(move || {
+                    if let Ok(rt) = tokio::runtime::Runtime::new() {
+                        rt.block_on(refresh);
+                    }
+                });
+            }
         }
     }
 
@@ -897,14 +894,17 @@ pub fn discover_opencode_models() -> Vec<String> {
             let cache = ALL_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
             update_discovered_models_cache(cache, discovered, "all", empty_reason);
         };
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(refresh);
-        } else {
-            std::thread::spawn(move || {
-                if let Ok(rt) = tokio::runtime::Runtime::new() {
-                    rt.block_on(refresh);
-                }
-            });
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(refresh);
+            }
+            _ => {
+                std::thread::spawn(move || {
+                    if let Ok(rt) = tokio::runtime::Runtime::new() {
+                        rt.block_on(refresh);
+                    }
+                });
+            }
         }
     }
 
@@ -925,10 +925,9 @@ pub fn prime_free_model_cache() {
     if skip_live_opencode_discovery() {
         return;
     }
-    let discovered_all = std::thread::spawn(|| {
-        if let Ok(rt) = tokio::runtime::Runtime::new() {
-            rt.block_on(run_opencode_models_discovery_async()).0
-        } else {
+    let discovered_all = std::thread::spawn(|| match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt.block_on(run_opencode_models_discovery_async()).0,
+        _ => {
             vec![]
         }
     })
@@ -983,7 +982,7 @@ fn opencode_program_available(program: &str) -> bool {
 /// `kill(2)`. A negative `pid` addresses the process group with that id
 #[cfg(unix)]
 fn raw_kill(pid: i32, sig: i32) -> i32 {
-    extern "C" {
+    unsafe extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
     // SAFETY: both arguments are plain integers and kill has no other effect on this process
@@ -1102,19 +1101,18 @@ fn synthesize_response_from_events(events: &[serde_json::Value]) -> crate::parse
             .unwrap_or("unknown");
         *counts.entry(event_type.to_string()).or_insert(0) += 1;
 
-        if event_type == "step_finish" {
-            if let Some(reason) = event
+        if event_type == "step_finish"
+            && let Some(reason) = event
                 .get("part")
                 .and_then(|p| p.get("reason"))
                 .and_then(|r| r.as_str())
-            {
-                step_finish_reason = Some(reason.to_string());
-            }
+        {
+            step_finish_reason = Some(reason.to_string());
         }
 
         // Capture tool names from common opencode/claude-style shapes.
-        if event_type == "tool_use" {
-            if let Some(name) = event
+        if event_type == "tool_use"
+            && let Some(name) = event
                 .get("name")
                 .and_then(|v| v.as_str())
                 .or_else(|| event.get("tool").and_then(|v| v.as_str()))
@@ -1130,9 +1128,8 @@ fn synthesize_response_from_events(events: &[serde_json::Value]) -> crate::parse
                         .and_then(|t| t.get("name"))
                         .and_then(|v| v.as_str())
                 })
-            {
-                tool_names.push(name.to_string());
-            }
+        {
+            tool_names.push(name.to_string());
         }
     }
 

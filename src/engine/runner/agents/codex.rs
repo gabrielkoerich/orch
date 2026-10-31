@@ -45,8 +45,8 @@
 //! ```
 
 use super::{
-    json_error_message, json_str, AgentError, AgentRunner, ParsedResponse, PermissionRules,
-    SandboxLevel, StreamEvent,
+    AgentError, AgentRunner, ParsedResponse, PermissionRules, SandboxLevel, StreamEvent,
+    json_error_message, json_str,
 };
 use crate::parser;
 
@@ -66,15 +66,15 @@ impl CodexRunner {
         for event in events {
             let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-            if event_type == "item.completed" {
-                if let Some(item) = event.get("item") {
-                    let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if event_type == "item.completed"
+                && let Some(item) = event.get("item")
+            {
+                let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-                    if item_type == "agent_message" {
-                        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                            texts.push(text.to_string());
-                        }
-                    }
+                if item_type == "agent_message"
+                    && let Some(text) = item.get("text").and_then(|v| v.as_str())
+                {
+                    texts.push(text.to_string());
                 }
             }
         }

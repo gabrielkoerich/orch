@@ -123,7 +123,8 @@ mod tests {
     impl EnvVarGuard {
         fn set(key: &'static str, value: &str) -> Self {
             let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
     }
@@ -131,8 +132,10 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             match self.previous.take() {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
+                // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                None => unsafe { std::env::remove_var(self.key) },
             }
         }
     }

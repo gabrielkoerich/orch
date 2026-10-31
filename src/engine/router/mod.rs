@@ -19,7 +19,7 @@ mod selection;
 mod strategies;
 pub mod weights;
 
-pub use config::{parse_pool_entry, RouterConfig};
+pub use config::{RouterConfig, parse_pool_entry};
 pub use weights::AgentWeights;
 
 fn fmt_degraded(degraded: &[String]) -> String {
@@ -97,7 +97,7 @@ use crate::engine::cooldown::{
     cooldown_until, is_agent_degraded, is_agent_in_cooldown, is_model_in_cooldown,
     list_degraded_agents, record_agent_success, refresh_degraded_agents, sync_from_kv,
 };
-use crate::store::{get_task_field_direct, store_log_activity, TaskStore};
+use crate::store::{TaskStore, get_task_field_direct, store_log_activity};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -575,13 +575,13 @@ impl Router {
                 earliest = Some(earliest.map_or(until, |current| current.min(until)));
             }
 
-            if let Some(comp) = complexity {
-                if let Some(pool) = self.config.model_pool_for_complexity(agent, comp) {
-                    for model in pool {
-                        let key = format!("{agent}:{model}");
-                        if let Some(until) = cooldown_until(&key) {
-                            earliest = Some(earliest.map_or(until, |current| current.min(until)));
-                        }
+            if let Some(comp) = complexity
+                && let Some(pool) = self.config.model_pool_for_complexity(agent, comp)
+            {
+                for model in pool {
+                    let key = format!("{agent}:{model}");
+                    if let Some(until) = cooldown_until(&key) {
+                        earliest = Some(earliest.map_or(until, |current| current.min(until)));
                     }
                 }
             }
@@ -618,9 +618,9 @@ impl Router {
             // (e.g. over-threshold rate limiting without explicit cooldown duration).
             // Log at warn and return an error so the tick skips this task and retries after backoff.
             tracing::warn!(
-        scope = complexity.unwrap_or("all agents"),
-        "all agents degraded (no cooldown timestamp available) — skipping task, will retry after backoff"
-    );
+                scope = complexity.unwrap_or("all agents"),
+                "all agents degraded (no cooldown timestamp available) — skipping task, will retry after backoff"
+            );
             // Return an error similar to the cooldown case to trigger backoff in the tick loop
             return Err(AllAgentsCooledError::new(
                 complexity.unwrap_or("all agents").to_string(),
@@ -1207,13 +1207,12 @@ impl Router {
         store: &std::sync::Arc<TaskStore>,
         repo: &str,
     ) {
-        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
-            if let Err(e) = store
+        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await
+            && let Err(e) = store
                 .set_fields(store_id, &[("route_attempts", serde_json::json!(attempts))])
                 .await
-            {
-                tracing::warn!(task_id, error = %e, "failed to store route_attempts");
-            }
+        {
+            tracing::warn!(task_id, error = %e, "failed to store route_attempts");
         }
     }
 
@@ -1628,7 +1627,7 @@ mod tests {
     use super::llm::LlmRouteResponse;
     use super::strategies;
     use super::weights::{
-        AgentWeights, RateLimitState, DEFAULT_WEIGHT, MIN_WEIGHT, RATE_LIMIT_DECAY, RECOVERY_DELAY,
+        AgentWeights, DEFAULT_WEIGHT, MIN_WEIGHT, RATE_LIMIT_DECAY, RECOVERY_DELAY, RateLimitState,
     };
     use super::*;
     use crate::backends::{ExternalId, ExternalTask};
@@ -1649,7 +1648,8 @@ mod tests {
             "model_map:\n  medium:\n    claude: sonnet\n",
         )
         .unwrap();
-        std::env::set_var("ORCH_HOME", home.path());
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", home.path()) };
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let store_id = store
@@ -1676,7 +1676,8 @@ mod tests {
 
         let route = get_route_result(&store, "owner/repo", "7").await;
         let stored = store.get(store_id).await.unwrap().model;
-        std::env::remove_var("ORCH_HOME");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::remove_var("ORCH_HOME") };
 
         assert_eq!(route.unwrap().model.as_deref(), Some("sonnet"));
         assert_eq!(stored.as_deref(), Some("sonnet"));
@@ -1864,18 +1865,26 @@ mod tests {
     fn model_map_lookup_returns_none_without_config() {
         // Default config has no hardcoded models — config.yml is the source of truth.
         let config = RouterConfig::default();
-        assert!(config
-            .model_for_complexity("claude", "simple", "")
-            .is_none());
-        assert!(config
-            .model_for_complexity("claude", "medium", "")
-            .is_none());
-        assert!(config
-            .model_for_complexity("claude", "complex", "")
-            .is_none());
-        assert!(config
-            .model_for_complexity("opencode", "review", "")
-            .is_none());
+        assert!(
+            config
+                .model_for_complexity("claude", "simple", "")
+                .is_none()
+        );
+        assert!(
+            config
+                .model_for_complexity("claude", "medium", "")
+                .is_none()
+        );
+        assert!(
+            config
+                .model_for_complexity("claude", "complex", "")
+                .is_none()
+        );
+        assert!(
+            config
+                .model_for_complexity("opencode", "review", "")
+                .is_none()
+        );
     }
 
     #[serial(cooldown_state)]
@@ -3113,8 +3122,10 @@ Hope that helps!"#;
         impl Drop for PathRestore {
             fn drop(&mut self) {
                 match &self.0 {
-                    Some(p) => std::env::set_var("PATH", p),
-                    None => std::env::remove_var("PATH"),
+                    // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                    Some(p) => unsafe { std::env::set_var("PATH", p) },
+                    // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                    None => unsafe { std::env::remove_var("PATH") },
                 }
                 crate::cmd_cache::reset_for_test();
             }
@@ -3141,7 +3152,8 @@ Hope that helps!"#;
         if let Some(ref p) = prev_path {
             new_path.push(p);
         }
-        std::env::set_var("PATH", &new_path);
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("PATH", &new_path) };
         crate::cmd_cache::reset_for_test();
         let _restore = PathRestore(prev_path);
 

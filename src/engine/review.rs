@@ -122,11 +122,11 @@ use crate::engine::runner;
 use crate::engine::runner::worktree;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
-use crate::store::store_log_activity;
 use crate::store::TaskStore;
+use crate::store::store_log_activity;
+use crate::store::{CompleteRun, RunTokenUsage, StartRun};
 use crate::store::{opt_store_get_task, store_increment};
 use crate::store::{store_set, store_set_result};
-use crate::store::{CompleteRun, RunTokenUsage, StartRun};
 use crate::tmux::TmuxManager;
 use anyhow::Context;
 use std::collections::HashSet;
@@ -795,11 +795,11 @@ async fn select_review_agent(
     if !task_agent.is_empty() {
         exclude_set.insert(task_agent.to_string());
     }
-    if let Some(store_id) = store_id {
-        if let Ok(failed) = store.previous_review_agents(store_id).await {
-            for agent in failed {
-                exclude_set.insert(agent);
-            }
+    if let Some(store_id) = store_id
+        && let Ok(failed) = store.previous_review_agents(store_id).await
+    {
+        for agent in failed {
+            exclude_set.insert(agent);
         }
     }
 
@@ -880,18 +880,17 @@ async fn build_review_context(
         .as_ref()
         .and_then(|t| t.pr_number)
         .and_then(|n| u64::try_from(n).ok())
+        && pr_head_already_approved(store, repo, &task.id.0, pr_number).await
     {
-        if pr_head_already_approved(store, repo, &task.id.0, pr_number).await {
-            tracing::info!(
-                task_id = task.id.0,
-                pr_number,
-                "PR head already approved — skipping review, merge retry continues"
-            );
-            record_carried_approval(store, repo, &task.id.0, pr_number).await;
-            return Ok(ReviewPhase::EarlyReturn(ReviewDecision::Approve {
-                issues: Vec::new(),
-            }));
-        }
+        tracing::info!(
+            task_id = task.id.0,
+            pr_number,
+            "PR head already approved — skipping review, merge retry continues"
+        );
+        record_carried_approval(store, repo, &task.id.0, pr_number).await;
+        return Ok(ReviewPhase::EarlyReturn(ReviewDecision::Approve {
+            issues: Vec::new(),
+        }));
     }
 
     let had_prev_push_failure = stored_task
@@ -1000,7 +999,7 @@ async fn build_review_context(
             max_reroutes,
             "no worktree/branch/pr for external needs_review task — re-routing to a different agent"
         );
-        if let Err(e) = store_set_result(
+        match store_set_result(
             &Some(Arc::clone(store)),
             repo,
             &task.id.0,
@@ -1015,9 +1014,14 @@ async fn build_review_context(
         )
         .await
         {
-            tracing::error!(task_id = task.id.0, err = %e, "failed to clear agent/model for reroute — skipping status transition");
-        } else if let Err(e) = task_manager.update_task_status(&task.id, Status::New).await {
-            tracing::error!(task_id = task.id.0, err = %e, "update_task_status(New) failed — task may be stuck in InReview");
+            Err(e) => {
+                tracing::error!(task_id = task.id.0, err = %e, "failed to clear agent/model for reroute — skipping status transition");
+            }
+            _ => {
+                if let Err(e) = task_manager.update_task_status(&task.id, Status::New).await {
+                    tracing::error!(task_id = task.id.0, err = %e, "update_task_status(New) failed — task may be stuck in InReview");
+                }
+            }
         }
         return Ok(ReviewPhase::EarlyReturn(ReviewDecision::Rerouted));
     }
@@ -1275,8 +1279,8 @@ async fn complete_review_run(
     error: &str,
     tokens: RunTokenUsage,
 ) {
-    if let Some(run_id) = run_id {
-        if let Err(e) = store
+    if let Some(run_id) = run_id
+        && let Err(e) = store
             .complete_run(&CompleteRun {
                 run_id,
                 exit_code,
@@ -1288,13 +1292,12 @@ async fn complete_review_run(
                 tokens,
             })
             .await
-        {
-            tracing::warn!(
-                run_id,
-                error = %e,
-                "failed to record review run completion in audit trail"
-            );
-        }
+    {
+        tracing::warn!(
+            run_id,
+            error = %e,
+            "failed to record review run completion in audit trail"
+        );
     }
 }
 
@@ -1358,18 +1361,17 @@ async fn invoke_review_agent(
             let app = review_app(repo).await;
             post_review_started(app.as_deref(), &gh, repo, ctx.head_sha.as_deref()).await;
             // The comment is comment mode's only start signal, the App's check run shows it already
-            if app.is_none() {
-                if let Err(e) = gh
+            if app.is_none()
+                && let Err(e) = gh
                     .add_comment(repo, &ctx.pr_number.to_string(), &start_comment)
                     .await
-                {
-                    tracing::debug!(
-                        task_id = task.id.0,
-                        pr_number = ctx.pr_number,
-                        error = %e,
-                        "failed to post review-started comment"
-                    );
-                }
+            {
+                tracing::debug!(
+                    task_id = task.id.0,
+                    pr_number = ctx.pr_number,
+                    error = %e,
+                    "failed to post review-started comment"
+                );
             }
         }
         Err(e) => {
@@ -2123,28 +2125,28 @@ async fn finalize_review_run(
     )
     .await;
 
-    if let Some(store_id) = ctx.store_id {
-        if parsed.token_usage.input_tokens > 0 || parsed.token_usage.output_tokens > 0 {
-            let model = if ctx.review_model_str().is_empty() {
-                "unknown"
-            } else {
-                ctx.review_model_str()
-            };
-            if let Err(e) = store
-                .store_tokens(
-                    store_id,
-                    parsed.token_usage.input_tokens,
-                    parsed.token_usage.output_tokens,
-                    model,
-                )
-                .await
-            {
-                tracing::warn!(
-                    task_id = task.id.0,
-                    ?e,
-                    "failed to store review agent token usage"
-                );
-            }
+    if let Some(store_id) = ctx.store_id
+        && (parsed.token_usage.input_tokens > 0 || parsed.token_usage.output_tokens > 0)
+    {
+        let model = if ctx.review_model_str().is_empty() {
+            "unknown"
+        } else {
+            ctx.review_model_str()
+        };
+        if let Err(e) = store
+            .store_tokens(
+                store_id,
+                parsed.token_usage.input_tokens,
+                parsed.token_usage.output_tokens,
+                model,
+            )
+            .await
+        {
+            tracing::warn!(
+                task_id = task.id.0,
+                ?e,
+                "failed to store review agent token usage"
+            );
         }
     }
 }
@@ -2300,8 +2302,8 @@ async fn push_review_branch(
                 })),
             )
             .await;
-            if ctx.had_prev_push_failure {
-                if let Err(e) = store_set_result(
+            if ctx.had_prev_push_failure
+                && let Err(e) = store_set_result(
                     &Some(Arc::clone(store)),
                     repo,
                     &task.id.0,
@@ -2311,9 +2313,8 @@ async fn push_review_branch(
                     ],
                 )
                 .await
-                {
-                    tracing::warn!(task_id = task.id.0, err = %e, "failed to reset push_failures — counter may drift");
-                }
+            {
+                tracing::warn!(task_id = task.id.0, err = %e, "failed to reset push_failures — counter may drift");
             }
             Ok(())
         }
@@ -3069,52 +3070,53 @@ async fn ensure_pr_exists(
                                             "created missing PR via CLI, but failed to parse PR number"
                                         );
                                         Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Failed(
-                                            format!("created missing PR via CLI, but could not parse PR number: {e}")
+                                            format!(
+                                                "created missing PR via CLI, but could not parse PR number: {e}"
+                                            ),
                                         )))
                                     }
                                 }
                             }
                             Ok(Ok(o)) => {
                                 let stderr = String::from_utf8_lossy(&o.stderr);
-                                if stderr.contains("already exists") {
-                                    if let Some(pr_url) =
+                                if stderr.contains("already exists")
+                                    && let Some(pr_url) =
                                         stderr.lines().find(|l| l.trim().starts_with("https://"))
-                                    {
-                                        match parse_pr_number_from_url(pr_url.trim()) {
-                                            Ok(pr_num) => {
-                                                if let Err(e) = store_set_result(
-                                                    &Some(Arc::clone(store)),
-                                                    repo,
-                                                    &task.id.0,
-                                                    &[("pr_number", serde_json::json!(pr_num))],
-                                                )
-                                                .await
-                                                {
-                                                    tracing::warn!(
-                                                        task_id = task.id.0,
-                                                        pr_num,
-                                                        err = %e,
-                                                        "failed to persist pr_number from already-exists recovery — downstream may retry PR creation"
-                                                    );
-                                                }
-                                                tracing::info!(
-                                                    task_id = task.id.0,
-                                                    branch = %branch_name,
-                                                    pr_url = %pr_url,
-                                                    "PR already exists (from CLI stderr) — retrying review"
-                                                );
-                                                return Ok(EnsurePrResult::Ready(pr_num));
-                                            }
-                                            Err(e) => {
+                                {
+                                    match parse_pr_number_from_url(pr_url.trim()) {
+                                        Ok(pr_num) => {
+                                            if let Err(e) = store_set_result(
+                                                &Some(Arc::clone(store)),
+                                                repo,
+                                                &task.id.0,
+                                                &[("pr_number", serde_json::json!(pr_num))],
+                                            )
+                                            .await
+                                            {
                                                 tracing::warn!(
                                                     task_id = task.id.0,
-                                                    branch = %branch_name,
-                                                    pr_url = %pr_url,
-                                                    error = %e,
-                                                    "found existing PR URL in CLI stderr, but failed to parse PR number"
+                                                    pr_num,
+                                                    err = %e,
+                                                    "failed to persist pr_number from already-exists recovery — downstream may retry PR creation"
                                                 );
-                                                // Continue to the error handling below
                                             }
+                                            tracing::info!(
+                                                task_id = task.id.0,
+                                                branch = %branch_name,
+                                                pr_url = %pr_url,
+                                                "PR already exists (from CLI stderr) — retrying review"
+                                            );
+                                            return Ok(EnsurePrResult::Ready(pr_num));
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                task_id = task.id.0,
+                                                branch = %branch_name,
+                                                pr_url = %pr_url,
+                                                error = %e,
+                                                "found existing PR URL in CLI stderr, but failed to parse PR number"
+                                            );
+                                            // Continue to the error handling below
                                         }
                                     }
                                 }
@@ -3488,7 +3490,7 @@ async fn ensure_pr_exists(
                     // fact that this attempt produced no PR or code changes.
                     // Use store_set_result so we only transition status when the
                     // store write succeeds — partial failure would orphan the task.
-                    if let Err(e) = store_set_result(
+                    match store_set_result(
                         &Some(Arc::clone(store)),
                         repo,
                         &task.id.0,
@@ -3503,12 +3505,17 @@ async fn ensure_pr_exists(
                     )
                     .await
                     {
-                        tracing::error!(task_id = task.id.0, err = %e, "failed to clear agent/model for reroute — skipping status transition");
-                        // Don't update status — task stays in InReview and will be retried next tick
-                    } else if let Err(e) =
-                        task_manager.update_task_status(&task.id, Status::New).await
-                    {
-                        tracing::error!(task_id = task.id.0, err = %e, "update_task_status(New) failed — task may be stuck in InReview");
+                        Err(e) => {
+                            tracing::error!(task_id = task.id.0, err = %e, "failed to clear agent/model for reroute — skipping status transition");
+                            // Don't update status — task stays in InReview and will be retried next tick
+                        }
+                        _ => {
+                            if let Err(e) =
+                                task_manager.update_task_status(&task.id, Status::New).await
+                            {
+                                tracing::error!(task_id = task.id.0, err = %e, "update_task_status(New) failed — task may be stuck in InReview");
+                            }
+                        }
                     }
                     Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Rerouted))
                 }
@@ -3758,9 +3765,11 @@ mod tests {
         let url = "https://gitlab.com/owner/repo/merge_requests/42";
         let result = parse_pr_number_from_url(url);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("does not start with 'https://github.com/'"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("does not start with 'https://github.com/'")
+        );
     }
 
     #[test]
@@ -3801,9 +3810,11 @@ mod tests {
         let url = "http://github.com/owner/repo/pull/42";
         let result = parse_pr_number_from_url(url);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("does not start with 'https://github.com/'"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("does not start with 'https://github.com/'")
+        );
     }
 
     // ── format_review_error ─────────────────────────────────────────────────
@@ -4029,9 +4040,10 @@ mod tests {
         let cfg = RouterConfig::default();
         assert!(cfg.model_for_complexity("claude", "simple", "").is_none());
         assert!(cfg.model_for_complexity("opencode", "review", "").is_none());
-        assert!(cfg
-            .model_for_complexity("unknown_agent_xyz", "simple", "")
-            .is_none());
+        assert!(
+            cfg.model_for_complexity("unknown_agent_xyz", "simple", "")
+                .is_none()
+        );
     }
 
     #[test]
@@ -4506,7 +4518,8 @@ mod tests {
         let orch_dir = temp_home.path().join(".orch");
         std::fs::create_dir_all(&orch_dir).unwrap();
         let old_orch_home = std::env::var_os("ORCH_HOME");
-        std::env::set_var("ORCH_HOME", &orch_dir);
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", &orch_dir) };
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let repo = "owner/repo";
@@ -4539,9 +4552,11 @@ mod tests {
         assert_eq!(stored.status, TaskStatus::Blocked);
 
         if let Some(old) = old_orch_home {
-            std::env::set_var("ORCH_HOME", old);
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::set_var("ORCH_HOME", old) };
         } else {
-            std::env::remove_var("ORCH_HOME");
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::remove_var("ORCH_HOME") };
         }
     }
 
@@ -4631,7 +4646,8 @@ mod tests {
         let orch_dir = temp_home.path().join(".orch");
         std::fs::create_dir_all(&orch_dir).unwrap();
         let old_orch_home = std::env::var_os("ORCH_HOME");
-        std::env::set_var("ORCH_HOME", &orch_dir);
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", &orch_dir) };
 
         let project_dir = temp_home.path().join("project");
         std::fs::create_dir_all(&project_dir).unwrap();
@@ -4676,9 +4692,11 @@ mod tests {
         assert!(recovered.branch.starts_with("gh-issue-1-"));
 
         if let Some(old) = old_orch_home {
-            std::env::set_var("ORCH_HOME", old);
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::set_var("ORCH_HOME", old) };
         } else {
-            std::env::remove_var("ORCH_HOME");
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::remove_var("ORCH_HOME") };
         }
     }
 
@@ -5441,9 +5459,11 @@ mod tests {
                 .await
                 .is_none()
         );
-        assert!(review_app_for(ReviewMode::App, None, "org/b")
-            .await
-            .is_none());
+        assert!(
+            review_app_for(ReviewMode::App, None, "org/b")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -5481,9 +5501,11 @@ mod tests {
         post_review_started(Some(&app), &gh, "o/r", Some("abc123")).await;
         post_review_decision(Some(&app), &gh, "o/r", Some("abc123"), &decision, "fix it").await;
         let requests = server.received_requests().await.expect("requests");
-        assert!(requests
-            .iter()
-            .all(|req| !req.url.path().contains("/statuses/")));
+        assert!(
+            requests
+                .iter()
+                .all(|req| !req.url.path().contains("/statuses/"))
+        );
     }
 
     #[tokio::test]
@@ -5556,7 +5578,8 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let _env = crate::github::token::ENV_LOCK.lock().unwrap();
         let prev = std::env::var_os("GH_TOKEN");
-        std::env::set_var("GH_TOKEN", "owner-token");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("GH_TOKEN", "owner-token") };
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/repos/o/r/issues/9/comments"))
@@ -5576,14 +5599,18 @@ mod tests {
         )
         .await;
         match prev {
-            Some(value) => std::env::set_var("GH_TOKEN", value),
-            None => std::env::remove_var("GH_TOKEN"),
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            Some(value) => unsafe { std::env::set_var("GH_TOKEN", value) },
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            None => unsafe { std::env::remove_var("GH_TOKEN") },
         }
         result.expect("comment posted");
         let requests = server.received_requests().await.expect("requests");
-        assert!(requests
-            .iter()
-            .all(|req| !req.url.path().contains("/reviews")));
+        assert!(
+            requests
+                .iter()
+                .all(|req| !req.url.path().contains("/reviews"))
+        );
     }
 
     #[tokio::test]

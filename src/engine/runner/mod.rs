@@ -222,7 +222,11 @@ fn parse_success_output(
         let assistant_text = agents::collect_assistant_messages_text(agent_name, raw_stdout);
         if !assistant_text.is_empty() {
             if let Ok(response) = crate::parser::parse(&assistant_text) {
-                tracing::debug!(task_id, agent = agent_name, "found AgentResponse JSON in earlier assistant message (terminal_reason:completed)");
+                tracing::debug!(
+                    task_id,
+                    agent = agent_name,
+                    "found AgentResponse JSON in earlier assistant message (terminal_reason:completed)"
+                );
                 return Ok(agents::ParsedResponse {
                     response,
                     input_tokens: None,
@@ -291,20 +295,20 @@ fn parse_success_output(
         // their final output, so the `type:result` text may be pure
         // narrative while a prior assistant turn contains the JSON.
         let assistant_text = agents::collect_assistant_messages_text(agent_name, raw_stdout);
-        if !assistant_text.is_empty() {
-            if let Ok(response) = crate::parser::parse(&assistant_text) {
-                tracing::debug!(
-                    task_id,
-                    agent = agent_name,
-                    "found AgentResponse JSON in earlier assistant message"
-                );
-                return Ok(agents::ParsedResponse {
-                    response,
-                    input_tokens: agent_result.input_tokens,
-                    output_tokens: agent_result.output_tokens,
-                    duration_ms: agent_result.duration_ms,
-                });
-            }
+        if !assistant_text.is_empty()
+            && let Ok(response) = crate::parser::parse(&assistant_text)
+        {
+            tracing::debug!(
+                task_id,
+                agent = agent_name,
+                "found AgentResponse JSON in earlier assistant message"
+            );
+            return Ok(agents::ParsedResponse {
+                response,
+                input_tokens: agent_result.input_tokens,
+                output_tokens: agent_result.output_tokens,
+                duration_ms: agent_result.duration_ms,
+            });
         }
 
         // Only fall back to text synthesis when parsing fails
@@ -483,24 +487,24 @@ pub fn parse_session_output(
         match parse_success_output(task_id, agent_name, agent_runner, &combined_output) {
             Ok(parsed) => return Ok(parsed),
             Err(err) => {
-                if session_output.exit_code == 124 {
-                    if let Some(summary) = salvage_wrapup(&combined_output) {
-                        tracing::warn!(
-                            task_id,
-                            agent = agent_name,
-                            "timed out after commit during wrap-up, salvaging as done"
-                        );
-                        return Ok(agents::ParsedResponse {
-                            response: crate::parser::AgentResponse {
-                                status: "done".to_string(),
-                                summary,
-                                ..Default::default()
-                            },
-                            input_tokens: None,
-                            output_tokens: None,
-                            duration_ms: None,
-                        });
-                    }
+                if session_output.exit_code == 124
+                    && let Some(summary) = salvage_wrapup(&combined_output)
+                {
+                    tracing::warn!(
+                        task_id,
+                        agent = agent_name,
+                        "timed out after commit during wrap-up, salvaging as done"
+                    );
+                    return Ok(agents::ParsedResponse {
+                        response: crate::parser::AgentResponse {
+                            status: "done".to_string(),
+                            summary,
+                            ..Default::default()
+                        },
+                        input_tokens: None,
+                        output_tokens: None,
+                        duration_ms: None,
+                    });
                 }
                 // If parse_success_output already returned a classified error
                 // (RateLimit, AgentFailed, Timeout, Auth, etc.), propagate it
@@ -795,10 +799,17 @@ impl TaskRunner {
                     if route_reason.starts_with("label agent:") {
                         let agent_label = route_reason.trim_start_matches("label ");
                         let gh = crate::github::http::GhHttp::new()?;
-                        if let Err(e) = gh.remove_label(&self.repo, task_id, agent_label).await {
-                            tracing::warn!(task_id, label = agent_label, err = %e, "failed to remove agent label after max attempts");
-                        } else {
-                            tracing::info!(task_id, label = agent_label, "removed forced agent label after max attempts — /retry will use free routing");
+                        match gh.remove_label(&self.repo, task_id, agent_label).await {
+                            Err(e) => {
+                                tracing::warn!(task_id, label = agent_label, err = %e, "failed to remove agent label after max attempts");
+                            }
+                            _ => {
+                                tracing::info!(
+                                    task_id,
+                                    label = agent_label,
+                                    "removed forced agent label after max attempts — /retry will use free routing"
+                                );
+                            }
                         }
                     }
                 }
@@ -839,15 +850,14 @@ impl TaskRunner {
 
         // A sandbox that cannot start blocks the task, which never runs without it. It is the
         // operator's setup that fails, so no agent or model is cooled down
-        if init.invocation.sandbox {
-            if let Err(e) = sandbox::argv(
+        if init.invocation.sandbox
+            && let Err(e) = sandbox::argv(
                 &init.invocation,
                 &std::env::temp_dir().join("orch-sandbox-preflight"),
             )
             .await
-            {
-                return Ok(Some(self.sandbox_blocked(task_id, e.to_string()).await));
-            }
+        {
+            return Ok(Some(self.sandbox_blocked(task_id, e.to_string()).await));
         }
 
         // Run agent session: spawn in tmux, wait for completion, collect output
@@ -1052,14 +1062,12 @@ impl TaskRunner {
         // For no-op done tasks (agent finished with no code changes and no PR),
         // clean up the worktree and branch immediately — tmux session is already
         // dead so the tmux guard won't block removal.
-        if final_status.as_str() == "done" {
-            if let Some(ref st) = self.store {
-                if let Err(e) =
-                    crate::engine::cleanup::cleanup_task_worktree(task_id, &self.repo, st).await
-                {
-                    tracing::warn!(task_id, error = ?e, "worktree cleanup failed after no-op done");
-                }
-            }
+        if final_status.as_str() == "done"
+            && let Some(ref st) = self.store
+            && let Err(e) =
+                crate::engine::cleanup::cleanup_task_worktree(task_id, &self.repo, st).await
+        {
+            tracing::warn!(task_id, error = ?e, "worktree cleanup failed after no-op done");
         }
 
         // Return final status and the session exit code so callers can record it.
@@ -1216,31 +1224,36 @@ impl TaskRunner {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0)
                 + 1;
-            if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, task_id).await {
-                match store
-                    .start_run(&crate::store::StartRun {
-                        task_id: store_id,
-                        attempt,
-                        run_type: "agent",
-                        agent: &agent_name,
-                        model: model.unwrap_or(""),
-                        command: &format!("{} --model {}", agent_name, model.unwrap_or("default")),
-                        prompt: &task.body,
-                    })
-                    .await
-                {
-                    Ok(run_id) => Some(run_id),
-                    Err(e) => {
-                        tracing::warn!(
-                            task_id,
-                            error = %e,
-                            "failed to record run start in audit trail"
-                        );
-                        None
+            match store.resolve_task_id(&self.repo, task_id).await {
+                Ok(Some(store_id)) => {
+                    match store
+                        .start_run(&crate::store::StartRun {
+                            task_id: store_id,
+                            attempt,
+                            run_type: "agent",
+                            agent: &agent_name,
+                            model: model.unwrap_or(""),
+                            command: &format!(
+                                "{} --model {}",
+                                agent_name,
+                                model.unwrap_or("default")
+                            ),
+                            prompt: &task.body,
+                        })
+                        .await
+                    {
+                        Ok(run_id) => Some(run_id),
+                        Err(e) => {
+                            tracing::warn!(
+                                task_id,
+                                error = %e,
+                                "failed to record run start in audit trail"
+                            );
+                            None
+                        }
                     }
                 }
-            } else {
-                None
+                _ => None,
             }
         } else {
             None
@@ -1254,29 +1267,27 @@ impl TaskRunner {
         {
             Ok(run_result) => run_result,
             Err(e) => {
-                if let Some(run_id) = run_audit_id {
-                    if let Some(ref store) = self.store {
-                        if let Err(complete_err) = store
-                            .complete_run(&crate::store::CompleteRun {
-                                run_id,
-                                exit_code: Some(-1),
-                                stdout: "",
-                                stderr: "",
-                                parsed: "",
-                                outcome: "failed",
-                                error: &e.to_string(),
-                                tokens: crate::store::RunTokenUsage::default(),
-                            })
-                            .await
-                        {
-                            tracing::warn!(
-                                task_id,
-                                run_id,
-                                error = %complete_err,
-                                "failed to record run completion in audit trail after runner error"
-                            );
-                        }
-                    }
+                if let Some(run_id) = run_audit_id
+                    && let Some(ref store) = self.store
+                    && let Err(complete_err) = store
+                        .complete_run(&crate::store::CompleteRun {
+                            run_id,
+                            exit_code: Some(-1),
+                            stdout: "",
+                            stderr: "",
+                            parsed: "",
+                            outcome: "failed",
+                            error: &e.to_string(),
+                            tokens: crate::store::RunTokenUsage::default(),
+                        })
+                        .await
+                {
+                    tracing::warn!(
+                        task_id,
+                        run_id,
+                        error = %complete_err,
+                        "failed to record run completion in audit trail after runner error"
+                    );
                 }
                 return Err(e);
             }
@@ -1286,29 +1297,27 @@ impl TaskRunner {
         let (status, exit_code_opt, run_audit) = if let Some(result) = run_result {
             (result.status, result.exit_code, result.audit)
         } else {
-            if let Some(run_id) = run_audit_id {
-                if let Some(ref store) = self.store {
-                    if let Err(e) = store
-                        .complete_run(&crate::store::CompleteRun {
-                            run_id,
-                            exit_code: Some(-1),
-                            stdout: "",
-                            stderr: "",
-                            parsed: "",
-                            outcome: "aborted",
-                            error: "run skipped by guard",
-                            tokens: crate::store::RunTokenUsage::default(),
-                        })
-                        .await
-                    {
-                        tracing::warn!(
-                            task_id,
-                            run_id,
-                            error = %e,
-                            "failed to record skipped run completion in audit trail"
-                        );
-                    }
-                }
+            if let Some(run_id) = run_audit_id
+                && let Some(ref store) = self.store
+                && let Err(e) = store
+                    .complete_run(&crate::store::CompleteRun {
+                        run_id,
+                        exit_code: Some(-1),
+                        stdout: "",
+                        stderr: "",
+                        parsed: "",
+                        outcome: "aborted",
+                        error: "run skipped by guard",
+                        tokens: crate::store::RunTokenUsage::default(),
+                    })
+                    .await
+            {
+                tracing::warn!(
+                    task_id,
+                    run_id,
+                    error = %e,
+                    "failed to record skipped run completion in audit trail"
+                );
             }
             tracing::info!(task_id, "guard skipped task — not posting stale result");
             return Ok(WeightSignal::None);
@@ -1437,13 +1446,12 @@ impl TaskRunner {
             let has_rate_limit_error = classify_run_error_type(&last_error) == "rate_limit";
             if has_rate_limit_error {
                 // Record in the metrics store so the router's health check detects it.
-                if let Some(ref store) = self.store {
-                    if let Err(e) = store
+                if let Some(ref store) = self.store
+                    && let Err(e) = store
                         .record_rate_limit(&agent_name, "rate", Some(task_id))
                         .await
-                    {
-                        tracing::warn!(task_id, agent = %agent_name, err = %e, "failed to persist rate_limit event — router health check may miss this signal");
-                    }
+                {
+                    tracing::warn!(task_id, agent = %agent_name, err = %e, "failed to persist rate_limit event — router health check may miss this signal");
                 }
                 // Also record via the cooldown system so model_for_complexity() skips
                 // this model.  Use the stored last_error text as the message since
@@ -1498,34 +1506,32 @@ impl TaskRunner {
         }
 
         // Complete run in task_runs audit trail (include exit code from runner when available)
-        if let Some(run_id) = run_audit_id {
-            if let Some(ref store) = self.store {
-                if let Err(e) = store
-                    .complete_run(&crate::store::CompleteRun {
-                        run_id,
-                        exit_code: exit_code_opt,
-                        stdout: &run_audit.stdout,
-                        stderr: &run_audit.stderr,
-                        parsed: &run_audit.parsed_response,
-                        outcome: &run_audit.outcome,
-                        error: &run_audit.error,
-                        tokens: crate::store::RunTokenUsage {
-                            input_tokens: run_audit.input_tokens,
-                            output_tokens: run_audit.output_tokens,
-                            total_cost_usd: run_audit.total_cost_usd,
-                            duration_secs: run_audit.duration_secs,
-                        },
-                    })
-                    .await
-                {
-                    tracing::warn!(
-                        task_id,
-                        run_id,
-                        error = %e,
-                        "failed to record run completion in audit trail"
-                    );
-                }
-            }
+        if let Some(run_id) = run_audit_id
+            && let Some(ref store) = self.store
+            && let Err(e) = store
+                .complete_run(&crate::store::CompleteRun {
+                    run_id,
+                    exit_code: exit_code_opt,
+                    stdout: &run_audit.stdout,
+                    stderr: &run_audit.stderr,
+                    parsed: &run_audit.parsed_response,
+                    outcome: &run_audit.outcome,
+                    error: &run_audit.error,
+                    tokens: crate::store::RunTokenUsage {
+                        input_tokens: run_audit.input_tokens,
+                        output_tokens: run_audit.output_tokens,
+                        total_cost_usd: run_audit.total_cost_usd,
+                        duration_secs: run_audit.duration_secs,
+                    },
+                })
+                .await
+        {
+            tracing::warn!(
+                task_id,
+                run_id,
+                error = %e,
+                "failed to record run completion in audit trail"
+            );
         }
 
         // If task was rerouted (status=routed or new after run), update GitHub agent label
@@ -1560,16 +1566,16 @@ impl TaskRunner {
             _ => Status::NeedsReview,
         };
         // Store-first: update SQLite (must succeed), then mirror to backend.
-        if let Some(ref store) = self.store {
-            if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &task.id.0).await {
-                store
-                    .update_status(
-                        store_id,
-                        crate::engine::tasks::status_to_task_status(new_status),
-                    )
-                    .await
-                    .context("store-first status update failed in runner")?;
-            }
+        if let Some(ref store) = self.store
+            && let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &task.id.0).await
+        {
+            store
+                .update_status(
+                    store_id,
+                    crate::engine::tasks::status_to_task_status(new_status),
+                )
+                .await
+                .context("store-first status update failed in runner")?;
         }
         if let Err(e) = backend.update_status(&task.id, new_status).await {
             tracing::warn!(
@@ -1669,13 +1675,13 @@ impl TaskRunner {
         }
 
         // Mark parent as blocked — store-first, then mirror to backend.
-        if let Some(ref store) = self.store {
-            if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &parent_id.0).await {
-                store
-                    .update_status(store_id, crate::store::TaskStatus::Blocked)
-                    .await
-                    .context("store-first: failed to block parent in store")?;
-            }
+        if let Some(ref store) = self.store
+            && let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &parent_id.0).await
+        {
+            store
+                .update_status(store_id, crate::store::TaskStatus::Blocked)
+                .await
+                .context("store-first: failed to block parent in store")?;
         }
         if let Err(e) = backend.update_status(parent_id, Status::Blocked).await {
             tracing::warn!(
@@ -1711,10 +1717,10 @@ impl TaskRunner {
     /// Resolve the project directory for this repo.
     async fn resolve_project_dir(&self) -> anyhow::Result<PathBuf> {
         // Explicit env var always wins
-        if let Ok(dir) = std::env::var("PROJECT_DIR") {
-            if !dir.is_empty() {
-                return Ok(PathBuf::from(dir));
-            }
+        if let Ok(dir) = std::env::var("PROJECT_DIR")
+            && !dir.is_empty()
+        {
+            return Ok(PathBuf::from(dir));
         }
 
         // Check projects list in global config — find path for this repo
@@ -1733,13 +1739,13 @@ impl TaskRunner {
         }
 
         // Legacy: check config project_dir
-        if let Ok(dir) = config::get("project_dir") {
-            if !dir.is_empty() {
-                let path = PathBuf::from(&dir);
-                let path_for_check = path.clone();
-                if tokio::fs::metadata(&path_for_check).await.is_ok() {
-                    return Ok(path);
-                }
+        if let Ok(dir) = config::get("project_dir")
+            && !dir.is_empty()
+        {
+            let path = PathBuf::from(&dir);
+            let path_for_check = path.clone();
+            if tokio::fs::metadata(&path_for_check).await.is_ok() {
+                return Ok(path);
             }
         }
 
@@ -2470,9 +2476,11 @@ mod tests {
         // dedicated key that only this test touches. std::env::set_var is not
         // thread-safe in general, but the subsequent call is synchronous and
         // isolated to the temp dir created above.
-        std::env::set_var("PROJECT_DIR", &dir_str);
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("PROJECT_DIR", &dir_str) };
         let result = runner.resolve_project_dir().await;
-        std::env::remove_var("PROJECT_DIR");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::remove_var("PROJECT_DIR") };
 
         assert!(
             result.is_ok(),
@@ -2485,9 +2493,11 @@ mod tests {
     async fn resolve_project_dir_empty_project_dir_env_falls_through() {
         // An empty PROJECT_DIR should be ignored and fall through to other logic.
         let runner = TaskRunner::new("owner/testrepo-nonexistent".to_string());
-        std::env::set_var("PROJECT_DIR", "");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("PROJECT_DIR", "") };
         let result = runner.resolve_project_dir().await;
-        std::env::remove_var("PROJECT_DIR");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::remove_var("PROJECT_DIR") };
 
         // No active config entry, no legacy project_dir, no bare clone for this
         // repo: should return an explicit error rather than falling back to the
@@ -2636,7 +2646,8 @@ mod tests {
         let orch_home = temp_home.path().join(".orch");
         tokio::fs::create_dir_all(&orch_home).await.unwrap();
         let old_orch_home = std::env::var("ORCH_HOME").ok();
-        std::env::set_var("ORCH_HOME", &orch_home);
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", &orch_home) };
 
         let runner = TaskRunner::new("owner/repo".to_string());
         let parent = make_task("99");
@@ -2703,9 +2714,11 @@ mod tests {
         );
 
         if let Some(old) = old_orch_home {
-            std::env::set_var("ORCH_HOME", old);
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::set_var("ORCH_HOME", old) };
         } else {
-            std::env::remove_var("ORCH_HOME");
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::remove_var("ORCH_HOME") };
         }
     }
 
@@ -2720,7 +2733,8 @@ mod tests {
         let orch_home = temp_home.path().join(".orch");
         tokio::fs::create_dir_all(&orch_home).await.unwrap();
         let old_orch_home = std::env::var("ORCH_HOME").ok();
-        std::env::set_var("ORCH_HOME", &orch_home);
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", &orch_home) };
 
         let runner = TaskRunner::new("owner/repo".to_string());
         let parent = make_task("101");
@@ -2761,9 +2775,11 @@ mod tests {
         );
 
         if let Some(old) = old_orch_home {
-            std::env::set_var("ORCH_HOME", old);
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::set_var("ORCH_HOME", old) };
         } else {
-            std::env::remove_var("ORCH_HOME");
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::remove_var("ORCH_HOME") };
         }
     }
 

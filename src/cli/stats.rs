@@ -89,10 +89,10 @@ fn print_summary_table(
         if total_cost > 0.0 {
             if let Some(period) = c.periods.iter().find(|p| p.label == window_label) {
                 println!("  Cost ({}): ${:.2}", window_label, period.total_cost_usd);
-            } else if let Some(period_24h) = c.periods.iter().find(|p| p.label == "24h") {
-                if period_24h.total_cost_usd > 0.0 {
-                    println!("  Cost (24h):   ${:.2}", period_24h.total_cost_usd);
-                }
+            } else if let Some(period_24h) = c.periods.iter().find(|p| p.label == "24h")
+                && period_24h.total_cost_usd > 0.0
+            {
+                println!("  Cost (24h):   ${:.2}", period_24h.total_cost_usd);
             }
         }
     }
@@ -109,30 +109,26 @@ fn get_configured_repos() -> Vec<String> {
     let mut repos = Vec::new();
 
     // Try current project
-    if let Ok(repo) = config::get_current_repo() {
-        if !repo.is_empty() {
-            repos.push(repo);
-        }
+    if let Ok(repo) = config::get_current_repo()
+        && !repo.is_empty()
+    {
+        repos.push(repo);
     }
 
     // Try projects from global config
     if let Ok(paths) = config::get_project_paths() {
         for path_str in &paths {
             let candidate = std::path::PathBuf::from(path_str).join(".orch.yml");
-            if candidate.exists() {
-                if let Ok(content) = std::fs::read_to_string(&candidate) {
-                    if let Ok(val) = serde_norway::from_str::<serde_norway::Value>(&content) {
-                        if let Some(repo) = val
-                            .get("gh")
-                            .and_then(|g| g.get("repo"))
-                            .and_then(|r| r.as_str())
-                        {
-                            if !repos.contains(&repo.to_string()) {
-                                repos.push(repo.to_string());
-                            }
-                        }
-                    }
-                }
+            if candidate.exists()
+                && let Ok(content) = std::fs::read_to_string(&candidate)
+                && let Ok(val) = serde_norway::from_str::<serde_norway::Value>(&content)
+                && let Some(repo) = val
+                    .get("gh")
+                    .and_then(|g| g.get("repo"))
+                    .and_then(|r| r.as_str())
+                && !repos.contains(&repo.to_string())
+            {
+                repos.push(repo.to_string());
             }
         }
     }

@@ -5,8 +5,8 @@
 
 use super::types::GitHubReview;
 use chrono::{DateTime, Duration, Utc};
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use reqwest::{header, Client, StatusCode};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -669,7 +669,7 @@ pub(crate) fn test_pem() -> &'static str {
 mod tests {
     use super::*;
     use crate::github::types::GitHubUser;
-    use jsonwebtoken::{decode, DecodingKey, Validation};
+    use jsonwebtoken::{DecodingKey, Validation, decode};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{body_partial_json, header as header_is, method, path};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};

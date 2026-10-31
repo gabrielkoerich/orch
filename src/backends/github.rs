@@ -4,9 +4,9 @@
 //! (`GH_TOKEN` → `GITHUB_TOKEN` environment variables by default).
 
 use super::{ExternalBackend, ExternalId, ExternalTask, Mention, Status};
-use crate::github::http::{status_label_color, GhHttp};
-use crate::github::projects::label_status::LabelSyncConfig;
+use crate::github::http::{GhHttp, status_label_color};
 use crate::github::projects::ProjectSync;
+use crate::github::projects::label_status::LabelSyncConfig;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 
@@ -248,17 +248,18 @@ impl ExternalBackend for GitHubBackend {
             match ProjectSync::discover_fields(project.project_id()).await {
                 Ok(discovered) => {
                     if discovered.estimate_field_id().is_some() {
-                        if let Err(e) =
-                            crate::github::projects::write_project_config(&discovered).await
-                        {
-                            tracing::warn!(
-                                err = %e,
-                                "failed to persist discovered estimate field ID to config"
-                            );
-                        } else {
-                            tracing::info!(
-                                "auto-discovered and persisted project_estimate_field_id to config"
-                            );
+                        match crate::github::projects::write_project_config(&discovered).await {
+                            Err(e) => {
+                                tracing::warn!(
+                                    err = %e,
+                                    "failed to persist discovered estimate field ID to config"
+                                );
+                            }
+                            _ => {
+                                tracing::info!(
+                                    "auto-discovered and persisted project_estimate_field_id to config"
+                                );
+                            }
                         }
                         discovered
                     } else {
@@ -374,32 +375,27 @@ impl ExternalBackend for GitHubBackend {
             match self.set_labels(id, &[label.to_string()]).await {
                 Ok(()) => {
                     // Label update succeeded — now sync project board (non-fatal)
-                    if let Some(ref node_id) = issue_node_id {
-                        if let Some(project) = ProjectSync::from_config() {
-                            if let Err(e) =
-                                self.sync_project_status(&project, node_id, &status).await
-                            {
-                                tracing::warn!(
-                                    task_id = id.0,
-                                    err = %e,
-                                    "project board sync failed (non-fatal)"
-                                );
-                            }
-                        }
+                    if let Some(ref node_id) = issue_node_id
+                        && let Some(project) = ProjectSync::from_config()
+                        && let Err(e) = self.sync_project_status(&project, node_id, &status).await
+                    {
+                        tracing::warn!(
+                            task_id = id.0,
+                            err = %e,
+                            "project board sync failed (non-fatal)"
+                        );
                     }
 
                     // Auto-close issue when status → Done (if auto_close enabled)
                     if status == Status::Done {
                         let auto_close =
                             crate::config::get("workflow.auto_close").map_or(true, |v| v == "true");
-                        if auto_close {
-                            if let Err(e) = self.gh.close_issue(&self.repo, &id.0).await {
-                                tracing::warn!(
-                                    task_id = id.0,
-                                    err = %e,
-                                    "auto-close issue failed (non-fatal)"
-                                );
-                            }
+                        if auto_close && let Err(e) = self.gh.close_issue(&self.repo, &id.0).await {
+                            tracing::warn!(
+                                task_id = id.0,
+                                err = %e,
+                                "auto-close issue failed (non-fatal)"
+                            );
                         }
                     }
 
@@ -592,17 +588,15 @@ impl ExternalBackend for GitHubBackend {
         if let (Some(child_node_id), Ok(parent_issue)) = (
             child_issue.node_id,
             self.gh.get_issue(&self.repo, &parent_id.0).await,
-        ) {
-            if let Some(parent_node_id) = parent_issue.node_id {
-                if let Err(e) = self.gh.add_sub_issue(&parent_node_id, &child_node_id).await {
-                    tracing::warn!(
-                        parent = parent_id.0,
-                        child = child_id.0,
-                        err = %e,
-                        "failed to add native sub-issue link (parent label still set)"
-                    );
-                }
-            }
+        ) && let Some(parent_node_id) = parent_issue.node_id
+            && let Err(e) = self.gh.add_sub_issue(&parent_node_id, &child_node_id).await
+        {
+            tracing::warn!(
+                parent = parent_id.0,
+                child = child_id.0,
+                err = %e,
+                "failed to add native sub-issue link (parent label still set)"
+            );
         }
 
         Ok(child_id)
@@ -1199,7 +1193,8 @@ mod tests {
 
         let _env = crate::github::token::ENV_LOCK.lock().unwrap();
         let prev = std::env::var_os("GH_TOKEN");
-        std::env::set_var("GH_TOKEN", "test_token");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("GH_TOKEN", "test_token") };
 
         let server = MockServer::start().await;
         let comments = serde_json::json!([
@@ -1247,8 +1242,10 @@ mod tests {
             .expect("list_issue_comments");
 
         match prev {
-            Some(value) => std::env::set_var("GH_TOKEN", value),
-            None => std::env::remove_var("GH_TOKEN"),
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            Some(value) => unsafe { std::env::set_var("GH_TOKEN", value) },
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            None => unsafe { std::env::remove_var("GH_TOKEN") },
         }
 
         assert_eq!(mentions.len(), 1);

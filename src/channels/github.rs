@@ -6,11 +6,11 @@ use super::IncomingMessage;
 use chrono::{DateTime, Utc};
 
 use axum::{
+    Router,
     extract::State,
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Router,
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -356,12 +356,11 @@ fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
     file.write_all(content.as_bytes())?;
     file.sync_all()?;
     std::fs::rename(&tmp_path, path)?;
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            if let Err(e) = dir.sync_all() {
-                tracing::warn!(?e, path = %parent.display(), "failed to sync parent directory after dedup file rename");
-            }
-        }
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+        && let Err(e) = dir.sync_all()
+    {
+        tracing::warn!(?e, path = %parent.display(), "failed to sync parent directory after dedup file rename");
     }
     Ok(())
 }
@@ -448,25 +447,25 @@ fn parse_github_event(
 
     match event_type {
         "issues" => {
-            if let (Some(action), Some(issue)) = (&payload.action, &payload.issue) {
-                if action == "opened" || action == "labeled" {
-                    let labels: Vec<String> = issue.labels.iter().map(|l| l.name.clone()).collect();
-                    return Some(IncomingMessage {
-                        channel: "github".to_string(),
-                        id: format!("issue-{}-{}", issue.number, action),
-                        thread_id: issue.number.to_string(),
-                        author: "github".to_string(),
-                        body: format!("Issue {}: {}", action, issue.title),
-                        timestamp,
-                        metadata: serde_json::json!({
-                            "event": "issues",
-                            "action": action,
-                            "issue_number": issue.number,
-                            "labels": labels
-                        }),
-                        topic_id: None,
-                    });
-                }
+            if let (Some(action), Some(issue)) = (&payload.action, &payload.issue)
+                && (action == "opened" || action == "labeled")
+            {
+                let labels: Vec<String> = issue.labels.iter().map(|l| l.name.clone()).collect();
+                return Some(IncomingMessage {
+                    channel: "github".to_string(),
+                    id: format!("issue-{}-{}", issue.number, action),
+                    thread_id: issue.number.to_string(),
+                    author: "github".to_string(),
+                    body: format!("Issue {}: {}", action, issue.title),
+                    timestamp,
+                    metadata: serde_json::json!({
+                        "event": "issues",
+                        "action": action,
+                        "issue_number": issue.number,
+                        "labels": labels
+                    }),
+                    topic_id: None,
+                });
             }
         }
         "pull_request" => {
@@ -494,49 +493,47 @@ fn parse_github_event(
         "issue_comment" => {
             if let (Some(action), Some(comment), Some(issue)) =
                 (&payload.action, &payload.comment, &payload.issue)
+                && action == "created"
             {
-                if action == "created" {
-                    return Some(IncomingMessage {
-                        channel: "github".to_string(),
-                        id: format!("comment-{}", comment.id),
-                        thread_id: issue.number.to_string(),
-                        author: comment.user.login.clone(),
-                        body: comment.body.clone(),
-                        timestamp: comment.created_at.unwrap_or(timestamp),
-                        metadata: serde_json::json!({
-                            "event": "issue_comment",
-                            "action": action,
-                            "issue_number": issue.number
-                        }),
-                        topic_id: None,
-                    });
-                }
+                return Some(IncomingMessage {
+                    channel: "github".to_string(),
+                    id: format!("comment-{}", comment.id),
+                    thread_id: issue.number.to_string(),
+                    author: comment.user.login.clone(),
+                    body: comment.body.clone(),
+                    timestamp: comment.created_at.unwrap_or(timestamp),
+                    metadata: serde_json::json!({
+                        "event": "issue_comment",
+                        "action": action,
+                        "issue_number": issue.number
+                    }),
+                    topic_id: None,
+                });
             }
         }
         "pull_request_review" => {
             if let (Some(action), Some(review), Some(pr)) =
                 (&payload.action, &payload.review, &payload.pr)
+                && action == "submitted"
             {
-                if action == "submitted" {
-                    return Some(IncomingMessage {
-                        channel: "github".to_string(),
-                        id: format!("review-{}", review.id),
-                        thread_id: pr.number.to_string(),
-                        author: review.user.login.clone(),
-                        body: review
-                            .body
-                            .clone()
-                            .unwrap_or_else(|| format!("Review {}", review.state)),
-                        timestamp,
-                        metadata: serde_json::json!({
-                            "event": "pull_request_review",
-                            "action": action,
-                            "pr_number": pr.number,
-                            "review_state": review.state
-                        }),
-                        topic_id: None,
-                    });
-                }
+                return Some(IncomingMessage {
+                    channel: "github".to_string(),
+                    id: format!("review-{}", review.id),
+                    thread_id: pr.number.to_string(),
+                    author: review.user.login.clone(),
+                    body: review
+                        .body
+                        .clone()
+                        .unwrap_or_else(|| format!("Review {}", review.state)),
+                    timestamp,
+                    metadata: serde_json::json!({
+                        "event": "pull_request_review",
+                        "action": action,
+                        "pr_number": pr.number,
+                        "review_state": review.state
+                    }),
+                    topic_id: None,
+                });
             }
         }
         _ => {}
@@ -596,10 +593,10 @@ async fn handle_webhook(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if let Some(msg) = parse_github_event(&payload, event_type, &state.repo) {
-        if state.tx.send(msg).await.is_err() {
-            tracing::warn!("webhook event channel receiver dropped");
-        }
+    if let Some(msg) = parse_github_event(&payload, event_type, &state.repo)
+        && state.tx.send(msg).await.is_err()
+    {
+        tracing::warn!("webhook event channel receiver dropped");
     }
 
     (StatusCode::OK, "OK")
@@ -754,7 +751,7 @@ pub async fn start_webhook_server(
             Err(e) => {
                 return Err(anyhow::anyhow!(
                     "failed to initialize file-backed dedup store: {e}"
-                ))
+                ));
             }
         }
     } else {

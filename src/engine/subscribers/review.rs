@@ -4,14 +4,14 @@ use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::engine::cooldown::AGENT_COOLDOWN_SECS;
 use crate::engine::dispatch_guard::DispatchGuard;
 use crate::engine::events::TaskEvent;
-use crate::engine::review::{review_and_merge, ReviewDecision, MAX_REVIEW_AGENT_FAILURES};
+use crate::engine::review::{MAX_REVIEW_AGENT_FAILURES, ReviewDecision, review_and_merge};
 use crate::engine::review_gate::CiGate;
 use crate::engine::review_shipcheck::Prerun;
 use crate::engine::router::Router;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
 use crate::repo_context::REPO_CONTEXT;
-use crate::store::{opt_store_get_task, TaskStore};
+use crate::store::{TaskStore, opt_store_get_task};
 use crate::tmux::TmuxManager;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -631,7 +631,10 @@ crate::store::TaskStatus::Routed | crate::store::TaskStatus::New)
                 }
                 Ok(_) => {} // Not a needs_review event or different repo
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::debug!(n, "review subscriber lagged; sync catch-up will re-fire missed NeedsReview tasks");
+                    tracing::debug!(
+                        n,
+                        "review subscriber lagged; sync catch-up will re-fire missed NeedsReview tasks"
+                    );
                 }
                 Err(_) => break, // Channel closed
             }
@@ -794,7 +797,10 @@ async fn route_back_on_red_ci(
                         "CI failed on PR #{pr_number} before review: {checks}. Fix the failing checks"
                     )),
                 ),
-                ("route_reason", serde_json::json!("re-dispatch after CI failed before review")),
+                (
+                    "route_reason",
+                    serde_json::json!("re-dispatch after CI failed before review"),
+                ),
             ],
         )
     };
@@ -849,13 +855,12 @@ async fn recorded(
         tracing::warn!(task_id, err = %e, "failed to record review attempt failure");
     }
 
-    if external {
-        if let Err(e) = store
+    if external
+        && let Err(e) = store
             .set_fields(store_id, &[("needs_review_refires", serde_json::json!(0))])
             .await
-        {
-            tracing::warn!(task_id, err = %e, "failed to clear needs_review_refires after external review failure");
-        }
+    {
+        tracing::warn!(task_id, err = %e, "failed to clear needs_review_refires after external review failure");
     }
 
     outcome

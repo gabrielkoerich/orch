@@ -118,16 +118,14 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
     // be deserialized into AgentResponse, but they carry no orch fields like
     // `summary`, `accomplished`, `files`, etc. Returning them would silently
     // promote a domain value (e.g. "inbound-not-submitted") as the task status.
-    if let Some((resp, raw_candidate)) = best_candidate {
-        if has_substantive_fields(&raw_candidate) {
-            return Ok(resp);
-        }
+    if let Some((resp, raw_candidate)) = best_candidate
+        && has_substantive_fields(&raw_candidate)
+    {
+        return Ok(resp);
     }
 
-    if saw_jsonish_candidate {
-        if let Some(err) = last_err {
-            return Err(err);
-        }
+    if saw_jsonish_candidate && let Some(err) = last_err {
+        return Err(err);
     }
 
     if let Some(err) = last_err {
@@ -353,20 +351,20 @@ fn parse_candidate(candidate: &str) -> anyhow::Result<AgentResponse> {
     }
 
     let repaired = repair_json_like(candidate);
-    if repaired != candidate {
-        if let Ok(resp) = serde_json::from_str::<AgentResponse>(&repaired) {
-            return Ok(resp);
-        }
+    if repaired != candidate
+        && let Ok(resp) = serde_json::from_str::<AgentResponse>(&repaired)
+    {
+        return Ok(resp);
     }
 
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(candidate) {
         return map_generic_response(&val);
     }
 
-    if repaired != candidate {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&repaired) {
-            return map_generic_response(&val);
-        }
+    if repaired != candidate
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&repaired)
+    {
+        return map_generic_response(&val);
     }
 
     anyhow::bail!("invalid agent response candidate")
@@ -473,10 +471,10 @@ fn repair_json_like(text: &str) -> String {
             '{' => stack.push('}'),
             '[' => stack.push(']'),
             '}' | ']' => {
-                if let Some(expected) = stack.last().copied() {
-                    if expected == ch {
-                        stack.pop();
-                    }
+                if let Some(expected) = stack.last().copied()
+                    && expected == ch
+                {
+                    stack.pop();
                 }
             }
             _ => {}
@@ -707,9 +705,10 @@ Done.
     fn parse_fallback_raw_text() {
         let input = "This is just plain text output from the agent.";
         let err = parse(input).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("agent output is not valid JSON or a supported JSON wrapper"));
+        assert!(
+            err.to_string()
+                .contains("agent output is not valid JSON or a supported JSON wrapper")
+        );
     }
 
     #[test]

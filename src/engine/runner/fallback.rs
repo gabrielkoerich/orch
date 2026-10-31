@@ -472,8 +472,8 @@ pub async fn handle_error(
 
             // No other standard models available — try free models for simple tasks
             let is_simple = matches!(complexity, None | Some("simple"));
-            if is_simple {
-                if let Some(result) = try_free_model_reroute(
+            if is_simple
+                && let Some(result) = try_free_model_reroute(
                     task_id,
                     agent_name,
                     agent_runner,
@@ -486,9 +486,8 @@ pub async fn handle_error(
                     repo,
                 )
                 .await
-                {
-                    return Ok(result);
-                }
+            {
+                return Ok(result);
             }
 
             (
@@ -717,20 +716,18 @@ pub async fn handle_error(
     if matches!(
         retryable,
         response::RetryableError::Timeout | response::RetryableError::Interrupted
-    ) {
-        if let Err(e) = store::store_set_result(
-            store,
-            repo,
-            task_id,
-            &[
-                ("agent", serde_json::json!("")),
-                ("last_error", serde_json::json!(error_msg.clone())),
-            ],
-        )
-        .await
-        {
-            tracing::warn!(task_id, err = %e, "failed to write timeout agent clear to store");
-        }
+    ) && let Err(e) = store::store_set_result(
+        store,
+        repo,
+        task_id,
+        &[
+            ("agent", serde_json::json!("")),
+            ("last_error", serde_json::json!(error_msg.clone())),
+        ],
+    )
+    .await
+    {
+        tracing::warn!(task_id, err = %e, "failed to write timeout agent clear to store");
     }
 
     // Record rate limit in store (sqlx). Timeouts and interrupted runs are
@@ -742,15 +739,13 @@ pub async fn handle_error(
             response::RetryableError::Timeout | response::RetryableError::Interrupted => None,
             _ => Some("error"),
         };
-        if let Some(limit_type) = error_type_str {
-            if let Some(ref s) = store {
-                if let Err(e) = s
-                    .record_rate_limit(agent_name, limit_type, Some(task_id))
-                    .await
-                {
-                    tracing::warn!(task_id, agent = %agent_name, err = %e, "failed to persist rate_limit event — router health check may miss this signal");
-                }
-            }
+        if let Some(limit_type) = error_type_str
+            && let Some(s) = store
+            && let Err(e) = s
+                .record_rate_limit(agent_name, limit_type, Some(task_id))
+                .await
+        {
+            tracing::warn!(task_id, agent = %agent_name, err = %e, "failed to persist rate_limit event — router health check may miss this signal");
         }
     }
 

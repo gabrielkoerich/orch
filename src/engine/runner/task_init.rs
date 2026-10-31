@@ -5,7 +5,7 @@
 
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask};
 use crate::config;
-use crate::engine::router::{get_route_result, RouteResultError};
+use crate::engine::router::{RouteResultError, get_route_result};
 use crate::store;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
@@ -181,7 +181,7 @@ pub async fn prepare_task(
     git_ops::rebase_on_default(&wt.work_dir, &wt.default_branch).await;
 
     // Get routing result — distinguish between "no route" and store errors
-    let route_result = if let Some(ref s) = store {
+    let route_result = if let Some(s) = store {
         match get_route_result(s, repo, task_id).await {
             Ok(r) => Some(r),
             // NoAgent means the router hasn't set a route for this task yet;
@@ -444,8 +444,9 @@ mod tests {
 
         assert!(matches!(outcome, GuardOutcome::MaxAttempts));
         let task = task_store.get(store_id).await.unwrap();
-        assert!(task
-            .block_reason
-            .is_some_and(|r| r.contains("exceeded max attempts")));
+        assert!(
+            task.block_reason
+                .is_some_and(|r| r.contains("exceeded max attempts"))
+        );
     }
 }
