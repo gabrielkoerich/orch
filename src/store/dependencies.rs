@@ -1086,6 +1086,11 @@ pub(crate) mod apply {
                 format!("review_approved_sha:{old}#"),
                 format!("review_approved_sha:{new}#"),
             ),
+            (format!("ci_check_ts:{old}#"), format!("ci_check_ts:{new}#")),
+            (
+                format!("ci_pending_since:{old}#"),
+                format!("ci_pending_since:{new}#"),
+            ),
         ] {
             sqlx::query(
                 "UPDATE OR REPLACE kv SET key = ? || substr(key, ?) WHERE substr(key, 1, ?) = ?",

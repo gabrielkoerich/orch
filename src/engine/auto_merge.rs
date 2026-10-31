@@ -54,13 +54,17 @@ fn ci_poll_semaphore() -> &'static Arc<Semaphore> {
 ///
 /// Uses the KV store to track the last time CI was checked for each task.
 /// Returns `true` if the cooldown has not elapsed yet.
-async fn is_ci_check_in_cooldown(store: &Arc<TaskStore>, task_id: &str) -> anyhow::Result<bool> {
+async fn is_ci_check_in_cooldown(
+    store: &Arc<TaskStore>,
+    repo: &str,
+    task_id: &str,
+) -> anyhow::Result<bool> {
     let cooldown_secs: u64 = config::get("workflow.ci_check_cooldown_secs")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_CI_CHECK_COOLDOWN_SECS);
 
-    let key = format!("ci_check_ts:{}", task_id);
+    let key = ci_check_ts_key(repo, task_id);
     let last_check = store.kv_get(&key).await?;
 
     if let Some(last_ts) = last_check {
@@ -311,14 +315,24 @@ async fn attempt_worktree_rebase_and_force_push(
 }
 
 /// Record that CI was checked for this task, updating the timestamp in KV store.
-async fn record_ci_check(store: &Arc<TaskStore>, task_id: &str) -> anyhow::Result<()> {
-    let key = format!("ci_check_ts:{}", task_id);
+async fn record_ci_check(store: &Arc<TaskStore>, repo: &str, task_id: &str) -> anyhow::Result<()> {
+    let key = ci_check_ts_key(repo, task_id);
     let now = chrono::Utc::now().to_rfc3339();
     store.kv_set(&key, &now).await
 }
 
-fn ci_pending_since_key(task_id: &str) -> String {
-    format!("ci_pending_since:{}", task_id)
+fn ci_check_ts_key(repo: &str, task_id: &str) -> String {
+    format!("ci_check_ts:{repo}#{task_id}")
+}
+
+/// Prefix shared by the pending timers of every head of one task
+fn ci_pending_since_prefix(repo: &str, task_id: &str) -> String {
+    format!("ci_pending_since:{repo}#{task_id}#")
+}
+
+/// The head sha in the key means a new head starts a new pending window
+fn ci_pending_since_key(repo: &str, task_id: &str, head_sha: &str) -> String {
+    format!("{}{head_sha}", ci_pending_since_prefix(repo, task_id))
 }
 
 /// Return how long CI has been continuously observed as `pending` for this
@@ -334,9 +348,11 @@ fn ci_pending_since_key(task_id: &str) -> String {
 /// does for the check cooldown.
 async fn ci_pending_elapsed(
     store: &Arc<TaskStore>,
+    repo: &str,
     task_id: &str,
+    head_sha: &str,
 ) -> anyhow::Result<chrono::Duration> {
-    let key = ci_pending_since_key(task_id);
+    let key = ci_pending_since_key(repo, task_id, head_sha);
     let now = chrono::Utc::now();
     // `auto_merge_pr` can run as two overlapping invocations for the same task
     // (the review-agent's direct approval call in review.rs races the periodic
@@ -372,14 +388,18 @@ async fn ci_pending_elapsed(
 /// another multi-day live reproduction.
 async fn clear_ci_pending_since(
     store: &Arc<TaskStore>,
+    repo: &str,
     task_id: &str,
     reason: &str,
 ) -> anyhow::Result<()> {
-    let key = ci_pending_since_key(task_id);
-    if let Ok(Some(prior)) = store.kv_get(&key).await {
+    for (key, prior) in store
+        .kv_list_prefix(&ci_pending_since_prefix(repo, task_id))
+        .await?
+    {
         tracing::debug!(task_id, reason, prior_since = %prior, "clearing ci_pending_since");
+        store.kv_delete(&key).await?;
     }
-    store.kv_delete(&key).await
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1247,7 +1267,7 @@ pub(crate) async fn auto_merge_pr(
     loop {
         // Check per-task CI check cooldown before making GitHub API calls.
         // This prevents rate limit exhaustion when many tasks are in CI loops.
-        if is_ci_check_in_cooldown(store, &task.id.0).await? {
+        if is_ci_check_in_cooldown(store, repo, &task.id.0).await? {
             tracing::debug!(
                 task_id = task.id.0,
                 pr_number,
@@ -1293,7 +1313,7 @@ pub(crate) async fn auto_merge_pr(
 
         // Record that we checked CI for this task (before breaking on success or
         // returning on failure/pending timeout). This enables per-task cooldown.
-        if let Err(e) = record_ci_check(store, &task.id.0).await {
+        if let Err(e) = record_ci_check(store, repo, &task.id.0).await {
             tracing::warn!(task_id = task.id.0, err = %e, "failed to record CI check timestamp");
         }
 
@@ -1319,13 +1339,15 @@ pub(crate) async fn auto_merge_pr(
 
         match state.as_str() {
             "success" => {
-                if let Err(e) = clear_ci_pending_since(store, &task.id.0, "ci_success").await {
+                if let Err(e) = clear_ci_pending_since(store, repo, &task.id.0, "ci_success").await
+                {
                     tracing::warn!(task_id = task.id.0, err = %e, "failed to clear ci_pending_since after CI success");
                 }
                 break;
             }
             "failure" => {
-                if let Err(e) = clear_ci_pending_since(store, &task.id.0, "ci_failure").await {
+                if let Err(e) = clear_ci_pending_since(store, repo, &task.id.0, "ci_failure").await
+                {
                     tracing::warn!(task_id = task.id.0, err = %e, "failed to clear ci_pending_since after CI failure");
                 }
                 match gh.get_pr(repo, pr_number).await {
@@ -1650,7 +1672,9 @@ pub(crate) async fn auto_merge_pr(
                 // pending — wait up to max_wait, tracked via a persisted
                 // "first seen pending" timestamp rather than the local
                 // `start` Instant (see `ci_pending_elapsed` doc comment).
-                let pending_elapsed = match ci_pending_elapsed(store, &task.id.0).await {
+                let pending_elapsed = match ci_pending_elapsed(store, repo, &task.id.0, &head_sha)
+                    .await
+                {
                     Ok(d) => d,
                     Err(e) => {
                         tracing::warn!(task_id = task.id.0, err = %e, "failed to read/persist ci_pending_since — skipping timeout check this tick");
@@ -1660,9 +1684,13 @@ pub(crate) async fn auto_merge_pr(
                 if pending_elapsed
                     >= chrono::Duration::from_std(max_wait).unwrap_or(chrono::Duration::MAX)
                 {
-                    if let Err(e) =
-                        clear_ci_pending_since(store, &task.id.0, "pending_timeout_escalation")
-                            .await
+                    if let Err(e) = clear_ci_pending_since(
+                        store,
+                        repo,
+                        &task.id.0,
+                        "pending_timeout_escalation",
+                    )
+                    .await
                     {
                         tracing::warn!(task_id = task.id.0, err = %e, "failed to clear ci_pending_since before timeout escalation");
                     }
@@ -3307,7 +3335,9 @@ mod tests {
 
         // First observation: no prior timestamp, so elapsed starts at zero
         // and the "first seen pending" timestamp is persisted.
-        let first = ci_pending_elapsed(&store, task_id).await.unwrap();
+        let first = ci_pending_elapsed(&store, REPO, task_id, SHA)
+            .await
+            .unwrap();
         assert!(
             first.num_seconds() < 1,
             "first pending observation should report ~zero elapsed, got {first:?}"
@@ -3318,11 +3348,16 @@ mod tests {
         // if `is_ci_check_in_cooldown` had short-circuited several polls ago.
         let backdated = chrono::Utc::now() - chrono::Duration::seconds(700);
         store
-            .kv_set(&ci_pending_since_key(task_id), &backdated.to_rfc3339())
+            .kv_set(
+                &ci_pending_since_key(REPO, task_id, SHA),
+                &backdated.to_rfc3339(),
+            )
             .await
             .unwrap();
 
-        let second = ci_pending_elapsed(&store, task_id).await.unwrap();
+        let second = ci_pending_elapsed(&store, REPO, task_id, SHA)
+            .await
+            .unwrap();
         assert!(
             second.num_seconds() >= 600,
             "elapsed pending time must accumulate across calls instead of resetting, got {second:?}"
@@ -3330,10 +3365,12 @@ mod tests {
 
         // Clearing removes the persisted timestamp so the next observation
         // starts a fresh streak at ~zero elapsed.
-        clear_ci_pending_since(&store, task_id, "test")
+        clear_ci_pending_since(&store, REPO, task_id, "test")
             .await
             .unwrap();
-        let after_clear = ci_pending_elapsed(&store, task_id).await.unwrap();
+        let after_clear = ci_pending_elapsed(&store, REPO, task_id, SHA)
+            .await
+            .unwrap();
         assert!(
             after_clear.num_seconds() < 1,
             "elapsed must reset to ~zero after clear_ci_pending_since, got {after_clear:?}"
@@ -3357,17 +3394,79 @@ mod tests {
 
         let backdated = chrono::Utc::now() - chrono::Duration::seconds(700);
         store
-            .kv_set(&ci_pending_since_key(task_id), &backdated.to_rfc3339())
+            .kv_set(
+                &ci_pending_since_key(REPO, task_id, SHA),
+                &backdated.to_rfc3339(),
+            )
             .await
             .unwrap();
 
         // A second, racing invocation observing the same pending state must
         // read back the already-persisted timestamp instead of clobbering it
         // with its own "now".
-        let racer = ci_pending_elapsed(&store, task_id).await.unwrap();
+        let racer = ci_pending_elapsed(&store, REPO, task_id, SHA)
+            .await
+            .unwrap();
         assert!(
             racer.num_seconds() >= 600,
             "a racing call must not reset an already-persisted ci_pending_since, got {racer:?}"
         );
+    }
+
+    const REPO: &str = "owner/repo";
+    const SHA: &str = "abc123";
+
+    #[tokio::test]
+    async fn ci_pending_window_is_per_repo_and_per_head() {
+        use crate::store::TaskStore;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backdated = chrono::Utc::now() - chrono::Duration::days(3);
+        store
+            .kv_set(
+                &ci_pending_since_key("other/repo", "7", SHA),
+                &backdated.to_rfc3339(),
+            )
+            .await
+            .unwrap();
+        store
+            .kv_set(
+                &ci_pending_since_key(REPO, "7", "oldsha"),
+                &backdated.to_rfc3339(),
+            )
+            .await
+            .unwrap();
+
+        let other_repo = ci_pending_elapsed(&store, REPO, "7", SHA).await.unwrap();
+        assert!(other_repo.num_seconds() < 1, "got {other_repo:?}");
+
+        let new_head = ci_pending_elapsed(&store, REPO, "7", "newsha")
+            .await
+            .unwrap();
+        assert!(new_head.num_seconds() < 1, "got {new_head:?}");
+
+        clear_ci_pending_since(&store, REPO, "7", "test")
+            .await
+            .unwrap();
+        assert!(store
+            .kv_list_prefix(&ci_pending_since_prefix(REPO, "7"))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .kv_get(&ci_pending_since_key("other/repo", "7", SHA))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn ci_check_cooldown_is_per_repo() {
+        use crate::store::TaskStore;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        record_ci_check(&store, "a/x", "5").await.unwrap();
+        assert!(is_ci_check_in_cooldown(&store, "a/x", "5").await.unwrap());
+        assert!(!is_ci_check_in_cooldown(&store, "b/x", "5").await.unwrap());
     }
 }
