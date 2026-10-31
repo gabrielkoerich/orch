@@ -223,8 +223,10 @@ mod tests {
         assert!(!woke(&notify).await);
     }
 
-    // The handshake callback's error type is tungstenite's, too large for the lint
-    #[allow(clippy::result_large_err)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "the handshake callback returns tungstenite's large error type"
+    )]
     #[tokio::test]
     async fn a_session_says_hello_with_the_cursor_and_applies_events() {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};

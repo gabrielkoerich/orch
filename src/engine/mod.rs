@@ -110,6 +110,15 @@ pub struct ProjectEngine {
     pub store: Arc<TaskStore>,
 }
 
+impl std::fmt::Debug for ProjectEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProjectEngine")
+            .field("repo", &self.repo)
+            .field("project_dir", &self.project_dir)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A restart ends every review session, so an `in_review` task with no session has no reviewer.
 /// Hand it back to `needs_review` at start, so it does not wait for the stuck-review recovery
 pub(crate) async fn reset_orphaned_reviews(
@@ -225,7 +234,10 @@ fn start_relay_client(project_engines: &[ProjectEngine], notify: &Arc<Notify>) {
  * in a spawned task. Sync time is the slowest project instead of the sum of all of them
  * (#3864). The caller must already hold `sync_in_progress`; this releases it when done
  **/
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the spawned task takes its own handle to each piece of engine state"
+)]
 fn spawn_sync_pass(
     project_engines: &[ProjectEngine],
     tmux: &Arc<TmuxManager>,
@@ -265,7 +277,7 @@ fn spawn_sync_pass(
         sync::sync_shared_tail(&router, engines.first().map(|e| &e.store)).await;
         tracing::info!(
             trigger,
-            elapsed_ms = started.elapsed().as_millis() as u64,
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "sync tick complete"
         );
         guard.store(false, std::sync::atomic::Ordering::Release);
@@ -280,7 +292,7 @@ async fn sync_one_project(
     dispatching: &Arc<dashmap::DashMap<String, String>>,
     auto_merge_in_flight: &Arc<dashmap::DashSet<String>>,
 ) {
-    if let Err(e) = sync::sync_tick(
+    if let Err(e) = Box::pin(sync::sync_tick(
         &engine.backend,
         tmux,
         &engine.repo,
@@ -290,7 +302,7 @@ async fn sync_one_project(
         &engine.store,
         dispatching,
         auto_merge_in_flight,
-    )
+    ))
     .await
     {
         tracing::error!(repo = %engine.repo, ?e, "sync tick failed for project");
@@ -350,7 +362,7 @@ pub fn configured_agents() -> Vec<String> {
 }
 
 /// Engine configuration.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct EngineConfig {
     /// Main tick interval
     pub tick_interval: std::time::Duration,
@@ -792,7 +804,10 @@ fn diff_configured_projects(
 ///
 /// A removed project keeps running until the next restart: its subscriber
 /// tasks and any agent it already dispatched outlive the config read
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a new project engine needs every shared engine handle"
+)]
 async fn sync_project_engines(
     project_engines: &mut Vec<ProjectEngine>,
     active_repos: &mut std::collections::HashSet<String>,
@@ -1256,7 +1271,7 @@ async fn check_and_notify_upgrade(
     let now = chrono::Utc::now().timestamp();
     if let Ok(Some(last_check_str)) = store.kv_get(last_check_key).await {
         if let Ok(last_check) = last_check_str.parse::<i64>() {
-            if now - last_check < check_interval.as_secs() as i64 {
+            if now - last_check < i64::try_from(check_interval.as_secs()).unwrap_or(i64::MAX) {
                 return;
             }
         }
@@ -1354,6 +1369,7 @@ async fn check_and_notify_upgrade(
 /// config — mirroring the approach used during normal channel registration, but
 /// without relying on `ChannelRegistry`.
 async fn send_startup_escalation_notification(elapsed_secs: u64) {
+    #[expect(clippy::cast_precision_loss, reason = "a display duration")]
     let duration = crate::channels::notification::format_duration(elapsed_secs as f64);
 
     let msg_telegram = format!(
@@ -1514,13 +1530,14 @@ pub async fn serve() -> anyhow::Result<()> {
                         && elapsed >= startup_escalation_secs
                     {
                         escalated = true;
+                        #[expect(clippy::cast_precision_loss, reason = "a display duration")]
+                        let outage = crate::channels::notification::format_duration(elapsed as f64);
                         tracing::error!(
                             delay_secs,
                             attempt,
                             elapsed_secs = elapsed,
                             threshold_secs = startup_escalation_secs,
-                            "project backends unavailable for {} — escalating startup failure: {e}",
-                            crate::channels::notification::format_duration(elapsed as f64)
+                            "project backends unavailable for {outage} — escalating startup failure: {e}",
                         );
                         // Send one-time notification to configured channels.
                         // Channels aren't registered yet at this stage, so we
@@ -2110,6 +2127,10 @@ pub async fn serve() -> anyhow::Result<()> {
     ));
 
     if webhook_enabled {
+        // Spawn the HTTP server with exponential-backoff retry on transient
+        // bind errors (e.g. EADDRINUSE).  After MAX_ATTEMPTS the engine falls
+        // back to polling and updates the shared status accordingly.
+        const WEBHOOK_MAX_ATTEMPTS: u32 = 5;
         let port: u16 = crate::config::get("webhook.port")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -2134,10 +2155,6 @@ pub async fn serve() -> anyhow::Result<()> {
         };
         to_save.save().await;
 
-        // Spawn the HTTP server with exponential-backoff retry on transient
-        // bind errors (e.g. EADDRINUSE).  After MAX_ATTEMPTS the engine falls
-        // back to polling and updates the shared status accordingly.
-        const WEBHOOK_MAX_ATTEMPTS: u32 = 5;
         let status_for_spawn = std::sync::Arc::clone(&webhook_status);
         tokio::spawn(async move {
             use crate::channels::github::{is_transient_bind_error, webhook_backoff_delay};
@@ -2437,7 +2454,7 @@ pub async fn serve() -> anyhow::Result<()> {
                         (None, None) => None,
                     };
                     if let Some(gap) = gap {
-                        let gap_secs = gap.num_seconds() as u64;
+                        let gap_secs = u64::try_from(gap.num_seconds()).unwrap_or(0);
                         if gap_secs >= stale_secs {
                             tracing::info!(
                                 stale_secs,
@@ -2649,9 +2666,15 @@ pub async fn serve() -> anyhow::Result<()> {
                 // Update watchdog timestamp + log tick duration.
                 let tick_elapsed = tick_start.elapsed();
                 if tick_elapsed.as_secs() > 30 {
-                    tracing::warn!(elapsed_ms = tick_elapsed.as_millis() as u64, "slow tick");
+                    tracing::warn!(
+                        elapsed_ms = u64::try_from(tick_elapsed.as_millis()).unwrap_or(u64::MAX),
+                        "slow tick"
+                    );
                 } else {
-                    tracing::debug!(elapsed_ms = tick_elapsed.as_millis() as u64, "tick complete");
+                    tracing::debug!(
+                        elapsed_ms = u64::try_from(tick_elapsed.as_millis()).unwrap_or(u64::MAX),
+                        "tick complete"
+                    );
                 }
                 last_tick_epoch.store(
                     std::time::SystemTime::now()
@@ -3338,7 +3361,7 @@ mod tests {
     /// create sessions on CI runners, but capture-pane output is empty or
     /// delayed, causing the assertion to fail after a 10s timeout.
     #[tokio::test]
-    #[ignore]
+    #[ignore = "capture-pane timing is unreliable on CI runners"]
     async fn integration_channel_to_tmux_to_capture() {
         use crate::channels::capture::CaptureService;
         use crate::channels::transport::Transport;

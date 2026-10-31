@@ -45,7 +45,7 @@ fn read_file_with_limit<P: AsRef<Path>>(path: P, max_bytes: u64) -> anyhow::Resu
     let start_pos = file_size.saturating_sub(max_bytes);
     file.seek(SeekFrom::Start(start_pos))?;
 
-    let mut buffer = Vec::with_capacity(max_bytes as usize);
+    let mut buffer = Vec::with_capacity(usize::try_from(max_bytes).unwrap_or(0));
     file.read_to_end(&mut buffer)?;
 
     // Try to convert to UTF-8, replacing invalid sequences
@@ -71,13 +71,20 @@ pub(crate) fn calculate_backoff_delay(retry_count: usize) -> u64 {
     let max_delay = crate::engine::router::config::retry_max_delay_ms();
 
     // Exponential: base * 2^retry_count
-    let exponential = base_delay * (2_u64.saturating_pow(retry_count as u32));
+    let exponential =
+        base_delay * (2_u64.saturating_pow(u32::try_from(retry_count).unwrap_or(u32::MAX)));
     let capped = exponential.min(max_delay);
 
     // Add jitter: ±30% using a hash-based pseudo-random value.
     // Mix system time (nanoseconds) with thread ID so concurrent retries on
     // different threads get different delays even when called in the same
     // microsecond, avoiding the thundering-herd problem.
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a jitter range in milliseconds, far below 2^52 and never negative"
+    )]
     let jitter_range = (capped as f64 * JITTER_FACTOR) as u64;
     let jitter = {
         use std::collections::hash_map::DefaultHasher;
@@ -98,7 +105,7 @@ fn fallback_retry_count(task: Option<&crate::store::Task>) -> usize {
             .split(',')
             .filter(|entry| !entry.is_empty())
             .count();
-        let network_retry_count = t.network_retries.max(0) as usize;
+        let network_retry_count = usize::try_from(t.network_retries).unwrap_or(0);
         chain_retry_count.max(network_retry_count)
     })
 }
@@ -331,7 +338,6 @@ pub enum RetryableError {
 impl RetryableError {
     /// Return a short classified string for this error type.
     /// Used in DB rate-limit metrics and test assertions.
-    #[expect(dead_code)]
     pub fn type_str(self) -> &'static str {
         match self {
             RetryableError::Timeout => "timeout",
@@ -810,7 +816,10 @@ fn extract_review_response_object(text: &str) -> Option<ReviewResponse> {
 }
 
 /// Extract learnings and store as memory for future attempts.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a memory entry records the task, attempt, agent, model and outcome"
+)]
 pub async fn store_learnings_from_response(
     task_id: &str,
     attempt: u32,
@@ -909,6 +918,12 @@ mod tests {
 
         // retry_count=0 → exponential = base, capped = base (assuming base < max)
         let capped = base.min(max);
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "mirrors the jitter range in calculate_backoff_delay"
+        )]
         let jitter_range = (capped as f64 * JITTER_FACTOR) as u64;
         let lo = capped.saturating_sub(jitter_range);
         let hi = capped + jitter_range;

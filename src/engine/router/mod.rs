@@ -182,6 +182,12 @@ impl RouteResult {
 /// safely be called without starving write-lock waiters.
 pub struct LlmRouterHandle(std::sync::Arc<LlmRouter>);
 
+impl std::fmt::Debug for LlmRouterHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmRouterHandle").finish_non_exhaustive()
+    }
+}
+
 impl LlmRouterHandle {
     /// Invalidate the skills catalog cache so the next routing call reloads
     /// from disk.  Safe to await without holding any `RwLock` on `Router`.
@@ -191,6 +197,10 @@ impl LlmRouterHandle {
 }
 
 /// The agent router.
+#[expect(
+    clippy::struct_field_names,
+    reason = "the router holds sub-routers whose names say which backend they use"
+)]
 pub struct Router {
     /// Router configuration
     pub config: RouterConfig,
@@ -214,6 +224,22 @@ pub struct Router {
     pub(crate) router_pool: Vec<(String, String)>,
     /// Current round-robin index into router_pool
     pub(crate) pool_index: usize,
+}
+
+impl std::fmt::Debug for Router {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Router")
+            .field("config", &self.config)
+            .field("available_agents", &self.available_agents)
+            .field("weights", &self.weights)
+            .field("ollama_router", &self.ollama_router)
+            .field("rr_index", &self.rr_index)
+            .field("last_agent", &self.last_agent)
+            .field("review_rr_index", &self.review_rr_index)
+            .field("router_pool", &self.router_pool)
+            .field("pool_index", &self.pool_index)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Router {
@@ -579,7 +605,7 @@ impl Router {
         earliest
     }
 
-    async fn wait_for_cooldown(&self, complexity: Option<&str>) -> anyhow::Result<()> {
+    fn wait_for_cooldown(&self, complexity: Option<&str>) -> anyhow::Result<()> {
         // If any cooldowns are present, return an error immediately so the
         // caller (the tick loop) can skip this task and retry on the next tick.
         // Sleeping inside the router blocks the entire tick loop for the
@@ -613,7 +639,7 @@ impl Router {
             );
             // Return a domain error indicating all candidates are cooled so the
             // caller can handle it (tick will skip this task and retry later).
-            return Err(AllAgentsCooledError::new(scope_str, Some(remaining as u64)).into());
+            return Err(AllAgentsCooledError::new(scope_str, u64::try_from(remaining).ok()).into());
         }
 
         Ok(())
@@ -805,7 +831,7 @@ impl Router {
 
                 let candidates = self.available_agents_for_complexity(&complexity);
                 if candidates.is_empty() {
-                    self.wait_for_cooldown(Some(&complexity)).await?;
+                    self.wait_for_cooldown(Some(&complexity))?;
                     continue;
                 }
                 // Label target is cooled or lacked model; fall through to standard routing.
@@ -816,7 +842,7 @@ impl Router {
             // Check if any agents have available models for this complexity
             let mut candidates = self.available_agents_for_complexity(&complexity);
             if candidates.is_empty() {
-                self.wait_for_cooldown(Some(&complexity)).await?;
+                self.wait_for_cooldown(Some(&complexity))?;
                 continue;
             }
 
@@ -905,7 +931,7 @@ impl Router {
                 );
                 let candidates = self.available_agents_for_complexity(&complexity);
                 if candidates.is_empty() {
-                    self.wait_for_cooldown(Some(&complexity)).await?;
+                    self.wait_for_cooldown(Some(&complexity))?;
                     continue;
                 }
                 let result = strategies::route_via_round_robin_stateful(
@@ -927,7 +953,7 @@ impl Router {
                 Ok(result) => {
                     let candidates = self.available_agents_for_complexity(&result.complexity);
                     if candidates.is_empty() {
-                        self.wait_for_cooldown(Some(&result.complexity)).await?;
+                        self.wait_for_cooldown(Some(&result.complexity))?;
                         continue;
                     }
 
@@ -954,7 +980,7 @@ impl Router {
                                 complexity = %result.complexity,
                                 "all available agents are the no-code agent — waiting for another agent"
                             );
-                            self.wait_for_cooldown(Some(&result.complexity)).await?;
+                            self.wait_for_cooldown(Some(&result.complexity))?;
                             continue;
                         }
                         tracing::info!(
@@ -1020,7 +1046,7 @@ impl Router {
                                 complexity = %result.complexity,
                                 "LLM-selected model(s) are cooled for the only available agent; waiting for cooldown"
                             );
-                            self.wait_for_cooldown(Some(&result.complexity)).await?;
+                            self.wait_for_cooldown(Some(&result.complexity))?;
                             continue;
                         }
 
@@ -1099,7 +1125,7 @@ impl Router {
                             "all agents" | "router pool" => None,
                             _ => Some(scope),
                         };
-                        self.wait_for_cooldown(scope_opt).await?;
+                        self.wait_for_cooldown(scope_opt)?;
                         continue;
                     }
 
@@ -1123,7 +1149,7 @@ impl Router {
                         );
                         let candidates = self.available_agents_for_complexity(&complexity);
                         if candidates.is_empty() {
-                            self.wait_for_cooldown(Some(&complexity)).await?;
+                            self.wait_for_cooldown(Some(&complexity))?;
                             continue;
                         }
                         let result = strategies::route_via_round_robin_stateful(
@@ -1140,7 +1166,7 @@ impl Router {
 
                     let candidates = self.available_agents_for_complexity(&complexity);
                     if candidates.is_empty() {
-                        self.wait_for_cooldown(Some(&complexity)).await?;
+                        self.wait_for_cooldown(Some(&complexity))?;
                         continue;
                     }
                     let result = strategies::route_via_fallback(
@@ -1168,7 +1194,7 @@ impl Router {
             Ok(Some(store_id)) => store
                 .get(store_id)
                 .await
-                .map_or(0, |t| t.route_attempts as u32),
+                .map_or(0, |t| u32::try_from(t.route_attempts).unwrap_or(0)),
             _ => 0,
         }
     }
@@ -1820,8 +1846,8 @@ mod tests {
         assert_eq!(config.router_model, "haiku");
         assert_eq!(config.fallback_executor, "codex");
         assert_eq!(config.max_route_attempts, 3);
-        assert!(!config.allowed_tools.is_empty());
-        assert!(!config.default_skills.is_empty());
+        assert_ne!(config.allowed_tools, [] as [String; 0]);
+        assert_ne!(config.default_skills, [] as [String; 0]);
 
         // Verify configurable agents list includes all 7 agents
         assert_eq!(config.agents.len(), 7);
@@ -1873,7 +1899,6 @@ mod tests {
     #[tokio::test]
     async fn model_pool_selection_skips_cooled() {
         crate::engine::cooldown::reset_global_state().await;
-        use std::collections::HashMap;
 
         let mut config = RouterConfig::default();
         // Set up a two-model pool for opencode/simple
@@ -1910,7 +1935,6 @@ mod tests {
         // All cooled → return None so the caller can fall back to a different agent
         let fallback = config.model_for_complexity("opencode", "simple", "task-fallback");
         assert_eq!(fallback, None);
-        let _ = HashMap::<(), ()>::new(); // suppress unused import lint
     }
 
     #[serial(cooldown_state)]
@@ -2306,7 +2330,7 @@ Hope that helps!"#;
         // Fallback executor should always be set
         assert_ne!(router.config.fallback_executor, "");
         // Tools should always be populated
-        assert!(!router.config.allowed_tools.is_empty());
+        assert_ne!(router.config.allowed_tools, [] as [String; 0]);
     }
 
     // --- Weighted round-robin tests ---
@@ -2590,7 +2614,11 @@ Hope that helps!"#;
         // Set up a rate limit that looks like it happened long ago
         let state = weights.states.get_mut("claude").unwrap();
         state.weight = 0.5;
-        state.last_limited_at = Some(Instant::now() - RECOVERY_DELAY - Duration::from_secs(1));
+        state.last_limited_at = Some(
+            Instant::now()
+                .checked_sub(RECOVERY_DELAY + Duration::from_secs(1))
+                .expect("the clock is past the recovery delay"),
+        );
         state.consecutive_hits = 2;
 
         let before = weights.get_weight("claude");
@@ -2609,7 +2637,11 @@ Hope that helps!"#;
         // Set weight just below full with an old limit
         let state = weights.states.get_mut("claude").unwrap();
         state.weight = DEFAULT_WEIGHT - 0.01;
-        state.last_limited_at = Some(Instant::now() - RECOVERY_DELAY - Duration::from_secs(1));
+        state.last_limited_at = Some(
+            Instant::now()
+                .checked_sub(RECOVERY_DELAY + Duration::from_secs(1))
+                .expect("the clock is past the recovery delay"),
+        );
         state.consecutive_hits = 1;
 
         weights.tick_recovery();
@@ -3067,7 +3099,7 @@ Hope that helps!"#;
     fn router_pool_non_empty_after_construction() {
         let config = RouterConfig::default();
         let router = Router::new(config);
-        assert!(!router.router_pool.is_empty());
+        assert_ne!(router.router_pool, [] as [(String, String); 0]);
     }
 
     /**

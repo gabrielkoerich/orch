@@ -1475,7 +1475,10 @@ fn cleaned_pr_items(items: &[String]) -> Vec<String> {
 }
 
 /// Format the GitHub PR description from the agent summary, stripping push and PR-creation statements
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is one section of the PR body"
+)]
 fn build_pr_body(
     title: &str,
     summary: &str,
@@ -1486,6 +1489,7 @@ fn build_pr_body(
     agent: &str,
     model: Option<&str>,
 ) -> String {
+    use std::fmt::Write as _;
     let cleaned_summary = strip_push_and_pr_creation(summary);
     let summary_text = if cleaned_summary.is_empty() {
         title
@@ -1500,35 +1504,36 @@ fn build_pr_body(
     if !accomplished.is_empty() {
         body.push_str("\n\n### What was done\n\n");
         for item in &accomplished {
-            body.push_str(&format!("- {item}\n"));
+            let _ = writeln!(body, "- {item}");
         }
     }
 
     if !remaining.is_empty() {
         body.push_str("\n\n### Remaining\n\n");
         for item in &remaining {
-            body.push_str(&format!("- {item}\n"));
+            let _ = writeln!(body, "- {item}");
         }
     }
 
     if !files.is_empty() {
         body.push_str("\n\n### Files changed\n\n");
         for file in files {
-            body.push_str(&format!("- `{file}`\n"));
+            let _ = writeln!(body, "- `{file}`");
         }
     }
 
     if !task_id.starts_with("internal:") {
         if let Ok(issue_num) = task_id.parse::<u64>() {
-            body.push_str(&format!("\n\nCloses #{issue_num}"));
+            let _ = write!(body, "\n\nCloses #{issue_num}");
         }
     }
 
     let model_str = model.map(|m| format!(" using `{m}`")).unwrap_or_default();
     let task_ref = format_task_ref(task_id);
-    body.push_str(&format!(
+    let _ = write!(
+        body,
         "\n\n---\n*Task {task_ref} · Created by {agent}[bot] via [Orch](https://github.com/gabrielkoerich/orch){model_str}*"
-    ));
+    );
     body
 }
 
@@ -1540,7 +1545,10 @@ fn build_pr_body(
 /// # Returns
 /// - `Ok(url)` - PR URL (newly created or already existed)
 /// - `Err(PrCreateError)` - API error or other failure
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the PR needs its branch, body sections, attribution and target together"
+)]
 pub async fn create_pr_if_needed(
     dir: &Path,
     branch: &str,
@@ -1555,6 +1563,8 @@ pub async fn create_pr_if_needed(
     repo: &str,
     base_branch: &str,
 ) -> PrCreateResult<String> {
+    // Retries for transient 5xx errors on PR creation below
+    const MAX_RETRIES: u32 = 3;
     let gh = GhHttp::new()?;
 
     // Check if PR already exists using GhHttp API
@@ -1624,7 +1634,6 @@ pub async fn create_pr_if_needed(
     let pr_title = title;
 
     // Create PR using GhHttp API with exponential backoff retry for transient 5xx errors.
-    const MAX_RETRIES: u32 = 3;
     let mut last_error: Option<anyhow::Error> = None;
     let mut created_url: Option<String> = None;
     let mut had_transient_error = false;

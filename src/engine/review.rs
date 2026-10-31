@@ -860,7 +860,6 @@ async fn select_review_agent(
     }
 }
 
-#[expect(clippy::too_many_arguments)]
 async fn build_review_context(
     task: &ExternalTask,
     repo: &str,
@@ -877,8 +876,11 @@ async fn build_review_context(
 
     // A commit that already has an approval must not be reviewed again. Checked before
     // the review_invocations increment so a stuck merge cannot exhaust the review quota
-    if let Some(pr_number) = stored_task.as_ref().and_then(|t| t.pr_number) {
-        let pr_number = pr_number as u64;
+    if let Some(pr_number) = stored_task
+        .as_ref()
+        .and_then(|t| t.pr_number)
+        .and_then(|n| u64::try_from(n).ok())
+    {
         if pr_head_already_approved(store, repo, &task.id.0, pr_number).await {
             tracing::info!(
                 task_id = task.id.0,
@@ -903,7 +905,7 @@ async fn build_review_context(
     )
     .await
     {
-        Ok(v) => v as u32,
+        Ok(v) => u32::try_from(v).unwrap_or(u32::MAX),
         Err(e) => {
             tracing::warn!(task_id = task.id.0, err = %e, "failed to increment review_invocations — using fallback attempt=1");
             1
@@ -962,7 +964,7 @@ async fn build_review_context(
             }
         };
 
-        if reroutes as u32 >= max_reroutes {
+        if reroutes >= u64::from(max_reroutes) {
             tracing::error!(
                 task_id = task.id.0,
                 reroutes,
@@ -1080,7 +1082,7 @@ async fn build_review_context(
     let stored_pr_number = stored_task
         .as_ref()
         .and_then(|t| t.pr_number)
-        .map(|n| n as u64)
+        .and_then(|n| u64::try_from(n).ok())
         .filter(|&n| n > 0);
 
     let pr_number = match ensure_pr_exists(
@@ -1258,7 +1260,10 @@ async fn build_review_context(
     }))
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run record needs the outcome, the agent and the timing together"
+)]
 async fn complete_review_run(
     store: &Arc<TaskStore>,
     run_id: Option<i64>,
@@ -1304,7 +1309,7 @@ async fn invoke_review_agent(
         match store
             .start_run(&StartRun {
                 task_id: sid,
-                attempt: ctx.review_attempt as i32,
+                attempt: i32::try_from(ctx.review_attempt).unwrap_or(i32::MAX),
                 run_type: "review",
                 agent: &ctx.review_agent,
                 model: ctx.review_model.as_deref().unwrap_or(""),
@@ -2264,7 +2269,6 @@ async fn push_review_branch(
                     Ok(recovered) => {
                         worktree_path = recovered.work_dir;
                         branch_name = recovered.branch;
-                        continue;
                     }
                     Err(recover_err) => {
                         break Err(anyhow::anyhow!(
@@ -2354,20 +2358,22 @@ fn append_review_issues(
     body: &mut String,
     issues: &[crate::engine::runner::response::ReviewIssue],
 ) {
+    use std::fmt::Write as _;
     if issues.is_empty() {
         return;
     }
     body.push_str("\n**Issues Found:**\n");
     for issue in issues {
-        body.push_str(&format!(
-            "- `{}` line {}: {} [{}]\n",
+        let _ = writeln!(
+            body,
+            "- `{}` line {}: {} [{}]",
             issue.file,
             issue
                 .line
                 .map_or_else(|| "?".to_string(), |line| line.to_string()),
             issue.description,
             issue.severity
-        ));
+        );
     }
 }
 
@@ -2632,7 +2638,10 @@ async fn inline_comments(
     }
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "applying a decision touches the backend, the store, tmux and the router"
+)]
 async fn apply_review_decision(
     task: &ExternalTask,
     backend: &Arc<dyn ExternalBackend>,
@@ -2773,9 +2782,12 @@ async fn count_ahead_commits(
     worktree_path: &std::path::Path,
     default_branch: &str,
 ) -> Result<u64, String> {
-    let worktree_str = worktree_path
-        .to_str()
-        .ok_or_else(|| format!("worktree path contains non-UTF-8 characters: {worktree_path:?}"))?;
+    let worktree_str = worktree_path.to_str().ok_or_else(|| {
+        format!(
+            "worktree path contains non-UTF-8 characters: {}",
+            worktree_path.display()
+        )
+    })?;
 
     let output = tokio::process::Command::new("git")
         .args([
@@ -2814,7 +2826,10 @@ async fn count_ahead_commits(
 /// If no PR exists but the branch has commits, attempts to create one and
 /// continues with the same review pass.
 /// All error and no-op paths update task status and return [`EnsurePrResult::EarlyReturn`].
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every early return path needs its own piece of review state"
+)]
 async fn ensure_pr_exists(
     task: &ExternalTask,
     branch_name: &str,
@@ -2875,7 +2890,8 @@ async fn ensure_pr_exists(
                 );
                 let worktree_str = worktree_path.to_str().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "worktree path contains non-UTF-8 characters: {worktree_path:?}"
+                        "worktree path contains non-UTF-8 characters: {}",
+                        worktree_path.display()
                     )
                 })?;
                 // Push first in case agent forgot (use token auth like git_ops::push_branch)
@@ -2941,7 +2957,7 @@ async fn ensure_pr_exists(
                                 &Some(Arc::clone(store)),
                                 repo,
                                 &task.id.0,
-                                &[("pr_number", serde_json::json!(pr_num as i64))],
+                                &[("pr_number", serde_json::json!(pr_num))],
                             )
                             .await?;
                             tracing::info!(
@@ -2993,7 +3009,7 @@ async fn ensure_pr_exists(
                                     &Some(Arc::clone(store)),
                                     repo,
                                     &task.id.0,
-                                    &[("pr_number", serde_json::json!(n as i64))],
+                                    &[("pr_number", serde_json::json!(n))],
                                 )
                                 .await?;
                                 return Ok(EnsurePrResult::Ready(n));
@@ -3034,7 +3050,7 @@ async fn ensure_pr_exists(
                                             &Some(Arc::clone(store)),
                                             repo,
                                             &task.id.0,
-                                            &[("pr_number", serde_json::json!(pr_num as i64))],
+                                            &[("pr_number", serde_json::json!(pr_num))],
                                         )
                                         .await?;
                                         tracing::info!(
@@ -3070,10 +3086,7 @@ async fn ensure_pr_exists(
                                                     &Some(Arc::clone(store)),
                                                     repo,
                                                     &task.id.0,
-                                                    &[(
-                                                        "pr_number",
-                                                        serde_json::json!(pr_num as i64),
-                                                    )],
+                                                    &[("pr_number", serde_json::json!(pr_num))],
                                                 )
                                                 .await
                                                 {
@@ -3420,7 +3433,7 @@ async fn ensure_pr_exists(
                     }
                 };
 
-                if reroutes as u32 >= max_reroutes {
+                if reroutes >= u64::from(max_reroutes) {
                     tracing::error!(
                         task_id = task.id.0,
                         reroutes,
@@ -5533,7 +5546,10 @@ mod tests {
         );
     }
 
-    #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the env lock must stay held across the awaited review call"
+    )]
     #[tokio::test]
     async fn without_an_app_the_review_path_posts_only_the_comment() {
         use wiremock::matchers::{method, path};

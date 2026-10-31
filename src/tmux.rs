@@ -23,7 +23,7 @@ pub struct Session {
 }
 
 /// Manage tmux sessions for agent tasks.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TmuxManager {
     /// Prefix for session names (e.g. "orch-")
     prefix: String,
@@ -748,9 +748,7 @@ mod tests {
             .output()
             .await;
 
-        let output = if let Ok(o) = check_result {
-            o
-        } else {
+        let Ok(output) = check_result else {
             eprintln!("Skipping test: unable to check tmux environment");
             return;
         };
@@ -891,12 +889,10 @@ mod tests {
     #[tokio::test]
     async fn test_manager_does_not_touch_the_default_server() {
         let tmux = TmuxManager::new();
-        let name = if let Ok(n) = tmux
+        let Ok(name) = tmux
             .create_session("owner/repo", "isolation", "/tmp", "sleep 30", &[])
             .await
-        {
-            n
-        } else {
+        else {
             eprintln!("Skipping test: tmux not available or failed to create test session");
             return;
         };

@@ -25,6 +25,7 @@ use super::{
 };
 
 /// Runner for the `grok` CLI
+#[derive(Debug)]
 pub struct GrokRunner;
 
 impl GrokRunner {

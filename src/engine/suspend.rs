@@ -31,6 +31,7 @@ struct GapRecord {
     gap: ChronoDuration,
 }
 
+#[derive(Debug)]
 struct Checkpoint {
     instant: Instant,
     wall: DateTime<Utc>,
@@ -97,6 +98,7 @@ pub fn checkpoint() -> Option<ChronoDuration> {
 /// main loop's own `checkpoint()` call and observe no gap yet. A `SuspendDetector`
 /// avoids the race by tracking its own Instant/wall-clock baseline, so it detects the
 /// gap from its own frozen timer instead of waiting on another task to record it.
+#[derive(Debug)]
 pub struct SuspendDetector {
     last: Option<Checkpoint>,
 }

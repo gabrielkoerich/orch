@@ -1,6 +1,7 @@
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
+use std::hash::BuildHasher;
 use std::io::{self, Write};
 use std::sync::LazyLock;
 
@@ -22,9 +23,9 @@ fn var_pattern() -> Result<&'static Regex, String> {
     VAR_PATTERN.as_ref().map_err(std::clone::Clone::clone)
 }
 
-fn render_template_with_vars(
+fn render_template_with_vars<S: BuildHasher>(
     template: &str,
-    vars: &HashMap<String, String>,
+    vars: &HashMap<String, String, S>,
 ) -> Result<String, String> {
     let mut data = template.to_string();
 
@@ -62,9 +63,9 @@ fn render_template_with_vars(
     Ok(result)
 }
 
-pub fn render_template_str(
+pub fn render_template_str<S: BuildHasher>(
     template: &str,
-    vars: &HashMap<String, String>,
+    vars: &HashMap<String, String, S>,
 ) -> Result<String, String> {
     render_template_with_vars(template, vars)
 }

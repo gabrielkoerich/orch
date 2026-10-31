@@ -992,8 +992,8 @@ mod tests {
         let patch =
             "@@ -1,2 +10,3 @@\n a\n+b\n@@ -40 +44 @@ fn x()\n-c\n+d\n@@ -60,3 +70,0 @@\n-gone";
         assert_eq!(right_side_ranges(patch), vec![(10, 12), (44, 44)]);
-        assert!(right_side_ranges("").is_empty());
-        assert!(right_side_ranges("@@ garbage @@").is_empty());
+        assert_eq!(right_side_ranges(""), [] as [(u32, u32); 0]);
+        assert_eq!(right_side_ranges("@@ garbage @@"), [] as [(u32, u32); 0]);
     }
 
     #[test]

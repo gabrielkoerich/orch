@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tokio::process::Command;
 
 /// Result of worktree setup.
+#[derive(Debug)]
 pub struct WorktreeSetup {
     /// The directory where the agent will work
     pub work_dir: PathBuf,
@@ -108,11 +109,11 @@ pub async fn rebase_worktree_on_origin_main(
     )
     .await?
     {
-        crate::engine::runner::git_ops::RebaseOutcome::Succeeded => Ok(()),
+        crate::engine::runner::git_ops::RebaseOutcome::Succeeded
+        | crate::engine::runner::git_ops::RebaseOutcome::Skipped(_) => Ok(()),
         crate::engine::runner::git_ops::RebaseOutcome::Failed(e) => {
             anyhow::bail!("git rebase {origin_branch} failed: {e}")
         }
-        crate::engine::runner::git_ops::RebaseOutcome::Skipped(_) => Ok(()),
     }
 }
 
@@ -370,6 +371,10 @@ pub async fn validate_worktree_gitdir(worktree_dir: &Path) -> bool {
 /// When a child task is created from a mention on a PR, it should work on the
 /// parent task's branch so changes are committed to the existing PR rather than
 /// a new one being opened.
+#[expect(
+    clippy::ref_option,
+    reason = "the store helper it calls takes the store as &Option"
+)]
 async fn resolve_parent_branch(
     store: &Option<Arc<TaskStore>>,
     parent_id: Option<i64>,
@@ -905,7 +910,7 @@ mod tests {
             args,
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
-        )
+        );
     }
 
     /// When `origin/<branch>` exists, `resolve_branch_start_point` should

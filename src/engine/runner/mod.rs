@@ -108,7 +108,6 @@ fn classify_run_outcome(
             crate::engine::cooldown::detect_credit_exhaustion_outcome(message).unwrap_or("failed")
         }
         Err(agents::AgentError::InvalidResponse { .. }) => "parse_error",
-        Err(_) => "failed",
         Ok(_)
             if matches!(
                 status,
@@ -123,7 +122,7 @@ fn classify_run_outcome(
         Ok(_) if crate::status_heuristics::status_looks_like_descriptive_completion(status) => {
             "success"
         }
-        Ok(_) => "failed",
+        Err(_) | Ok(_) => "failed",
     }
 }
 
@@ -187,6 +186,7 @@ fn extract_run_tokens(
     }
 }
 
+#[expect(clippy::cast_precision_loss, reason = "a run duration in seconds")]
 fn run_duration_secs(started_at: &chrono::DateTime<Utc>) -> f64 {
     (Utc::now() - *started_at).num_milliseconds() as f64 / 1000.0
 }
@@ -581,6 +581,15 @@ pub struct TaskRunner {
     store: Option<Arc<crate::store::TaskStore>>,
 }
 
+impl std::fmt::Debug for TaskRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskRunner")
+            .field("repo", &self.repo)
+            .field("orch_home", &self.orch_home)
+            .finish_non_exhaustive()
+    }
+}
+
 impl TaskRunner {
     pub fn new(repo: String) -> Self {
         let orch_home = crate::home::orch_home().unwrap_or_else(|e| {
@@ -596,6 +605,7 @@ impl TaskRunner {
     }
 
     /// Set the unified task store for run audit trail.
+    #[must_use]
     pub fn with_store(mut self, store: Arc<crate::store::TaskStore>) -> Self {
         self.store = Some(store);
         self
@@ -696,6 +706,7 @@ impl TaskRunner {
 
         let (input_tokens, output_tokens) = extract_run_tokens(input.parse_result);
 
+        #[expect(clippy::cast_precision_loss, reason = "a run duration in seconds")]
         let duration_secs = input
             .elapsed_secs
             .map_or_else(|| run_duration_secs(input.started_at), |s| s as f64);
@@ -1077,19 +1088,23 @@ impl TaskRunner {
     }
 
     /// Record task execution metrics to the database.
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a metric row needs the agent, model, route, timing and outcome together"
+    )]
     async fn record_metrics(
         &self,
         task_id: &str,
         agent_name: &str,
-        model_name: &Option<String>,
-        route_result: &Option<RouteResult>,
+        model_name: Option<&str>,
+        route_result: Option<&RouteResult>,
         started_at: &chrono::DateTime<Utc>,
         attempts: u32,
         final_status: &str,
         error_type: Option<&str>,
     ) {
         let completed_at = Utc::now();
+        #[expect(clippy::cast_precision_loss, reason = "a run duration in seconds")]
         let duration_seconds = (completed_at - *started_at).num_milliseconds() as f64 / 1000.0;
 
         // Classify outcome based on the final status and optional error_type/last_error
@@ -1100,7 +1115,7 @@ impl TaskRunner {
             _ => "unknown",
         };
 
-        let complexity = route_result.as_ref().map(|r| r.complexity.clone());
+        let complexity = route_result.map(|r| r.complexity.clone());
         let files_changed = git_ops::count_changed_files(&PathBuf::from(
             self.get_field(task_id, "worktree")
                 .await
@@ -1121,12 +1136,12 @@ impl TaskRunner {
             let usage = store::get_token_usage(&self.store, &self.repo, task_id).await;
             let cost = store::get_cost_estimate(&self.store, &self.repo, task_id).await;
             let input_tokens = if usage.input_tokens > 0 {
-                Some(usage.input_tokens as i64)
+                Some(i64::try_from(usage.input_tokens).unwrap_or(i64::MAX))
             } else {
                 None
             };
             let output_tokens = if usage.output_tokens > 0 {
-                Some(usage.output_tokens as i64)
+                Some(i64::try_from(usage.output_tokens).unwrap_or(i64::MAX))
             } else {
                 None
             };
@@ -1150,14 +1165,14 @@ impl TaskRunner {
                 repo: &self.repo,
                 task_id,
                 agent: agent_name,
-                model: model_name.as_deref(),
+                model: model_name,
                 complexity: complexity.as_deref(),
                 outcome,
                 duration_seconds,
                 started_at,
                 completed_at: &completed_at,
-                attempts: attempts as i32 + 1,
-                files_changed: files_changed as i32,
+                attempts: i32::try_from(attempts.saturating_add(1)).unwrap_or(i32::MAX),
+                files_changed: i32::try_from(files_changed).unwrap_or(i32::MAX),
                 error_type: db_error_type.as_deref(),
                 input_tokens,
                 output_tokens,
@@ -1468,8 +1483,8 @@ impl TaskRunner {
             self.record_metrics(
                 task_id,
                 &agent_name,
-                &model.map(std::string::ToString::to_string),
-                &route_result.cloned(),
+                model,
+                route_result,
                 &started_at,
                 attempts,
                 &status,
@@ -1540,7 +1555,6 @@ impl TaskRunner {
             "in_progress" => Status::InProgress,
             "in_review" => Status::InReview,
             "blocked" => Status::Blocked,
-            "needs_review" => Status::NeedsReview,
             "routed" => Status::Routed, // Rerouted (agent/model already set)
             "new" => Status::New,       // Legacy reroute path
             _ => Status::NeedsReview,
@@ -1771,7 +1785,11 @@ impl TaskRunner {
 /// in the repo, then applies it. Returns `true` only when both `ensure_label` (repo label creation)
 /// and `set_labels` (issue label assignment) succeed. `remove_label` failures are non-fatal.
 async fn update_agent_label_after_reroute(
-    #[cfg_attr(test, allow(unused_variables))] repo: &str,
+    #[cfg_attr(
+        test,
+        expect(unused_variables, reason = "only the label call outside tests uses it")
+    )]
+    repo: &str,
     task: &ExternalTask,
     backend: &Arc<dyn ExternalBackend>,
     old_agent: &str,
@@ -1845,14 +1863,13 @@ mod tests {
     use crate::store::{NewTask, TaskStore};
     use async_trait::async_trait;
     use chrono::Utc;
-    use once_cell::sync::Lazy;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
-    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    fn ok_parse_result(status: &str) -> Result<agents::ParsedResponse, agents::AgentError> {
-        Ok(agents::ParsedResponse {
+    fn ok_parse_result(status: &str) -> agents::ParsedResponse {
+        agents::ParsedResponse {
             response: AgentResponse {
                 status: status.to_string(),
                 summary: String::new(),
@@ -1868,7 +1885,7 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             duration_ms: None,
-        })
+        }
     }
 
     // ── safe_utf8_tail ───────────────────────────────────────────────────────
@@ -2119,7 +2136,7 @@ mod tests {
         // "routed" is a canonical non-success status (task will be re-dispatched).
         // It should be classified as "success" so the audit trail distinguishes it
         // from genuine failures (#2801).
-        let parse_result = ok_parse_result("routed");
+        let parse_result = Ok(ok_parse_result("routed"));
         assert_eq!(
             classify_run_outcome("routed", &parse_result, false),
             "success"
@@ -2128,7 +2145,7 @@ mod tests {
 
     #[test]
     fn classify_run_outcome_blocked_is_blocked() {
-        let parse_result = ok_parse_result("blocked");
+        let parse_result = Ok(ok_parse_result("blocked"));
         assert_eq!(
             classify_run_outcome("blocked", &parse_result, false),
             "blocked"
@@ -2139,7 +2156,7 @@ mod tests {
     fn classify_run_outcome_non_canonical_is_failed() {
         // Non-canonical statuses should be classified as "failed" in the audit.
         // The explicit error message is provided by build_run_audit.
-        let parse_result = ok_parse_result("fix_deployed");
+        let parse_result = Ok(ok_parse_result("fix_deployed"));
         assert_eq!(
             classify_run_outcome("fix_deployed", &parse_result, false),
             "failed"
@@ -2238,7 +2255,7 @@ mod tests {
             .unwrap();
 
         let runner = TaskRunner::new("owner/repo".to_string()).with_store(store);
-        let parse_result = ok_parse_result("done");
+        let parse_result = Ok(ok_parse_result("done"));
         let started_at = Utc::now();
         let audit = runner
             .build_run_audit(RunAuditInput {
@@ -2322,7 +2339,7 @@ mod tests {
     #[tokio::test]
     async fn build_run_audit_non_success_uses_fallback_error_when_empty() {
         let runner = TaskRunner::new("owner/repo".to_string());
-        let parse_result = ok_parse_result("new");
+        let parse_result = Ok(ok_parse_result("new"));
         let started_at = Utc::now();
         let audit = runner
             .build_run_audit(RunAuditInput {
@@ -2349,7 +2366,7 @@ mod tests {
         // should get an explicit "unrecognized status: X" message instead of
         // the opaque "no error info available" placeholder (#2801).
         let runner = TaskRunner::new("owner/repo".to_string());
-        let parse_result = ok_parse_result("fix_deployed");
+        let parse_result = Ok(ok_parse_result("fix_deployed"));
         let started_at = Utc::now();
         let audit = runner
             .build_run_audit(RunAuditInput {
@@ -2375,7 +2392,7 @@ mod tests {
         // an error message — they're expected outcomes, not failures.
         for status in &["routed"] {
             let runner = TaskRunner::new("owner/repo".to_string());
-            let parse_result = ok_parse_result(status);
+            let parse_result = Ok(ok_parse_result(status));
             let started_at = Utc::now();
             let audit = runner
                 .build_run_audit(RunAuditInput {
@@ -2608,7 +2625,10 @@ mod tests {
 
     // ── process_delegations ───────────────────────────────────────────────────
 
-    #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the env lock must stay held across the awaited calls"
+    )]
     #[tokio::test]
     async fn process_delegations_creates_subtasks_and_blocks_parent() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -2689,7 +2709,10 @@ mod tests {
         }
     }
 
-    #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the env lock must stay held across the awaited calls"
+    )]
     #[tokio::test]
     async fn process_delegations_single_subtask() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -3266,18 +3289,27 @@ mod tests {
 
     #[test]
     fn salvage_wrapup_accepts_commit_then_cleanup() {
-        let raw = tool_pair("1", "run_terminal_cmd", "git commit -m x", false)
-            + &tool_pair("2", "run_terminal_cmd", "git status", false);
+        let raw = format!(
+            "{}{}",
+            tool_pair("1", "run_terminal_cmd", "git commit -m x", false),
+            tool_pair("2", "run_terminal_cmd", "git status", false)
+        );
         assert!(salvage_wrapup(&raw).is_some());
     }
 
     #[test]
     fn salvage_wrapup_rejects_edit_after_commit_or_unanswered_call() {
-        let edit = tool_pair("1", "run_terminal_cmd", "git commit -m x", false)
-            + &tool_pair("2", "search_replace", "", false);
+        let edit = format!(
+            "{}{}",
+            tool_pair("1", "run_terminal_cmd", "git commit -m x", false),
+            tool_pair("2", "search_replace", "", false)
+        );
         assert!(salvage_wrapup(&edit).is_none());
-        let pending = tool_pair("1", "run_terminal_cmd", "git commit -m x", false)
-            + &serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"2","name":"run_terminal_cmd","input":{"command":"cargo test"}}]}}).to_string();
+        let pending = format!(
+            "{}{}",
+            tool_pair("1", "run_terminal_cmd", "git commit -m x", false),
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"2","name":"run_terminal_cmd","input":{"command":"cargo test"}}]}})
+        );
         assert!(salvage_wrapup(&pending).is_none());
         assert!(salvage_wrapup(&tool_pair("1", "run_terminal_cmd", "ls", false)).is_none());
     }

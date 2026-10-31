@@ -131,7 +131,10 @@ pub enum BlockedByFetch {
 ///
 /// Each implementation talks to a different issue tracker.
 /// The engine calls these methods without knowing which backend is active.
-#[expect(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait marks its boxed futures must_use twice"
+)]
 #[async_trait]
 pub trait ExternalBackend: Send + Sync {
     /// Human-readable name (e.g. "github", "linear", "jira")
@@ -162,6 +165,7 @@ pub trait ExternalBackend: Send + Sync {
     /// Note: labels removed in a previous attempt are already gone — the retry
     /// re-evaluates the current state rather than undoing prior work.
     async fn update_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
+        const MAX_RETRIES: u32 = 3;
         let label = status.as_label();
 
         // Hook for backends that need to auto-create labels (e.g. GitHub).
@@ -169,7 +173,6 @@ pub trait ExternalBackend: Send + Sync {
             tracing::warn!(label, err = %e, "ensure_status_label failed, continuing");
         }
 
-        const MAX_RETRIES: u32 = 3;
         let mut last_err =
             anyhow::anyhow!("update_status({label}) failed: all {MAX_RETRIES} attempts exhausted");
 
@@ -406,7 +409,6 @@ pub trait ExternalBackend: Send + Sync {
     /// Used for deduplication before creating issues. The `label` parameter
     /// narrows the search to issues with a specific label.
     /// Default returns `false` (no dedup for backends that don't support it).
-    #[expect(dead_code)]
     async fn has_open_issue_with_title(&self, _title: &str, _label: &str) -> anyhow::Result<bool> {
         Ok(false)
     }

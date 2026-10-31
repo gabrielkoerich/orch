@@ -613,7 +613,10 @@ fn owned_updates(
 
 impl TaskStore {
     /// Append a lifecycle activity event for a task.
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per column of the activity row"
+    )]
     pub async fn append_activity(
         &self,
         task_id: i64,
@@ -647,7 +650,10 @@ impl TaskStore {
 
     /// Append a lifecycle activity event for a task within a transaction.
     #[doc(hidden)]
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per column of the activity row"
+    )]
     pub async fn append_activity_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         task_id: i64,
@@ -1396,8 +1402,8 @@ impl TaskStore {
         for row in &rows {
             let external_id: String = row.try_get("external_id")?;
             let estimate_raw: i64 = row.try_get("estimate")?;
-            if (1..=255).contains(&estimate_raw) {
-                result.push((external_id, estimate_raw as u8));
+            if let Ok(estimate @ 1..) = u8::try_from(estimate_raw) {
+                result.push((external_id, estimate));
             }
         }
         Ok(result)
@@ -1600,12 +1606,12 @@ impl TaskStore {
     /// Test-only helper for bulk counter resets used by tests.
     #[cfg(test)]
     pub async fn batch_reset_failure_counters(&self, ids: &[i64]) -> anyhow::Result<()> {
-        if ids.is_empty() {
-            return Ok(());
-        }
         // SQLite has a hard limit on host parameters (commonly 999). Chunk the
         // IN-list into smaller batches to avoid exceeding the limit.
         const CHUNK_SIZE: usize = 500;
+        if ids.is_empty() {
+            return Ok(());
+        }
 
         let mut tx = self.begin_write().await?;
 
@@ -1647,12 +1653,11 @@ impl TaskStore {
     /// Test-only helper for bulk cleaning used by tests.
     #[cfg(test)]
     pub async fn batch_mark_cleaned(&self, ids: &[i64]) -> anyhow::Result<()> {
+        // Chunk updates to avoid exceeding SQLite's parameter limit.
+        const CHUNK_SIZE: usize = 500;
         if ids.is_empty() {
             return Ok(());
         }
-
-        // Chunk updates to avoid exceeding SQLite's parameter limit.
-        const CHUNK_SIZE: usize = 500;
 
         let mut tx = self.begin_write().await?;
 
@@ -1973,12 +1978,12 @@ impl TaskStore {
         &self,
         task_ids: &[i64],
     ) -> anyhow::Result<std::collections::HashMap<i64, Vec<TaskRun>>> {
-        if task_ids.is_empty() {
-            return Ok(std::collections::HashMap::new());
-        }
         // SQLite has a hard limit on host parameters (commonly 999). Chunk the
         // IN-list into smaller batches to avoid exceeding the limit.
         const CHUNK_SIZE: usize = 500;
+        if task_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
 
         let mut result: std::collections::HashMap<i64, Vec<TaskRun>> =
             std::collections::HashMap::new();
@@ -2007,12 +2012,12 @@ impl TaskStore {
         &self,
         ids: &[i64],
     ) -> anyhow::Result<std::collections::HashMap<i64, Task>> {
-        if ids.is_empty() {
-            return Ok(std::collections::HashMap::new());
-        }
         // SQLite has a hard limit on host parameters (commonly 999). Chunk the
         // IN-list into smaller batches to avoid exceeding the limit.
         const CHUNK_SIZE: usize = 500;
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
 
         let mut result = std::collections::HashMap::new();
 
@@ -2041,12 +2046,12 @@ impl TaskStore {
         repo: &str,
         ext_ids: &[&str],
     ) -> anyhow::Result<std::collections::HashMap<String, TaskStatus>> {
+        const CHUNK_SIZE: usize = 500;
         let mut result = std::collections::HashMap::new();
         if ext_ids.is_empty() {
             return Ok(result);
         }
 
-        const CHUNK_SIZE: usize = 500;
         for chunk in ext_ids.chunks(CHUNK_SIZE) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
             let sql = format!(
@@ -2781,7 +2786,10 @@ pub(crate) mod apply {
         Ok((status, agent, model))
     }
 
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per column of the activity row"
+    )]
     pub(crate) async fn activity(
         conn: &mut SqliteConnection,
         task_id: i64,

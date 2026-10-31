@@ -14,7 +14,6 @@ const CONTROL_MESSAGE_COLS: &str = "id, session_id, role, channel, channel_threa
 
 /// A message in the control session conversation history.
 #[derive(Debug, Clone)]
-#[expect(dead_code)] // fields used by channel integration (Phase 2)
 pub struct ControlMessage {
     pub id: i64,
     pub session_id: String,
@@ -57,7 +56,10 @@ impl TaskStore {
     pub const DEFAULT_SESSION: &'static str = "default";
 
     /// Insert a control session message.
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per column of the message row"
+    )]
     pub async fn insert_control_message(
         &self,
         session_id: &str,

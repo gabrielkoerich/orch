@@ -21,6 +21,8 @@ use super::{agents, response};
 /// summariser as the task runner. Without this, review runs persisted raw
 /// api_retry JSON fragments into `task_runs.error` (issue #3149).
 pub(crate) fn summarize_rate_limit_error(raw_output: &str) -> String {
+    // Byte cap for the first-line fallback summary below
+    const FIRST_LINE_CAP: usize = 120;
     // Find the last line containing "subtype":"api_retry"
     // This handles both complete JSON objects and truncated fragments that begin
     // mid-object (e.g. `,"subtype":"api_retry","attempt":5...`).
@@ -50,7 +52,6 @@ pub(crate) fn summarize_rate_limit_error(raw_output: &str) -> String {
     // No api_retry JSON or field markers found — emit a compact first-line
     // summary, never raw passthrough. Truncate to a tight byte cap so even
     // long single-line provider payloads cannot bloat `task_runs.error`.
-    const FIRST_LINE_CAP: usize = 120;
     let first_line = raw_output.lines().next().unwrap_or(raw_output);
     if first_line.len() > FIRST_LINE_CAP {
         let cutoff = agents::truncate_at_char_boundary(first_line, FIRST_LINE_CAP);
@@ -78,6 +79,11 @@ fn summarise_api_retry_line(line: &str) -> String {
 
     if has_field {
         let retry_delay_s = retry_delay_ms.parse::<f64>().unwrap_or(0.0) / 1000.0;
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the saturating cast floors the delay to whole seconds"
+        )]
         let retry_delay_s = retry_delay_s as u64;
         format!("status={error_status} after {attempt} attempts (last delay {retry_delay_s}s)")
     } else {
@@ -114,6 +120,7 @@ fn extract_json_field(json: &str, field: &str) -> Option<String> {
 }
 
 /// How `run()` should proceed after error handling.
+#[derive(Debug)]
 pub enum ErrorHandleResult {
     /// Task was rerouted — `run()` should record metrics then return early.
     EarlyReturn { status: String },
@@ -135,7 +142,14 @@ pub enum ErrorHandleResult {
 /// - `set_agent`: if `Some`, also overwrite the task's `agent` field
 /// - `apply_backoff`: whether to pace the reroute with `wait_for_fallback_backoff`
 /// - `reason_prefix`: prefix for the `last_error` message (free model name is appended)
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each caller picks a different mix of reroute options"
+)]
+#[expect(
+    clippy::ref_option,
+    reason = "the store helpers it calls take the store as &Option"
+)]
 async fn try_free_model_reroute(
     task_id: &str,
     agent_name: &str,
@@ -223,7 +237,10 @@ async fn apply_vendor_reset_date(
 /// Returns `Ok(ErrorHandleResult::EarlyReturn)` when the task was rerouted and
 /// `run()` should record metrics and return immediately (skipping tmux cleanup).
 /// Returns `Ok(ErrorHandleResult::Continue)` when `run()` should proceed to cleanup.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the error path needs the task, agent, model and store context together"
+)]
 pub async fn handle_error(
     task_id: &str,
     agent_err: &agents::AgentError,

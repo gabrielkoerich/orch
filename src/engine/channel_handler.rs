@@ -31,6 +31,7 @@ const PICK_TIMEOUT: Duration = Duration::from_secs(60);
 ///
 /// Stored in-memory with a 60-second TTL. If the user does not pick within
 /// that window the entry is silently discarded on next access.
+#[derive(Debug)]
 pub struct PendingPick {
     /// Original free-text body that will become the task title/body.
     pub original_body: String,
@@ -228,7 +229,10 @@ async fn ack_channel_interaction(
 /// Used both by the direct `NewTask` path and by the project-picker callback path.
 ///
 /// `forced_repo` overrides project resolution and ALWAYS shows the `in [repo]` label.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared by two call paths that each hold these pieces separately"
+)]
 async fn create_and_announce_task(
     body: &str,
     forced_repo: Option<&str>,
@@ -327,7 +331,10 @@ async fn create_and_announce_task(
 ///
 /// When a free-text message arrives on the General channel with multiple projects
 /// configured, a project picker is shown instead of silently using the first project.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the channel loop passes each engine handle separately"
+)]
 pub(super) async fn handle_channel_message(
     msg: IncomingMessage,
     transport: &Arc<Transport>,
@@ -775,6 +782,7 @@ pub(super) async fn handle_stats_command(
         match store.get_metrics_summary_by_repo(repo, 24).await {
             Ok(summary) => {
                 let total = summary.tasks_completed_24h + summary.tasks_failed_24h;
+                #[expect(clippy::cast_precision_loss, reason = "a display percentage")]
                 let rate = if total > 0 {
                     (summary.tasks_completed_24h as f64 / total as f64) * 100.0
                 } else {
@@ -978,7 +986,9 @@ mod tests {
     fn pending_pick_is_expired_when_deadline_in_past() {
         let pick = PendingPick {
             original_body: "fix the login button".to_string(),
-            expires_at: Instant::now() - Duration::from_secs(1),
+            expires_at: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("the clock is past one second"),
         };
         assert!(pick.is_expired());
     }

@@ -534,8 +534,8 @@ pub async fn tick(
                                 | "status:in_review"
                                 | "status:approved"
                                 | "status:waiting",
-                            ) => true,
-                            None => true,     // No status label — treat as active
+                            )
+                            | None => true, // no status label is treated as active
                             Some(_) => false, // Terminal state
                         }
                     }

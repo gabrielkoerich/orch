@@ -26,7 +26,22 @@ pub struct TaskInitResult {
     pub new_attempts: u32,
 }
 
+impl std::fmt::Debug for TaskInitResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskInitResult")
+            .field("agent_name", &self.agent_name)
+            .field("model_name", &self.model_name)
+            .field("complexity", &self.complexity)
+            .field("task_title", &self.task_title)
+            .field("wt", &self.wt)
+            .field("attempt_dir", &self.attempt_dir)
+            .field("new_attempts", &self.new_attempts)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Outcome of the guard check.
+#[derive(Debug)]
 pub enum GuardOutcome {
     /// Task should proceed; returns current attempt count.
     Proceed(u32),
@@ -46,7 +61,7 @@ pub async fn check_guards(
 ) -> anyhow::Result<GuardOutcome> {
     let attempts: u32 = store::opt_store_get_task(store, repo, task_id)
         .await
-        .map_or(0, |t| t.attempts) as u32;
+        .map_or(0, |t| u32::try_from(t.attempts).unwrap_or(0));
 
     // Guard: check if tmux session already exists (prevents duplicate dispatch)
     let tmux = TmuxManager::new();
@@ -130,7 +145,10 @@ fn resolve_model_name(
 }
 
 /// Prepare the full task: set up worktree, build context and prompts, create invocation.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "task setup needs the routing result, backend, project paths and store together"
+)]
 pub async fn prepare_task(
     task_id: &str,
     agent: Option<&str>,
