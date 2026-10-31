@@ -37,7 +37,7 @@ fn read_file_with_limit<P: AsRef<Path>>(path: P, max_bytes: u64) -> anyhow::Resu
 
     // If file is within limits, read the whole thing
     if file_size <= max_bytes {
-        return std::fs::read_to_string(path).map_err(|e| e.into());
+        return std::fs::read_to_string(path).map_err(std::convert::Into::into);
     }
 
     // File is too large - read from the end to get the most recent output
@@ -92,7 +92,7 @@ pub(crate) fn calculate_backoff_delay(retry_count: usize) -> u64 {
 }
 
 fn fallback_retry_count(task: Option<&crate::store::Task>) -> usize {
-    task.map(|t| {
+    task.map_or(0, |t| {
         let chain_retry_count = t
             .limit_reroute_chain
             .split(',')
@@ -101,7 +101,6 @@ fn fallback_retry_count(task: Option<&crate::store::Task>) -> usize {
         let network_retry_count = t.network_retries.max(0) as usize;
         chain_retry_count.max(network_retry_count)
     })
-    .unwrap_or(0)
 }
 
 /// Wait with exponential backoff before retrying with a fallback agent.
@@ -163,7 +162,7 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
     })
     .await
     .ok()
-    .and_then(|r| r.ok())
+    .and_then(std::result::Result::ok)
     {
         if !content.is_empty() {
             return content;
@@ -176,8 +175,7 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
         // Use async metadata for is_dir check
         if tokio::fs::metadata(&attempts_dir)
             .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false)
+            .is_ok_and(|m| m.is_dir())
         {
             let mut attempt_nums: Vec<u32> = tokio::task::spawn_blocking({
                 let a = attempts_dir.clone();
@@ -222,7 +220,7 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
                 })
                 .await
                 .ok()
-                .and_then(|r| r.ok())
+                .and_then(std::result::Result::ok)
                 {
                     if !content.is_empty() {
                         tracing::info!(task_id, path = %p.display(), "read output from attempt dir");
@@ -254,7 +252,7 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
         })
         .await
         .ok()
-        .and_then(|r| r.ok())
+        .and_then(std::result::Result::ok)
         {
             if !content.is_empty() {
                 tracing::info!(task_id, path = %path.display(), "read output from legacy fallback");
@@ -333,7 +331,7 @@ pub enum RetryableError {
 impl RetryableError {
     /// Return a short classified string for this error type.
     /// Used in DB rate-limit metrics and test assertions.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub fn type_str(self) -> &'static str {
         match self {
             RetryableError::Timeout => "timeout",
@@ -812,7 +810,7 @@ fn extract_review_response_object(text: &str) -> Option<ReviewResponse> {
 }
 
 /// Extract learnings and store as memory for future attempts.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn store_learnings_from_response(
     task_id: &str,
     attempt: u32,
@@ -1163,7 +1161,7 @@ mod tests {
         let resp = parse_review_response(json).unwrap();
         assert_eq!(resp.decision, "approve");
         assert_eq!(resp.notes, "LGTM");
-        assert!(resp.issues.is_empty());
+        assert!(resp.issues.is_empty(), "{:?}", resp.issues);
     }
 
     #[serial(cooldown_state)]
@@ -1281,7 +1279,7 @@ That's all."#;
         let text = "The review is done. LGTM.";
         let resp = parse_review_plain(text).unwrap();
         assert_eq!(resp.decision, "approve");
-        assert!(resp.issues.is_empty());
+        assert!(resp.issues.is_empty(), "{:?}", resp.issues);
     }
 
     /// opencode NDJSON stream — text events use the `part.text` format.
@@ -1807,7 +1805,7 @@ That's all."#;
 
         let read_content = result.unwrap();
         // from_utf8_lossy should handle invalid sequences
-        assert!(!read_content.is_empty());
+        assert_ne!(read_content, "");
 
         let _ = std::fs::remove_file(&file_path);
     }
@@ -1837,7 +1835,7 @@ That's all."#;
         assert_eq!(resp.decision, "approve");
         assert_eq!(resp.notes, "All checks pass");
         assert_eq!(resp.test_results.as_deref(), Some("pass"));
-        assert!(resp.issues.is_empty());
+        assert!(resp.issues.is_empty(), "{:?}", resp.issues);
     }
 
     #[serial(cooldown_state)]
@@ -1879,7 +1877,7 @@ That's all."#;
         let resp = parse_review_via_agent("opencode", raw).unwrap();
         assert_eq!(resp.decision, "approve");
         assert_eq!(resp.notes, "All checks pass");
-        assert!(resp.issues.is_empty());
+        assert!(resp.issues.is_empty(), "{:?}", resp.issues);
     }
 
     #[serial(cooldown_state)]
@@ -1913,7 +1911,7 @@ That's all."#;
         let resp = parse_review_via_agent("codex", raw).unwrap();
         assert_eq!(resp.decision, "approve");
         assert_eq!(resp.notes, "Clean implementation");
-        assert!(resp.issues.is_empty());
+        assert!(resp.issues.is_empty(), "{:?}", resp.issues);
     }
 
     #[serial(cooldown_state)]
@@ -1947,7 +1945,7 @@ That's all."#;
         assert_eq!(resp.decision, "approve");
         assert_eq!(resp.notes, "LGTM");
         assert_eq!(resp.test_results.as_deref(), Some("pass"));
-        assert!(resp.issues.is_empty());
+        assert!(resp.issues.is_empty(), "{:?}", resp.issues);
     }
 
     // ── MiniMax review fixtures ────────────────────────────────────────────────

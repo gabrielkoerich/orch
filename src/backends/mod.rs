@@ -131,7 +131,7 @@ pub enum BlockedByFetch {
 ///
 /// Each implementation talks to a different issue tracker.
 /// The engine calls these methods without knowing which backend is active.
-#[allow(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
+#[expect(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
 #[async_trait]
 pub trait ExternalBackend: Send + Sync {
     /// Human-readable name (e.g. "github", "linear", "jira")
@@ -406,7 +406,7 @@ pub trait ExternalBackend: Send + Sync {
     /// Used for deduplication before creating issues. The `label` parameter
     /// narrows the search to issues with a specific label.
     /// Default returns `false` (no dedup for backends that don't support it).
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     async fn has_open_issue_with_title(&self, _title: &str, _label: &str) -> anyhow::Result<bool> {
         Ok(false)
     }
@@ -574,7 +574,7 @@ mod tests {
 
     #[async_trait]
     impl ExternalBackend for MockBackend {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "mock"
         }
 
@@ -591,7 +591,7 @@ mod tests {
             Ok(ExternalTask {
                 id: ExternalId("1".into()),
                 title: "mock".into(),
-                body: "".into(),
+                body: String::new(),
                 state: "open".into(),
                 labels: self.current_labels(),
                 author: "user".into(),

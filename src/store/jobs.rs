@@ -1,4 +1,4 @@
-use super::*;
+use super::TaskStore;
 use crate::cluster::Command;
 use serde::{Deserialize, Serialize};
 use sqlx::SqliteConnection;
@@ -27,10 +27,7 @@ impl TaskStore {
         repo: &str,
         job_id: &str,
     ) -> anyhow::Result<Option<JobState>> {
-        let sql = format!(
-            "SELECT {} FROM job_state WHERE repo = ? AND job_id = ?",
-            JOB_STATE_COLS
-        );
+        let sql = format!("SELECT {JOB_STATE_COLS} FROM job_state WHERE repo = ? AND job_id = ?");
         let row: Option<JobState> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(repo)
             .bind(job_id)
@@ -48,7 +45,7 @@ impl TaskStore {
 
     /// List all job states for a repo.
     pub async fn list_job_states(&self, repo: &str) -> anyhow::Result<Vec<JobState>> {
-        let sql = format!("SELECT {} FROM job_state WHERE repo = ?", JOB_STATE_COLS);
+        let sql = format!("SELECT {JOB_STATE_COLS} FROM job_state WHERE repo = ?");
         let rows: Vec<JobState> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(repo)
             .fetch_all(&self.pool)
@@ -126,7 +123,7 @@ impl TaskStore {
 
 /// The SQL behind each replicated job and channel write
 pub(crate) mod apply {
-    use super::*;
+    use super::{JobState, SqliteConnection};
 
     pub(crate) async fn upsert_job_state(
         conn: &mut SqliteConnection,

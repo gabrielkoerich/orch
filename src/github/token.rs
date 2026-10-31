@@ -43,7 +43,7 @@ impl TokenResolver {
     }
 
     /// Enable or disable `gh auth token` CLI fallback.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub fn with_gh_fallback(mut self, enabled: bool) -> Self {
         self.allow_gh_fallback = enabled;
         self
@@ -183,9 +183,7 @@ static SHARED_RESOLVER: OnceLock<Arc<TokenResolver>> = OnceLock::new();
 
 /// Get the process-wide shared token resolver.
 pub fn shared() -> Arc<TokenResolver> {
-    SHARED_RESOLVER
-        .get_or_init(|| Arc::new(TokenResolver::default_env()))
-        .clone()
+    std::sync::Arc::clone(SHARED_RESOLVER.get_or_init(|| Arc::new(TokenResolver::default_env())))
 }
 
 impl Default for TokenResolver {

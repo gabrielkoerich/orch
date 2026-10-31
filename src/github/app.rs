@@ -150,7 +150,9 @@ impl std::fmt::Debug for AppAuth {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|err| err.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 static SHARED: RwLock<Option<Arc<AppAuth>>> = RwLock::new(None);
@@ -158,11 +160,16 @@ const LOAD_RETRY: StdDuration = StdDuration::from_secs(300);
 
 /// Process-wide App client, `None` until the loader has read the key or when no App is set up
 pub(crate) fn shared() -> Option<Arc<AppAuth>> {
-    SHARED.read().unwrap_or_else(|err| err.into_inner()).clone()
+    SHARED
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 fn publish(app: Arc<AppAuth>) {
-    *SHARED.write().unwrap_or_else(|err| err.into_inner()) = Some(app);
+    *SHARED
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(app);
 }
 
 /// Reads the App key in the background, once per daemon start. A passbox key waits on Touch
@@ -770,7 +777,7 @@ mod tests {
         let server = MockServer::start().await;
         installed(&server, "o/r", 42).await;
         let posts = Arc::new(AtomicUsize::new(0));
-        let counter = posts.clone();
+        let counter = std::sync::Arc::clone(&posts);
         Mock::given(method("POST"))
             .and(path("/app/installations/42/access_tokens"))
             .respond_with(move |_req: &Request| {

@@ -87,7 +87,7 @@ impl DiscordGateway {
     /// Send a message with action row buttons to a specific channel.
     ///
     /// Returns the message ID of the sent message.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub async fn send_with_buttons(
         &self,
         channel_id: &str,
@@ -122,7 +122,7 @@ impl DiscordGateway {
 
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("discord API error: {}", body);
+            anyhow::bail!("discord API error: {body}");
         }
 
         let result: serde_json::Value = response.json().await?;
@@ -153,7 +153,7 @@ impl DiscordGateway {
 
 #[async_trait]
 impl Channel for DiscordGateway {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "discord"
     }
 
@@ -256,10 +256,10 @@ impl GatewayState {
     }
 
     fn ws_url(&self) -> String {
-        self.resume_url
-            .as_deref()
-            .map(|u| format!("{}/?v=10&encoding=json", u.trim_end_matches('/')))
-            .unwrap_or_else(|| DEFAULT_GATEWAY_URL.to_string())
+        self.resume_url.as_deref().map_or_else(
+            || DEFAULT_GATEWAY_URL.to_string(),
+            |u| format!("{}/?v=10&encoding=json", u.trim_end_matches('/')),
+        )
     }
 }
 
@@ -446,8 +446,7 @@ async fn handle_connection(
                                 // Server explicitly requested a heartbeat
                                 let d = state
                                     .last_seq
-                                    .map(|s| serde_json::json!(s))
-                                    .unwrap_or(Value::Null);
+                                    .map_or(Value::Null, |s| serde_json::json!(s));
                                 let hb_payload = Message::Text(
                                     serde_json::json!({"op": OP_HEARTBEAT, "d": d}).to_string(),
                                 );
@@ -479,17 +478,17 @@ async fn handle_connection(
                         }
                     }
                     Message::Close(frame) => {
-                        let code = frame.as_ref().map(|f| u16::from(f.code)).unwrap_or(0);
+                        let code = frame.as_ref().map_or(0, |f| u16::from(f.code));
                         // Non-resumable Discord Gateway close codes per Discord docs
                         let resumable = !matches!(code, 4004 | 4010 | 4011 | 4013 | 4014);
-                        if !resumable {
+                        if resumable {
+                            tracing::info!(code, ?frame, "discord gateway: close frame, will attempt resume");
+                        } else {
                             state.clear();
                             tracing::error!(
                                 code,
                                 "discord gateway: non-resumable close code — check bot token and intent configuration"
                             );
-                        } else {
-                            tracing::info!(code, ?frame, "discord gateway: close frame, will attempt resume");
                         }
                         return Ok(resumable);
                     }
@@ -513,8 +512,7 @@ async fn handle_connection(
                 ack_received = false;
                 let d = state
                     .last_seq
-                    .map(|s| serde_json::json!(s))
-                    .unwrap_or(Value::Null);
+                    .map_or(Value::Null, |s| serde_json::json!(s));
                 let hb_payload = Message::Text(
                     serde_json::json!({"op": OP_HEARTBEAT, "d": d}).to_string(),
                 );
@@ -593,8 +591,7 @@ async fn handle_dispatch(
             let timestamp = data["timestamp"]
                 .as_str()
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(Utc::now);
+                .map_or_else(Utc::now, |dt| dt.with_timezone(&Utc));
 
             let incoming = IncomingMessage {
                 channel: "discord".to_string(),
@@ -646,8 +643,7 @@ async fn handle_dispatch(
 
                 // Acknowledge the interaction (type 6 = DEFERRED_UPDATE_MESSAGE)
                 let callback_url = format!(
-                    "https://discord.com/api/v10/interactions/{}/{}/callback",
-                    interaction_id, interaction_token
+                    "https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
                 );
                 let http_client = client.clone();
                 if let Err(e) = http_client

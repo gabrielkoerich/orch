@@ -14,7 +14,7 @@ pub(crate) struct NoopBackend;
 
 #[async_trait]
 impl ExternalBackend for NoopBackend {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "noop"
     }
 
@@ -26,13 +26,13 @@ impl ExternalBackend for NoopBackend {
         Ok(ExternalTask {
             id: id.clone(),
             title: "t".into(),
-            body: "".into(),
+            body: String::new(),
             state: "open".into(),
             labels: vec![],
             author: "bot".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
-            url: "".into(),
+            url: String::new(),
         })
     }
 

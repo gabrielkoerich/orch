@@ -298,7 +298,7 @@ impl Router {
     /// prevents holding the read lock across await points (which starves
     /// write-lock waiters due to Tokio's write-preferring `RwLock`).
     pub fn llm_router_handle(&self) -> LlmRouterHandle {
-        LlmRouterHandle(self.llm_router.clone())
+        LlmRouterHandle(std::sync::Arc::clone(&self.llm_router))
     }
 
     fn advance_pool_index_after_attempt(&mut self, idx: usize, pool_len: usize) {
@@ -312,7 +312,7 @@ impl Router {
         let mut agents = Vec::new();
         for agent in configured_agents {
             if crate::cmd_cache::command_exists(agent) {
-                agents.push(agent.to_string());
+                agents.push(agent.clone());
             }
         }
         agents
@@ -409,7 +409,7 @@ impl Router {
             "router reloaded (async)"
         );
         self.config = new_config;
-        self.available_agents = new_agents.clone();
+        self.available_agents.clone_from(&new_agents);
         // Ensure new agents have weight entries (preserves existing weights)
         self.weights.ensure_agents(&new_agents);
         self.router_pool = new_pool;
@@ -790,18 +790,17 @@ impl Router {
                         );
                         // Label routing uses agent-specific role and the
                         // resolved model (may differ from from_config's default).
-                        result.profile.role = format!("{} specialist", agent);
+                        result.profile.role = format!("{agent} specialist");
                         result.model = model.clone();
                         self.log_route_activity(store, repo, &task.id.0, &result, None)
                             .await;
                         return Ok(result);
-                    } else {
-                        // No concrete model found for the labeled agent — do
-                        // not honor the label override. Fall through to the
-                        // standard routing logic so another agent or the LLM
-                        // can be chosen with a valid model.
-                        tracing::warn!(task_id = %task.id.0, agent = %agent, "label agent has no available model — falling through to LLM routing");
                     }
+                    // No concrete model found for the labeled agent — do
+                    // not honor the label override. Fall through to the
+                    // standard routing logic so another agent or the LLM
+                    // can be chosen with a valid model.
+                    tracing::warn!(task_id = %task.id.0, agent = %agent, "label agent has no available model — falling through to LLM routing");
                 }
 
                 let candidates = self.available_agents_for_complexity(&complexity);
@@ -1050,14 +1049,10 @@ impl Router {
 
                         let reason = if fallback_agent == result.agent {
                             format!(
-                                "LLM selected cooled model; using same agent {} with different model",
-                                fallback_agent
+                                "LLM selected cooled model; using same agent {fallback_agent} with different model"
                             )
                         } else {
-                            format!(
-                                "LLM selected cooled agent/model; rerouted to {}",
-                                fallback_agent
-                            )
+                            format!("LLM selected cooled agent/model; rerouted to {fallback_agent}")
                         };
 
                         let result = RouteResult {
@@ -1173,8 +1168,7 @@ impl Router {
             Ok(Some(store_id)) => store
                 .get(store_id)
                 .await
-                .map(|t| t.route_attempts as u32)
-                .unwrap_or(0),
+                .map_or(0, |t| t.route_attempts as u32),
             _ => 0,
         }
     }
@@ -1340,16 +1334,14 @@ impl Router {
                         crate::engine::runner::response::record_model_failure(agent, model_str)
                             .await;
                         return Err(e);
-                    } else {
-                        tracing::warn!(
-                            agent,
-                            model = model_str,
-                            error = %e,
-                            "pool entry failed, recording cooldown and trying next"
-                        );
-                        crate::engine::runner::response::record_model_failure(agent, model_str)
-                            .await;
                     }
+                    tracing::warn!(
+                        agent,
+                        model = model_str,
+                        error = %e,
+                        "pool entry failed, recording cooldown and trying next"
+                    );
+                    crate::engine::runner::response::record_model_failure(agent, model_str).await;
                     last_err = Some(e);
                     self.advance_pool_index_after_attempt(idx, n);
                 }
@@ -1435,19 +1427,15 @@ impl Router {
                             "fallback router LLM timed out — returning immediately to unblock tick loop"
                         );
                         return Err(e);
-                    } else {
-                        tracing::warn!(
-                            agent = %fb_agent,
-                            model = %fb_model_str,
-                            error = %e,
-                            "fallback router LLM also failed"
-                        );
-                        crate::engine::runner::response::record_model_failure(
-                            &fb_agent,
-                            fb_model_str,
-                        )
-                        .await;
                     }
+                    tracing::warn!(
+                        agent = %fb_agent,
+                        model = %fb_model_str,
+                        error = %e,
+                        "fallback router LLM also failed"
+                    );
+                    crate::engine::runner::response::record_model_failure(&fb_agent, fb_model_str)
+                        .await;
                     last_err = Some(e);
                 }
             }
@@ -2122,8 +2110,8 @@ Hope that helps!"#;
         let parsed = router.parse_llm_response(response).unwrap();
         assert_eq!(parsed.executor, "codex");
         assert_eq!(parsed.complexity, "medium");
-        assert!(!parsed.reason.is_empty());
-        assert!(!parsed.profile.role.is_empty());
+        assert_ne!(parsed.reason, "");
+        assert_ne!(parsed.profile.role, "");
     }
 
     /// Real Claude envelope with result as JSON object (not string).
@@ -2316,7 +2304,7 @@ Hope that helps!"#;
             router.config.mode
         );
         // Fallback executor should always be set
-        assert!(!router.config.fallback_executor.is_empty());
+        assert_ne!(router.config.fallback_executor, "");
         // Tools should always be populated
         assert!(!router.config.allowed_tools.is_empty());
     }

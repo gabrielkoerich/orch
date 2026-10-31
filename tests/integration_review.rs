@@ -1,3 +1,8 @@
+#![expect(
+    clippy::print_stderr,
+    reason = "helpers log progress of live agent runs"
+)]
+
 //! Integration tests for the full review agent flow.
 //!
 //! ## Approach

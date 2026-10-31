@@ -1,4 +1,4 @@
-use super::*;
+use super::{SqlitePool, TaskStore};
 use crate::cluster::{Command, Reply};
 use sqlx::SqliteConnection;
 

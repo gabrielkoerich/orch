@@ -15,7 +15,7 @@ use std::sync::Arc;
 ///
 /// Exists so tests can inject a mock that simulates DB failures without
 /// coupling the test harness to a real SQLite pool.
-#[allow(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
+#[expect(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
 #[async_trait]
 pub trait CommandStoreOps: Send + Sync {
     async fn resolve_task_id(&self, repo: &str, task_id: &str) -> anyhow::Result<Option<i64>>;
@@ -56,7 +56,7 @@ impl CommandStoreOps for crate::store::TaskStore {
 ///
 /// Exists so tests can inject a mock that simulates transient API failures
 /// without reaching the network.
-#[allow(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
+#[expect(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
 #[async_trait]
 pub trait CommandGh: Send + Sync {
     async fn get_issue(&self, repo: &str, number: &str) -> anyhow::Result<GitHubIssue>;
@@ -152,8 +152,7 @@ pub fn parse_command(body: &str) -> Option<OwnerCommand> {
         let command_text = trimmed
             .strip_prefix("@orchestrator")
             .or_else(|| trimmed.strip_prefix("@orch"))
-            .map(str::trim_start)
-            .unwrap_or(trimmed);
+            .map_or(trimmed, str::trim_start);
 
         if !command_text.starts_with('/') {
             continue;
@@ -343,7 +342,7 @@ pub enum CommandOutcome {
 ///
 /// Shared by both `scan_commands` (issue comments) and `scan_mentions` (mention
 /// handling). Posts a confirmation or error comment on the issue/PR.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn validate_and_run_command(
     backend: &Arc<dyn ExternalBackend>,
     gh: &dyn CommandGh,
@@ -432,13 +431,13 @@ mod tests {
                 task: ExternalTask {
                     id: ExternalId(id.to_string()),
                     title: "Task".to_string(),
-                    body: "".to_string(),
+                    body: String::new(),
                     state: "open".to_string(),
                     labels: vec![],
                     author: "bot".to_string(),
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                     updated_at: "2026-01-01T00:00:00Z".to_string(),
-                    url: "".to_string(),
+                    url: String::new(),
                 },
                 fail_remove_label: false,
             }
@@ -459,7 +458,7 @@ mod tests {
 
     #[async_trait]
     impl ExternalBackend for MockBackend {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "mock"
         }
 
@@ -585,21 +584,21 @@ mod tests {
                 repo: "owner/repo".to_string(),
                 origin: "github".to_string(),
                 title: "Task".to_string(),
-                body: "".to_string(),
+                body: String::new(),
                 source: "manual".to_string(),
-                source_id: "".to_string(),
+                source_id: String::new(),
                 author: "bot".to_string(),
-                url: "".to_string(),
+                url: String::new(),
                 labels: vec![],
                 parent_id: None,
             })
             .await
             .unwrap();
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new("42"));
-        let backend_for_call = backend.clone();
+        let backend_for_call = std::sync::Arc::clone(&backend);
         let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let gh = crate::github::http::GhHttp::new().unwrap();
@@ -652,11 +651,11 @@ mod tests {
                 repo: "owner/repo".to_string(),
                 origin: "github".to_string(),
                 title: "Task".to_string(),
-                body: "".to_string(),
+                body: String::new(),
                 source: "cron".to_string(),
                 source_id: "code-development".to_string(),
                 author: "bot".to_string(),
-                url: "".to_string(),
+                url: String::new(),
                 labels: vec![],
                 parent_id: None,
             })
@@ -669,8 +668,8 @@ mod tests {
 
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new("58"));
         let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let gh = crate::github::http::GhHttp::new().unwrap();
@@ -864,8 +863,8 @@ mod tests {
         ));
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let gh = crate::github::http::GhHttp::new().unwrap();
@@ -897,8 +896,8 @@ mod tests {
         ));
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let gh = crate::github::http::GhHttp::new().unwrap();
@@ -930,7 +929,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new("42"));
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
-            backend.clone(),
+            std::sync::Arc::clone(&backend),
             store,
             "owner/repo".to_string(),
         ));
@@ -964,7 +963,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new("42"));
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
-            backend.clone(),
+            std::sync::Arc::clone(&backend),
             store,
             "owner/repo".to_string(),
         ));

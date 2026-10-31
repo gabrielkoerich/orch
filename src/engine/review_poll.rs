@@ -41,7 +41,7 @@ use super::sync::ReviewTaskSnapshot;
 /// Abstraction over the GitHub HTTP calls used by `review_open_prs`.
 ///
 /// Allows tests to inject a mock without needing a real GitHub token.
-#[allow(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
+#[expect(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
 #[async_trait]
 pub(crate) trait GhReviewClient: Send + Sync {
     async fn get_pr_number(&self, repo: &str, branch: &str) -> anyhow::Result<Option<u64>>;
@@ -201,7 +201,7 @@ async fn handle_merge_conflict(
     ConflictAction::RerouteToAgent
 }
 
-#[allow(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
+#[expect(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
 #[async_trait]
 trait ReviewBatchFailCounterStore: Send + Sync {
     async fn kv_delete(&self, key: &str) -> anyhow::Result<()>;
@@ -263,7 +263,7 @@ async fn reset_batch_fail_counter(
 /// Lists tasks in review, fetches PR reviews, and re-dispatches the agent
 /// when a reviewer requests changes. The review context is stored in the
 /// store and injected into the agent prompt.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn review_open_prs(
     backend: &Arc<dyn ExternalBackend>,
     repo: &str,
@@ -304,7 +304,7 @@ pub(crate) async fn review_open_prs(
         let task_id = &task.id.0;
 
         // Skip tasks currently being processed by the main tick.
-        let dispatch_key = format!("{}/{}", repo, task_id);
+        let dispatch_key = format!("{repo}/{task_id}");
         if dispatching.contains_key(&dispatch_key) {
             tracing::debug!(
                 task_id,
@@ -479,7 +479,7 @@ pub(crate) async fn review_open_prs(
                     }
                 };
 
-                if reroutes >= max_reroutes as u64 {
+                if reroutes >= u64::from(max_reroutes) {
                     tracing::error!(
                         task_id,
                         reroutes,
@@ -487,8 +487,7 @@ pub(crate) async fn review_open_prs(
                         "reached max reroute attempts for in_review no-PR — blocking for human review"
                     );
                     let msg = format!(
-                        "no PR or code changes after {}/{} reroute attempts",
-                        reroutes, max_reroutes
+                        "no PR or code changes after {reroutes}/{max_reroutes} reroute attempts"
                     );
                     // Write block_reason atomically with the status transition to prevent
                     // auto_unblock_blocked_tasks (block_reason.is_none() gate) from
@@ -594,7 +593,7 @@ pub(crate) async fn review_open_prs(
             .as_deref()
             .is_some_and(|app| crate::github::app::same_login(login, app))
     };
-    let mut unique_users: std::collections::HashSet<String> = Default::default();
+    let mut unique_users: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut app_users: Vec<String> = Vec::new();
     for data in batch.values() {
         for c in &data.issue_comments {
@@ -651,16 +650,13 @@ pub(crate) async fn review_open_prs(
             }
         }
 
-        let batch_data = match batch.get(&pr_number) {
-            Some(d) => d,
-            None => {
-                tracing::warn!(
-                    task_id,
-                    pr_number,
-                    "PR not in batch data, skipping this tick"
-                );
-                continue;
-            }
+        let Some(batch_data) = batch.get(&pr_number) else {
+            tracing::warn!(
+                task_id,
+                pr_number,
+                "PR not in batch data, skipping this tick"
+            );
+            continue;
         };
 
         let review_ts_map: serde_json::Value =
@@ -762,7 +758,7 @@ pub(crate) async fn review_open_prs(
                 } else {
                     // Spawn auto-merge in background to avoid blocking sync_tick.
                     // The CI polling loop can take up to 10 minutes with backoff.
-                    auto_merge_in_flight.insert(task_id.to_string());
+                    auto_merge_in_flight.insert(task_id.clone());
                     let task_clone = task.clone();
                     let branch_clone = task_info.branch.clone();
                     let backend_clone = Arc::clone(backend);
@@ -772,7 +768,7 @@ pub(crate) async fn review_open_prs(
                     let in_flight_clone = Arc::clone(auto_merge_in_flight);
 
                     tokio::spawn(async move {
-                        let _guard = scopeguard::guard((), |_| {
+                        let _guard = scopeguard::guard((), |()| {
                             in_flight_clone.remove(&task_clone.id.0);
                         });
 
@@ -847,7 +843,7 @@ pub(crate) async fn review_open_prs(
 
             if let Some(ref body) = pr_review.review.body {
                 if !body.trim().is_empty() {
-                    review_context.push_str(&format!("**Overall Feedback:** {}\n\n", body));
+                    review_context.push_str(&format!("**Overall Feedback:** {body}\n\n"));
                 }
             }
 
@@ -1145,7 +1141,7 @@ mod tests {
 
     #[async_trait]
     impl crate::backends::ExternalBackend for MockBackend {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "mock"
         }
         async fn create_task(
@@ -1222,13 +1218,13 @@ mod tests {
         ExternalTask {
             id: ExternalId(id.to_string()),
             title: "test task".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             state: "open".to_string(),
             labels: vec![],
             author: "user".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            url: "".to_string(),
+            url: String::new(),
         }
     }
 
@@ -1290,7 +1286,7 @@ mod tests {
     impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for CaptureWriter {
         type Writer = CaptureWriter;
         fn make_writer(&'a self) -> Self::Writer {
-            CaptureWriter(self.0.clone())
+            CaptureWriter(std::sync::Arc::clone(&self.0))
         }
     }
 
@@ -1487,7 +1483,7 @@ mod tests {
             .await
             .unwrap();
         let _ = crate::store::store_set_by_id(
-            &Some(&store),
+            Some(&store),
             task_store_id,
             &[("branch", serde_json::json!("my-branch"))],
         )
@@ -1559,7 +1555,7 @@ mod tests {
             .await
             .unwrap();
         let _ = crate::store::store_set_by_id(
-            &Some(&store),
+            Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
         )
@@ -1622,7 +1618,7 @@ mod tests {
             .await
             .unwrap();
         let _ = crate::store::store_set_by_id(
-            &Some(&store),
+            Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
         )
@@ -1684,7 +1680,7 @@ mod tests {
             .await
             .unwrap();
         let _ = crate::store::store_set_by_id(
-            &Some(&store),
+            Some(&store),
             task_id,
             &[("branch", serde_json::json!("approved-branch"))],
         )
@@ -1750,7 +1746,7 @@ mod tests {
             .await
             .unwrap();
         let _ = crate::store::store_set_by_id(
-            &Some(&store),
+            Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
         )
@@ -1763,7 +1759,7 @@ mod tests {
         // Pre-set no_code_reroutes to a high value that exceeds any configured max after increment.
         // The default max is 3; use 99 to be robust against any real config on the test machine.
         let _ = crate::store::store_set_by_id(
-            &Some(&store),
+            Some(&store),
             task_id,
             &[("no_code_reroutes", serde_json::json!(99i64))],
         )
@@ -1849,7 +1845,7 @@ mod tests {
             .await
             .unwrap();
         let _ = crate::store::store_set_by_id(
-            &Some(&store),
+            Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
         )
@@ -1909,14 +1905,14 @@ mod tests {
             .await
             .unwrap();
         let _ = crate::store::store_set_by_id(
-            &Some(&store),
+            Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
         )
         .await;
         // Set pr_number so task reaches Phase 4.
         let _ = crate::store::store_set_by_id(
-            &Some(&store),
+            Some(&store),
             task_id,
             &[("pr_number", serde_json::json!(99i64))],
         )
@@ -1978,7 +1974,7 @@ mod tests {
             .await
             .unwrap();
         let _ = crate::store::store_set_by_id(
-            &Some(&store),
+            Some(&store),
             task_id,
             &[
                 ("branch", serde_json::json!("feat-conflict")),
@@ -2131,7 +2127,7 @@ mod tests {
         // Pre-set review_ts_map so the reviewer's review is already watermarked.
         let ts = "2026-01-05T00:00:00Z";
         let _ = crate::store::store_set_by_id(
-            &Some(&store),
+            Some(&store),
             task_id,
             &[
                 ("branch", serde_json::json!("feat-branch")),
@@ -2208,7 +2204,7 @@ mod tests {
             .await
             .unwrap();
         let _ = crate::store::store_set_by_id(
-            &Some(&store),
+            Some(&store),
             task_id,
             &[
                 ("branch", serde_json::json!("feat-branch")),
@@ -2278,13 +2274,13 @@ mod tests {
             .await
             .unwrap();
         let _ = crate::store::store_set_by_id(
-            &Some(&store),
+            Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
         )
         .await;
         let _ = crate::store::store_set_by_id(
-            &Some(&store),
+            Some(&store),
             task_id,
             &[("pr_number", serde_json::json!(20i64))],
         )
@@ -2292,7 +2288,7 @@ mod tests {
         // Set last_comment_review_ts to match the comment's created_at so it is deduplicated.
         let ts = "2026-01-05T00:00:00Z";
         let _ = crate::store::store_set_by_id(
-            &Some(&store),
+            Some(&store),
             task_id,
             &[("last_comment_review_ts", serde_json::json!(ts))],
         )

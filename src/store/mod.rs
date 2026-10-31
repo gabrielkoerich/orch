@@ -38,15 +38,15 @@ mod pricing;
 pub(crate) mod replica;
 pub(crate) mod tasks;
 
-#[allow(unused_imports)]
+#[expect(unused_imports)]
 pub use control::{parse_since_duration, ChatCostSummary, ControlMessage, MemoryEntry};
-#[allow(unused_imports)]
+#[expect(unused_imports)]
 pub use dependencies::{
     blocker_failure_kind, blocker_is_satisfied, blocker_snapshot_key, dep_label,
     worktree_refresh_key, BlockerSnapshot, DepSource, NewDependency, ObservedPullRequest,
     TaskDependency, WaitingOnDependency,
 };
-#[allow(unused_imports)]
+#[expect(unused_imports)]
 pub use helpers::{
     get_cost_estimate, get_cost_estimate_result, get_recent_memory, get_recent_memory_result,
     get_task_field, get_task_field_direct, get_token_usage, get_token_usage_result,
@@ -55,14 +55,14 @@ pub use helpers::{
     store_set, store_set_by_id, store_set_result, store_set_result_by_id, store_touch_updated_at,
     StoreResult,
 };
-#[allow(unused_imports)]
+#[expect(unused_imports)]
 pub use jobs::JobState;
-#[allow(unused_imports)]
+#[expect(unused_imports)]
 pub use metrics::{
     AgentStat, CostByGroup, CostPeriod, CostSummary, ErrorStat, HighReviewCycleTask,
     InsertTaskMetric, MetricsSummary, SlowTaskInfo,
 };
-#[allow(unused_imports)]
+#[expect(unused_imports)]
 pub use pricing::{pricing_for_model, CostEstimate, ModelPricing, TokenUsage};
 pub use tasks::{
     parse_cli_task_spec, CliTaskRef, CliTaskSpec, CompleteRun, NewTask, RunTokenUsage, StartRun,
@@ -112,7 +112,7 @@ impl TaskStore {
     }
 
     /// Open a store with a single connection.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     ///
     /// Uses `max_connections(1)` to avoid WAL visibility issues where a write
     /// on one pooled connection isn't visible to a read on another. Used by
@@ -178,7 +178,7 @@ impl TaskStore {
     /// True on the node that decides: the Raft leader, or a store with no Raft, as in the CLI and tests.
     /// A single node always leads, so one machine runs every phase as before
     pub fn is_leader(&self) -> bool {
-        self.raft.get().is_none_or(|node| node.is_leader())
+        self.raft.get().is_none_or(super::cluster::Node::is_leader)
     }
 
     /// Writes go through Raft or a daemon that runs it, so they reach the other machines
@@ -278,7 +278,7 @@ impl TaskStore {
     }
 
     /// Get a reference to the underlying pool (for advanced queries).
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
@@ -293,7 +293,7 @@ fn is_write_lock_error(err: &anyhow::Error) -> bool {
         cause
             .downcast_ref::<sqlx::Error>()
             .and_then(|e| e.as_database_error())
-            .and_then(|e| e.code())
+            .and_then(sqlx::error::DatabaseError::code)
             .is_some_and(|code| code == "5" || code == "517")
     })
 }

@@ -133,7 +133,7 @@ impl LabelSyncConfig {
     }
 }
 
-#[allow(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
+#[expect(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
 #[async_trait]
 pub(crate) trait ProjectApi: Sync {
     async fn query(&self, query: &str, variables: Value) -> Result<Value>;
@@ -159,7 +159,7 @@ fn check_response(response: &Value) -> Result<()> {
     Ok(())
 }
 
-const BOARD_QUERY: &str = r#"
+const BOARD_QUERY: &str = r"
 query ProjectLabelStatus($project: ID!, $field: String!, $cursor: String) {
   node(id: $project) {
     ... on ProjectV2 {
@@ -191,17 +191,17 @@ query ProjectLabelStatus($project: ID!, $field: String!, $cursor: String) {
       }
     }
   }
-}"#;
+}";
 
-const UPDATE_STATUS: &str = r#"
+const UPDATE_STATUS: &str = r"
 mutation ProjectLabelStatusUpdate($project: ID!, $item: ID!, $field: ID!, $option: String!) {
   updateProjectV2ItemFieldValue(input: {
     projectId: $project, itemId: $item, fieldId: $field,
     value: { singleSelectOptionId: $option }
   }) { projectV2Item { id } }
-}"#;
+}";
 
-const FIELDS_QUERY: &str = r#"
+const FIELDS_QUERY: &str = r"
 query ProjectLabelStatusFields($node: ID!, $cursor: String!) {
   node(id: $node) { ... on ProjectV2 {
     id fields(first: 100, after: $cursor) {
@@ -212,16 +212,16 @@ query ProjectLabelStatusFields($node: ID!, $cursor: String!) {
         }
     }
   } }
-}"#;
+}";
 
-const LABELS_QUERY: &str = r#"
+const LABELS_QUERY: &str = r"
 query ProjectLabelStatusLabels($node: ID!, $cursor: String!) {
   node(id: $node) { ... on Issue {
     id labels(first: 100, after: $cursor) {
       pageInfo { hasNextPage endCursor } nodes { name }
     }
   } }
-}"#;
+}";
 
 // A safety ceiling above GitHub's maximum Project item count. Detect both
 // repeated and endlessly advancing malformed cursors without unbounded reads.
@@ -550,7 +550,7 @@ mod tests {
 
     fn config() -> LabelSyncConfig {
         LabelSyncConfig::parse(
-            r#"
+            r"
 enabled: true
 projects:
   - repo: example/work
@@ -559,7 +559,7 @@ projects:
       board:todo: Todo
       board:held: Held
       board:done: Done
-"#,
+",
         )
         .unwrap()
     }

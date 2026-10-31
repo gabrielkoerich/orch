@@ -26,8 +26,8 @@ pub(super) fn simple_hash_fraction_for(task_id: &str) -> f64 {
 
     // Mix bits using a simple hash
     let hash = seed
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
     (hash % 10000) as f64 / 10000.0
 }
 
@@ -48,13 +48,13 @@ pub(crate) fn simple_hash_index_for(len: usize, task_id: &str) -> usize {
     let seed = nanos ^ seq ^ task_hash;
 
     let hash = seed
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
     (hash as usize) % len
 }
 
 fn hash_task_id(task_id: &str) -> u64 {
-    task_id
-        .bytes()
-        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64))
+    task_id.bytes().fold(0u64, |acc, b| {
+        acc.wrapping_mul(31).wrapping_add(u64::from(b))
+    })
 }

@@ -37,7 +37,7 @@ where
 /// This mirrors the logic in `tick_dispatch_tasks` but triggers instantly
 /// instead of waiting for the next tick. The dispatching set prevents
 /// double-dispatch if the tick loop picks up the same task.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn spawn(
     mut rx: broadcast::Receiver<TaskEvent>,
     backend: Arc<dyn ExternalBackend>,

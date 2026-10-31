@@ -57,7 +57,7 @@ fn split_for_telegram(text: &str, max: usize) -> Vec<String> {
 fn is_preformatted_html(msg: &OutgoingMessage) -> bool {
     msg.metadata
         .get("preformatted_html")
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
 }
 
@@ -149,15 +149,14 @@ impl TelegramChannel {
                         continue;
                     }
                     anyhow::bail!(
-                        "telegram getUpdates failed after {} attempts: {e}",
-                        TELEGRAM_MAX_RETRIES,
+                        "telegram getUpdates failed after {TELEGRAM_MAX_RETRIES} attempts: {e}",
                     );
                 }
             };
 
             if !response.status().is_success() {
                 let body = response.text().await.unwrap_or_default();
-                anyhow::bail!("telegram API error: {}", body);
+                anyhow::bail!("telegram API error: {body}");
             }
 
             let updates: GetUpdatesResponse = response.json().await?;
@@ -169,10 +168,7 @@ impl TelegramChannel {
             return Ok(updates.result);
         }
 
-        anyhow::bail!(
-            "telegram getUpdates failed after {} attempts",
-            TELEGRAM_MAX_RETRIES,
-        );
+        anyhow::bail!("telegram getUpdates failed after {TELEGRAM_MAX_RETRIES} attempts");
     }
 
     async fn send_message(
@@ -212,13 +208,13 @@ impl TelegramChannel {
 
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("telegram API error: {}", body);
+            anyhow::bail!("telegram API error: {body}");
         }
 
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub async fn send_inline_keyboard(
         &self,
         chat_id: i64,
@@ -249,14 +245,14 @@ impl TelegramChannel {
         let response = self.client.post(&url).json(&params).send().await?;
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("telegram API error: {}", body);
+            anyhow::bail!("telegram API error: {body}");
         }
         let result: serde_json::Value = response.json().await?;
         let message_id = result["result"]["message_id"].as_i64().unwrap_or(0);
         Ok(message_id)
     }
 
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub async fn answer_callback_query(
         &self,
         callback_query_id: &str,
@@ -270,7 +266,7 @@ impl TelegramChannel {
         let response = self.client.post(&url).json(&params).send().await?;
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("telegram API error: {}", body);
+            anyhow::bail!("telegram API error: {body}");
         }
         Ok(())
     }
@@ -278,7 +274,7 @@ impl TelegramChannel {
 
 #[async_trait]
 impl Channel for TelegramChannel {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "telegram"
     }
 
@@ -287,13 +283,13 @@ impl Channel for TelegramChannel {
         let token = self.token.clone();
         let client = self.client.clone();
         let chat_id = self.chat_id.clone();
-        let offset = self.offset.clone();
+        let offset = std::sync::Arc::clone(&self.offset);
 
         let token_fingerprint = {
             let mut hasher = Sha256::new();
             hasher.update(token.as_bytes());
             let hash = hasher.finalize();
-            let hex: String = hash[..8].iter().map(|b| format!("{:02x}", b)).collect();
+            let hex: String = hash[..8].iter().map(|b| format!("{b:02x}")).collect();
             format!("sha256:{hex}")
         };
 
@@ -304,7 +300,7 @@ impl Channel for TelegramChannel {
             token: token.clone(),
             client: client.clone(),
             chat_id: chat_id.clone(),
-            offset: offset.clone(),
+            offset: std::sync::Arc::clone(&offset),
         };
 
         tokio::spawn(async move {
@@ -367,7 +363,7 @@ impl Channel for TelegramChannel {
                             .as_ref()
                             .map(|m| m.message_id.to_string())
                             .unwrap_or_default();
-                        let msg_date = cb.message.as_ref().map(|m| m.date).unwrap_or(0);
+                        let msg_date = cb.message.as_ref().map_or(0, |m| m.date);
 
                         let incoming = IncomingMessage {
                             channel: "telegram".to_string(),
@@ -392,16 +388,12 @@ impl Channel for TelegramChannel {
                     }
 
                     // Handle regular messages
-                    let msg = match update.message {
-                        Some(m) => m,
-                        None => continue,
-                    };
+                    let Some(msg) = update.message else { continue };
 
-                    let author = msg
-                        .from
-                        .as_ref()
-                        .map(|u| u.username.clone().unwrap_or(u.first_name.clone()))
-                        .unwrap_or_else(|| "unknown".to_string());
+                    let author = msg.from.as_ref().map_or_else(
+                        || "unknown".to_string(),
+                        |u| u.username.clone().unwrap_or(u.first_name.clone()),
+                    );
 
                     let body = msg.text.unwrap_or_default();
 
@@ -499,7 +491,7 @@ impl Channel for TelegramChannel {
 
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("telegram health check failed: {}", body);
+            anyhow::bail!("telegram health check failed: {body}");
         }
 
         tracing::info!("telegram bot health check passed");

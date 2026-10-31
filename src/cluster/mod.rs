@@ -284,7 +284,7 @@ pub async fn start_node_on(
     }
     .validate()?;
     let network = network::HttpNetwork {
-        secret: secret.clone(),
+        secret: std::sync::Arc::clone(&secret),
     };
     let raft = Raft::new(cfg.id, Arc::new(config), network, log, sm).await?;
     let me = network::Hello {
@@ -295,9 +295,14 @@ pub async fn start_node_on(
         term: 0,
         proof: String::new(),
     };
-    let app = network::router(raft.clone(), secret.clone(), me, cfg.addr.clone());
+    let app = network::router(
+        raft.clone(),
+        std::sync::Arc::clone(&secret),
+        me,
+        cfg.addr.clone(),
+    );
     let stop = Arc::new(tokio::sync::Notify::new());
-    let stopped = stop.clone();
+    let stopped = std::sync::Arc::clone(&stop);
     tokio::spawn(async move {
         // Graceful shutdown also closes kept-alive connections, which would keep answering for a stopped node
         let served = axum::serve(listener, app)

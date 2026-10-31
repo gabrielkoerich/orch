@@ -514,7 +514,7 @@ fn scan_skills_directory(skills_dir: &std::path::Path) -> Option<String> {
 }
 
 impl LlmRouter {
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             skills_catalog: tokio::sync::Mutex::new(None),
         }
@@ -525,8 +525,8 @@ impl LlmRouter {
     /// This is the core routing method. The `router_agent` and `router_model` parameters
     /// identify which LLM to use for classification (distinct from the task's target agent).
     /// The `Router` drives pool selection and calls this method for each pool entry.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn route_with_llm_using(
+    #[expect(clippy::too_many_arguments)]
+    pub(super) async fn route_with_llm_using(
         &self,
         task: &ExternalTask,
         available_agents: &[String],
@@ -652,7 +652,7 @@ impl LlmRouter {
         let debug_preview = {
             let inner = self
                 .extract_agent_text(router_agent, response.trim())
-                .unwrap_or_else(|_| response.to_string());
+                .unwrap_or_else(|_| response.clone());
             let trimmed = inner.trim();
             if trimmed.len() <= 500 {
                 trimmed.to_string()
@@ -675,7 +675,7 @@ impl LlmRouter {
             // Map to nearest allowed value; warn so operators can tune the prompt.
             let nearest = FIBONACCI_ESTIMATES
                 .iter()
-                .min_by_key(|&&v| (v as i16 - llm_response.estimate as i16).unsigned_abs())
+                .min_by_key(|&&v| (i16::from(v) - i16::from(llm_response.estimate)).unsigned_abs())
                 .copied()
                 .unwrap_or(0);
             tracing::warn!(
@@ -760,7 +760,7 @@ impl LlmRouter {
     /// Invalidate the skills catalog cache so the next routing call reloads from disk.
     ///
     /// Called after `skills_sync()` updates skill files on disk.
-    pub async fn invalidate_skills_catalog(&self) {
+    pub(super) async fn invalidate_skills_catalog(&self) {
         let mut cache = self.skills_catalog.lock().await;
         *cache = None;
     }
@@ -894,7 +894,7 @@ impl LlmRouter {
     /// Handles: direct JSON, Claude `--output-format stream-json` NDJSON,
     /// Claude `--output-format json` envelopes, markdown code blocks, and raw
     /// text with embedded JSON.
-    pub fn parse_llm_response(
+    pub(super) fn parse_llm_response(
         &self,
         agent: &str,
         response: &str,
@@ -1036,10 +1036,9 @@ impl LlmRouter {
                 // Advance past this block
                 idx = abs_start + 3 + end_rel + 3;
                 continue;
-            } else {
-                // No matching end fence — break to avoid infinite loop
-                break;
             }
+            // No matching end fence — break to avoid infinite loop
+            break;
         }
 
         // 2) Try to extract balanced JSON objects from the raw text. This is a
@@ -1124,38 +1123,33 @@ impl LlmRouter {
                     // event types). If they don't, they're likely plain JSON that got
                     // parsed via the fragmented NDJSON fallback, so fall back to raw text.
                     let looks_like_opencode_ndjson = events.iter().any(|e| {
-                        e.get("type")
-                            .and_then(|v| v.as_str())
-                            .map(|t| {
-                                matches!(
-                                    t,
-                                    "step_start"
-                                        | "step_finish"
-                                        | "text"
-                                        | "message"
-                                        | "assistant"
-                                        | "error"
-                                        | "system"
-                                ) || t.contains("step")
-                                    || t.contains("text")
-                                    || t.contains("error")
-                            })
-                            .unwrap_or(false)
+                        e.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
+                            matches!(
+                                t,
+                                "step_start"
+                                    | "step_finish"
+                                    | "text"
+                                    | "message"
+                                    | "assistant"
+                                    | "error"
+                                    | "system"
+                            ) || t.contains("step")
+                                || t.contains("text")
+                                || t.contains("error")
+                        })
                     });
 
-                    match opencode::extract_ndjson_text(&events) {
-                        Some(text) => Ok(text),
-                        None => {
-                            if looks_like_opencode_ndjson {
-                                // Real opencode NDJSON events but no text payload — clear error
-                                anyhow::bail!(
-                                    "opencode produced no text output (NDJSON had no text events)"
-                                )
-                            } else {
-                                // Not opencode NDJSON — likely plain JSON from fragmented fallback
-                                Ok(raw.to_string())
-                            }
+                    if let Some(text) = opencode::extract_ndjson_text(&events) {
+                        Ok(text)
+                    } else {
+                        if looks_like_opencode_ndjson {
+                            // Real opencode NDJSON events but no text payload — clear error
+                            anyhow::bail!(
+                                "opencode produced no text output (NDJSON had no text events)"
+                            )
                         }
+                        // Not opencode NDJSON — likely plain JSON from fragmented fallback
+                        Ok(raw.to_string())
                     }
                 }
             }
@@ -1178,8 +1172,7 @@ impl LlmRouter {
                                 || val
                                     .get("subtype")
                                     .and_then(|v| v.as_str())
-                                    .map(|s| s == "init")
-                                    .unwrap_or(false)
+                                    .is_some_and(|s| s == "init")
                         } else {
                             false
                         };
@@ -1216,7 +1209,7 @@ impl LlmRouter {
     }
 
     /// Run sanity checks on routing decision.
-    pub fn check_routing_sanity(
+    pub(super) fn check_routing_sanity(
         &self,
         task: &ExternalTask,
         agent: &str,
@@ -1269,7 +1262,10 @@ mod tests {
             title: "Test task".to_string(),
             body: "Test body".to_string(),
             state: "open".to_string(),
-            labels: labels.iter().map(|s| s.to_string()).collect(),
+            labels: labels
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             author: "testuser".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -1280,7 +1276,10 @@ mod tests {
     fn make_profile(skills: Vec<&str>) -> AgentProfile {
         AgentProfile {
             role: "developer".to_string(),
-            skills: skills.iter().map(|s| s.to_string()).collect(),
+            skills: skills
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             tools: vec!["git".to_string()],
             constraints: vec![],
         }
@@ -1405,7 +1404,7 @@ mod tests {
         // Non-object JSON values should return None
         let json: serde_json::Value = serde_json::from_str(r#""just a string""#).unwrap();
         assert!(detect_error_envelope(&json).is_none());
-        let json: serde_json::Value = serde_json::from_str(r#"[1,2,3]"#).unwrap();
+        let json: serde_json::Value = serde_json::from_str(r"[1,2,3]").unwrap();
         assert!(detect_error_envelope(&json).is_none());
     }
 
@@ -1591,8 +1590,7 @@ mod tests {
             .unwrap_err();
         assert!(
             err.to_string().contains("could not parse"),
-            "malformed JSON must produce parse failure, got: {}",
-            err
+            "malformed JSON must produce parse failure, got: {err}"
         );
     }
 
@@ -1658,7 +1656,11 @@ mod tests {
         assert_eq!(resp.executor, "claude");
         assert_eq!(resp.complexity, "");
         assert_eq!(resp.reason, "");
-        assert!(resp.selected_skills.is_empty());
+        assert!(
+            resp.selected_skills.is_empty(),
+            "{:?}",
+            resp.selected_skills
+        );
     }
 
     #[test]
@@ -2008,7 +2010,7 @@ mod tests {
         assert!(result.is_some(), "should detect 503 or overloaded");
         // Ensure the returned string is valid (would panic if slice is misaligned)
         let msg = result.unwrap();
-        assert!(!msg.is_empty());
+        assert_ne!(msg, "");
     }
 
     #[test]

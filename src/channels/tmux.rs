@@ -28,7 +28,7 @@ impl TmuxChannel {
 
 #[async_trait]
 impl Channel for TmuxChannel {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "tmux"
     }
 

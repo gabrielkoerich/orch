@@ -141,8 +141,7 @@ async fn progress(
 
     let node = crate::cluster::discovery::status()
         .await
-        .map(|t| t.me.name)
-        .unwrap_or_else(|_| "local".to_string());
+        .map_or_else(|_| "local".to_string(), |t| t.me.name);
     match super::progress::handle(&app.store, &node, report).await {
         Ok(record) => Json(record).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),

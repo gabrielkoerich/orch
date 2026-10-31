@@ -133,7 +133,7 @@ async fn recover_routed_blocked_dispatch(
 
     if let Some(store_id) = resolved_store_id {
         if let Err(e) = store_set_by_id(
-            &Some(store),
+            Some(store),
             store_id,
             &[
                 ("agent", serde_json::Value::Null),
@@ -281,7 +281,7 @@ struct StuckTaskTiming {
     threshold: u64,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn stuck_task_timing_from_map(
     tmux: &Arc<TmuxManager>,
     repo: &str,
@@ -566,7 +566,7 @@ pub(crate) async fn tick_detect_silent_agents(
                 // directly without an LLM re-routing cycle. Clearing model forces
                 // model_for_complexity to pick the best available model for the new agent.
                 let _ = store_set_by_id(
-                    &Some(store),
+                    Some(store),
                     store_id,
                     &[
                         ("agent", serde_json::json!(fallback)),
@@ -583,7 +583,7 @@ pub(crate) async fn tick_detect_silent_agents(
                 .await;
             } else {
                 let _ = store_set_by_id(
-                    &Some(store),
+                    Some(store),
                     store_id,
                     &[
                         ("agent", serde_json::Value::Null),
@@ -675,7 +675,7 @@ fn should_use_backend(task_id: &str) -> bool {
 /// - `in_progress` tasks → reset to `New` when their session is missing or the run timed out
 /// - `routed` tasks      → reset to `New` when an old live session keeps blocking re-dispatch
 /// - `in_review` tasks   → reset to `NeedsReview` when the review session disappeared
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn tick_recover_stuck_tasks(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
@@ -860,7 +860,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
         };
         if let Some(store_id) = resolved_store_id {
             if let Err(e) = store_set_by_id(
-                &Some(store),
+                Some(store),
                 store_id,
                 &[
                     ("agent", serde_json::Value::Null),
@@ -1152,7 +1152,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
         };
         if let Some(store_id) = resolved_store_id {
             if let Err(e) = store_set_by_id(
-                &Some(store),
+                Some(store),
                 store_id,
                 &[
                     ("agent", serde_json::Value::Null),
@@ -1437,7 +1437,7 @@ pub(crate) async fn recover_untracked_repo_stuck_tasks(
         }
 
         if let Err(e) = store_set_by_id(
-            &Some(store),
+            Some(store),
             task.id,
             &[
                 ("agent", serde_json::Value::Null),
@@ -1957,7 +1957,7 @@ pub(crate) fn dispatch_mode_from_router(router: &Router) -> DispatchMode {
 }
 
 /// Phase 3b of tick: spawn agents for all status:routed tasks up to the parallel limit.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, name = "engine.tick.phase3b.dispatch")]
 pub(crate) async fn tick_dispatch_tasks(
     backend: &Arc<dyn ExternalBackend>,
@@ -2012,7 +2012,7 @@ pub(crate) async fn tick_dispatch_tasks(
 /// Shared by `tick_dispatch_tasks` (active-repo, per-tick dispatch) and
 /// `dispatch_routed_tasks_global` (inactive-repo sweep) so both paths spawn
 /// agents through the exact same worktree/tmux/runner logic.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn dispatch_tasks_for_repo(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
@@ -2107,7 +2107,8 @@ async fn dispatch_tasks_for_repo(
             }
         }
         // RAII guard — removes dispatch_key on drop even if the spawned task panics.
-        let dispatch_guard = DispatchGuard::new(dispatching.clone(), dispatch_key.clone());
+        let dispatch_guard =
+            DispatchGuard::new(std::sync::Arc::clone(dispatching), dispatch_key.clone());
         let task_id = task.id.0.clone();
 
         // Load routing result from store (stored during Phase 3a). Loaded before the
@@ -2167,12 +2168,9 @@ async fn dispatch_tasks_for_repo(
         }
 
         // Try to acquire a slot
-        let permit = match semaphore.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => {
-                tracing::debug!("all parallel slots busy, skipping remaining tasks");
-                break; // dispatch_guard drops here, removing the key
-            }
+        let Ok(permit) = std::sync::Arc::clone(semaphore).try_acquire_owned() else {
+            tracing::debug!("all parallel slots busy, skipping remaining tasks");
+            break; // dispatch_guard drops here, removing the key
         };
 
         // Mark in_progress BEFORE spawning to prevent double dispatch.
@@ -2192,16 +2190,16 @@ async fn dispatch_tasks_for_repo(
             .await;
 
         // Dispatch task
-        let runner = runner.clone();
-        let backend = backend.clone();
-        let tmux = tmux.clone();
-        let capture = capture.clone();
+        let runner = std::sync::Arc::clone(runner);
+        let backend = std::sync::Arc::clone(backend);
+        let tmux = std::sync::Arc::clone(tmux);
+        let capture = std::sync::Arc::clone(capture);
         let task_id_for_cleanup = task_id.clone();
         let task_owned = task;
         let weight_tx = weight_tx.clone();
         let repo_owned = repo.to_string();
-        let task_manager_for_spawn = task_manager.clone();
-        let store_for_spawn = store.clone();
+        let task_manager_for_spawn = std::sync::Arc::clone(task_manager);
+        let store_for_spawn = std::sync::Arc::clone(store);
 
         let repo_ctx = repo_owned.clone();
         tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
@@ -2222,8 +2220,7 @@ async fn dispatch_tasks_for_repo(
                     // handler already marked the task done (no-op tasks with
                     // no PR and no commits should not enter the review cycle).
                     let enable_review = config::get("workflow.enable_review_agent")
-                        .map(|v| v != "false")
-                        .unwrap_or(true);
+                        .map_or(true, |v| v != "false");
                     let display_status = match &signal {
                         WeightSignal::Success { .. } if enable_review => {
                             // Check if response handler already set done (no-op task).
@@ -2418,7 +2415,7 @@ fn group_orphaned_routed_tasks(
 /// `TaskRunner::resolve_project_dir` already falls back to the deterministic
 /// `~/.orch/projects/<owner>/<repo>.git` bare-clone convention when a repo is
 /// not listed in the active config, so dispatch works without a `ProjectEngine`.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_routed_tasks_global(
     tmux: &Arc<TmuxManager>,
     capture: &Arc<CaptureService>,
@@ -2455,11 +2452,12 @@ pub(crate) async fn dispatch_routed_tasks_global(
             }
         };
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(store),
             repo.clone(),
         ));
-        let runner = Arc::new(TaskRunner::new(repo.clone()).with_store(store.clone()));
+        let runner =
+            Arc::new(TaskRunner::new(repo.clone()).with_store(std::sync::Arc::clone(store)));
         let dispatchable: Vec<ExternalTask> = tasks
             .iter()
             .map(crate::engine::tasks::store_task_to_external)
@@ -2600,13 +2598,13 @@ pub(crate) async fn tick_unblock_parents(
                 let child_ext_strs: Vec<String> =
                     children.iter().map(|c| c.0.clone()).collect();
                 let child_exts: Vec<&str> =
-                    child_ext_strs.iter().map(|s| s.as_str()).collect();
+                    child_ext_strs.iter().map(std::string::String::as_str).collect();
                 // Query store for statuses of any children present locally
                 if let Ok(map) = store_clone
                     .get_statuses_by_external_ids(&repo_owned, &child_exts)
                     .await
                 {
-                    for (k, v) in map.into_iter() {
+                    for (k, v) in map {
                         child_statuses.insert(k, v);
                     }
                 } else {
@@ -2686,7 +2684,7 @@ pub(crate) async fn tick_job_scheduler(
 ///
 /// The store-wide work that used to sit in here runs once per tick in `tick_all`:
 /// `tick_global_sweeps` and `reconcile_dependencies`.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn tick_before_routing(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
@@ -2748,7 +2746,7 @@ pub(crate) async fn tick_before_routing(
 /// 1. `tick_dispatch_tasks`  — spawn agents for status:routed tasks
 /// 2. `tick_unblock_parents` — unblock parents whose sub-issues are all done
 /// 3. `tick_job_scheduler`   — fire due cron jobs
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn tick_after_routing(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
@@ -2813,7 +2811,7 @@ pub(crate) async fn tick_after_routing(
 ///
 /// The tmux session map, the global sweeps and the dependency reconcile are the same for
 /// every project, so they run once per tick rather than once per project.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn tick_all(
     engines: &[ProjectEngine],
     tmux: &Arc<TmuxManager>,
@@ -2908,7 +2906,7 @@ pub(crate) async fn tick_all(
     if let Err(err) = crate::engine::dependencies::reconcile_dependencies(
         first.backend.as_ref(),
         store,
-        transport.map(|arc| arc.as_ref()),
+        transport.map(std::convert::AsRef::as_ref),
     )
     .await
     {
@@ -3067,8 +3065,8 @@ mod tests {
         fn new() -> Self {
             Self {
                 blocked_tasks: vec![],
-                sub_issues: Default::default(),
-                tasks_by_id: Default::default(),
+                sub_issues: std::collections::HashMap::new(),
+                tasks_by_id: std::collections::HashMap::new(),
                 get_sub_issues_calls: Arc::new(Mutex::new(vec![])),
                 status_updates: Arc::new(Mutex::new(vec![])),
                 removed_labels: Arc::new(Mutex::new(vec![])),
@@ -3081,9 +3079,12 @@ mod tests {
         ExternalTask {
             id: ExternalId(id.to_string()),
             title: format!("Task {id}"),
-            body: "".to_string(),
+            body: String::new(),
             state: "open".to_string(),
-            labels: labels.iter().map(|s| s.to_string()).collect(),
+            labels: labels
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             author: "bot".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -3093,7 +3094,7 @@ mod tests {
 
     #[async_trait]
     impl ExternalBackend for MockBackend {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "mock"
         }
         async fn create_task(
@@ -3203,9 +3204,9 @@ mod tests {
         mock.tasks_by_id
             .insert("12".to_string(), make_task("12", &["status:done"]));
 
-        let status_updates = mock.status_updates.clone();
+        let status_updates = std::sync::Arc::clone(&mock.status_updates);
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
-        let task_manager = make_task_manager(backend.clone());
+        let task_manager = make_task_manager(std::sync::Arc::clone(&backend));
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
         tick_unblock_parents(&backend, &task_manager, &store, "test/repo")
@@ -3233,9 +3234,9 @@ mod tests {
         mock.tasks_by_id
             .insert("22".to_string(), make_task("22", &["status:in_progress"]));
 
-        let status_updates = mock.status_updates.clone();
+        let status_updates = std::sync::Arc::clone(&mock.status_updates);
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
-        let task_manager = make_task_manager(backend.clone());
+        let task_manager = make_task_manager(std::sync::Arc::clone(&backend));
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
         tick_unblock_parents(&backend, &task_manager, &store, "test/repo")
@@ -3258,9 +3259,9 @@ mod tests {
         mock.blocked_tasks.push(parent.clone());
         // No entry in sub_issues → get_sub_issues returns []
 
-        let status_updates = mock.status_updates.clone();
+        let status_updates = std::sync::Arc::clone(&mock.status_updates);
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
-        let task_manager = make_task_manager(backend.clone());
+        let task_manager = make_task_manager(std::sync::Arc::clone(&backend));
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
         tick_unblock_parents(&backend, &task_manager, &store, "test/repo")
@@ -3290,9 +3291,9 @@ mod tests {
         mock.tasks_by_id
             .insert("61".to_string(), make_task("61", &["status:done"]));
 
-        let status_updates = mock.status_updates.clone();
+        let status_updates = std::sync::Arc::clone(&mock.status_updates);
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
-        let task_manager = make_task_manager(backend.clone());
+        let task_manager = make_task_manager(std::sync::Arc::clone(&backend));
 
         // Insert the blocked task into the store with a block_reason set.
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
@@ -3332,13 +3333,13 @@ mod tests {
     #[tokio::test]
     async fn unblock_parents_unblocks_internal_parent_from_store_children() {
         let mock = MockBackend::new();
-        let get_sub_issues_calls = mock.get_sub_issues_calls.clone();
-        let status_updates = mock.status_updates.clone();
+        let get_sub_issues_calls = std::sync::Arc::clone(&mock.get_sub_issues_calls);
+        let status_updates = std::sync::Arc::clone(&mock.status_updates);
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "test/repo".to_string(),
         ));
 
@@ -3415,11 +3416,11 @@ mod tests {
     async fn recover_stuck_tasks_resets_external_in_review_to_needs_review() {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let mock = MockBackend::new();
-        let status_updates = mock.status_updates.clone();
+        let status_updates = std::sync::Arc::clone(&mock.status_updates);
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
@@ -3473,11 +3474,11 @@ mod tests {
     async fn recover_stuck_tasks_skips_recent_in_review() {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let mock = MockBackend::new();
-        let status_updates = mock.status_updates.clone();
+        let status_updates = std::sync::Arc::clone(&mock.status_updates);
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
@@ -3532,8 +3533,8 @@ mod tests {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
@@ -3580,11 +3581,11 @@ mod tests {
     async fn recover_stuck_tasks_ages_in_review_from_status_entry_not_updated_at() {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let mock = MockBackend::new();
-        let status_updates = mock.status_updates.clone();
+        let status_updates = std::sync::Arc::clone(&mock.status_updates);
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
@@ -3648,8 +3649,8 @@ mod tests {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
@@ -3675,7 +3676,7 @@ mod tests {
         set_in_review_entered_at_past(&store, id).await;
         if with_decision {
             crate::store::store_log_activity(
-                &Some(store.clone()),
+                &Some(std::sync::Arc::clone(&store)),
                 "owner/repo",
                 "55",
                 "review_decision",
@@ -3725,8 +3726,8 @@ mod tests {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
@@ -3779,11 +3780,11 @@ mod tests {
     async fn recover_stuck_tasks_reclaims_hung_in_review_session() {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let mock = MockBackend::new();
-        let status_updates = mock.status_updates.clone();
+        let status_updates = std::sync::Arc::clone(&mock.status_updates);
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
@@ -3948,8 +3949,8 @@ mod tests {
         let mock = MockBackend::new();
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
@@ -4042,8 +4043,8 @@ mod tests {
         let mock = MockBackend::new();
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
@@ -4159,8 +4160,8 @@ mod tests {
         let mock = MockBackend::new();
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
@@ -4299,11 +4300,11 @@ mod tests {
     async fn recover_stuck_tasks_skips_external_in_review_waiting_for_human_review() {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let mock = MockBackend::new();
-        let status_updates = mock.status_updates.clone();
+        let status_updates = std::sync::Arc::clone(&mock.status_updates);
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
@@ -4355,9 +4356,9 @@ mod tests {
     #[tokio::test]
     async fn unblock_parents_no_blocked_tasks() {
         let mock = MockBackend::new(); // no blocked tasks
-        let status_updates = mock.status_updates.clone();
+        let status_updates = std::sync::Arc::clone(&mock.status_updates);
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
-        let task_manager = make_task_manager(backend.clone());
+        let task_manager = make_task_manager(std::sync::Arc::clone(&backend));
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
         tick_unblock_parents(&backend, &task_manager, &store, "test/repo")
@@ -4387,9 +4388,9 @@ mod tests {
         mock.tasks_by_id
             .insert("51".to_string(), make_task("51", &["status:in_progress"]));
 
-        let status_updates = mock.status_updates.clone();
+        let status_updates = std::sync::Arc::clone(&mock.status_updates);
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
-        let task_manager = make_task_manager(backend.clone());
+        let task_manager = make_task_manager(std::sync::Arc::clone(&backend));
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
         tick_unblock_parents(&backend, &task_manager, &store, "test/repo")
@@ -4407,7 +4408,7 @@ mod tests {
     #[tokio::test]
     async fn tick_all_is_a_no_op_without_projects() {
         let transport = Arc::new(Transport::new());
-        let capture = Arc::new(CaptureService::new(transport.clone()));
+        let capture = Arc::new(CaptureService::new(std::sync::Arc::clone(&transport)));
         let tmux = Arc::new(TmuxManager::new());
         let semaphore = Arc::new(Semaphore::new(1));
         let router = Arc::new(tokio::sync::RwLock::new(cooled_review_router_for_test()));
@@ -4480,14 +4481,14 @@ mod tests {
                 ProjectEngine {
                     repo: repo.to_string(),
                     project_dir: std::path::PathBuf::from("/nonexistent"),
-                    backend: backend.clone(),
+                    backend: std::sync::Arc::clone(&backend),
                     task_manager: Arc::new(TaskManager::with_store(
                         backend,
-                        store.clone(),
+                        std::sync::Arc::clone(&store),
                         repo.to_string(),
                     )),
                     runner: Arc::new(crate::engine::runner::TaskRunner::new(repo.to_string())),
-                    store: store.clone(),
+                    store: std::sync::Arc::clone(&store),
                 }
             })
             .collect();
@@ -4505,7 +4506,7 @@ mod tests {
         )));
 
         let transport = Arc::new(Transport::new());
-        let capture = Arc::new(CaptureService::new(transport.clone()));
+        let capture = Arc::new(CaptureService::new(std::sync::Arc::clone(&transport)));
         let (weight_tx, _weight_rx) = mpsc::channel(8);
 
         tick_all(
@@ -4535,15 +4536,14 @@ mod tests {
     #[tokio::test]
     async fn tick_all_does_not_kill_sessions_it_did_not_create() {
         let tmux = Arc::new(TmuxManager::new());
-        let session_name = match tmux
+        let session_name = if let Ok(name) = tmux
             .create_session("other/foreign", "3889", "/tmp", "sleep 30", &[])
             .await
         {
-            Ok(name) => name,
-            Err(_) => {
-                eprintln!("Skipping test: tmux not available or failed to create test session");
-                return;
-            }
+            name
+        } else {
+            eprintln!("Skipping test: tmux not available or failed to create test session");
+            return;
         };
         let _guard = SessionGuard(session_name.clone());
 
@@ -4556,10 +4556,10 @@ mod tests {
         let engines = vec![ProjectEngine {
             repo: "owner/one".to_string(),
             project_dir: std::path::PathBuf::from("/nonexistent"),
-            backend: backend.clone(),
+            backend: std::sync::Arc::clone(&backend),
             task_manager: Arc::new(TaskManager::with_store(
                 backend,
-                store.clone(),
+                std::sync::Arc::clone(&store),
                 "owner/one".to_string(),
             )),
             runner: Arc::new(crate::engine::runner::TaskRunner::new(
@@ -4569,7 +4569,7 @@ mod tests {
         }];
 
         let transport = Arc::new(Transport::new());
-        let capture = Arc::new(CaptureService::new(transport.clone()));
+        let capture = Arc::new(CaptureService::new(std::sync::Arc::clone(&transport)));
         let (weight_tx, _weight_rx) = mpsc::channel(8);
         let router = Arc::new(tokio::sync::RwLock::new(cooled_review_router_for_test()));
 
@@ -4599,11 +4599,11 @@ mod tests {
         let transport = Arc::new(Transport::new());
         let capture = Arc::new(CaptureService::new(transport));
         let mock = Arc::new(MockBackend::new());
-        let backend: Arc<dyn ExternalBackend> = mock.clone();
+        let backend: Arc<dyn ExternalBackend> = Arc::<MockBackend>::clone(&mock);
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
@@ -4668,8 +4668,8 @@ mod tests {
         let mock = MockBackend::new();
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let transport = Arc::new(Transport::new());
@@ -4763,8 +4763,8 @@ mod tests {
         let mock = MockBackend::new();
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
@@ -4956,8 +4956,8 @@ mod tests {
         let mock = MockBackend::new();
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
@@ -5051,8 +5051,8 @@ mod tests {
         let mock = MockBackend::new();
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
@@ -5115,8 +5115,8 @@ mod tests {
         let mock = MockBackend::new();
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
@@ -5210,8 +5210,8 @@ mod tests {
         let mock = MockBackend::new();
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
@@ -5306,8 +5306,8 @@ mod tests {
         let mock = MockBackend::new();
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());

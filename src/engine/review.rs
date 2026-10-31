@@ -106,7 +106,7 @@ pub(crate) fn parse_pr_number_from_url(url: &str) -> Result<u64, String> {
 
 fn review_started_comment(review_agent: &str, review_model: &str) -> String {
     let footer = attribution_footer("Review started", review_agent, Some(review_model));
-    format!("🔍 Automated review started{}", footer)
+    format!("🔍 Automated review started{footer}")
 }
 
 fn should_skip_no_code_reroute_increment(last_error: &str) -> bool {
@@ -810,10 +810,12 @@ async fn select_review_agent(
     let available_count = r.available_agents.len().max(1);
 
     loop {
-        let tmp_exclude_refs: Vec<&str> = exclude_set.iter().map(|s| s.as_str()).collect();
-        let agent = match r.next_round_robin_agent(&tmp_exclude_refs, "review") {
-            Some(a) => a,
-            None => break,
+        let tmp_exclude_refs: Vec<&str> = exclude_set
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
+        let Some(agent) = r.next_round_robin_agent(&tmp_exclude_refs, "review") else {
+            break;
         };
 
         if tried_agents.contains(&agent) {
@@ -838,7 +840,10 @@ async fn select_review_agent(
         let same = !task_agent.is_empty() && agent == task_agent;
         Ok((agent, chosen_model, same))
     } else {
-        let final_exclude_refs: Vec<&str> = exclude_set.iter().map(|s| s.as_str()).collect();
+        let final_exclude_refs: Vec<&str> = exclude_set
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
         let fallback_agent = r
             .next_round_robin_agent(&final_exclude_refs, "review")
             .unwrap_or_else(|| "claude".to_string());
@@ -847,8 +852,7 @@ async fn select_review_agent(
             .model_for_complexity(&fallback_agent, "review", task_id);
         if fallback_model.is_none() {
             anyhow::bail!(
-                "no review agent with a configured review model is available for task {}",
-                task_id
+                "no review agent with a configured review model is available for task {task_id}"
             );
         }
         let same = !task_agent.is_empty() && fallback_agent == task_agent;
@@ -856,7 +860,7 @@ async fn select_review_agent(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn build_review_context(
     task: &ExternalTask,
     repo: &str,
@@ -965,10 +969,8 @@ async fn build_review_context(
                 max_reroutes,
                 "reached max reroute attempts for no-worktree/branch/pr result — blocking for human review"
             );
-            let msg = format!(
-                "no worktree/branch/pr after {}/{} reroute attempts",
-                reroutes, max_reroutes
-            );
+            let msg =
+                format!("no worktree/branch/pr after {reroutes}/{max_reroutes} reroute attempts");
             let fields = [
                 (
                     "block_reason",
@@ -1256,7 +1258,7 @@ async fn build_review_context(
     }))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn complete_review_run(
     store: &Arc<TaskStore>,
     run_id: Option<i64>,
@@ -1426,7 +1428,7 @@ async fn invoke_review_agent(
                 let agent_result =
                     runner::agents::find_agent_result(&ctx.review_agent, &raw_output);
                 // Treat as success if we found a valid result without is_error set
-                if agent_result.as_ref().map(|r| !r.is_error).unwrap_or(false) {
+                if agent_result.as_ref().is_some_and(|r| !r.is_error) {
                     tracing::info!(
                         task_id = task.id.0,
                         agent = %ctx.review_agent,
@@ -1656,9 +1658,7 @@ async fn parse_review_output(
         let review_attempt_dir_clone = ctx.review_attempt_dir.clone();
         match tokio::task::spawn_blocking(move || {
             let file_exists = output_file_clone.exists();
-            let file_size = std::fs::metadata(&output_file_clone)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let file_size = std::fs::metadata(&output_file_clone).map_or(0, |m| m.len());
             let exit_code = std::fs::read_to_string(review_attempt_dir_clone.join("exit.txt"))
                 .ok()
                 .and_then(|s| s.trim().parse::<i32>().ok())
@@ -1711,7 +1711,7 @@ async fn parse_review_output(
         duration_secs: 0.0,
     };
 
-    let agent_result_is_error = agent_result.as_ref().map(|r| r.is_error).unwrap_or(false);
+    let agent_result_is_error = agent_result.as_ref().is_some_and(|r| r.is_error);
     let ndjson_completed_no_error = raw_output.contains("\"terminal_reason\":\"completed\"")
         && !raw_output.contains("\"is_error\":true");
     // Do not short-circuit completed NDJSON sessions before rescue parsing.
@@ -1939,11 +1939,7 @@ async fn parse_review_output(
                 }
 
                 // Cut off at the output token limit (opencode step_finish reason=length)
-                if agent_result
-                    .as_ref()
-                    .map(|r| r.truncated_by_length)
-                    .unwrap_or(false)
-                {
+                if agent_result.as_ref().is_some_and(|r| r.truncated_by_length) {
                     tracing::warn!(
                         task_id = task.id.0,
                         agent = %ctx.review_agent,
@@ -2188,8 +2184,7 @@ async fn restore_review_config_if_needed(
         .await
         .ok()
         .filter(|output| output.status.success())
-        .map(|output| !output.stdout.is_empty())
-        .unwrap_or(false);
+        .is_some_and(|output| !output.stdout.is_empty());
 
     if !orch_yml_changed {
         return;
@@ -2204,8 +2199,7 @@ async fn restore_review_config_if_needed(
         .current_dir(worktree_path)
         .status()
         .await
-        .map(|status| status.success())
-        .unwrap_or(false);
+        .is_ok_and(|status| status.success());
 
     if !restore_ok {
         return;
@@ -2218,8 +2212,7 @@ async fn restore_review_config_if_needed(
         .await
         .ok()
         .filter(|output| output.status.success())
-        .map(|output| !output.stdout.is_empty())
-        .unwrap_or(false);
+        .is_some_and(|output| !output.stdout.is_empty());
 
     if staged {
         let _ = Command::new("git")
@@ -2371,8 +2364,7 @@ fn append_review_issues(
             issue.file,
             issue
                 .line
-                .map(|line| line.to_string())
-                .unwrap_or_else(|| "?".to_string()),
+                .map_or_else(|| "?".to_string(), |line| line.to_string()),
             issue.description,
             issue.severity
         ));
@@ -2382,10 +2374,8 @@ fn append_review_issues(
 fn build_pr_review_comment(decision: &ReviewDecision, review_notes_for_comment: &str) -> String {
     match decision {
         ReviewDecision::Approve { issues } => {
-            let mut body = format!(
-                "## Automated Review \u{2014} Approve\n\n{}",
-                review_notes_for_comment
-            );
+            let mut body =
+                format!("## Automated Review \u{2014} Approve\n\n{review_notes_for_comment}");
             if !issues.is_empty() && !body.ends_with('\n') {
                 body.push('\n');
             }
@@ -2393,10 +2383,7 @@ fn build_pr_review_comment(decision: &ReviewDecision, review_notes_for_comment: 
             body
         }
         ReviewDecision::RequestChanges { notes, issues } => {
-            let mut body = format!(
-                "## Automated Review \u{2014} Changes Requested\n\n{}\n",
-                notes
-            );
+            let mut body = format!("## Automated Review \u{2014} Changes Requested\n\n{notes}\n");
             append_review_issues(&mut body, issues);
             body
         }
@@ -2482,7 +2469,7 @@ async fn post_review_comment(
     if !pr_comment.is_empty() {
         let footer =
             attribution_footer("Reviewed", &ctx.review_agent, Some(ctx.review_model_str()));
-        let pr_comment_with_footer = format!("{}{}", pr_comment, footer);
+        let pr_comment_with_footer = format!("{pr_comment}{footer}");
         if let Err(e) = publish_review(
             app.as_deref(),
             &gh,
@@ -2645,7 +2632,7 @@ async fn inline_comments(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn apply_review_decision(
     task: &ExternalTask,
     backend: &Arc<dyn ExternalBackend>,
@@ -2786,12 +2773,9 @@ async fn count_ahead_commits(
     worktree_path: &std::path::Path,
     default_branch: &str,
 ) -> Result<u64, String> {
-    let worktree_str = worktree_path.to_str().ok_or_else(|| {
-        format!(
-            "worktree path contains non-UTF-8 characters: {:?}",
-            worktree_path
-        )
-    })?;
+    let worktree_str = worktree_path
+        .to_str()
+        .ok_or_else(|| format!("worktree path contains non-UTF-8 characters: {worktree_path:?}"))?;
 
     let output = tokio::process::Command::new("git")
         .args([
@@ -2830,7 +2814,7 @@ async fn count_ahead_commits(
 /// If no PR exists but the branch has commits, attempts to create one and
 /// continues with the same review pass.
 /// All error and no-op paths update task status and return [`EnsurePrResult::EarlyReturn`].
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn ensure_pr_exists(
     task: &ExternalTask,
     branch_name: &str,
@@ -2891,8 +2875,7 @@ async fn ensure_pr_exists(
                 );
                 let worktree_str = worktree_path.to_str().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "worktree path contains non-UTF-8 characters: {:?}",
-                        worktree_path
+                        "worktree path contains non-UTF-8 characters: {worktree_path:?}"
                     )
                 })?;
                 // Push first in case agent forgot (use token auth like git_ops::push_branch)
@@ -2920,7 +2903,9 @@ async fn ensure_pr_exists(
                         );
                     }
                     Ok(Ok(o)) => {
-                        if !o.status.success() {
+                        if o.status.success() {
+                            tracing::info!(task_id = task.id.0, branch = %branch_name, "review gate fallback push succeeded");
+                        } else {
                             tracing::warn!(
                                 task_id = task.id.0,
                                 branch = %branch_name,
@@ -2929,8 +2914,6 @@ async fn ensure_pr_exists(
                                 stderr = %String::from_utf8_lossy(&o.stderr),
                                 "review gate fallback push failed"
                             );
-                        } else {
-                            tracing::info!(task_id = task.id.0, branch = %branch_name, "review gate fallback push succeeded");
                         }
                     }
                     Ok(Err(e)) => {
@@ -3301,10 +3284,10 @@ async fn ensure_pr_exists(
                     .await
                     .map(|t| t.last_error)
                     .unwrap_or_default();
-                let reason = if !agent_summary.is_empty() {
-                    agent_summary.to_string()
-                } else {
+                let reason = if agent_summary.is_empty() {
                     last_error.clone()
+                } else {
+                    agent_summary.to_string()
                 };
 
                 if last_error.contains("exceeded max attempts") {
@@ -3445,8 +3428,7 @@ async fn ensure_pr_exists(
                         "reached max reroute attempts for no-pr-result — blocking for human review"
                     );
                     let msg = format!(
-                        "no PR or code changes after {}/{} reroute attempts",
-                        reroutes, max_reroutes
+                        "no PR or code changes after {reroutes}/{max_reroutes} reroute attempts"
                     );
                     // Write block_reason atomically with the status transition to prevent
                     // auto_unblock_blocked_tasks (block_reason.is_none() gate) from
@@ -3905,7 +3887,7 @@ mod tests {
             cmd.args(["-c", "commit.gpgsign=false"]);
         }
         let status = cmd.args(args).status().unwrap();
-        assert!(status.success(), "git {:?} failed", args);
+        assert!(status.success(), "git {args:?} failed");
     }
 
     #[test]
@@ -3985,7 +3967,7 @@ mod tests {
                     user: GitHubUser {
                         login: "reviewer".to_string(),
                     },
-                    body: "".to_string(),
+                    body: String::new(),
                     path: "src/lib.rs".to_string(),
                     line: Some(20),
                     original_line: Some(20),
@@ -4087,7 +4069,7 @@ mod tests {
                     notes.contains("test_results: fail"),
                     "notes must name the failing test run, got {notes:?}"
                 );
-                assert!(issues.is_empty());
+                assert!(issues.is_empty(), "{issues:?}");
             }
             other => panic!("expected RequestChanges, got {other:?}"),
         }
@@ -4141,7 +4123,7 @@ mod tests {
     #[test]
     fn review_started_comment_includes_agent_and_model() {
         let expected_footer = attribution_footer("Review started", "kimi", Some("opus"));
-        let expected = format!("🔍 Automated review started{}", expected_footer);
+        let expected = format!("🔍 Automated review started{expected_footer}");
         assert_eq!(review_started_comment("kimi", "opus"), expected);
     }
 
@@ -4151,7 +4133,7 @@ mod tests {
         ExternalTask {
             id: crate::backends::ExternalId(id.to_string()),
             title: "opencode discovery timeout".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             state: "open".to_string(),
             labels: vec![],
             author: "tester".to_string(),
@@ -4396,7 +4378,11 @@ mod tests {
 
     #[test]
     fn only_a_merge_of_the_approved_commit_carries_the_approval() {
-        let parents = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let parents = |p: &[&str]| {
+            p.iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
             base_merge_parent("approved", &parents(&["approved", "base"])),
             Some("base")
@@ -4659,7 +4645,7 @@ mod tests {
         let ext = ExternalTask {
             id: crate::backends::ExternalId("1".to_string()),
             title: "Fix review recovery".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             state: "open".to_string(),
             labels: vec![],
             author: "tester".to_string(),
@@ -4934,7 +4920,7 @@ mod tests {
         ExternalTask {
             id: crate::backends::ExternalId(id.to_string()),
             title: "Test review task".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             state: "open".to_string(),
             labels: vec![],
             author: "tester".to_string(),
@@ -5251,7 +5237,7 @@ mod tests {
     async fn finalize_review_run_success_resets_generic_model_failure_count() {
         crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        crate::engine::cooldown::init_cooldown_store(store.clone()).await;
+        crate::engine::cooldown::init_cooldown_store(std::sync::Arc::clone(&store)).await;
 
         let agent = "test-3478-agent";
         let model = "test-3478-model";
@@ -5296,7 +5282,7 @@ mod tests {
     async fn finalize_review_run_interleaved_success_keeps_generic_cooldown_at_base() {
         crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        crate::engine::cooldown::init_cooldown_store(store.clone()).await;
+        crate::engine::cooldown::init_cooldown_store(std::sync::Arc::clone(&store)).await;
 
         let agent = "test-3478-interleave-agent";
         let model = "test-3478-interleave-model";
@@ -5345,7 +5331,7 @@ mod tests {
     async fn finalize_review_run_success_does_not_reset_persistent_model_failure_count() {
         crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        crate::engine::cooldown::init_cooldown_store(store.clone()).await;
+        crate::engine::cooldown::init_cooldown_store(std::sync::Arc::clone(&store)).await;
 
         let agent = "test-3571-agent";
         let model = "test-3571-model";

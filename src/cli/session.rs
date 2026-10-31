@@ -20,16 +20,15 @@ pub async fn export(
     let repo = resolved.repo.clone();
     let task = store.get(internal_id).await.context("task not found")?;
 
-    let attempt = match attempt {
-        Some(n) => n,
-        None => {
-            let runs = store.get_runs(internal_id).await?;
-            if runs.is_empty() {
-                anyhow::bail!("no attempts found for task");
-            }
-            let max_attempt = runs.iter().map(|r| r.attempt).max().unwrap_or(1);
-            max_attempt as u32
+    let attempt = if let Some(n) = attempt {
+        n
+    } else {
+        let runs = store.get_runs(internal_id).await?;
+        if runs.is_empty() {
+            anyhow::bail!("no attempts found for task");
         }
+        let max_attempt = runs.iter().map(|r| r.attempt).max().unwrap_or(1);
+        max_attempt as u32
     };
 
     let output_path = crate::cli::task_ref::state_dir(&resolved)?
@@ -50,7 +49,7 @@ pub async fn export(
         ExportFormat::Markdown => export_markdown(&task, attempt, &content, &store, &repo).await,
         ExportFormat::Json => export_json(&task, attempt, &content),
         ExportFormat::Raw => {
-            println!("{}", content);
+            println!("{content}");
             Ok(())
         }
     }
@@ -87,9 +86,9 @@ impl ParsedOutput {
 /// with `git` are captured as `git_commands`.  Assistant text messages
 /// longer than 40 chars are kept as `key_messages` (capped at 10).
 fn parse_output(content: &str) -> ParsedOutput {
-    let mut files_changed: std::collections::BTreeSet<String> = Default::default();
-    let mut files_read: std::collections::BTreeSet<String> = Default::default();
-    let mut tool_counts: BTreeMap<String, usize> = Default::default();
+    let mut files_changed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut files_read: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut tool_counts: BTreeMap<String, usize> = BTreeMap::default();
     let mut git_commands: Vec<String> = Vec::new();
     let mut key_messages: Vec<String> = Vec::new();
 
@@ -256,7 +255,7 @@ async fn export_markdown(
     let agent = task.agent.as_deref().unwrap_or("unknown");
     let model = task.model.as_deref().unwrap_or("-");
 
-    let duration = attempt_run.map(|r| r.duration_secs).unwrap_or(0.0);
+    let duration = attempt_run.map_or(0.0, |r| r.duration_secs);
     let duration_str = format_duration(duration);
 
     let input_tokens = task.input_tokens;
@@ -266,19 +265,19 @@ async fn export_markdown(
 
     println!(
         "# Session: {} (Attempt {})",
-        task_id_display(&task.id, &task.external_id),
+        task_id_display(task.id, &task.external_id),
         attempt
     );
     println!();
-    println!("**Agent**: {} ({})", agent, model);
-    println!("**Duration**: {}", duration_str);
+    println!("**Agent**: {agent} ({model})");
+    println!("**Duration**: {duration_str}");
     println!(
         "**Tokens**: {} in / {} out",
         format_num(input_tokens),
         format_num(output_tokens)
     );
     if cost > 0.0 {
-        println!("**Cost**: ${:.4}", cost);
+        println!("**Cost**: ${cost:.4}");
     }
     println!("---");
 
@@ -297,7 +296,7 @@ async fn export_markdown(
             println!();
             println!("### Files Changed");
             for f in &parsed.files_changed {
-                println!("- `{}`", f);
+                println!("- `{f}`");
             }
         }
 
@@ -308,7 +307,7 @@ async fn export_markdown(
             let mut counts: Vec<(&String, &usize)> = parsed.tool_counts.iter().collect();
             counts.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
             for (tool, count) in &counts {
-                println!("- **{}**: {}", tool, count);
+                println!("- **{tool}**: {count}");
             }
         }
 
@@ -319,7 +318,7 @@ async fn export_markdown(
             let mut seen = std::collections::HashSet::new();
             for cmd in &parsed.git_commands {
                 if seen.insert(cmd.as_str()) {
-                    println!("- `{}`", cmd);
+                    println!("- `{cmd}`");
                 }
             }
         }
@@ -328,7 +327,7 @@ async fn export_markdown(
             println!();
             println!("### Key Decisions");
             for msg in &parsed.key_messages {
-                println!("- {}", msg);
+                println!("- {msg}");
             }
         }
     }
@@ -360,14 +359,14 @@ async fn export_markdown(
             "incomplete"
         };
 
-        println!("**Status**: {}", status);
-        println!("**Summary**: {}", summary);
+        println!("**Status**: {status}");
+        println!("**Summary**: {summary}");
     }
 
     let error = &task.last_error;
     if !error.is_empty() {
         println!();
-        println!("**Error**: {}", error);
+        println!("**Error**: {error}");
     }
 
     Ok(())
@@ -433,10 +432,10 @@ fn export_json(task: &crate::store::Task, attempt: u32, content: &str) -> anyhow
     Ok(())
 }
 
-fn task_id_display(internal_id: &i64, external_id: &Option<String>) -> String {
+fn task_id_display(internal_id: i64, external_id: &Option<String>) -> String {
     match external_id {
-        Some(ext) => format!("{}:{}", ext, internal_id),
-        None => format!("internal:{}", internal_id),
+        Some(ext) => format!("{ext}:{internal_id}"),
+        None => format!("internal:{internal_id}"),
     }
 }
 
@@ -454,17 +453,17 @@ fn format_num(n: i64) -> String {
 
 fn format_duration(secs: f64) -> String {
     if secs < 60.0 {
-        format!("{:.0}s", secs)
+        format!("{secs:.0}s")
     } else if secs < 3600.0 {
         let mins = secs / 60.0;
         if mins < 10.0 {
-            format!("{:.1}m", mins)
+            format!("{mins:.1}m")
         } else {
-            format!("{:.0}m", mins)
+            format!("{mins:.0}m")
         }
     } else {
         let hours = secs / 3600.0;
-        format!("{:.1}h", hours)
+        format!("{hours:.1}h")
     }
 }
 
@@ -482,8 +481,7 @@ fn extract_claude_text(v: &serde_json::Value) -> Option<String> {
                 None
             }
         })
-        .collect::<Vec<_>>()
-        .join("");
+        .collect::<String>();
     if text.is_empty() {
         None
     } else {
@@ -502,8 +500,7 @@ fn first_sentence(s: &str, max: usize) -> String {
     let sentence_end = s
         .char_indices()
         .find(|(_, c)| matches!(c, '.' | '!' | '?'))
-        .map(|(i, _)| i + 1)
-        .unwrap_or(s.len());
+        .map_or(s.len(), |(i, _)| i + 1);
     let candidate = &s[..sentence_end.min(s.len())];
     ndjson::truncate(candidate.trim(), max)
 }
@@ -524,7 +521,7 @@ impl std::str::FromStr for ExportFormat {
             "markdown" | "md" => Ok(Self::Markdown),
             "json" | "js" => Ok(Self::Json),
             "raw" | "ndjson" => Ok(Self::Raw),
-            _ => Err(format!("unknown format: {}", s)),
+            _ => Err(format!("unknown format: {s}")),
         }
     }
 }
@@ -631,7 +628,7 @@ mod tests {
 
     #[test]
     fn format_num_thousands() {
-        assert_eq!(format_num(1234567), "1,234,567");
+        assert_eq!(format_num(1_234_567), "1,234,567");
         assert_eq!(format_num(999), "999");
     }
 

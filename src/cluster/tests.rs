@@ -795,13 +795,16 @@ async fn a_learner_joins_through_any_node_and_catches_up() {
 async fn probe_never_sends_the_secret_and_rejects_a_peer_without_proof() {
     use axum::http::HeaderMap;
     let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let record = seen.clone();
+    let record = std::sync::Arc::clone(&seen);
     let fake = axum::Router::new().route(
         "/cluster/hello",
         axum::routing::get(move |headers: HeaderMap| {
-            let record = record.clone();
+            let record = std::sync::Arc::clone(&record);
             async move {
-                let names = headers.keys().map(|k| k.to_string()).collect::<Vec<_>>();
+                let names = headers
+                    .keys()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>();
                 let values = headers
                     .values()
                     .filter_map(|v| v.to_str().ok().map(str::to_string))
@@ -1026,7 +1029,7 @@ async fn a_relayed_proof_is_rejected() {
             let real = real.clone();
             async move {
                 let mut req = reqwest::Client::new().get(format!("http://{real}/cluster/hello"));
-                for (k, v) in headers.iter() {
+                for (k, v) in &headers {
                     if k.as_str().starts_with("x-orch") {
                         req = req.header(k.as_str(), v.as_bytes());
                     }

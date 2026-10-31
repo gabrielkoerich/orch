@@ -87,7 +87,7 @@ impl SlackChannel {
     }
 
     fn api_url(&self, method: &str) -> String {
-        format!("https://slack.com/api/{}", method)
+        format!("https://slack.com/api/{method}")
     }
 
     /// Fetch all messages newer than `oldest` from a channel, following pagination.
@@ -127,14 +127,14 @@ impl SlackChannel {
 
             if !response.status().is_success() {
                 let body = response.text().await.unwrap_or_default();
-                anyhow::bail!("slack API HTTP error: {}", body);
+                anyhow::bail!("slack API HTTP error: {body}");
             }
 
             let result: ConversationsHistoryResponse = response.json().await?;
 
             if !result.ok {
                 let err = result.error.as_deref().unwrap_or("unknown");
-                anyhow::bail!("slack conversations.history error: {}", err);
+                anyhow::bail!("slack conversations.history error: {err}");
             }
 
             all_messages.extend(result.messages.unwrap_or_default());
@@ -170,14 +170,14 @@ impl SlackChannel {
 
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("slack API HTTP error: {}", body);
+            anyhow::bail!("slack API HTTP error: {body}");
         }
 
         let result: PostMessageResponse = response.json().await?;
 
         if !result.ok {
             let err = result.error.as_deref().unwrap_or("unknown");
-            anyhow::bail!("slack chat.postMessage error: {}", err);
+            anyhow::bail!("slack chat.postMessage error: {err}");
         }
 
         Ok(())
@@ -186,7 +186,7 @@ impl SlackChannel {
 
 #[async_trait]
 impl Channel for SlackChannel {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "slack"
     }
 
@@ -201,21 +201,18 @@ impl Channel for SlackChannel {
 
         let bot_token = self.bot_token.clone();
         let client = self.client.clone();
-        let channel_id = match self.channel_id.clone() {
-            Some(id) => id,
-            None => {
-                // Defensive: is_none() early-return above should prevent reaching here
-                tracing::error!("slack channel_id unexpectedly None after guard check");
-                return Ok(rx);
-            }
+        let Some(channel_id) = self.channel_id.clone() else {
+            // Defensive: is_none() early-return above should prevent reaching here
+            tracing::error!("slack channel_id unexpectedly None after guard check");
+            return Ok(rx);
         };
-        let last_ts = self.last_ts.clone();
+        let last_ts = std::sync::Arc::clone(&self.last_ts);
 
         let token_fingerprint = {
             let mut hasher = Sha256::new();
             hasher.update(bot_token.as_bytes());
             let hash = hasher.finalize();
-            let hex: String = hash[..8].iter().map(|b| format!("{:02x}", b)).collect();
+            let hex: String = hash[..8].iter().map(|b| format!("{b:02x}")).collect();
             format!("sha256:{hex}")
         };
 
@@ -235,7 +232,7 @@ impl Channel for SlackChannel {
                     bot_token: bot_token.clone(),
                     client: client.clone(),
                     channel_id: Some(channel_id.clone()),
-                    last_ts: last_ts.clone(),
+                    last_ts: std::sync::Arc::clone(&last_ts),
                 };
 
                 // Snapshot the cursor once so all pagination pages use the same lower bound.
@@ -329,14 +326,14 @@ impl Channel for SlackChannel {
 
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("slack health check HTTP error: {}", body);
+            anyhow::bail!("slack health check HTTP error: {body}");
         }
 
         let result: AuthTestResponse = response.json().await?;
 
         if !result.ok {
             let err = result.error.as_deref().unwrap_or("unknown");
-            anyhow::bail!("slack auth.test failed: {}", err);
+            anyhow::bail!("slack auth.test failed: {err}");
         }
 
         tracing::info!("slack bot health check passed");

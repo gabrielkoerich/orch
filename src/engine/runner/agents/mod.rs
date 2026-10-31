@@ -42,7 +42,7 @@ pub struct PermissionRules {
     /// Restrict to orchestration-only operations — denies Read, Glob, Grep,
     /// and Bash commands for browsing/reading files (ls, cat, find, etc.).
     /// Agents translate this into their native permission model.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub deny_read_only: bool,
     /// Additional directories that must be writable (e.g. the git common dir
     /// when running inside a worktree whose `.git` metadata lives outside the
@@ -158,7 +158,7 @@ impl PermissionRules {
 /// functions parse agent-specific envelopes and return a unified `AgentResult`
 /// so callers (review pipeline, response handler) don't need format knowledge.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields read by tests and future phases
+#[expect(dead_code)] // fields read by tests and future phases
 pub struct AgentResult {
     /// Whether the agent reported an error (e.g. `is_error: true` in Claude).
     pub is_error: bool,
@@ -631,7 +631,7 @@ pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
     let mut done_confident = false;
     for sentence in trimmed
         .split(['.', '!', '?', '\n'])
-        .map(|s| s.trim())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
     {
         let s_lower = sentence.to_lowercase();
@@ -878,7 +878,7 @@ pub trait AgentRunner: Send + Sync {
     ///
     /// Returns `Err(AgentError)` only for terminal errors (rate limit, auth, etc.)
     /// that should abort the review pipeline entirely.
-    #[allow(dead_code)] // used by per-agent unit tests; production uses find_agent_result
+    #[expect(dead_code)] // used by per-agent unit tests; production uses find_agent_result
     fn extract_text(&self, raw: &str) -> Result<String, AgentError> {
         Ok(raw.to_string())
     }
@@ -1221,7 +1221,7 @@ pub(crate) mod patterns {
     }
 
     /// Check for rate limit / usage limit patterns in text.
-    pub fn detect_rate_limit(text: &str) -> Option<AgentError> {
+    pub(crate) fn detect_rate_limit(text: &str) -> Option<AgentError> {
         let lower = text.to_lowercase();
         let patterns = [
             "rate limit",
@@ -1346,7 +1346,7 @@ pub(crate) mod patterns {
     ///   - `"http 401"` / `"http/1.1 401"`
     ///   - `"401 unauthorized"` / `"401\n"` / `"401"` at end-of-string
     ///   - `": 401"` when not immediately followed by another digit
-    pub fn contains_http_status(lower: &str, code: &str) -> bool {
+    pub(crate) fn contains_http_status(lower: &str, code: &str) -> bool {
         // Fast prefix checks that are inherently unambiguous.
         if lower.contains(&format!("http {code}")) || lower.contains(&format!("{code} ")) {
             return true;
@@ -1372,7 +1372,7 @@ pub(crate) mod patterns {
     /// Returns the line containing the match (not the tail) so the stored
     /// error message is the actual error string rather than trailing output
     /// (e.g. NDJSON session metadata that agents emit at exit).
-    pub fn detect_auth_error(text: &str) -> Option<AgentError> {
+    pub(crate) fn detect_auth_error(text: &str) -> Option<AgentError> {
         let lower = text.to_lowercase();
         let patterns = [
             "unauthorized",
@@ -1465,11 +1465,10 @@ pub(crate) mod patterns {
 
     /// Returns the full line containing `byte_pos` in `text`.
     fn find_line_containing(text: &str, byte_pos: usize) -> String {
-        let start = text[..byte_pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let start = text[..byte_pos].rfind('\n').map_or(0, |i| i + 1);
         let end = text[byte_pos..]
             .find('\n')
-            .map(|i| byte_pos + i)
-            .unwrap_or(text.len());
+            .map_or(text.len(), |i| byte_pos + i);
         text[start..end].trim().to_string()
     }
 
@@ -1512,7 +1511,7 @@ pub(crate) mod patterns {
     }
 
     /// Check for transient network connectivity errors.
-    pub fn detect_network_error(text: &str) -> Option<AgentError> {
+    pub(crate) fn detect_network_error(text: &str) -> Option<AgentError> {
         let lower = text.to_lowercase();
         let patterns = [
             "connectionrefused",
@@ -1568,7 +1567,7 @@ pub(crate) mod patterns {
     /// event. Without this, the message falls through to `AgentError::Unknown`,
     /// which bumps the agent-wide failure cooldown instead of the
     /// model-scoped one that `ModelUnavailable` is exempted into.
-    pub fn detect_model_unavailable(text: &str) -> Option<AgentError> {
+    pub(crate) fn detect_model_unavailable(text: &str) -> Option<AgentError> {
         let lower = text.to_lowercase();
         let is_model_unavailable = lower.contains("model metadata")
             || lower.contains("no endpoints found")
@@ -1601,7 +1600,7 @@ pub(crate) mod patterns {
     }
 
     /// Check for missing worktree / working directory setup failures.
-    pub fn detect_worktree_missing(text: &str) -> Option<AgentError> {
+    pub(crate) fn detect_worktree_missing(text: &str) -> Option<AgentError> {
         let lower = text.to_lowercase();
         let patterns = ["worktree directory does not exist"];
         if patterns.iter().any(|p| lower.contains(p)) {
@@ -1613,7 +1612,7 @@ pub(crate) mod patterns {
     }
 
     /// Check for context overflow patterns.
-    pub fn detect_context_overflow(text: &str) -> Option<AgentError> {
+    pub(crate) fn detect_context_overflow(text: &str) -> Option<AgentError> {
         let lower = text.to_lowercase();
         let patterns = [
             "context_length_exceeded",
@@ -1632,7 +1631,7 @@ pub(crate) mod patterns {
     }
 
     /// Check for missing tooling patterns. Returns the tool name.
-    pub fn detect_missing_tool(text: &str) -> Option<AgentError> {
+    pub(crate) fn detect_missing_tool(text: &str) -> Option<AgentError> {
         let known_tools = [
             "bun",
             "node",
@@ -1692,7 +1691,7 @@ pub(crate) mod patterns {
     }
 
     /// Check for permission/sandbox denied patterns.
-    pub fn detect_permission_denied(text: &str) -> Option<AgentError> {
+    pub(crate) fn detect_permission_denied(text: &str) -> Option<AgentError> {
         let lower = text.to_lowercase();
         let patterns = [
             "permission denied",
@@ -1716,7 +1715,7 @@ pub(crate) mod patterns {
     }
 
     /// Check for interactive input prompts (1Password, SSH passphrase, etc.).
-    pub fn detect_waiting_for_input(text: &str) -> Option<AgentError> {
+    pub(crate) fn detect_waiting_for_input(text: &str) -> Option<AgentError> {
         let lower = text.to_lowercase();
         let patterns = [
             "enter passphrase",
@@ -1743,7 +1742,7 @@ pub(crate) mod patterns {
     /// Occurs when Claude CLI reconstructs a multi-turn tool-use request and the
     /// Anthropic API rejects it because a thinking block was altered between turns.
     /// Classified separately to avoid penalising the model with a failure count.
-    pub fn detect_thinking_block_conflict(text: &str) -> Option<AgentError> {
+    pub(crate) fn detect_thinking_block_conflict(text: &str) -> Option<AgentError> {
         // Match the exact phrasing the Anthropic API emits (backtick-quoted names,
         // case-sensitive — the API always uses this exact string).
         if text.contains(
@@ -1751,9 +1750,7 @@ pub(crate) mod patterns {
         ) {
             let message = text
                 .lines()
-                .find(|l| l.contains("cannot be modified"))
-                .map(|l| l.trim().to_string())
-                .unwrap_or_else(|| safe_tail(text, 300).to_string());
+                .find(|l| l.contains("cannot be modified")).map_or_else(|| safe_tail(text, 300).to_string(), |l| l.trim().to_string());
             return Some(AgentError::ThinkingBlockConflict { message });
         }
         None
@@ -1764,7 +1761,7 @@ pub(crate) mod patterns {
     /// Claude returns `"No conversation found with session ID: <uuid>"` when
     /// the session UUID stored in orch's KV has expired server-side. The caller
     /// should reset the stored UUID and retry with a fresh `--session-id`.
-    pub fn detect_stale_session(text: &str) -> Option<AgentError> {
+    pub(crate) fn detect_stale_session(text: &str) -> Option<AgentError> {
         // Case-insensitive match; extract the UUID if present.
         // We search the lowercased copy for the pattern, then find the
         // corresponding byte offset in the *original* text via char_indices so
@@ -1781,8 +1778,7 @@ pub(crate) mod patterns {
             let pos = text
                 .char_indices()
                 .nth(char_idx)
-                .map(|(i, _)| i)
-                .unwrap_or(text.len());
+                .map_or(text.len(), |(i, _)| i);
             // Try to extract the UUID that follows the colon.
             let after = &text[pos..];
             let session_id = after
@@ -1825,7 +1821,7 @@ pub(crate) mod patterns {
 
     /// Run all pattern detectors against combined stdout+stderr.
     /// Returns the first matching AgentError, or a generic Unknown.
-    pub fn classify_from_text(exit_code: i32, text: &str) -> AgentError {
+    pub(crate) fn classify_from_text(exit_code: i32, text: &str) -> AgentError {
         if exit_code == TIMEOUT_EXIT_CODE {
             return AgentError::Timeout {
                 elapsed: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
@@ -1900,7 +1896,7 @@ pub(crate) mod patterns {
     }
 
     /// Safely extract the last `max_bytes` of a string, respecting UTF-8 boundaries.
-    pub fn safe_tail(text: &str, max_bytes: usize) -> &str {
+    pub(crate) fn safe_tail(text: &str, max_bytes: usize) -> &str {
         if text.len() <= max_bytes {
             return text;
         }
@@ -1914,7 +1910,7 @@ pub(crate) mod patterns {
     }
 
     /// Safely extract the first `max_bytes` of a string, respecting UTF-8 boundaries.
-    pub fn safe_head(text: &str, max_bytes: usize) -> &str {
+    pub(crate) fn safe_head(text: &str, max_bytes: usize) -> &str {
         if text.len() <= max_bytes {
             return text;
         }
@@ -1932,7 +1928,7 @@ pub(crate) mod patterns {
     /// If it returns `Some`, the message is classified via `classify`. The most
     /// specific error is kept — any typed error (RateLimit, Auth, etc.) takes
     /// precedence over a generic `AgentFailed`.
-    pub fn detect_ndjson_error(
+    pub(crate) fn detect_ndjson_error(
         events: &[serde_json::Value],
         extract_message: impl Fn(&serde_json::Value) -> Option<String>,
         classify: impl Fn(&str) -> AgentError,
@@ -2026,7 +2022,7 @@ mod tests {
         use tracing_subscriber::EnvFilter;
 
         let output: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let output_clone = output.clone();
+        let output_clone = std::sync::Arc::clone(&output);
 
         struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for CaptureWriter {
@@ -2041,7 +2037,7 @@ mod tests {
         impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for CaptureWriter {
             type Writer = CaptureWriter;
             fn make_writer(&'a self) -> Self::Writer {
-                CaptureWriter(self.0.clone())
+                CaptureWriter(std::sync::Arc::clone(&self.0))
             }
         }
 
@@ -2062,8 +2058,7 @@ mod tests {
         };
         assert!(
             !captured.contains("unknown agent"),
-            "known claude-compatible agents must not emit 'unknown agent' warnings; got: {}",
-            captured
+            "known claude-compatible agents must not emit 'unknown agent' warnings; got: {captured}"
         );
     }
 
@@ -2075,7 +2070,7 @@ mod tests {
         assert!(e.to_string().contains("rate limit"));
 
         let e = AgentError::Timeout {
-            elapsed: Duration::from_secs(1800),
+            elapsed: Duration::from_mins(30),
         };
         assert!(e.to_string().contains("1800"));
     }
@@ -3131,7 +3126,11 @@ world"}"#;
     #[test]
     fn permission_rules_default_no_allowed_edit_paths() {
         let rules = PermissionRules::default();
-        assert!(rules.allowed_edit_paths.is_empty());
+        assert!(
+            rules.allowed_edit_paths.is_empty(),
+            "{:?}",
+            rules.allowed_edit_paths
+        );
     }
 
     // ── Permission translation across all agents ────────────────

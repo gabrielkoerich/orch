@@ -40,16 +40,11 @@ pub async fn run(dry_run: bool) -> anyhow::Result<()> {
                 continue;
             }
         };
-        if !project_entry
-            .file_type()
-            .map(|t| t.is_dir())
-            .unwrap_or(false)
-        {
+        if !project_entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
-        let branch_dirs = match std::fs::read_dir(project_entry.path()) {
-            Ok(d) => d,
-            Err(_) => continue,
+        let Ok(branch_dirs) = std::fs::read_dir(project_entry.path()) else {
+            continue;
         };
         for branch_entry in branch_dirs {
             let branch_entry = match branch_entry {
@@ -59,11 +54,7 @@ pub async fn run(dry_run: bool) -> anyhow::Result<()> {
                     continue;
                 }
             };
-            if !branch_entry
-                .file_type()
-                .map(|t| t.is_dir())
-                .unwrap_or(false)
-            {
+            if !branch_entry.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
             let wt_path = branch_entry.path().to_string_lossy().to_string();
@@ -72,17 +63,17 @@ pub async fn run(dry_run: bool) -> anyhow::Result<()> {
             }
 
             if dry_run {
-                println!("would remove: {}", wt_path);
+                println!("would remove: {wt_path}");
                 removed += 1;
                 continue;
             }
 
             let ok = cleanup_orphaned_worktree("prune", Path::new(&wt_path)).await;
             if ok {
-                println!("removed: {}", wt_path);
+                println!("removed: {wt_path}");
                 removed += 1;
             } else {
-                eprintln!("failed to remove: {}", wt_path);
+                eprintln!("failed to remove: {wt_path}");
                 failed += 1;
             }
         }
@@ -94,16 +85,13 @@ pub async fn run(dry_run: bool) -> anyhow::Result<()> {
     }
 
     if dry_run {
-        println!(
-            "\n{} orphaned worktree(s) would be removed (dry run)",
-            removed
-        );
+        println!("\n{removed} orphaned worktree(s) would be removed (dry run)");
     } else {
         println!(
             "\nRemoved {} orphaned worktree(s){}",
             removed,
             if failed > 0 {
-                format!(", {} failed", failed)
+                format!(", {failed} failed")
             } else {
                 String::new()
             }

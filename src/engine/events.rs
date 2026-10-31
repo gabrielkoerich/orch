@@ -111,7 +111,7 @@ impl EventBus {
     }
 
     /// Publish an event. Returns number of receivers that got it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn publish(&self, event: TaskEvent) -> usize {
         self.tx.send(event).unwrap_or(0)
     }
@@ -151,7 +151,7 @@ impl EventBus {
                         let mut rx = tx.subscribe();
                         tokio::spawn(async move {
                             let mut filter = EventFilter::default();
-                            #[allow(clippy::result_large_err)]
+                            #[expect(clippy::result_large_err)]
                             let callback = |req: &Request, resp| {
                                 filter = EventFilter::from_request(req);
                                 tracing::debug!(?filter, "ws client connected with filter");
@@ -229,7 +229,7 @@ pub fn select_available_listener() -> anyhow::Result<(std::net::TcpListener, u16
     let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "orch".to_string());
     let hash = hostname
         .bytes()
-        .fold(0u32, |acc, b| acc.wrapping_add(b as u32));
+        .fold(0u32, |acc, b| acc.wrapping_add(u32::from(b)));
     let range = 65535u32 - 49152;
     let start = 49152u16 + (hash % range) as u16;
 
@@ -258,8 +258,7 @@ pub fn cleanup_version_file() {
         let owned = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| s.split('\t').next()?.parse::<u32>().ok())
-            .map(|pid| pid == std::process::id())
-            .unwrap_or(true); // legacy plain-version files: assume ownership
+            .is_none_or(|pid| pid == std::process::id()); // legacy plain-version files: assume ownership
         if owned {
             let _ = std::fs::remove_file(path);
         }
@@ -436,7 +435,7 @@ mod tests {
         let port = bus.start_ws_server().await.unwrap();
 
         // Connect a websocket client
-        let url = format!("ws://127.0.0.1:{}", port);
+        let url = format!("ws://127.0.0.1:{port}");
         let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         let (_write, mut read) = ws.split();
 
@@ -608,12 +607,9 @@ mod tests {
         // Tiny capacity (1) so we can force lag by publishing faster than the
         // client consumes.
         let bus = EventBus::new(1);
-        let port = match bus.start_ws_server().await {
-            Ok(p) => p,
-            Err(_) => {
-                // Port unavailable (race with parallel tests) — skip gracefully.
-                return;
-            }
+        let Ok(port) = bus.start_ws_server().await else {
+            // Port unavailable (race with parallel tests) — skip gracefully.
+            return;
         };
 
         // Connect client, but don't read yet — let the buffer overflow.

@@ -21,8 +21,7 @@ impl TreeNode {
             .labels
             .iter()
             .find(|l| l.starts_with("status:"))
-            .map(|s| s.replace("status:", ""))
-            .unwrap_or_else(|| "unknown".to_string());
+            .map_or_else(|| "unknown".to_string(), |s| s.replace("status:", ""));
 
         let agent = task
             .labels
@@ -178,7 +177,7 @@ fn render_node(node: &TreeNode, output: &mut String, prefix: &str, is_last: bool
             node.status,
             node.agent
                 .as_ref()
-                .map(|a| format!("({}) ", a))
+                .map(|a| format!("({a}) "))
                 .unwrap_or_default(),
             node.title
         ));
@@ -193,7 +192,7 @@ fn render_node(node: &TreeNode, output: &mut String, prefix: &str, is_last: bool
             node.status,
             node.agent
                 .as_ref()
-                .map(|a| format!("({}) ", a))
+                .map(|a| format!("({a}) "))
                 .unwrap_or_default(),
             node.title
         ));
@@ -203,9 +202,9 @@ fn render_node(node: &TreeNode, output: &mut String, prefix: &str, is_last: bool
     let child_prefix = if is_root {
         prefix.to_string()
     } else if is_last {
-        format!("{}    ", prefix)
+        format!("{prefix}    ")
     } else {
-        format!("{}│   ", prefix)
+        format!("{prefix}│   ")
     };
 
     let child_count = node.children.len();
@@ -256,11 +255,14 @@ mod tests {
             title: title.to_string(),
             body: String::new(),
             state: "open".to_string(),
-            labels: labels.iter().map(|s| s.to_string()).collect(),
+            labels: labels
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             author: "test".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            url: format!("https://github.com/test/test/issues/{}", id),
+            url: format!("https://github.com/test/test/issues/{id}"),
         })
     }
 

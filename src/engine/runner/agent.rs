@@ -439,7 +439,12 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
             }
         }
 
-        if !inv.output_file.exists() && inv.output_file.parent().is_some_and(|p| p.is_dir()) {
+        if !inv.output_file.exists()
+            && inv
+                .output_file
+                .parent()
+                .is_some_and(std::path::Path::is_dir)
+        {
             tokio::fs::write(&inv.output_file, "").await?;
         }
 
@@ -487,7 +492,9 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
         }
     }
 
-    let sys_content = if !permissions.allowed_tools.is_empty() {
+    let sys_content = if permissions.allowed_tools.is_empty() {
+        inv.system_prompt.clone()
+    } else {
         let tools_list = permissions
             .allowed_tools
             .iter()
@@ -498,8 +505,6 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
         vars.insert("TOOLS_LIST".to_string(), tools_list);
         let tools_prompt = render_prompt_template(ALLOWED_TOOLS_TEMPLATE, vars);
         format!("{}\n\n{}", inv.system_prompt, tools_prompt)
-    } else {
-        inv.system_prompt.clone()
     };
 
     tokio::fs::write(&sys_file, &sys_content).await?;
@@ -726,7 +731,7 @@ pub fn build_agent_message(
                 let learnings = entry
                     .learnings
                     .iter()
-                    .map(|learning| format!("- {}", learning))
+                    .map(|learning| format!("- {learning}"))
                     .collect::<Vec<_>>()
                     .join("\n");
                 entry_vars.insert("LEARNINGS".to_string(), learnings);
@@ -794,7 +799,7 @@ pub fn build_review_prompt(
 /// Build the runner shell script contents for testing and inspection.
 ///
 /// IMPORTANT: this must not embed secrets (GH_TOKEN) into the script.
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub fn build_runner_script(inv: &AgentInvocation) -> anyhow::Result<String> {
     // Prepare attempt directory and prompt files
     let attempt_dir = crate::home::task_attempt_dir(&inv.repo, &inv.task_id, inv.attempt)?;
@@ -856,7 +861,6 @@ fn build_runner_script_in_dir(
     let sq_work_dir = shell_single_quote(&inv.work_dir.to_string_lossy());
     let script = format!(
         "#!/usr/bin/env bash\nset -euo pipefail\nstatus_file={sq_status}\nstderr_file={sq_stderr}\ntrap 'status=$?; printf \"%s\\n\" \"$status\" > \"$status_file\"' EXIT\nunset CLAUDECODE\ncd {sq_work_dir} || {{\n  printf '%s\\n' \"worktree directory does not exist: {sq_work_dir}\" > \"$stderr_file\"\n  exit 1\n}}\nset +e\nRESPONSE=$({agent_cmd} 2> \"$stderr_file\")\nCMD_STATUS=$?\nset -e\nprintf '%s' \"$RESPONSE\" > {sq_out}\nexit $CMD_STATUS\n",
-        agent_cmd = agent_cmd,
     );
 
     Ok(script)
@@ -1152,7 +1156,7 @@ mod tests {
             .current_dir(dir.path())
             .output()
             .unwrap();
-        assert!(status.stdout.is_empty(), "{:?}", status);
+        assert!(status.stdout.is_empty(), "{status:?}");
     }
 
     #[tokio::test]

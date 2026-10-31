@@ -167,7 +167,7 @@ pub async fn stats(session_id: &str) -> anyhow::Result<()> {
     let current_agent = summary.primary_agent.clone().unwrap_or(fallback_agent);
 
     if summary.total_messages == 0 {
-        println!("No messages found in session '{}'.", session_id);
+        println!("No messages found in session '{session_id}'.");
         return Ok(());
     }
 
@@ -177,10 +177,7 @@ pub async fn stats(session_id: &str) -> anyhow::Result<()> {
         session_id.to_string()
     };
 
-    println!(
-        "Session: {} ({}:{})",
-        session_label, current_agent, current_model
-    );
+    println!("Session: {session_label} ({current_agent}:{current_model})");
     println!(
         "Messages: {} ({} user, {} assistant)",
         summary.total_messages,
@@ -208,7 +205,7 @@ pub async fn stats(session_id: &str) -> anyhow::Result<()> {
             } else {
                 String::new()
             };
-            println!("  {}: {} msg{} (${:.4})", model, count, tokens_str, cost);
+            println!("  {model}: {count} msg{tokens_str} (${cost:.4})");
         }
     }
 

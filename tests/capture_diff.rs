@@ -1,7 +1,7 @@
-#[allow(dead_code)]
+#[expect(dead_code)]
 mod channels {
-    pub mod tmux {
-        pub async fn capture_pane(_session: &str) -> anyhow::Result<String> {
+    pub(crate) mod tmux {
+        pub(crate) async fn capture_pane(_session: &str) -> anyhow::Result<String> {
             Ok(String::new())
         }
 
@@ -9,21 +9,21 @@ mod channels {
         /// are treated as alive. This lets integration tests exercise both the
         /// #2573 fix (dead seen-alive sessions → silent) and the #2318 fix
         /// (alive seen-alive sessions → NOT silent) without real tmux.
-        pub async fn is_session_dead(session: &str) -> bool {
+        pub(crate) async fn is_session_dead(session: &str) -> bool {
             session.ends_with("-dead")
         }
     }
 
     #[derive(Debug, Clone)]
-    pub struct OutputChunk {
+    pub(crate) struct OutputChunk {
         pub content: String,
         pub is_final: bool,
     }
 
-    pub mod transport {
+    pub(crate) mod transport {
         use crate::channels::OutputChunk;
 
-        pub fn session_key(repo: &str, task_id: &str) -> String {
+        pub(crate) fn session_key(repo: &str, task_id: &str) -> String {
             if task_id.starts_with("internal:") {
                 task_id.to_string()
             } else {
@@ -32,53 +32,61 @@ mod channels {
         }
 
         #[derive(Debug)]
-        pub struct Transport;
+        pub(crate) struct Transport;
 
         impl Transport {
-            pub fn new() -> Self {
+            pub(crate) fn new() -> Self {
                 Self
             }
 
-            pub async fn get_session_output(&self, _task_id: &str) -> Option<String> {
+            pub(crate) async fn get_session_output(&self, _task_id: &str) -> Option<String> {
                 None
             }
 
-            pub async fn push_output(&self, _repo: &str, _task_id: &str, _chunk: OutputChunk) {}
+            pub(crate) async fn push_output(
+                &self,
+                _repo: &str,
+                _task_id: &str,
+                _chunk: OutputChunk,
+            ) {
+            }
 
-            pub async fn unbind(&self, _repo: &str, _task_id: &str) {}
+            pub(crate) async fn unbind(&self, _repo: &str, _task_id: &str) {}
         }
     }
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 mod engine {
-    pub mod suspend {
+    pub(crate) mod suspend {
         use chrono::{DateTime, Duration, Utc};
         use std::sync::Mutex;
 
         static GAPS: Mutex<Vec<(DateTime<Utc>, Duration)>> = Mutex::new(Vec::new());
 
-        pub fn suspended_duration_since(since: DateTime<Utc>) -> Duration {
+        pub(crate) fn suspended_duration_since(since: DateTime<Utc>) -> Duration {
             GAPS.lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .iter()
                 .filter(|(detected_at, _)| *detected_at > since)
                 .fold(Duration::zero(), |acc, (_, gap)| acc + *gap)
         }
 
-        pub fn inject_gap_for_test(detected_at: DateTime<Utc>, gap: Duration) {
+        pub(crate) fn inject_gap_for_test(detected_at: DateTime<Utc>, gap: Duration) {
             GAPS.lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push((detected_at, gap));
         }
 
-        pub fn clear_for_test() {
-            GAPS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        pub(crate) fn clear_for_test() {
+            GAPS.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
         }
     }
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 #[path = "../src/channels/capture.rs"]
 mod capture;
 

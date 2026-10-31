@@ -79,10 +79,10 @@ fn insert_project(content: &str, path: &str) -> anyhow::Result<ProjectsEdit> {
                 return Ok(ProjectsEdit::Updated(join_lines(&lines, newline_at_end)));
             }
             if is_empty_list_value(value) {
-                if !comment.trim().is_empty() {
-                    lines[key_line] = format!("projects:{comment}");
-                } else {
+                if comment.trim().is_empty() {
                     lines[key_line] = "projects:".to_string();
+                } else {
+                    lines[key_line] = format!("projects:{comment}");
                 }
             } else if !value.is_empty() {
                 anyhow::bail!("could not edit projects: list as text");
@@ -332,10 +332,7 @@ fn inline_comment_index(s: &str) -> Option<usize> {
             '"' if !in_single => in_double = !in_double,
             '#' if !in_single
                 && !in_double
-                && (i == 0
-                    || s.as_bytes()
-                        .get(i - 1)
-                        .is_some_and(|b| b.is_ascii_whitespace())) =>
+                && (i == 0 || s.as_bytes().get(i - 1).is_some_and(u8::is_ascii_whitespace)) =>
             {
                 return Some(i);
             }

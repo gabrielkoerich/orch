@@ -139,8 +139,7 @@ fn reload_file(path: &PathBuf) -> bool {
         Err(err) => {
             let first_failure = BAD_FILES
                 .write()
-                .map(|mut bad| bad.insert(path.clone()))
-                .unwrap_or(false);
+                .is_ok_and(|mut bad| bad.insert(path.clone()));
             if first_failure {
                 tracing::error!(
                     path = %path.display(),
@@ -155,7 +154,9 @@ fn reload_file(path: &PathBuf) -> bool {
 
 /// Start the file watcher if not already running.
 fn ensure_watcher() {
-    let mut watcher_guard = FILE_WATCHER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut watcher_guard = FILE_WATCHER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if watcher_guard.is_some() {
         return;
     }
@@ -164,7 +165,7 @@ fn ensure_watcher() {
     let watcher = RecommendedWatcher::new(
         move |res: Result<notify::Event, notify::Error>| {
             if let Ok(event) = res {
-                if !is_content_change(&event.kind) {
+                if !is_content_change(event.kind) {
                     return;
                 }
                 for path in event.paths {
@@ -187,7 +188,7 @@ fn ensure_watcher() {
 
 // inotify reports every read as an access event, and reload_file reads the file, so reacting to
 // access events reloads forever on Linux
-fn is_content_change(kind: &notify::EventKind) -> bool {
+fn is_content_change(kind: notify::EventKind) -> bool {
     kind.is_create() || kind.is_modify() || kind.is_remove()
 }
 
@@ -627,9 +628,8 @@ fn extract_projects_list(root: &serde_norway::Value, key: &str) -> anyhow::Resul
     let mut current = root;
     for part in key.split('.') {
         // If key doesn't exist, return empty vector
-        let next = match current.get(part) {
-            Some(v) => v,
-            None => return Ok(vec![]),
+        let Some(next) = current.get(part) else {
+            return Ok(vec![]);
         };
         current = next;
     }
@@ -776,7 +776,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_yaml(dir.path(), "config.yml", "repo: owner/single-repo\n");
         let projects = resolve_projects_list(&path, "projects").unwrap();
-        assert!(projects.is_empty());
+        assert!(projects.is_empty(), "{projects:?}");
     }
 
     #[test]
@@ -801,7 +801,7 @@ mod tests {
     fn extract_projects_list_empty_for_missing() {
         let yaml = serde_norway::from_str::<serde_norway::Value>("foo: bar").unwrap();
         let projects = extract_projects_list(&yaml, "projects").unwrap();
-        assert!(projects.is_empty());
+        assert!(projects.is_empty(), "{projects:?}");
     }
 
     #[test]
@@ -873,7 +873,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_yaml(dir.path(), "config.yml", "foo: bar\n");
         let list = resolve_list(&path, "workflow.allowed_tools").unwrap();
-        assert!(list.is_empty());
+        assert!(list.is_empty(), "{list:?}");
     }
 
     #[test]
@@ -914,16 +914,16 @@ mod tests {
     #[test]
     fn reading_a_config_file_does_not_trigger_a_reload() {
         use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, ModifyKind};
-        assert!(!is_content_change(&notify::EventKind::Access(
+        assert!(!is_content_change(notify::EventKind::Access(
             AccessKind::Open(AccessMode::Read)
         )));
-        assert!(!is_content_change(&notify::EventKind::Access(
+        assert!(!is_content_change(notify::EventKind::Access(
             AccessKind::Close(AccessMode::Read)
         )));
-        assert!(is_content_change(&notify::EventKind::Modify(
+        assert!(is_content_change(notify::EventKind::Modify(
             ModifyKind::Data(DataChange::Content)
         )));
-        assert!(is_content_change(&notify::EventKind::Create(
+        assert!(is_content_change(notify::EventKind::Create(
             CreateKind::File
         )));
     }

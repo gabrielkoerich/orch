@@ -35,7 +35,7 @@ struct OllamaResponse {
 ///
 /// Handles HTTP requests to localhost:11434 and parses responses
 /// using the same format as cloud LLMs.
-pub struct OllamaRouter {
+pub(super) struct OllamaRouter {
     /// Base URL for Ollama API.
     url: String,
     /// Model name to use for routing.
@@ -45,7 +45,7 @@ pub struct OllamaRouter {
 }
 
 impl OllamaRouter {
-    pub fn new(config: &RouterConfig) -> Self {
+    pub(super) fn new(config: &RouterConfig) -> Self {
         let timeout = Duration::from_secs(config.ollama_timeout_seconds);
         let client = reqwest::Client::builder()
             .timeout(timeout)
@@ -63,7 +63,7 @@ impl OllamaRouter {
     ///
     /// Builds a routing prompt, calls Ollama, parses the JSON response,
     /// and returns a RouteResult.
-    pub async fn route(
+    pub(super) async fn route(
         &self,
         task: &ExternalTask,
         config: &RouterConfig,
@@ -134,10 +134,10 @@ impl OllamaRouter {
         // Validate executor against configured agents
         let mut agent = llm_response.executor.to_lowercase();
         if !config.agents.contains(&agent) {
-            agent = if !config.fallback_executor.is_empty() {
-                config.fallback_executor.clone()
-            } else {
+            agent = if config.fallback_executor.is_empty() {
                 config.agents.first().cloned().unwrap_or_default()
+            } else {
+                config.fallback_executor.clone()
             };
         }
 
@@ -246,7 +246,10 @@ mod tests {
             title: title.to_string(),
             body: body.to_string(),
             state: "open".to_string(),
-            labels: labels.iter().map(|s| s.to_string()).collect(),
+            labels: labels
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             author: "testuser".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -288,7 +291,7 @@ mod tests {
     #[test]
     fn ollama_response_raw_body_used_on_json_failure() {
         // Simulate the fallback: JSON parse fails → body becomes the response
-        let raw_body = r#"Here's my routing decision: use claude for this task."#;
+        let raw_body = r"Here's my routing decision: use claude for this task.";
         let result: OllamaResponse = match serde_json::from_str::<OllamaResponse>(raw_body) {
             Ok(r) => r,
             Err(_) => OllamaResponse {
@@ -297,7 +300,7 @@ mod tests {
         };
         assert_eq!(result.response, raw_body);
         // The fallback text is then trimmed and passed to parse_llm_response
-        assert!(!result.response.trim().is_empty());
+        assert_ne!(result.response.trim(), "");
     }
 
     #[test]

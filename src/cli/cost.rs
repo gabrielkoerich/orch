@@ -17,14 +17,14 @@ pub async fn show_task(id: &str) -> anyhow::Result<()> {
         .unwrap_or_default();
 
     if usage.total_tokens() == 0 {
-        println!("No token data available for task #{}", id);
+        println!("No token data available for task #{id}");
         println!("Run the task first to collect token usage.");
         return Ok(());
     }
 
     let pricing = store::pricing_for_model(&model);
 
-    println!("Task #{}: cost breakdown", id);
+    println!("Task #{id}: cost breakdown");
     println!(
         "├── Input tokens:  {:>12}",
         format_tokens(usage.input_tokens)

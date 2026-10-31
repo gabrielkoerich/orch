@@ -413,14 +413,13 @@ struct ReviewPayload {
 }
 
 fn verify_signature(secret: &str, payload: &[u8], signature: &str) -> bool {
-    let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
-        Ok(m) => m,
-        Err(_) => return false,
+    let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) else {
+        return false;
     };
     mac.update(payload);
     let result = mac.finalize().into_bytes();
 
-    let expected = format!("sha256={:x}", result);
+    let expected = format!("sha256={result:x}");
     if expected.len() != signature.len() {
         return false;
     }
@@ -627,15 +626,18 @@ pub async fn check_webhook_health(port: u16) -> (bool, Option<String>) {
             return (false, Some(format!("failed to build HTTP client: {e}")));
         }
     };
-    let url = format!("http://localhost:{}/health", port);
+    let url = format!("http://localhost:{port}/health");
     match client.get(&url).send().await {
         Ok(response) if response.status().is_success() => {
             // Log dedup metrics from the health endpoint response.
             if let Ok(body) = response.json::<serde_json::Value>().await {
-                let seen = body.get("seen_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                let seen = body
+                    .get("seen_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
                 let dupes = body
                     .get("duplicate_count")
-                    .and_then(|v| v.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0);
                 tracing::debug!(
                     seen_count = seen,
@@ -676,11 +678,12 @@ pub fn webhook_backoff_delay(attempt: u32) -> std::time::Duration {
     let max_ms: u64 = 30_000;
     let exp_ms = base_ms.saturating_mul(1u64 << (attempt.saturating_sub(1)).min(6));
     let bounded_ms = exp_ms.min(max_ms);
-    let jitter_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_millis() as u64
-        % 500;
+    let jitter_ms = u64::from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_millis(),
+    ) % 500;
     std::time::Duration::from_millis(bounded_ms + jitter_ms)
 }
 
@@ -699,7 +702,7 @@ pub async fn start_webhook_server(
     repo: String,
     tx: tokio::sync::mpsc::Sender<IncomingMessage>,
 ) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
 
     let window_secs = crate::config::get("webhook.dedup_window_seconds")
         .ok()
@@ -714,19 +717,17 @@ pub async fn start_webhook_server(
     let store_type =
         crate::config::get("webhook.dedup_store").unwrap_or_else(|_| "memory".to_string());
 
-    let metrics_enabled = crate::config::get("webhook.dedup_metrics")
-        .map(|v| v == "true")
-        .unwrap_or(true);
+    let metrics_enabled = crate::config::get("webhook.dedup_metrics").map_or(true, |v| v == "true");
 
     let dedup_store = if store_type == "file" {
-        let path = crate::config::get("webhook.dedup_path")
-            .ok()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
+        let path = crate::config::get("webhook.dedup_path").ok().map_or_else(
+            || {
                 crate::home::orch_home()
                     .unwrap_or_else(|_| PathBuf::from("/tmp"))
                     .join("webhook_dedup.db")
-            });
+            },
+            PathBuf::from,
+        );
 
         // Initialization may perform blocking filesystem I/O (reading the
         // dedup file). Run the constructor on a blocking thread so we don't
@@ -1071,7 +1072,7 @@ mod tests {
         let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(payload);
         let result = mac.finalize().into_bytes();
-        let signature = format!("sha256={:x}", result);
+        let signature = format!("sha256={result:x}");
 
         assert!(
             verify_signature(secret, payload, &signature),
@@ -1129,7 +1130,7 @@ mod tests {
 
         // Insert max + 5 entries; each with a unique ID.
         for i in 0..(max + 5) {
-            store.check_and_insert(&format!("d-{}", i)).await;
+            store.check_and_insert(&format!("d-{i}")).await;
         }
 
         let m = store.metrics().await;
@@ -1191,9 +1192,7 @@ mod tests {
         let now_secs: u64 = 1_700_000_000;
 
         for i in 0..(DEFAULT_MAX_SEEN_DELIVERIES + 10) {
-            inner
-                .entries
-                .insert(format!("id-{}", i), now_secs - i as u64);
+            inner.entries.insert(format!("id-{i}"), now_secs - i as u64);
         }
 
         // Use a window large enough so none of the test entries expire (they span
@@ -1620,13 +1619,11 @@ mod tests {
         let delay = webhook_backoff_delay(10);
         assert!(
             delay.as_millis() <= 30_500,
-            "delay exceeded 30 s cap + jitter: {:?}",
-            delay
+            "delay exceeded 30 s cap + jitter: {delay:?}"
         );
         assert!(
             delay.as_millis() >= 500,
-            "delay should be at least base: {:?}",
-            delay
+            "delay should be at least base: {delay:?}"
         );
     }
 

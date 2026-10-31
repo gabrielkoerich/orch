@@ -126,7 +126,7 @@ pub(crate) async fn handle(text: &str, store: &TaskStore, notify: &Notify) {
                     .payload
                     .as_ref()
                     .and_then(|p| p.pointer("/issue/number"))
-                    .and_then(|v| v.as_i64());
+                    .and_then(serde_json::Value::as_i64);
 
                 if let Some(number) = number {
                     let key = format!("dep_blocker_read_at:{}#{number}", msg.repo);

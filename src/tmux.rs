@@ -110,7 +110,7 @@ impl TmuxManager {
         // session creation to avoid exposing them in process arguments.
         for (key, value) in env_vars {
             // tmux accepts -e KEY=VALUE to inject environment into the session.
-            cmd.arg("-e").arg(format!("{}={}", key, value));
+            cmd.arg("-e").arg(format!("{key}={value}"));
         }
 
         cmd.arg(command);
@@ -135,8 +135,7 @@ impl TmuxManager {
             .args(["has-session", "-t", session])
             .output_with_context()
             .await
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .is_ok_and(|o| o.status.success())
     }
 
     /// Kill a session.
@@ -585,8 +584,7 @@ pub(crate) fn test_session_name() -> String {
         "orch-test-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or_else(|_| 0)
+            .map_or_else(|_| 0, |d| d.as_millis())
     )
 }
 
@@ -750,18 +748,16 @@ mod tests {
             .output()
             .await;
 
-        let output = match check_result {
-            Ok(o) => o,
-            Err(_) => {
-                eprintln!("Skipping test: unable to check tmux environment");
-                return;
-            }
+        let output = if let Ok(o) = check_result {
+            o
+        } else {
+            eprintln!("Skipping test: unable to check tmux environment");
+            return;
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             stdout.contains("TEST_VAR=test_value"),
-            "Expected TEST_VAR=test_value, got: {}",
-            stdout
+            "Expected TEST_VAR=test_value, got: {stdout}"
         );
     }
 
@@ -857,8 +853,7 @@ mod tests {
             .await;
         assert!(
             result.is_ok(),
-            "capture_pane should return Ok for non-existent session, got: {:?}",
-            result
+            "capture_pane should return Ok for non-existent session, got: {result:?}"
         );
         assert_eq!(
             result.unwrap(),
@@ -882,8 +877,7 @@ mod tests {
             .await;
         assert!(
             result.is_ok(),
-            "wait_for_completion should return Ok for non-existent session, got: {:?}",
-            result
+            "wait_for_completion should return Ok for non-existent session, got: {result:?}"
         );
         assert_eq!(
             result.unwrap(),
@@ -897,15 +891,14 @@ mod tests {
     #[tokio::test]
     async fn test_manager_does_not_touch_the_default_server() {
         let tmux = TmuxManager::new();
-        let name = match tmux
+        let name = if let Ok(n) = tmux
             .create_session("owner/repo", "isolation", "/tmp", "sleep 30", &[])
             .await
         {
-            Ok(n) => n,
-            Err(_) => {
-                eprintln!("Skipping test: tmux not available or failed to create test session");
-                return;
-            }
+            n
+        } else {
+            eprintln!("Skipping test: tmux not available or failed to create test session");
+            return;
         };
         let _guard = SessionGuard(name.clone());
 
@@ -918,8 +911,7 @@ mod tests {
             .args(["has-session", "-t", &name])
             .output()
             .await
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+            .is_ok_and(|o| o.status.success());
         assert!(
             !on_default,
             "TmuxManager under cfg(test) must not create sessions on the default tmux server"

@@ -1,4 +1,4 @@
-use super::*;
+use super::{pricing_for_model, Context, MemoryEntry, SqlitePool, TaskStore, TokenUsage};
 use crate::cluster::Command;
 use crate::security;
 use serde::{Deserialize, Serialize};
@@ -613,7 +613,7 @@ fn owned_updates(
 
 impl TaskStore {
     /// Append a lifecycle activity event for a task.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn append_activity(
         &self,
         task_id: i64,
@@ -647,7 +647,7 @@ impl TaskStore {
 
     /// Append a lifecycle activity event for a task within a transaction.
     #[doc(hidden)]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn append_activity_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         task_id: i64,
@@ -980,9 +980,9 @@ impl TaskStore {
 
     /// Update the block reason for a task.
     pub async fn set_block_reason(&self, id: i64, reason: Option<&str>) -> anyhow::Result<()> {
-        let value = reason
-            .map(|r| serde_json::Value::String(r.to_string()))
-            .unwrap_or(serde_json::Value::Null);
+        let value = reason.map_or(serde_json::Value::Null, |r| {
+            serde_json::Value::String(r.to_string())
+        });
         self.set_fields(id, &[("block_reason", value)]).await
     }
 
@@ -2755,7 +2755,10 @@ pub(crate) async fn replace_replicated(
 
 /// The SQL behind each replicated task write, run with the proposer's time
 pub(crate) mod apply {
-    use super::*;
+    use super::{
+        sanitize_activity_details, sql_value_for_task_field, MemoryEntry, NewTask, Row,
+        StoreRouteCmd, TaskStatus, UpsertExternalCmd, ALLOWED_FIELDS, INCREMENTABLE_FIELDS,
+    };
     use sqlx::SqliteConnection;
 
     async fn previous(
@@ -2778,7 +2781,7 @@ pub(crate) mod apply {
         Ok((status, agent, model))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn activity(
         conn: &mut SqliteConnection,
         task_id: i64,
@@ -3160,7 +3163,7 @@ pub(crate) mod apply {
         .bind(&route.agent)
         .bind(&route.model)
         .bind(&route.complexity)
-        .bind(route.estimate as i64)
+        .bind(i64::from(route.estimate))
         .bind(&route.reason)
         .bind(&route.profile)
         .bind(&route.skills)
@@ -3196,7 +3199,7 @@ pub(crate) mod apply {
         let result = sqlx::query(
             "UPDATE tasks SET estimate = ?, updated_at = ? WHERE id = ? AND estimate = 0",
         )
-        .bind(estimate as i64)
+        .bind(i64::from(estimate))
         .bind(now)
         .bind(id)
         .execute(conn)

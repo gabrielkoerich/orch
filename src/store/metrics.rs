@@ -1,4 +1,4 @@
-use super::*;
+use super::TaskStore;
 #[cfg(test)]
 use chrono::Datelike;
 use chrono::Utc;

@@ -89,7 +89,7 @@ pub struct Join {
 fn authorized(app: &App, headers: &HeaderMap) -> bool {
     let given = headers
         .get(SECRET_HEADER)
-        .map(|v| v.as_bytes())
+        .map(reqwest::header::HeaderValue::as_bytes)
         .unwrap_or_default();
     given.ct_eq(app.secret.as_bytes()).into()
 }
@@ -314,7 +314,7 @@ impl RaftNetworkFactory<TypeConfig> for HttpNetwork {
         Peer {
             target,
             addr: node.addr.clone(),
-            secret: self.secret.clone(),
+            secret: std::sync::Arc::clone(&self.secret),
         }
     }
 }

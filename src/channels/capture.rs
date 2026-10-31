@@ -87,7 +87,7 @@ impl CaptureService {
         // re-registrations both observe the same stale generation value.
         let generation = {
             let mut buffers = self.buffers.write().await;
-            let generation = buffers.get(&skey).map(|b| b.generation + 1).unwrap_or(0);
+            let generation = buffers.get(&skey).map_or(0, |b| b.generation + 1);
             let buffer = OutputBuffer {
                 repo: repo.to_string(),
                 session: session.to_string(),
@@ -280,14 +280,11 @@ impl CaptureService {
                     // 2. It has the same generation (not re-registered)
                     // 3. It was seen alive before
                     // 4. The tmux session is actually dead
-                    let should_finalize = current
-                        .as_ref()
-                        .map(|c| {
-                            c.generation == buffer.generation
-                                && c.seen_alive
-                                && c.session == buffer.session
-                        })
-                        .unwrap_or(false);
+                    let should_finalize = current.as_ref().is_some_and(|c| {
+                        c.generation == buffer.generation
+                            && c.seen_alive
+                            && c.session == buffer.session
+                    });
 
                     if should_finalize && tmux::is_session_dead(&buffer.session).await {
                         tracing::info!(

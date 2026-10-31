@@ -198,7 +198,7 @@ impl CodexRunner {
 
 impl AgentRunner for CodexRunner {
     #[cfg(test)]
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "codex"
     }
 
@@ -295,12 +295,6 @@ impl AgentRunner for CodexRunner {
   -c 'sandbox_workspace_write.network_access=true' \
   -c 'shell_environment_policy.inherit=all' \
   {permission_flags} {add_dir_flags} --json - < <(cat "{sys_file}" "{msg_file}")"#,
-            sys_file = sys_file,
-            msg_file = msg_file,
-            timeout_cmd = timeout_cmd,
-            model_flag = model_flag,
-            permission_flags = permission_flags,
-            add_dir_flags = add_dir_flags,
         )
     }
 
@@ -917,7 +911,7 @@ mod tests {
     #[test]
     fn extract_text_empty_input_returns_empty_ok() {
         let text = runner().extract_text("").unwrap();
-        assert!(text.is_empty());
+        assert_eq!(text, "");
     }
 
     // ── find_codex_result ───────────────────────────────────────

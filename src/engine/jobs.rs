@@ -157,8 +157,7 @@ pub fn resolve_jobs_path() -> PathBuf {
 pub fn load_jobs(path: &PathBuf) -> anyhow::Result<Vec<Job>> {
     let base_dir = path
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let mut jobs: Vec<Job> = if path.exists() {
         let content =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -271,7 +270,7 @@ pub fn scan_prompt_jobs(base_dir: &Path) -> anyhow::Result<Vec<Job>> {
     }
     let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
         .with_context(|| format!("reading {}", dir.display()))?
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("md"))
         .collect();
@@ -526,14 +525,16 @@ pub async fn tick(
                 match backend.get_task(&ExternalId(task_id_clone.clone())).await {
                     Ok(task) => {
                         let status = task.labels.iter().find(|l| l.starts_with("status:"));
-                        match status.map(|s| s.as_str()) {
-                            Some("status:in_progress")
-                            | Some("status:routed")
-                            | Some("status:new")
-                            | Some("status:needs_review")
-                            | Some("status:in_review")
-                            | Some("status:approved")
-                            | Some("status:waiting") => true,
+                        match status.map(std::string::String::as_str) {
+                            Some(
+                                "status:in_progress"
+                                | "status:routed"
+                                | "status:new"
+                                | "status:needs_review"
+                                | "status:in_review"
+                                | "status:approved"
+                                | "status:waiting",
+                            ) => true,
                             None => true,     // No status label — treat as active
                             Some(_) => false, // Terminal state
                         }
@@ -714,7 +715,7 @@ pub async fn execute_job(
                         .await
                     {
                         Ok(internal_id) => {
-                            let task_id = format!("internal:{}", internal_id);
+                            let task_id = format!("internal:{internal_id}");
                             tracing::info!(job_id = job.id, task_id, "created internal task");
                             state.active_task_id = Some(task_id);
                             state.last_task_status = Some("new".to_string());

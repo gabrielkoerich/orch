@@ -39,7 +39,7 @@ fn print_summary_table(
     summary: &crate::store::MetricsSummary,
     cost: Option<&crate::store::CostSummary>,
 ) {
-    println!("── {} ──────────────────────────────────", title);
+    println!("── {title} ──────────────────────────────────");
 
     let total = summary.tasks_completed_24h + summary.tasks_failed_24h;
     let success_rate = if total > 0 {
@@ -52,7 +52,7 @@ fn print_summary_table(
         "  Tasks ({}):  {} completed, {} failed",
         window_label, summary.tasks_completed_24h, summary.tasks_failed_24h
     );
-    println!("  Success rate: {:.1}%", success_rate);
+    println!("  Success rate: {success_rate:.1}%");
 
     // Duration by complexity
     let mut durations = Vec::new();

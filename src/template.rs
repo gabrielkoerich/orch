@@ -12,14 +12,14 @@ fn compile_pattern(pattern: &str, label: &str) -> Result<Regex, String> {
 fn if_pattern() -> Result<&'static Regex, String> {
     static IF_PATTERN: LazyLock<Result<Regex, String>> =
         LazyLock::new(|| compile_pattern(r"(?s)\{\{#if\s+(\w+)\}\}(.*?)\{\{/if\}\}", "if_pattern"));
-    IF_PATTERN.as_ref().map_err(|err| err.clone())
+    IF_PATTERN.as_ref().map_err(std::clone::Clone::clone)
 }
 
 /// Matches `{{VAR}}` variable placeholders.
 fn var_pattern() -> Result<&'static Regex, String> {
     static VAR_PATTERN: LazyLock<Result<Regex, String>> =
         LazyLock::new(|| compile_pattern(r"\{\{(\w+)\}\}", "var_pattern"));
-    VAR_PATTERN.as_ref().map_err(|err| err.clone())
+    VAR_PATTERN.as_ref().map_err(std::clone::Clone::clone)
 }
 
 fn render_template_with_vars(
@@ -31,7 +31,7 @@ fn render_template_with_vars(
     loop {
         let mut changed = false;
         let new_data = if_pattern()?
-            .replace_all(&data, |caps: &regex::Captures| {
+            .replace_all(&data, |caps: &regex::Captures<'_>| {
                 changed = true;
                 let var_name = &caps[1];
                 let content = &caps[2];
@@ -49,7 +49,7 @@ fn render_template_with_vars(
     }
 
     let result = var_pattern()?
-        .replace_all(&data, |caps: &regex::Captures| {
+        .replace_all(&data, |caps: &regex::Captures<'_>| {
             let var_name = &caps[1];
             vars.get(var_name).cloned().unwrap_or_default()
         })
@@ -70,15 +70,12 @@ pub fn render_template_str(
 }
 
 pub fn render_template(template_path: &str, extra_vars: &[String]) -> Result<String, String> {
-    if !fs::metadata(template_path)
-        .map(|m| m.is_file())
-        .unwrap_or(false)
-    {
-        return Err(format!("template not found: {}", template_path));
+    if !fs::metadata(template_path).is_ok_and(|m| m.is_file()) {
+        return Err(format!("template not found: {template_path}"));
     }
 
     let data =
-        fs::read_to_string(template_path).map_err(|e| format!("failed to read template: {}", e))?;
+        fs::read_to_string(template_path).map_err(|e| format!("failed to read template: {e}"))?;
 
     let mut vars: HashMap<String, String> = HashMap::new();
 

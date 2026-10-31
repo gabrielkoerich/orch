@@ -39,7 +39,7 @@ struct MockBackend;
 
 #[async_trait]
 impl ExternalBackend for MockBackend {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "mock"
     }
 
@@ -56,13 +56,13 @@ impl ExternalBackend for MockBackend {
         Ok(ExternalTask {
             id: id.clone(),
             title: "mock task".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             state: "open".to_string(),
             labels: vec![],
             author: "test".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            url: "".to_string(),
+            url: String::new(),
         })
     }
 
@@ -137,7 +137,7 @@ async fn notify_done_event_pushes_notification() {
     let transport = Arc::new(Transport::new());
     let mut notify_rx = transport.subscribe_notifications();
 
-    notify::spawn(rx, transport.clone());
+    notify::spawn(rx, std::sync::Arc::clone(&transport));
 
     tx.send(make_event("42", "owner/repo", "done")).unwrap();
 
@@ -164,7 +164,7 @@ async fn notify_in_review_event_pushes_notification() {
     let transport = Arc::new(Transport::new());
     let mut notify_rx = transport.subscribe_notifications();
 
-    notify::spawn(rx, transport.clone());
+    notify::spawn(rx, std::sync::Arc::clone(&transport));
 
     tx.send(make_event("7", "owner/repo", "in_review")).unwrap();
 
@@ -188,7 +188,7 @@ async fn notify_needs_review_event_suppressed() {
     let transport = Arc::new(Transport::new());
     let mut notify_rx = transport.subscribe_notifications();
 
-    notify::spawn(rx, transport.clone());
+    notify::spawn(rx, std::sync::Arc::clone(&transport));
 
     tx.send(make_event("7", "owner/repo", "needs_review"))
         .unwrap();
@@ -208,7 +208,7 @@ async fn notify_blocked_event_pushes_notification() {
     let transport = Arc::new(Transport::new());
     let mut notify_rx = transport.subscribe_notifications();
 
-    notify::spawn(rx, transport.clone());
+    notify::spawn(rx, std::sync::Arc::clone(&transport));
 
     tx.send(make_event("3", "owner/repo", "blocked")).unwrap();
 
@@ -228,7 +228,7 @@ async fn notify_failed_event_pushes_notification() {
     let transport = Arc::new(Transport::new());
     let mut notify_rx = transport.subscribe_notifications();
 
-    notify::spawn(rx, transport.clone());
+    notify::spawn(rx, std::sync::Arc::clone(&transport));
 
     tx.send(make_event("8", "owner/repo", "failed")).unwrap();
 
@@ -250,7 +250,7 @@ async fn notify_intermediate_statuses_not_forwarded() {
     let transport = Arc::new(Transport::new());
     let mut notify_rx = transport.subscribe_notifications();
 
-    notify::spawn(rx, transport.clone());
+    notify::spawn(rx, std::sync::Arc::clone(&transport));
 
     for status in &["new", "routed", "in_progress", "needs_review"] {
         tx.send(make_event("1", "owner/repo", status)).unwrap();
@@ -273,7 +273,7 @@ async fn notify_multiple_terminal_events_all_forwarded() {
     let transport = Arc::new(Transport::new());
     let mut notify_rx = transport.subscribe_notifications();
 
-    notify::spawn(rx, transport.clone());
+    notify::spawn(rx, std::sync::Arc::clone(&transport));
 
     tx.send(make_event("1", "repo/a", "done")).unwrap();
     tx.send(make_event("2", "repo/b", "blocked")).unwrap();
@@ -309,7 +309,7 @@ async fn notify_channel_close_exits_cleanly() {
     let (tx, rx) = broadcast::channel::<TaskEvent>(16);
     let transport = Arc::new(Transport::new());
 
-    notify::spawn(rx, transport.clone());
+    notify::spawn(rx, std::sync::Arc::clone(&transport));
 
     drop(tx); // close the channel
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -339,11 +339,12 @@ async fn make_dispatch_harness(
     let transport = Arc::new(Transport::new());
     let capture = Arc::new(CaptureService::new(transport));
     let tmux = Arc::new(TmuxManager::isolated());
-    let runner = Arc::new(TaskRunner::new(repo.to_string()).with_store(store.clone()));
+    let runner =
+        Arc::new(TaskRunner::new(repo.to_string()).with_store(std::sync::Arc::clone(&store)));
     let semaphore = Arc::new(Semaphore::new(4));
     let task_manager = Arc::new(TaskManager::with_store(
-        backend.clone(),
-        store.clone(),
+        std::sync::Arc::clone(&backend),
+        std::sync::Arc::clone(&store),
         repo.to_string(),
     ));
     let (weight_tx, _weight_rx) = mpsc::channel::<WeightSignal>(16);
@@ -367,7 +368,7 @@ async fn make_dispatch_harness(
         task_manager,
         weight_tx,
         router,
-        dispatching.clone(),
+        std::sync::Arc::clone(&dispatching),
         store,
         repo.to_string(),
     );
@@ -433,8 +434,8 @@ async fn make_unblock_harness(repo: &str) -> (broadcast::Sender<TaskEvent>, std:
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
     let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
     let task_manager = Arc::new(TaskManager::with_store(
-        backend.clone(),
-        store.clone(),
+        std::sync::Arc::clone(&backend),
+        std::sync::Arc::clone(&store),
         repo.to_string(),
     ));
 
@@ -501,13 +502,13 @@ async fn unblock_subscriber_only_handles_its_repo() {
     let backend_b: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
 
     let tm_a = Arc::new(TaskManager::with_store(
-        backend_a.clone(),
-        store_a.clone(),
+        std::sync::Arc::clone(&backend_a),
+        std::sync::Arc::clone(&store_a),
         "repo-a/proj".to_string(),
     ));
     let tm_b = Arc::new(TaskManager::with_store(
-        backend_b.clone(),
-        store_b.clone(),
+        std::sync::Arc::clone(&backend_b),
+        std::sync::Arc::clone(&store_b),
         "repo-b/proj".to_string(),
     ));
 
@@ -547,8 +548,8 @@ async fn make_review_harness(
     let tmux = Arc::new(TmuxManager::isolated());
     let semaphore = Arc::new(Semaphore::new(4));
     let task_manager = Arc::new(TaskManager::with_store(
-        backend.clone(),
-        store.clone(),
+        std::sync::Arc::clone(&backend),
+        std::sync::Arc::clone(&store),
         repo.to_string(),
     ));
     // No available agents — router is a no-op in these tests.
@@ -568,7 +569,7 @@ async fn make_review_harness(
         semaphore,
         task_manager,
         router,
-        dispatching.clone(),
+        std::sync::Arc::clone(&dispatching),
         store,
         repo.to_string(),
     );
@@ -674,13 +675,13 @@ async fn review_subscriber_only_handles_its_repo() {
     };
 
     let tm_a = Arc::new(TaskManager::with_store(
-        backend_a.clone(),
-        store_a.clone(),
+        std::sync::Arc::clone(&backend_a),
+        std::sync::Arc::clone(&store_a),
         "repo-a/proj".to_string(),
     ));
     let tm_b = Arc::new(TaskManager::with_store(
-        backend_b.clone(),
-        store_b.clone(),
+        std::sync::Arc::clone(&backend_b),
+        std::sync::Arc::clone(&store_b),
         "repo-b/proj".to_string(),
     ));
     let router_a = Arc::new(RwLock::new(Router::new(config.clone())));
@@ -695,11 +696,11 @@ async fn review_subscriber_only_handles_its_repo() {
     review::spawn(
         rx_a,
         backend_a,
-        tmux.clone(),
-        semaphore.clone(),
+        std::sync::Arc::clone(&tmux),
+        std::sync::Arc::clone(&semaphore),
         tm_a,
         router_a,
-        dispatching_a.clone(),
+        std::sync::Arc::clone(&dispatching_a),
         store_a,
         "repo-a/proj".to_string(),
     );
@@ -710,7 +711,7 @@ async fn review_subscriber_only_handles_its_repo() {
         semaphore,
         tm_b,
         router_b,
-        dispatching_b.clone(),
+        std::sync::Arc::clone(&dispatching_b),
         store_b,
         "repo-b/proj".to_string(),
     );

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use super::{agents, git_ops, response, worktree};
 
 /// Write a structured `result.json` to the attempt directory for debugging.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn write_result_json(
     attempt_dir: &Path,
     task_id: &str,
@@ -163,7 +163,7 @@ fn classify_final_status(input: &DecisionInput<'_>) -> String {
         // Same-agent loop detection: if this agent is the same as the one that
         // produced the previous no-code result, block immediately (#2410, #2686).
         // Otherwise, block if max reroutes exhausted, else reroute.
-        if input.is_same_agent || input.no_code_reroutes >= input.max_reroutes as u64 {
+        if input.is_same_agent || input.no_code_reroutes >= u64::from(input.max_reroutes) {
             "blocked".to_string()
         } else {
             "new".to_string()
@@ -192,7 +192,7 @@ fn classify_final_status(input: &DecisionInput<'_>) -> String {
     } else if input.is_completed_status && input.requires_pr {
         // Agent said "completed" on external task requiring PR without a PR or pushes.
         // Same-agent loop detection applies, then reroute or block.
-        if input.is_same_agent || input.no_code_reroutes >= input.max_reroutes as u64 {
+        if input.is_same_agent || input.no_code_reroutes >= u64::from(input.max_reroutes) {
             "blocked".to_string()
         } else {
             "new".to_string()
@@ -222,11 +222,11 @@ struct StoreCtx<'a> {
     task_id: &'a str,
 }
 
-impl<'a> StoreCtx<'a> {
+impl StoreCtx<'_> {
     /// Write fields, using the pre-resolved `store_id` when available.
     async fn set(&self, fields: &[(&str, serde_json::Value)]) {
         if let Some(store_id) = self.store_id_opt {
-            let _ = store::store_set_by_id(&self.store.as_ref(), store_id, fields).await;
+            let _ = store::store_set_by_id(self.store.as_ref(), store_id, fields).await;
         } else {
             store::store_set(self.store, self.repo, self.task_id, fields).await;
         }
@@ -852,7 +852,17 @@ async fn run_git_ops(
     // Skip push + PR if there are no commits ahead of the default branch.
     // No-op tasks (e.g. "nothing to execute") produce no commits, so pushing
     // and creating a PR would just waste API calls and trigger 422 errors.
-    let push_result = if !has_commits {
+    let push_result = if has_commits {
+        push_branch_with_log(
+            ctx,
+            &wt.work_dir,
+            &wt.branch,
+            &wt.default_branch,
+            agent_name,
+            model_name,
+        )
+        .await
+    } else {
         store::store_log_activity(
             ctx.store,
             ctx.repo,
@@ -871,16 +881,6 @@ async fn run_git_ops(
         )
         .await;
         PushResult::NoCommits
-    } else {
-        push_branch_with_log(
-            ctx,
-            &wt.work_dir,
-            &wt.branch,
-            &wt.default_branch,
-            agent_name,
-            model_name,
-        )
-        .await
     };
     let push_result = if matches!(push_result, PushResult::WorktreeMissing) {
         match recover_missing_worktree_for_push(ctx, wt, task_title, agent_name, model_name).await {
@@ -892,9 +892,7 @@ async fn run_git_ops(
                     &wt_for_ops.default_branch,
                 )
                 .await;
-                if !has_commits {
-                    PushResult::NoCommits
-                } else {
+                if has_commits {
                     push_branch_with_log(
                         ctx,
                         &wt_for_ops.work_dir,
@@ -904,6 +902,8 @@ async fn run_git_ops(
                         model_name,
                     )
                     .await
+                } else {
+                    PushResult::NoCommits
                 }
             }
             Err(e) => {
@@ -1069,8 +1069,7 @@ async fn detect_push_failure_state(
                 // On DB error, read current value to ensure blocking threshold is still reachable
                 ctx.get_task()
                     .await
-                    .map(|t| (t.push_failures.max(0) as u64) + 1)
-                    .unwrap_or(1) // assume at least 1 if we can't read either
+                    .map_or(1, |t| (t.push_failures.max(0) as u64) + 1) // assume at least 1 if we can't read either
             }
         }
     } else {
@@ -1114,8 +1113,7 @@ async fn detect_no_code_reroutes(
             // On DB error, read current value to ensure blocking threshold is still reachable
             ctx.get_task()
                 .await
-                .map(|t| (t.no_code_reroutes.max(0) as u64) + 1)
-                .unwrap_or(1) // assume at least 1 if we can't read either
+                .map_or(1, |t| (t.no_code_reroutes.max(0) as u64) + 1) // assume at least 1 if we can't read either
         }
     }
 }
@@ -1127,10 +1125,10 @@ async fn detect_no_code_reroutes(
 /// Priority: explicit `error` field → `summary` → fallback.
 /// Appends `remaining` items if present so operators know what was left to do.
 fn agent_blocked_reason(resp: &crate::parser::AgentResponse) -> String {
-    let summary_opt = if !resp.summary.is_empty() {
-        Some(resp.summary.as_str())
-    } else {
+    let summary_opt = if resp.summary.is_empty() {
         None
+    } else {
+        Some(resp.summary.as_str())
     };
     let base = resp
         .error
@@ -1212,7 +1210,7 @@ fn is_retryable_blocked_reason(reason: &str) -> bool {
 }
 
 /// Apply tracing and store writes that depend on the final status decision.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn apply_post_decision_effects(
     ctx: &StoreCtx<'_>,
     final_status: &str,
@@ -1329,8 +1327,7 @@ async fn apply_post_decision_effects(
                     agent_name
                 );
                 format!(
-                    "agent {} completed without code changes twice — same-agent loop detected, blocking for human review",
-                    agent_name
+                    "agent {agent_name} completed without code changes twice — same-agent loop detected, blocking for human review"
                 )
             } else {
                 tracing::error!(
@@ -1341,8 +1338,7 @@ async fn apply_post_decision_effects(
                     no_code_reroutes, max_reroutes
                 );
                 format!(
-                    "agent completed without code changes after {}/{} reroute attempts on external task requiring PR",
-                    no_code_reroutes, max_reroutes
+                    "agent completed without code changes after {no_code_reroutes}/{max_reroutes} reroute attempts on external task requiring PR"
                 )
             };
             ctx.set(&[("last_error", serde_json::json!(msg))]).await;
@@ -1411,7 +1407,7 @@ async fn store_token_usage(
 /// Returns `Ok((status, push_failed))` where `status` is the final task status
 /// string and `push_failed` is `true` when a push was attempted but failed (for
 /// audit trail classification).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn handle_success(
     task_id: &str,
     parsed: agents::ParsedResponse,
@@ -1549,8 +1545,7 @@ pub async fn handle_success(
     };
     let is_retryable_blocked = blocked_reason
         .as_deref()
-        .map(is_retryable_blocked_reason)
-        .unwrap_or(false);
+        .is_some_and(is_retryable_blocked_reason);
 
     // ── Detect same-agent loop ───────────────────────────────────────────────
     //

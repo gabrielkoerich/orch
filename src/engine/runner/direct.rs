@@ -208,10 +208,10 @@ fn finish_output(output: std::process::Output, agent: &str) -> Result<DirectResu
 
     match runner.parse_response(&stdout) {
         Ok(parsed) => {
-            let text = if !parsed.response.summary.is_empty() {
-                parsed.response.summary.clone()
-            } else {
+            let text = if parsed.response.summary.is_empty() {
                 stdout.clone()
+            } else {
+                parsed.response.summary.clone()
             };
             Ok(DirectResult {
                 text,
@@ -283,11 +283,11 @@ pub(crate) fn extract_from_envelope(raw: &str) -> (String, Option<u64>, Option<u
                 let input_tokens = obj
                     .get("usage")
                     .and_then(|u| u.get("input_tokens"))
-                    .and_then(|v| v.as_u64());
+                    .and_then(serde_json::Value::as_u64);
                 let output_tokens = obj
                     .get("usage")
                     .and_then(|u| u.get("output_tokens"))
-                    .and_then(|v| v.as_u64());
+                    .and_then(serde_json::Value::as_u64);
                 return (text, input_tokens, output_tokens);
             }
         }
@@ -422,7 +422,7 @@ mod tests {
         );
         assert_eq!(
             DirectCommandError::EmptyResponse {
-                stderr: "".to_string()
+                stderr: String::new()
             }
             .to_string(),
             "agent returned empty response"

@@ -68,9 +68,8 @@ pub async fn build_parent_context(
     let mut ctx = String::new();
 
     // Get parent issue details
-    let parent = match backend.get_task(&ExternalId(parent_id.clone())).await {
-        Ok(t) => t,
-        Err(_) => return String::new(),
+    let Ok(parent) = backend.get_task(&ExternalId(parent_id.clone())).await else {
+        return String::new();
     };
 
     ctx.push_str(&format!(
@@ -102,15 +101,14 @@ pub async fn build_parent_context(
                         .labels
                         .iter()
                         .find(|l| l.starts_with("status:"))
-                        .map(|s| s.replace("status:", ""))
-                        .unwrap_or_else(|| "unknown".to_string());
+                        .map_or_else(|| "unknown".to_string(), |s| s.replace("status:", ""));
                     ctx.push_str(&format!("- #{} [{}]: {}\n", sib.id.0, status, sib.title));
 
                     // Include summary if available from the store result at same index
                     if let Some(Some(task_rec)) = store_results.get(i) {
                         let summary = &task_rec.summary;
                         if !summary.is_empty() {
-                            ctx.push_str(&format!("  Summary: {}\n", summary));
+                            ctx.push_str(&format!("  Summary: {summary}\n"));
                         }
                     }
                 }
@@ -347,7 +345,7 @@ pub async fn build_memory_context(
         ));
 
         if let Some(ref model) = entry.model {
-            context.push_str(&format!(", Model: {}", model));
+            context.push_str(&format!(", Model: {model}"));
         }
         context.push('\n');
 
@@ -358,12 +356,12 @@ pub async fn build_memory_context(
         if !entry.learnings.is_empty() {
             context.push_str("**Key Learnings**:\n");
             for learning in &entry.learnings {
-                context.push_str(&format!("- {}\n", learning));
+                context.push_str(&format!("- {learning}\n"));
             }
         }
 
         if let Some(ref error) = entry.error {
-            context.push_str(&format!("**Error**: {}\n", error));
+            context.push_str(&format!("**Error**: {error}\n"));
         }
 
         if !entry.files_modified.is_empty() {
@@ -392,7 +390,7 @@ pub async fn load_pr_review_context(
 }
 
 /// Build the full task context.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn build_full_context(
     task: &ExternalTask,
     backend: Option<&dyn ExternalBackend>,
@@ -463,15 +461,15 @@ mod tests {
     #[tokio::test]
     async fn test_build_memory_context_empty() {
         let (context, memory) = build_memory_context("nonexistent-task-12345", &None, "").await;
-        assert!(context.is_empty());
-        assert!(memory.is_empty());
+        assert_eq!(context, "");
+        assert!(memory.is_empty(), "{memory:?}");
     }
 
     #[tokio::test]
     async fn test_build_project_instructions_empty_dir() {
         let dir = std::env::temp_dir().join("orch_test_nonexistent");
         let instructions = build_project_instructions(&dir).await;
-        assert!(instructions.is_empty());
+        assert_eq!(instructions, "");
     }
 
     #[cfg(unix)]
@@ -492,7 +490,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_skills_docs_empty() {
         let docs = build_skills_docs(&[]).await;
-        assert!(docs.is_empty());
+        assert_eq!(docs, "");
     }
 
     #[test]
@@ -509,7 +507,7 @@ mod tests {
             memory: vec![],
         };
 
-        assert!(ctx.task_context.is_empty());
-        assert!(ctx.memory.is_empty());
+        assert_eq!(ctx.task_context, "");
+        assert!(ctx.memory.is_empty(), "{:?}", ctx.memory);
     }
 }

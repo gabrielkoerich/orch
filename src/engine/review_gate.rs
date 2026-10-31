@@ -78,12 +78,11 @@ pub(crate) async fn review_ci_gate(
         CiState::Red(failed) => CiGate::Red(failed),
         CiState::NotStarted => {
             let now = chrono::Utc::now().timestamp();
-            let since = match store.kv_get(&wait_key).await? {
-                Some(v) => v.parse().unwrap_or(now),
-                None => {
-                    store.kv_set(&wait_key, &now.to_string()).await?;
-                    now
-                }
+            let since = if let Some(v) = store.kv_get(&wait_key).await? {
+                v.parse().unwrap_or(now)
+            } else {
+                store.kv_set(&wait_key, &now.to_string()).await?;
+                now
             };
             CiGate::NotStarted {
                 waited_out: now - since >= NO_CHECKS_WAIT_SECS,

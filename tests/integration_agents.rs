@@ -1,3 +1,8 @@
+#![expect(
+    clippy::print_stderr,
+    reason = "helpers log progress of live agent runs"
+)]
+
 //! Integration tests that invoke real agent CLIs.
 //!
 //! These tests are `#[ignore]`d by default — they need real API keys,
@@ -49,7 +54,7 @@ fn assert_claude_envelope(stdout: &str) -> String {
 
     let is_error = val
         .get("is_error")
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     assert!(!is_error, "Claude envelope has is_error=true: {val}");
 
@@ -111,7 +116,7 @@ fn kimi_has_quota_error(stdout: &str) -> bool {
 
     let is_error = val
         .get("is_error")
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let result = val.get("result").and_then(|v| v.as_str()).unwrap_or("");
 

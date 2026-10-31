@@ -1074,8 +1074,7 @@ fn split_cells(line: &str) -> Vec<String> {
 fn cell(cells: &[String], index: Option<usize>) -> &str {
     index
         .and_then(|index| cells.get(index))
-        .map(String::as_str)
-        .unwrap_or("")
+        .map_or("", String::as_str)
 }
 
 fn task_from_row(
@@ -1169,7 +1168,7 @@ impl Draft {
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = r#"
+    const SAMPLE: &str = r"
 ## M1. Content model and pack format
 
 ### M1-01 Set up the workspace
@@ -1229,7 +1228,7 @@ mod tests {
 |---|---|---|---|
 | M6-01 Units 4 to 10 | Write the rest of the year | Each pack validates | M1-05, M1-01 |
 | M6-02 Festival modules | Attach modules | Each shows in Hoje | M6-01 |
-"#;
+";
 
     fn roadmap() -> Roadmap {
         parse_roadmap(SAMPLE).unwrap()
@@ -1275,12 +1274,16 @@ mod tests {
                 "- CI fails on a formatting error.".to_string(),
             ]
         );
-        assert!(first.depends_on.is_empty());
+        assert!(first.depends_on.is_empty(), "{:?}", first.depends_on);
         assert_eq!(first.goal, "a Rust workspace that builds.");
         assert_eq!(first.scope, "the `api/` workspace.");
 
         let scheduler = task(&roadmap, "M1-05");
-        assert!(scheduler.depends_on.is_empty());
+        assert!(
+            scheduler.depends_on.is_empty(),
+            "{:?}",
+            scheduler.depends_on
+        );
         assert_eq!(
             scheduler.acceptance,
             vec!["- At least 15 fixtures.".to_string()]
@@ -1311,7 +1314,7 @@ mod tests {
             task(&roadmap, "M6-02").depends_on,
             vec!["M6-01".to_string()]
         );
-        assert!(task(&roadmap, "M6-01").anchor_heading.is_empty());
+        assert_eq!(task(&roadmap, "M6-01").anchor_heading, "");
         assert_eq!(task(&roadmap, "M6-01").milestone_id, "M6");
     }
 
@@ -1345,13 +1348,13 @@ mod tests {
 
     #[test]
     fn unknown_table_column_is_an_error() {
-        let markdown = r#"
+        let markdown = r"
 ## M3. Session
 
 | Task | Title | Depends on |
 |---|---|---|
 | M3-01 Session backfill | ignored | none |
-"#;
+";
         let err = parse_roadmap(markdown).unwrap_err();
         assert!(err.message.contains("Title"), "{}", err.message);
         assert!(err.message.contains("line 4"), "{}", err.message);
@@ -1364,13 +1367,13 @@ mod tests {
 
     #[test]
     fn table_row_with_only_an_id_has_no_title() {
-        let markdown = r#"
+        let markdown = r"
 ## M3. Session
 
 | Task | Depends on |
 |---|---|
 | M3-01 | none |
-"#;
+";
         let err = parse_roadmap(markdown).unwrap_err();
         assert!(err.message.contains("M3-01"), "{}", err.message);
         assert!(err.message.contains("no title"), "{}", err.message);
@@ -1379,14 +1382,14 @@ mod tests {
 
     #[test]
     fn heading_task_with_no_title_is_an_error() {
-        let markdown = r#"
+        let markdown = r"
 ## M3. Session
 
 ### M3-01
 
 - Goal: backfill.
 - Depends on: none.
-"#;
+";
         let err = parse_roadmap(markdown).unwrap_err();
         assert!(err.message.contains("M3-01"), "{}", err.message);
         assert!(err.message.contains("no title"), "{}", err.message);
@@ -1395,19 +1398,19 @@ mod tests {
 
     #[test]
     fn table_owner_column_keeps_title_in_the_task_cell() {
-        let markdown = r#"
+        let markdown = r"
 ## M3. Session
 
 | Task | Owner | Depends on |
 |---|---|---|
 | M3-01 Session backfill | human | none |
 | M3-02 Follow up | | M3-01 |
-"#;
+";
         let roadmap = parse_roadmap(markdown).unwrap();
         let first = task(&roadmap, "M3-01");
         assert_eq!(first.title, "Session backfill");
         assert!(first.owner_human);
-        assert!(first.depends_on.is_empty());
+        assert!(first.depends_on.is_empty(), "{:?}", first.depends_on);
         let second = task(&roadmap, "M3-02");
         assert_eq!(second.title, "Follow up");
         assert!(!second.owner_human);
@@ -1416,21 +1419,21 @@ mod tests {
 
     #[test]
     fn depends_on_without_a_task_id_is_an_error() {
-        let markdown = r#"
+        let markdown = r"
 ## M1. Content model
 
 ### M1-01 First
 
 - Goal: one.
 - Depends on: later today.
-"#;
+";
         let err = parse_roadmap(markdown).unwrap_err();
         assert!(err.message.contains("no task id"), "{}", err.message);
     }
 
     #[test]
     fn unknown_dependency_is_an_error() {
-        let markdown = r#"
+        let markdown = r"
 ## M1. Content model
 
 ### M1-01 First
@@ -1439,7 +1442,7 @@ mod tests {
 - Acceptance:
   - done.
 - Depends on: M1-99.
-"#;
+";
         let err = parse_roadmap(markdown).unwrap_err();
         assert!(
             err.message.contains("unknown task M1-99"),
@@ -1509,7 +1512,7 @@ mod tests {
             .tasks
             .iter()
             .all(|plan| plan.kind == ChangeKind::Unchanged));
-        assert!(diff.removed.is_empty());
+        assert!(diff.removed.is_empty(), "{:?}", diff.removed);
         let current = current_links(&roadmap);
         let links =
             diff_links(&roadmap.tasks, &bindings_from_existing(&existing), &current).unwrap();

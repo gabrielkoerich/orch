@@ -24,15 +24,13 @@ fn is_trusted_author(issue: &crate::github::types::GitHubIssue) -> bool {
     issue
         .author_association
         .as_deref()
-        .map(|a| ALLOWED_ASSOCIATIONS.contains(&a))
-        .unwrap_or(false) // missing field = untrusted
+        .is_some_and(|a| ALLOWED_ASSOCIATIONS.contains(&a)) // missing field = untrusted
 }
 
 fn is_trusted_comment_author(c: &crate::github::types::GitHubComment) -> bool {
     c.author_association
         .as_deref()
-        .map(|a| ALLOWED_ASSOCIATIONS.contains(&a))
-        .unwrap_or(false)
+        .is_some_and(|a| ALLOWED_ASSOCIATIONS.contains(&a))
 }
 
 fn trusted_mentions(
@@ -148,7 +146,7 @@ impl GitHubBackend {
 
 #[async_trait]
 impl ExternalBackend for GitHubBackend {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "github"
     }
 
@@ -207,9 +205,8 @@ impl ExternalBackend for GitHubBackend {
         status: Status,
     ) -> anyhow::Result<Option<String>> {
         // Only sync if project integration is configured
-        let project = match ProjectSync::from_config() {
-            Some(p) => p,
-            None => return Ok(None),
+        let Some(project) = ProjectSync::from_config() else {
+            return Ok(None);
         };
 
         // Fetch the issue to get its node_id
@@ -239,9 +236,8 @@ impl ExternalBackend for GitHubBackend {
     }
 
     async fn sync_estimate_to_project(&self, id: &ExternalId, estimate: u8) -> anyhow::Result<()> {
-        let project = match ProjectSync::from_config() {
-            Some(p) => p,
-            None => return Ok(()),
+        let Some(project) = ProjectSync::from_config() else {
+            return Ok(());
         };
 
         // If the estimate field ID is missing from config, try to discover it
@@ -302,9 +298,8 @@ impl ExternalBackend for GitHubBackend {
         &self,
         issue_node_ids: &[String],
     ) -> anyhow::Result<std::collections::HashMap<String, u8>> {
-        let project = match ProjectSync::from_config() {
-            Some(p) => p,
-            None => return Ok(std::collections::HashMap::new()),
+        let Some(project) = ProjectSync::from_config() else {
+            return Ok(std::collections::HashMap::new());
         };
 
         if issue_node_ids.is_empty() {
@@ -394,9 +389,8 @@ impl ExternalBackend for GitHubBackend {
 
                     // Auto-close issue when status → Done (if auto_close enabled)
                     if status == Status::Done {
-                        let auto_close = crate::config::get("workflow.auto_close")
-                            .map(|v| v == "true")
-                            .unwrap_or(true);
+                        let auto_close =
+                            crate::config::get("workflow.auto_close").map_or(true, |v| v == "true");
                         if auto_close {
                             if let Err(e) = self.gh.close_issue(&self.repo, &id.0).await {
                                 tracing::warn!(
@@ -992,7 +986,7 @@ mod tests {
 
     #[test]
     fn is_github_issue_id_rejects_empty_and_non_numeric() {
-        assert!(!is_github_issue_id(&ExternalId("".to_string())));
+        assert!(!is_github_issue_id(&ExternalId(String::new())));
         assert!(!is_github_issue_id(&ExternalId("abc".to_string())));
         assert!(!is_github_issue_id(&ExternalId("1.0".to_string())));
     }
@@ -1016,9 +1010,9 @@ mod tests {
             user: GitHubUser {
                 login: "u".to_string(),
             },
-            created_at: "".to_string(),
-            updated_at: "".to_string(),
-            html_url: "".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            html_url: String::new(),
             node_id: None,
             pull_request: None,
             state_reason: None,
@@ -1039,9 +1033,9 @@ mod tests {
             user: GitHubUser {
                 login: "u".to_string(),
             },
-            created_at: "".to_string(),
-            updated_at: "".to_string(),
-            html_url: "".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            html_url: String::new(),
             node_id: None,
             pull_request: None,
             state_reason: None,
@@ -1062,9 +1056,9 @@ mod tests {
             user: GitHubUser {
                 login: "u".to_string(),
             },
-            created_at: "".to_string(),
-            updated_at: "".to_string(),
-            html_url: "".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            html_url: String::new(),
             node_id: None,
             pull_request: None,
             state_reason: None,
@@ -1085,9 +1079,9 @@ mod tests {
             user: GitHubUser {
                 login: "u".to_string(),
             },
-            created_at: "".to_string(),
-            updated_at: "".to_string(),
-            html_url: "".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            html_url: String::new(),
             node_id: None,
             pull_request: None,
             state_reason: None,
@@ -1105,7 +1099,7 @@ mod tests {
             user: crate::github::types::GitHubUser {
                 login: "u".to_string(),
             },
-            created_at: "".to_string(),
+            created_at: String::new(),
             updated_at: None,
             html_url: None,
             issue_url: None,
@@ -1123,7 +1117,7 @@ mod tests {
             user: crate::github::types::GitHubUser {
                 login: "u".to_string(),
             },
-            created_at: "".to_string(),
+            created_at: String::new(),
             updated_at: None,
             html_url: None,
             issue_url: None,
@@ -1168,9 +1162,9 @@ mod tests {
             user: GitHubUser {
                 login: "owner".to_string(),
             },
-            created_at: "".to_string(),
-            updated_at: "".to_string(),
-            html_url: "".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            html_url: String::new(),
             node_id: None,
             pull_request: None,
             state_reason: None,
@@ -1268,9 +1262,9 @@ mod tests {
             user: GitHubUser {
                 login: "u".to_string(),
             },
-            created_at: "".to_string(),
-            updated_at: "".to_string(),
-            html_url: "".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            html_url: String::new(),
             node_id: None,
             pull_request: None,
             state_reason: None,

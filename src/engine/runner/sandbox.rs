@@ -206,7 +206,7 @@ fn policy(run: &Run) -> Policy {
             known::BASIC_MACH_SERVICES
                 .iter()
                 .chain(&[KEYCHAIN])
-                .map(|s| s.to_string())
+                .map(std::string::ToString::to_string)
                 .collect(),
         );
     } else {

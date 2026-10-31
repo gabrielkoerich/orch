@@ -33,10 +33,10 @@ pub async fn import(
     let repo = config::get_current_repo()
         .context("'repo' not set — run `orch init` or set gh.repo in .orch.yml")?;
     let rel_path = repo_relative(path).unwrap_or_else(|| {
-        let name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| file.to_string());
+        let name = path.file_name().map_or_else(
+            || file.to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
         eprintln!("warning: {file} is outside the git checkout, the issue link uses {name}");
         name
     });

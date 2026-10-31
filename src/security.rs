@@ -336,8 +336,7 @@ mod tests {
         assert_eq!(
             matches.len(),
             2,
-            "expected two github_token matches, got: {:?}",
-            matches
+            "expected two github_token matches, got: {matches:?}"
         );
     }
 

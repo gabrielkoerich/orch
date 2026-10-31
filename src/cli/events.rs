@@ -218,9 +218,8 @@ async fn stream_from_store(
     loop {
         interval.tick().await;
 
-        let tasks = match store.list_all_active_global().await {
-            Ok(t) => t,
-            Err(_) => continue,
+        let Ok(tasks) = store.list_all_active_global().await else {
+            continue;
         };
 
         for t in &tasks {
@@ -253,7 +252,7 @@ async fn stream_from_store(
                         .map(|p| format!(" PR: #{p}"))
                         .unwrap_or_default();
 
-                    println!("{now} {key} {old_status} \u{2192} {new_status} {agent_str}{pr_str}",);
+                    println!("{now} {key} {old_status} \u{2192} {new_status} {agent_str}{pr_str}");
                     last_status.insert(key, (new_status, t.agent.clone(), t.pr_number));
                 }
                 None => {

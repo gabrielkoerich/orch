@@ -5,13 +5,12 @@
 //! Replaces `scripts/parse_response.sh` + `jq` pipelines.
 
 use anyhow::Context;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 
-static TRAILING_COMMA_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r",(\s*[}\]])").expect("trailing comma regex is valid"));
+static TRAILING_COMMA_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r",(\s*[}\]])").expect("trailing comma regex is valid"));
 
 /// Normalized agent response.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -51,6 +50,10 @@ pub struct Delegation {
 }
 
 /// Parse an agent response from a file path (or stdin if "-").
+#[expect(
+    clippy::print_stdout,
+    reason = "prints the parsed response for the CLI"
+)]
 pub fn parse_and_print(path: &str) -> anyhow::Result<()> {
     let content = if path == "-" {
         let mut buf = String::new();
@@ -519,7 +522,7 @@ const SUBSTANTIVE_RESPONSE_FIELDS: &[&str] = &[
 /// - `{"tests_passed": true, ...}` — tests-passed completion signal
 fn infer_completion_status(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
     // success: true
-    if obj.get("success").and_then(|v| v.as_bool()) == Some(true) {
+    if obj.get("success").and_then(serde_json::Value::as_bool) == Some(true) {
         return Some("done".to_string());
     }
     // type: "task_complete"
@@ -527,11 +530,11 @@ fn infer_completion_status(obj: &serde_json::Map<String, serde_json::Value>) -> 
         return Some("done".to_string());
     }
     // ok: true
-    if obj.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+    if obj.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
         return Some("done".to_string());
     }
     // tests_passed: true
-    if obj.get("tests_passed").and_then(|v| v.as_bool()) == Some(true) {
+    if obj.get("tests_passed").and_then(serde_json::Value::as_bool) == Some(true) {
         return Some("done".to_string());
     }
     None
@@ -581,15 +584,15 @@ fn map_generic_response(val: &serde_json::Value) -> anyhow::Result<AgentResponse
     let remaining = extract_string_array(obj.get("remaining"));
     let files = {
         let f = extract_string_array(obj.get("files"));
-        if !f.is_empty() {
-            f
-        } else {
+        if f.is_empty() {
             let fc = extract_string_array(obj.get("files_changed"));
-            if !fc.is_empty() {
-                fc
-            } else {
+            if fc.is_empty() {
                 extract_string_array(obj.get("files_modified"))
+            } else {
+                fc
             }
+        } else {
+            f
         }
     };
     let error = obj.get("error").and_then(|v| v.as_str()).map(String::from);
@@ -608,7 +611,7 @@ fn map_generic_response(val: &serde_json::Value) -> anyhow::Result<AgentResponse
     // and debug malformed agent output.
     let delegations = if let Some(v) = obj.get("delegations") {
         serde_json::from_value::<Vec<Delegation>>(v.clone())
-            .with_context(|| format!("invalid delegations field: {}", v))?
+            .with_context(|| format!("invalid delegations field: {v}"))?
     } else {
         Vec::new()
     };
@@ -629,7 +632,7 @@ fn map_generic_response(val: &serde_json::Value) -> anyhow::Result<AgentResponse
 
 /// Extract a u64 from a JSON value.
 fn extract_u64(val: Option<&serde_json::Value>) -> Option<u64> {
-    val.and_then(|v| v.as_u64())
+    val.and_then(serde_json::Value::as_u64)
 }
 
 /// Extract tokens from a usage object (common in OpenAI-compatible APIs).
@@ -640,7 +643,7 @@ fn extract_usage_tokens(usage: Option<&serde_json::Value>, is_input: bool) -> Op
     } else {
         "output_tokens"
     };
-    obj.get(key).and_then(|v| v.as_u64())
+    obj.get(key).and_then(serde_json::Value::as_u64)
 }
 
 fn extract_string_array(val: Option<&serde_json::Value>) -> Vec<String> {
@@ -820,7 +823,7 @@ Thanks"#;
     #[test]
     fn extract_string_array_none() {
         let result = extract_string_array(None);
-        assert!(result.is_empty());
+        assert!(result.is_empty(), "{result:?}");
     }
 
     #[test]
@@ -850,7 +853,7 @@ Thanks"#;
     fn parse_learnings_empty_by_default() {
         let input = r#"{"status":"done","summary":"Completed","accomplished":["done"],"remaining":[],"files":[]}"#;
         let resp = parse(input).unwrap();
-        assert!(resp.learnings.is_empty());
+        assert!(resp.learnings.is_empty(), "{:?}", resp.learnings);
     }
 
     #[test]

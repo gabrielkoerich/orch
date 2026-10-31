@@ -97,12 +97,9 @@ pub async fn fanout_output(
     transport: Arc<Transport>,
     channels: Arc<ChannelRegistry>,
 ) {
-    let mut rx = match transport.subscribe(&repo, &task_id).await {
-        Some(r) => r,
-        None => {
-            tracing::debug!(task_id, "fanout: no binding for task, cannot subscribe");
-            return;
-        }
+    let Some(mut rx) = transport.subscribe(&repo, &task_id).await else {
+        tracing::debug!(task_id, "fanout: no binding for task, cannot subscribe");
+        return;
     };
 
     tracing::debug!(task_id, "fanout: started output streaming");
@@ -124,11 +121,11 @@ pub async fn fanout_output(
                         let now = Instant::now();
 
                         for thread_key in &binding.connected_threads {
-                            let (ch_name, thread_id, topic_id) =
-                                match parse_conversation_key(thread_key) {
-                                    Some(p) => p,
-                                    None => continue,
-                                };
+                            let Some((ch_name, thread_id, topic_id)) =
+                                parse_conversation_key(thread_key)
+                            else {
+                                continue;
+                            };
 
                             // Append new content to this thread's buffer
                             buffers
@@ -140,8 +137,7 @@ pub async fn fanout_output(
                             let rate = platform_rate(ch_name);
                             let can_send = last_send
                                 .get(ch_name)
-                                .map(|t| now.duration_since(*t) >= rate)
-                                .unwrap_or(true);
+                                .is_none_or(|t| now.duration_since(*t) >= rate);
 
                             if can_send {
                                 if let Some(buffered) = buffers.remove(thread_key) {
@@ -174,11 +170,11 @@ pub async fn fanout_output(
                             if buffered.is_empty() {
                                 continue;
                             }
-                            let (ch_name, thread_id, topic_id) =
-                                match parse_conversation_key(&thread_key) {
-                                    Some(p) => p,
-                                    None => continue,
-                                };
+                            let Some((ch_name, thread_id, topic_id)) =
+                                parse_conversation_key(&thread_key)
+                            else {
+                                continue;
+                            };
                             // Escape HTML for Telegram before splitting (same as above).
                             let to_send = if ch_name == "telegram" {
                                 html_escape(&buffered)
@@ -249,16 +245,15 @@ pub async fn fanout_output(
                     let keys: Vec<String> = buffers.keys().cloned().collect();
                     for thread_key in keys {
                         if let Some(buffered) = buffers.remove(&thread_key) {
-                            let (ch_name, thread_id, topic_id) =
-                                match parse_conversation_key(&thread_key) {
-                                    Some(p) => p,
-                                    None => continue,
-                                };
+                            let Some((ch_name, thread_id, topic_id)) =
+                                parse_conversation_key(&thread_key)
+                            else {
+                                continue;
+                            };
                             let rate = platform_rate(ch_name);
                             let can_send = last_send
                                 .get(ch_name)
-                                .map(|t| now.duration_since(*t) >= rate)
-                                .unwrap_or(true);
+                                .is_none_or(|t| now.duration_since(*t) >= rate);
                             if can_send {
                                 // Escape HTML for Telegram before splitting (same as above).
                                 let to_send = if ch_name == "telegram" {
@@ -515,12 +510,12 @@ mod tests {
             .await;
 
         // Spawn the fanout_output task
-        let transport_clone = transport.clone();
-        let registry_clone = registry.clone();
+        let transport_clone = std::sync::Arc::clone(&transport);
+        let registry_clone = std::sync::Arc::clone(&registry);
         let task_id_str = task_id.to_string();
         let repo_str = repo.to_string();
         tokio::spawn(async move {
-            fanout_output(repo_str, task_id_str, transport_clone, registry_clone).await
+            fanout_output(repo_str, task_id_str, transport_clone, registry_clone).await;
         });
 
         // Give fanout time to subscribe to the broadcast
@@ -544,7 +539,7 @@ mod tests {
                 repo,
                 task_id,
                 crate::channels::OutputChunk {
-                    content: "".to_string(),
+                    content: String::new(),
                     is_final: true,
                 },
             )
@@ -603,12 +598,12 @@ mod tests {
             )
             .await;
 
-        let transport_clone = transport.clone();
-        let registry_clone = registry.clone();
+        let transport_clone = std::sync::Arc::clone(&transport);
+        let registry_clone = std::sync::Arc::clone(&registry);
         let task_id_str = task_id.to_string();
         let repo_str = repo.to_string();
         tokio::spawn(async move {
-            fanout_output(repo_str, task_id_str, transport_clone, registry_clone).await
+            fanout_output(repo_str, task_id_str, transport_clone, registry_clone).await;
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

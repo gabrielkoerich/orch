@@ -464,7 +464,7 @@ mod tests {
             vec!["fatal: not a git repository"]
         );
         assert!(fmt(&["\x1b[?25h"]).is_empty());
-        assert!(fmt(&["   "]).is_empty());
+        assert!(fmt(&[" "]).is_empty());
     }
 
     #[test]

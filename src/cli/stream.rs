@@ -21,7 +21,7 @@ struct Tail {
 
 impl Tail {
     fn open(path: PathBuf, color: bool) -> Self {
-        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let len = std::fs::metadata(&path).map_or(0, |m| m.len());
         let offset = len.saturating_sub(BACKLOG_BYTES);
         Self {
             path,
@@ -67,15 +67,12 @@ impl Tail {
 /// Follow one task (and its review) when `task_id` is set, else every running agent session
 pub async fn run(task_id: Option<&str>, formatted: bool) -> anyhow::Result<()> {
     let color = formatted && std::io::stdout().is_terminal();
-    let watched = match task_id {
-        Some(id) => {
-            println!("Watching task {id}. Ctrl+C to stop");
-            Some(Watched::resolve(id).await?)
-        }
-        None => {
-            println!("Watching all running agents. Ctrl+C to stop");
-            None
-        }
+    let watched = if let Some(id) = task_id {
+        println!("Watching task {id}. Ctrl+C to stop");
+        Some(Watched::resolve(id).await?)
+    } else {
+        println!("Watching all running agents. Ctrl+C to stop");
+        None
     };
 
     let mut tails: HashMap<String, Tail> = HashMap::new();
