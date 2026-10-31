@@ -1471,23 +1471,36 @@ async fn invoke_review_agent(
             }
 
             tracing::error!(task_id = task.id.0, "review agent timed out");
-            // A slow review says nothing about the model, so no cooldown: the task goes back
-            // to needs_review and the next review picks an agent as usual
-            complete_review_run(
-                store,
-                run_id,
-                Some(-1),
-                "",
-                "timeout",
-                "",
-                "timeout",
-                "timeout",
-                RunTokenUsage::default(),
-            )
-            .await;
-            ReviewPhase::EarlyReturn(ReviewDecision::Failed("timeout".to_string()))
+            store_review_timeout(store, run_id, -1, "", "timeout").await
         }
     }
+}
+
+/// Exit code of the `timeout` command that wraps the review agent
+const REVIEW_TIMEOUT_EXIT_CODE: i32 = 124;
+
+/// A slow review says nothing about the model, so no cooldown: the task goes back
+/// to needs_review and the next review picks an agent as usual
+async fn store_review_timeout<T>(
+    store: &Arc<TaskStore>,
+    run_id: Option<i64>,
+    exit_code: i32,
+    raw_output: &str,
+    stderr: &str,
+) -> ReviewPhase<T> {
+    complete_review_run(
+        store,
+        run_id,
+        Some(exit_code),
+        raw_output,
+        stderr,
+        "",
+        "timeout",
+        "timeout",
+        RunTokenUsage::default(),
+    )
+    .await;
+    ReviewPhase::EarlyReturn(ReviewDecision::Failed("timeout".to_string()))
 }
 
 /// The decision is in when this attempt's final result parses as a review, whatever the session
@@ -1711,6 +1724,16 @@ async fn parse_review_output(
     // Do not short-circuit completed NDJSON sessions before rescue parsing.
     let is_hard_failure =
         !ndjson_completed_no_error && (raw_output.is_empty() || agent_result_is_error);
+
+    if exit_code == REVIEW_TIMEOUT_EXIT_CODE
+        && !output_has_review_decision(&ctx.review_agent, &raw_output)
+    {
+        tracing::error!(
+            task_id = task.id.0,
+            "review agent killed by its own timeout without a decision"
+        );
+        return store_review_timeout(store, run.run_id, exit_code, &raw_output, &stderr).await;
+    }
 
     if is_hard_failure {
         tracing::warn!(
@@ -5011,6 +5034,40 @@ mod tests {
             !crate::engine::cooldown::is_model_in_cooldown(agent, model),
             "mid-thought incomplete must not apply persistent model cooldown"
         );
+    }
+
+    /// A review ended by the shell `timeout` (exit 124) with no decision is a timeout,
+    /// not a parse error, and puts no model in cooldown (issue #3942)
+    #[serial_test::serial(cooldown_state)]
+    #[tokio::test]
+    async fn parse_review_output_exit_124_is_timeout_without_cooldown() {
+        crate::engine::cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let work_dir = TempDir::new().unwrap();
+        let agent = "claude";
+        let model = "opus-3942-timeout";
+        let ctx = test_review_context(agent, model, work_dir.path());
+        let ndjson = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"`shipcheck run` is still going. I am waiting on that local CI run before I decide."}]}}"#;
+        write_review_output(work_dir.path(), ndjson, 124);
+
+        let task = test_review_task("3942");
+        let phase = parse_review_output(
+            &task,
+            "owner/repo",
+            &ctx,
+            ReviewRun { run_id: None },
+            &store,
+        )
+        .await;
+
+        match phase {
+            ReviewPhase::EarlyReturn(ReviewDecision::Failed(reason)) => {
+                assert_eq!(reason, "timeout");
+            }
+            ReviewPhase::EarlyReturn(_) => panic!("expected Failed(timeout)"),
+            ReviewPhase::Ready(_) => panic!("expected Failed(timeout), got Ready"),
+        }
+        assert!(!crate::engine::cooldown::is_model_in_cooldown(agent, model));
     }
 
     /// A tool_use as the last assistant content with no result envelope is the
