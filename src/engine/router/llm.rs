@@ -13,7 +13,7 @@
 
 use super::{AgentProfile, RouteResult, RouterConfig};
 use crate::backends::ExternalTask;
-use crate::engine::runner::agents::{self, claude, opencode, AgentError};
+use crate::engine::runner::agents::{self, AgentError, claude, opencode};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -146,14 +146,14 @@ fn detect_error_envelope(value: &serde_json::Value) -> Option<String> {
         }
         // Handle `{"error":{"name":"...","data":{"message":"..."}}}` inside type=error envelope
         if let Some(error_obj) = obj.get("error").and_then(|e| e.as_object()) {
-            if let Some(data) = error_obj.get("data").and_then(|d| d.as_object()) {
-                if let Some(data_msg) = data.get("message").and_then(|m| m.as_str()) {
-                    let name = error_obj
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("UnknownError");
-                    return Some(format!("type=error: error.name={name}: {data_msg}"));
-                }
+            if let Some(data) = error_obj.get("data").and_then(|d| d.as_object())
+                && let Some(data_msg) = data.get("message").and_then(|m| m.as_str())
+            {
+                let name = error_obj
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("UnknownError");
+                return Some(format!("type=error: error.name={name}: {data_msg}"));
             }
             if let Some(msg) = error_obj.get("message").and_then(|m| m.as_str()) {
                 let name = error_obj
@@ -185,15 +185,15 @@ fn detect_error_envelope(value: &serde_json::Value) -> Option<String> {
         if let Some(msg) = error_obj.get("message").and_then(|m| m.as_str()) {
             return Some(format!("error.name={name}: {msg}"));
         }
-        if let Some(data) = error_obj.get("data").and_then(|d| d.as_object()) {
-            if let Some(data_msg) = data.get("message").and_then(|m| m.as_str()) {
-                // PermissionError with data.message is an OpenCode tool-use rejection,
-                // not an API auth/quota error. Skip it to avoid false-positive cooldowns.
-                if name == "PermissionError" {
-                    return None;
-                }
-                return Some(format!("error.name={name}: {data_msg}"));
+        if let Some(data) = error_obj.get("data").and_then(|d| d.as_object())
+            && let Some(data_msg) = data.get("message").and_then(|m| m.as_str())
+        {
+            // PermissionError with data.message is an OpenCode tool-use rejection,
+            // not an API auth/quota error. Skip it to avoid false-positive cooldowns.
+            if name == "PermissionError" {
+                return None;
             }
+            return Some(format!("error.name={name}: {data_msg}"));
         }
         if let Some(etype) = error_obj.get("type").and_then(|t| t.as_str()) {
             if let Some(msg) = error_obj.get("message").and_then(|m| m.as_str()) {
@@ -268,10 +268,10 @@ fn classify_router_llm_failure(agent: &str, stdout: &str, stderr: &str) -> Strin
     // If stdout has content, try to detect structured errors or startup-only envelopes
     if !stdout_trimmed.is_empty() {
         // Try to parse stdout as JSON to detect error envelopes
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(stdout_trimmed) {
-            if let Some(err_msg) = detect_error_envelope(&val) {
-                return err_msg;
-            }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(stdout_trimmed)
+            && let Some(err_msg) = detect_error_envelope(&val)
+        {
+            return err_msg;
         }
 
         // Check for startup/system-only NDJSON by running through extract_agent_text
@@ -322,10 +322,10 @@ fn classify_router_llm_failure(agent: &str, stdout: &str, stderr: &str) -> Strin
         }
 
         // Try tolerant reparse to find embedded error envelopes
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(stdout_trimmed) {
-            if let Some(err_msg) = detect_error_envelope(&val) {
-                return err_msg;
-            }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(stdout_trimmed)
+            && let Some(err_msg) = detect_error_envelope(&val)
+        {
+            return err_msg;
         }
 
         // Last resort: check for common error indicators in stdout.
@@ -788,28 +788,26 @@ impl LlmRouter {
 
         let catalog = tokio::task::spawn_blocking(move || -> String {
             // Try skills.yml in current directory
-            if let Ok(content) = std::fs::read_to_string("skills.yml") {
-                if let Ok(yaml) = serde_norway::from_str::<serde_norway::Value>(&content) {
-                    if let Some(skills) = yaml.get("skills") {
-                        if let Ok(json) = serde_json::to_string(skills) {
-                            return json;
-                        }
-                    }
-                }
+            if let Ok(content) = std::fs::read_to_string("skills.yml")
+                && let Ok(yaml) = serde_norway::from_str::<serde_norway::Value>(&content)
+                && let Some(skills) = yaml.get("skills")
+                && let Ok(json) = serde_json::to_string(skills)
+            {
+                return json;
             }
 
             // Try ORCH_HOME/skills directory
-            if let Some(skills_dir) = skills_dir_opt.as_ref() {
-                if let Some(catalog) = scan_skills_directory(skills_dir) {
-                    return catalog;
-                }
+            if let Some(skills_dir) = skills_dir_opt.as_ref()
+                && let Some(catalog) = scan_skills_directory(skills_dir)
+            {
+                return catalog;
             }
 
             // Try ~/.orch/skills
-            if let Ok(skills_dir) = crate::home::skills_dir() {
-                if let Some(catalog) = scan_skills_directory(&skills_dir) {
-                    return catalog;
-                }
+            if let Ok(skills_dir) = crate::home::skills_dir()
+                && let Some(catalog) = scan_skills_directory(&skills_dir)
+            {
+                return catalog;
             }
 
             "[]".to_string()
@@ -835,7 +833,7 @@ impl LlmRouter {
         model: Option<&str>,
         timeout: Duration,
     ) -> anyhow::Result<String> {
-        use crate::engine::runner::direct::{run_direct_command_raw, DirectCommandError};
+        use crate::engine::runner::direct::{DirectCommandError, run_direct_command_raw};
 
         // Skip immediately if the agent itself is on cooldown (agent-level)
         if crate::engine::cooldown::is_agent_in_cooldown(agent) {
@@ -947,33 +945,33 @@ impl LlmRouter {
         }
 
         // Step 4: Try to find JSON object between curly braces
-        if let Some(start) = text.find('{') {
-            if let Some(end) = text.rfind('}') {
-                let json_str = &text[start..=end];
-                // Attempt to parse the curly-brace substring as a generic JSON
-                // value first so we can inspect keys before accepting it as a
-                // routing decision. This prevents accidental acceptance of
-                // unrelated JSON fragments embedded in prose (e.g. log
-                // snippets). Only accept the JSON if it contains an
-                // identifying routing key ("executor" or alias "agent").
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
-                    if let Some(obj) = value.as_object() {
-                        // Only accept if it contains routing-identifying keys
-                        if obj.contains_key("executor") || obj.contains_key("agent") {
-                            if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(json_str) {
-                                if parsed.executor.trim().is_empty() {
-                                    anyhow::bail!("LLM response contained empty 'executor' field");
-                                }
-                                return Ok(parsed);
-                            }
+        if let Some(start) = text.find('{')
+            && let Some(end) = text.rfind('}')
+        {
+            let json_str = &text[start..=end];
+            // Attempt to parse the curly-brace substring as a generic JSON
+            // value first so we can inspect keys before accepting it as a
+            // routing decision. This prevents accidental acceptance of
+            // unrelated JSON fragments embedded in prose (e.g. log
+            // snippets). Only accept the JSON if it contains an
+            // identifying routing key ("executor" or alias "agent").
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(obj) = value.as_object() {
+                    // Only accept if it contains routing-identifying keys
+                    if (obj.contains_key("executor") || obj.contains_key("agent"))
+                        && let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(json_str)
+                    {
+                        if parsed.executor.trim().is_empty() {
+                            anyhow::bail!("LLM response contained empty 'executor' field");
                         }
+                        return Ok(parsed);
                     }
+                }
 
-                    // json_str is valid JSON but not a routing response — check
-                    // for known error envelopes and surface those first.
-                    if let Some(err_msg) = detect_error_envelope(&value) {
-                        anyhow::bail!("router LLM returned error payload: {err_msg}");
-                    }
+                // json_str is valid JSON but not a routing response — check
+                // for known error envelopes and surface those first.
+                if let Some(err_msg) = detect_error_envelope(&value) {
+                    anyhow::bail!("router LLM returned error payload: {err_msg}");
                 }
             }
         }
@@ -1023,16 +1021,16 @@ impl LlmRouter {
             if let Some(end_rel) = after_trimmed.find("```") {
                 let json_str = &after_trimmed[..end_rel].trim();
                 if !json_str.is_empty() {
-                    if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(json_str) {
-                        if !parsed.executor.trim().is_empty() {
-                            return Ok(Some(parsed));
-                        }
+                    if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(json_str)
+                        && !parsed.executor.trim().is_empty()
+                    {
+                        return Ok(Some(parsed));
                     }
                     // Try parsing generic JSON to check for error envelopes
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
-                        if let Some(err) = detect_error_envelope(&val) {
-                            return Err(anyhow::anyhow!(err));
-                        }
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str)
+                        && let Some(err) = detect_error_envelope(&val)
+                    {
+                        return Err(anyhow::anyhow!(err));
                     }
                 }
                 // Advance past this block
@@ -1058,27 +1056,22 @@ impl LlmRouter {
                         depth -= 1;
                         if depth == 0 {
                             // candidate from i..=j
-                            if let Ok(candidate) = std::str::from_utf8(&bytes[i..=j]) {
-                                if let Ok(val) =
+                            if let Ok(candidate) = std::str::from_utf8(&bytes[i..=j])
+                                && let Ok(val) =
                                     serde_json::from_str::<serde_json::Value>(candidate)
+                            {
+                                // If it's an error envelope, surface it
+                                if let Some(err) = detect_error_envelope(&val) {
+                                    return Err(anyhow::anyhow!(err));
+                                }
+                                // Only accept if contains routing key
+                                if let Some(obj) = val.as_object()
+                                    && (obj.contains_key("executor") || obj.contains_key("agent"))
+                                    && let Ok(parsed) =
+                                        serde_json::from_str::<LlmRouteResponse>(candidate)
+                                    && !parsed.executor.trim().is_empty()
                                 {
-                                    // If it's an error envelope, surface it
-                                    if let Some(err) = detect_error_envelope(&val) {
-                                        return Err(anyhow::anyhow!(err));
-                                    }
-                                    // Only accept if contains routing key
-                                    if let Some(obj) = val.as_object() {
-                                        if obj.contains_key("executor") || obj.contains_key("agent")
-                                        {
-                                            if let Ok(parsed) =
-                                                serde_json::from_str::<LlmRouteResponse>(candidate)
-                                            {
-                                                if !parsed.executor.trim().is_empty() {
-                                                    return Ok(Some(parsed));
-                                                }
-                                            }
-                                        }
-                                    }
+                                    return Ok(Some(parsed));
                                 }
                             }
                             break;
@@ -1097,16 +1090,16 @@ impl LlmRouter {
         //    opencode/Claude wrappers.
         if let Some(text) = opencode::extract_router_text(raw) {
             let trimmed = text.trim();
-            if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(trimmed) {
-                if !parsed.executor.trim().is_empty() {
-                    return Ok(Some(parsed));
-                }
+            if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(trimmed)
+                && !parsed.executor.trim().is_empty()
+            {
+                return Ok(Some(parsed));
             }
             // If it's valid JSON but an error envelope, surface it
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                if let Some(err) = detect_error_envelope(&val) {
-                    return Err(anyhow::anyhow!(err));
-                }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
+                && let Some(err) = detect_error_envelope(&val)
+            {
+                return Err(anyhow::anyhow!(err));
             }
         }
 

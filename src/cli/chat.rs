@@ -1,7 +1,7 @@
 //! CLI handlers for `orch chat` — control session interaction.
 
 use crate::control;
-use crate::store::{parse_since_duration, TaskStore};
+use crate::store::{TaskStore, parse_since_duration};
 use std::io::{self, BufRead, Write};
 
 /// Interactive REPL mode — reads from stdin, sends to control session.

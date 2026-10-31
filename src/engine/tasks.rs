@@ -179,15 +179,14 @@ impl TaskManager {
 
     pub async fn get_task(&self, id: i64) -> anyhow::Result<Task> {
         // Try store first (covers both internal and external tasks)
-        if let Some(ref store) = self.store {
-            if let Ok(task) = store.get(id).await {
-                if task.origin == "internal" {
-                    return Ok(Task::Internal(task));
-                }
-                // External task found in store — still return as External from backend
-                // for compatibility with callers that expect ExternalTask fields
-            }
+        if let Some(ref store) = self.store
+            && let Ok(task) = store.get(id).await
+            && task.origin == "internal"
+        {
+            return Ok(Task::Internal(task));
         }
+        // External task found in store — still return as External from backend
+        // for compatibility with callers that expect ExternalTask fields
         // Fall back to backend for external tasks
         let ext_id = ExternalId(id.to_string());
         match self.backend.get_task(&ext_id).await {
@@ -230,10 +229,10 @@ impl TaskManager {
                         .list_internal_by_status(&self.repo, task_status)
                         .await?;
                     for t in internal_tasks {
-                        if let Some(ref source) = filter.source {
-                            if t.source != *source {
-                                continue;
-                            }
+                        if let Some(ref source) = filter.source
+                            && t.source != *source
+                        {
+                            continue;
                         }
                         tasks.push(Task::Internal(t));
                     }
@@ -401,13 +400,12 @@ impl TaskManager {
         }
 
         // Always include internal tasks from store when available
-        if self.store.is_some() {
-            if let Ok(internal) = self
+        if self.store.is_some()
+            && let Ok(internal) = self
                 .list_internal_by_status(status_to_task_status(status))
                 .await
-            {
-                tasks.extend(internal);
-            }
+        {
+            tasks.extend(internal);
         }
 
         Ok(tasks)
@@ -488,13 +486,13 @@ impl TaskManager {
 
         // External tasks: store-first, then mirror to backend.
         // SQLite is the source of truth; backend sync is best-effort.
-        if let Some(ref store) = self.store {
-            if let Some(store_id) = snapshot_store_id {
-                if task_status != TaskStatus::Blocked {
-                    store.set_block_reason(store_id, None).await?;
-                }
-                store.update_status(store_id, task_status).await?;
+        if let Some(ref store) = self.store
+            && let Some(store_id) = snapshot_store_id
+        {
+            if task_status != TaskStatus::Blocked {
+                store.set_block_reason(store_id, None).await?;
             }
+            store.update_status(store_id, task_status).await?;
         }
 
         // Mirror to backend (GitHub labels). Log failure but don't fail the operation
@@ -545,12 +543,12 @@ impl TaskManager {
         }
 
         // External tasks: store-first, then mirror to backend.
-        if let Some(ref store) = self.store {
-            if let Some(store_id) = snapshot_store_id {
-                store
-                    .update_status_and_fields(store_id, task_status, updates)
-                    .await?;
-            }
+        if let Some(ref store) = self.store
+            && let Some(store_id) = snapshot_store_id
+        {
+            store
+                .update_status_and_fields(store_id, task_status, updates)
+                .await?;
         }
 
         // Mirror to backend (GitHub labels).
@@ -676,13 +674,13 @@ impl TaskManager {
             return Ok(());
         }
 
-        if let Some(ref store) = self.store {
-            if let Some(store_id) = snapshot_store_id {
-                if task_status != TaskStatus::Blocked {
-                    store.set_block_reason(store_id, None).await?;
-                }
-                store.update_status(store_id, task_status).await?;
+        if let Some(ref store) = self.store
+            && let Some(store_id) = snapshot_store_id
+        {
+            if task_status != TaskStatus::Blocked {
+                store.set_block_reason(store_id, None).await?;
             }
+            store.update_status(store_id, task_status).await?;
         }
 
         if let Err(e) = self.backend.update_status(id, status).await {
@@ -1254,10 +1252,11 @@ mod tests {
             Task::Internal(t) => {
                 assert_eq!(t.title, "Internal task");
                 assert_eq!(t.origin, "internal");
-                assert!(t
-                    .external_id
-                    .as_deref()
-                    .is_some_and(|s| s.starts_with("internal:")));
+                assert!(
+                    t.external_id
+                        .as_deref()
+                        .is_some_and(|s| s.starts_with("internal:"))
+                );
             }
             Task::External(_) => panic!("expected Internal variant"),
         }
@@ -1686,9 +1685,11 @@ mod tests {
         let routable = tm.list_routable().await.unwrap();
         assert_eq!(routable.len(), 2);
         assert!(routable.iter().any(|task| task.id.0 == "55"));
-        assert!(routable
-            .iter()
-            .any(|task| task.id.0.starts_with("internal:")));
+        assert!(
+            routable
+                .iter()
+                .any(|task| task.id.0.starts_with("internal:"))
+        );
     }
 
     #[tokio::test]

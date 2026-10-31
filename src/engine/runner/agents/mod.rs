@@ -342,11 +342,7 @@ fn extract_file_paths(text: &str) -> Vec<String> {
             let still_has_ext = extensions
                 .iter()
                 .any(|ext| without.ends_with(&format!(".{ext}")));
-            if still_has_ext {
-                without
-            } else {
-                token
-            }
+            if still_has_ext { without } else { token }
         } else {
             token
         };
@@ -899,10 +895,10 @@ pub trait AgentRunner: Send + Sync {
         elapsed_secs: Option<u64>,
     ) -> AgentError {
         let mut err = self.classify_error(exit_code, stdout, stderr);
-        if let AgentError::Timeout { elapsed } = &mut err {
-            if let Some(actual_elapsed) = elapsed_secs {
-                *elapsed = Duration::from_secs(actual_elapsed);
-            }
+        if let AgentError::Timeout { elapsed } = &mut err
+            && let Some(actual_elapsed) = elapsed_secs
+        {
+            *elapsed = Duration::from_secs(actual_elapsed);
         }
         err
     }
@@ -2015,8 +2011,8 @@ mod tests {
     fn get_runner_no_warning_for_claude_compatible_agents() {
         use std::sync::{Arc, Mutex};
         use tracing::Level;
-        use tracing_subscriber::util::SubscriberInitExt;
         use tracing_subscriber::EnvFilter;
+        use tracing_subscriber::util::SubscriberInitExt;
 
         struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for CaptureWriter {
@@ -2077,10 +2073,12 @@ mod tests {
         assert!(patterns::detect_rate_limit("Error: rate limit exceeded").is_some());
         assert!(patterns::detect_rate_limit("HTTP 429 Too Many Requests").is_some());
         assert!(patterns::detect_rate_limit("You've hit your usage limit").is_some());
-        assert!(patterns::detect_rate_limit(
-            "You've hit your session limit · resets 10:30am (America/Sao_Paulo)"
-        )
-        .is_some());
+        assert!(
+            patterns::detect_rate_limit(
+                "You've hit your session limit · resets 10:30am (America/Sao_Paulo)"
+            )
+            .is_some()
+        );
         assert!(patterns::detect_rate_limit(
             "Upstream error from Alibaba: Request rate increased too quickly. \
              To ensure system stability, please adjust your client logic to scale requests more smoothly over time."
@@ -2230,16 +2228,20 @@ mod tests {
         assert!(patterns::detect_auth_error("task done").is_none());
         // Bare numbers in JSON must NOT trigger auth classification.
         assert!(patterns::detect_auth_error("duration_api_ms 4010292").is_none());
-        assert!(patterns::detect_auth_error(
-            "API Error: Unable to connect to API (ConnectionRefused) duration_api_ms 4010292"
-        )
-        .is_none());
+        assert!(
+            patterns::detect_auth_error(
+                "API Error: Unable to connect to API (ConnectionRefused) duration_api_ms 4010292"
+            )
+            .is_none()
+        );
         // JSON field with colon: "duration_api_ms": 4010292 — contains ": 401" as substring.
         assert!(patterns::detect_auth_error(r#""duration_api_ms": 4010292"#).is_none());
-        assert!(patterns::detect_auth_error(
-            r#"{"error":"ConnectionRefused","duration_api_ms": 4010292}"#
-        )
-        .is_none());
+        assert!(
+            patterns::detect_auth_error(
+                r#"{"error":"ConnectionRefused","duration_api_ms": 4010292}"#
+            )
+            .is_none()
+        );
         // ": 401" at end-of-string or followed by non-digit must still match.
         assert!(patterns::detect_auth_error("status: 401").is_some());
         assert!(patterns::detect_auth_error("error: 403").is_some());
@@ -2955,9 +2957,11 @@ mod tests {
 
         assert_eq!(response.status, "done");
         assert!(response.error.is_none());
-        assert!(response
-            .summary
-            .contains("Filed 3 high-value GitHub issues"));
+        assert!(
+            response
+                .summary
+                .contains("Filed 3 high-value GitHub issues")
+        );
     }
 
     #[test]

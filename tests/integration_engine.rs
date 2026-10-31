@@ -194,9 +194,9 @@ fn cleanup_db(path: &std::path::Path) {
 /// If any struct field changes or a constructor signature drifts, this fails.
 #[tokio::test]
 async fn project_engine_constructs() {
+    use orch::engine::ProjectEngine;
     use orch::engine::runner::TaskRunner;
     use orch::engine::tasks::TaskManager;
-    use orch::engine::ProjectEngine;
 
     let tmp = temp_db("pe-construct");
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
@@ -433,8 +433,8 @@ async fn store_route_result_persists() {
 /// an integration test, since tick_route_tasks is pub(crate).
 #[tokio::test]
 async fn router_round_robin_routes_task() {
-    use orch::engine::router::config::RouterConfig;
     use orch::engine::router::Router;
+    use orch::engine::router::config::RouterConfig;
     use orch::store::UpsertExternal;
 
     let tmp = temp_db("rr-route");

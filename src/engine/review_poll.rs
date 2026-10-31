@@ -23,9 +23,9 @@
 
 use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::config;
-use crate::engine::auto_merge::{dedup_reviews, handle_review_changes, MAX_MERGE_CONFLICT_RETRIES};
-use crate::engine::tasks::TaskManager;
 use crate::engine::EngineConfig;
+use crate::engine::auto_merge::{MAX_MERGE_CONFLICT_RETRIES, dedup_reviews, handle_review_changes};
+use crate::engine::tasks::TaskManager;
 use crate::github::http::{GhHttp, PrReviewBatchData};
 use crate::github::types::{GitHubComment, GitHubReviewComment, PullRequestReview};
 use crate::store::TaskStore;
@@ -465,7 +465,10 @@ pub(crate) async fn review_open_prs(
                 // store error indicates a transient GitHub 5xx/transport failure.
                 let last_error = task_info.stored.last_error.clone();
                 if crate::engine::runner::git_ops::is_transient_github_api_error(&last_error) {
-                    tracing::warn!(task_id, "transient GitHub error recorded in last_error; skipping persistent no_pr_reroutes increment and retrying later");
+                    tracing::warn!(
+                        task_id,
+                        "transient GitHub error recorded in last_error; skipping persistent no_pr_reroutes increment and retrying later"
+                    );
                     continue;
                 }
 
@@ -636,16 +639,15 @@ pub(crate) async fn review_open_prs(
         };
 
         // Skip a rewrite of the same number, set_fields would bump updated_at
-        if stored_task.pr_number.and_then(|n| u64::try_from(n).ok()) != Some(pr_number) {
-            if let Err(e) = store_set_result_by_id(
+        if stored_task.pr_number.and_then(|n| u64::try_from(n).ok()) != Some(pr_number)
+            && let Err(e) = store_set_result_by_id(
                 &Some(Arc::clone(store)),
                 task_info.store_id,
                 &[("pr_number", serde_json::json!(pr_number))],
             )
             .await
-            {
-                tracing::warn!(task_id, err = %e, "failed to persist pr_number");
-            }
+        {
+            tracing::warn!(task_id, err = %e, "failed to persist pr_number");
         }
 
         let Some(batch_data) = batch.get(&pr_number) else {
@@ -840,10 +842,10 @@ pub(crate) async fn review_open_prs(
                 pr_review.review.user.login
             );
 
-            if let Some(ref body) = pr_review.review.body {
-                if !body.trim().is_empty() {
-                    let _ = write!(review_context, "**Overall Feedback:** {body}\n\n");
-                }
+            if let Some(ref body) = pr_review.review.body
+                && !body.trim().is_empty()
+            {
+                let _ = write!(review_context, "**Overall Feedback:** {body}\n\n");
             }
 
             let actionable = pr_review.actionable_comments();
@@ -1303,8 +1305,8 @@ mod tests {
         let guard = tracing::subscriber::set_default(subscriber);
         f();
         drop(guard);
-        let captured = String::from_utf8_lossy(&output.lock().unwrap()).to_string();
-        captured
+
+        String::from_utf8_lossy(&output.lock().unwrap()).to_string()
     }
 
     #[derive(Clone)]

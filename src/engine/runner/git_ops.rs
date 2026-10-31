@@ -11,8 +11,8 @@ use crate::cmd::CommandErrorContext;
 use crate::github::http::GhHttp;
 use regex::Regex;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::process::Command;
 
@@ -317,42 +317,42 @@ async fn restore_stash_by_hash(dir: &Path, stash_hash: Option<&str>) {
             .current_dir(dir)
             .output_with_context()
             .await;
-        if let Ok(list_out) = list {
-            if list_out.status.success() {
-                let list_str = String::from_utf8_lossy(&list_out.stdout);
-                if let Some(stash_ref) = find_stash_ref_by_hash(&list_str, stash_hash) {
-                    match Command::new("git")
-                        .args(["stash", "drop", &stash_ref])
-                        .current_dir(dir)
-                        .output_with_context()
-                        .await
-                    {
-                        Ok(drop_out) if !drop_out.status.success() => {
-                            let stderr = String::from_utf8_lossy(&drop_out.stderr);
-                            tracing::warn!(
-                                dir = %dir.display(),
-                                stash_ref = %stash_ref,
-                                err = %stderr,
-                                "stash drop failed after apply — entry may remain on stack"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                dir = %dir.display(),
-                                stash_ref = %stash_ref,
-                                error = %e,
-                                "stash drop command failed after apply — entry may remain on stack"
-                            );
-                        }
-                        _ => {}
+        if let Ok(list_out) = list
+            && list_out.status.success()
+        {
+            let list_str = String::from_utf8_lossy(&list_out.stdout);
+            if let Some(stash_ref) = find_stash_ref_by_hash(&list_str, stash_hash) {
+                match Command::new("git")
+                    .args(["stash", "drop", &stash_ref])
+                    .current_dir(dir)
+                    .output_with_context()
+                    .await
+                {
+                    Ok(drop_out) if !drop_out.status.success() => {
+                        let stderr = String::from_utf8_lossy(&drop_out.stderr);
+                        tracing::warn!(
+                            dir = %dir.display(),
+                            stash_ref = %stash_ref,
+                            err = %stderr,
+                            "stash drop failed after apply — entry may remain on stack"
+                        );
                     }
-                } else {
-                    tracing::warn!(
-                        dir = %dir.display(),
-                        stash = %stash_hash,
-                        "stash applied but could not find ref by hash — stash entry may be orphaned on stack"
-                    );
+                    Err(e) => {
+                        tracing::warn!(
+                            dir = %dir.display(),
+                            stash_ref = %stash_ref,
+                            error = %e,
+                            "stash drop command failed after apply — entry may remain on stack"
+                        );
+                    }
+                    _ => {}
                 }
+            } else {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    stash = %stash_hash,
+                    "stash applied but could not find ref by hash — stash entry may be orphaned on stack"
+                );
             }
         }
     } else {
@@ -1522,10 +1522,10 @@ fn build_pr_body(
         }
     }
 
-    if !task_id.starts_with("internal:") {
-        if let Ok(issue_num) = task_id.parse::<u64>() {
-            let _ = write!(body, "\n\nCloses #{issue_num}");
-        }
+    if !task_id.starts_with("internal:")
+        && let Ok(issue_num) = task_id.parse::<u64>()
+    {
+        let _ = write!(body, "\n\nCloses #{issue_num}");
     }
 
     let model_str = model.map(|m| format!(" using `{m}`")).unwrap_or_default();
@@ -1940,14 +1940,17 @@ async fn append_pr_footer_if_missing(
     );
     let new_body = format!("{body}{footer}");
 
-    if let Err(e) = gh.update_pr_body(repo, pr_number, &new_body).await {
-        tracing::warn!(task_id, error = %e, "failed to append footer to PR (non-fatal)");
-    } else {
-        tracing::info!(
-            task_id,
-            pr = pr_number,
-            "appended attribution footer to agent-created PR"
-        );
+    match gh.update_pr_body(repo, pr_number, &new_body).await {
+        Err(e) => {
+            tracing::warn!(task_id, error = %e, "failed to append footer to PR (non-fatal)");
+        }
+        _ => {
+            tracing::info!(
+                task_id,
+                pr = pr_number,
+                "appended attribution footer to agent-created PR"
+            );
+        }
     }
 }
 

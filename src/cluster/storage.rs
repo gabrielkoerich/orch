@@ -19,7 +19,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::{Acquire, SqliteConnection};
 
 use super::{NodeId, Reply, TypeConfig};
-use crate::store::{kv, replica, tasks, TaskStore};
+use crate::store::{TaskStore, kv, replica, tasks};
 
 type Err = StorageError<NodeId>;
 

@@ -4,10 +4,10 @@
 //! it never edits labels, closes issues, changes membership, or dispatches work.
 
 use super::super::http::GhHttp;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 
 #[derive(Debug, Default, Deserialize)]
@@ -84,7 +84,9 @@ impl LabelSyncConfig {
                     .iter()
                     .any(|reserved| prefix.starts_with(reserved))
             {
-                bail!("project label sync label_prefix must be a distinct namespace ending in ':' (default board:)");
+                bail!(
+                    "project label sync label_prefix must be a distinct namespace ending in ':' (default board:)"
+                );
             }
             for (label, option) in &board.options {
                 if !label.starts_with(&board.label_prefix)
@@ -92,7 +94,9 @@ impl LabelSyncConfig {
                     || label.trim() != label
                     || option.trim().is_empty()
                 {
-                    bail!("project label sync options must map labels in label_prefix to option names");
+                    bail!(
+                        "project label sync options must map labels in label_prefix to option names"
+                    );
                 }
             }
         }
@@ -631,12 +635,13 @@ projects:
             ]
         );
         // Only field mutations: no issue state, label, or membership operations.
-        assert!(api
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|(query, _)| query == BOARD_QUERY || query == UPDATE_STATUS));
+        assert!(
+            api.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(query, _)| query == BOARD_QUERY || query == UPDATE_STATUS)
+        );
     }
 
     #[tokio::test]
@@ -945,20 +950,23 @@ projects:
             1
         );
         assert!(api.replies.lock().unwrap().is_empty());
-        assert!(api
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|(query, _)| query == BOARD_QUERY || query == UPDATE_STATUS));
+        assert!(
+            api.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(query, _)| query == BOARD_QUERY || query == UPDATE_STATUS)
+        );
         let no_calls = FakeApi::new(vec![]);
-        assert!(crate::cli::board_reconcile_with(
-            &LabelSyncConfig::default(),
-            &no_calls,
-            "example/work"
-        )
-        .await
-        .is_err());
+        assert!(
+            crate::cli::board_reconcile_with(
+                &LabelSyncConfig::default(),
+                &no_calls,
+                "example/work"
+            )
+            .await
+            .is_err()
+        );
         assert!(
             crate::cli::board_reconcile_with(&config(), &no_calls, "other/repo")
                 .await
@@ -1007,10 +1015,11 @@ projects:
         let api = FakeApi::new(replies);
         assert_eq!(config.reconcile(&api, "example/work").await.unwrap(), 6);
         assert_eq!(api.mutations().len(), 6);
-        assert!(api
-            .mutations()
-            .iter()
-            .all(|vars| vars["option"] == "HELD_A"));
+        assert!(
+            api.mutations()
+                .iter()
+                .all(|vars| vars["option"] == "HELD_A")
+        );
     }
 
     #[tokio::test]
@@ -1055,16 +1064,20 @@ projects:
                 "{prefix}"
             );
         }
-        assert!(LabelSyncConfig::parse(
-            &raw.replace("PREFIX", "'workflow:'")
-                .replace("LABEL", "board:held")
-        )
-        .is_err());
-        assert!(LabelSyncConfig::parse(
-            &raw.replace("PREFIX", "'workflow:'")
-                .replace("LABEL", "workflow:held")
-        )
-        .is_ok());
+        assert!(
+            LabelSyncConfig::parse(
+                &raw.replace("PREFIX", "'workflow:'")
+                    .replace("LABEL", "board:held")
+            )
+            .is_err()
+        );
+        assert!(
+            LabelSyncConfig::parse(
+                &raw.replace("PREFIX", "'workflow:'")
+                    .replace("LABEL", "workflow:held")
+            )
+            .is_ok()
+        );
     }
 
     #[test]

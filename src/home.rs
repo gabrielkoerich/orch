@@ -333,14 +333,17 @@ mod tests {
         let orch_home = temp.path().join(".orch");
         std::fs::create_dir_all(&orch_home).unwrap();
         let prev = std::env::var("ORCH_HOME").ok();
-        std::env::set_var("ORCH_HOME", &orch_home);
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", &orch_home) };
         (temp, prev)
     }
 
     fn restore_orch_home(prev: Option<String>) {
         match prev {
-            Some(v) => std::env::set_var("ORCH_HOME", v),
-            None => std::env::remove_var("ORCH_HOME"),
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            Some(v) => unsafe { std::env::set_var("ORCH_HOME", v) },
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            None => unsafe { std::env::remove_var("ORCH_HOME") },
         }
     }
 
@@ -349,7 +352,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let custom_dir = temp.path().join(".orch-custom");
         let prev = std::env::var("ORCH_HOME").ok();
-        std::env::set_var("ORCH_HOME", &custom_dir);
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", &custom_dir) };
 
         let result = orch_home().unwrap();
         assert_eq!(result, custom_dir);

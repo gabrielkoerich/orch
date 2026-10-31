@@ -2,7 +2,7 @@
 //!
 //! Uses the Telegram Bot API to receive commands and stream agent output.
 
-use super::{html_escape, Channel, IncomingMessage, OutgoingMessage};
+use super::{Channel, IncomingMessage, OutgoingMessage, html_escape};
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -465,21 +465,21 @@ impl Channel for TelegramChannel {
         let topic_id = msg.topic_id.as_ref().and_then(|t| t.parse::<i64>().ok());
 
         // If metadata carries inline keyboard buttons, send as interactive message.
-        if let Some(buttons_val) = msg.metadata.get("buttons") {
-            if let Some(buttons_arr) = buttons_val.as_array() {
-                let buttons: Vec<(String, String)> = buttons_arr
-                    .iter()
-                    .filter_map(|b| {
-                        let text = b["text"].as_str()?.to_string();
-                        let callback_data = b["callback_data"].as_str()?.to_string();
-                        Some((text, callback_data))
-                    })
-                    .collect();
-                if !buttons.is_empty() {
-                    self.send_inline_keyboard(chat_id, topic_id, &msg.body, &buttons)
-                        .await?;
-                    return Ok(());
-                }
+        if let Some(buttons_val) = msg.metadata.get("buttons")
+            && let Some(buttons_arr) = buttons_val.as_array()
+        {
+            let buttons: Vec<(String, String)> = buttons_arr
+                .iter()
+                .filter_map(|b| {
+                    let text = b["text"].as_str()?.to_string();
+                    let callback_data = b["callback_data"].as_str()?.to_string();
+                    Some((text, callback_data))
+                })
+                .collect();
+            if !buttons.is_empty() {
+                self.send_inline_keyboard(chat_id, topic_id, &msg.body, &buttons)
+                    .await?;
+                return Ok(());
             }
         }
 

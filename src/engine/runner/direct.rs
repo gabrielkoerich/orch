@@ -4,7 +4,7 @@
 //! in a fire-and-forget mode without a persistent tmux session.
 
 use crate::engine::runner::agents::{
-    get_runner, shell_single_quote, supports_session, AgentError, PermissionRules,
+    AgentError, PermissionRules, get_runner, shell_single_quote, supports_session,
 };
 use anyhow::Result;
 use std::time::Duration;
@@ -273,25 +273,24 @@ pub(crate) fn extract_from_envelope(raw: &str) -> (String, Option<u64>, Option<u
         })
         .unwrap_or(raw);
 
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
-        if let Some(obj) = value.as_object() {
-            if obj.get("type").and_then(|v| v.as_str()) == Some("result") {
-                let text = obj
-                    .get("result")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let input_tokens = obj
-                    .get("usage")
-                    .and_then(|u| u.get("input_tokens"))
-                    .and_then(serde_json::Value::as_u64);
-                let output_tokens = obj
-                    .get("usage")
-                    .and_then(|u| u.get("output_tokens"))
-                    .and_then(serde_json::Value::as_u64);
-                return (text, input_tokens, output_tokens);
-            }
-        }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate)
+        && let Some(obj) = value.as_object()
+        && obj.get("type").and_then(|v| v.as_str()) == Some("result")
+    {
+        let text = obj
+            .get("result")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let input_tokens = obj
+            .get("usage")
+            .and_then(|u| u.get("input_tokens"))
+            .and_then(serde_json::Value::as_u64);
+        let output_tokens = obj
+            .get("usage")
+            .and_then(|u| u.get("output_tokens"))
+            .and_then(serde_json::Value::as_u64);
+        return (text, input_tokens, output_tokens);
     }
     (raw.to_string(), None, None)
 }

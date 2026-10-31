@@ -3,7 +3,7 @@
 
 use crate::config;
 use crate::store::{self, CliTaskRef, TaskStore};
-use std::path::{Path, PathBuf, MAIN_SEPARATOR_STR};
+use std::path::{MAIN_SEPARATOR_STR, Path, PathBuf};
 
 /// Resolve a task id against the store, using the project of the working directory
 pub async fn resolve(store: &TaskStore, id: &str) -> anyhow::Result<CliTaskRef> {
@@ -77,10 +77,10 @@ async fn expand_repo(
         return Ok(spec.to_string());
     }
 
-    if let Some(repo) = current_repo {
-        if repo.rsplit_once('/').is_some_and(|(_, n)| n == name) {
-            return Ok(format!("{repo}#{number}"));
-        }
+    if let Some(repo) = current_repo
+        && repo.rsplit_once('/').is_some_and(|(_, n)| n == name)
+    {
+        return Ok(format!("{repo}#{number}"));
     }
 
     let owners: Vec<String> = store

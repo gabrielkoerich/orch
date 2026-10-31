@@ -6,7 +6,7 @@ use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
-use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
 const CURSOR_KEY: &str = "relay_cursor";
 const PING_EVERY: Duration = Duration::from_secs(300);
@@ -50,11 +50,7 @@ pub async fn run(url: String, token: String, store: Arc<TaskStore>, notify: Arc<
 
 /// Seconds to wait before the next connect
 fn retry_after(backoff: u64, lasted: Duration) -> u64 {
-    if lasted >= STABLE_SESSION {
-        1
-    } else {
-        backoff
-    }
+    if lasted >= STABLE_SESSION { 1 } else { backoff }
 }
 
 async fn session(url: &str, token: &str, store: &TaskStore, notify: &Notify) -> anyhow::Result<()> {
@@ -194,11 +190,13 @@ mod tests {
             store.kv_get("dep_blocker_read_at:o/r#12").await.unwrap(),
             None
         );
-        assert!(store
-            .kv_get("dep_blocker_read_at:o/r#13")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .kv_get("dep_blocker_read_at:o/r#13")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

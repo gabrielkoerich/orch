@@ -94,25 +94,25 @@ impl TokenResolver {
     /// 2. `GITHUB_TOKEN` env var
     /// 3. `gh.auth.token` config value
     fn resolve_env_token() -> Option<String> {
-        if let Ok(t) = env::var("GH_TOKEN") {
-            if !t.is_empty() {
-                // Info, not debug: when a token turns out bad, the source is the first thing to check
-                tracing::info!("Resolved GitHub token from GH_TOKEN environment variable");
-                return Some(t);
-            }
+        if let Ok(t) = env::var("GH_TOKEN")
+            && !t.is_empty()
+        {
+            // Info, not debug: when a token turns out bad, the source is the first thing to check
+            tracing::info!("Resolved GitHub token from GH_TOKEN environment variable");
+            return Some(t);
         }
-        if let Ok(t) = env::var("GITHUB_TOKEN") {
-            if !t.is_empty() {
-                tracing::info!("Resolved GitHub token from GITHUB_TOKEN environment variable");
-                return Some(t);
-            }
+        if let Ok(t) = env::var("GITHUB_TOKEN")
+            && !t.is_empty()
+        {
+            tracing::info!("Resolved GitHub token from GITHUB_TOKEN environment variable");
+            return Some(t);
         }
         // Config-based token (explicit override in ~/.orch/config.yml)
-        if let Ok(t) = crate::config::get("gh.auth.token") {
-            if !t.is_empty() {
-                tracing::info!("Resolved GitHub token from gh.auth.token config");
-                return Some(t);
-            }
+        if let Ok(t) = crate::config::get("gh.auth.token")
+            && !t.is_empty()
+        {
+            tracing::info!("Resolved GitHub token from gh.auth.token config");
+            return Some(t);
         }
         None
     }
@@ -222,8 +222,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_returns_none_when_no_env_set() {
         let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GH_TOKEN") };
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GITHUB_TOKEN") };
         // Disable gh fallback so we don't actually call gh CLI in tests
         let resolver = TokenResolver::default_env().with_gh_fallback(false);
         resolver.clear_cache().await;
@@ -239,19 +241,24 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_prefers_gh_token() {
         let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GH_TOKEN") };
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GITHUB_TOKEN") };
         let resolver = TokenResolver::default_env().with_gh_fallback(false);
         resolver.clear_cache().await;
 
-        env::set_var("GH_TOKEN", "gh_token_value");
-        env::remove_var("GITHUB_TOKEN");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::set_var("GH_TOKEN", "gh_token_value") };
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GITHUB_TOKEN") };
 
         let resolver = TokenResolver::default_env().with_gh_fallback(false);
         let token = resolver.get_token().await.unwrap();
         assert_eq!(token, Some("gh_token_value".to_string()));
 
-        env::remove_var("GH_TOKEN");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GH_TOKEN") };
     }
 
     #[expect(
@@ -261,17 +268,21 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_falls_back_to_github_token() {
         let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GH_TOKEN") };
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GITHUB_TOKEN") };
         let resolver = TokenResolver::default_env().with_gh_fallback(false);
         resolver.clear_cache().await;
 
-        env::set_var("GITHUB_TOKEN", "github_token_value");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::set_var("GITHUB_TOKEN", "github_token_value") };
 
         let token = resolver.get_token().await.unwrap();
         assert_eq!(token, Some("github_token_value".to_string()));
 
-        env::remove_var("GITHUB_TOKEN");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GITHUB_TOKEN") };
     }
 
     #[expect(
@@ -281,20 +292,26 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_prefers_gh_token_over_github_token() {
         let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GH_TOKEN") };
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GITHUB_TOKEN") };
         let resolver = TokenResolver::default_env().with_gh_fallback(false);
         resolver.clear_cache().await;
 
-        env::set_var("GH_TOKEN", "gh_token_value");
-        env::set_var("GITHUB_TOKEN", "github_token_value");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::set_var("GH_TOKEN", "gh_token_value") };
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::set_var("GITHUB_TOKEN", "github_token_value") };
 
         let token = resolver.get_token().await.unwrap();
         // GH_TOKEN should be preferred
         assert_eq!(token, Some("gh_token_value".to_string()));
 
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GH_TOKEN") };
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GITHUB_TOKEN") };
     }
 
     #[expect(
@@ -304,19 +321,25 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_ignores_empty_env_vars() {
         let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GH_TOKEN") };
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GITHUB_TOKEN") };
         let resolver = TokenResolver::default_env().with_gh_fallback(false);
         resolver.clear_cache().await;
 
-        env::set_var("GH_TOKEN", "");
-        env::set_var("GITHUB_TOKEN", "");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::set_var("GH_TOKEN", "") };
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::set_var("GITHUB_TOKEN", "") };
 
         let token = resolver.get_token().await.unwrap();
         assert!(token.is_none());
 
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GH_TOKEN") };
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GITHUB_TOKEN") };
     }
 
     #[expect(
@@ -326,12 +349,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn clear_cache_clears_token() {
         let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GH_TOKEN") };
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GITHUB_TOKEN") };
         let resolver = TokenResolver::default_env().with_gh_fallback(false);
         resolver.clear_cache().await;
 
-        env::set_var("GH_TOKEN", "cached_token");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::set_var("GH_TOKEN", "cached_token") };
 
         // First call should cache the token
         let token1 = resolver.get_token().await.unwrap();
@@ -344,14 +370,17 @@ mod tests {
         let token2 = resolver.get_token().await.unwrap();
         assert_eq!(token2, Some("cached_token".to_string()));
 
-        env::remove_var("GH_TOKEN");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GH_TOKEN") };
     }
 
     #[test]
     fn resolve_env_token_returns_none_when_unset() {
         let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GH_TOKEN") };
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GITHUB_TOKEN") };
 
         let token = TokenResolver::resolve_env_token();
         assert!(token.is_none());
@@ -360,13 +389,17 @@ mod tests {
     #[test]
     fn resolve_env_token_prefers_gh_token() {
         let _guard = ENV_LOCK.lock().unwrap();
-        env::set_var("GH_TOKEN", "gh_pref");
-        env::set_var("GITHUB_TOKEN", "github_pref");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::set_var("GH_TOKEN", "gh_pref") };
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::set_var("GITHUB_TOKEN", "github_pref") };
 
         let token = TokenResolver::resolve_env_token();
         assert_eq!(token, Some("gh_pref".to_string()));
 
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GH_TOKEN") };
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::remove_var("GITHUB_TOKEN") };
     }
 }

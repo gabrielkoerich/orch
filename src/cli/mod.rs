@@ -391,7 +391,7 @@ pub async fn board_list() -> anyhow::Result<()> {
 
 /// Link current repo to a GitHub Projects V2 board by ID and discover fields.
 pub async fn board_link(project_id: &str) -> anyhow::Result<()> {
-    use crate::github::projects::{write_project_config, ProjectSync};
+    use crate::github::projects::{ProjectSync, write_project_config};
 
     println!("Discovering board fields...");
     let sync = ProjectSync::discover_fields(project_id).await?;
@@ -410,7 +410,7 @@ pub async fn board_link(project_id: &str) -> anyhow::Result<()> {
 
 /// Re-discover field IDs from configured board and update config.
 pub async fn board_sync() -> anyhow::Result<()> {
-    use crate::github::projects::{write_project_config, ProjectSync};
+    use crate::github::projects::{ProjectSync, write_project_config};
 
     let project_id = config::get("gh.project_id").map_err(|_| {
         anyhow::anyhow!("no board configured — run `orch project board link <id>` first")
@@ -470,7 +470,9 @@ pub async fn board_reconcile(repo: Option<&str>) -> anyhow::Result<()> {
     let config = crate::github::projects::label_status::LabelSyncConfig::from_config()?;
     let gh = crate::github::http::GhHttp::owner()?;
     let updated = board_reconcile_with(&config, &gh, &repo).await?;
-    println!("Updated {updated} project Status field(s) in this pass; skipped items are reported at debug level.");
+    println!(
+        "Updated {updated} project Status field(s) in this pass; skipped items are reported at debug level."
+    );
     Ok(())
 }
 
@@ -753,8 +755,8 @@ fn read_project_repo(project_path: &std::path::Path) -> Option<String> {
 
 /// Initialize task manager with database and backend.
 pub async fn init_task_manager() -> anyhow::Result<TaskManager> {
-    use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
+    use crate::backends::github::GitHubBackend;
 
     let repo = config::get_current_repo()
         .context("'repo' not set — run `orch init` or set gh.repo in .orch.yml")?;

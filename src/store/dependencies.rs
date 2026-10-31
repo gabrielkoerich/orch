@@ -1029,8 +1029,8 @@ mod tests {
 /// The SQL behind each replicated dependency write
 pub(crate) mod apply {
     use super::{
-        blocked_external_from_body, load_blockers, worktree_refresh_key, Context, NewDependency,
-        Row, SqliteConnection,
+        Context, NewDependency, Row, SqliteConnection, blocked_external_from_body, load_blockers,
+        worktree_refresh_key,
     };
 
     pub(crate) async fn move_repo(

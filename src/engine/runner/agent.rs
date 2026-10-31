@@ -483,14 +483,14 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
         }
         permissions.extra_writable_dirs.extend(extra_dirs);
 
-        if Shipcheck::detect(&inv.work_dir).await == Shipcheck::Available {
-            if let Err(e) = install_shipcheck_rule(&inv.work_dir).await {
-                tracing::warn!(
-                    work_dir = %inv.work_dir.display(),
-                    error = %e,
-                    "failed to install the shipcheck codex rule"
-                );
-            }
+        if Shipcheck::detect(&inv.work_dir).await == Shipcheck::Available
+            && let Err(e) = install_shipcheck_rule(&inv.work_dir).await
+        {
+            tracing::warn!(
+                work_dir = %inv.work_dir.display(),
+                error = %e,
+                "failed to install the shipcheck codex rule"
+            );
         }
     }
 
@@ -906,8 +906,10 @@ mod tests {
         let inv = test_invocation("runner-status-test");
         let script = build_runner_script_in_dir(&inv, tmp.path());
 
-        assert!(script
-            .contains("trap 'status=$?; printf \"%s\\n\" \"$status\" > \"$status_file\"' EXIT"));
+        assert!(
+            script
+                .contains("trap 'status=$?; printf \"%s\\n\" \"$status\" > \"$status_file\"' EXIT")
+        );
         assert!(script.contains("set +e"));
     }
 

@@ -9,8 +9,8 @@
 //! - Discord:  2 KB per message, 500 ms between sends
 //! - Slack:    4 KB per message, 200 ms between sends
 
-use crate::channels::transport::{parse_conversation_key, Transport};
-use crate::channels::{html_escape, split_utf8, ChannelRegistry, OutgoingMessage};
+use crate::channels::transport::{Transport, parse_conversation_key};
+use crate::channels::{ChannelRegistry, OutgoingMessage, html_escape, split_utf8};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::{Duration, Instant};
@@ -139,24 +139,20 @@ pub async fn fanout_output(
                                 .get(ch_name)
                                 .is_none_or(|t| now.duration_since(*t) >= rate);
 
-                            if can_send {
-                                if let Some(buffered) = buffers.remove(thread_key) {
-                                    // Escape HTML for Telegram before splitting so chunk
-                                    // boundaries are computed on the actual API payload size.
-                                    let to_send = if ch_name == "telegram" {
-                                        html_escape(&buffered)
-                                    } else {
-                                        buffered
-                                    };
-                                    let parts = split_for_platform(&to_send, ch_name);
-                                    for part in parts {
-                                        send_to_thread(
-                                            &channels, ch_name, thread_id, topic_id, part,
-                                        )
+                            if can_send && let Some(buffered) = buffers.remove(thread_key) {
+                                // Escape HTML for Telegram before splitting so chunk
+                                // boundaries are computed on the actual API payload size.
+                                let to_send = if ch_name == "telegram" {
+                                    html_escape(&buffered)
+                                } else {
+                                    buffered
+                                };
+                                let parts = split_for_platform(&to_send, ch_name);
+                                for part in parts {
+                                    send_to_thread(&channels, ch_name, thread_id, topic_id, part)
                                         .await;
-                                    }
-                                    last_send.insert(ch_name.to_string(), now);
                                 }
+                                last_send.insert(ch_name.to_string(), now);
                             }
                         }
                     }
@@ -554,11 +550,10 @@ mod tests {
                     rx.recv().await
                 })
                 .await
+                && msg.body.contains("hello from agent")
             {
-                if msg.body.contains("hello from agent") {
-                    got = true;
-                    break;
-                }
+                got = true;
+                break;
             }
         }
 
@@ -627,16 +622,15 @@ mod tests {
                     rx.recv().await
                 })
                 .await
+                && msg.body.contains("topic reply")
             {
-                if msg.body.contains("topic reply") {
-                    assert_eq!(
-                        msg.topic_id.as_deref(),
-                        Some("topic-42"),
-                        "outgoing message must carry the bound topic_id"
-                    );
-                    got_topic = true;
-                    break;
-                }
+                assert_eq!(
+                    msg.topic_id.as_deref(),
+                    Some("topic-42"),
+                    "outgoing message must carry the bound topic_id"
+                );
+                got_topic = true;
+                break;
             }
         }
 

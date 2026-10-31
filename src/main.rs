@@ -7,7 +7,7 @@
 use orch::{cli, config, cron, engine, home, parser, template};
 
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
-use clap_complete::{generate, Shell};
+use clap_complete::{Shell, generate};
 
 const MAX_SERVICE_LOG_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ROTATED_SERVICE_LOGS: usize = 3;
@@ -23,40 +23,41 @@ fn ensure_path() {
     // Source ~/.path — a shell snippet that exports PATH entries.
     // We parse `export PATH="..."` lines and extract the directories.
     let dotpath = format!("{home}/.path");
-    if std::path::Path::new(&dotpath).is_file() {
-        if let Ok(contents) = std::fs::read_to_string(&dotpath) {
-            let current = std::env::var("PATH").unwrap_or_default();
-            let mut path = current.clone();
-            for line in contents.lines() {
-                let line = line.trim();
-                // Match: export PATH="...:$PATH" or export PATH="...$PATH"
-                if let Some(value) = line
-                    .strip_prefix("export PATH=\"")
-                    .and_then(|s| s.strip_suffix('"'))
+    if std::path::Path::new(&dotpath).is_file()
+        && let Ok(contents) = std::fs::read_to_string(&dotpath)
+    {
+        let current = std::env::var("PATH").unwrap_or_default();
+        let mut path = current.clone();
+        for line in contents.lines() {
+            let line = line.trim();
+            // Match: export PATH="...:$PATH" or export PATH="...$PATH"
+            if let Some(value) = line
+                .strip_prefix("export PATH=\"")
+                .and_then(|s| s.strip_suffix('"'))
+            {
+                // Extract the new directory (only the part before the first $PATH)
+                // Use strip_prefix to handle $PATH only at the end, preserving any
+                // additional path components that come before it
+                let dir = if let Some((before, _)) = value.split_once("$PATH") {
+                    before
+                } else {
+                    value
+                }
+                .replace("$HOME", &home)
+                .trim_end_matches(':')
+                .to_string();
+                if !dir.is_empty()
+                    && !path.split(':').any(|d| d == dir)
+                    && std::path::Path::new(&dir).is_dir()
                 {
-                    // Extract the new directory (only the part before the first $PATH)
-                    // Use strip_prefix to handle $PATH only at the end, preserving any
-                    // additional path components that come before it
-                    let dir = if let Some((before, _)) = value.split_once("$PATH") {
-                        before
-                    } else {
-                        value
-                    }
-                    .replace("$HOME", &home)
-                    .trim_end_matches(':')
-                    .to_string();
-                    if !dir.is_empty()
-                        && !path.split(':').any(|d| d == dir)
-                        && std::path::Path::new(&dir).is_dir()
-                    {
-                        path = format!("{dir}:{path}");
-                    }
+                    path = format!("{dir}:{path}");
                 }
             }
-            if path != current {
-                std::env::set_var("PATH", &path);
-                return;
-            }
+        }
+        if path != current {
+            // SAFETY: main calls this before it builds the tokio runtime, so the process has one thread
+            unsafe { std::env::set_var("PATH", &path) };
+            return;
         }
     }
 
@@ -77,7 +78,8 @@ fn ensure_path() {
         }
     }
     if new_path != current {
-        std::env::set_var("PATH", &new_path);
+        // SAFETY: main calls this before it builds the tokio runtime, so the process has one thread
+        unsafe { std::env::set_var("PATH", &new_path) };
     }
 }
 
@@ -103,7 +105,8 @@ fn load_private_env() {
         let key = key.trim();
         let val = val.trim().trim_matches('"');
         if !key.is_empty() && std::env::var(key).is_err() {
-            std::env::set_var(key, val);
+            // SAFETY: main calls this before it builds the tokio runtime, so the process has one thread
+            unsafe { std::env::set_var(key, val) };
         }
     }
 }
@@ -159,8 +162,8 @@ fn rotated_log_path(path: &std::path::Path, suffix: usize) -> std::path::PathBuf
 
 #[cfg(test)]
 mod tests {
-    use super::{rotate_log_if_needed, rotated_log_path, Cli, Commands, MAX_SERVICE_LOG_BYTES};
-    use clap::{error::ErrorKind, CommandFactory, Parser};
+    use super::{Cli, Commands, MAX_SERVICE_LOG_BYTES, rotate_log_if_needed, rotated_log_path};
+    use clap::{CommandFactory, Parser, error::ErrorKind};
 
     #[test]
     fn rotated_log_path_appends_suffix() {
@@ -346,15 +349,17 @@ mod tests {
         assert!(Cli::try_parse_from(["orch", "service", "doctor"]).is_ok());
         assert!(Cli::try_parse_from(["orch", "service", "prune"]).is_ok());
         assert!(Cli::try_parse_from(["orch", "project", "board", "info"]).is_ok());
-        assert!(Cli::try_parse_from([
-            "orch",
-            "project",
-            "board",
-            "reconcile",
-            "--repo",
-            "owner/repo"
-        ])
-        .is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "orch",
+                "project",
+                "board",
+                "reconcile",
+                "--repo",
+                "owner/repo"
+            ])
+            .is_ok()
+        );
         assert!(Cli::try_parse_from(["orch", "config", "agents"]).is_ok());
         assert!(Cli::try_parse_from(["orch", "log", "-f", "--task", "123"]).is_ok());
         assert!(Cli::try_parse_from(["orch", "task", "unblock", "owner/repo#58"]).is_ok());

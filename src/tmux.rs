@@ -425,10 +425,13 @@ impl TmuxManager {
                     created_at = session.created_at,
                     "killing stale tmux session from previous run"
                 );
-                if let Err(e) = self.kill_session(&session.name).await {
-                    tracing::warn!(session = %session.name, error = %e, "failed to kill stale session");
-                } else {
-                    killed += 1;
+                match self.kill_session(&session.name).await {
+                    Err(e) => {
+                        tracing::warn!(session = %session.name, error = %e, "failed to kill stale session");
+                    }
+                    _ => {
+                        killed += 1;
+                    }
                 }
             }
         }

@@ -98,7 +98,8 @@ mod tests {
     #[test]
     fn an_env_reference_reads_the_variable() {
         // A name no other test sets, so parallel tests cannot race on it
-        std::env::set_var("ORCH_SECRET_REF_TEST_SET", "from-env");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_SECRET_REF_TEST_SET", "from-env") };
         assert_eq!(
             resolve_with("/nonexistent", "${ORCH_SECRET_REF_TEST_SET}").unwrap(),
             "from-env"

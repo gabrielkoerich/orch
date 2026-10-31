@@ -14,8 +14,8 @@
 
 use super::claude::ClaudeRunner;
 use super::{
-    truncate_at_char_boundary, AgentError, AgentRunner, ParsedResponse, PermissionRules,
-    StreamEvent,
+    AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent,
+    truncate_at_char_boundary,
 };
 
 /// Count Edit and Write tool_use events in NDJSON stream output.
@@ -73,12 +73,12 @@ fn extract_last_assistant_text(raw: &str) -> Option<String> {
             continue;
         };
         for item in content {
-            if item.get("type").and_then(|v| v.as_str()) == Some("text") {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        last_text = Some(trimmed.to_string());
-                    }
+            if item.get("type").and_then(|v| v.as_str()) == Some("text")
+                && let Some(text) = item.get("text").and_then(|v| v.as_str())
+            {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    last_text = Some(trimmed.to_string());
                 }
             }
         }
@@ -228,10 +228,10 @@ impl AgentRunner for MiniMaxClaudeRunner {
 
     fn extract_text(&self, raw: &str) -> Result<String, AgentError> {
         // Try standard Claude extraction first
-        if let Ok(text) = self.inner.extract_text(raw) {
-            if !text.is_empty() {
-                return Ok(text);
-            }
+        if let Ok(text) = self.inner.extract_text(raw)
+            && !text.is_empty()
+        {
+            return Ok(text);
         }
 
         // Fall back to extracting last assistant text from stream

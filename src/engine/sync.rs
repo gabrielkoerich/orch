@@ -20,7 +20,7 @@ use crate::engine::cooldown::{
 };
 use crate::engine::router::Router;
 use crate::engine::runner::agents::patterns;
-use crate::engine::tasks::{status_to_task_status, TaskManager};
+use crate::engine::tasks::{TaskManager, status_to_task_status};
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
@@ -86,10 +86,10 @@ async fn try_kv_set_prefer_store(
     Ok(())
 }
 
-use super::cleanup::{check_merged_prs, cleanup_done_worktrees};
-use super::commands::{parse_command, validate_and_run_command, CommandOutcome, CommandStoreOps};
-use super::review_poll::review_open_prs;
 use super::EngineConfig;
+use super::cleanup::{check_merged_prs, cleanup_done_worktrees};
+use super::commands::{CommandOutcome, CommandStoreOps, parse_command, validate_and_run_command};
+use super::review_poll::review_open_prs;
 use crate::github::types::extract_issue_number_from_url;
 
 #[derive(Debug, Clone)]
@@ -1345,21 +1345,19 @@ async fn auto_unblock_blocked_tasks(
             }
         };
         for task in ci_failure_tasks {
-            if ci_failure_unblock_cooldown_elapsed(&task) {
-                if let Some(ref gh) = gh {
-                    if let Err(e) = try_unblock_ci_failure_task(
-                        gh,
-                        repo,
-                        task_manager,
-                        store,
-                        &task,
-                        auto_merge_in_flight,
-                    )
-                    .await
-                    {
-                        tracing::warn!(task_id = task.id, err = %e, "CI failure unblock check failed");
-                    }
-                }
+            if ci_failure_unblock_cooldown_elapsed(&task)
+                && let Some(ref gh) = gh
+                && let Err(e) = try_unblock_ci_failure_task(
+                    gh,
+                    repo,
+                    task_manager,
+                    store,
+                    &task,
+                    auto_merge_in_flight,
+                )
+                .await
+            {
+                tracing::warn!(task_id = task.id, err = %e, "CI failure unblock check failed");
             }
         }
     }
@@ -2192,7 +2190,7 @@ async fn scan_comments(
         .enumerate()
         .filter_map(|(i, action)| {
             if let CommentAction::CreateMentionTask {
-                issue_num: Some(ref num),
+                issue_num: Some(num),
             } = action
             {
                 Some((i, num.clone()))
@@ -2828,52 +2826,52 @@ pub(crate) async fn ingest_external_tasks(
             let duplicate_target = existing_by_title
                 .get(&task.title)
                 .or_else(|| accepted_by_title.get(&task.title));
-            if let Some(target) = duplicate_target {
-                if target.id != task.id.0 {
-                    let label = target.status_label.as_str();
-                    let should_dedupe =
-                        match backend.has_open_issue_with_title(&task.title, label).await {
-                            Ok(true) => true,
-                            Ok(false) => false,
-                            Err(e) => {
-                                tracing::warn!(
-                                    task_id = task.id.0,
-                                    err = %e,
-                                    "ingest: dedup check failed — defaulting to keep issue"
-                                );
-                                false
-                            }
-                        };
-
-                    if should_dedupe {
-                        let comment = format!(
-                            "Duplicate of #{id} — closing to avoid duplicate work.{footer}",
-                            id = target.id,
-                            footer = crate::engine::orch_footer()
-                        );
-                        if let Err(e) = backend.post_comment(&task.id, &comment).await {
+            if let Some(target) = duplicate_target
+                && target.id != task.id.0
+            {
+                let label = target.status_label.as_str();
+                let should_dedupe =
+                    match backend.has_open_issue_with_title(&task.title, label).await {
+                        Ok(true) => true,
+                        Ok(false) => false,
+                        Err(e) => {
                             tracing::warn!(
                                 task_id = task.id.0,
                                 err = %e,
-                                "ingest: failed to comment on duplicate issue"
+                                "ingest: dedup check failed — defaulting to keep issue"
                             );
+                            false
                         }
-                        match backend.update_status(&task.id, Status::Done).await {
-                            Ok(()) => {
-                                tracing::info!(
-                                    task_id = task.id.0,
-                                    duplicate_of = target.id,
-                                    "ingest: closed duplicate issue"
-                                );
-                                continue;
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    task_id = task.id.0,
-                                    err = %e,
-                                    "ingest: failed to close duplicate issue — falling through to ingest normally"
-                                );
-                            }
+                    };
+
+                if should_dedupe {
+                    let comment = format!(
+                        "Duplicate of #{id} — closing to avoid duplicate work.{footer}",
+                        id = target.id,
+                        footer = crate::engine::orch_footer()
+                    );
+                    if let Err(e) = backend.post_comment(&task.id, &comment).await {
+                        tracing::warn!(
+                            task_id = task.id.0,
+                            err = %e,
+                            "ingest: failed to comment on duplicate issue"
+                        );
+                    }
+                    match backend.update_status(&task.id, Status::Done).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                task_id = task.id.0,
+                                duplicate_of = target.id,
+                                "ingest: closed duplicate issue"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                task_id = task.id.0,
+                                err = %e,
+                                "ingest: failed to close duplicate issue — falling through to ingest normally"
+                            );
                         }
                     }
                 }
@@ -2882,8 +2880,8 @@ pub(crate) async fn ingest_external_tasks(
 
         match store.ensure_external_task(repo, task).await {
             Ok(store_id) => {
-                if let Ok(number) = task.id.0.parse::<i64>() {
-                    if let Err(err) = crate::engine::dependencies::sync_issue_dependencies(
+                if let Ok(number) = task.id.0.parse::<i64>()
+                    && let Err(err) = crate::engine::dependencies::sync_issue_dependencies(
                         backend.as_ref(),
                         store,
                         store_id,
@@ -2892,13 +2890,12 @@ pub(crate) async fn ingest_external_tasks(
                         &task.body,
                     )
                     .await
-                    {
-                        tracing::warn!(
-                            task_id = task.id.0,
-                            err = %err,
-                            "ingest: dependency sync failed"
-                        );
-                    }
+                {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        err = %err,
+                        "ingest: dependency sync failed"
+                    );
                 }
                 if let Some(s) = status {
                     id_status_pairs.push((store_id, *s));
@@ -2965,14 +2962,14 @@ pub(crate) async fn ingest_external_tasks(
             }
         };
         for (store_id, status) in id_status_pairs {
-            if let Some(existing) = existing_map.get(&store_id) {
-                if existing.status == TaskStatus::New {
-                    let db_status = status_to_task_status(status);
-                    if db_status != TaskStatus::New {
-                        if let Err(e) = store.update_status(store_id, db_status).await {
-                            tracing::debug!(?e, "ingest: status sync failed");
-                        }
-                    }
+            if let Some(existing) = existing_map.get(&store_id)
+                && existing.status == TaskStatus::New
+            {
+                let db_status = status_to_task_status(status);
+                if db_status != TaskStatus::New
+                    && let Err(e) = store.update_status(store_id, db_status).await
+                {
+                    tracing::debug!(?e, "ingest: status sync failed");
                 }
             }
         }
@@ -2985,17 +2982,16 @@ pub(crate) async fn ingest_external_tasks(
         match backend.get_project_item_estimates(&node_ids).await {
             Ok(estimates) => {
                 for (store_id, node_id) in new_task_node_ids {
-                    if let Some(&estimate) = estimates.get(&node_id) {
-                        if estimate > 0 {
-                            if let Err(e) = store.set_estimate_if_zero(store_id, estimate).await {
-                                tracing::debug!(
-                                    store_id,
-                                    estimate,
-                                    err = %e,
-                                    "ingest: failed to set estimate from project"
-                                );
-                            }
-                        }
+                    if let Some(&estimate) = estimates.get(&node_id)
+                        && estimate > 0
+                        && let Err(e) = store.set_estimate_if_zero(store_id, estimate).await
+                    {
+                        tracing::debug!(
+                            store_id,
+                            estimate,
+                            err = %e,
+                            "ingest: failed to set estimate from project"
+                        );
                     }
                 }
             }
@@ -3230,11 +3226,13 @@ mod tests {
         ingest_external_tasks(&backend_dyn, "owner/repo", &store)
             .await
             .unwrap();
-        assert!(store
-            .get_by_external_id("owner/repo", "73")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .get_by_external_id("owner/repo", "73")
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         // A second sync, standing in for the one right after a restart, sees a new issue.
         let backend = IngestMockBackend::with_tasks(vec![(
@@ -3252,11 +3250,13 @@ mod tests {
             1,
             "one sync is one listing"
         );
-        assert!(store
-            .get_by_external_id("owner/repo", "78")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .get_by_external_id("owner/repo", "78")
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
             store
                 .kv_get("issues_last_ingested:owner/repo")
@@ -3884,11 +3884,13 @@ mod tests {
         assert!(mock.project_syncs.lock().await.is_empty());
         assert!(mock.status_updates.lock().await.is_empty());
         assert!(dispatching.is_empty());
-        assert!(store
-            .existing_external_ids("owner/repo")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .existing_external_ids("owner/repo")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[serial(cooldown_state)]
@@ -4690,7 +4692,10 @@ mod tests {
     #[serial(cooldown_state)]
     #[test]
     fn classify_failure_model_unavailable_phrase_is_recoverable() {
-        let category = classify_failure("model unavailable (anthropic/claude-sonnet-4-6): Model not found: anthropic/claude-sonnet-4-6", "error");
+        let category = classify_failure(
+            "model unavailable (anthropic/claude-sonnet-4-6): Model not found: anthropic/claude-sonnet-4-6",
+            "error",
+        );
         assert_eq!(
             category,
             FailureCategory::ModelUnavailable,
@@ -5375,7 +5380,7 @@ mod tests {
 
     // ── classify_comment tests ──────────────────────────────────────────
 
-    use super::{classify_comment, CommentAction, MentionCursor};
+    use super::{CommentAction, MentionCursor, classify_comment};
     use crate::engine::commands::OwnerCommand;
 
     #[serial(cooldown_state)]

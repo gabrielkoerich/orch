@@ -512,10 +512,10 @@ pub async fn tick(
         let mut should_clear_task_id = false;
         let mut should_skip = false;
 
-        if let Some(ref task_id) = state.active_task_id {
-            if task_id.is_empty() {
-                state.active_task_id = None;
-            }
+        if let Some(ref task_id) = state.active_task_id
+            && task_id.is_empty()
+        {
+            state.active_task_id = None;
         }
 
         if let Some(ref task_id) = state.active_task_id {
@@ -628,15 +628,15 @@ pub async fn tick(
         // last_run here ensures a crash during execution won't cause the
         // job to be considered due again immediately.
         state.last_run = Some(now.format("%Y-%m-%dT%H:%M:%SZ").to_string());
-        if let Some(s) = store {
-            if let Err(e) = s.upsert_job_state(&state).await {
-                tracing::error!(
-                    job_id = job.id,
-                    ?e,
-                    "failed to persist job state before execution — skipping this tick to preserve restart safety"
-                );
-                continue; // retry next tick instead of risking duplicate execution
-            }
+        if let Some(s) = store
+            && let Err(e) = s.upsert_job_state(&state).await
+        {
+            tracing::error!(
+                job_id = job.id,
+                ?e,
+                "failed to persist job state before execution — skipping this tick to preserve restart safety"
+            );
+            continue; // retry next tick instead of risking duplicate execution
         }
 
         // Execute the job (may mutate state.active_task_id / last_task_status).
@@ -644,14 +644,14 @@ pub async fn tick(
         execute_job(job, &mut state, backend, store, repo, transport, base_dir).await;
 
         // Persist updated state (active_task_id, last_task_status) after execution.
-        if let Some(s) = store {
-            if let Err(e) = s.upsert_job_state(&state).await {
-                tracing::error!(
-                    job_id = job.id,
-                    ?e,
-                    "failed to persist job state after execution"
-                );
-            }
+        if let Some(s) = store
+            && let Err(e) = s.upsert_job_state(&state).await
+        {
+            tracing::error!(
+                job_id = job.id,
+                ?e,
+                "failed to persist job state after execution"
+            );
         }
     }
 
@@ -688,10 +688,10 @@ pub async fn execute_job(
                     labels.push("scheduled".to_string());
                     labels.push(format!("job:{}", job.id));
 
-                    if let Some(ref agent) = template.agent {
-                        if !agent.is_empty() {
-                            labels.push(format!("agent:{agent}"));
-                        }
+                    if let Some(ref agent) = template.agent
+                        && !agent.is_empty()
+                    {
+                        labels.push(format!("agent:{agent}"));
                     }
 
                     match backend.create_task(&template.title, &body, &labels).await {
@@ -799,37 +799,37 @@ pub async fn execute_job(
     }
 
     // Send Telegram notification if requested for this job.
-    if job.notify {
-        if let Some(t) = transport {
-            let status = state
-                .last_task_status
-                .as_deref()
-                .unwrap_or("unknown")
-                .to_string();
-            let summary = match status.as_str() {
-                "done" => format!("Job `{}` completed successfully.", job.id),
-                "failed" => format!("Job `{}` failed.", job.id),
-                "new" => format!("Job `{}` created a new task.", job.id),
-                other => format!("Job `{}` finished with status: {other}.", job.id),
-            };
-            // Resolve target chat_id: job override → config default
-            let target = job
-                .notify_target
-                .clone()
-                .or_else(|| crate::config::get("channels.telegram.chat_id").ok());
-            let notification = TaskNotification {
-                task_id: job.id.clone(),
-                title: format!("Job: {}", job.id),
-                status,
-                agent: "scheduler".to_string(),
-                duration_seconds: 0.0,
-                summary,
-                repo: Some(repo.to_string()),
-                notify_target: target,
-                pr_number: None,
-            };
-            t.push_notification(notification);
-        }
+    if job.notify
+        && let Some(t) = transport
+    {
+        let status = state
+            .last_task_status
+            .as_deref()
+            .unwrap_or("unknown")
+            .to_string();
+        let summary = match status.as_str() {
+            "done" => format!("Job `{}` completed successfully.", job.id),
+            "failed" => format!("Job `{}` failed.", job.id),
+            "new" => format!("Job `{}` created a new task.", job.id),
+            other => format!("Job `{}` finished with status: {other}.", job.id),
+        };
+        // Resolve target chat_id: job override → config default
+        let target = job
+            .notify_target
+            .clone()
+            .or_else(|| crate::config::get("channels.telegram.chat_id").ok());
+        let notification = TaskNotification {
+            task_id: job.id.clone(),
+            title: format!("Job: {}", job.id),
+            status,
+            agent: "scheduler".to_string(),
+            duration_seconds: 0.0,
+            summary,
+            repo: Some(repo.to_string()),
+            notify_target: target,
+            pr_number: None,
+        };
+        t.push_notification(notification);
     }
 }
 

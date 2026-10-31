@@ -27,10 +27,10 @@
 //!                  └───────────┘
 
 use super::notification::TaskNotification;
-use super::{split_utf8, IncomingMessage, OutputChunk};
+use super::{IncomingMessage, OutputChunk, split_utf8};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 
 const MAX_OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -169,7 +169,7 @@ impl Transport {
                 binding.connected_threads.push(key.clone());
             }
         } // bindings lock released here
-          // Update thread_to_task after releasing bindings lock
+        // Update thread_to_task after releasing bindings lock
         self.thread_to_task.write().await.insert(key, skey);
     }
 

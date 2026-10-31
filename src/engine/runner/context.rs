@@ -142,10 +142,10 @@ pub async fn build_project_instructions(project_dir: &Path) -> String {
             continue;
         }
 
-        if let Ok(content) = tokio::fs::read_to_string(&path).await {
-            if !content.is_empty() {
-                let _ = writeln!(instructions, "## {filename}\n\n{content}\n");
-            }
+        if let Ok(content) = tokio::fs::read_to_string(&path).await
+            && !content.is_empty()
+        {
+            let _ = writeln!(instructions, "## {filename}\n\n{content}\n");
         }
     }
 

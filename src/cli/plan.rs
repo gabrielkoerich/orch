@@ -9,9 +9,9 @@ use crate::config;
 use crate::github::http::GhHttp;
 use crate::github::types::GitHubIssue;
 use crate::plan::{
-    diff_import, diff_links, issue_body_with, issue_title, labels_for, marker_id, render_report,
-    skip_unmet_ids, unmet_externals, Binding, DepRef, ExistingIssue, LinkEdit, PlanDiff, Task,
-    UnmetExternal, HUMAN_LABEL, NO_AGENT_LABEL, PLAN_LABEL,
+    Binding, DepRef, ExistingIssue, HUMAN_LABEL, LinkEdit, NO_AGENT_LABEL, PLAN_LABEL, PlanDiff,
+    Task, UnmetExternal, diff_import, diff_links, issue_body_with, issue_title, labels_for,
+    marker_id, render_report, skip_unmet_ids, unmet_externals,
 };
 
 pub async fn import(

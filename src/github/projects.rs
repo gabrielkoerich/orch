@@ -175,38 +175,33 @@ impl ProjectSync {
         if let Ok(result) = gh
             .graphql_with_vars(query, serde_json::json!({ "login": user }))
             .await
-        {
-            if let Some(nodes) = result
+            && let Some(nodes) = result
                 .pointer("/data/user/projectsV2/nodes")
                 .and_then(|n| n.as_array())
-            {
-                for node in nodes {
-                    if let Some(info) = parse_project_node(node) {
-                        projects.push(info);
-                    }
+        {
+            for node in nodes {
+                if let Some(info) = parse_project_node(node) {
+                    projects.push(info);
                 }
             }
         }
 
         // Try org projects for the repo owner (if different from user)
-        if let Ok(repo) = config::get_current_repo() {
-            if let Some(owner) = repo.split('/').next() {
-                if owner != user {
-                    let query = r"query($login: String!) { organization(login: $login) { projectsV2(first: 100) { nodes { id number title } } } }";
-                    if let Ok(result) = gh
-                        .graphql_with_vars(query, serde_json::json!({ "login": owner }))
-                        .await
-                    {
-                        if let Some(nodes) = result
-                            .pointer("/data/organization/projectsV2/nodes")
-                            .and_then(|n| n.as_array())
-                        {
-                            for node in nodes {
-                                if let Some(info) = parse_project_node(node) {
-                                    projects.push(info);
-                                }
-                            }
-                        }
+        if let Ok(repo) = config::get_current_repo()
+            && let Some(owner) = repo.split('/').next()
+            && owner != user
+        {
+            let query = r"query($login: String!) { organization(login: $login) { projectsV2(first: 100) { nodes { id number title } } } }";
+            if let Ok(result) = gh
+                .graphql_with_vars(query, serde_json::json!({ "login": owner }))
+                .await
+                && let Some(nodes) = result
+                    .pointer("/data/organization/projectsV2/nodes")
+                    .and_then(|n| n.as_array())
+            {
+                for node in nodes {
+                    if let Some(info) = parse_project_node(node) {
+                        projects.push(info);
                     }
                 }
             }
@@ -563,7 +558,8 @@ mod tests {
         std::fs::create_dir_all(&orch_dir).unwrap();
 
         std::env::set_current_dir(temp_cwd.path()).unwrap();
-        std::env::set_var("ORCH_HOME", &orch_dir);
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", &orch_dir) };
         config::clear_test_cache();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -572,9 +568,11 @@ mod tests {
 
         std::env::set_current_dir(&original_cwd).unwrap();
         if let Some(prev) = prev_orch_home {
-            std::env::set_var("ORCH_HOME", prev);
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::set_var("ORCH_HOME", prev) };
         } else {
-            std::env::remove_var("ORCH_HOME");
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::remove_var("ORCH_HOME") };
         }
         result.unwrap();
     }
@@ -617,7 +615,8 @@ mod tests {
         std::fs::create_dir_all(&orch_dir).unwrap();
 
         std::env::set_current_dir(temp_cwd.path()).unwrap();
-        std::env::set_var("ORCH_HOME", &orch_dir);
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", &orch_dir) };
         config::clear_test_cache();
 
         // Write a config with project ID and status field but NO estimate field.
@@ -649,9 +648,11 @@ gh:
 
         std::env::set_current_dir(&original_cwd).unwrap();
         if let Some(prev) = prev_orch_home {
-            std::env::set_var("ORCH_HOME", prev);
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::set_var("ORCH_HOME", prev) };
         } else {
-            std::env::remove_var("ORCH_HOME");
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::remove_var("ORCH_HOME") };
         }
         result.unwrap();
     }

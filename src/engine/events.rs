@@ -41,15 +41,15 @@ impl EventFilter {
 
     /// Returns `true` if the event matches this filter (or no filter is set).
     fn matches(&self, event: &TaskEvent) -> bool {
-        if let Some(ref task_id) = self.task_id {
-            if event.task_id != *task_id {
-                return false;
-            }
+        if let Some(ref task_id) = self.task_id
+            && event.task_id != *task_id
+        {
+            return false;
         }
-        if let Some(ref repo) = self.repo {
-            if event.repo != *repo {
-                return false;
-            }
+        if let Some(ref repo) = self.repo
+            && event.repo != *repo
+        {
+            return false;
         }
         true
     }
@@ -641,14 +641,13 @@ mod tests {
 
             let Ok(Some(Ok(msg))) = result else { break };
 
-            if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
-                if let Ok(ctrl) = serde_json::from_str::<ControlMessage>(&text) {
-                    if ctrl.kind == "lagged" {
-                        got_lag = true;
-                        assert!(ctrl.missed > 0, "missed count must be > 0");
-                        break;
-                    }
-                }
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = msg
+                && let Ok(ctrl) = serde_json::from_str::<ControlMessage>(&text)
+                && ctrl.kind == "lagged"
+            {
+                got_lag = true;
+                assert!(ctrl.missed > 0, "missed count must be > 0");
+                break;
             }
         }
 

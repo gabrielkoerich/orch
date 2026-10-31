@@ -84,7 +84,8 @@ fn setup_temp_home() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().expect("failed to create temp dir");
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).expect("failed to create home dir");
-    std::env::set_var("HOME", &home);
+    // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+    unsafe { std::env::set_var("HOME", &home) };
     (temp, home)
 }
 
@@ -112,9 +113,11 @@ MIIEpAIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF8PbnGy0AHB7MqK8k7f5l2EckKlw
 ";
         let findings = scan_for_secrets(content);
         assert!(!findings.is_empty(), "Should detect private key");
-        assert!(findings
-            .iter()
-            .any(|(_, name, _)| name == "Private key header"));
+        assert!(
+            findings
+                .iter()
+                .any(|(_, name, _)| name == "Private key header")
+        );
     }
 
     /// Test that scan_for_secrets ignores safe content.
@@ -227,7 +230,8 @@ mod integration_tests {
 
         // Set GH_TOKEN in environment (simulating real deployment)
         let test_token = "ghp_test1234567890abcdefghijklmnopqrstuvwxyz12";
-        std::env::set_var("GH_TOKEN", test_token);
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("GH_TOKEN", test_token) };
 
         // Create a minimal agent invocation
         let attempt_dir = home.join(".orch/state/owner/repo/tasks/456/attempts/1");
@@ -262,7 +266,8 @@ export GIT_AUTHOR_EMAIL="test@example.com"
         assert_no_secrets_in_files(&prompt_files);
 
         // Clean up env var
-        std::env::remove_var("GH_TOKEN");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::remove_var("GH_TOKEN") };
     }
 
     /// Test that when no GH_TOKEN is in environment, the runner script
@@ -272,8 +277,10 @@ export GIT_AUTHOR_EMAIL="test@example.com"
         let (_temp, home) = setup_temp_home();
 
         // Ensure no GH_TOKEN in environment
-        std::env::remove_var("GH_TOKEN");
-        std::env::remove_var("GITHUB_TOKEN");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::remove_var("GH_TOKEN") };
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::remove_var("GITHUB_TOKEN") };
 
         let attempt_dir = home.join(".orch/state/owner/repo/tasks/789/attempts/1");
         std::fs::create_dir_all(&attempt_dir).unwrap();

@@ -9,8 +9,8 @@ use crate::store::{Task, TaskStatus, TaskStore};
 use crate::tmux::TmuxManager;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// What kind of automatic repair can be applied to a finding.
 ///
@@ -289,21 +289,21 @@ async fn run_checks(
                     // If task has a branch, check if there's an open PR for it
                     if let Some(pr) = pr_by_head.get(&task.branch) {
                         // PR exists and is open — link PR (warning) unless already linked
-                        if task.pr_number.is_none() {
-                            if let Some(n) = pr.get("number").and_then(serde_json::Value::as_u64) {
-                                findings.push(Finding {
-                                    severity: Severity::Warning,
-                                    task_id: task_label(task),
-                                    message: format!(
-                                        "branch '{}' has open PR #{} not linked in store",
-                                        task.branch, n
-                                    ),
-                                    fix: FixAction::LinkPr {
-                                        store_id: task.id,
-                                        pr_number: n,
-                                    },
-                                });
-                            }
+                        if task.pr_number.is_none()
+                            && let Some(n) = pr.get("number").and_then(serde_json::Value::as_u64)
+                        {
+                            findings.push(Finding {
+                                severity: Severity::Warning,
+                                task_id: task_label(task),
+                                message: format!(
+                                    "branch '{}' has open PR #{} not linked in store",
+                                    task.branch, n
+                                ),
+                                fix: FixAction::LinkPr {
+                                    store_id: task.id,
+                                    pr_number: n,
+                                },
+                            });
                         }
                     }
                 }
@@ -338,11 +338,11 @@ async fn run_checks(
                 let mut owned = false;
                 if let Some(n) = pr_num {
                     for t in &active_tasks {
-                        if let Some(pn) = t.pr_number {
-                            if u64::try_from(pn) == Ok(n) {
-                                owned = true;
-                                break;
-                            }
+                        if let Some(pn) = t.pr_number
+                            && u64::try_from(pn) == Ok(n)
+                        {
+                            owned = true;
+                            break;
                         }
                         if !t.branch.is_empty() && Some(t.branch.clone()) == head {
                             owned = true;
@@ -600,9 +600,10 @@ async fn check_dirty_worktree(task: &Task, findings: &mut Vec<Finding>) {
         .current_dir(wt)
         .output()
         .await;
-    if let Ok(out) = output {
-        if !out.stdout.is_empty() {
-            findings.push(Finding {
+    if let Ok(out) = output
+        && !out.stdout.is_empty()
+    {
+        findings.push(Finding {
                 severity: Severity::Error,
                 task_id: task_label(task),
                 message: format!(
@@ -611,7 +612,6 @@ async fn check_dirty_worktree(task: &Task, findings: &mut Vec<Finding>) {
                 ),
                 fix: FixAction::None,
             });
-        }
     }
 }
 
@@ -629,14 +629,15 @@ async fn check_unpushed_commits(task: &Task, findings: &mut Vec<Finding>) {
         .current_dir(wt)
         .output()
         .await;
-    if let Ok(out) = output {
-        if !out.stdout.is_empty() {
-            #[expect(
-                clippy::naive_bytecount,
-                reason = "a short git log does not need the bytecount crate"
-            )]
-            let count = out.stdout.iter().filter(|&&b| b == b'\n').count();
-            findings.push(Finding {
+    if let Ok(out) = output
+        && !out.stdout.is_empty()
+    {
+        #[expect(
+            clippy::naive_bytecount,
+            reason = "a short git log does not need the bytecount crate"
+        )]
+        let count = out.stdout.iter().filter(|&&b| b == b'\n').count();
+        findings.push(Finding {
                 severity: Severity::Error,
                 task_id: task_label(task),
                 message: format!(
@@ -645,7 +646,6 @@ async fn check_unpushed_commits(task: &Task, findings: &mut Vec<Finding>) {
                 ),
                 fix: FixAction::None,
             });
-        }
     }
 }
 
@@ -853,19 +853,19 @@ fn check_pr_merged_not_done(
         return;
     };
 
-    if let Some((merged, _)) = pr_states.get(&pr_num) {
-        if *merged {
-            findings.push(Finding {
-                severity: Severity::Error,
-                task_id: task_label(task),
-                message: format!(
-                    "PR #{} is merged but task status is '{}'",
-                    pr_num,
-                    task.status.as_str()
-                ),
-                fix: FixAction::MarkDoneFromMergedPr { store_id: task.id },
-            });
-        }
+    if let Some((merged, _)) = pr_states.get(&pr_num)
+        && *merged
+    {
+        findings.push(Finding {
+            severity: Severity::Error,
+            task_id: task_label(task),
+            message: format!(
+                "PR #{} is merged but task status is '{}'",
+                pr_num,
+                task.status.as_str()
+            ),
+            fix: FixAction::MarkDoneFromMergedPr { store_id: task.id },
+        });
     }
 }
 
@@ -1388,9 +1388,11 @@ mod tests {
         let mut findings = Vec::new();
         super::check_orphaned_worktrees_in(base.path(), &[done], &mut findings).await;
         assert_eq!(findings.len(), 1);
-        assert!(findings[0]
-            .message
-            .contains("done but worktree not cleaned up"));
+        assert!(
+            findings[0]
+                .message
+                .contains("done but worktree not cleaned up")
+        );
         assert!(!findings[0].message.contains("orphaned"));
 
         let mut findings = Vec::new();

@@ -21,7 +21,7 @@
 
 use super::claude::{self, ClaudeRunner};
 use super::{
-    shell_single_quote, AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent,
+    AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent, shell_single_quote,
 };
 
 /// Runner for the `grok` CLI
@@ -233,10 +233,10 @@ fn deny_args(rules: &[String]) -> Vec<String> {
     for rule in rules {
         match rule.as_str() {
             "Read" | "Grep" | "Glob" | "Edit" | "Write" | "Bash" => {
-                if let Some(id) = grok_tool_id(rule) {
-                    if !remove.contains(&id) {
-                        remove.push(id);
-                    }
+                if let Some(id) = grok_tool_id(rule)
+                    && !remove.contains(&id)
+                {
+                    remove.push(id);
                 }
             }
             _ => denies.push(rule.as_str()),
@@ -268,10 +268,10 @@ fn startup_errors(stdout: &str) -> Vec<String> {
         if val.get("type").and_then(|t| t.as_str()) != Some("error") {
             continue;
         }
-        if let Some(message) = val.get("message").and_then(|m| m.as_str()) {
-            if !message.is_empty() {
-                out.push(message.to_string());
-            }
+        if let Some(message) = val.get("message").and_then(|m| m.as_str())
+            && !message.is_empty()
+        {
+            out.push(message.to_string());
         }
     }
     out

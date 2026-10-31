@@ -67,13 +67,13 @@ async fn is_ci_check_in_cooldown(
     let key = ci_check_ts_key(repo, task_id);
     let last_check = store.kv_get(&key).await?;
 
-    if let Some(last_ts) = last_check {
-        if let Ok(last_time) = chrono::DateTime::parse_from_rfc3339(&last_ts) {
-            let elapsed =
-                chrono::Utc::now().signed_duration_since(last_time.with_timezone(&chrono::Utc));
-            if elapsed.num_seconds() < i64::try_from(cooldown_secs).unwrap_or(i64::MAX) {
-                return Ok(true);
-            }
+    if let Some(last_ts) = last_check
+        && let Ok(last_time) = chrono::DateTime::parse_from_rfc3339(&last_ts)
+    {
+        let elapsed =
+            chrono::Utc::now().signed_duration_since(last_time.with_timezone(&chrono::Utc));
+        if elapsed.num_seconds() < i64::try_from(cooldown_secs).unwrap_or(i64::MAX) {
+            return Ok(true);
         }
     }
 
@@ -1005,16 +1005,14 @@ pub(crate) async fn auto_merge_pr(
     // unrecoverable failures (billing, CI failure limit, etc.). No point
     // polling CI for a task that will never be unblocked.
     if let Some(stored_task) = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0).await
+        && stored_task.status == crate::store::TaskStatus::Blocked
+        && should_skip_ci_check(&stored_task)
     {
-        if stored_task.status == crate::store::TaskStatus::Blocked
-            && should_skip_ci_check(&stored_task)
-        {
-            tracing::debug!(
-                task_id = task.id.0,
-                "skipping auto-merge CI checks — task is blocked with unrecoverable failure"
-            );
-            return Ok(());
-        }
+        tracing::debug!(
+            task_id = task.id.0,
+            "skipping auto-merge CI checks — task is blocked with unrecoverable failure"
+        );
+        return Ok(());
     }
 
     // 1. Get PR number from branch
@@ -2245,9 +2243,13 @@ pub(crate) async fn handle_review_changes(
                     } else {
                         let recovery_comment = format!(
                             "🔄 Auto-recovery: required CI checks pass. \
-                            The review agent may have been blocked by a non-required check failure. \
-                            Resetting review cycles and re-triggering review.{}",
-                            crate::engine::attribution_footer("Commented", review_agent, Some(review_model))
+                        The review agent may have been blocked by a non-required check failure. \
+                        Resetting review cycles and re-triggering review.{}",
+                            crate::engine::attribution_footer(
+                                "Commented",
+                                review_agent,
+                                Some(review_model)
+                            )
                         );
                         if let Err(e) = gh.add_comment(repo, &pr_num_str, &recovery_comment).await {
                             tracing::warn!(
@@ -3452,11 +3454,13 @@ mod tests {
             [] as [(String, String); 0]
         );
 
-        assert!(store
-            .kv_get(&ci_pending_since_key("other/repo", "7", SHA))
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .kv_get(&ci_pending_since_key("other/repo", "7", SHA))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -3487,11 +3491,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(store
-            .kv_get(&ci_check_ts_key(REPO, "7"))
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .kv_get(&ci_check_ts_key(REPO, "7"))
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             store
                 .kv_list_prefix(&ci_pending_since_prefix(REPO, "7"))
@@ -3502,10 +3508,12 @@ mod tests {
 
         assert!(store.kv_get("ci_check_ts:7").await.unwrap().is_none());
         assert!(store.kv_get("ci_pending_since:7").await.unwrap().is_none());
-        assert!(store
-            .kv_get(&ci_check_ts_key(REPO, "8"))
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .kv_get(&ci_check_ts_key(REPO, "8"))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

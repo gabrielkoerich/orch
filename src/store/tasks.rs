@@ -1,4 +1,4 @@
-use super::{pricing_for_model, Context, MemoryEntry, SqlitePool, TaskStore, TokenUsage};
+use super::{Context, MemoryEntry, SqlitePool, TaskStore, TokenUsage, pricing_for_model};
 use crate::cluster::Command;
 use crate::security;
 use serde::{Deserialize, Serialize};
@@ -29,8 +29,7 @@ pub(crate) const TASK_COLS: &str = "id, external_id, repo, origin, title, body, 
 pub(crate) const TASK_COLS_COUNT: usize = 61;
 
 /// Explicit column list for `SELECT` queries on the `task_runs` table.
-const TASK_RUN_COLS: &str =
-    "id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, \
+const TASK_RUN_COLS: &str = "id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, \
     exit_code, stdout, stderr, parsed_response, outcome, error, input_tokens, output_tokens, \
     total_cost_usd, duration_secs, started_at, completed_at";
 
@@ -413,10 +412,10 @@ pub fn parse_cli_task_spec(raw: &str) -> anyhow::Result<CliTaskSpec> {
         return Ok(CliTaskSpec::Issue { repo, number });
     }
     let bare = spec.strip_prefix('#').unwrap_or(spec);
-    if let Ok(number) = bare.parse::<i64>() {
-        if number > 0 {
-            return Ok(CliTaskSpec::Bare(number));
-        }
+    if let Ok(number) = bare.parse::<i64>()
+        && number > 0
+    {
+        return Ok(CliTaskSpec::Bare(number));
     }
     anyhow::bail!("invalid task id '{spec}': use a number, owner/repo#N, or internal:N")
 }
@@ -2761,8 +2760,8 @@ pub(crate) async fn replace_replicated(
 /// The SQL behind each replicated task write, run with the proposer's time
 pub(crate) mod apply {
     use super::{
-        sanitize_activity_details, sql_value_for_task_field, MemoryEntry, NewTask, Row,
-        StoreRouteCmd, TaskStatus, UpsertExternalCmd, ALLOWED_FIELDS, INCREMENTABLE_FIELDS,
+        ALLOWED_FIELDS, INCREMENTABLE_FIELDS, MemoryEntry, NewTask, Row, StoreRouteCmd, TaskStatus,
+        UpsertExternalCmd, sanitize_activity_details, sql_value_for_task_field,
     };
     use sqlx::SqliteConnection;
 

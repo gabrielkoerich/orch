@@ -4,7 +4,7 @@ use crate::cmd::SyncCommandErrorContext;
 use crate::config;
 use crate::engine::router::Router;
 use crate::engine::runner::TaskRunner;
-use crate::engine::tasks::{status_to_task_status, CreateTaskRequest, Task, TaskFilter, TaskType};
+use crate::engine::tasks::{CreateTaskRequest, Task, TaskFilter, TaskType, status_to_task_status};
 use crate::home;
 use crate::store;
 use crate::store::TaskStore;
@@ -112,10 +112,10 @@ async fn update_status_store_first(
     status: Status,
 ) -> anyhow::Result<()> {
     let db_status = status_to_task_status(status);
-    if let Some(s) = store {
-        if let Ok(Some(store_id)) = s.resolve_task_id(repo, &id.0).await {
-            s.update_status(store_id, db_status).await?;
-        }
+    if let Some(s) = store
+        && let Ok(Some(store_id)) = s.resolve_task_id(repo, &id.0).await
+    {
+        s.update_status(store_id, db_status).await?;
     }
     if let Err(e) = backend.update_status(id, status).await {
         tracing::warn!(
@@ -588,42 +588,42 @@ pub async fn get(id: &str) -> anyhow::Result<()> {
     println!("Created: {}", ext.created_at);
     println!("Updated: {}", ext.updated_at);
 
-    if let Some(ref s) = store_arc {
-        if let Ok(Some(t)) = s.get_by_external_id(&repo, &ext.id.0).await {
-            if let Some(ref agent) = t.agent {
-                println!("Agent: {agent}");
-            }
-            if let Some(ref model) = t.model {
-                println!("Model: {model}");
-            }
-            if !t.complexity.is_empty() {
-                println!("Complexity: {}", t.complexity);
-            }
-            if t.route_attempts > 0 {
-                println!("Route attempts: {}", t.route_attempts);
-            }
-            if t.attempts > 0 {
-                println!("Attempts: {}", t.attempts);
-            }
-            if t.review_cycles > 0 {
-                println!("Review cycles: {}", t.review_cycles);
-            }
-            if let Some(pr) = t.pr_number {
-                if pr > 0 {
-                    println!("PR: #{pr}");
-                }
-            }
-            if !t.branch.is_empty() {
-                println!("Branch: {}", t.branch);
-            }
-            if !t.last_error.is_empty() {
-                println!("Last error: {}", truncate_err(&t.last_error, 200));
-            }
-            if t.status == crate::store::TaskStatus::Waiting {
-                let blockers = s.unmet_blocker_labels(t.id).await.unwrap_or_default();
-                if !blockers.is_empty() {
-                    println!("Waiting on: {}", blockers.join(", "));
-                }
+    if let Some(ref s) = store_arc
+        && let Ok(Some(t)) = s.get_by_external_id(&repo, &ext.id.0).await
+    {
+        if let Some(ref agent) = t.agent {
+            println!("Agent: {agent}");
+        }
+        if let Some(ref model) = t.model {
+            println!("Model: {model}");
+        }
+        if !t.complexity.is_empty() {
+            println!("Complexity: {}", t.complexity);
+        }
+        if t.route_attempts > 0 {
+            println!("Route attempts: {}", t.route_attempts);
+        }
+        if t.attempts > 0 {
+            println!("Attempts: {}", t.attempts);
+        }
+        if t.review_cycles > 0 {
+            println!("Review cycles: {}", t.review_cycles);
+        }
+        if let Some(pr) = t.pr_number
+            && pr > 0
+        {
+            println!("PR: #{pr}");
+        }
+        if !t.branch.is_empty() {
+            println!("Branch: {}", t.branch);
+        }
+        if !t.last_error.is_empty() {
+            println!("Last error: {}", truncate_err(&t.last_error, 200));
+        }
+        if t.status == crate::store::TaskStatus::Waiting {
+            let blockers = s.unmet_blocker_labels(t.id).await.unwrap_or_default();
+            if !blockers.is_empty() {
+                println!("Waiting on: {}", blockers.join(", "));
             }
         }
     }
@@ -817,8 +817,8 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
 
 /// Route a task to an agent.
 pub async fn route(id: &str) -> anyhow::Result<()> {
-    use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
+    use crate::backends::github::GitHubBackend;
     use crate::engine::tasks::store_task_to_external;
     use crate::store::TaskStatus;
 
@@ -873,8 +873,8 @@ pub async fn route(id: &str) -> anyhow::Result<()> {
 
 /// Run a task (manual execution).
 pub async fn run(id: Option<String>) -> anyhow::Result<()> {
-    use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
+    use crate::backends::github::GitHubBackend;
     use crate::engine::router::get_route_result;
     use crate::store::TaskStatus;
 
@@ -950,8 +950,8 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
 /// When `agent` is provided, the task is force-routed to that agent/model and
 /// set directly to `Routed` status, bypassing the router entirely.
 pub async fn retry(id: &str, agent: Option<String>, model: Option<String>) -> anyhow::Result<()> {
-    use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
+    use crate::backends::github::GitHubBackend;
     use crate::store::TaskStatus;
 
     let s = Arc::new(crate::cli::init_store().await?);
@@ -1038,8 +1038,8 @@ fn retry_force_fields<'a>(
 
 /// Unblock a task or all blocked tasks.
 pub async fn unblock(id: &str) -> anyhow::Result<()> {
-    use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
+    use crate::backends::github::GitHubBackend;
     use crate::store::TaskStatus;
 
     if id == "all" {
@@ -1059,16 +1059,16 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
             let id = task.id.clone();
             async move {
                 store::store_reset_counters(&store, &repo, &id.0).await;
-                if let Some(ref s) = store {
-                    if let Ok(Some(store_id)) = s.resolve_task_id(&repo, &id.0).await {
-                        match s.status_after_unblock(store_id).await {
-                            Ok(TaskStatus::Waiting) => {
-                                let _ = backend.update_status(&id, Status::Waiting).await;
-                                return Ok(());
-                            }
-                            Ok(_) => {}
-                            Err(err) => return Err(err),
+                if let Some(ref s) = store
+                    && let Ok(Some(store_id)) = s.resolve_task_id(&repo, &id.0).await
+                {
+                    match s.status_after_unblock(store_id).await {
+                        Ok(TaskStatus::Waiting) => {
+                            let _ = backend.update_status(&id, Status::Waiting).await;
+                            return Ok(());
                         }
+                        Ok(_) => {}
+                        Err(err) => return Err(err),
                     }
                 }
                 update_status_store_first(store.as_ref(), &backend, &repo, &id, Status::New).await
@@ -1146,12 +1146,12 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
     let ext_id = ExternalId(resolved.external_id.clone());
     store::store_reset_counters(&store, &repo, &ext_id.0).await;
-    if let Some(store_id) = resolved.store_id {
-        if release_or_keep_waiting(&s, store_id).await? {
-            let _ = backend.update_status(&ext_id, Status::Waiting).await;
-            println!("Task {shown} stays waiting on an open dependency");
-            return Ok(());
-        }
+    if let Some(store_id) = resolved.store_id
+        && release_or_keep_waiting(&s, store_id).await?
+    {
+        let _ = backend.update_status(&ext_id, Status::Waiting).await;
+        println!("Task {shown} stays waiting on an open dependency");
+        return Ok(());
     }
     update_status_store_first(store.as_ref(), &backend, &repo, &ext_id, Status::New).await?;
     println!("Unblocked {shown} (attempts reset)");
@@ -1189,10 +1189,13 @@ async fn cleanup_sessions_and_worktree(
                             task_id,
                             "killing tmux session for closed task"
                         );
-                        if let Err(e) = tmux.kill_session(name).await {
-                            tracing::warn!(session = name, err = %e, "failed to kill session on close");
-                        } else {
-                            println!("  killed session {name}");
+                        match tmux.kill_session(name).await {
+                            Err(e) => {
+                                tracing::warn!(session = name, err = %e, "failed to kill session on close");
+                            }
+                            _ => {
+                                println!("  killed session {name}");
+                            }
                         }
                     }
                 }
@@ -1216,8 +1219,8 @@ async fn cleanup_sessions_and_worktree(
 
 /// Mark a task as done (without running an agent).
 pub async fn close(id: &str, note: Option<&str>) -> anyhow::Result<()> {
-    use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
+    use crate::backends::github::GitHubBackend;
     use crate::store::TaskStatus;
 
     let s = crate::cli::init_store().await?;
@@ -1423,10 +1426,10 @@ async fn dependency_tree(focus: Option<i64>) -> anyhow::Result<()> {
     let edges = store.list_dependency_edges().await?;
     let mut by_task: HashMap<i64, Vec<_>> = HashMap::new();
     for edge in edges {
-        if let Some(focus_id) = focus_id {
-            if edge.task_id != focus_id {
-                continue;
-            }
+        if let Some(focus_id) = focus_id
+            && edge.task_id != focus_id
+        {
+            continue;
         }
         by_task.entry(edge.task_id).or_default().push(edge);
     }
@@ -1558,17 +1561,17 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
     {
         {
             // Agent, model, and attempts from store — single DB round-trip.
-            if let Some(ref s) = store {
-                if let Ok(Some(t)) = s.get_by_external_id(&repo, &task_key).await {
-                    if let Some(ref agent) = t.agent {
-                        println!("Agent: {agent}");
-                    }
-                    if let Some(ref model) = t.model {
-                        println!("Model: {model}");
-                    }
-                    if t.attempts > 0 {
-                        println!("Attempts: {}", t.attempts);
-                    }
+            if let Some(ref s) = store
+                && let Ok(Some(t)) = s.get_by_external_id(&repo, &task_key).await
+            {
+                if let Some(ref agent) = t.agent {
+                    println!("Agent: {agent}");
+                }
+                if let Some(ref model) = t.model {
+                    println!("Model: {model}");
+                }
+                if t.attempts > 0 {
+                    println!("Attempts: {}", t.attempts);
                 }
             }
 
@@ -1628,28 +1631,27 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
                 let output_file = attempt_dir.join("output.json");
                 let exit_file = attempt_dir.join("exit.txt");
 
-                if output_file.exists() {
-                    if let Ok(content) = std::fs::read_to_string(&output_file) {
-                        let tail =
-                            crate::engine::runner::agents::patterns::safe_tail(&content, 2000);
-                        let truncated = if content.len() > 2000 {
-                            format!(
-                                "...({} chars truncated)...\n{}",
-                                content.len() - tail.len(),
-                                tail
-                            )
-                        } else {
-                            content.clone()
-                        };
-                        println!("\n--- Last attempt output (attempt {attempt_n}) ---");
-                        println!("{truncated}");
-                    }
+                if output_file.exists()
+                    && let Ok(content) = std::fs::read_to_string(&output_file)
+                {
+                    let tail = crate::engine::runner::agents::patterns::safe_tail(&content, 2000);
+                    let truncated = if content.len() > 2000 {
+                        format!(
+                            "...({} chars truncated)...\n{}",
+                            content.len() - tail.len(),
+                            tail
+                        )
+                    } else {
+                        content.clone()
+                    };
+                    println!("\n--- Last attempt output (attempt {attempt_n}) ---");
+                    println!("{truncated}");
                 }
 
-                if exit_file.exists() {
-                    if let Ok(exit_code) = std::fs::read_to_string(&exit_file) {
-                        println!("Exit code: {}", exit_code.trim());
-                    }
+                if exit_file.exists()
+                    && let Ok(exit_code) = std::fs::read_to_string(&exit_file)
+                {
+                    println!("Exit code: {}", exit_code.trim());
                 }
             }
             Err(e) => {
@@ -1662,46 +1664,41 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
     let review_task_id = format!("{task_key}-review");
     if let Ok(review_attempt_dir) = home::task_attempt_dir(&repo, &review_task_id, 1) {
         let review_output_file = review_attempt_dir.join("output.json");
-        if review_output_file.exists() {
-            if let Ok(content) = std::fs::read_to_string(&review_output_file) {
-                println!("\n--- Review agent output ---");
-                println!("{content}");
-            }
+        if review_output_file.exists()
+            && let Ok(content) = std::fs::read_to_string(&review_output_file)
+        {
+            println!("\n--- Review agent output ---");
+            println!("{content}");
         }
     }
 
     // Show audit trail from task_runs table (if available in store)
-    if let Ok(store) = crate::cli::init_store().await {
-        if let Ok(Some(store_id)) = store.resolve_task_id(&repo, &task_key).await {
-            if let Ok(runs) = store.get_runs(store_id).await {
-                if !runs.is_empty() {
-                    println!("\n--- Run audit trail ({} runs) ---", runs.len());
-                    for run in &runs {
-                        println!(
-                            "\n  Run #{} [{}] agent={} model={} outcome={}",
-                            run.attempt, run.run_type, run.agent, run.model, run.outcome,
-                        );
-                        if let Some(code) = run.exit_code {
-                            println!("    exit_code: {code}");
-                        }
-                        if !run.error.is_empty() {
-                            println!("    error: {}", run.error);
-                        }
-                        if run.total_cost_usd > 0.0 {
-                            println!(
-                                "    tokens: {}in/{}out  cost: ${:.6}  duration: {:.1}s",
-                                run.input_tokens,
-                                run.output_tokens,
-                                run.total_cost_usd,
-                                run.duration_secs,
-                            );
-                        }
-                        println!("    started: {}", run.started_at);
-                        if let Some(ref completed) = run.completed_at {
-                            println!("    completed: {completed}");
-                        }
-                    }
-                }
+    if let Ok(store) = crate::cli::init_store().await
+        && let Ok(Some(store_id)) = store.resolve_task_id(&repo, &task_key).await
+        && let Ok(runs) = store.get_runs(store_id).await
+        && !runs.is_empty()
+    {
+        println!("\n--- Run audit trail ({} runs) ---", runs.len());
+        for run in &runs {
+            println!(
+                "\n  Run #{} [{}] agent={} model={} outcome={}",
+                run.attempt, run.run_type, run.agent, run.model, run.outcome,
+            );
+            if let Some(code) = run.exit_code {
+                println!("    exit_code: {code}");
+            }
+            if !run.error.is_empty() {
+                println!("    error: {}", run.error);
+            }
+            if run.total_cost_usd > 0.0 {
+                println!(
+                    "    tokens: {}in/{}out  cost: ${:.6}  duration: {:.1}s",
+                    run.input_tokens, run.output_tokens, run.total_cost_usd, run.duration_secs,
+                );
+            }
+            println!("    started: {}", run.started_at);
+            if let Some(ref completed) = run.completed_at {
+                println!("    completed: {completed}");
             }
         }
     }
@@ -1878,10 +1875,10 @@ pub async fn history(id: &str) -> anyhow::Result<()> {
             }
 
             // Show from/to agent if available
-            if let Some(from) = event.details.get("from_agent").and_then(|a| a.as_str()) {
-                if let Some(to) = event.details.get("to_agent").and_then(|a| a.as_str()) {
-                    println!("    Change:   {from} → {to}");
-                }
+            if let Some(from) = event.details.get("from_agent").and_then(|a| a.as_str())
+                && let Some(to) = event.details.get("to_agent").and_then(|a| a.as_str())
+            {
+                println!("    Change:   {from} → {to}");
             }
 
             // Show if agents were exhausted

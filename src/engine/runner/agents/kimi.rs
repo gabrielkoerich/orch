@@ -10,7 +10,7 @@
 
 use super::minimax::MiniMaxClaudeRunner;
 use super::{
-    delegate_agent_runner, AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent,
+    AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent, delegate_agent_runner,
 };
 
 /// Runner for Kimi-via-Claude agents (same output handling as MiniMaxClaude).

@@ -2,7 +2,7 @@
 //! and session export. Each agent's runner turns its own lines into [`StreamEvent`]s
 
 use crate::engine::runner::agents::{
-    get_runner, json_error_message, json_str, AgentRunner, StreamEvent,
+    AgentRunner, StreamEvent, get_runner, json_error_message, json_str,
 };
 use regex::Regex;
 use serde_json::Value;

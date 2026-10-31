@@ -206,12 +206,12 @@ pub async fn detect_default_branch(project_dir: &Path) -> String {
         .output_with_context()
         .await;
 
-    if let Ok(o) = &symref {
-        if o.status.success() {
-            let raw = String::from_utf8_lossy(&o.stdout);
-            if let Some(branch) = normalize_branch_name(&raw) {
-                return branch;
-            }
+    if let Ok(o) = &symref
+        && o.status.success()
+    {
+        let raw = String::from_utf8_lossy(&o.stdout);
+        if let Some(branch) = normalize_branch_name(&raw) {
+            return branch;
         }
     }
 
@@ -222,12 +222,12 @@ pub async fn detect_default_branch(project_dir: &Path) -> String {
         .output_with_context()
         .await;
 
-    if let Ok(o) = &revparse {
-        if o.status.success() {
-            let raw = String::from_utf8_lossy(&o.stdout);
-            if let Some(branch) = normalize_branch_name(&raw) {
-                return branch;
-            }
+    if let Ok(o) = &revparse
+        && o.status.success()
+    {
+        let raw = String::from_utf8_lossy(&o.stdout);
+        if let Some(branch) = normalize_branch_name(&raw) {
+            return branch;
         }
     }
 
@@ -238,18 +238,18 @@ pub async fn detect_default_branch(project_dir: &Path) -> String {
         .output_with_context()
         .await;
 
-    if let Ok(o) = &remote_show {
-        if o.status.success() {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            for line in stdout.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with("HEAD branch:") {
-                    if let Some(branch) = trimmed.split(':').nth(1) {
-                        let branch = branch.trim();
-                        if !branch.is_empty() && branch != "(unknown)" {
-                            return branch.to_string();
-                        }
-                    }
+    if let Ok(o) = &remote_show
+        && o.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("HEAD branch:")
+                && let Some(branch) = trimmed.split(':').nth(1)
+            {
+                let branch = branch.trim();
+                if !branch.is_empty() && branch != "(unknown)" {
+                    return branch.to_string();
                 }
             }
         }
@@ -272,21 +272,21 @@ pub async fn resolve_main_repo(project_dir: &Path) -> PathBuf {
         .output_with_context()
         .await;
 
-    if let Ok(o) = output {
-        if o.status.success() {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            if let Some(first_line) = stdout.lines().next() {
-                if let Some(path) = first_line.strip_prefix("worktree ") {
-                    let main_path = PathBuf::from(path);
-                    if main_path != project_dir {
-                        tracing::info!(
-                            worktree = %project_dir.display(),
-                            main = %main_path.display(),
-                            "resolved worktree to main repo"
-                        );
-                        return main_path;
-                    }
-                }
+    if let Ok(o) = output
+        && o.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        if let Some(first_line) = stdout.lines().next()
+            && let Some(path) = first_line.strip_prefix("worktree ")
+        {
+            let main_path = PathBuf::from(path);
+            if main_path != project_dir {
+                tracing::info!(
+                    worktree = %project_dir.display(),
+                    main = %main_path.display(),
+                    "resolved worktree to main repo"
+                );
+                return main_path;
             }
         }
     }
@@ -738,15 +738,15 @@ pub async fn setup_worktree(
 
                 if tokio::fs::metadata(&worktree_dir).await.is_err() {
                     anyhow::bail!(
-                    "failed to create worktree at {} for task {} (stdout: {}, stderr: {}, retry stdout: {}, retry stderr: {}, retry error: {})",
-                    worktree_dir.display(),
-                    task_id,
-                    stdout,
-                    stderr,
-                    retry_stdout,
-                    retry_stderr,
-                    retry_error
-                );
+                        "failed to create worktree at {} for task {} (stdout: {}, stderr: {}, retry stdout: {}, retry stderr: {}, retry error: {})",
+                        worktree_dir.display(),
+                        task_id,
+                        stdout,
+                        stderr,
+                        retry_stdout,
+                        retry_stderr,
+                        retry_error
+                    );
                 }
             }
         }
@@ -755,20 +755,19 @@ pub async fn setup_worktree(
     // Link issue to branch via GitHub API (Development sidebar).
     // Must happen before the agent pushes — createLinkedBranch only works
     // for branches that don't yet exist on GitHub.
-    if !task_id.starts_with("internal:") {
-        if let Ok(issue_num) = task_id.parse::<u64>() {
-            if let Ok(gh) = crate::github::http::GhHttp::new() {
-                match gh
-                    .link_issue_to_branch(repo, issue_num, &branch_name_str)
-                    .await
-                {
-                    Ok(id) => {
-                        tracing::info!(task_id, branch = %branch_name_str, linked = %id, "linked issue to branch");
-                    }
-                    Err(e) => {
-                        tracing::debug!(task_id, error = %e, "failed to link issue to branch (non-fatal)");
-                    }
-                }
+    if !task_id.starts_with("internal:")
+        && let Ok(issue_num) = task_id.parse::<u64>()
+        && let Ok(gh) = crate::github::http::GhHttp::new()
+    {
+        match gh
+            .link_issue_to_branch(repo, issue_num, &branch_name_str)
+            .await
+        {
+            Ok(id) => {
+                tracing::info!(task_id, branch = %branch_name_str, linked = %id, "linked issue to branch");
+            }
+            Err(e) => {
+                tracing::debug!(task_id, error = %e, "failed to link issue to branch (non-fatal)");
             }
         }
     }
@@ -1045,7 +1044,8 @@ mod tests {
         // Isolate ORCH_HOME so the worktree lands in a temp dir.
         let orch_home_dir = tempfile::tempdir().unwrap();
         let prev_orch_home = std::env::var("ORCH_HOME").ok();
-        std::env::set_var("ORCH_HOME", orch_home_dir.path());
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", orch_home_dir.path()) };
 
         // Bare "remote".
         let remote = tempfile::tempdir().unwrap();
@@ -1108,8 +1108,10 @@ mod tests {
 
         // Restore ORCH_HOME.
         match prev_orch_home {
-            Some(v) => std::env::set_var("ORCH_HOME", v),
-            None => std::env::remove_var("ORCH_HOME"),
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            Some(v) => unsafe { std::env::set_var("ORCH_HOME", v) },
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            None => unsafe { std::env::remove_var("ORCH_HOME") },
         }
     }
 
