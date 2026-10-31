@@ -24,6 +24,7 @@ pub struct GlobalChannelConfig {
 }
 
 /// Maps channel targets to projects and vice versa.
+#[derive(Debug)]
 pub struct ChannelRouter {
     /// (channel_name, topic_or_channel_id) → repo
     target_to_repo: HashMap<(String, String), String>,

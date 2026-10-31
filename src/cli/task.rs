@@ -1362,7 +1362,7 @@ pub async fn tree(id: Option<i64>, deps: bool) -> anyhow::Result<()> {
         // For a single task, we need to find its children
         // First get all tasks to build the full hierarchy
         let all_tasks = task_manager.list_tasks(TaskFilter::default()).await?;
-        let forest = build_forest(all_tasks);
+        let forest = build_forest(&all_tasks);
 
         // Find the requested task in the forest
         fn find_node_in_forest<'a>(
@@ -1411,7 +1411,7 @@ pub async fn tree(id: Option<i64>, deps: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let forest = build_forest(tasks);
+    let forest = build_forest(&tasks);
     let output = render_forest(&forest);
     print!("{output}");
 

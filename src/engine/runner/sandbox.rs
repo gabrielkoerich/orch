@@ -647,7 +647,7 @@ mod tests {
         let Access::Only(sockets) = &p.unix_sockets else {
             panic!("every unix socket is reachable");
         };
-        assert_eq!(sockets, &vec![run.work_dir.clone(), run.temp.clone()]);
+        assert_eq!(sockets, &vec![run.work_dir, run.temp]);
         assert!(!sockets
             .iter()
             .any(|s| s.starts_with("/tmp") || s.starts_with("/private/tmp")));
@@ -864,7 +864,7 @@ mod tests {
     // A logged-in claude answers under the policy with the real home: `--run-ignored only claude`
     #[cfg(target_os = "macos")]
     #[test]
-    #[ignore]
+    #[ignore = "needs a logged-in claude on the host"]
     fn claude_answers_inside_the_sandbox_with_the_real_home() {
         let root = tempfile::tempdir().unwrap();
         let work = root.path().canonicalize().unwrap();

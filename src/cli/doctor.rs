@@ -154,11 +154,11 @@ async fn run_checks(
                 let mut nums: Vec<u64> = recent_done_tasks
                     .iter()
                     .filter(|t| !(t.origin == "internal" && t.external_id.is_none()))
-                    .filter_map(|t| t.pr_number.map(|n| n as u64))
+                    .filter_map(|t| t.pr_number.and_then(|n| u64::try_from(n).ok()))
                     .chain(
                         active_tasks
                             .iter()
-                            .filter_map(|t| t.pr_number.map(|n| n as u64)),
+                            .filter_map(|t| t.pr_number.and_then(|n| u64::try_from(n).ok())),
                     )
                     .collect();
                 nums.sort_unstable();
@@ -268,8 +268,8 @@ async fn run_checks(
                 }
 
                 // PR merged check for tasks that have a PR recorded — make one REST call per active task (few)
-                if let Some(pr_num) = task.pr_number {
-                    if let Ok(pr) = gh.get_pr(repo, pr_num as u64).await {
+                if let Some(pr_num) = task.pr_number.and_then(|n| u64::try_from(n).ok()) {
+                    if let Ok(pr) = gh.get_pr(repo, pr_num).await {
                         if pr.merged.unwrap_or(false) {
                             findings.push(Finding {
                                 severity: Severity::Error,
@@ -339,7 +339,7 @@ async fn run_checks(
                 if let Some(n) = pr_num {
                     for t in &active_tasks {
                         if let Some(pn) = t.pr_number {
-                            if pn as u64 == n {
+                            if u64::try_from(pn) == Ok(n) {
                                 owned = true;
                                 break;
                             }
@@ -437,13 +437,13 @@ async fn check_done_no_merged_pr(
     let task_label = task_label(task);
     let store_id = task.id;
 
-    match task.pr_number {
+    match task.pr_number.and_then(|n| u64::try_from(n).ok()) {
         Some(pr_num) => {
             // Use cached state; fall back to live fetch if missing (e.g. new PR since batch)
-            let (merged, state) = if let Some(s) = pr_states.get(&(pr_num as u64)) {
+            let (merged, state) = if let Some(s) = pr_states.get(&pr_num) {
                 s.clone()
             } else {
-                match gh.get_pr(repo, pr_num as u64).await {
+                match gh.get_pr(repo, pr_num).await {
                     Ok(pr) => (pr.merged.unwrap_or(false), pr.state),
                     Err(e) => {
                         findings.push(Finding {
@@ -631,6 +631,10 @@ async fn check_unpushed_commits(task: &Task, findings: &mut Vec<Finding>) {
         .await;
     if let Ok(out) = output {
         if !out.stdout.is_empty() {
+            #[expect(
+                clippy::naive_bytecount,
+                reason = "a short git log does not need the bytecount crate"
+            )]
             let count = out.stdout.iter().filter(|&&b| b == b'\n').count();
             findings.push(Finding {
                 severity: Severity::Error,
@@ -845,9 +849,8 @@ fn check_pr_merged_not_done(
     pr_states: &std::collections::HashMap<u64, (bool, String)>,
     findings: &mut Vec<Finding>,
 ) {
-    let pr_num = match task.pr_number {
-        Some(n) => n as u64,
-        None => return,
+    let Some(pr_num) = task.pr_number.and_then(|n| u64::try_from(n).ok()) else {
+        return;
     };
 
     if let Some((merged, _)) = pr_states.get(&pr_num) {
@@ -934,7 +937,6 @@ async fn apply_fixes(
         match &f.fix {
             FixAction::None => {
                 skipped += 1;
-                continue;
             }
             FixAction::LinkPr {
                 store_id,
@@ -950,10 +952,7 @@ async fn apply_fixes(
                 }
 
                 let _ = store
-                    .set_fields(
-                        *store_id,
-                        &[("pr_number", serde_json::json!(*pr_number as i64))],
-                    )
+                    .set_fields(*store_id, &[("pr_number", serde_json::json!(*pr_number))])
                     .await;
                 println!("  fixed #{}: linked PR #{}", f.task_id, pr_number);
                 fixed += 1;

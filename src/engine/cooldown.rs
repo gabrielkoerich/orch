@@ -144,6 +144,7 @@ struct CooldownEntry {
     reason: String,
 }
 
+#[derive(Debug)]
 pub struct SilenceCountResult {
     pub count: usize,
     pub extended_cooldown_applied: bool,
@@ -382,7 +383,7 @@ pub fn compute_backoff(count: u64, base: i64, max: i64, allow_extended: bool) ->
     if count <= 1 {
         return base;
     }
-    let exp = count.saturating_sub(1).min(u64::from(u32::MAX)) as u32;
+    let exp = u32::try_from(count.saturating_sub(1)).unwrap_or(u32::MAX);
     let factor = 3_i64.saturating_pow(exp);
     let standard = base.saturating_mul(factor).min(max);
 
@@ -432,7 +433,7 @@ pub fn compute_backoff(count: u64, base: i64, max: i64, allow_extended: bool) ->
 /// Returns `u64::MAX` on store errors (e.g. lock contention) so backoff applies the cap duration
 /// instead of resetting to the base, preventing rapid re-dispatch during store outages.
 async fn read_and_increment_failure_count(
-    store_opt: &Option<Arc<crate::store::TaskStore>>,
+    store_opt: Option<&Arc<crate::store::TaskStore>>,
     key: &str,
 ) -> u64 {
     read_and_increment_failure_count_with_prefix(store_opt, FAILURE_COUNT_PREFIX, key).await
@@ -443,7 +444,7 @@ async fn read_and_increment_failure_count(
 /// Credit exhaustion uses [`CREDIT_FAILURE_COUNT_PREFIX`] so its backoff escalation
 /// is independent of generic agent failures (which use [`FAILURE_COUNT_PREFIX`]).
 async fn read_and_increment_failure_count_with_prefix(
-    store_opt: &Option<Arc<crate::store::TaskStore>>,
+    store_opt: Option<&Arc<crate::store::TaskStore>>,
     prefix: &str,
     key: &str,
 ) -> u64 {
@@ -510,7 +511,7 @@ pub async fn record_agent_failure_with_message(agent_name: &str, error_message: 
     }
 
     let store_opt = cooldown_store().lock().await.clone();
-    let count = read_and_increment_failure_count(&store_opt, agent_name).await;
+    let count = read_and_increment_failure_count(store_opt.as_ref(), agent_name).await;
     let base = crate::engine::router::config::get_agent_backoff_base(agent_name);
     let cooldown_until =
         chrono::Utc::now().timestamp() + compute_backoff(count, base, BACKOFF_MAX_SECS, true);
@@ -629,7 +630,7 @@ pub async fn record_credit_exhaustion(agent_name: &str, reason: CreditExhaustion
     // Previously both paths shared FAILURE_COUNT_PREFIX, causing generic failures
     // to inflate credit-exhaustion backoff (and vice versa).
     let count = read_and_increment_failure_count_with_prefix(
-        &store_opt,
+        store_opt.as_ref(),
         CREDIT_FAILURE_COUNT_PREFIX,
         agent_name,
     )
@@ -667,7 +668,7 @@ pub async fn record_credit_exhaustion(agent_name: &str, reason: CreditExhaustion
 pub async fn record_model_failure(agent_name: &str, model: &str) {
     let key = format!("{agent_name}:{model}");
     let store_opt = cooldown_store().lock().await.clone();
-    let count = read_and_increment_failure_count(&store_opt, &key).await;
+    let count = read_and_increment_failure_count(store_opt.as_ref(), &key).await;
     let base = crate::engine::router::config::get_agent_backoff_base(agent_name);
     let cooldown_until =
         chrono::Utc::now().timestamp() + compute_backoff(count, base, BACKOFF_MAX_SECS, true);
@@ -684,7 +685,9 @@ pub async fn record_model_failure(agent_name: &str, model: &str) {
 pub async fn record_rate_limit(agent_name: &str, model: Option<&str>, error_message: &str) {
     if let Some(window_secs) = parse_relative_usage_window(error_message) {
         if let Some(m) = model {
-            let cooldown_until = chrono::Utc::now().timestamp() + window_secs as i64;
+            let cooldown_until = chrono::Utc::now()
+                .timestamp()
+                .saturating_add(i64::try_from(window_secs).unwrap_or(i64::MAX));
             set_model_cooldown(agent_name, m, window_secs, "rate_limit_usage_window").await;
             tracing::info!(
                 agent = agent_name,
@@ -718,7 +721,7 @@ pub async fn record_persistent_model_failure(agent_name: &str, model: &str) {
     let key = format!("{agent_name}:{model}");
     let store_opt = cooldown_store().lock().await.clone();
     let count = read_and_increment_failure_count_with_prefix(
-        &store_opt,
+        store_opt.as_ref(),
         PERSISTENT_FAILURE_COUNT_PREFIX,
         &key,
     )
@@ -761,7 +764,7 @@ fn is_model_permanently_gone(message: &str) -> bool {
 pub async fn record_transient_model_failure(agent_name: &str, model: &str) {
     let key = format!("{agent_name}:{model}");
     let store_opt = cooldown_store().lock().await.clone();
-    let count = read_and_increment_failure_count(&store_opt, &key).await;
+    let count = read_and_increment_failure_count(store_opt.as_ref(), &key).await;
     let cooldown_secs = compute_backoff(
         count,
         TRANSIENT_MODEL_BACKOFF_BASE_SECS,
@@ -780,7 +783,9 @@ pub async fn record_transient_model_failure(agent_name: &str, model: &str) {
 /// apart in `orch cooldown list`.
 pub async fn set_model_cooldown(agent_name: &str, model: &str, duration_secs: u64, reason: &str) {
     let key = format!("{agent_name}:{model}");
-    let cooldown_until = chrono::Utc::now().timestamp() + duration_secs as i64;
+    let cooldown_until = chrono::Utc::now()
+        .timestamp()
+        .saturating_add(i64::try_from(duration_secs).unwrap_or(i64::MAX));
     set_cooldown_async(&key, cooldown_until, reason).await;
 }
 
@@ -797,7 +802,9 @@ pub async fn set_model_cooldown_until(agent_name: &str, model: &str, until: i64)
 /// (exponential backoff), this uses a short duration (typically 120s) —
 /// just enough to force one re-route cycle to a different agent.
 pub async fn set_agent_cooldown(agent_name: &str, duration_secs: u64) {
-    let cooldown_until = chrono::Utc::now().timestamp() + duration_secs as i64;
+    let cooldown_until = chrono::Utc::now()
+        .timestamp()
+        .saturating_add(i64::try_from(duration_secs).unwrap_or(i64::MAX));
     set_cooldown_async(agent_name, cooldown_until, "silence_agent_cooldown").await;
 }
 
@@ -1451,7 +1458,7 @@ pub fn github_circuit_remaining_secs() -> u64 {
         if let Some(until) = *open {
             let now = chrono::Utc::now().timestamp();
             if now < until {
-                return (until - now) as u64;
+                return u64::try_from(until - now).unwrap_or(0);
             }
             return 0;
         }
@@ -1461,7 +1468,7 @@ pub fn github_circuit_remaining_secs() -> u64 {
     if let Some(until) = cooldown_until("github:5xx") {
         let now = chrono::Utc::now().timestamp();
         if now < until {
-            return (until - now) as u64;
+            return u64::try_from(until - now).unwrap_or(0);
         }
     }
     0
@@ -1639,6 +1646,13 @@ pub(crate) fn parse_retry_at(error_message: &str) -> Option<i64> {
 /// same window-detection the `needs_review` call site
 /// (`record_rate_limit()`, below) already uses — see issue #3580.
 pub(crate) fn parse_relative_usage_window(error_message: &str) -> Option<u64> {
+    static WINDOW_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(
+            r"(?i)(?:^|\s|[\(\)\.,;:!?])(?:(\d+)\s*-?\s*(hour|hours|hr|hrs|minute|minutes|min|mins|day|days)|(hourly|daily|weekly|monthly))(?:$|\s|[\(\)\.,;:!?])"
+        )
+        .expect("usage window regex is valid")
+    });
+
     if error_message.is_empty() {
         return None;
     }
@@ -1651,13 +1665,6 @@ pub(crate) fn parse_relative_usage_window(error_message: &str) -> Option<u64> {
     if !has_context {
         return None;
     }
-
-    static WINDOW_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-        Regex::new(
-            r"(?i)(?:^|\s|[\(\)\.,;:!?])(?:(\d+)\s*-?\s*(hour|hours|hr|hrs|minute|minutes|min|mins|day|days)|(hourly|daily|weekly|monthly))(?:$|\s|[\(\)\.,;:!?])"
-        )
-        .expect("usage window regex is valid")
-    });
 
     let mut max_secs: Option<u64> = None;
     for caps in WINDOW_RE.captures_iter(&lower) {
@@ -1929,13 +1936,15 @@ mod tests {
     #[serial(cooldown_state)]
     #[test]
     fn parse_retry_at_codex_format() {
+        use chrono::Datelike;
+        use chrono::TimeZone;
+
         let msg = "You've hit your usage limit. Upgrade to Pro, visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Mar 26th, 2026 5:55 AM.";
         let ts = parse_retry_at(msg);
         assert!(ts.is_some(), "should parse codex retry-at date");
 
         // The parsed timestamp must equal "Mar 26 2026 05:55 local" in UTC.
         // We reconstruct what the function should produce and compare directly.
-        use chrono::TimeZone;
         let naive = chrono::NaiveDateTime::new(
             chrono::NaiveDate::from_ymd_opt(2026, 3, 26).unwrap(),
             chrono::NaiveTime::from_hms_opt(5, 55, 0).unwrap(),
@@ -1953,7 +1962,6 @@ mod tests {
 
         // Sanity: the UTC date must still be March 26 (true for all timezones within ±14h)
         let dt = chrono::DateTime::from_timestamp(ts.unwrap(), 0).unwrap();
-        use chrono::Datelike;
         assert_eq!(dt.month(), 3);
         assert_eq!(dt.day(), 26);
     }
@@ -2001,10 +2009,11 @@ mod tests {
     #[serial(cooldown_state)]
     #[test]
     fn parse_retry_at_glm_reset_format_with_seconds() {
+        use chrono::TimeZone;
+
         let msg = "Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-04-23 18:33:48";
         let ts = parse_retry_at(msg).expect("should parse GLM reset-at date");
 
-        use chrono::TimeZone;
         let naive = chrono::NaiveDateTime::new(
             chrono::NaiveDate::from_ymd_opt(2026, 4, 23).expect("valid date"),
             chrono::NaiveTime::from_hms_opt(18, 33, 48).expect("valid time"),
@@ -2193,7 +2202,7 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
         let remaining = entry.cooldown_until - now;
         assert!(
-            remaining <= SILENCE_AGENT_COOLDOWN_SECS as i64,
+            remaining <= i64::try_from(SILENCE_AGENT_COOLDOWN_SECS).unwrap(),
             "silence agent cooldown should be <= {SILENCE_AGENT_COOLDOWN_SECS}s, got {remaining}s"
         );
         assert!(remaining > 0, "cooldown should still be active");
@@ -2223,7 +2232,7 @@ mod tests {
             entry.cooldown_until - chrono::Utc::now().timestamp()
         };
         assert!(
-            remaining >= SILENCE_EXTENDED_COOLDOWN_SECS as i64 - 5,
+            remaining >= i64::try_from(SILENCE_EXTENDED_COOLDOWN_SECS).unwrap() - 5,
             "extended cooldown should be applied, got {remaining}s"
         );
 
@@ -3389,8 +3398,7 @@ mod tests {
 
         // Accumulate 3 failures to escalate the backoff
         for _ in 0..3 {
-            let _ =
-                read_and_increment_failure_count(&Some(std::sync::Arc::clone(&store)), agent).await;
+            let _ = read_and_increment_failure_count(Some(&store), agent).await;
         }
         // Verify count is 3
         let kv_key = format!("{FAILURE_COUNT_PREFIX}{agent}");
@@ -3468,8 +3476,7 @@ mod tests {
 
         // Accumulate failures
         for _ in 0..5 {
-            let _ =
-                read_and_increment_failure_count(&Some(std::sync::Arc::clone(&store)), agent).await;
+            let _ = read_and_increment_failure_count(Some(&store), agent).await;
         }
         // Set a cooldown so clear_cooldown has something to clear
         set_agent_cooldown(agent, 3600).await;
@@ -3517,8 +3524,7 @@ mod tests {
 
         let agents = ["test_clear_all_a", "test_clear_all_b"];
         for agent in &agents {
-            let _ =
-                read_and_increment_failure_count(&Some(std::sync::Arc::clone(&store)), agent).await;
+            let _ = read_and_increment_failure_count(Some(&store), agent).await;
             set_agent_cooldown(agent, 3600).await;
         }
 

@@ -1,9 +1,10 @@
 // Library target — exposes production modules to integration tests.
 //
-// These lints are suppressed because they fire on public types that are only
-// public to satisfy the lib target requirement for integration tests —
-// the binary doesn't expose these as a public API.
-#![allow(clippy::new_without_default, clippy::should_implement_trait)]
+#![expect(
+    clippy::new_without_default,
+    clippy::should_implement_trait,
+    reason = "these types are public only so integration tests can reach them"
+)]
 //
 //
 // Integration tests in tests/ cannot access modules declared in main.rs.

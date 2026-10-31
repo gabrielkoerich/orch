@@ -176,7 +176,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("orch.log");
 
-        std::fs::write(&path, vec![b'a'; (MAX_SERVICE_LOG_BYTES + 1) as usize]).unwrap();
+        std::fs::write(
+            &path,
+            vec![b'a'; usize::try_from(MAX_SERVICE_LOG_BYTES + 1).unwrap()],
+        )
+        .unwrap();
         std::fs::write(path.with_file_name("orch.log.1"), b"one").unwrap();
         std::fs::write(path.with_file_name("orch.log.2"), b"two").unwrap();
         std::fs::write(path.with_file_name("orch.log.3"), b"three").unwrap();
@@ -206,7 +210,11 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("orch.log");
-        std::fs::write(&path, vec![b'a'; (MAX_SERVICE_LOG_BYTES + 1) as usize]).unwrap();
+        std::fs::write(
+            &path,
+            vec![b'a'; usize::try_from(MAX_SERVICE_LOG_BYTES + 1).unwrap()],
+        )
+        .unwrap();
 
         let mut live = std::fs::OpenOptions::new()
             .append(true)
@@ -1281,10 +1289,7 @@ async fn async_main() -> anyhow::Result<()> {
             TaskAction::Run { id } => {
                 cli::task::run(id).await?;
             }
-            TaskAction::Retry { id, agent, model } => {
-                cli::task::retry(&id, agent, model).await?;
-            }
-            TaskAction::Reroute { id, agent, model } => {
+            TaskAction::Retry { id, agent, model } | TaskAction::Reroute { id, agent, model } => {
                 cli::task::retry(&id, agent, model).await?;
             }
             TaskAction::Unblock { id } => {

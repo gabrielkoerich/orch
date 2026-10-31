@@ -62,15 +62,18 @@ fn assert_no_secrets_in_files(files: &[(PathBuf, String)]) {
     }
 
     if !all_violations.is_empty() {
+        use std::fmt::Write as _;
+
         let mut msg = String::from("Secret leakage detected in task artifacts:\n\n");
         for (path, line, pattern, snippet) in all_violations {
-            msg.push_str(&format!(
+            let _ = write!(
+                msg,
                 "  File: {}\n  Line: {}\n  Pattern: {}\n  Snippet: {}\n\n",
                 path.display(),
                 line,
                 pattern,
                 &snippet[..snippet.len().min(100)]
-            ));
+            );
         }
         panic!("{}", msg);
     }
@@ -130,7 +133,7 @@ Add tests for the new feature
     /// This simulates the actual artifact generation process.
     #[test]
     fn test_prompt_files_no_secrets() {
-        let (_temp, _home) = setup_temp_home();
+        let (_temp, home) = setup_temp_home();
 
         // Simulate the content that would be written to prompt files
         let sys_prompt = r"# Task Instructions
@@ -156,7 +159,7 @@ Tokens should be validated against the database.
 Tokens are accepted without validation.";
 
         // Create temp files to test
-        let attempt_dir = _home.join(".orch/state/owner/repo/tasks/123/attempts/1");
+        let attempt_dir = home.join(".orch/state/owner/repo/tasks/123/attempts/1");
         std::fs::create_dir_all(&attempt_dir).unwrap();
 
         let sys_file = attempt_dir.join("prompt-sys.md");
@@ -255,10 +258,7 @@ export GIT_AUTHOR_EMAIL="test@example.com"
         std::fs::write(&runner_file, &runner_script).unwrap();
 
         // Verify prompt files have no secrets
-        let prompt_files = vec![
-            (sys_file.clone(), sys_prompt),
-            (msg_file.clone(), msg_prompt),
-        ];
+        let prompt_files = vec![(sys_file, sys_prompt), (msg_file, msg_prompt)];
         assert_no_secrets_in_files(&prompt_files);
 
         // Clean up env var

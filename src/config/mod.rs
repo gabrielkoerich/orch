@@ -26,8 +26,8 @@ static CACHE: std::sync::LazyLock<RwLock<HashMap<PathBuf, serde_norway::Value>>>
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Files currently being watched for changes.
-static WATCHER: std::sync::LazyLock<RwLock<HashMap<PathBuf, ()>>> =
-    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+static WATCHER: std::sync::LazyLock<RwLock<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashSet::new()));
 
 /// Global file watcher instance (started on first use).
 static FILE_WATCHER: std::sync::LazyLock<Arc<Mutex<Option<RecommendedWatcher>>>> =
@@ -214,8 +214,8 @@ fn watch_file(path: &PathBuf) {
 
     // Track that we want to watch this file
     if let Ok(mut watched) = WATCHER.write() {
-        if !watched.contains_key(path) {
-            watched.insert(path.clone(), ());
+        if !watched.contains(path) {
+            watched.insert(path.clone());
 
             // Add to notify watcher
             if let Ok(mut guard) = FILE_WATCHER.lock() {
@@ -316,32 +316,32 @@ fn resolve_list(path: &PathBuf, key: &str) -> anyhow::Result<Vec<String>> {
 
     let root = load_cached_root(path)?;
 
-    extract_list(&root, key)
+    Ok(extract_list(&root, key))
 }
 
 /// Extract a list of strings from a YAML tree by dot-separated key.
-fn extract_list(root: &serde_norway::Value, key: &str) -> anyhow::Result<Vec<String>> {
+fn extract_list(root: &serde_norway::Value, key: &str) -> Vec<String> {
     let mut current = root;
     for part in key.split('.') {
         match current.get(part) {
             Some(v) => current = v,
-            None => return Ok(vec![]),
+            None => return vec![],
         }
     }
 
     match current {
-        serde_norway::Value::Sequence(seq) => Ok(seq
+        serde_norway::Value::Sequence(seq) => seq
             .iter()
             .filter_map(|item| item.as_str().map(String::from))
-            .collect()),
+            .collect(),
         serde_norway::Value::String(s) => {
             // Support comma-separated string format
-            Ok(s.split(',')
+            s.split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .collect())
+                .collect()
         }
-        _ => Ok(vec![]),
+        _ => vec![],
     }
 }
 
@@ -582,13 +582,13 @@ pub fn get_skills() -> anyhow::Result<Vec<SkillConfig>> {
 
     let root = load_cached_root(&global_path)?;
 
-    extract_skills_list(&root)
+    Ok(extract_skills_list(&root))
 }
 
 /// Extract skills list from a YAML tree.
-fn extract_skills_list(root: &serde_norway::Value) -> anyhow::Result<Vec<SkillConfig>> {
+fn extract_skills_list(root: &serde_norway::Value) -> Vec<SkillConfig> {
     let Some(serde_norway::Value::Sequence(seq)) = root.get("skills") else {
-        return Ok(vec![]);
+        return vec![];
     };
 
     let mut skills = Vec::new();
@@ -606,7 +606,7 @@ fn extract_skills_list(root: &serde_norway::Value) -> anyhow::Result<Vec<SkillCo
         }
     }
 
-    Ok(skills)
+    skills
 }
 
 /// Resolve a projects list from a config file.
@@ -616,20 +616,16 @@ fn resolve_projects_list(path: &PathBuf, key: &str) -> anyhow::Result<Vec<String
 
     let root = load_cached_root(path)?;
 
-    // Try to extract projects list - if key doesn't exist, return empty vector
-    match extract_projects_list(&root, key) {
-        Ok(projects) => Ok(projects),
-        Err(_) => Ok(vec![]),
-    }
+    Ok(extract_projects_list(&root, key))
 }
 
 /// Extract a projects list from a YAML tree.
-fn extract_projects_list(root: &serde_norway::Value, key: &str) -> anyhow::Result<Vec<String>> {
+fn extract_projects_list(root: &serde_norway::Value, key: &str) -> Vec<String> {
     let mut current = root;
     for part in key.split('.') {
         // If key doesn't exist, return empty vector
         let Some(next) = current.get(part) else {
-            return Ok(vec![]);
+            return vec![];
         };
         current = next;
     }
@@ -647,9 +643,9 @@ fn extract_projects_list(root: &serde_norway::Value, key: &str) -> anyhow::Resul
                     }
                 }
             }
-            Ok(projects)
+            projects
         }
-        _ => Ok(vec![]),
+        _ => vec![],
     }
 }
 
@@ -784,7 +780,7 @@ mod tests {
         let yaml =
             serde_norway::from_str::<serde_norway::Value>("projects:\n  - a\n  - b\n  - c\n")
                 .unwrap();
-        let projects = extract_projects_list(&yaml, "projects").unwrap();
+        let projects = extract_projects_list(&yaml, "projects");
         assert_eq!(projects, vec!["a", "b", "c"]);
     }
 
@@ -793,14 +789,14 @@ mod tests {
         let yaml =
             serde_norway::from_str::<serde_norway::Value>("projects:\n  - repo: a\n  - repo: b\n")
                 .unwrap();
-        let projects = extract_projects_list(&yaml, "projects").unwrap();
+        let projects = extract_projects_list(&yaml, "projects");
         assert_eq!(projects, vec!["a", "b"]);
     }
 
     #[test]
     fn extract_projects_list_empty_for_missing() {
         let yaml = serde_norway::from_str::<serde_norway::Value>("foo: bar").unwrap();
-        let projects = extract_projects_list(&yaml, "projects").unwrap();
+        let projects = extract_projects_list(&yaml, "projects");
         assert!(projects.is_empty(), "{projects:?}");
     }
 
@@ -817,7 +813,7 @@ mod tests {
         loop {
             match rx.try_recv() {
                 Ok(received_path) if received_path == path => break,
-                Ok(_) => continue, // skip notifications from other tests
+                Ok(_) => {} // skip notifications from other tests
                 Err(e) => panic!("expected config change notification, got error: {e:?}"),
             }
         }
@@ -836,7 +832,7 @@ mod tests {
         let find_path = |rx: &mut tokio::sync::broadcast::Receiver<PathBuf>, expected: &PathBuf| loop {
             match rx.try_recv() {
                 Ok(p) if &p == expected => return,
-                Ok(_) => continue,
+                Ok(_) => {}
                 Err(e) => panic!("expected config change notification, got error: {e:?}"),
             }
         };
@@ -882,7 +878,7 @@ mod tests {
             "skills:\n  - repo: owner/skills1\n  - repo: owner/skills2\n",
         )
         .unwrap();
-        let skills = extract_skills_list(&yaml).unwrap();
+        let skills = extract_skills_list(&yaml);
         assert_eq!(skills.len(), 2);
         assert_eq!(skills[0].repo, "owner/skills1");
         assert_eq!(skills[1].repo, "owner/skills2");
@@ -893,7 +889,7 @@ mod tests {
         let yaml =
             serde_norway::from_str::<serde_norway::Value>("skills:\n  - repo: owner/skills\n")
                 .unwrap();
-        let skills = extract_skills_list(&yaml).unwrap();
+        let skills = extract_skills_list(&yaml);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].repo, "owner/skills");
     }
@@ -908,7 +904,7 @@ mod tests {
     }
 
     fn cached_projects(path: &PathBuf) -> Vec<String> {
-        extract_projects_list(&load_cached_root(path).unwrap(), "projects").unwrap()
+        extract_projects_list(&load_cached_root(path).unwrap(), "projects")
     }
 
     #[test]
@@ -994,7 +990,7 @@ mod tests {
     #[test]
     fn extract_skills_list_empty_for_missing() {
         let yaml = serde_norway::from_str::<serde_norway::Value>("foo: bar").unwrap();
-        let skills = extract_skills_list(&yaml).unwrap();
+        let skills = extract_skills_list(&yaml);
         assert!(skills.is_empty());
     }
 }

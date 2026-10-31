@@ -53,6 +53,7 @@ use super::{
 use crate::parser;
 
 /// Runner for Claude-compatible agents (Claude, Kimi, MiniMax).
+#[derive(Debug)]
 pub struct ClaudeRunner {
     /// The agent binary name (claude, kimi, minimax, or custom).
     binary: String,
@@ -68,7 +69,7 @@ impl ClaudeRunner {
     /// Parse the Claude `--output-format json` envelope.
     ///
     /// Extracts `result`, `usage`, and `is_error`.
-    fn parse_envelope(&self, raw: &str) -> Result<ParsedResponse, AgentError> {
+    fn parse_envelope(raw: &str) -> Result<ParsedResponse, AgentError> {
         let parsed_json: serde_json::Value = serde_json::from_str(raw).map_err(|_| {
             // Not valid JSON at all — try as raw text
             AgentError::InvalidResponse {
@@ -87,7 +88,7 @@ impl ClaudeRunner {
 
         if !is_envelope {
             // Not a Claude envelope — try direct parsing via generic parser
-            return self.parse_direct(raw);
+            return Self::parse_direct(raw);
         }
 
         // Check is_error flag
@@ -176,7 +177,7 @@ impl ClaudeRunner {
     }
 
     /// Parse raw text directly (non-envelope response).
-    fn parse_direct(&self, raw: &str) -> Result<ParsedResponse, AgentError> {
+    fn parse_direct(raw: &str) -> Result<ParsedResponse, AgentError> {
         let response = parser::parse(raw).map_err(|_| AgentError::InvalidResponse {
             raw: raw.to_string(),
         })?;
@@ -424,7 +425,7 @@ impl AgentRunner for ClaudeRunner {
         // For NDJSON (--output-format stream-json): find the best result line and its
         // token count. For single-line JSON (--output-format json), returns None.
         if let Some((result_line, tokens)) = find_ndjson_result_line(trimmed) {
-            let result = self.parse_envelope(result_line)?;
+            let result = Self::parse_envelope(result_line)?;
             // If the envelope parse preserved meaningful tokens, use those.
             // Otherwise, fall back to the tokens from find_ndjson_result_line
             // (which selected the best result line by token count — issue #1387).
@@ -441,7 +442,7 @@ impl AgentRunner for ClaudeRunner {
         }
 
         // Fallback: treat the whole string as the envelope (e.g. pretty-printed JSON)
-        self.parse_envelope(trimmed)
+        Self::parse_envelope(trimmed)
     }
 
     fn classify_error(&self, exit_code: i32, stdout: &str, stderr: &str) -> AgentError {
@@ -1965,7 +1966,7 @@ mod tests {
         })
         .to_string();
         // Concatenate without using concat! to avoid string-escaping headaches.
-        let mut ndjson = json_result_line.clone();
+        let mut ndjson = json_result_line;
         ndjson.push('\n');
         ndjson.push_str(r#"{"type":"system","subtype":"task_notification"}"#);
         ndjson.push('\n');

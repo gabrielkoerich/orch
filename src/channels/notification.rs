@@ -31,7 +31,6 @@ impl NotificationLevel {
     pub fn from_config() -> Self {
         match crate::config::get("notifications.level") {
             Ok(val) => match val.as_str() {
-                "all" => Self::All,
                 "verbose" => Self::Verbose,
                 "errors_only" => Self::ErrorsOnly,
                 "none" => Self::None,
@@ -194,7 +193,6 @@ impl TaskNotification {
     ///
     /// Prepends `[project_name]` to the channel-specific formatted message
     /// so recipients of multi-project channels can identify the source.
-    #[expect(dead_code)]
     pub fn format_with_project(&self, channel: &str) -> String {
         let project_name = self
             .repo
@@ -203,10 +201,9 @@ impl TaskNotification {
             .unwrap_or("unknown");
 
         let base = match channel {
-            "telegram" => self.format_telegram(),
             "discord" => self.format_discord(),
             "slack" => self.format_slack(),
-            _ => self.format_telegram(), // fallback
+            _ => self.format_telegram(),
         };
 
         let project_name = if channel == "telegram" {

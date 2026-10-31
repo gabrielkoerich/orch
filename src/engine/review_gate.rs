@@ -63,7 +63,7 @@ pub(crate) async fn review_ci_gate(
             let unstarted =
                 crate::engine::auto_merge::billing_failed_runs(gh, repo, &sha, Some(failed_runs))
                     .await;
-            if unstarted as usize == failed.len() {
+            if unstarted == failed.len() as u64 {
                 CiState::NotStarted
             } else {
                 CiState::Red(failed)

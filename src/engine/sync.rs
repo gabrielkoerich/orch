@@ -480,18 +480,17 @@ pub(crate) fn classify_comment(
         },
         // Command but no issue URL — if it's a mention, create task; otherwise skip
         (Some(_), true, None) => CommentAction::CreateMentionTask { issue_num: None },
-        (Some(_), false, None) => CommentAction::Skip,
         // Mention without command — create task for agent
         (None, true, issue_num) => CommentAction::CreateMentionTask { issue_num },
         // Neither mention nor command — skip
-        (None, false, _) => CommentAction::Skip,
+        (Some(_), false, None) | (None, false, _) => CommentAction::Skip,
     }
 }
 
 /// Handle a slash command from a mention. Records a sentinel task and advances
 /// the cursor on success; logs a warning and returns early if the mention has
 /// no valid issue URL.
-#[expect(clippy::too_many_arguments)]
+///
 /// Execute a slash command mentioned by `@orch` on a comment.
 ///
 /// Returns:
@@ -500,6 +499,10 @@ pub(crate) fn classify_comment(
 ///   GitHub error; caller must stop cursor advancement so the next tick retries
 /// - `Err(_)` — DB lookup failed for parent_id; caller must NOT advance cursor
 ///   so this mention is retried on the next sync
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the sync tick hands over its shared state piece by piece"
+)]
 async fn handle_slash_command(
     backend: &Arc<dyn ExternalBackend>,
     store: Option<&Arc<TaskStore>>,
@@ -670,7 +673,7 @@ async fn try_unblock_ci_failure_task(
     task: &crate::store::Task,
     auto_merge_in_flight: &Arc<DashSet<String>>,
 ) -> anyhow::Result<bool> {
-    let Some(pr_number) = task.pr_number else {
+    let Some(pr_number) = task.pr_number.and_then(|n| u64::try_from(n).ok()) else {
         tracing::debug!(
             task_id = task.id,
             "CI failure blocked task has no PR number"
@@ -678,7 +681,7 @@ async fn try_unblock_ci_failure_task(
         return Ok(false);
     };
 
-    let pr = match gh.get_pr(repo, pr_number as u64).await {
+    let pr = match gh.get_pr(repo, pr_number).await {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(task_id = task.id, pr_number, err = %e, "failed to get PR status for CI failure block");
@@ -743,7 +746,7 @@ async fn try_unblock_ci_failure_task(
     // can silently stall even when checks are green and the branch is up to date,
     // so after arming auto-merge we poll for completion and fall back to a direct
     // merge once the PR is mergeable and CI is passing.
-    let branch_update_result = gh.update_pr_branch(repo, pr_number as u64).await;
+    let branch_update_result = gh.update_pr_branch(repo, pr_number).await;
     match branch_update_result {
         Ok(()) => {
             tracing::info!(
@@ -764,7 +767,7 @@ async fn try_unblock_ci_failure_task(
         }
     }
 
-    if let Err(e) = gh.enable_auto_merge(repo, pr_number as u64).await {
+    if let Err(e) = gh.enable_auto_merge(repo, pr_number).await {
         tracing::warn!(task_id = task.id, pr_number, err = %e, "failed to re-enable auto-merge after branch update");
     }
 
@@ -810,9 +813,7 @@ async fn try_unblock_ci_failure_task(
             in_flight_clone.remove(&task_id_str);
         });
 
-        match poll_and_merge_recovered_pr(&gh_clone, &repo_string, pr_number as u64, task_clone.id)
-            .await
-        {
+        match poll_and_merge_recovered_pr(&gh_clone, &repo_string, pr_number, task_clone.id).await {
             Ok(true) => {
                 tracing::info!(
                     task_id = task_clone.id,
@@ -895,6 +896,11 @@ async fn poll_and_merge_recovered_pr(
     pr_number: u64,
     task_id: i64,
 ) -> anyhow::Result<bool> {
+    // The branch can fall behind while CI runs. Retry the update-branch call a
+    // few times inside the poll loop instead of exiting and waiting for the next
+    // 24-hour recovery cooldown.
+    const MAX_BEHIND_RETRIES: u32 = 3;
+
     let max_wait_secs: u64 = config::get("workflow.ci_poll_max_wait_secs")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -906,10 +912,6 @@ async fn poll_and_merge_recovered_pr(
     let max_wait = std::time::Duration::from_secs(max_wait_secs);
     let start = std::time::Instant::now();
     let mut poll_count: u32 = 0;
-    // The branch can fall behind while CI runs. Retry the update-branch call a
-    // few times inside the poll loop instead of exiting and waiting for the next
-    // 24-hour recovery cooldown.
-    const MAX_BEHIND_RETRIES: u32 = 3;
     let mut behind_retries: u32 = 0;
 
     let initial_pr = gh.get_pr(repo, pr_number).await?;
@@ -1203,8 +1205,10 @@ pub(crate) async fn auto_recover_rebroadcast_blocked_tasks_global(
             .clone()
             .unwrap_or_else(|| format!("internal:{}", task.id));
 
-        if let (Some(gh), Some(pr_number)) = (&gh, task.pr_number) {
-            match gh.get_pr(&task.repo, pr_number as u64).await {
+        if let (Some(gh), Some(pr_number)) =
+            (&gh, task.pr_number.and_then(|n| u64::try_from(n).ok()))
+        {
+            match gh.get_pr(&task.repo, pr_number).await {
                 Ok(pr) => {
                     if pr.merged.unwrap_or(false) {
                         tracing::info!(
@@ -1646,7 +1650,7 @@ pub(crate) async fn refire_and_escalate_stale_needs_review_global(
             continue;
         }
 
-        let current_refires = stored.needs_review_refires.max(0) as u64;
+        let current_refires = u64::try_from(stored.needs_review_refires).unwrap_or(0);
         let new_refires = current_refires + 1;
 
         if new_refires > MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS {
@@ -1694,7 +1698,8 @@ pub(crate) async fn refire_and_escalate_stale_needs_review_global(
         }
 
         // Exponential backoff: MIN * 2^(current_refires)
-        let required_minutes = MIN_STALE_NEEDS_REVIEW_MINUTES * (1i64 << (current_refires as u32));
+        let required_minutes =
+            MIN_STALE_NEEDS_REVIEW_MINUTES * (1i64 << u32::try_from(current_refires).unwrap_or(0));
 
         let should_fire = match age_minutes {
             Some(age) => age >= required_minutes,
@@ -1756,7 +1761,10 @@ pub(crate) async fn refire_and_escalate_stale_needs_review_global(
 /// - Cleanup finished worktrees
 /// - Check for merged PRs → mark tasks done
 /// - Scan for @mentions
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the engine passes its shared handles one by one"
+)]
 pub(crate) async fn sync_tick(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
@@ -1874,7 +1882,7 @@ pub(crate) async fn sync_tick(
                         return Ok(());
                     }
                 };
-                review_open_prs(
+                Box::pin(review_open_prs(
                     backend,
                     repo,
                     config,
@@ -1885,7 +1893,7 @@ pub(crate) async fn sync_tick(
                     &in_review_tasks,
                     &gh,
                     &cached_router_config,
-                )
+                ))
                 .await
             }
         );
@@ -1951,6 +1959,9 @@ pub(crate) async fn sync_tick(
             .collect();
 
         for (_stored, external) in &in_progress_tasks {
+            // A task is only considered stale if it has been in InProgress for > 5 minutes.
+            const MIN_STALE_MINUTES: i64 = 5;
+
             let task_id = &external.id.0;
 
             // Skip tasks currently being processed by the main tick (dispatch + agent flow).
@@ -1967,8 +1978,6 @@ pub(crate) async fn sync_tick(
 
             // Skip tasks that just transitioned to InProgress — allow time for the
             // agent to start its tmux session before treating it as stale.
-            // A task is only considered stale if it has been in InProgress for > 5 minutes.
-            const MIN_STALE_MINUTES: i64 = 5;
             match chrono::DateTime::parse_from_rfc3339(&external.updated_at) {
                 Ok(updated_at) => {
                     let age = chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc);
@@ -2533,6 +2542,10 @@ pub(crate) async fn emit_degraded_agents_if_needed(
     config: &crate::engine::router::RouterConfig,
     store: Option<&Arc<TaskStore>>,
 ) {
+    // Edge-triggered: only log when the affected-agents set changes, so a
+    // persistent condition doesn't flood the log every sync tick.
+    const STALE_AGENTS_KV: &str = "metrics:orch.model_pool_stale_persistent.agents";
+
     // Complexity tiers to check for configured models.
     const COMPLEXITIES: &[&str] = &["simple", "medium", "complex", "review"];
     const HEAVILY_COOLED_RATIO_THRESHOLD: f64 = 0.5;
@@ -2648,6 +2661,10 @@ pub(crate) async fn emit_degraded_agents_if_needed(
             if d.total_configured_models == 0 || d.persistent_failed_models.is_empty() {
                 return None;
             }
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "model counts are far below 2^52"
+            )]
             let ratio = d.cooled_models.len() as f64 / d.total_configured_models as f64;
             (ratio >= HEAVILY_COOLED_RATIO_THRESHOLD).then(|| {
                 format!(
@@ -2661,9 +2678,6 @@ pub(crate) async fn emit_degraded_agents_if_needed(
         })
         .collect();
 
-    // Edge-triggered: only log when the affected-agents set changes, so a
-    // persistent condition doesn't flood the log every sync tick.
-    const STALE_AGENTS_KV: &str = "metrics:orch.model_pool_stale_persistent.agents";
     let current_dim = heavily_cooled_agents.join(",");
     let prev_dim = kv_get_prefer_store(store, STALE_AGENTS_KV)
         .await
@@ -3083,7 +3097,6 @@ mod tests {
             let mut result = Vec::new();
             for (label, tasks) in &self.tasks {
                 let status = match label.as_str() {
-                    "status:new" => None,
                     "status:routed" => Some(Status::Routed),
                     "status:in_progress" => Some(Status::InProgress),
                     "status:needs_review" => Some(Status::NeedsReview),
@@ -3294,8 +3307,9 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn ingest_closes_duplicate_titles() {
-        crate::engine::cooldown::reset_global_state().await;
         use crate::store::{NewTask, TaskStore};
+
+        crate::engine::cooldown::reset_global_state().await;
 
         let backend = IngestMockBackend::with_tasks_and_dedup(
             vec![(Status::New, make_ext_task("2", "Duplicate issue"))],
@@ -3416,8 +3430,9 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn ingest_sync_to_project_called_only_for_new_tasks() {
-        crate::engine::cooldown::reset_global_state().await;
         use crate::store::{NewTask, TaskStore};
+
+        crate::engine::cooldown::reset_global_state().await;
 
         // Two tasks: "10" is pre-existing, "11" is new.
         let backend = IngestMockBackend::with_tasks(vec![
@@ -3456,7 +3471,6 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn ingest_handles_mixed_labeled_and_unlabeled_open_issues() {
-        crate::engine::cooldown::reset_global_state().await;
         // Simulate a backend where some issues have no status label (routable/unlabeled)
         // and others carry active status labels.  Both kinds must be ingested and the
         // store status must reflect the label where present.
@@ -3525,6 +3539,8 @@ mod tests {
                 Ok(None)
             }
         }
+
+        crate::engine::cooldown::reset_global_state().await;
 
         let backend: Arc<dyn ExternalBackend> = Arc::new(MixedBackend);
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
@@ -3734,8 +3750,9 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn dispatch_key_held_during_review_agent_execution() {
-        crate::engine::cooldown::reset_global_state().await;
         use tokio::sync::oneshot;
+
+        crate::engine::cooldown::reset_global_state().await;
 
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
 
@@ -3797,8 +3814,9 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn dispatch_guard_releases_key_on_panic() {
-        crate::engine::cooldown::reset_global_state().await;
         use crate::engine::dispatch_guard::DispatchGuard;
+
+        crate::engine::cooldown::reset_global_state().await;
 
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let key = "owner/repo/42".to_string();
@@ -3842,7 +3860,7 @@ mod tests {
             "owner/repo".to_string(),
         ));
         let dispatching = Arc::new(DashMap::new());
-        sync_tick(
+        Box::pin(sync_tick(
             &backend,
             &Arc::new(TmuxManager::new()),
             "owner/repo",
@@ -3855,7 +3873,7 @@ mod tests {
             &store,
             &dispatching,
             &Arc::new(DashSet::new()),
-        )
+        ))
         .await
         .unwrap();
         assert_eq!(
@@ -4458,7 +4476,7 @@ mod tests {
             .unwrap();
         // Don't backdate — task is fresh (just created)
 
-        sync_tick(
+        Box::pin(sync_tick(
             &backend,
             &tmux,
             "owner/repo",
@@ -4468,7 +4486,7 @@ mod tests {
             &store,
             &dispatching,
             &auto_merge_in_flight,
-        )
+        ))
         .await
         .unwrap();
 
@@ -5191,8 +5209,9 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn emit_degraded_agents_writes_metric_when_three_or_more_agents_degraded() {
-        crate::engine::cooldown::reset_global_state().await;
         use crate::engine::router::{Router, RouterConfig};
+
+        crate::engine::cooldown::reset_global_state().await;
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
@@ -5265,8 +5284,9 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn emit_degraded_agents_clears_alert_when_below_threshold() {
-        crate::engine::cooldown::reset_global_state().await;
         use crate::engine::router::{Router, RouterConfig};
+
+        crate::engine::cooldown::reset_global_state().await;
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
@@ -5321,9 +5341,10 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn emit_degraded_agents_sets_stale_pool_alert_for_persistent_model_failures() {
-        crate::engine::cooldown::reset_global_state().await;
         use crate::engine::cooldown::record_persistent_model_failure;
         use crate::engine::router::{Router, RouterConfig};
+
+        crate::engine::cooldown::reset_global_state().await;
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 

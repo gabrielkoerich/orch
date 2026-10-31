@@ -901,7 +901,7 @@ Thanks"#;
         let resp = parse(input).unwrap();
         assert_eq!(resp.delegations.len(), 1);
         assert_eq!(resp.delegations[0].title, "Subtask");
-        assert!(resp.delegations[0].labels.is_empty());
+        assert_eq!(resp.delegations[0].labels, Vec::<String>::new());
     }
 
     #[test]

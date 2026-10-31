@@ -113,6 +113,7 @@ pub fn parse_conversation_key(key: &str) -> Option<(&str, &str, Option<&str>)> {
 }
 
 /// The transport layer manages all session bindings and routes messages.
+#[derive(Debug)]
 pub struct Transport {
     /// Active session bindings, keyed by session_key(repo, task_id)
     bindings: Arc<RwLock<HashMap<String, SessionBinding>>>,
@@ -354,7 +355,7 @@ mod tests {
     fn split_chunks_multibyte_at_boundary_does_not_panic() {
         // 4-byte emoji at the chunk boundary: the old code set end = start + 1
         // and then sliced content[start..end], which panics on multi-byte chars.
-        let content = "x".repeat(97) + "😀"; // 101 bytes; with max=100 the cut is at byte 100 (mid-emoji)
+        let content = format!("{}😀", "x".repeat(97)); // 101 bytes; with max=100 the cut is at byte 100 (mid-emoji)
         let chunks = split_utf8(&content, 100);
         assert_eq!(chunks.join(""), content);
         for c in &chunks {

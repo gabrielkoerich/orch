@@ -14,7 +14,10 @@ use std::sync::Arc;
 use super::{agents, git_ops, response, worktree};
 
 /// Write a structured `result.json` to the attempt directory for debugging.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each field of result.json is a separate argument"
+)]
 pub async fn write_result_json(
     attempt_dir: &Path,
     task_id: &str,
@@ -80,6 +83,10 @@ pub async fn write_result_json(
 /// increments) and populating them here.  No I/O is performed inside the
 /// decision function itself, making it trivially unit-testable.
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent input to the status decision"
+)]
 struct DecisionInput<'a> {
     /// Agent-reported status (e.g. `"done"`, `"in_progress"`).
     agent_status: &'a str,
@@ -293,6 +300,10 @@ impl StoreCtx<'_> {
 
 /// Outcome of the auto-commit → push → PR pipeline.
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent outcome of the git pipeline"
+)]
 struct GitOpsResult {
     has_pr: bool,
     has_pushed: bool,
@@ -740,7 +751,7 @@ async fn create_pr_with_log(
                         ctx.store,
                         ctx.repo,
                         ctx.task_id,
-                        &[("pr_number", serde_json::json!(pr_num as i64))],
+                        &[("pr_number", serde_json::json!(pr_num))],
                     )
                     .await
                     {
@@ -1023,7 +1034,9 @@ fn superseded_conflict_pr(
     if has_commits || merge_conflict_retries <= 0 {
         return None;
     }
-    pr_number.filter(|n| *n > 0).map(|n| n as u64)
+    pr_number
+        .filter(|n| *n > 0)
+        .and_then(|n| u64::try_from(n).ok())
 }
 
 /// Read push-failure state from the store and increment `push_failures` if needed.
@@ -1069,7 +1082,8 @@ async fn detect_push_failure_state(
                 // On DB error, read current value to ensure blocking threshold is still reachable
                 ctx.get_task()
                     .await
-                    .map_or(1, |t| (t.push_failures.max(0) as u64) + 1) // assume at least 1 if we can't read either
+                    .map_or(1, |t| u64::try_from(t.push_failures).unwrap_or(0) + 1)
+                // assume at least 1 if we can't read either
             }
         }
     } else {
@@ -1113,7 +1127,8 @@ async fn detect_no_code_reroutes(
             // On DB error, read current value to ensure blocking threshold is still reachable
             ctx.get_task()
                 .await
-                .map_or(1, |t| (t.no_code_reroutes.max(0) as u64) + 1) // assume at least 1 if we can't read either
+                .map_or(1, |t| u64::try_from(t.no_code_reroutes).unwrap_or(0) + 1)
+            // assume at least 1 if we can't read either
         }
     }
 }
@@ -1210,7 +1225,10 @@ fn is_retryable_blocked_reason(reason: &str) -> bool {
 }
 
 /// Apply tracing and store writes that depend on the final status decision.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the decision and its context arrive as separate values"
+)]
 async fn apply_post_decision_effects(
     ctx: &StoreCtx<'_>,
     final_status: &str,
@@ -1315,7 +1333,7 @@ async fn apply_post_decision_effects(
             let prev_no_code_agent = ctx
                 .get_task()
                 .await
-                .map(|t| t.no_code_last_agent.clone())
+                .map(|t| t.no_code_last_agent)
                 .unwrap_or_default();
             let is_same_agent = !prev_no_code_agent.is_empty() && prev_no_code_agent == agent_name;
 
@@ -1407,7 +1425,10 @@ async fn store_token_usage(
 /// Returns `Ok((status, push_failed))` where `status` is the final task status
 /// string and `push_failed` is `true` when a push was attempted but failed (for
 /// audit trail classification).
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the runner passes each part of the run result"
+)]
 pub async fn handle_success(
     task_id: &str,
     parsed: agents::ParsedResponse,
@@ -1555,7 +1576,7 @@ pub async fn handle_success(
         let prev_no_code_agent = ctx
             .get_task()
             .await
-            .map(|t| t.no_code_last_agent.clone())
+            .map(|t| t.no_code_last_agent)
             .unwrap_or_default();
         !prev_no_code_agent.is_empty() && prev_no_code_agent == agent_name
     } else {

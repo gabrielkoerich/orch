@@ -53,7 +53,10 @@ pub struct TaskFilter {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
-#[expect(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "tasks are few and boxing would touch every match"
+)]
 pub enum Task {
     External(ExternalTask),
     Internal(store::Task),
@@ -84,6 +87,14 @@ pub struct TaskManager {
     event_tx: Option<tokio::sync::broadcast::Sender<crate::engine::events::TaskEvent>>,
 }
 
+impl std::fmt::Debug for TaskManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskManager")
+            .field("repo", &self.repo)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Clone for TaskManager {
     fn clone(&self) -> Self {
         Self {
@@ -96,7 +107,7 @@ impl Clone for TaskManager {
 }
 
 impl TaskManager {
-    #[expect(dead_code)] // Used in tests
+    #[cfg(test)]
     pub fn new(backend: Arc<dyn ExternalBackend>) -> Self {
         Self {
             backend,
@@ -104,18 +115,6 @@ impl TaskManager {
             repo: String::new(),
             event_tx: None,
         }
-    }
-
-    /// Get reference to the task store (if available).
-    #[expect(dead_code)]
-    pub fn store(&self) -> Option<&Arc<TaskStore>> {
-        self.store.as_ref()
-    }
-
-    /// Get reference to the repo identifier.
-    #[expect(dead_code)]
-    pub fn repo(&self) -> &str {
-        &self.repo
     }
 
     /// Create a TaskManager with the unified store for dual-write support.

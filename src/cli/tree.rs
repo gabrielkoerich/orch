@@ -58,12 +58,37 @@ impl TreeNode {
 /// Uses `parent:*` labels to determine hierarchy. Tasks without a parent label
 /// are roots. Tasks with a parent label that doesn't exist in the list are
 /// also treated as roots (orphaned children become top-level).
-pub fn build_forest(tasks: Vec<Task>) -> Vec<TreeNode> {
+pub fn build_forest(tasks: &[Task]) -> Vec<TreeNode> {
+    fn build_node(
+        id: &str,
+        nodes: &HashMap<String, TreeNode>,
+        children_map: &HashMap<String, Vec<String>>,
+    ) -> Option<TreeNode> {
+        let mut node = nodes.get(id)?.clone();
+
+        if let Some(children_ids) = children_map.get(id) {
+            for child_id in children_ids {
+                if let Some(child_node) = build_node(child_id, nodes, children_map) {
+                    node.children.push(child_node);
+                }
+            }
+        }
+
+        // Sort children by numeric ID for deterministic output
+        node.children.sort_by(|a, b| {
+            let a_num = a.id.parse::<i64>().unwrap_or(0);
+            let b_num = b.id.parse::<i64>().unwrap_or(0);
+            a_num.cmp(&b_num)
+        });
+
+        Some(node)
+    }
+
     let mut nodes: HashMap<String, TreeNode> = HashMap::new();
     let mut parent_map: HashMap<String, Option<String>> = HashMap::new();
 
     // First pass: create nodes and extract parent relationships
-    for task in &tasks {
+    for task in tasks {
         let (id, parent_id, node) = match task {
             Task::External(ext) => {
                 let parent = ext
@@ -118,31 +143,6 @@ pub fn build_forest(tasks: Vec<Task>) -> Vec<TreeNode> {
     }
 
     // Third pass: recursively build the tree
-    fn build_node(
-        id: &str,
-        nodes: &HashMap<String, TreeNode>,
-        children_map: &HashMap<String, Vec<String>>,
-    ) -> Option<TreeNode> {
-        let mut node = nodes.get(id)?.clone();
-
-        if let Some(children_ids) = children_map.get(id) {
-            for child_id in children_ids {
-                if let Some(child_node) = build_node(child_id, nodes, children_map) {
-                    node.children.push(child_node);
-                }
-            }
-        }
-
-        // Sort children by numeric ID for deterministic output
-        node.children.sort_by(|a, b| {
-            let a_num = a.id.parse::<i64>().unwrap_or(0);
-            let b_num = b.id.parse::<i64>().unwrap_or(0);
-            a_num.cmp(&b_num)
-        });
-
-        Some(node)
-    }
-
     let mut roots: Vec<TreeNode> = Vec::new();
     for root_id in root_ids {
         if let Some(tree) = build_node(&root_id, &nodes, &children_map) {
@@ -169,10 +169,13 @@ pub fn render_tree(root: &TreeNode) -> String {
 
 /// Render a tree node and its children recursively.
 fn render_node(node: &TreeNode, output: &mut String, prefix: &str, is_last: bool, is_root: bool) {
+    use std::fmt::Write as _;
+
     if is_root {
         // Root node format: #30 [blocked] Implement auth system
-        output.push_str(&format!(
-            "#{} [{}] {}{}\n",
+        let _ = writeln!(
+            output,
+            "#{} [{}] {}{}",
             node.id,
             node.status,
             node.agent
@@ -180,12 +183,13 @@ fn render_node(node: &TreeNode, output: &mut String, prefix: &str, is_last: bool
                 .map(|a| format!("({a}) "))
                 .unwrap_or_default(),
             node.title
-        ));
+        );
     } else {
         // Child node format with tree branches
         let branch = if is_last { "└── " } else { "├── " };
-        output.push_str(&format!(
-            "{}{}#{} [{}] {}{}\n",
+        let _ = writeln!(
+            output,
+            "{}{}#{} [{}] {}{}",
             prefix,
             branch,
             node.id,
@@ -195,7 +199,7 @@ fn render_node(node: &TreeNode, output: &mut String, prefix: &str, is_last: bool
                 .map(|a| format!("({a}) "))
                 .unwrap_or_default(),
             node.title
-        ));
+        );
     }
 
     // Render children
@@ -249,7 +253,7 @@ mod tests {
     use super::*;
     use crate::backends::{ExternalId, ExternalTask};
 
-    fn create_test_task(id: &str, title: &str, _state: &str, labels: Vec<&str>) -> Task {
+    fn create_test_task(id: &str, title: &str, _state: &str, labels: &[&str]) -> Task {
         Task::External(ExternalTask {
             id: ExternalId(id.to_string()),
             title: title.to_string(),
@@ -268,7 +272,7 @@ mod tests {
 
     #[test]
     fn test_build_forest_empty() {
-        let forest = build_forest(vec![]);
+        let forest = build_forest(&[]);
         assert!(forest.is_empty());
     }
 
@@ -278,10 +282,10 @@ mod tests {
             "30",
             "Implement auth",
             "open",
-            vec!["status:blocked", "agent:claude"],
+            &["status:blocked", "agent:claude"],
         )];
 
-        let forest = build_forest(tasks);
+        let forest = build_forest(&tasks);
         assert_eq!(forest.len(), 1);
         assert_eq!(forest[0].id, "30");
         assert_eq!(forest[0].status, "blocked");
@@ -296,23 +300,23 @@ mod tests {
                 "30",
                 "Implement auth",
                 "open",
-                vec!["status:blocked", "agent:claude"],
+                &["status:blocked", "agent:claude"],
             ),
             create_test_task(
                 "31",
                 "Add user model",
                 "open",
-                vec!["status:done", "parent:30"],
+                &["status:done", "parent:30"],
             ),
             create_test_task(
                 "32",
                 "Add login API",
                 "open",
-                vec!["status:in_progress", "parent:30"],
+                &["status:in_progress", "parent:30"],
             ),
         ];
 
-        let forest = build_forest(tasks);
+        let forest = build_forest(&tasks);
         assert_eq!(forest.len(), 1);
         assert_eq!(forest[0].id, "30");
         assert_eq!(forest[0].children.len(), 2);
@@ -325,11 +329,11 @@ mod tests {
     #[test]
     fn test_build_forest_multiple_roots() {
         let tasks = vec![
-            create_test_task("35", "Refactor DB", "open", vec!["status:in_progress"]),
-            create_test_task("30", "Implement auth", "open", vec!["status:blocked"]),
+            create_test_task("35", "Refactor DB", "open", &["status:in_progress"]),
+            create_test_task("30", "Implement auth", "open", &["status:blocked"]),
         ];
 
-        let forest = build_forest(tasks);
+        let forest = build_forest(&tasks);
         assert_eq!(forest.len(), 2);
         // Should be sorted by ID: 30, 35
         assert_eq!(forest[0].id, "30");
@@ -388,10 +392,10 @@ mod tests {
             "31",
             "Orphan task",
             "open",
-            vec!["status:new", "parent:99"],
+            &["status:new", "parent:99"],
         )];
 
-        let forest = build_forest(tasks);
+        let forest = build_forest(&tasks);
         assert_eq!(forest.len(), 1);
         assert_eq!(forest[0].id, "31");
         assert!(forest[0].children.is_empty());

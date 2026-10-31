@@ -38,15 +38,12 @@ mod pricing;
 pub(crate) mod replica;
 pub(crate) mod tasks;
 
-#[expect(unused_imports)]
 pub use control::{parse_since_duration, ChatCostSummary, ControlMessage, MemoryEntry};
-#[expect(unused_imports)]
 pub use dependencies::{
     blocker_failure_kind, blocker_is_satisfied, blocker_snapshot_key, dep_label,
     worktree_refresh_key, BlockerSnapshot, DepSource, NewDependency, ObservedPullRequest,
     TaskDependency, WaitingOnDependency,
 };
-#[expect(unused_imports)]
 pub use helpers::{
     get_cost_estimate, get_cost_estimate_result, get_recent_memory, get_recent_memory_result,
     get_task_field, get_task_field_direct, get_token_usage, get_token_usage_result,
@@ -55,14 +52,11 @@ pub use helpers::{
     store_set, store_set_by_id, store_set_result, store_set_result_by_id, store_touch_updated_at,
     StoreResult,
 };
-#[expect(unused_imports)]
 pub use jobs::JobState;
-#[expect(unused_imports)]
 pub use metrics::{
     AgentStat, CostByGroup, CostPeriod, CostSummary, ErrorStat, HighReviewCycleTask,
     InsertTaskMetric, MetricsSummary, SlowTaskInfo,
 };
-#[expect(unused_imports)]
 pub use pricing::{pricing_for_model, CostEstimate, ModelPricing, TokenUsage};
 pub use tasks::{
     parse_cli_task_spec, CliTaskRef, CliTaskSpec, CompleteRun, NewTask, RunTokenUsage, StartRun,
@@ -82,6 +76,12 @@ pub struct TaskStore {
     raft: Arc<OnceLock<crate::cluster::Node>>,
     /// Set on the CLI when a daemon runs, so its writes go through the daemon's log
     daemon: Arc<OnceLock<crate::cluster::local::Endpoint>>,
+}
+
+impl std::fmt::Debug for TaskStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskStore").finish_non_exhaustive()
+    }
 }
 
 impl TaskStore {
@@ -112,7 +112,6 @@ impl TaskStore {
     }
 
     /// Open a store with a single connection.
-    #[expect(dead_code)]
     ///
     /// Uses `max_connections(1)` to avoid WAL visibility issues where a write
     /// on one pooled connection isn't visible to a read on another. Used by
@@ -278,7 +277,6 @@ impl TaskStore {
     }
 
     /// Get a reference to the underlying pool (for advanced queries).
-    #[expect(dead_code)]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }

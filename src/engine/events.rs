@@ -90,6 +90,7 @@ pub struct TaskEvent {
 }
 
 /// The event bus — wraps a tokio broadcast channel.
+#[derive(Debug)]
 pub struct EventBus {
     tx: broadcast::Sender<TaskEvent>,
 }
@@ -111,7 +112,7 @@ impl EventBus {
     }
 
     /// Publish an event. Returns number of receivers that got it.
-    #[cfg_attr(not(test), expect(dead_code))]
+    #[cfg(test)]
     pub fn publish(&self, event: TaskEvent) -> usize {
         self.tx.send(event).unwrap_or(0)
     }
@@ -126,7 +127,7 @@ impl EventBus {
         let listener = TcpListener::from_std(listener)?;
 
         // Write port file without blocking the runtime thread.
-        let port_path = ws_port_path().await?;
+        let port_path = ws_port_path()?;
         if let Some(parent) = port_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -151,7 +152,10 @@ impl EventBus {
                         let mut rx = tx.subscribe();
                         tokio::spawn(async move {
                             let mut filter = EventFilter::default();
-                            #[expect(clippy::result_large_err)]
+                            #[expect(
+                                clippy::result_large_err,
+                                reason = "the tungstenite callback type fixes the error type"
+                            )]
                             let callback = |req: &Request, resp| {
                                 filter = EventFilter::from_request(req);
                                 tracing::debug!(?filter, "ws client connected with filter");
@@ -231,7 +235,7 @@ pub fn select_available_listener() -> anyhow::Result<(std::net::TcpListener, u16
         .bytes()
         .fold(0u32, |acc, b| acc.wrapping_add(u32::from(b)));
     let range = 65535u32 - 49152;
-    let start = 49152u16 + (hash % range) as u16;
+    let start = 49152u16 + u16::try_from(hash % range).unwrap_or(0);
 
     for offset in 0..1000u16 {
         let port = start.wrapping_add(offset);
@@ -247,7 +251,7 @@ pub fn select_available_listener() -> anyhow::Result<(std::net::TcpListener, u16
 
 /// Remove the ws.port file on shutdown.
 pub async fn cleanup_port_file() {
-    if let Ok(path) = ws_port_path().await {
+    if let Ok(path) = ws_port_path() {
         let _ = tokio::fs::remove_file(path).await;
     }
 }
@@ -265,7 +269,7 @@ pub fn cleanup_version_file() {
     }
 }
 
-async fn ws_port_path() -> anyhow::Result<std::path::PathBuf> {
+fn ws_port_path() -> anyhow::Result<std::path::PathBuf> {
     if cfg!(test) {
         Ok(std::env::temp_dir().join("orch-test-state").join("ws.port"))
     } else {
@@ -345,7 +349,7 @@ mod tests {
             summary: None,
             duration_seconds: None,
         };
-        bus.publish(event.clone());
+        bus.publish(event);
         let received = rx.try_recv().unwrap();
         assert_eq!(received.task_id, "1");
         assert_eq!(received.new_status, "routed");
