@@ -582,6 +582,113 @@ mod tests {
         assert!(expand_alias("@yearly 13-1").is_err());
     }
 
+    fn alias_err(s: &str) -> String {
+        expand_alias(s).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn expand_alias_error_messages_are_stable() {
+        assert_eq!(
+            alias_err("@hourly abc"),
+            "invalid minute in @hourly alias: 'abc'"
+        );
+        assert_eq!(
+            alias_err("@hourly 60"),
+            "minute out of range in @hourly alias: 60 (must be 0-59)"
+        );
+        assert_eq!(
+            alias_err("@daily abc"),
+            "invalid hour in @daily alias: 'abc'"
+        );
+        assert_eq!(
+            alias_err("@daily x:30"),
+            "invalid hour in @daily alias: 'x'"
+        );
+        assert_eq!(
+            alias_err("@daily 9:y"),
+            "invalid minute in @daily alias: 'y'"
+        );
+        assert_eq!(
+            alias_err("@daily 24"),
+            "hour out of range in @daily alias: 24 (must be 0-23)"
+        );
+        assert_eq!(
+            alias_err("@daily 24:5"),
+            "hour out of range in @daily alias: 24 (must be 0-23)"
+        );
+        assert_eq!(
+            alias_err("@daily 9:60"),
+            "minute out of range in @daily alias: 60 (must be 0-59)"
+        );
+        assert_eq!(
+            alias_err("@weekly foo"),
+            "invalid day-of-week in @weekly alias: 'foo'"
+        );
+        assert_eq!(
+            alias_err("@weekly 8"),
+            "day-of-week out of range in @weekly alias: 8 (must be 0-7)"
+        );
+        assert_eq!(
+            alias_err("@monthly bar"),
+            "invalid day-of-month in @monthly alias: 'bar'"
+        );
+        assert_eq!(
+            alias_err("@monthly 0"),
+            "day-of-month out of range in @monthly alias: 0 (must be 1-31)"
+        );
+        assert_eq!(
+            alias_err("@monthly 32"),
+            "day-of-month out of range in @monthly alias: 32 (must be 1-31)"
+        );
+        assert_eq!(
+            alias_err("@yearly x-15"),
+            "invalid month in @yearly alias: 'x'"
+        );
+        assert_eq!(
+            alias_err("@yearly 3-y"),
+            "invalid day-of-month in @yearly alias: 'y'"
+        );
+        assert_eq!(
+            alias_err("@yearly 13-1"),
+            "month out of range in @yearly alias: 13 (must be 1-12)"
+        );
+        assert_eq!(
+            alias_err("@yearly 0-1"),
+            "month out of range in @yearly alias: 0 (must be 1-12)"
+        );
+        assert_eq!(
+            alias_err("@yearly 3-32"),
+            "day-of-month out of range in @yearly alias: 32 (must be 1-31)"
+        );
+        assert_eq!(
+            alias_err("@yearly 3"),
+            "invalid @yearly alias parameter: '3' (expected month-day, e.g. '3-15')"
+        );
+    }
+
+    #[test]
+    fn expand_alias_error_order_parses_before_range_checks() {
+        // Both fields are parsed before either range check runs
+        assert_eq!(
+            alias_err("@yearly 13-x"),
+            "invalid day-of-month in @yearly alias: 'x'"
+        );
+        assert_eq!(
+            alias_err("@daily 24:x"),
+            "invalid minute in @daily alias: 'x'"
+        );
+    }
+
+    #[test]
+    fn expand_alias_accepts_range_bounds() {
+        assert_eq!(expand_alias("@hourly 59").unwrap(), "59 * * * *");
+        assert_eq!(expand_alias("@daily 23:59").unwrap(), "59 23 * * *");
+        assert_eq!(expand_alias("@weekly 7").unwrap(), "0 0 * * 7");
+        assert_eq!(expand_alias("@monthly 31").unwrap(), "0 0 31 * *");
+        assert_eq!(expand_alias("@yearly 12-31").unwrap(), "0 0 31 12 *");
+        assert_eq!(expand_alias("@yearly 1-1").unwrap(), "0 0 1 1 *");
+    }
+
     #[test]
     fn expand_alias_daily_abc_errors_via_check() {
         // Regression: @daily abc used to silently expand to "0 0 * * *"
