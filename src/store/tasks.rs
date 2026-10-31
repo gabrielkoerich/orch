@@ -1832,7 +1832,8 @@ impl TaskStore {
             exit_code = ?, stdout = ?, stderr = ?, parsed_response = ?,
             outcome = ?, error = NULLIF(?, ''),
             input_tokens = ?, output_tokens = ?, total_cost_usd = ?,
-            duration_secs = ?,
+            duration_secs = CASE WHEN ? > 0 THEN ?
+                ELSE MAX(0, (julianday('now') - julianday(started_at)) * 86400.0) END,
             completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          WHERE id = ?",
         )
@@ -1857,6 +1858,7 @@ impl TaskStore {
             i64::MAX
         }))
         .bind(run.tokens.total_cost_usd)
+        .bind(run.tokens.duration_secs)
         .bind(run.tokens.duration_secs)
         .bind(run.run_id)
         .execute(&self.pool)

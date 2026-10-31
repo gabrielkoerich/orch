@@ -2862,6 +2862,61 @@ async fn complete_run_records_all_fields() {
 }
 
 #[tokio::test]
+async fn complete_run_derives_duration_from_started_at_when_unreported() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let task_id = store
+        .create(&NewTask {
+            repo: "owner/repo".to_string(),
+            origin: "internal".to_string(),
+            title: "Test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let run_id = store
+        .start_run(&StartRun {
+            task_id,
+            attempt: 1,
+            run_type: "review",
+            agent: "claude",
+            model: "sonnet",
+            command: "",
+            prompt: "",
+        })
+        .await
+        .unwrap();
+
+    sqlx::query("UPDATE task_runs SET started_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-120 seconds') WHERE id = ?")
+        .bind(run_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+    store
+        .complete_run(&CompleteRun {
+            run_id,
+            exit_code: Some(0),
+            stdout: "",
+            stderr: "",
+            parsed: "",
+            outcome: "timeout",
+            error: "",
+            tokens: RunTokenUsage::default(),
+        })
+        .await
+        .unwrap();
+
+    let run = store
+        .get_last_run(task_id, "review")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(run.duration_secs >= 119.0, "got {}", run.duration_secs);
+}
+
+#[tokio::test]
 async fn get_last_run_filters_by_run_type() {
     let store = TaskStore::open_memory().await.unwrap();
 
