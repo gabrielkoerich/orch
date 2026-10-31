@@ -52,7 +52,7 @@ pub(crate) async fn increment(
         "kv_increment returned unexpected value {}",
         row.0
     );
-    Ok(row.0 as u64)
+    Ok(u64::try_from(row.0).unwrap_or(0))
 }
 
 /// Whoever lands first wins, and every caller reads back the stored winner

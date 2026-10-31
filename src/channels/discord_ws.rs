@@ -55,6 +55,16 @@ pub struct DiscordGateway {
     shard_count: u64,
 }
 
+impl std::fmt::Debug for DiscordGateway {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscordGateway")
+            .field("channel_id", &self.channel_id)
+            .field("shard_id", &self.shard_id)
+            .field("shard_count", &self.shard_count)
+            .finish_non_exhaustive()
+    }
+}
+
 impl DiscordGateway {
     /// Create a new Gateway client.
     ///
@@ -80,14 +90,13 @@ impl DiscordGateway {
         })
     }
 
-    fn api_url(&self, endpoint: &str) -> String {
+    fn api_url(endpoint: &str) -> String {
         format!("https://discord.com/api/v10{endpoint}")
     }
 
     /// Send a message with action row buttons to a specific channel.
     ///
     /// Returns the message ID of the sent message.
-    #[expect(dead_code)]
     pub async fn send_with_buttons(
         &self,
         channel_id: &str,
@@ -111,7 +120,7 @@ impl DiscordGateway {
             "components": components
         });
 
-        let url = self.api_url(&format!("/channels/{channel_id}/messages"));
+        let url = Self::api_url(&format!("/channels/{channel_id}/messages"));
         let response = self
             .client
             .post(&url)
@@ -130,7 +139,7 @@ impl DiscordGateway {
     }
 
     async fn send_message(&self, channel_id: &str, content: &str) -> anyhow::Result<()> {
-        let url = self.api_url(&format!("/channels/{channel_id}/messages"));
+        let url = Self::api_url(&format!("/channels/{channel_id}/messages"));
         let resp = self
             .client
             .post(&url)
@@ -205,7 +214,7 @@ impl Channel for DiscordGateway {
     async fn health_check(&self) -> anyhow::Result<()> {
         let resp = self
             .client
-            .get(self.api_url("/users/@me"))
+            .get(Self::api_url("/users/@me"))
             .header("Authorization", format!("Bot {}", self.token))
             .send()
             .await?;
@@ -533,8 +542,7 @@ where
     loop {
         match read.next().await {
             Some(Ok(Message::Text(t))) => return Ok(t),
-            Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             Some(Err(e)) => return Err(e.into()),
             None => anyhow::bail!("stream closed before receiving expected message"),
         }

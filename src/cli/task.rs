@@ -105,14 +105,14 @@ fn format_run_text(text: &str, verbose: bool, max: usize) -> String {
 
 /// Store-first status update for CLI: updates SQLite first, then mirrors to backend.
 async fn update_status_store_first(
-    store: &Option<Arc<TaskStore>>,
+    store: Option<&Arc<TaskStore>>,
     backend: &Arc<dyn ExternalBackend>,
     repo: &str,
     id: &ExternalId,
     status: Status,
 ) -> anyhow::Result<()> {
     let db_status = status_to_task_status(status);
-    if let Some(ref s) = store {
+    if let Some(s) = store {
         if let Ok(Some(store_id)) = s.resolve_task_id(repo, &id.0).await {
             s.update_status(store_id, db_status).await?;
         }
@@ -250,7 +250,7 @@ pub async fn list(
                     .unwrap_or("")
                     .to_string();
                 let age = format_age(&ext.updated_at);
-                let project = store_task.map(|t| t.repo.as_str()).unwrap_or(&repo);
+                let project = store_task.map_or(repo.as_str(), |t| t.repo.as_str());
                 let tries = store_task
                     .map(|t| {
                         if t.attempts > 0 {
@@ -262,8 +262,7 @@ pub async fn list(
                     .unwrap_or_default();
                 let blockers = store_task
                     .and_then(|row| waiting_on.get(&row.id))
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
+                    .map_or(&[][..], Vec::as_slice);
                 let title = waiting_title(&ext.title, &status, blockers);
                 println!(
                     "{:<15} {:<12} {:<20} {:<24} {:<10} {:<6} {:<5} {}",
@@ -279,7 +278,7 @@ pub async fn list(
                 } else {
                     "-".to_string()
                 };
-                let blockers = waiting_on.get(&int.id).map(Vec::as_slice).unwrap_or(&[]);
+                let blockers = waiting_on.get(&int.id).map_or(&[][..], Vec::as_slice);
                 let title = if int.status == crate::store::TaskStatus::Blocked {
                     if let Some(ref reason) = int.block_reason {
                         format!("{} [blocked: {}]", int.title, reason)
@@ -377,7 +376,7 @@ async fn list_from_global_store(
         } else {
             "-".to_string()
         };
-        let blockers = waiting_on.get(&task.id).map(Vec::as_slice).unwrap_or(&[]);
+        let blockers = waiting_on.get(&task.id).map_or(&[][..], Vec::as_slice);
         let title = if task.status == crate::store::TaskStatus::Blocked {
             if let Some(ref reason) = task.block_reason {
                 format!("{} [blocked: {}]", task.title, reason)
@@ -704,15 +703,15 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
 
     if let Some(ref s) = store {
         if let Ok((input, output, cost)) = s.cost_summary(&repo).await {
-            total_input_tokens = input as u64;
-            total_output_tokens = output as u64;
+            total_input_tokens = u64::try_from(input).unwrap_or(0);
+            total_output_tokens = u64::try_from(output).unwrap_or(0);
             total_cost = cost;
         }
     } else {
         // No store available: sum up internal task costs directly from already-loaded data.
         for task in &all_internal {
-            total_input_tokens += task.input_tokens as u64;
-            total_output_tokens += task.output_tokens as u64;
+            total_input_tokens += u64::try_from(task.input_tokens).unwrap_or(0);
+            total_output_tokens += u64::try_from(task.output_tokens).unwrap_or(0);
             total_cost += task.total_cost_usd;
         }
     }
@@ -856,7 +855,7 @@ pub async fn route(id: &str) -> anyhow::Result<()> {
             format!("complexity:{}", result.complexity),
         ];
         backend.set_labels(&ext_id, &labels).await?;
-        update_status_store_first(&Some(store), &backend, &repo, &ext_id, Status::Routed).await?;
+        update_status_store_first(Some(&store), &backend, &repo, &ext_id, Status::Routed).await?;
     } else if let Some(store_id) = resolved.store_id {
         store.update_status(store_id, TaskStatus::Routed).await?;
     }
@@ -923,14 +922,8 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
     let ext_id = ExternalId(task_id.clone());
     let started_at = Utc::now();
     if let Some(ref backend) = backend {
-        update_status_store_first(
-            &Some(std::sync::Arc::clone(&store)),
-            backend,
-            &repo,
-            &ext_id,
-            Status::InProgress,
-        )
-        .await?;
+        update_status_store_first(Some(&store), backend, &repo, &ext_id, Status::InProgress)
+            .await?;
     } else if let Some(store_id) = store.resolve_task_id(&repo, &task_id).await? {
         store
             .update_status(store_id, TaskStatus::InProgress)
@@ -1013,13 +1006,13 @@ pub async fn retry(id: &str, agent: Option<String>, model: Option<String>) -> an
             s.set_fields(store_id, &fields).await?;
         }
 
-        update_status_store_first(&store, &backend, &repo, &ext_id, Status::Routed).await?;
+        update_status_store_first(store.as_ref(), &backend, &repo, &ext_id, Status::Routed).await?;
         let model_hint = model.as_deref().unwrap_or("(router default)");
         println!(
             "Task {shown} force-routed to {forced_agent}:{model_hint} (set to routed, dispatches on next tick)"
         );
     } else {
-        update_status_store_first(&store, &backend, &repo, &ext_id, Status::New).await?;
+        update_status_store_first(store.as_ref(), &backend, &repo, &ext_id, Status::New).await?;
         println!("Task {shown} reset to new (attempts reset, will be re-routed)");
     }
 
@@ -1078,7 +1071,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
                         }
                     }
                 }
-                update_status_store_first(&store, &backend, &repo, &id, Status::New).await
+                update_status_store_first(store.as_ref(), &backend, &repo, &id, Status::New).await
             }
         });
         for result in join_all(ext_futs).await {
@@ -1160,7 +1153,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
             return Ok(());
         }
     }
-    update_status_store_first(&store, &backend, &repo, &ext_id, Status::New).await?;
+    update_status_store_first(store.as_ref(), &backend, &repo, &ext_id, Status::New).await?;
     println!("Unblocked {shown} (attempts reset)");
 
     Ok(())
@@ -1174,7 +1167,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
 async fn cleanup_sessions_and_worktree(
     task_id: &str,
     repo: &str,
-    store: &Option<Arc<crate::store::TaskStore>>,
+    store: Option<&Arc<crate::store::TaskStore>>,
 ) {
     let tmux = TmuxManager::new();
 
@@ -1211,7 +1204,7 @@ async fn cleanup_sessions_and_worktree(
     }
 
     // Remove the worktree (sessions are already gone so the tmux guard won't block).
-    if let Some(ref s) = store {
+    if let Some(s) = store {
         match crate::engine::cleanup::cleanup_task_worktree(task_id, repo, s).await {
             Ok(()) => {}
             Err(e) => {
@@ -1239,7 +1232,7 @@ pub async fn close(id: &str, note: Option<&str>) -> anyhow::Result<()> {
             .context("internal task missing store id")?;
         s.update_status(store_id, TaskStatus::Done).await?;
         println!("Closed {shown} (marked done)");
-        cleanup_sessions_and_worktree(&resolved.external_id, &repo, &store).await;
+        cleanup_sessions_and_worktree(&resolved.external_id, &repo, store.as_ref()).await;
         return Ok(());
     }
 
@@ -1250,9 +1243,9 @@ pub async fn close(id: &str, note: Option<&str>) -> anyhow::Result<()> {
         backend.post_comment(&ext_id, text).await?;
     }
 
-    update_status_store_first(&store, &backend, &repo, &ext_id, Status::Done).await?;
+    update_status_store_first(store.as_ref(), &backend, &repo, &ext_id, Status::Done).await?;
     println!("Closed {shown} (marked done)");
-    cleanup_sessions_and_worktree(&resolved.external_id, &repo, &store).await;
+    cleanup_sessions_and_worktree(&resolved.external_id, &repo, store.as_ref()).await;
     Ok(())
 }
 
@@ -1347,23 +1340,17 @@ pub async fn cost(id: &str) -> anyhow::Result<()> {
 
 /// Show task tree view (parent-child relationships).
 pub async fn tree(id: Option<i64>, deps: bool) -> anyhow::Result<()> {
+    use crate::cli::tree::{build_forest, render_forest, render_single_tree};
+    use crate::engine::tasks::TaskFilter;
+
     if deps {
         return dependency_tree(id).await;
     }
-    use crate::cli::tree::{build_forest, render_forest, render_single_tree};
-    use crate::engine::tasks::TaskFilter;
 
     let task_manager = init_task_manager().await?;
 
     // If a specific task ID is provided, show just that tree
     if let Some(task_id) = id {
-        let task = task_manager.get_task(task_id).await?;
-
-        // For a single task, we need to find its children
-        // First get all tasks to build the full hierarchy
-        let all_tasks = task_manager.list_tasks(TaskFilter::default()).await?;
-        let forest = build_forest(&all_tasks);
-
         // Find the requested task in the forest
         fn find_node_in_forest<'a>(
             forest: &'a [crate::cli::tree::TreeNode],
@@ -1379,6 +1366,13 @@ pub async fn tree(id: Option<i64>, deps: bool) -> anyhow::Result<()> {
             }
             None
         }
+
+        let task = task_manager.get_task(task_id).await?;
+
+        // For a single task, we need to find its children
+        // First get all tasks to build the full hierarchy
+        let all_tasks = task_manager.list_tasks(TaskFilter::default()).await?;
+        let forest = build_forest(&all_tasks);
 
         let target_id = task_id.to_string();
         if let Some(node) = find_node_in_forest(&forest, &target_id) {
@@ -1625,9 +1619,9 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
     }
 
     // Show agent output from last attempt if available
-    let attempt_n: u32 = store::opt_store_get_task(&store, &repo, &task_key)
+    let attempt_n = store::opt_store_get_task(&store, &repo, &task_key)
         .await
-        .map_or(0, |t| t.attempts) as u32;
+        .map_or(0, |t| u32::try_from(t.attempts).unwrap_or(0));
     if attempt_n > 0 {
         match home::task_attempt_dir(&repo, &task_key, attempt_n) {
             Ok(attempt_dir) => {

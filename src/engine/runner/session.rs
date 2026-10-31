@@ -10,6 +10,7 @@ use tokio::time::{timeout, Duration};
 use super::{agent, response};
 
 /// Raw output collected from an agent session.
+#[derive(Debug)]
 pub struct SessionOutput {
     pub exit_code: i32,
     pub raw_stdout: String,

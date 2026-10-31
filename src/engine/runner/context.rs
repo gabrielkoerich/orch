@@ -19,7 +19,7 @@ use std::sync::Arc;
 use tokio::process::Command;
 
 /// All assembled context for a task execution.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct TaskContext {
     /// Task-specific context from previous runs
     pub task_context: String,
@@ -56,6 +56,8 @@ pub async fn build_parent_context(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
 ) -> String {
+    use std::fmt::Write as _;
+
     // Check if task has a parent via store
     let parent_id = match store::opt_store_get_task(store, repo, &task.id.0)
         .await
@@ -72,10 +74,11 @@ pub async fn build_parent_context(
         return String::new();
     };
 
-    ctx.push_str(&format!(
-        "## Parent Task #{}\n\n**Title**: {}\n\n{}\n\n",
+    let _ = writeln!(
+        ctx,
+        "## Parent Task #{}\n\n**Title**: {}\n\n{}\n",
         parent.id.0, parent.title, parent.body
-    ));
+    );
 
     // Get sibling tasks — fetch remote task objects and store summaries in parallel
     if let Ok(siblings) = backend.get_sub_issues(&ExternalId(parent_id)).await {
@@ -102,13 +105,13 @@ pub async fn build_parent_context(
                         .iter()
                         .find(|l| l.starts_with("status:"))
                         .map_or_else(|| "unknown".to_string(), |s| s.replace("status:", ""));
-                    ctx.push_str(&format!("- #{} [{}]: {}\n", sib.id.0, status, sib.title));
+                    let _ = writeln!(ctx, "- #{} [{}]: {}", sib.id.0, status, sib.title);
 
                     // Include summary if available from the store result at same index
                     if let Some(Some(task_rec)) = store_results.get(i) {
                         let summary = &task_rec.summary;
                         if !summary.is_empty() {
-                            ctx.push_str(&format!("  Summary: {summary}\n"));
+                            let _ = writeln!(ctx, "  Summary: {summary}");
                         }
                     }
                 }
@@ -123,6 +126,8 @@ pub async fn build_parent_context(
 
 /// Build project instructions from CLAUDE.md, AGENTS.md, README.md.
 pub async fn build_project_instructions(project_dir: &Path) -> String {
+    use std::fmt::Write as _;
+
     let mut instructions = String::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -139,7 +144,7 @@ pub async fn build_project_instructions(project_dir: &Path) -> String {
 
         if let Ok(content) = tokio::fs::read_to_string(&path).await {
             if !content.is_empty() {
-                instructions.push_str(&format!("## {filename}\n\n{content}\n\n"));
+                let _ = writeln!(instructions, "## {filename}\n\n{content}\n");
             }
         }
     }
@@ -149,6 +154,8 @@ pub async fn build_project_instructions(project_dir: &Path) -> String {
 
 /// Build skills documentation for selected skills.
 pub async fn build_skills_docs(selected_skills: &[String]) -> String {
+    use std::fmt::Write as _;
+
     if selected_skills.is_empty() {
         return String::new();
     }
@@ -166,7 +173,7 @@ pub async fn build_skills_docs(selected_skills: &[String]) -> String {
         for dir in &skills_dirs {
             let skill_file = dir.join(skill).join("SKILL.md");
             if let Ok(content) = tokio::fs::read_to_string(&skill_file).await {
-                docs.push_str(&format!("## Skill: {skill}\n\n{content}\n\n"));
+                let _ = writeln!(docs, "## Skill: {skill}\n\n{content}\n");
                 break;
             }
         }
@@ -283,6 +290,8 @@ pub async fn fetch_issue_comments(
     task_id: &str,
     limit: usize,
 ) -> String {
+    use std::fmt::Write as _;
+
     let id = crate::backends::ExternalId(task_id.to_string());
     let all_comments = match backend.list_issue_comments(&id).await {
         Ok(c) => c,
@@ -301,10 +310,11 @@ pub async fn fetch_issue_comments(
     let start = human_comments.len().saturating_sub(limit);
     let mut formatted = String::new();
     for comment in &human_comments[start..] {
-        formatted.push_str(&format!(
-            "**@{}** ({}):\n{}\n\n",
+        let _ = writeln!(
+            formatted,
+            "**@{}** ({}):\n{}\n",
             comment.author, comment.created_at, comment.body
-        ));
+        );
     }
 
     formatted
@@ -317,6 +327,8 @@ pub async fn build_memory_context(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
 ) -> (String, Vec<crate::store::MemoryEntry>) {
+    use std::fmt::Write as _;
+
     const MAX_MEMORY_ENTRIES: usize = 3;
 
     let memory = match store::get_recent_memory_result(store, repo, task_id, MAX_MEMORY_ENTRIES)
@@ -339,36 +351,38 @@ pub async fn build_memory_context(
     context.push_str("Learnings from previous task attempts:\n\n");
 
     for entry in &memory {
-        context.push_str(&format!(
+        let _ = write!(
+            context,
             "### Attempt #{} (Agent: {})",
             entry.attempt, entry.agent
-        ));
+        );
 
         if let Some(ref model) = entry.model {
-            context.push_str(&format!(", Model: {model}"));
+            let _ = write!(context, ", Model: {model}");
         }
         context.push('\n');
 
         if !entry.approach.is_empty() {
-            context.push_str(&format!("**Approach**: {}\n", entry.approach));
+            let _ = writeln!(context, "**Approach**: {}", entry.approach);
         }
 
         if !entry.learnings.is_empty() {
             context.push_str("**Key Learnings**:\n");
             for learning in &entry.learnings {
-                context.push_str(&format!("- {learning}\n"));
+                let _ = writeln!(context, "- {learning}");
             }
         }
 
         if let Some(ref error) = entry.error {
-            context.push_str(&format!("**Error**: {error}\n"));
+            let _ = writeln!(context, "**Error**: {error}");
         }
 
         if !entry.files_modified.is_empty() {
-            context.push_str(&format!(
-                "**Files Modified**: {}\n",
+            let _ = writeln!(
+                context,
+                "**Files Modified**: {}",
                 entry.files_modified.join(", ")
-            ));
+            );
         }
 
         context.push('\n');
@@ -390,7 +404,10 @@ pub async fn load_pr_review_context(
 }
 
 /// Build the full task context.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is a separate context source"
+)]
 pub async fn build_full_context(
     task: &ExternalTask,
     backend: Option<&dyn ExternalBackend>,

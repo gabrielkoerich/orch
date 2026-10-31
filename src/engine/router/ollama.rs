@@ -129,8 +129,7 @@ impl OllamaRouter {
         );
 
         // Use the same parsing logic as LlmRouter for compatibility
-        let llm_router = super::llm::LlmRouter::new();
-        let llm_response = llm_router.parse_llm_response("ollama", llm_text)?;
+        let llm_response = super::llm::LlmRouter::parse_llm_response("ollama", llm_text)?;
 
         // Validate executor against configured agents
         let mut agent = llm_response.executor.to_lowercase();

@@ -33,7 +33,7 @@ fn blocker_refresh_ttl_secs(repo: &str, number: i64) -> i64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     repo.hash(&mut hasher);
     number.hash(&mut hasher);
-    let offset = (hasher.finish() % BLOCKER_REFRESH_SPREAD_SECS as u64) as i64;
+    let offset = i64::try_from(hasher.finish() % BLOCKER_REFRESH_SPREAD_SECS as u64).unwrap_or(0);
     BLOCKER_REFRESH_TTL_SECS + offset
 }
 

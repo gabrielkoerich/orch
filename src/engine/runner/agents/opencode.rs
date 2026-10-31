@@ -105,6 +105,7 @@ fn update_discovered_models_cache(
 }
 
 /// Runner for OpenCode agent.
+#[derive(Debug)]
 pub struct OpenCodeRunner;
 
 pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String> {
@@ -374,12 +375,12 @@ impl OpenCodeRunner {
     /// Handles two text event formats emitted by different opencode versions:
     /// - Format 1 (current): `{"type":"text","part":{"type":"text","text":"..."}}`
     /// - Format 2 (newer):   `{"type":"text","text":"..."}`
-    fn extract_text_from_events(&self, events: &[serde_json::Value]) -> Option<String> {
+    fn extract_text_from_events(events: &[serde_json::Value]) -> Option<String> {
         extract_ndjson_text(events)
     }
 
     /// Extract token usage from `step_finish` events.
-    fn extract_tokens(&self, events: &[serde_json::Value]) -> (Option<u64>, Option<u64>) {
+    fn extract_tokens(events: &[serde_json::Value]) -> (Option<u64>, Option<u64>) {
         for event in events.iter().rev() {
             let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -398,7 +399,7 @@ impl OpenCodeRunner {
     }
 
     /// Check for error events in the stream.
-    fn detect_error(&self, events: &[serde_json::Value]) -> Option<AgentError> {
+    fn detect_error(events: &[serde_json::Value]) -> Option<AgentError> {
         super::patterns::detect_ndjson_error(
             events,
             |event| {
@@ -481,7 +482,7 @@ impl AgentRunner for OpenCodeRunner {
         }
 
         // Propagate terminal errors so the review pipeline records cooldowns.
-        if let Some(err) = self.detect_error(&events) {
+        if let Some(err) = Self::detect_error(&events) {
             return Err(err);
         }
 
@@ -576,12 +577,12 @@ impl AgentRunner for OpenCodeRunner {
         }
 
         // Check for errors first
-        if let Some(err) = self.detect_error(&events) {
+        if let Some(err) = Self::detect_error(&events) {
             return Err(err);
         }
 
         // Extract tokens (needed for both the text path and the tool-only fallback)
-        let (input_tokens, output_tokens) = self.extract_tokens(&events);
+        let (input_tokens, output_tokens) = Self::extract_tokens(&events);
 
         // Extract text — when opencode emits only tool_use/step events with no
         // text content, synthesize a human-readable summary from the event
@@ -589,7 +590,7 @@ impl AgentRunner for OpenCodeRunner {
         // upstream `synthesize_response_from_text` heuristic gets handed the
         // entire raw NDJSON, matches a "completed" substring inside tool state
         // JSON, and emits 500 bytes of raw NDJSON as the task summary.
-        let Some(text) = self.extract_text_from_events(&events) else {
+        let Some(text) = Self::extract_text_from_events(&events) else {
             let response = synthesize_response_from_events(&events);
             return Ok(ParsedResponse {
                 response,
@@ -621,7 +622,7 @@ impl AgentRunner for OpenCodeRunner {
     fn classify_error(&self, exit_code: i32, stdout: &str, stderr: &str) -> AgentError {
         // Try parsing NDJSON events from stdout for structured errors
         let events = super::parse_ndjson(stdout);
-        if let Some(err) = self.detect_error(&events) {
+        if let Some(err) = Self::detect_error(&events) {
             return err;
         }
 
@@ -994,7 +995,10 @@ fn raw_kill(pid: i32, sig: i32) -> i32 {
 #[cfg(unix)]
 fn kill_process_group(pgid: u32) {
     const SIGKILL: i32 = 9;
-    let _ = raw_kill(-(pgid as i32), SIGKILL);
+    let Ok(pgid) = i32::try_from(pgid) else {
+        return;
+    };
+    let _ = raw_kill(-pgid, SIGKILL);
 }
 
 async fn run_opencode_models_cli_inner(
@@ -1184,8 +1188,7 @@ pub fn find_opencode_result(ndjson: &str) -> Option<super::AgentResult> {
     // Check for errors first
     let is_error;
     let error_text;
-    let runner = OpenCodeRunner::new();
-    if let Some(err) = runner.detect_error(&events) {
+    if let Some(err) = OpenCodeRunner::detect_error(&events) {
         is_error = true;
         error_text = Some(err.to_string());
     } else {
@@ -1201,7 +1204,7 @@ pub fn find_opencode_result(ndjson: &str) -> Option<super::AgentResult> {
     };
 
     // Extract tokens from step_finish
-    let (input_tokens, output_tokens) = runner.extract_tokens(&events);
+    let (input_tokens, output_tokens) = OpenCodeRunner::extract_tokens(&events);
 
     // The model was cut off for exceeding its output/reasoning token budget,
     // not because it produced malformed prose. Distinguish this from a
@@ -1417,11 +1420,10 @@ mod tests {
 
     #[test]
     fn extract_tokens_from_step_finish() {
-        let r = runner();
         let events: Vec<serde_json::Value> = vec![
             serde_json::json!({"type":"step_finish","part":{"type":"step-finish","tokens":{"input":1000,"output":500,"total":1500}}}),
         ];
-        let (input, output) = r.extract_tokens(&events);
+        let (input, output) = OpenCodeRunner::extract_tokens(&events);
         assert_eq!(input, Some(1000));
         assert_eq!(output, Some(500));
     }
@@ -1682,10 +1684,13 @@ mod tests {
     #[test]
     fn live_opencode_discovery_is_skipped_in_test_builds() {
         assert!(skip_live_opencode_discovery());
-        assert!(discover_opencode_models().is_empty());
-        assert!(discover_free_opencode_models().is_empty());
+        let models = discover_opencode_models();
+        assert!(models.is_empty(), "{models:?}");
+        let models = discover_free_opencode_models();
+        assert!(models.is_empty(), "{models:?}");
         prime_free_model_cache();
-        assert!(discover_opencode_models().is_empty());
+        let models = discover_opencode_models();
+        assert!(models.is_empty(), "{models:?}");
     }
 
     /// The stub stands in for opencode 2.2.1, which starts `opencode serve --service`
@@ -1736,7 +1741,7 @@ mod tests {
     #[cfg(unix)]
     fn pid_is_alive(pid: u32) -> bool {
         // Signal 0 is the POSIX existence probe
-        super::raw_kill(pid as i32, 0) == 0
+        i32::try_from(pid).is_ok_and(|pid| super::raw_kill(pid, 0) == 0)
     }
 
     #[test]
@@ -2196,12 +2201,14 @@ mod stream_tests {
 
     #[test]
     fn only_final_step_is_done() {
-        assert!(events(r#"{"type":"step_finish","part":{"reason":"tool-calls"}}"#).is_empty());
+        let dropped = events(r#"{"type":"step_finish","part":{"reason":"tool-calls"}}"#);
+        assert!(dropped.is_empty(), "{dropped:?}");
         assert_eq!(
             events(r#"{"type":"step_finish","part":{"reason":"stop"}}"#),
             vec![StreamEvent::Done(String::new())]
         );
-        assert!(events(r#"{"type":"step_start"}"#).is_empty());
+        let dropped = events(r#"{"type":"step_start"}"#);
+        assert!(dropped.is_empty(), "{dropped:?}");
     }
 
     #[test]

@@ -138,6 +138,8 @@ async fn reconcile_closed_tasks(
     all_tasks: &[ExternalTask],
     task_manager: &TaskManager,
 ) {
+    const MAX_RECONCILE_PER_CYCLE: usize = 10;
+
     let done_set: std::collections::HashSet<String> = task_ids.iter().cloned().collect();
     let closed_not_in_store: Vec<_> = all_tasks
         .iter()
@@ -167,7 +169,6 @@ async fn reconcile_closed_tasks(
 
     // Reconcile issues missing the done label — cap to avoid rate-limit
     // exhaustion. Remaining issues will be picked up in subsequent cycles.
-    const MAX_RECONCILE_PER_CYCLE: usize = 10;
     if needs_reconcile.len() > MAX_RECONCILE_PER_CYCLE {
         tracing::info!(
             total = needs_reconcile.len(),
@@ -813,13 +814,13 @@ pub(crate) async fn remove_worktree_and_branch(
 
     match remove_result {
         Ok(output) if output.status.success() => {
+            const MAX_RETRIES: usize = 3;
+            const RETRY_DELAY_MS: u64 = 2000;
             tracing::info!(task_id, "worktree removed (git metadata)");
             // `git worktree remove` only removes git metadata — the physical directory
             // with working files may remain. Clean it up with retry logic, since macOS
             // sometimes needs a moment to release file handles from a recently-exited
             // process. Retrying with a delay addresses "Directory not empty" errors.
-            const MAX_RETRIES: usize = 3;
-            const RETRY_DELAY_MS: u64 = 2000;
             let mut removed = false;
             for attempt in 0..MAX_RETRIES {
                 match tokio::fs::remove_dir_all(wt).await {
@@ -1767,7 +1768,7 @@ mod tests {
             assert!(
                 !cleaned,
                 "cleanup should return false when there is no worktree or branch to clean"
-            )
+            );
         } else {
             // resolve_repo_root fails for test repo — acceptable.
             // The bug was that even with no worktree/branch, Ok(true) was returned.

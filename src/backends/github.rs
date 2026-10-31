@@ -97,6 +97,7 @@ fn classify_active_open_issue(
     Some((task, status))
 }
 
+#[derive(Debug)]
 pub struct GitHubBackend {
     repo: String,
     gh: GhHttp,
@@ -314,6 +315,7 @@ impl ExternalBackend for GitHubBackend {
 
     /// Override default update_status to add project board sync after label update.
     async fn update_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
+        const MAX_RETRIES: u32 = 3;
         // Internal tasks (e.g. "internal:63857") are not GitHub issues — skip silently.
         if !is_github_issue_id(id) {
             return Ok(());
@@ -326,7 +328,6 @@ impl ExternalBackend for GitHubBackend {
             tracing::warn!(label, err = %e, "ensure_status_label failed, continuing");
         }
 
-        const MAX_RETRIES: u32 = 3;
         let mut last_err =
             anyhow::anyhow!("update_status({label}) failed: all {MAX_RETRIES} attempts exhausted");
 
@@ -684,7 +685,9 @@ impl ExternalBackend for GitHubBackend {
         if issue_number <= 0 {
             return Ok(crate::backends::BlockedByFetch::Unavailable);
         }
-        self.gh.list_blocked_by(repo, issue_number as u64).await
+        self.gh
+            .list_blocked_by(repo, issue_number.cast_unsigned())
+            .await
     }
 
     async fn issue_close_state(
@@ -722,14 +725,18 @@ impl ExternalBackend for GitHubBackend {
         if pr_number <= 0 {
             return Ok(None);
         }
-        let pr = match self.gh.get_pr(repo, pr_number as u64).await {
+        let pr = match self.gh.get_pr(repo, pr_number.cast_unsigned()).await {
             Ok(pr) => pr,
             Err(err) if is_missing_issue(&err) => return Ok(None),
             Err(err) => return Err(err),
         };
         let default_branch = self.gh.get_default_branch(repo).await.unwrap_or_default();
         let app_login = crate::github::app::bot_login().await;
-        let reviews = match self.gh.get_pr_reviews(repo, pr_number as u64).await {
+        let reviews = match self
+            .gh
+            .get_pr_reviews(repo, pr_number.cast_unsigned())
+            .await
+        {
             Ok(reviews) => {
                 crate::github::app::reviews_for_gate(&reviews, &pr.head.sha, app_login.as_deref())
             }
@@ -797,7 +804,11 @@ impl ExternalBackend for GitHubBackend {
             anyhow::bail!("blocking issue {blocking_repo}#{blocking_number} has no database id");
         }
         self.gh
-            .add_blocked_by(&self.repo, issue_number as u64, blocker.id as i64)
+            .add_blocked_by(
+                &self.repo,
+                issue_number.cast_unsigned(),
+                blocker.id.cast_signed(),
+            )
             .await
     }
 }
@@ -1176,7 +1187,10 @@ mod tests {
         assert!(mentions.is_empty());
     }
 
-    #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the env lock stays held across the awaits so tests do not race on GH_TOKEN"
+    )]
     #[tokio::test]
     async fn get_mentions_and_list_issue_comments_exclude_contributor_on_owner_issue() {
         use crate::github::http::GhHttp;

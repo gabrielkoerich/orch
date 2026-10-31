@@ -31,6 +31,7 @@ pub struct ProjectInfo {
 ///     review: "option-id-3"
 ///     done: "option-id-4"
 /// ```
+#[derive(Debug)]
 pub struct ProjectSync {
     project_id: String,
     status_field_id: String,
@@ -350,6 +351,8 @@ impl ProjectSync {
         &self,
         issue_node_ids: &[String],
     ) -> anyhow::Result<std::collections::HashMap<String, u8>> {
+        const FIBONACCI: &[u8] = &[0, 1, 2, 3, 5, 8, 13, 21];
+
         let Some(field_id) = &self.estimate_field_id else {
             return Ok(std::collections::HashMap::new());
         };
@@ -396,6 +399,11 @@ impl ProjectSync {
             else {
                 continue;
             };
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "the saturating cast is fine, only fibonacci values up to 21 are kept"
+            )]
             let estimate = field_values
                 .iter()
                 .find(|fv| {
@@ -409,7 +417,6 @@ impl ProjectSync {
                 .unwrap_or(0.0) as u8;
 
             // Only accept Fibonacci values (0 = not set, or 1/2/3/5/8/13/21).
-            const FIBONACCI: &[u8] = &[0, 1, 2, 3, 5, 8, 13, 21];
             if FIBONACCI.contains(&estimate) {
                 estimates.insert(content_id.to_string(), estimate);
             }

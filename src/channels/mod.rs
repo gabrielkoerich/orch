@@ -109,7 +109,10 @@ pub struct OutputChunk {
 }
 
 /// The core channel trait. All external interfaces implement this.
-#[expect(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait marks its boxed futures must_use twice"
+)]
 #[async_trait]
 pub trait Channel: Send + Sync {
     /// Human-readable channel name.
@@ -138,6 +141,14 @@ pub trait Channel: Send + Sync {
 /// Registry of active channels.
 pub struct ChannelRegistry {
     channels: Vec<Box<dyn Channel>>,
+}
+
+impl std::fmt::Debug for ChannelRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.channels.iter().map(|c| c.name()))
+            .finish()
+    }
 }
 
 impl ChannelRegistry {

@@ -281,7 +281,6 @@ struct StuckTaskTiming {
     threshold: u64,
 }
 
-#[expect(clippy::too_many_arguments)]
 fn stuck_task_timing_from_map(
     tmux: &Arc<TmuxManager>,
     repo: &str,
@@ -320,7 +319,7 @@ fn stuck_task_timing_from_map(
     // detected suspend/resume gaps that occurred since this task was last touched.
     let suspended = super::suspend::suspended_duration_since(updated);
     let age = (raw_age - suspended).max(chrono::Duration::zero());
-    if age.num_seconds() <= threshold as i64 {
+    if age.num_seconds() <= i64::try_from(threshold).unwrap_or(i64::MAX) {
         return None;
     }
 
@@ -675,7 +674,10 @@ fn should_use_backend(task_id: &str) -> bool {
 /// - `in_progress` tasks → reset to `New` when their session is missing or the run timed out
 /// - `routed` tasks      → reset to `New` when an old live session keeps blocking re-dispatch
 /// - `in_review` tasks   → reset to `NeedsReview` when the review session disappeared
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is engine state the tick passes down"
+)]
 pub(crate) async fn tick_recover_stuck_tasks(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
@@ -686,6 +688,8 @@ pub(crate) async fn tick_recover_stuck_tasks(
     session_map: &std::collections::HashMap<String, bool>,
     dispatching: &Arc<DashMap<String, String>>,
 ) -> anyhow::Result<()> {
+    use crate::store::TaskStatus as DbStatus;
+
     let _span = tracing::info_span!("engine.tick.phase2.stuck_tasks").entered();
 
     let in_progress = match task_manager
@@ -995,7 +999,6 @@ pub(crate) async fn tick_recover_stuck_tasks(
 
     // Recover internal (SQLite) tasks stuck in in_progress.
     // These have no GitHub labels or comments — just reset the DB status to New.
-    use crate::store::TaskStatus as DbStatus;
     let internal_in_progress = match task_manager
         .list_internal_by_status(DbStatus::InProgress)
         .await
@@ -1957,7 +1960,10 @@ pub(crate) fn dispatch_mode_from_router(router: &Router) -> DispatchMode {
 }
 
 /// Phase 3b of tick: spawn agents for all status:routed tasks up to the parallel limit.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is engine state the tick passes down"
+)]
 #[tracing::instrument(skip_all, name = "engine.tick.phase3b.dispatch")]
 pub(crate) async fn tick_dispatch_tasks(
     backend: &Arc<dyn ExternalBackend>,
@@ -2012,7 +2018,10 @@ pub(crate) async fn tick_dispatch_tasks(
 /// Shared by `tick_dispatch_tasks` (active-repo, per-tick dispatch) and
 /// `dispatch_routed_tasks_global` (inactive-repo sweep) so both paths spawn
 /// agents through the exact same worktree/tmux/runner logic.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is engine state the tick passes down"
+)]
 async fn dispatch_tasks_for_repo(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
@@ -2252,20 +2261,18 @@ async fn dispatch_tasks_for_repo(
                                 "done"
                             }
                         }
-                        WeightSignal::Success { .. } => "done",
-                        WeightSignal::RateLimited { .. } => "new",
-                        WeightSignal::Blocked => "blocked",
                         // Rerouted: silence detection or other non-rate-limit reset already
                         // moved the task to "new". Stay in "new" — never convert to
                         // needs_review, which would trigger the no-code shortcut and falsely
                         // close the task as done without a successful agent run.
-                        WeightSignal::Rerouted => "new",
+                        WeightSignal::RateLimited { .. } | WeightSignal::Rerouted => "new",
+                        WeightSignal::Blocked => "blocked",
                         // None means the runner guard skipped the task (e.g. tmux session
                         // already exists) or the task completed with an unrecognised status.
                         // Route to needs_review only when the review agent is enabled;
                         // otherwise mark done so the task is not permanently stuck.
                         WeightSignal::None if enable_review => "needs_review",
-                        WeightSignal::None => "done",
+                        WeightSignal::Success { .. } | WeightSignal::None => "done",
                     };
 
                     // Send weight signal back to the router
@@ -2415,7 +2422,10 @@ fn group_orphaned_routed_tasks(
 /// `TaskRunner::resolve_project_dir` already falls back to the deterministic
 /// `~/.orch/projects/<owner>/<repo>.git` bare-clone convention when a repo is
 /// not listed in the active config, so dispatch works without a `ProjectEngine`.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is engine state the tick passes down"
+)]
 pub(crate) async fn dispatch_routed_tasks_global(
     tmux: &Arc<TmuxManager>,
     capture: &Arc<CaptureService>,
@@ -2684,7 +2694,10 @@ pub(crate) async fn tick_job_scheduler(
 ///
 /// The store-wide work that used to sit in here runs once per tick in `tick_all`:
 /// `tick_global_sweeps` and `reconcile_dependencies`.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is engine state the tick passes down"
+)]
 pub(crate) async fn tick_before_routing(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
@@ -2746,7 +2759,10 @@ pub(crate) async fn tick_before_routing(
 /// 1. `tick_dispatch_tasks`  — spawn agents for status:routed tasks
 /// 2. `tick_unblock_parents` — unblock parents whose sub-issues are all done
 /// 3. `tick_job_scheduler`   — fire due cron jobs
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is engine state the tick passes down"
+)]
 pub(crate) async fn tick_after_routing(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
@@ -2811,7 +2827,10 @@ pub(crate) async fn tick_after_routing(
 ///
 /// The tmux session map, the global sweeps and the dependency reconcile are the same for
 /// every project, so they run once per tick rather than once per project.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is engine state the tick passes down"
+)]
 pub(crate) async fn tick_all(
     engines: &[ProjectEngine],
     tmux: &Arc<TmuxManager>,
@@ -4156,6 +4175,8 @@ mod tests {
     /// on one thread and `DashMap::contains_key()` on another, this test would catch it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn recover_stuck_tasks_never_reclaims_while_guard_held_under_real_concurrency() {
+        const HAMMER_ITERATIONS: u32 = 300;
+
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let mock = MockBackend::new();
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
@@ -4243,7 +4264,6 @@ mod tests {
         // thread the tokio scheduler picks, independent of the thread that claimed
         // the guard — this is what actually exercises cross-thread DashMap
         // visibility, not wall-clock racing against a timer.
-        const HAMMER_ITERATIONS: u32 = 300;
         for i in 0..HAMMER_ITERATIONS {
             tick_recover_stuck_tasks(
                 &backend,
@@ -4536,12 +4556,10 @@ mod tests {
     #[tokio::test]
     async fn tick_all_does_not_kill_sessions_it_did_not_create() {
         let tmux = Arc::new(TmuxManager::new());
-        let session_name = if let Ok(name) = tmux
+        let Ok(session_name) = tmux
             .create_session("other/foreign", "3889", "/tmp", "sleep 30", &[])
             .await
-        {
-            name
-        } else {
+        else {
             eprintln!("Skipping test: tmux not available or failed to create test session");
             return;
         };
@@ -4888,7 +4906,9 @@ mod tests {
             ..EngineConfig::default()
         };
         let updated_at = (chrono::Utc::now()
-            - chrono::Duration::seconds(config.no_session_stuck_timeout as i64 + 5))
+            - chrono::Duration::seconds(
+                i64::try_from(config.no_session_stuck_timeout).expect("timeout fits in i64") + 5,
+            ))
         .to_rfc3339();
 
         let timing = stuck_task_timing_from_map(
@@ -5941,8 +5961,6 @@ mod tests {
     async fn group_orphaned_routed_tasks_selects_inactive_repo_tasks() {
         use crate::store::{StoreRoute, TaskStatus, UpsertExternal};
 
-        let store = Arc::new(TaskStore::open_memory().await.unwrap());
-
         async fn make_routed(store: &TaskStore, repo: &str, ext_id: &str) -> i64 {
             let id = store
                 .upsert_external(&UpsertExternal {
@@ -5973,6 +5991,8 @@ mod tests {
             store.update_status(id, TaskStatus::Routed).await.unwrap();
             id
         }
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
         let active_id = make_routed(&store, "active/repo", "1").await;
         let inactive_id_a = make_routed(&store, "inactive/repo", "2").await;
@@ -6025,8 +6045,6 @@ mod tests {
     async fn group_orphaned_routed_tasks_excludes_all_active_repos_not_just_current() {
         use crate::store::{StoreRoute, TaskStatus, UpsertExternal};
 
-        let store = Arc::new(TaskStore::open_memory().await.unwrap());
-
         async fn make_routed(store: &TaskStore, repo: &str, ext_id: &str) -> i64 {
             let id = store
                 .upsert_external(&UpsertExternal {
@@ -6057,6 +6075,8 @@ mod tests {
             store.update_status(id, TaskStatus::Routed).await.unwrap();
             id
         }
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
         let repo_a_id = make_routed(&store, "active/repo-a", "1").await;
         let repo_b_id = make_routed(&store, "active/repo-b", "2").await;

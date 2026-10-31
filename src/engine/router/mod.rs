@@ -1678,20 +1678,15 @@ mod tests {
         assert_eq!(stored.as_deref(), Some("sonnet"));
     }
 
-    // Test-only delegates so tests can call router.parse_llm_response() and
-    // router.check_routing_sanity() directly without referencing llm_router.
+    // Test-only delegate so tests can call router.parse_llm_response() directly
+    // without referencing llm_router.
     impl Router {
+        #[expect(
+            clippy::unused_self,
+            reason = "the test helper keeps the router method syntax"
+        )]
         fn parse_llm_response(&self, response: &str) -> anyhow::Result<LlmRouteResponse> {
-            self.llm_router.parse_llm_response("claude", response)
-        }
-
-        fn check_routing_sanity(
-            &self,
-            task: &ExternalTask,
-            agent: &str,
-            profile: &AgentProfile,
-        ) -> Option<String> {
-            self.llm_router.check_routing_sanity(task, agent, profile)
+            LlmRouter::parse_llm_response("claude", response)
         }
     }
 
@@ -2268,9 +2263,6 @@ Hope that helps!"#;
     #[serial(cooldown_state)]
     #[test]
     fn check_routing_sanity_warnings() {
-        let config = RouterConfig::default();
-        let router = Router::new(config);
-
         // Backend task routed to claude should warn
         let task = create_test_task("1", "Fix API", vec!["backend".to_string()]);
         let profile = AgentProfile {
@@ -2279,19 +2271,19 @@ Hope that helps!"#;
             tools: vec![],
             constraints: vec![],
         };
-        let warning = router.check_routing_sanity(&task, "claude", &profile);
+        let warning = LlmRouter::check_routing_sanity(&task, "claude", &profile);
         assert!(warning.is_some());
         assert!(warning.unwrap().contains("backend"));
 
         // Docs task routed to codex should warn
         let task = create_test_task("1", "Update README", vec!["docs".to_string()]);
-        let warning = router.check_routing_sanity(&task, "codex", &profile);
+        let warning = LlmRouter::check_routing_sanity(&task, "codex", &profile);
         assert!(warning.is_some());
         assert!(warning.unwrap().contains("docs"));
 
         // Normal routing should not warn
         let task = create_test_task("1", "Fix bug", vec!["bug".to_string()]);
-        let warning = router.check_routing_sanity(&task, "codex", &profile);
+        let warning = LlmRouter::check_routing_sanity(&task, "codex", &profile);
         assert!(warning.is_none());
     }
 

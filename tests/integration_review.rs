@@ -316,7 +316,7 @@ fn verify_review_output(
     eprintln!(
         "=== {label} PASSED: extracted {} chars, parsed review decision={:?} ===\n",
         text.len(),
-        review.unwrap().decision
+        review.expect("asserted above").decision
     );
 }
 
@@ -344,7 +344,7 @@ fn run_claude_agent(binary: &str, model: &str) -> (i32, String, String) {
         .spawn()
         .expect("printf");
 
-    cmd.stdin(echo.stdout.take().unwrap());
+    cmd.stdin(echo.stdout.take().expect("printf stdout is piped"));
     let _ = echo.wait(); // avoid zombie
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -361,7 +361,7 @@ fn run_claude_agent(binary: &str, model: &str) -> (i32, String, String) {
 }
 
 #[test]
-#[ignore]
+#[ignore = "runs a real agent CLI"]
 fn review_flow_claude_haiku() {
     if !is_available("claude") {
         eprintln!("claude not installed, skipping");
@@ -372,7 +372,7 @@ fn review_flow_claude_haiku() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "runs a real agent CLI"]
 fn review_flow_kimi() {
     if !is_available("kimi") {
         eprintln!("kimi not installed, skipping");
@@ -383,7 +383,7 @@ fn review_flow_kimi() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "runs a real agent CLI"]
 fn review_flow_minimax() {
     if !is_available("minimax") {
         eprintln!("minimax not installed, skipping");
@@ -408,7 +408,7 @@ fn run_opencode_agent(model: &str) -> (i32, String, String) {
     echo.arg(REVIEW_PROMPT).stdout(std::process::Stdio::piped());
 
     let mut echo_child = echo.spawn().expect("printf");
-    cmd.stdin(echo_child.stdout.take().unwrap());
+    cmd.stdin(echo_child.stdout.take().expect("printf stdout is piped"));
     let _ = echo_child.wait(); // avoid zombie
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -425,7 +425,7 @@ fn run_opencode_agent(model: &str) -> (i32, String, String) {
 }
 
 #[test]
-#[ignore]
+#[ignore = "runs a real agent CLI"]
 fn review_flow_opencode() {
     if !is_available("opencode") {
         eprintln!("opencode not installed, skipping");

@@ -446,6 +446,14 @@ pub struct GhHttp {
     api_base: Option<String>,
 }
 
+impl std::fmt::Debug for GhHttp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GhHttp")
+            .field("owner_only", &self.owner_only)
+            .finish_non_exhaustive()
+    }
+}
+
 impl GhHttp {
     /// Create a new client backed by the process-wide shared [`TokenResolver`].
     ///
@@ -493,7 +501,13 @@ impl GhHttp {
         }
     }
 
-    #[cfg_attr(not(test), expect(clippy::unused_self))]
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "only the test build reads the api base override"
+        )
+    )]
     fn api_root(&self) -> &str {
         #[cfg(test)]
         if let Some(base) = &self.api_base {
@@ -925,12 +939,12 @@ impl GhHttp {
         url: &str,
         query: &[(&str, &str)],
     ) -> anyhow::Result<Vec<T>> {
+        const MAX_JSON_DECODE_RETRIES: u32 = 2;
+        const JSON_DECODE_RETRY_BACKOFF_MS: u64 = 200;
         Self::check_backoff(url)?;
         let mut all: Vec<T> = Vec::new();
         let mut next_url: Option<String> = None;
         let mut is_first = true;
-        const MAX_JSON_DECODE_RETRIES: u32 = 2;
-        const JSON_DECODE_RETRY_BACKOFF_MS: u64 = 200;
 
         loop {
             let (request_url, request_query) = if is_first {
@@ -1453,7 +1467,6 @@ impl GhHttp {
     }
 
     /// List issues filtered by a label (paginated).
-    #[expect(dead_code)]
     pub async fn list_issues(&self, repo: &str, label: &str) -> anyhow::Result<Vec<GitHubIssue>> {
         self.list_issues_with_state(repo, label, "open").await
     }
@@ -1484,7 +1497,6 @@ impl GhHttp {
     /// List closed issues updated since `since` (ISO 8601), filtered by label.
     ///
     /// Used for dedup checks — prevents re-creating issues that were recently closed.
-    #[expect(dead_code)]
     pub async fn list_issues_closed_since(
         &self,
         repo: &str,
@@ -1819,6 +1831,8 @@ impl GhHttp {
         repo: &str,
         branches: &[String],
     ) -> anyhow::Result<std::collections::HashMap<String, bool>> {
+        use std::fmt::Write as _;
+
         if branches.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -1834,10 +1848,11 @@ impl GhHttp {
         let mut aliases = String::new();
         let mut vars = serde_json::json!({ "owner": owner, "name": name });
         for (i, branch) in branches.iter().enumerate() {
-            var_defs.push_str(&format!(", $b{i}: String!"));
-            aliases.push_str(&format!(
+            let _ = write!(var_defs, ", $b{i}: String!");
+            let _ = write!(
+                aliases,
                 r"b{i}: pullRequests(headRefName: $b{i}, states: [MERGED], last: 1) {{ nodes {{ merged }} }} "
-            ));
+            );
             vars[format!("b{i}")] = serde_json::Value::String(branch.clone());
         }
 
@@ -1990,10 +2005,6 @@ impl GhHttp {
     ) -> anyhow::Result<String> {
         use reqwest::header;
 
-        let body = redact_posted_body(body);
-        let url = format!("{}/repos/{repo}/pulls", self.api_root());
-        Self::check_backoff(&url)?;
-
         #[derive(Serialize)]
         struct CreatePullRequest<'a> {
             title: &'a str,
@@ -2001,6 +2012,10 @@ impl GhHttp {
             head: &'a str,
             base: &'a str,
         }
+
+        let body = redact_posted_body(body);
+        let url = format!("{}/repos/{repo}/pulls", self.api_root());
+        Self::check_backoff(&url)?;
 
         let payload = CreatePullRequest {
             title,
@@ -2064,6 +2079,9 @@ impl GhHttp {
         repo: &str,
         pr_numbers: &[u64],
     ) -> anyhow::Result<std::collections::HashMap<u64, (bool, String)>> {
+        // GitHub GraphQL complexity limit: chunk at 50 to avoid slow/rejected queries.
+        const CHUNK_SIZE: usize = 50;
+
         if pr_numbers.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -2072,8 +2090,6 @@ impl GhHttp {
             .split_once('/')
             .ok_or_else(|| anyhow::anyhow!("invalid repo format: {repo}"))?;
 
-        // GitHub GraphQL complexity limit: chunk at 50 to avoid slow/rejected queries.
-        const CHUNK_SIZE: usize = 50;
         let mut result = std::collections::HashMap::new();
 
         for chunk in pr_numbers.chunks(CHUNK_SIZE) {
@@ -2123,6 +2139,9 @@ impl GhHttp {
         issue_numbers: &[u64],
         caller_context: &str,
     ) -> anyhow::Result<std::collections::HashMap<String, (String, Vec<String>)>> {
+        // GitHub GraphQL complexity limit: chunk at 50 to avoid slow/rejected queries.
+        const CHUNK_SIZE: usize = 50;
+
         if issue_numbers.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -2146,8 +2165,6 @@ impl GhHttp {
             .split_once('/')
             .ok_or_else(|| anyhow::anyhow!("invalid repo format: {repo}"))?;
 
-        // GitHub GraphQL complexity limit: chunk at 50 to avoid slow/rejected queries.
-        const CHUNK_SIZE: usize = 50;
         let mut result = std::collections::HashMap::new();
 
         for chunk in valid_issue_numbers.chunks(CHUNK_SIZE) {
@@ -3284,7 +3301,6 @@ impl GhHttp {
                         pr_number,
                         "ignoring automated review comment from non-collaborator"
                     );
-                    continue;
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -3292,7 +3308,6 @@ impl GhHttp {
                         error = %e,
                         "failed to check collaborator status, skipping comment"
                     );
-                    continue;
                 }
             }
         }
@@ -3702,11 +3717,11 @@ fn parse_graphql_review_comment(node: &serde_json::Value) -> Option<GitHubReview
         line: node
             .get("line")
             .and_then(serde_json::Value::as_u64)
-            .map(|v| v as u32),
+            .and_then(|v| u32::try_from(v).ok()),
         original_line: node
             .get("originalLine")
             .and_then(serde_json::Value::as_u64)
-            .map(|v| v as u32),
+            .and_then(|v| u32::try_from(v).ok()),
         commit_id: node
             .pointer("/commit/oid")
             .and_then(|v| v.as_str())
@@ -3847,7 +3862,8 @@ mod tests {
 
     #[test]
     fn parse_classic_required_status_checks_empty_when_unprotected() {
-        assert!(parse_classic_required_status_checks(&serde_json::json!({})).is_empty());
+        let checks = parse_classic_required_status_checks(&serde_json::json!({}));
+        assert!(checks.is_empty(), "{checks:?}");
     }
 
     #[test]
@@ -5000,7 +5016,10 @@ mod tests {
             }))
         }
 
-        #[allow(clippy::await_holding_lock)]
+        #[expect(
+            clippy::await_holding_lock,
+            reason = "the env lock stays held across the awaits so tests do not race on GH_TOKEN"
+        )]
         #[tokio::test]
         async fn retries_once_with_fresh_token_after_401() {
             let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
@@ -5041,7 +5060,10 @@ mod tests {
             assert_eq!(hits.load(Ordering::SeqCst), 2, "exactly one retry expected");
         }
 
-        #[allow(clippy::await_holding_lock)]
+        #[expect(
+            clippy::await_holding_lock,
+            reason = "the env lock stays held across the awaits so tests do not race on GH_TOKEN"
+        )]
         #[tokio::test]
         async fn double_401_bails_with_distinct_auth_error() {
             let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
@@ -5127,7 +5149,10 @@ mod tests {
             );
         }
 
-        #[allow(clippy::await_holding_lock)]
+        #[expect(
+            clippy::await_holding_lock,
+            reason = "the env lock stays held across the awaits so tests do not race on GH_TOKEN"
+        )]
         #[tokio::test]
         async fn add_comment_redacts_github_token() {
             let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
@@ -5166,7 +5191,10 @@ mod tests {
             assert_token_redacted(&raw);
         }
 
-        #[allow(clippy::await_holding_lock)]
+        #[expect(
+            clippy::await_holding_lock,
+            reason = "the env lock stays held across the awaits so tests do not race on GH_TOKEN"
+        )]
         #[tokio::test]
         async fn create_pr_redacts_github_token() {
             let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
@@ -5207,7 +5235,10 @@ mod tests {
             assert_token_redacted(&raw);
         }
 
-        #[allow(clippy::await_holding_lock)]
+        #[expect(
+            clippy::await_holding_lock,
+            reason = "the env lock stays held across the awaits so tests do not race on GH_TOKEN"
+        )]
         #[tokio::test]
         async fn update_pr_body_redacts_github_token() {
             let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();

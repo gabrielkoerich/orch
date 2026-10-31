@@ -28,7 +28,7 @@ pub async fn export(
             anyhow::bail!("no attempts found for task");
         }
         let max_attempt = runs.iter().map(|r| r.attempt).max().unwrap_or(1);
-        max_attempt as u32
+        u32::try_from(max_attempt).unwrap_or(1)
     };
 
     let output_path = crate::cli::task_ref::state_dir(&resolved)?
@@ -213,12 +213,7 @@ fn record_file_or_command(
 ) {
     let Some(input) = input else { return };
     match name {
-        "Write" | "write" | "NotebookEdit" => {
-            if let Some(p) = str_field(input, "file_path") {
-                files_changed.insert(p);
-            }
-        }
-        "Edit" | "edit" | "MultiEdit" => {
+        "Write" | "write" | "NotebookEdit" | "Edit" | "edit" | "MultiEdit" => {
             if let Some(p) = str_field(input, "file_path") {
                 files_changed.insert(p);
             }
@@ -250,7 +245,8 @@ async fn export_markdown(
     _repo: &str,
 ) -> anyhow::Result<()> {
     let runs = store.get_runs(task.id).await?;
-    let attempt_run = runs.iter().find(|r| r.attempt == attempt as i32);
+    let attempt_i32 = i32::try_from(attempt).ok();
+    let attempt_run = runs.iter().find(|r| Some(r.attempt) == attempt_i32);
 
     let agent = task.agent.as_deref().unwrap_or("unknown");
     let model = task.model.as_deref().unwrap_or("-");
@@ -265,7 +261,7 @@ async fn export_markdown(
 
     println!(
         "# Session: {} (Attempt {})",
-        task_id_display(task.id, &task.external_id),
+        task_id_display(task.id, task.external_id.as_ref()),
         attempt
     );
     println!();
@@ -373,19 +369,6 @@ async fn export_markdown(
 }
 
 fn export_json(task: &crate::store::Task, attempt: u32, content: &str) -> anyhow::Result<()> {
-    let output_lines: Vec<serde_json::Value> = content
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                return None;
-            }
-            serde_json::from_str(trimmed).ok()
-        })
-        .collect();
-
-    let parsed = parse_output(content);
-
     #[derive(Serialize)]
     struct SessionExport {
         task_id: i64,
@@ -406,6 +389,19 @@ fn export_json(task: &crate::store::Task, attempt: u32, content: &str) -> anyhow
         key_messages: Vec<String>,
         output: Vec<serde_json::Value>,
     }
+
+    let output_lines: Vec<serde_json::Value> = content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            serde_json::from_str(trimmed).ok()
+        })
+        .collect();
+
+    let parsed = parse_output(content);
 
     let export = SessionExport {
         task_id: task.id,
@@ -432,7 +428,7 @@ fn export_json(task: &crate::store::Task, attempt: u32, content: &str) -> anyhow
     Ok(())
 }
 
-fn task_id_display(internal_id: i64, external_id: &Option<String>) -> String {
+fn task_id_display(internal_id: i64, external_id: Option<&String>) -> String {
     match external_id {
         Some(ext) => format!("{ext}:{internal_id}"),
         None => format!("internal:{internal_id}"),

@@ -99,6 +99,10 @@ struct BlockerView {
 /// The store does not talk to GitHub. The engine fills this and the snapshot
 /// decides whether the blocker is done
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool mirrors a github field and the struct is stored as json"
+)]
 pub struct ObservedPullRequest {
     pub merged: bool,
     pub base_is_default: bool,
@@ -110,6 +114,10 @@ pub struct ObservedPullRequest {
 ///
 /// Missing JSON fails closed: the dependency stays open
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool mirrors a github field and the struct is stored as json"
+)]
 pub struct BlockerSnapshot {
     pub issue_state: String,
     pub state_reason: Option<String>,
@@ -926,7 +934,8 @@ mod tests {
             blocked_external_from_body(body),
             vec!["M1-05".to_string(), "M1-01".to_string()]
         );
-        assert!(blocked_external_from_body("<!-- orch-plan: M6-01 -->").is_empty());
+        let blocked = blocked_external_from_body("<!-- orch-plan: M6-01 -->");
+        assert!(blocked.is_empty(), "{blocked:?}");
     }
 
     #[tokio::test]

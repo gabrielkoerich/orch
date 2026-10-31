@@ -174,7 +174,10 @@ pub async fn store_touch_updated_at(store: &Option<Arc<TaskStore>>, repo: &str, 
 }
 
 /// Append a lifecycle activity event to a task timeline.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments are the activity row columns"
+)]
 pub async fn store_log_activity(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
@@ -228,7 +231,7 @@ pub async fn store_increment_by_id(
         .as_ref()
         .ok_or_else(|| anyhow!("task store unavailable"))?;
     match s.increment(store_id, field).await {
-        Ok(new_val) => Ok(new_val as u64),
+        Ok(new_val) => Ok(u64::try_from(new_val).unwrap_or(0)),
         Err(e) => Err(anyhow!("store.increment failed: {e}")),
     }
 }

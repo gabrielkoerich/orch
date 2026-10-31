@@ -14,7 +14,10 @@ use std::time::Duration;
 const TELEGRAM_LONG_POLL_TIMEOUT_SECS: u64 = 30;
 const TELEGRAM_HTTP_TIMEOUT_SECS: u64 = TELEGRAM_LONG_POLL_TIMEOUT_SECS + 15;
 const TELEGRAM_MAX_RETRIES: u32 = 3;
-const _: () = assert!(TELEGRAM_HTTP_TIMEOUT_SECS > TELEGRAM_LONG_POLL_TIMEOUT_SECS);
+const _: () = assert!(
+    TELEGRAM_HTTP_TIMEOUT_SECS > TELEGRAM_LONG_POLL_TIMEOUT_SECS,
+    "the HTTP timeout must outlast the long poll"
+);
 
 /// Escape text for Telegram HTML parse_mode.
 ///
@@ -68,6 +71,14 @@ pub struct TelegramChannel {
     pub offset: std::sync::Arc<tokio::sync::Mutex<i64>>,
 }
 
+impl std::fmt::Debug for TelegramChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelegramChannel")
+            .field("chat_id", &self.chat_id)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Deserialize)]
 struct TelegramUser {
     first_name: String,
@@ -101,7 +112,8 @@ struct CallbackQuery {
 
 #[derive(Deserialize)]
 struct Update {
-    update_id: i64,
+    #[serde(rename = "update_id")]
+    id: i64,
     message: Option<TelegramMessage>,
     callback_query: Option<CallbackQuery>,
 }
@@ -214,7 +226,6 @@ impl TelegramChannel {
         Ok(())
     }
 
-    #[expect(dead_code)]
     pub async fn send_inline_keyboard(
         &self,
         chat_id: i64,
@@ -252,7 +263,6 @@ impl TelegramChannel {
         Ok(message_id)
     }
 
-    #[expect(dead_code)]
     pub async fn answer_callback_query(
         &self,
         callback_query_id: &str,
@@ -279,6 +289,8 @@ impl Channel for TelegramChannel {
     }
 
     async fn start(&self) -> anyhow::Result<tokio::sync::mpsc::Receiver<IncomingMessage>> {
+        use std::fmt::Write as _;
+
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let token = self.token.clone();
         let client = self.client.clone();
@@ -289,7 +301,10 @@ impl Channel for TelegramChannel {
             let mut hasher = Sha256::new();
             hasher.update(token.as_bytes());
             let hash = hasher.finalize();
-            let hex: String = hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+            let hex = hash[..8].iter().fold(String::new(), |mut hex, b| {
+                let _ = write!(hex, "{b:02x}");
+                hex
+            });
             format!("sha256:{hex}")
         };
 
@@ -297,9 +312,9 @@ impl Channel for TelegramChannel {
 
         // Create a single TelegramChannel instance to reuse for all API calls
         let channel = TelegramChannel {
-            token: token.clone(),
-            client: client.clone(),
-            chat_id: chat_id.clone(),
+            token,
+            client,
+            chat_id,
             offset: std::sync::Arc::clone(&offset),
         };
 
@@ -335,8 +350,8 @@ impl Channel for TelegramChannel {
                     // Update offset
                     {
                         let mut off = offset.lock().await;
-                        if update.update_id + 1 > *off {
-                            *off = update.update_id + 1;
+                        if update.id + 1 > *off {
+                            *off = update.id + 1;
                         }
                     }
 
@@ -511,9 +526,12 @@ mod tests {
 
     #[test]
     fn a_long_message_splits_at_line_ends_and_loses_nothing() {
-        let text: String = (0..400)
-            .map(|i| format!("line {i} with some text\n"))
-            .collect();
+        use std::fmt::Write as _;
+
+        let text = (0..400).fold(String::new(), |mut text, i| {
+            let _ = writeln!(text, "line {i} with some text");
+            text
+        });
         let parts = split_for_telegram(&text, 4000);
         assert!(parts.len() > 1);
         assert_eq!(parts.concat(), text);

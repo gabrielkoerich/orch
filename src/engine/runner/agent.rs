@@ -51,6 +51,7 @@ impl Shipcheck {
 
     /// What the prompt offers. shipcheck cannot start its own sandbox inside the OS sandbox, so a
     /// sandboxed agent runs the checks itself and the push hook runs shipcheck outside
+    #[must_use]
     pub fn for_prompt(self, sandboxed: bool) -> Self {
         if sandboxed && self == Shipcheck::Available {
             return Shipcheck::Absent;
@@ -252,8 +253,8 @@ pub(crate) async fn resolve_git_dir_arg(
     Ok(Some(canonical))
 }
 
-fn render_prompt_template(template: &str, vars: HashMap<String, String>) -> String {
-    match render_template_str(template, &vars) {
+fn render_prompt_template(template: &str, vars: &HashMap<String, String>) -> String {
+    match render_template_str(template, vars) {
         Ok(rendered) => rendered,
         Err(err) => {
             tracing::error!(error = %err, "failed to render prompt template");
@@ -263,6 +264,7 @@ fn render_prompt_template(template: &str, vars: HashMap<String, String>) -> Stri
 }
 
 /// Agent invocation configuration.
+#[derive(Debug)]
 pub struct AgentInvocation {
     /// Agent name (claude, codex, opencode, grok, kimi, minimax)
     pub agent: String,
@@ -306,7 +308,7 @@ fn build_tmux_runner_scripts(
     agent_cmd: &str,
     attempt_dir: &std::path::Path,
     sandbox: Option<&[std::ffi::OsString]>,
-) -> anyhow::Result<(String, String)> {
+) -> (String, String) {
     let status_file = attempt_dir.join("exit.txt");
     let stderr_file = attempt_dir.join("stderr.txt");
     let agent_cmd_script_path = attempt_dir.join("agent_cmd.sh");
@@ -391,7 +393,7 @@ exit $CMD_STATUS
 "#,
     );
 
-    Ok((runner_script, agent_cmd_script))
+    (runner_script, agent_cmd_script)
 }
 
 /// Spawn the agent in a tmux session.
@@ -503,7 +505,7 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
             .join("\n");
         let mut vars = HashMap::new();
         vars.insert("TOOLS_LIST".to_string(), tools_list);
-        let tools_prompt = render_prompt_template(ALLOWED_TOOLS_TEMPLATE, vars);
+        let tools_prompt = render_prompt_template(ALLOWED_TOOLS_TEMPLATE, &vars);
         format!("{}\n\n{}", inv.system_prompt, tools_prompt)
     };
 
@@ -553,7 +555,7 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
     let script_path = attempt_dir.join("runner.sh");
     let agent_cmd_script_path = attempt_dir.join("agent_cmd.sh");
     let (script_content, agent_cmd_script_content) =
-        build_tmux_runner_scripts(inv, &agent_cmd, &attempt_dir, sandbox.as_deref())?;
+        build_tmux_runner_scripts(inv, &agent_cmd, &attempt_dir, sandbox.as_deref());
     tokio::fs::write(&agent_cmd_script_path, &agent_cmd_script_content).await?;
     tokio::fs::write(&script_path, &script_content).await?;
 
@@ -671,7 +673,7 @@ pub fn build_system_prompt(
         vars.insert("REPO_TREE".to_string(), context.repo_tree.clone());
     }
 
-    render_prompt_template(AGENT_SYSTEM_TEMPLATE, vars)
+    render_prompt_template(AGENT_SYSTEM_TEMPLATE, &vars)
 }
 
 /// Build the agent message (task prompt).
@@ -748,7 +750,7 @@ pub fn build_agent_message(
                 );
             }
 
-            let rendered = render_prompt_template(AGENT_MEMORY_ENTRY_TEMPLATE, entry_vars);
+            let rendered = render_prompt_template(AGENT_MEMORY_ENTRY_TEMPLATE, &entry_vars);
             sections.push(rendered.trim().to_string());
         }
 
@@ -756,7 +758,7 @@ pub fn build_agent_message(
         vars.insert("MEMORY_SECTION".to_string(), memory_section);
     }
 
-    render_prompt_template(AGENT_MESSAGE_TEMPLATE, vars)
+    render_prompt_template(AGENT_MESSAGE_TEMPLATE, &vars)
 }
 
 /// Build the review prompt for the review agent.
@@ -793,33 +795,15 @@ pub fn build_review_prompt(
         vars.insert("GIT_LOG".to_string(), git_log.to_string());
     }
 
-    render_prompt_template(REVIEW_PROMPT_TEMPLATE, vars)
+    render_prompt_template(REVIEW_PROMPT_TEMPLATE, &vars)
 }
 
-/// Build the runner shell script contents for testing and inspection.
+/// Build the runner shell script contents for testing and inspection, given a pre-created
+/// attempt directory so tests can pass a temp dir.
 ///
 /// IMPORTANT: this must not embed secrets (GH_TOKEN) into the script.
-#[expect(dead_code)]
-pub fn build_runner_script(inv: &AgentInvocation) -> anyhow::Result<String> {
-    // Prepare attempt directory and prompt files
-    let attempt_dir = crate::home::task_attempt_dir(&inv.repo, &inv.task_id, inv.attempt)?;
-    std::fs::create_dir_all(&attempt_dir)?;
-
-    let sys_file = attempt_dir.join("prompt-sys.md");
-    let msg_file = attempt_dir.join("prompt-msg.md");
-    std::fs::write(&sys_file, &inv.system_prompt)?;
-    std::fs::write(&msg_file, &inv.agent_message)?;
-
-    build_runner_script_in_dir(inv, &attempt_dir)
-}
-
-/// Inner script builder given a pre-created attempt directory.
-/// Separated from `build_runner_script` so tests can pass a temp dir and
-/// avoid racing with the parallel binary/lib test that shares `~/.orch/state/`.
-fn build_runner_script_in_dir(
-    inv: &AgentInvocation,
-    attempt_dir: &std::path::Path,
-) -> anyhow::Result<String> {
+#[cfg(test)]
+fn build_runner_script_in_dir(inv: &AgentInvocation, attempt_dir: &std::path::Path) -> String {
     let sys_file = attempt_dir.join("prompt-sys.md");
     let msg_file = attempt_dir.join("prompt-msg.md");
 
@@ -863,12 +847,12 @@ fn build_runner_script_in_dir(
         "#!/usr/bin/env bash\nset -euo pipefail\nstatus_file={sq_status}\nstderr_file={sq_stderr}\ntrap 'status=$?; printf \"%s\\n\" \"$status\" > \"$status_file\"' EXIT\nunset CLAUDECODE\ncd {sq_work_dir} || {{\n  printf '%s\\n' \"worktree directory does not exist: {sq_work_dir}\" > \"$stderr_file\"\n  exit 1\n}}\nset +e\nRESPONSE=$({agent_cmd} 2> \"$stderr_file\")\nCMD_STATUS=$?\nset -e\nprintf '%s' \"$RESPONSE\" > {sq_out}\nexit $CMD_STATUS\n",
     );
 
-    Ok(script)
+    script
 }
 
 /// Build the system prompt for the review agent.
 pub fn review_system_prompt() -> String {
-    render_prompt_template(REVIEW_SYSTEM_TEMPLATE, HashMap::new())
+    render_prompt_template(REVIEW_SYSTEM_TEMPLATE, &HashMap::new())
 }
 
 #[cfg(test)]
@@ -920,8 +904,7 @@ mod tests {
         // Use a temp dir so lib and bin compilation units don't race on ~/.orch/state/.
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let inv = test_invocation("runner-status-test");
-        let script =
-            build_runner_script_in_dir(&inv, tmp.path()).expect("runner script should build");
+        let script = build_runner_script_in_dir(&inv, tmp.path());
 
         assert!(script
             .contains("trap 'status=$?; printf \"%s\\n\" \"$status\" > \"$status_file\"' EXIT"));
@@ -933,8 +916,7 @@ mod tests {
         // Use a temp dir so lib and bin compilation units don't race on ~/.orch/state/.
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let inv = test_invocation("runner-missing-worktree-test");
-        let script =
-            build_runner_script_in_dir(&inv, tmp.path()).expect("runner script should build");
+        let script = build_runner_script_in_dir(&inv, tmp.path());
 
         assert!(script.contains("worktree directory does not exist: '/tmp'"));
         assert!(script.contains("stderr_file='"));
@@ -950,8 +932,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let inv = test_invocation("pty-wrap-test");
         let (runner_script, agent_cmd_script) =
-            build_tmux_runner_scripts(&inv, "echo hello", tmp.path(), None)
-                .expect("runner scripts should build");
+            build_tmux_runner_scripts(&inv, "echo hello", tmp.path(), None);
 
         assert!(
             runner_script.contains("script -q /dev/null /bin/bash"),
@@ -975,8 +956,7 @@ mod tests {
     fn tmux_runner_script_captures_agent_exit_status_via_pipestatus() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let inv = test_invocation("pty-exit-status-test");
-        let (runner_script, _) = build_tmux_runner_scripts(&inv, "echo hello", tmp.path(), None)
-            .expect("runner scripts should build");
+        let (runner_script, _) = build_tmux_runner_scripts(&inv, "echo hello", tmp.path(), None);
 
         assert!(runner_script.contains("CMD_STATUS=${PIPESTATUS[0]:-0}"));
         assert!(runner_script.contains("exit $CMD_STATUS"));
@@ -987,8 +967,7 @@ mod tests {
         // Locked signing agent must not fail `git commit` inside agent sessions
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let inv = test_invocation("gpgsign-test");
-        let (runner_script, _) = build_tmux_runner_scripts(&inv, "echo hello", tmp.path(), None)
-            .expect("runner scripts should build");
+        let (runner_script, _) = build_tmux_runner_scripts(&inv, "echo hello", tmp.path(), None);
 
         assert!(runner_script.contains("GIT_CONFIG_KEY_0=\"commit.gpgsign\""));
         assert!(runner_script.contains("GIT_CONFIG_VALUE_0=\"false\""));
@@ -1006,8 +985,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let inv = test_invocation("pty-helper-path-test");
         let (runner_script, agent_cmd_script) =
-            build_tmux_runner_scripts(&inv, "echo hello", tmp.path(), None)
-                .expect("runner scripts should build");
+            build_tmux_runner_scripts(&inv, "echo hello", tmp.path(), None);
 
         let agent_cmd_script_path = tmp.path().join("agent_cmd.sh");
         assert!(
@@ -1027,8 +1005,7 @@ mod tests {
             "(version 1)".into(),
         ];
         let (_, agent_cmd_script) =
-            build_tmux_runner_scripts(&inv, "claude -p 'hi'", tmp.path(), Some(&argv))
-                .expect("runner scripts should build");
+            build_tmux_runner_scripts(&inv, "claude -p 'hi'", tmp.path(), Some(&argv));
         assert!(
             agent_cmd_script.contains(
                 "env -u TMUX -u TMUX_PANE -u SSH_AUTH_SOCK TMPDIR='"
@@ -1062,8 +1039,7 @@ mod tests {
         let mut inv = test_invocation("injection-test");
         inv.work_dir = std::path::PathBuf::from("/tmp/$(whoami)/workspace");
         inv.output_file = std::path::PathBuf::from("/tmp/evil`id`.json");
-        let script =
-            build_runner_script_in_dir(&inv, tmp.path()).expect("runner script should build");
+        let script = build_runner_script_in_dir(&inv, tmp.path());
 
         // Values must be single-quoted, neutralizing $() and backticks
         assert!(
