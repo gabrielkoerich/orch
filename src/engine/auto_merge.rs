@@ -402,6 +402,26 @@ async fn clear_ci_pending_since(
     Ok(())
 }
 
+/// Delete the CI timers of tasks that finished, and the bare-id keys older versions wrote
+pub(crate) async fn sweep_ci_timer_keys(
+    store: &Arc<TaskStore>,
+    repo: &str,
+    finished_task_ids: &[String],
+) -> anyhow::Result<()> {
+    for task_id in finished_task_ids {
+        store.kv_delete(&ci_check_ts_key(repo, task_id)).await?;
+        clear_ci_pending_since(store, repo, task_id, "task_finished").await?;
+    }
+    for prefix in ["ci_check_ts:", "ci_pending_since:"] {
+        for (key, _) in store.kv_list_prefix(prefix).await? {
+            if !key[prefix.len()..].contains('#') {
+                store.kv_delete(&key).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Handle a detected merge conflict by attempting a worktree rebase.
 ///
@@ -3468,5 +3488,42 @@ mod tests {
         record_ci_check(&store, "a/x", "5").await.unwrap();
         assert!(is_ci_check_in_cooldown(&store, "a/x", "5").await.unwrap());
         assert!(!is_ci_check_in_cooldown(&store, "b/x", "5").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn sweep_removes_finished_task_and_legacy_keys() {
+        use crate::store::TaskStore;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        record_ci_check(&store, REPO, "7").await.unwrap();
+        record_ci_check(&store, REPO, "8").await.unwrap();
+        store
+            .kv_set(&ci_pending_since_key(REPO, "7", SHA), "t")
+            .await
+            .unwrap();
+        store.kv_set("ci_check_ts:7", "t").await.unwrap();
+        store.kv_set("ci_pending_since:7", "t").await.unwrap();
+
+        sweep_ci_timer_keys(&store, REPO, &["7".to_string()])
+            .await
+            .unwrap();
+
+        assert!(store
+            .kv_get(&ci_check_ts_key(REPO, "7"))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .kv_list_prefix(&ci_pending_since_prefix(REPO, "7"))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store.kv_get("ci_check_ts:7").await.unwrap().is_none());
+        assert!(store.kv_get("ci_pending_since:7").await.unwrap().is_none());
+        assert!(store
+            .kv_get(&ci_check_ts_key(REPO, "8"))
+            .await
+            .unwrap()
+            .is_some());
     }
 }

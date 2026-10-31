@@ -288,6 +288,10 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
         "checking all terminal tasks for cleanup"
     );
 
+    if let Err(e) = crate::engine::auto_merge::sweep_ci_timer_keys(store, repo, &task_ids).await {
+        tracing::warn!(err = %e, "failed to sweep CI timer keys");
+    }
+
     // Prefetch all cleaned external IDs in one query instead of N+1 per-task lookups.
     // NOTE: This is now primarily a hint to skip processing, NOT a correctness
     // guarantee — tasks with external_id NOT in the store at all (or mismatched
