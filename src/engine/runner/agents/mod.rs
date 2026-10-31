@@ -1262,9 +1262,10 @@ pub(crate) mod patterns {
                 Some((pattern, byte_pos))
             })
             .min_by_key(|(_, byte_pos)| *byte_pos);
-        // "429" only when neither neighbor is a digit, so `"outputTokens":429` still
-        // matches and a UUID digit run like `4295` does not
-        let has_429 = contains_standalone_digits(&lower, "429");
+        // "429" only when neither neighbor is alphanumeric, so `"outputTokens":429` still
+        // matches and a UUID group like `4295` or `-429c-` does not
+        let pos_429 = find_standalone_digits(&lower, "429");
+        let has_429 = pos_429.is_some();
         // HTTP 529 is used by Cloudflare for rate limiting. Only match in HTTP status
         // contexts (e.g. "HTTP 529", "status: 529") to avoid false positives from bare
         // numbers like line numbers, port numbers, or file sizes.
@@ -1280,6 +1281,8 @@ pub(crate) mod patterns {
         if match_info.is_some() || has_429 || has_529 {
             let message = if let Some((_, pos)) = match_info {
                 extract_context_around(text, pos, 300)
+            } else if let Some(pos) = pos_429 {
+                extract_context_around(text, lower_offset_to_original_byte(text, &lower, pos), 300)
             } else {
                 safe_tail(text, 300).to_string()
             };
@@ -1309,8 +1312,9 @@ pub(crate) mod patterns {
         text[s..e].to_string()
     }
 
-    /// True when `digits` appears in `lower` with a non-digit (or string edge) on both sides
-    fn contains_standalone_digits(lower: &str, digits: &str) -> bool {
+    /// Byte offset of the first `digits` in `lower` with a non-alphanumeric (or string edge)
+    /// neighbour on both sides
+    fn find_standalone_digits(lower: &str, digits: &str) -> Option<usize> {
         let mut start = 0;
         while let Some(rel) = lower[start..].find(digits) {
             let pos = start + rel;
@@ -1318,19 +1322,19 @@ pub(crate) mod patterns {
                 || !lower[..pos]
                     .chars()
                     .next_back()
-                    .is_some_and(|c| c.is_ascii_digit());
+                    .is_some_and(|c| c.is_ascii_alphanumeric());
             let after = pos + digits.len();
             let after_ok = after >= lower.len()
                 || !lower[after..]
                     .chars()
                     .next()
-                    .is_some_and(|c| c.is_ascii_digit());
+                    .is_some_and(|c| c.is_ascii_alphanumeric());
             if before_ok && after_ok {
-                return true;
+                return Some(pos);
             }
             start = pos + 1;
         }
-        false
+        None
     }
 
     /// Returns true if `lower` contains the HTTP status `code` (e.g. "401") as a
@@ -3790,6 +3794,22 @@ world"}"#;
             patterns::detect_rate_limit(uuid).is_none(),
             "429 inside a UUID digit run must not match"
         );
+    }
+
+    #[test]
+    fn detect_rate_limit_ignores_429_in_uuid_hex_group() {
+        let hook = r#"{"type":"system","subtype":"hook_response","hook_id":"18db61b6-7b72-429c-8279-fae3089bf565"}"#;
+        assert!(patterns::detect_rate_limit(hook).is_none());
+    }
+
+    #[test]
+    fn detect_rate_limit_429_message_comes_from_matched_line() {
+        let filler = "unrelated agent prose that is long enough to fill the window. ".repeat(20);
+        let text = format!("HTTP 429 Too Many Requests\n{filler}");
+        match patterns::detect_rate_limit(&text) {
+            Some(AgentError::RateLimit { message }) => assert!(message.contains("429")),
+            other => panic!("expected RateLimit, got {other:?}"),
+        }
     }
 
     // Verify the guard logic that review.rs uses: when raw NDJSON has
