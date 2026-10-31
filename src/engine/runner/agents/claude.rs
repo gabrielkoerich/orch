@@ -486,6 +486,19 @@ impl AgentRunner for ClaudeRunner {
             None
         })();
 
+        // A kill signal (SIGTERM or SIGKILL) with no result envelope and no error event
+        // is an interrupted run, not a provider failure, so skip the text scan
+        let has_result_line = find_ndjson_result_line(stdout.trim()).is_some();
+        if matches!(exit_code, 143 | 137)
+            && !has_result_line
+            && error_result.is_none()
+            && system_error.is_none()
+        {
+            return AgentError::Interrupted {
+                message: format!("agent killed by signal (exit {exit_code})"),
+            };
+        }
+
         let combined = match (&error_result, &system_error) {
             (Some(r), Some(s)) => format!("{s}\n{r}\n{stdout}\n{stderr}"),
             (Some(r), None) => format!("{r}\n{stdout}\n{stderr}"),
@@ -1158,6 +1171,27 @@ mod tests {
         assert!(
             msg.contains("session limit"),
             "error message should contain the rate limit reason, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn classify_error_killed_run_with_429_in_uuid_hex_group_is_not_rate_limit() {
+        // Regression for issue #3956: `-429c-` in a hook id labelled a SIGTERM run RateLimit
+        let hook = r#"{"type":"system","subtype":"hook_response","hook_id":"18db61b6-7b72-429c-8279-fae3089bf565"}"#;
+        let prose = "the first lazy solution that works is the right one.\n".repeat(80);
+        let stdout = format!("{hook}\n{prose}");
+        assert!(stdout.len() > 3000);
+        for code in [143, 137, 1] {
+            let err = runner().classify_error(code, &stdout, "");
+            assert!(
+                !matches!(err, AgentError::RateLimit { .. }),
+                "exit {code} must not classify as RateLimit, got: {err:?}"
+            );
+        }
+        let err = runner().classify_error(143, &stdout, "");
+        assert!(
+            matches!(err, AgentError::Interrupted { .. }),
+            "got: {err:?}"
         );
     }
 
