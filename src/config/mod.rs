@@ -26,8 +26,8 @@ static CACHE: std::sync::LazyLock<RwLock<HashMap<PathBuf, serde_norway::Value>>>
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Files currently being watched for changes.
-static WATCHER: std::sync::LazyLock<RwLock<HashMap<PathBuf, ()>>> =
-    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+static WATCHER: std::sync::LazyLock<RwLock<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashSet::new()));
 
 /// Global file watcher instance (started on first use).
 static FILE_WATCHER: std::sync::LazyLock<Arc<Mutex<Option<RecommendedWatcher>>>> =
@@ -126,10 +126,10 @@ fn reload_file(path: &PathBuf) -> bool {
             if let Ok(mut cache) = CACHE.write() {
                 cache.insert(path.clone(), value);
             }
-            if let Ok(mut bad) = BAD_FILES.write() {
-                if bad.remove(path) {
-                    tracing::info!(path = %path.display(), "config file parses again, reloaded");
-                }
+            if let Ok(mut bad) = BAD_FILES.write()
+                && bad.remove(path)
+            {
+                tracing::info!(path = %path.display(), "config file parses again, reloaded");
             }
             tracing::debug!("config cache refreshed for: {}", path.display());
             // Notify subscribers (ignore error if no active receivers)
@@ -139,8 +139,7 @@ fn reload_file(path: &PathBuf) -> bool {
         Err(err) => {
             let first_failure = BAD_FILES
                 .write()
-                .map(|mut bad| bad.insert(path.clone()))
-                .unwrap_or(false);
+                .is_ok_and(|mut bad| bad.insert(path.clone()));
             if first_failure {
                 tracing::error!(
                     path = %path.display(),
@@ -155,7 +154,9 @@ fn reload_file(path: &PathBuf) -> bool {
 
 /// Start the file watcher if not already running.
 fn ensure_watcher() {
-    let mut watcher_guard = FILE_WATCHER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut watcher_guard = FILE_WATCHER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if watcher_guard.is_some() {
         return;
     }
@@ -164,7 +165,7 @@ fn ensure_watcher() {
     let watcher = RecommendedWatcher::new(
         move |res: Result<notify::Event, notify::Error>| {
             if let Ok(event) = res {
-                if !is_content_change(&event.kind) {
+                if !is_content_change(event.kind) {
                     return;
                 }
                 for path in event.paths {
@@ -187,7 +188,7 @@ fn ensure_watcher() {
 
 // inotify reports every read as an access event, and reload_file reads the file, so reacting to
 // access events reloads forever on Linux
-fn is_content_change(kind: &notify::EventKind) -> bool {
+fn is_content_change(kind: notify::EventKind) -> bool {
     kind.is_create() || kind.is_modify() || kind.is_remove()
 }
 
@@ -212,22 +213,22 @@ fn watch_file(path: &PathBuf) {
     ensure_watcher();
 
     // Track that we want to watch this file
-    if let Ok(mut watched) = WATCHER.write() {
-        if !watched.contains_key(path) {
-            watched.insert(path.clone(), ());
+    if let Ok(mut watched) = WATCHER.write()
+        && !watched.contains(path)
+    {
+        watched.insert(path.clone());
 
-            // Add to notify watcher
-            if let Ok(mut guard) = FILE_WATCHER.lock() {
-                if let Some(ref mut watcher) = *guard {
-                    match watcher.watch(path, RecursiveMode::NonRecursive) {
-                        Ok(()) => tracing::debug!("now watching config file: {}", path.display()),
-                        Err(e) => tracing::warn!(
-                            "failed to register config file watcher for {}: {}",
-                            path.display(),
-                            e
-                        ),
-                    }
-                }
+        // Add to notify watcher
+        if let Ok(mut guard) = FILE_WATCHER.lock()
+            && let Some(ref mut watcher) = *guard
+        {
+            match watcher.watch(path, RecursiveMode::NonRecursive) {
+                Ok(()) => tracing::debug!("now watching config file: {}", path.display()),
+                Err(e) => tracing::warn!(
+                    "failed to register config file watcher for {}: {}",
+                    path.display(),
+                    e
+                ),
             }
         }
     }
@@ -245,10 +246,10 @@ fn read_file_to_string(path: &Path) -> anyhow::Result<String> {
 }
 
 fn load_cached_root(path: &PathBuf) -> anyhow::Result<serde_norway::Value> {
-    if let Ok(cache) = CACHE.read() {
-        if let Some(cached) = cache.get(path) {
-            return Ok(cached.clone());
-        }
+    if let Ok(cache) = CACHE.read()
+        && let Some(cached) = cache.get(path)
+    {
+        return Ok(cached.clone());
     }
 
     let content =
@@ -292,12 +293,11 @@ pub fn get_list(key: &str) -> anyhow::Result<Vec<String>> {
     let project_path = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".orch.yml");
-    if project_path.exists() {
-        if let Ok(val) = resolve_list(&project_path, key) {
-            if !val.is_empty() {
-                return Ok(val);
-            }
-        }
+    if project_path.exists()
+        && let Ok(val) = resolve_list(&project_path, key)
+        && !val.is_empty()
+    {
+        return Ok(val);
     }
 
     // Fall back to global config
@@ -315,32 +315,32 @@ fn resolve_list(path: &PathBuf, key: &str) -> anyhow::Result<Vec<String>> {
 
     let root = load_cached_root(path)?;
 
-    extract_list(&root, key)
+    Ok(extract_list(&root, key))
 }
 
 /// Extract a list of strings from a YAML tree by dot-separated key.
-fn extract_list(root: &serde_norway::Value, key: &str) -> anyhow::Result<Vec<String>> {
+fn extract_list(root: &serde_norway::Value, key: &str) -> Vec<String> {
     let mut current = root;
     for part in key.split('.') {
         match current.get(part) {
             Some(v) => current = v,
-            None => return Ok(vec![]),
+            None => return vec![],
         }
     }
 
     match current {
-        serde_norway::Value::Sequence(seq) => Ok(seq
+        serde_norway::Value::Sequence(seq) => seq
             .iter()
             .filter_map(|item| item.as_str().map(String::from))
-            .collect()),
+            .collect(),
         serde_norway::Value::String(s) => {
             // Support comma-separated string format
-            Ok(s.split(',')
+            s.split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .collect())
+                .collect()
         }
-        _ => Ok(vec![]),
+        _ => vec![],
     }
 }
 
@@ -359,10 +359,10 @@ pub fn get(key: &str) -> anyhow::Result<String> {
     let project_path = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".orch.yml");
-    if project_path.exists() {
-        if let Ok(val) = resolve_key(&project_path, key) {
-            return Ok(val);
-        }
+    if project_path.exists()
+        && let Ok(val) = resolve_key(&project_path, key)
+    {
+        return Ok(val);
     }
 
     // Fall back to global config
@@ -377,10 +377,10 @@ pub fn get(key: &str) -> anyhow::Result<String> {
 /// Like [`get`], but reads the `.orch.yml` in `project_dir`, since the service runs from `/`
 pub fn get_for_project(project_dir: &std::path::Path, key: &str) -> anyhow::Result<String> {
     let project_path = project_dir.join(".orch.yml");
-    if project_path.exists() {
-        if let Ok(val) = resolve_key(&project_path, key) {
-            return Ok(val);
-        }
+    if project_path.exists()
+        && let Ok(val) = resolve_key(&project_path, key)
+    {
+        return Ok(val);
     }
 
     let global_path = global_config_path()?;
@@ -418,12 +418,11 @@ pub fn get_global(key: &str) -> anyhow::Result<String> {
 pub fn get_project_paths() -> anyhow::Result<Vec<String>> {
     let global_path = global_config_path()?;
 
-    if global_path.exists() {
-        if let Ok(paths) = resolve_projects_list(&global_path, "projects") {
-            if !paths.is_empty() {
-                return Ok(paths);
-            }
-        }
+    if global_path.exists()
+        && let Ok(paths) = resolve_projects_list(&global_path, "projects")
+        && !paths.is_empty()
+    {
+        return Ok(paths);
     }
 
     Ok(vec![])
@@ -453,16 +452,14 @@ pub fn get_projects_with_paths() -> anyhow::Result<Vec<(String, std::path::PathB
                 }
             };
 
-            if let Ok(content) = std::fs::read_to_string(&config_file) {
-                if let Ok(doc) = serde_norway::from_str::<serde_norway::Value>(&content) {
-                    if let Some(repo) = doc
-                        .get("gh")
-                        .and_then(|gh| gh.get("repo"))
-                        .and_then(|r| r.as_str())
-                    {
-                        results.push((repo.to_string(), path));
-                    }
-                }
+            if let Ok(content) = std::fs::read_to_string(&config_file)
+                && let Ok(doc) = serde_norway::from_str::<serde_norway::Value>(&content)
+                && let Some(repo) = doc
+                    .get("gh")
+                    .and_then(|gh| gh.get("repo"))
+                    .and_then(|r| r.as_str())
+            {
+                results.push((repo.to_string(), path));
             }
         }
 
@@ -472,10 +469,10 @@ pub fn get_projects_with_paths() -> anyhow::Result<Vec<(String, std::path::PathB
     }
 
     // Fall back to global gh.repo (no project dir available)
-    if let Ok(repo) = get("gh.repo") {
-        if !repo.is_empty() {
-            return Ok(vec![(repo, std::path::PathBuf::from("."))]);
-        }
+    if let Ok(repo) = get("gh.repo")
+        && !repo.is_empty()
+    {
+        return Ok(vec![(repo, std::path::PathBuf::from("."))]);
     }
 
     Ok(vec![])
@@ -532,24 +529,24 @@ pub fn find_project_root() -> anyhow::Result<std::path::PathBuf> {
 /// Falls back to global `gh.repo` for backward compatibility.
 pub fn get_current_repo() -> anyhow::Result<String> {
     // Try to find project root from CWD
-    if let Ok(project_root) = find_project_root() {
-        if let Ok(repo) = get_repo_for_project(&project_root) {
-            return Ok(repo);
-        }
+    if let Ok(project_root) = find_project_root()
+        && let Ok(repo) = get_repo_for_project(&project_root)
+    {
+        return Ok(repo);
     }
 
     // Fall back to per-project config in CWD (.orch.yml)
-    if let Ok(repo) = get("gh.repo") {
-        if !repo.is_empty() {
-            return Ok(repo);
-        }
+    if let Ok(repo) = get("gh.repo")
+        && !repo.is_empty()
+    {
+        return Ok(repo);
     }
 
     // Legacy fallback
-    if let Ok(repo) = get("repo") {
-        if !repo.is_empty() {
-            return Ok(repo);
-        }
+    if let Ok(repo) = get("repo")
+        && !repo.is_empty()
+    {
+        return Ok(repo);
     }
 
     anyhow::bail!("could not determine repo — ensure .orch.yml has gh.repo set")
@@ -581,13 +578,13 @@ pub fn get_skills() -> anyhow::Result<Vec<SkillConfig>> {
 
     let root = load_cached_root(&global_path)?;
 
-    extract_skills_list(&root)
+    Ok(extract_skills_list(&root))
 }
 
 /// Extract skills list from a YAML tree.
-fn extract_skills_list(root: &serde_norway::Value) -> anyhow::Result<Vec<SkillConfig>> {
+fn extract_skills_list(root: &serde_norway::Value) -> Vec<SkillConfig> {
     let Some(serde_norway::Value::Sequence(seq)) = root.get("skills") else {
-        return Ok(vec![]);
+        return vec![];
     };
 
     let mut skills = Vec::new();
@@ -605,7 +602,7 @@ fn extract_skills_list(root: &serde_norway::Value) -> anyhow::Result<Vec<SkillCo
         }
     }
 
-    Ok(skills)
+    skills
 }
 
 /// Resolve a projects list from a config file.
@@ -615,21 +612,16 @@ fn resolve_projects_list(path: &PathBuf, key: &str) -> anyhow::Result<Vec<String
 
     let root = load_cached_root(path)?;
 
-    // Try to extract projects list - if key doesn't exist, return empty vector
-    match extract_projects_list(&root, key) {
-        Ok(projects) => Ok(projects),
-        Err(_) => Ok(vec![]),
-    }
+    Ok(extract_projects_list(&root, key))
 }
 
 /// Extract a projects list from a YAML tree.
-fn extract_projects_list(root: &serde_norway::Value, key: &str) -> anyhow::Result<Vec<String>> {
+fn extract_projects_list(root: &serde_norway::Value, key: &str) -> Vec<String> {
     let mut current = root;
     for part in key.split('.') {
         // If key doesn't exist, return empty vector
-        let next = match current.get(part) {
-            Some(v) => v,
-            None => return Ok(vec![]),
+        let Some(next) = current.get(part) else {
+            return vec![];
         };
         current = next;
     }
@@ -647,9 +639,9 @@ fn extract_projects_list(root: &serde_norway::Value, key: &str) -> anyhow::Resul
                     }
                 }
             }
-            Ok(projects)
+            projects
         }
-        _ => Ok(vec![]),
+        _ => vec![],
     }
 }
 
@@ -776,7 +768,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_yaml(dir.path(), "config.yml", "repo: owner/single-repo\n");
         let projects = resolve_projects_list(&path, "projects").unwrap();
-        assert!(projects.is_empty());
+        assert!(projects.is_empty(), "{projects:?}");
     }
 
     #[test]
@@ -784,7 +776,7 @@ mod tests {
         let yaml =
             serde_norway::from_str::<serde_norway::Value>("projects:\n  - a\n  - b\n  - c\n")
                 .unwrap();
-        let projects = extract_projects_list(&yaml, "projects").unwrap();
+        let projects = extract_projects_list(&yaml, "projects");
         assert_eq!(projects, vec!["a", "b", "c"]);
     }
 
@@ -793,15 +785,15 @@ mod tests {
         let yaml =
             serde_norway::from_str::<serde_norway::Value>("projects:\n  - repo: a\n  - repo: b\n")
                 .unwrap();
-        let projects = extract_projects_list(&yaml, "projects").unwrap();
+        let projects = extract_projects_list(&yaml, "projects");
         assert_eq!(projects, vec!["a", "b"]);
     }
 
     #[test]
     fn extract_projects_list_empty_for_missing() {
         let yaml = serde_norway::from_str::<serde_norway::Value>("foo: bar").unwrap();
-        let projects = extract_projects_list(&yaml, "projects").unwrap();
-        assert!(projects.is_empty());
+        let projects = extract_projects_list(&yaml, "projects");
+        assert!(projects.is_empty(), "{projects:?}");
     }
 
     #[test]
@@ -817,7 +809,7 @@ mod tests {
         loop {
             match rx.try_recv() {
                 Ok(received_path) if received_path == path => break,
-                Ok(_) => continue, // skip notifications from other tests
+                Ok(_) => {} // skip notifications from other tests
                 Err(e) => panic!("expected config change notification, got error: {e:?}"),
             }
         }
@@ -836,7 +828,7 @@ mod tests {
         let find_path = |rx: &mut tokio::sync::broadcast::Receiver<PathBuf>, expected: &PathBuf| loop {
             match rx.try_recv() {
                 Ok(p) if &p == expected => return,
-                Ok(_) => continue,
+                Ok(_) => {}
                 Err(e) => panic!("expected config change notification, got error: {e:?}"),
             }
         };
@@ -873,7 +865,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_yaml(dir.path(), "config.yml", "foo: bar\n");
         let list = resolve_list(&path, "workflow.allowed_tools").unwrap();
-        assert!(list.is_empty());
+        assert!(list.is_empty(), "{list:?}");
     }
 
     #[test]
@@ -882,7 +874,7 @@ mod tests {
             "skills:\n  - repo: owner/skills1\n  - repo: owner/skills2\n",
         )
         .unwrap();
-        let skills = extract_skills_list(&yaml).unwrap();
+        let skills = extract_skills_list(&yaml);
         assert_eq!(skills.len(), 2);
         assert_eq!(skills[0].repo, "owner/skills1");
         assert_eq!(skills[1].repo, "owner/skills2");
@@ -893,7 +885,7 @@ mod tests {
         let yaml =
             serde_norway::from_str::<serde_norway::Value>("skills:\n  - repo: owner/skills\n")
                 .unwrap();
-        let skills = extract_skills_list(&yaml).unwrap();
+        let skills = extract_skills_list(&yaml);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].repo, "owner/skills");
     }
@@ -908,22 +900,22 @@ mod tests {
     }
 
     fn cached_projects(path: &PathBuf) -> Vec<String> {
-        extract_projects_list(&load_cached_root(path).unwrap(), "projects").unwrap()
+        extract_projects_list(&load_cached_root(path).unwrap(), "projects")
     }
 
     #[test]
     fn reading_a_config_file_does_not_trigger_a_reload() {
         use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, ModifyKind};
-        assert!(!is_content_change(&notify::EventKind::Access(
+        assert!(!is_content_change(notify::EventKind::Access(
             AccessKind::Open(AccessMode::Read)
         )));
-        assert!(!is_content_change(&notify::EventKind::Access(
+        assert!(!is_content_change(notify::EventKind::Access(
             AccessKind::Close(AccessMode::Read)
         )));
-        assert!(is_content_change(&notify::EventKind::Modify(
+        assert!(is_content_change(notify::EventKind::Modify(
             ModifyKind::Data(DataChange::Content)
         )));
-        assert!(is_content_change(&notify::EventKind::Create(
+        assert!(is_content_change(notify::EventKind::Create(
             CreateKind::File
         )));
     }
@@ -981,20 +973,22 @@ mod tests {
         );
         write_yaml(home.path(), "config.yml", "workflow:\n  sandbox: os\n");
         write_yaml(with.path(), ".orch.yml", "workflow:\n  sandbox: false\n");
-        std::env::set_var("ORCH_HOME", home.path());
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", home.path()) };
 
         let got = (
             get_for_project(with.path(), "workflow.sandbox").unwrap(),
             get_for_project(without.path(), "workflow.sandbox").unwrap(),
         );
-        std::env::remove_var("ORCH_HOME");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::remove_var("ORCH_HOME") };
         assert_eq!(got, ("false".to_string(), "os".to_string()));
     }
 
     #[test]
     fn extract_skills_list_empty_for_missing() {
         let yaml = serde_norway::from_str::<serde_norway::Value>("foo: bar").unwrap();
-        let skills = extract_skills_list(&yaml).unwrap();
+        let skills = extract_skills_list(&yaml);
         assert!(skills.is_empty());
     }
 }

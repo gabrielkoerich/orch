@@ -8,8 +8,8 @@ use crate::backends::{BlockedByFetch, ExternalBackend, ExternalId, PullRequestCo
 use crate::channels::notification::TaskNotification;
 use crate::channels::transport::Transport;
 use crate::store::{
-    blocker_failure_kind, blocker_is_satisfied, dep_label, BlockerSnapshot, DepSource,
-    NewDependency, ObservedPullRequest, TaskStore,
+    BlockerSnapshot, DepSource, NewDependency, ObservedPullRequest, TaskStore,
+    blocker_failure_kind, blocker_is_satisfied, dep_label,
 };
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -33,7 +33,7 @@ fn blocker_refresh_ttl_secs(repo: &str, number: i64) -> i64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     repo.hash(&mut hasher);
     number.hash(&mut hasher);
-    let offset = (hasher.finish() % BLOCKER_REFRESH_SPREAD_SECS as u64) as i64;
+    let offset = i64::try_from(hasher.finish() % BLOCKER_REFRESH_SPREAD_SECS as u64).unwrap_or(0);
     BLOCKER_REFRESH_TTL_SECS + offset
 }
 
@@ -117,11 +117,7 @@ fn dependency_line_rest(trimmed: &str) -> Option<&str> {
         .trim_start()
         .trim_start_matches(':')
         .trim();
-    if rest.is_empty() {
-        None
-    } else {
-        Some(rest)
-    }
+    if rest.is_empty() { None } else { Some(rest) }
 }
 
 /// One `--depends-on` token: a bare issue number, `#12`, or `owner/repo#12`
@@ -130,13 +126,14 @@ pub fn parse_depends_on_token(token: &str, default_repo: &str) -> Option<DepRef>
     if trimmed.is_empty() {
         return None;
     }
-    if let Ok(number) = trimmed.parse::<i64>() {
-        if number > 0 && !default_repo.is_empty() {
-            return Some(DepRef {
-                repo: default_repo.to_string(),
-                number,
-            });
-        }
+    if let Ok(number) = trimmed.parse::<i64>()
+        && number > 0
+        && !default_repo.is_empty()
+    {
+        return Some(DepRef {
+            repo: default_repo.to_string(),
+            number,
+        });
     }
     extract_refs(trimmed, default_repo).into_iter().next()
 }
@@ -152,7 +149,7 @@ fn extract_refs(text: &str, default_repo: &str) -> Vec<DepRef> {
         }
         let digits: String = text[index + 1..]
             .chars()
-            .take_while(|ch| ch.is_ascii_digit())
+            .take_while(char::is_ascii_digit)
             .collect();
         if digits.is_empty() {
             index += 1;
@@ -273,14 +270,12 @@ pub async fn sync_issue_dependencies(
                 .get_by_external_id(&dep.repo, &dep.number.to_string())
                 .await?
                 .is_none()
-        {
-            if let Ok(Some((state, reason))) =
+            && let Ok(Some((state, reason))) =
                 backend.issue_close_state(&dep.repo, dep.number).await
-            {
-                store
-                    .note_blocker_issue_state(&dep.repo, dep.number, &state, reason.as_deref())
-                    .await?;
-            }
+        {
+            store
+                .note_blocker_issue_state(&dep.repo, dep.number, &state, reason.as_deref())
+                .await?;
         }
         rows.push(NewDependency {
             repo: dep.repo,
@@ -336,12 +331,11 @@ pub async fn reconcile_dependencies(
             continue;
         };
         let key = format!("dep_synced_at:{}", task.id);
-        if let Ok(Some(prev)) = store.kv_get(&key).await {
-            if let Ok(prev) = prev.parse::<i64>() {
-                if now.saturating_sub(prev) < DEP_SYNC_TTL_SECS {
-                    continue;
-                }
-            }
+        if let Ok(Some(prev)) = store.kv_get(&key).await
+            && let Ok(prev) = prev.parse::<i64>()
+            && now.saturating_sub(prev) < DEP_SYNC_TTL_SECS
+        {
+            continue;
         }
         match sync_issue_dependencies(
             backend,
@@ -427,12 +421,11 @@ async fn refresh_one_blocker(
 
     let key = blocker_read_key(repo, number);
     let now = chrono::Utc::now().timestamp();
-    if let Ok(Some(prev)) = store.kv_get(&key).await {
-        if let Ok(prev) = prev.parse::<i64>() {
-            if now.saturating_sub(prev) < blocker_refresh_ttl_secs(repo, number) {
-                return Ok(());
-            }
-        }
+    if let Ok(Some(prev)) = store.kv_get(&key).await
+        && let Ok(prev) = prev.parse::<i64>()
+        && now.saturating_sub(prev) < blocker_refresh_ttl_secs(repo, number)
+    {
+        return Ok(());
     }
 
     store.kv_set(&key, &now.to_string()).await?;
@@ -558,24 +551,24 @@ pub async fn emit_dependency_notices(
                 );
             }
         }
-        if notice.notify {
-            if let Some(transport) = transport {
-                transport.push_notification(TaskNotification {
-                    task_id: if notice.issue_number > 0 {
-                        notice.issue_number.to_string()
-                    } else {
-                        notice.task_id.to_string()
-                    },
-                    title: notice.title.clone(),
-                    status: "failed".to_string(),
-                    agent: "orch".to_string(),
-                    duration_seconds: 0.0,
-                    summary: notice.summary.clone(),
-                    repo: Some(notice.repo.clone()),
-                    notify_target: None,
-                    pr_number: None,
-                });
-            }
+        if notice.notify
+            && let Some(transport) = transport
+        {
+            transport.push_notification(TaskNotification {
+                task_id: if notice.issue_number > 0 {
+                    notice.issue_number.to_string()
+                } else {
+                    notice.task_id.to_string()
+                },
+                title: notice.title.clone(),
+                status: "failed".to_string(),
+                agent: "orch".to_string(),
+                duration_seconds: 0.0,
+                summary: notice.summary.clone(),
+                repo: Some(notice.repo.clone()),
+                notify_target: None,
+                pr_number: None,
+            });
         }
     }
     Ok(notices)
@@ -701,19 +694,16 @@ async fn failure_notices(store: &TaskStore) -> anyhow::Result<Vec<DepNotice>> {
             &edge.depends_on_repo,
             edge.depends_on_number,
         );
-        let (comment, summary) = match kind {
-            "not_planned" => {
-                let text = format!(
-                    "Blocked by {label}, which was closed as not planned. This task stays waiting."
-                );
-                (format!("{text}{}", crate::engine::orch_footer()), text)
-            }
-            _ => {
-                let text = format!(
-                    "Blocked by {label}, which is blocked and needs a person. This task stays waiting."
-                );
-                (format!("{text}{}", crate::engine::orch_footer()), text)
-            }
+        let (comment, summary) = if kind == "not_planned" {
+            let text = format!(
+                "Blocked by {label}, which was closed as not planned. This task stays waiting."
+            );
+            (format!("{text}{}", crate::engine::orch_footer()), text)
+        } else {
+            let text = format!(
+                "Blocked by {label}, which is blocked and needs a person. This task stays waiting."
+            );
+            (format!("{text}{}", crate::engine::orch_footer()), text)
         };
         let issue_number = edge
             .task_external_id
@@ -903,7 +893,7 @@ See #4 in the notes
 
     #[async_trait]
     impl ExternalBackend for ScriptedBackend {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "scripted"
         }
 
@@ -996,28 +986,27 @@ See #4 in the notes
                 .get(&pr_number)
                 .cloned()
                 .unwrap_or(None);
-            if let Some(ref mut done) = completion {
-                if !done.approved {
-                    let comments = self
-                        .review_comments
-                        .lock()
-                        .unwrap()
-                        .get(&pr_number)
-                        .cloned()
-                        .unwrap_or_default();
-                    let reviewer = self.reviewer.lock().unwrap().clone().unwrap_or_default();
-                    let mapped: Vec<crate::backends::github::AutomatedReviewComment<'_>> = comments
-                        .iter()
-                        .map(|comment| crate::backends::github::AutomatedReviewComment {
-                            login: &comment.login,
-                            body: &comment.body,
-                            created_at: &comment.created_at,
-                        })
-                        .collect();
-                    done.approved = crate::backends::github::latest_automated_review_approves(
-                        &mapped, &reviewer,
-                    );
-                }
+            if let Some(ref mut done) = completion
+                && !done.approved
+            {
+                let comments = self
+                    .review_comments
+                    .lock()
+                    .unwrap()
+                    .get(&pr_number)
+                    .cloned()
+                    .unwrap_or_default();
+                let reviewer = self.reviewer.lock().unwrap().clone().unwrap_or_default();
+                let mapped: Vec<crate::backends::github::AutomatedReviewComment<'_>> = comments
+                    .iter()
+                    .map(|comment| crate::backends::github::AutomatedReviewComment {
+                        login: &comment.login,
+                        body: &comment.body,
+                        created_at: &comment.created_at,
+                    })
+                    .collect();
+                done.approved =
+                    crate::backends::github::latest_automated_review_approves(&mapped, &reviewer);
             }
             Ok(completion)
         }
@@ -1268,16 +1257,20 @@ See #4 in the notes
             .await
             .unwrap();
         assert_eq!(first.len(), 2);
-        assert!(first
-            .iter()
-            .all(|notice| notice.comment.contains("owner/repo#1")));
-        assert!(first
-            .iter()
-            .all(|notice| notice.comment.contains("owner/repo#2")));
+        assert!(
+            first
+                .iter()
+                .all(|notice| notice.comment.contains("owner/repo#1"))
+        );
+        assert!(
+            first
+                .iter()
+                .all(|notice| notice.comment.contains("owner/repo#2"))
+        );
         let second = emit_dependency_notices(&backend, &store, None)
             .await
             .unwrap();
-        assert!(second.is_empty());
+        assert!(second.is_empty(), "{second:?}");
         assert_eq!(backend.comments.lock().unwrap().len(), 2);
     }
 
@@ -1307,7 +1300,7 @@ See #4 in the notes
         let again = emit_dependency_notices(&backend, &store, Some(&transport))
             .await
             .unwrap();
-        assert!(again.is_empty());
+        assert!(again.is_empty(), "{again:?}");
         let note = rx.try_recv().unwrap();
         assert_eq!(note.status, "failed");
         assert!(rx.try_recv().is_err());
@@ -1318,7 +1311,7 @@ See #4 in the notes
     async fn waiting_task_is_not_routed_until_the_blocker_is_done() {
         use crate::engine::router::{Router, RouterConfig};
         use crate::engine::tasks::TaskManager;
-        use crate::engine::tick::{tick_route_tasks, RoutingTickQuota};
+        use crate::engine::tick::{RoutingTickQuota, tick_route_tasks};
 
         crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
@@ -1339,8 +1332,8 @@ See #4 in the notes
         let backend: Arc<dyn ExternalBackend> =
             Arc::new(crate::backends::test_helpers::NoopBackend);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".into(),
         ));
         let mut tier = HashMap::new();
@@ -1385,9 +1378,10 @@ See #4 in the notes
             .route(&ext, &store, "owner/repo")
             .await
             .unwrap_err();
-        assert!(err
-            .downcast_ref::<crate::store::WaitingOnDependency>()
-            .is_some());
+        assert!(
+            err.downcast_ref::<crate::store::WaitingOnDependency>()
+                .is_some()
+        );
         assert_eq!(store.get(b).await.unwrap().status, TaskStatus::Waiting);
         assert_eq!(store.get(b).await.unwrap().route_attempts, 0);
 
@@ -1470,9 +1464,10 @@ See #4 in the notes
         };
         let mut router = Router::new_for_test(config, vec!["claude".into()]);
         let err = router.route(&ext, &store, "owner/repo").await.unwrap_err();
-        assert!(err
-            .downcast_ref::<crate::store::WaitingOnDependency>()
-            .is_some());
+        assert!(
+            err.downcast_ref::<crate::store::WaitingOnDependency>()
+                .is_some()
+        );
         assert_eq!(store.get(b).await.unwrap().status, TaskStatus::Waiting);
         assert_eq!(store.get(b).await.unwrap().route_attempts, 0);
     }
@@ -1570,8 +1565,8 @@ See #4 in the notes
         assert!(first > 0, "the first refresh has to read the blocker");
 
         let task_manager = TaskManager::with_store(
-            backend.clone() as Arc<dyn ExternalBackend>,
-            store.clone(),
+            std::sync::Arc::clone(&backend) as Arc<dyn ExternalBackend>,
+            std::sync::Arc::clone(&store),
             "owner/repo".into(),
         );
         task_manager
@@ -1598,8 +1593,8 @@ See #4 in the notes
 
         // `#1` has no task row here, so finishing the dependent must not clear its entry
         let task_manager = TaskManager::with_store(
-            backend.clone() as Arc<dyn ExternalBackend>,
-            store.clone(),
+            std::sync::Arc::clone(&backend) as Arc<dyn ExternalBackend>,
+            std::sync::Arc::clone(&store),
             "owner/repo".into(),
         );
         task_manager
@@ -1886,8 +1881,8 @@ See #4 in the notes
             model_map,
             ..Default::default()
         };
-        let left_store = store.clone();
-        let right_store = store.clone();
+        let left_store = std::sync::Arc::clone(&store);
+        let right_store = std::sync::Arc::clone(&store);
         let left_task = ext.clone();
         let right_task = ext;
         let right_config = config.clone();

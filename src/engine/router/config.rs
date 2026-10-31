@@ -228,7 +228,10 @@ impl Default for RouterConfig {
             router_model: "haiku".to_string(),
             timeout_seconds: 45,
             fallback_executor: "codex".to_string(),
-            agents: DEFAULT_AGENTS.iter().map(|s| s.to_string()).collect(),
+            agents: DEFAULT_AGENTS
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             max_route_attempts: 3,
             pool: vec![],
             fallback: String::new(),
@@ -269,47 +272,46 @@ impl RouterConfig {
         let mut config = Self::default();
 
         // Try to load from config
-        if let Ok(mode) = crate::config::get("router.mode") {
-            if mode == "round_robin" || mode == "llm" || mode == "local" {
-                config.mode = mode;
-            }
+        if let Ok(mode) = crate::config::get("router.mode")
+            && (mode == "round_robin" || mode == "llm" || mode == "local")
+        {
+            config.mode = mode;
         }
 
-        if let Ok(agent) = crate::config::get("router.agent") {
-            if !agent.is_empty() {
-                config.router_agent = agent;
-            }
+        if let Ok(agent) = crate::config::get("router.agent")
+            && !agent.is_empty()
+        {
+            config.router_agent = agent;
         }
 
-        if let Ok(model) = crate::config::get("router.model") {
-            if !model.is_empty() {
-                config.router_model = RouterConfig::normalize_model_identifier(&model);
-            }
+        if let Ok(model) = crate::config::get("router.model")
+            && !model.is_empty()
+        {
+            config.router_model = RouterConfig::normalize_model_identifier(&model);
         }
 
-        if let Ok(timeout) = crate::config::get("router.timeout_seconds") {
-            if let Ok(secs) = timeout.parse::<u64>() {
-                let clamped = secs.min(MAX_ROUTER_TIMEOUT_SECS);
-                if clamped != secs {
-                    static TIMEOUT_CLAMP_WARNED: std::sync::OnceLock<()> =
-                        std::sync::OnceLock::new();
-                    TIMEOUT_CLAMP_WARNED.get_or_init(|| {
-                        tracing::warn!(
-                            configured_secs = secs,
-                            applied_secs = clamped,
-                            max_secs = MAX_ROUTER_TIMEOUT_SECS,
-                            "router.timeout_seconds is too high; clamping to keep routing responsive"
-                        );
-                    });
-                }
-                config.timeout_seconds = clamped;
+        if let Ok(timeout) = crate::config::get("router.timeout_seconds")
+            && let Ok(secs) = timeout.parse::<u64>()
+        {
+            let clamped = secs.min(MAX_ROUTER_TIMEOUT_SECS);
+            if clamped != secs {
+                static TIMEOUT_CLAMP_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                TIMEOUT_CLAMP_WARNED.get_or_init(|| {
+                    tracing::warn!(
+                        configured_secs = secs,
+                        applied_secs = clamped,
+                        max_secs = MAX_ROUTER_TIMEOUT_SECS,
+                        "router.timeout_seconds is too high; clamping to keep routing responsive"
+                    );
+                });
             }
+            config.timeout_seconds = clamped;
         }
 
-        if let Ok(fallback) = crate::config::get("router.fallback_executor") {
-            if !fallback.is_empty() {
-                config.fallback_executor = fallback;
-            }
+        if let Ok(fallback) = crate::config::get("router.fallback_executor")
+            && !fallback.is_empty()
+        {
+            config.fallback_executor = fallback;
         }
 
         // Parse agents list from top-level `agents:` config key
@@ -341,26 +343,27 @@ impl RouterConfig {
             }
         }
 
-        if let Ok(max_attempts) = crate::config::get("router.max_route_attempts") {
-            if let Ok(n) = max_attempts.parse::<u32>() {
-                config.max_route_attempts = n;
-            }
+        if let Ok(max_attempts) = crate::config::get("router.max_route_attempts")
+            && let Ok(n) = max_attempts.parse::<u32>()
+        {
+            config.max_route_attempts = n;
         }
 
         // Parse allowed_tools as comma-separated or YAML array
-        if let Ok(tools_str) = crate::config::get("router.allowed_tools") {
-            if !tools_str.is_empty() && tools_str != "[]" {
-                // Try to parse as JSON/YAML array first
-                if let Ok(tools_arr) = serde_json::from_str::<Vec<String>>(&tools_str) {
-                    config.allowed_tools = tools_arr;
-                } else {
-                    // Fall back to comma-separated
-                    config.allowed_tools = tools_str
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                }
+        if let Ok(tools_str) = crate::config::get("router.allowed_tools")
+            && !tools_str.is_empty()
+            && tools_str != "[]"
+        {
+            // Try to parse as JSON/YAML array first
+            if let Ok(tools_arr) = serde_json::from_str::<Vec<String>>(&tools_str) {
+                config.allowed_tools = tools_arr;
+            } else {
+                // Fall back to comma-separated
+                config.allowed_tools = tools_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
             }
         }
 
@@ -370,39 +373,38 @@ impl RouterConfig {
         }
 
         // Parse self_routing_penalty
-        if let Ok(val) = crate::config::get("router.self_routing_penalty") {
-            if let Ok(penalty) = val.parse::<f64>() {
-                config.self_routing_penalty = penalty.clamp(0.0, 1.0);
-            }
+        if let Ok(val) = crate::config::get("router.self_routing_penalty")
+            && let Ok(penalty) = val.parse::<f64>()
+        {
+            config.self_routing_penalty = penalty.clamp(0.0, 1.0);
         }
 
         // Parse per-agent weights from router.weights.<agent>
         for agent in &config.agents {
             let key = format!("router.weights.{agent}");
-            if let Ok(val) = crate::config::get(&key) {
-                if let Ok(w) = val.parse::<f64>() {
-                    config.weights.insert(agent.clone(), w.max(0.0));
-                }
+            if let Ok(val) = crate::config::get(&key)
+                && let Ok(w) = val.parse::<f64>()
+            {
+                config.weights.insert(agent.clone(), w.max(0.0));
             }
         }
 
         // Parse per-agent backoff base seconds from router.backoff_base.<agent>
         for agent in &config.agents {
             let key = format!("router.backoff_base.{agent}");
-            if let Ok(val) = crate::config::get(&key) {
-                if let Ok(secs) = val.parse::<i64>() {
-                    config.agent_backoff_bases.insert(agent.clone(), secs);
-                }
+            if let Ok(val) = crate::config::get(&key)
+                && let Ok(secs) = val.parse::<i64>()
+            {
+                config.agent_backoff_bases.insert(agent.clone(), secs);
             }
         }
 
         // Parse max_tasks_per_tick
-        if let Ok(val) = crate::config::get("router.max_tasks_per_tick") {
-            if let Ok(n) = val.parse::<usize>() {
-                if n > 0 {
-                    config.max_tasks_per_tick = n;
-                }
-            }
+        if let Ok(val) = crate::config::get("router.max_tasks_per_tick")
+            && let Ok(n) = val.parse::<usize>()
+            && n > 0
+        {
+            config.max_tasks_per_tick = n;
         }
 
         // Parse pool: list of "agent:model" entries.
@@ -428,10 +430,10 @@ impl RouterConfig {
         }
 
         // Parse fallback: single "agent:model" entry
-        if let Ok(fallback) = crate::config::get("router.fallback") {
-            if !fallback.is_empty() {
-                config.fallback = fallback;
-            }
+        if let Ok(fallback) = crate::config::get("router.fallback")
+            && !fallback.is_empty()
+        {
+            config.fallback = fallback;
         }
 
         // Load top-level model shorthand from config (models.{agent}).
@@ -449,7 +451,7 @@ impl RouterConfig {
                         .model_map
                         .entry(complexity.to_string())
                         .or_default()
-                        .insert(agent.to_string(), models.clone());
+                        .insert(agent.clone(), models.clone());
                 }
             }
         }
@@ -466,7 +468,7 @@ impl RouterConfig {
                         .model_map
                         .entry(complexity.to_string())
                         .or_default()
-                        .insert(agent.to_string(), models);
+                        .insert(agent.clone(), models);
                 }
             }
         }
@@ -487,16 +489,16 @@ impl RouterConfig {
             let discovered: std::collections::HashSet<String> =
                 discovered_opencode.into_iter().collect();
             for complexity in known_complexities {
-                if let Some(agent_models) = config.model_map.get(complexity) {
-                    if let Some(models) = agent_models.get("opencode") {
-                        for model in models {
-                            if model != "opencode:free" && !discovered.contains(model) {
-                                tracing::warn!(
-                                    complexity,
-                                    model,
-                                    "opencode model from config not present in provider model list; pruning from dispatch pool"
-                                );
-                            }
+                if let Some(agent_models) = config.model_map.get(complexity)
+                    && let Some(models) = agent_models.get("opencode")
+                {
+                    for model in models {
+                        if model != "opencode:free" && !discovered.contains(model) {
+                            tracing::warn!(
+                                complexity,
+                                model,
+                                "opencode model from config not present in provider model list; pruning from dispatch pool"
+                            );
                         }
                     }
                 }
@@ -512,37 +514,37 @@ impl RouterConfig {
         }
 
         // Parse default_skills
-        if let Ok(skills_str) = crate::config::get("router.default_skills") {
-            if !skills_str.is_empty() && skills_str != "[]" {
-                if let Ok(skills_arr) = serde_json::from_str::<Vec<String>>(&skills_str) {
-                    config.default_skills = skills_arr;
-                } else {
-                    config.default_skills = skills_str
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                }
+        if let Ok(skills_str) = crate::config::get("router.default_skills")
+            && !skills_str.is_empty()
+            && skills_str != "[]"
+        {
+            if let Ok(skills_arr) = serde_json::from_str::<Vec<String>>(&skills_str) {
+                config.default_skills = skills_arr;
+            } else {
+                config.default_skills = skills_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
             }
         }
 
         // Parse Ollama-specific config for local routing mode
-        if let Ok(url) = crate::config::get("router.ollama_url") {
-            if !url.is_empty() {
-                config.ollama_url = url;
-            }
+        if let Ok(url) = crate::config::get("router.ollama_url")
+            && !url.is_empty()
+        {
+            config.ollama_url = url;
         }
-        if let Ok(model) = crate::config::get("router.ollama_model") {
-            if !model.is_empty() {
-                config.ollama_model = model;
-            }
+        if let Ok(model) = crate::config::get("router.ollama_model")
+            && !model.is_empty()
+        {
+            config.ollama_model = model;
         }
-        if let Ok(timeout) = crate::config::get("router.ollama_timeout_seconds") {
-            if let Ok(secs) = timeout.parse::<u64>() {
-                if secs > 0 {
-                    config.ollama_timeout_seconds = secs;
-                }
-            }
+        if let Ok(timeout) = crate::config::get("router.ollama_timeout_seconds")
+            && let Ok(secs) = timeout.parse::<u64>()
+            && secs > 0
+        {
+            config.ollama_timeout_seconds = secs;
         }
 
         config
@@ -550,19 +552,19 @@ impl RouterConfig {
 
     /// Return the effective pool — the configured pool, or a single-entry pool from `router_agent:router_model`.
     pub fn effective_pool(&self) -> Vec<String> {
-        if !self.pool.is_empty() {
-            self.pool.clone()
-        } else {
+        if self.pool.is_empty() {
             vec![format!("{}:{}", self.router_agent, self.router_model)]
+        } else {
+            self.pool.clone()
         }
     }
 
     /// Return the effective fallback entry — the configured fallback, or `router_agent:router_model`.
     pub fn effective_fallback(&self) -> String {
-        if !self.fallback.is_empty() {
-            self.fallback.clone()
-        } else {
+        if self.fallback.is_empty() {
             format!("{}:{}", self.router_agent, self.router_model)
+        } else {
+            self.fallback.clone()
         }
     }
 
@@ -599,17 +601,22 @@ impl RouterConfig {
     }
 
     fn read_model_pool_from_config(key: &str) -> Option<Vec<String>> {
-        if let Ok(list) = crate::config::get_list(key) {
-            if !list.is_empty() {
-                return Some(
-                    list.iter()
-                        .map(|m| RouterConfig::normalize_model_identifier(m))
-                        .collect(),
-                );
+        match crate::config::get_list(key) {
+            Ok(list) => {
+                if !list.is_empty() {
+                    return Some(
+                        list.iter()
+                            .map(|m| RouterConfig::normalize_model_identifier(m))
+                            .collect(),
+                    );
+                }
             }
-        } else if let Ok(val) = crate::config::get(key) {
-            if !val.is_empty() {
-                return Some(vec![RouterConfig::normalize_model_identifier(&val)]);
+            _ => {
+                if let Ok(val) = crate::config::get(key)
+                    && !val.is_empty()
+                {
+                    return Some(vec![RouterConfig::normalize_model_identifier(&val)]);
+                }
             }
         }
 
@@ -760,7 +767,7 @@ impl RouterConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{RouterConfig, MAX_ROUTER_TIMEOUT_SECS};
+    use super::{MAX_ROUTER_TIMEOUT_SECS, RouterConfig};
     use serial_test::serial;
     use std::sync::{Mutex, OnceLock};
 
@@ -907,8 +914,8 @@ mod tests {
     #[test]
     fn default_self_routing_penalty_is_one() {
         let config = RouterConfig::default();
-        assert_eq!(
-            config.self_routing_penalty, 1.0,
+        assert!(
+            (config.self_routing_penalty - 1.0).abs() < f64::EPSILON,
             "default penalty must be 1.0 (no penalty = full self-routing allowed)"
         );
     }
@@ -926,7 +933,7 @@ mod tests {
         let _guard = CurrentDirGuard::set(dir.path());
 
         let config = RouterConfig::from_config();
-        assert_eq!(config.self_routing_penalty, 0.5);
+        assert!((config.self_routing_penalty - 0.5).abs() < f64::EPSILON);
     }
 
     #[serial(cooldown_state)]
@@ -1047,7 +1054,7 @@ mod tests {
         // Simulate a config with a custom agent (olm) in both agents and model_map
         std::fs::write(
             dir.path().join(".orch.yml"),
-            r#"
+            r"
 agents:
   - claude
   - olm
@@ -1061,7 +1068,7 @@ model_map:
   complex:
     claude: opus
     olm: gemma4
-"#,
+",
         )
         .unwrap();
         let _guard = CurrentDirGuard::set(dir.path());
@@ -1093,14 +1100,14 @@ model_map:
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".orch.yml"),
-            r#"
+            r"
 agents:
   - shorthand
 models:
   shorthand:
     - gpt-5.2
     - gpt-5.5
-"#,
+",
         )
         .unwrap();
         let _guard = CurrentDirGuard::set(dir.path());
@@ -1123,12 +1130,12 @@ models:
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".orch.yml"),
-            r#"
+            r"
 agents:
   - shorthand
 models:
   shorthand: gpt-5.2
-"#,
+",
         )
         .unwrap();
         let _guard = CurrentDirGuard::set(dir.path());
@@ -1151,7 +1158,7 @@ models:
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".orch.yml"),
-            r#"
+            r"
 agents:
   - shorthand
 models:
@@ -1161,7 +1168,7 @@ models:
 model_map:
   review:
     shorthand: gpt-5.6-review
-"#,
+",
         )
         .unwrap();
         let _guard = CurrentDirGuard::set(dir.path());
@@ -1215,14 +1222,12 @@ model_map:
         // The model returned should be one of the normalized versions
         assert!(
             model == "opus" || model == "sonnet" || model == "github-copilot/gpt-5-mini",
-            "returned model should be normalized (no trailing slash), got: {}",
-            model
+            "returned model should be normalized (no trailing slash), got: {model}"
         );
         // Verify no trailing slashes in the returned model
         assert!(
             !model.ends_with('/'),
-            "returned model should not have trailing slash, got: {}",
-            model
+            "returned model should not have trailing slash, got: {model}"
         );
     }
 
@@ -1279,7 +1284,7 @@ model_map:
 
         let discovered: HashSet<String> = ["model-a", "model-b"]
             .iter()
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
 
         let pruned = RouterConfig::prune_unavailable_opencode_models(&mut model_map, &discovered);
@@ -1385,8 +1390,7 @@ model_map:
         for tier in ["simple", "medium", "complex", "review"] {
             assert!(
                 model_map[tier]["opencode"].is_empty(),
-                "all entries for {} should be removed",
-                tier
+                "all entries for {tier} should be removed"
             );
         }
     }

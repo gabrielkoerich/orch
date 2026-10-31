@@ -2,7 +2,7 @@
 //! and session export. Each agent's runner turns its own lines into [`StreamEvent`]s
 
 use crate::engine::runner::agents::{
-    get_runner, json_error_message, json_str, AgentRunner, StreamEvent,
+    AgentRunner, StreamEvent, get_runner, json_error_message, json_str,
 };
 use regex::Regex;
 use serde_json::Value;
@@ -32,6 +32,16 @@ pub struct Formatter {
     runner: Option<Box<dyn AgentRunner>>,
     tools: HashMap<String, String>,
     changed: BTreeSet<String>,
+}
+
+impl std::fmt::Debug for Formatter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Formatter")
+            .field("color", &self.color)
+            .field("tools", &self.tools)
+            .field("changed", &self.changed)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Formatter {
@@ -463,8 +473,8 @@ mod tests {
             fmt(&["\x1b[?25hfatal: not a git repository\r"]),
             vec!["fatal: not a git repository"]
         );
-        assert!(fmt(&["\x1b[?25h"]).is_empty());
-        assert!(fmt(&["   "]).is_empty());
+        assert_eq!(fmt(&["\x1b[?25h"]), [] as [String; 0]);
+        assert_eq!(fmt(&[" "]), [] as [String; 0]);
     }
 
     #[test]
@@ -496,6 +506,6 @@ mod tests {
         let opencode = r#"{"type":"tool_use","part":{"tool":"edit","callID":"c","state":{"status":"completed","input":{"filePath":"src/bar.rs"}}}}"#;
         assert_eq!(extract_files_changed(opencode), vec!["src/bar.rs"]);
         let none = r#"{"type":"result","subtype":"success","result":"done"}"#;
-        assert!(extract_files_changed(none).is_empty());
+        assert_eq!(extract_files_changed(none), [] as [String; 0]);
     }
 }

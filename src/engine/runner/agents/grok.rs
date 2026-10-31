@@ -21,10 +21,11 @@
 
 use super::claude::{self, ClaudeRunner};
 use super::{
-    shell_single_quote, AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent,
+    AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent, shell_single_quote,
 };
 
 /// Runner for the `grok` CLI
+#[derive(Debug)]
 pub struct GrokRunner;
 
 impl GrokRunner {
@@ -35,7 +36,7 @@ impl GrokRunner {
 
 impl AgentRunner for GrokRunner {
     #[cfg(test)]
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "grok"
     }
 
@@ -141,7 +142,9 @@ pub fn find_grok_result(ndjson: &str) -> Option<super::AgentResult> {
         return Some(result);
     };
     if result.cost_usd.is_none() {
-        result.cost_usd = val.get("total_cost_usd").and_then(|v| v.as_f64());
+        result.cost_usd = val
+            .get("total_cost_usd")
+            .and_then(serde_json::Value::as_f64);
     }
     if val.get("stop_reason").and_then(|v| v.as_str()) == Some("max_tokens") {
         result.truncated_by_length = true;
@@ -230,10 +233,10 @@ fn deny_args(rules: &[String]) -> Vec<String> {
     for rule in rules {
         match rule.as_str() {
             "Read" | "Grep" | "Glob" | "Edit" | "Write" | "Bash" => {
-                if let Some(id) = grok_tool_id(rule) {
-                    if !remove.contains(&id) {
-                        remove.push(id);
-                    }
+                if let Some(id) = grok_tool_id(rule)
+                    && !remove.contains(&id)
+                {
+                    remove.push(id);
                 }
             }
             _ => denies.push(rule.as_str()),
@@ -265,10 +268,10 @@ fn startup_errors(stdout: &str) -> Vec<String> {
         if val.get("type").and_then(|t| t.as_str()) != Some("error") {
             continue;
         }
-        if let Some(message) = val.get("message").and_then(|m| m.as_str()) {
-            if !message.is_empty() {
-                out.push(message.to_string());
-            }
+        if let Some(message) = val.get("message").and_then(|m| m.as_str())
+            && !message.is_empty()
+        {
+            out.push(message.to_string());
         }
     }
     out

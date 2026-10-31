@@ -5,7 +5,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -41,8 +41,8 @@ fn port_path() -> anyhow::Result<PathBuf> {
 #[derive(Clone)]
 struct App {
     store: TaskStore,
-    token: Arc<String>,
-    host: Arc<String>,
+    token: Arc<str>,
+    host: Arc<str>,
 }
 
 /// Serve `POST /write` on 127.0.0.1 and record the port, a fresh token and the pid for the CLI
@@ -64,8 +64,8 @@ pub async fn serve(store: TaskStore) -> anyhow::Result<Endpoint> {
         .route("/nodes", get(nodes))
         .with_state(App {
             store,
-            token: Arc::new(token.clone()),
-            host: Arc::new(format!("127.0.0.1:{port}")),
+            token: Arc::from(token.as_str()),
+            host: Arc::from(format!("127.0.0.1:{port}")),
         });
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
@@ -141,8 +141,7 @@ async fn progress(
 
     let node = crate::cluster::discovery::status()
         .await
-        .map(|t| t.me.name)
-        .unwrap_or_else(|_| "local".to_string());
+        .map_or_else(|_| "local".to_string(), |t| t.me.name);
     match super::progress::handle(&app.store, &node, report).await {
         Ok(record) => Json(record).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),

@@ -10,13 +10,19 @@
 
 use super::minimax::MiniMaxClaudeRunner;
 use super::{
-    delegate_agent_runner, AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent,
+    AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent, delegate_agent_runner,
 };
 
 /// Runner for Kimi-via-Claude agents (same output handling as MiniMaxClaude).
 /// Named `KimiClaudeRunner` to distinguish from a future native Kimi CLI runner.
 pub struct KimiClaudeRunner {
     inner: MiniMaxClaudeRunner,
+}
+
+impl std::fmt::Debug for KimiClaudeRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KimiClaudeRunner").finish_non_exhaustive()
+    }
 }
 
 impl KimiClaudeRunner {

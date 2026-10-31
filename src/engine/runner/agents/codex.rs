@@ -45,12 +45,13 @@
 //! ```
 
 use super::{
-    json_error_message, json_str, AgentError, AgentRunner, ParsedResponse, PermissionRules,
-    SandboxLevel, StreamEvent,
+    AgentError, AgentRunner, ParsedResponse, PermissionRules, SandboxLevel, StreamEvent,
+    json_error_message, json_str,
 };
 use crate::parser;
 
 /// Runner for Codex agent.
+#[derive(Debug)]
 pub struct CodexRunner;
 
 impl CodexRunner {
@@ -59,21 +60,21 @@ impl CodexRunner {
     /// Looks for `item.completed` events with `item.type == "agent_message"`.
     /// Uses the **last** agent message that contains valid-looking JSON,
     /// since earlier messages are often progress updates.
-    fn extract_agent_text(&self, events: &[serde_json::Value]) -> Option<String> {
+    fn extract_agent_text(events: &[serde_json::Value]) -> Option<String> {
         let mut texts = Vec::new();
 
         for event in events {
             let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-            if event_type == "item.completed" {
-                if let Some(item) = event.get("item") {
-                    let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if event_type == "item.completed"
+                && let Some(item) = event.get("item")
+            {
+                let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-                    if item_type == "agent_message" {
-                        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                            texts.push(text.to_string());
-                        }
-                    }
+                if item_type == "agent_message"
+                    && let Some(text) = item.get("text").and_then(|v| v.as_str())
+                {
+                    texts.push(text.to_string());
                 }
             }
         }
@@ -98,7 +99,7 @@ impl CodexRunner {
     ///
     /// Scans ALL error events and returns the most specific one.
     /// Priority: RateLimit > ModelUnavailable > Auth > ContextOverflow > AgentFailed
-    fn detect_error(&self, events: &[serde_json::Value]) -> Option<AgentError> {
+    fn detect_error(events: &[serde_json::Value]) -> Option<AgentError> {
         super::patterns::detect_ndjson_error(
             events,
             |event| {
@@ -136,12 +137,12 @@ impl CodexRunner {
                     _ => None,
                 }
             },
-            |msg| self.classify_message(msg),
+            Self::classify_message,
         )
     }
 
     /// Classify an error message into an AgentError variant.
-    fn classify_message(&self, message: &str) -> AgentError {
+    fn classify_message(message: &str) -> AgentError {
         let lower = message.to_lowercase();
 
         // Rate limit — delegate to shared helper (covers "you've hit your", 429, 529, etc.)
@@ -198,7 +199,7 @@ impl CodexRunner {
 
 impl AgentRunner for CodexRunner {
     #[cfg(test)]
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "codex"
     }
 
@@ -219,14 +220,12 @@ impl AgentRunner for CodexRunner {
 
         // Propagate terminal errors (rate limit, auth) so the review pipeline
         // can record cooldowns and abort cleanly.
-        if let Some(err) = self.detect_error(&events) {
+        if let Some(err) = Self::detect_error(&events) {
             return Err(err);
         }
 
         // Return agent_message text, or fall back to the raw output.
-        Ok(self
-            .extract_agent_text(&events)
-            .unwrap_or_else(|| trimmed.to_string()))
+        Ok(Self::extract_agent_text(&events).unwrap_or_else(|| trimmed.to_string()))
     }
 
     fn build_command(
@@ -295,12 +294,6 @@ impl AgentRunner for CodexRunner {
   -c 'sandbox_workspace_write.network_access=true' \
   -c 'shell_environment_policy.inherit=all' \
   {permission_flags} {add_dir_flags} --json - < <(cat "{sys_file}" "{msg_file}")"#,
-            sys_file = sys_file,
-            msg_file = msg_file,
-            timeout_cmd = timeout_cmd,
-            model_flag = model_flag,
-            permission_flags = permission_flags,
-            add_dir_flags = add_dir_flags,
         )
     }
 
@@ -328,16 +321,15 @@ impl AgentRunner for CodexRunner {
         }
 
         // Check for errors first
-        if let Some(err) = self.detect_error(&events) {
+        if let Some(err) = Self::detect_error(&events) {
             return Err(err);
         }
 
         // Extract agent response text
         let agent_text =
-            self.extract_agent_text(&events)
-                .ok_or_else(|| AgentError::InvalidResponse {
-                    raw: trimmed.to_string(),
-                })?;
+            Self::extract_agent_text(&events).ok_or_else(|| AgentError::InvalidResponse {
+                raw: trimmed.to_string(),
+            })?;
 
         // Parse the agent text through our standard parser
         let response = match parser::parse(&agent_text) {
@@ -364,7 +356,7 @@ impl AgentRunner for CodexRunner {
     fn classify_error(&self, exit_code: i32, stdout: &str, stderr: &str) -> AgentError {
         // Try parsing NDJSON events from stdout for structured errors
         let events = super::parse_ndjson(stdout);
-        if let Some(err) = self.detect_error(&events) {
+        if let Some(err) = Self::detect_error(&events) {
             return err;
         }
 
@@ -412,7 +404,6 @@ fn extract_quoted(text: &str, quote: char) -> Option<String> {
 ///
 /// Returns `None` only if no parseable NDJSON events are found.
 pub fn find_codex_result(ndjson: &str) -> Option<super::AgentResult> {
-    let runner = CodexRunner;
     let events = super::parse_ndjson(ndjson.trim());
     if events.is_empty() {
         return None;
@@ -421,7 +412,7 @@ pub fn find_codex_result(ndjson: &str) -> Option<super::AgentResult> {
     // Check for errors first
     let is_error;
     let error_text;
-    if let Some(err) = runner.detect_error(&events) {
+    if let Some(err) = CodexRunner::detect_error(&events) {
         is_error = true;
         error_text = Some(err.to_string());
     } else {
@@ -432,7 +423,7 @@ pub fn find_codex_result(ndjson: &str) -> Option<super::AgentResult> {
     let result_text = if is_error {
         error_text.unwrap_or_default()
     } else {
-        runner.extract_agent_text(&events).unwrap_or_default()
+        CodexRunner::extract_agent_text(&events).unwrap_or_default()
     };
 
     if result_text.is_empty() && !is_error {
@@ -747,7 +738,7 @@ mod tests {
 
     #[test]
     fn classify_codex_stream_disconnected() {
-        let err = runner().classify_message("Reconnecting 3/5... stream disconnected");
+        let err = CodexRunner::classify_message("Reconnecting 3/5... stream disconnected");
         assert!(
             matches!(err, AgentError::NetworkError { .. }),
             "expected NetworkError so fallback retries, got: {err:?}"
@@ -756,7 +747,7 @@ mod tests {
 
     #[test]
     fn classify_codex_websocket_error() {
-        let err = runner().classify_message("WebSocket connection closed unexpectedly");
+        let err = CodexRunner::classify_message("WebSocket connection closed unexpectedly");
         assert!(
             matches!(err, AgentError::NetworkError { .. }),
             "expected NetworkError so fallback retries, got: {err:?}"
@@ -765,8 +756,9 @@ mod tests {
 
     #[test]
     fn classify_codex_event_stream_lagged() {
-        let err = runner()
-            .classify_message("in-process app-server event stream lagged; dropped 1 events");
+        let err = CodexRunner::classify_message(
+            "in-process app-server event stream lagged; dropped 1 events",
+        );
         assert!(
             matches!(err, AgentError::NetworkError { .. }),
             "expected NetworkError so fallback retries, got: {err:?}"
@@ -775,7 +767,7 @@ mod tests {
 
     #[test]
     fn classify_codex_econnreset() {
-        let err = runner().classify_message("ECONNRESET: connection reset by peer");
+        let err = CodexRunner::classify_message("ECONNRESET: connection reset by peer");
         assert!(
             matches!(err, AgentError::NetworkError { .. }),
             "expected NetworkError so fallback retries, got: {err:?}"
@@ -917,7 +909,7 @@ mod tests {
     #[test]
     fn extract_text_empty_input_returns_empty_ok() {
         let text = runner().extract_text("").unwrap();
-        assert!(text.is_empty());
+        assert_eq!(text, "");
     }
 
     // ── find_codex_result ───────────────────────────────────────
@@ -1125,7 +1117,9 @@ mod stream_tests {
     fn started_items_are_dropped() {
         let started =
             r#"{"type":"item.started","item":{"type":"command_execution","command":"ls"}}"#;
-        assert!(events(started).is_empty());
-        assert!(events(r#"{"type":"thread.started","thread_id":"t"}"#).is_empty());
+        let dropped = events(started);
+        assert!(dropped.is_empty(), "{dropped:?}");
+        let dropped = events(r#"{"type":"thread.started","thread_id":"t"}"#);
+        assert!(dropped.is_empty(), "{dropped:?}");
     }
 }

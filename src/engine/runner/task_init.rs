@@ -5,7 +5,7 @@
 
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask};
 use crate::config;
-use crate::engine::router::{get_route_result, RouteResultError};
+use crate::engine::router::{RouteResultError, get_route_result};
 use crate::store;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
@@ -26,7 +26,22 @@ pub struct TaskInitResult {
     pub new_attempts: u32,
 }
 
+impl std::fmt::Debug for TaskInitResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskInitResult")
+            .field("agent_name", &self.agent_name)
+            .field("model_name", &self.model_name)
+            .field("complexity", &self.complexity)
+            .field("task_title", &self.task_title)
+            .field("wt", &self.wt)
+            .field("attempt_dir", &self.attempt_dir)
+            .field("new_attempts", &self.new_attempts)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Outcome of the guard check.
+#[derive(Debug)]
 pub enum GuardOutcome {
     /// Task should proceed; returns current attempt count.
     Proceed(u32),
@@ -46,8 +61,7 @@ pub async fn check_guards(
 ) -> anyhow::Result<GuardOutcome> {
     let attempts: u32 = store::opt_store_get_task(store, repo, task_id)
         .await
-        .map(|t| t.attempts)
-        .unwrap_or(0) as u32;
+        .map_or(0, |t| u32::try_from(t.attempts).unwrap_or(0));
 
     // Guard: check if tmux session already exists (prevents duplicate dispatch)
     let tmux = TmuxManager::new();
@@ -98,8 +112,10 @@ pub async fn build_pseudo_task(
 ) -> ExternalTask {
     let (task_title, task_body) = store::opt_store_get_task(store, repo, task_id)
         .await
-        .map(|t| (t.title, t.body))
-        .unwrap_or_else(|| (format!("Task #{task_id}"), String::new()));
+        .map_or_else(
+            || (format!("Task #{task_id}"), String::new()),
+            |t| (t.title, t.body),
+        );
     ExternalTask {
         id: ExternalId(task_id.to_string()),
         title: task_title,
@@ -129,7 +145,10 @@ fn resolve_model_name(
 }
 
 /// Prepare the full task: set up worktree, build context and prompts, create invocation.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "task setup needs the routing result, backend, project paths and store together"
+)]
 pub async fn prepare_task(
     task_id: &str,
     agent: Option<&str>,
@@ -162,7 +181,7 @@ pub async fn prepare_task(
     git_ops::rebase_on_default(&wt.work_dir, &wt.default_branch).await;
 
     // Get routing result — distinguish between "no route" and store errors
-    let route_result = if let Some(ref s) = store {
+    let route_result = if let Some(s) = store {
         match get_route_result(s, repo, task_id).await {
             Ok(r) => Some(r),
             // NoAgent means the router hasn't set a route for this task yet;
@@ -417,7 +436,7 @@ mod tests {
             .set_fields(store_id, &[("attempts", serde_json::json!(1000))])
             .await
             .unwrap();
-        let store = Some(task_store.clone());
+        let store = Some(std::sync::Arc::clone(&task_store));
 
         let outcome = check_guards(&format!("internal:{store_id}"), "owner/repo", &store)
             .await
@@ -425,8 +444,9 @@ mod tests {
 
         assert!(matches!(outcome, GuardOutcome::MaxAttempts));
         let task = task_store.get(store_id).await.unwrap();
-        assert!(task
-            .block_reason
-            .is_some_and(|r| r.contains("exceeded max attempts")));
+        assert!(
+            task.block_reason
+                .is_some_and(|r| r.contains("exceeded max attempts"))
+        );
     }
 }

@@ -91,7 +91,7 @@ pub async fn handle(store: &TaskStore, node: &str, report: Report) -> anyhow::Re
         &ext,
         &report.done,
         "orch",
-        task.attempts as u32,
+        u32::try_from(task.attempts).unwrap_or(0),
         crate::engine::runner::commit::When::Tested,
     )
     .await

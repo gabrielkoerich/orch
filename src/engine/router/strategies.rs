@@ -13,9 +13,9 @@
 
 use crate::backends::ExternalTask;
 
+use super::RouteResult;
 use super::config::RouterConfig;
 use super::weights::AgentWeights;
-use super::RouteResult;
 
 /// Extract an explicit `agent:*` label from the task, if present and valid.
 ///
@@ -101,13 +101,13 @@ pub(super) fn route_via_round_robin_stateful(
             continue;
         }
         // Also skip last-used agent when possible
-        if agents.len() > 1 {
-            if let Some(ref last) = last_agent {
-                if candidate == last && offset + 1 < agents.len() {
-                    skipped_last_idx = Some(idx);
-                    continue;
-                }
-            }
+        if agents.len() > 1
+            && let &mut Some(ref last) = last_agent
+            && candidate == last
+            && offset + 1 < agents.len()
+        {
+            skipped_last_idx = Some(idx);
+            continue;
         }
         agent_idx = idx;
         found = true;
@@ -211,21 +211,15 @@ pub(super) fn route_via_fallback(
 ) -> anyhow::Result<RouteResult> {
     if config.fallback_executor == "round_robin" {
         // Use weighted selection if weights are configured
-        if let Some(w) = weights {
-            if !config.weights.is_empty() {
-                let mut last = None;
-                return route_via_weighted_round_robin(
-                    available_agents,
-                    w,
-                    config,
-                    task,
-                    &mut last,
-                )
+        if let Some(w) = weights
+            && !config.weights.is_empty()
+        {
+            let mut last = None;
+            return route_via_weighted_round_robin(available_agents, w, config, task, &mut last)
                 .map(|mut r| {
                     r.reason = format!("router failed; fallback weighted → {}", r.agent);
                     r
                 });
-            }
         }
         return route_via_round_robin(available_agents, config, task).map(|mut r| {
             r.reason = format!("router failed; fallback round_robin → {}", r.agent);

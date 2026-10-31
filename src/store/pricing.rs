@@ -19,6 +19,10 @@ pub struct ModelPricing {
 }
 
 impl ModelPricing {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "token counts stay far below 2^52"
+    )]
     pub fn estimate_cost_usd(self, usage: TokenUsage) -> CostEstimate {
         let input_cost = (usage.input_tokens as f64 / 1_000_000.0) * self.input_per_million_usd;
         let output_cost = (usage.output_tokens as f64 / 1_000_000.0) * self.output_per_million_usd;

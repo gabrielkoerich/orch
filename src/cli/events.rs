@@ -153,16 +153,17 @@ async fn resync_from_store(
     let now = chrono::Utc::now().format("%H:%M:%S");
     let mut printed = 0usize;
     for t in &tasks {
-        if let Some(rf) = repo_filter {
-            if !t.repo.contains(rf) {
-                continue;
-            }
+        if let Some(rf) = repo_filter
+            && !t.repo.contains(rf)
+        {
+            continue;
         }
         let key = task_key(t);
-        if let Some(tf) = task_filter {
-            if key != tf && t.external_id.as_deref() != Some(tf) {
-                continue;
-            }
+        if let Some(tf) = task_filter
+            && key != tf
+            && t.external_id.as_deref() != Some(tf)
+        {
+            continue;
         }
         let agent_str = t.agent.as_deref().unwrap_or("");
         let pr_str = t
@@ -218,24 +219,24 @@ async fn stream_from_store(
     loop {
         interval.tick().await;
 
-        let tasks = match store.list_all_active_global().await {
-            Ok(t) => t,
-            Err(_) => continue,
+        let Ok(tasks) = store.list_all_active_global().await else {
+            continue;
         };
 
         for t in &tasks {
             let key = task_key(t);
 
             // Apply filters
-            if let Some(ref rf) = repo_filter {
-                if !t.repo.contains(rf) {
-                    continue;
-                }
+            if let Some(ref rf) = repo_filter
+                && !t.repo.contains(rf)
+            {
+                continue;
             }
-            if let Some(tf) = task_filter {
-                if key != tf && t.external_id.as_deref() != Some(tf) {
-                    continue;
-                }
+            if let Some(tf) = task_filter
+                && key != tf
+                && t.external_id.as_deref() != Some(tf)
+            {
+                continue;
             }
 
             let new_status = t.status.as_str().to_string();
@@ -253,7 +254,7 @@ async fn stream_from_store(
                         .map(|p| format!(" PR: #{p}"))
                         .unwrap_or_default();
 
-                    println!("{now} {key} {old_status} \u{2192} {new_status} {agent_str}{pr_str}",);
+                    println!("{now} {key} {old_status} \u{2192} {new_status} {agent_str}{pr_str}");
                     last_status.insert(key, (new_status, t.agent.clone(), t.pr_number));
                 }
                 None => {
@@ -274,11 +275,11 @@ async fn stream_from_store(
             .cloned()
             .collect();
         for key in disappeared {
-            if let Some((old_status, _, _)) = last_status.remove(&key) {
-                if old_status != "done" {
-                    let now = chrono::Utc::now().format("%H:%M:%S");
-                    println!("{now} {key} {old_status} \u{2192} done");
-                }
+            if let Some((old_status, _, _)) = last_status.remove(&key)
+                && old_status != "done"
+            {
+                let now = chrono::Utc::now().format("%H:%M:%S");
+                println!("{now} {key} {old_status} \u{2192} done");
             }
         }
     }

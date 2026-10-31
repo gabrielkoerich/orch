@@ -168,35 +168,32 @@ pub fn check(expression: &str, since: Option<&str>) -> anyhow::Result<bool> {
 
     let now = Utc::now();
 
-    match since {
-        Some(since_str) => {
-            let since_dt = parse_timestamp(since_str)
-                .with_context(|| format!("invalid --since timestamp: {since_str}"))?;
+    if let Some(since_str) = since {
+        let since_dt = parse_timestamp(since_str)
+            .with_context(|| format!("invalid --since timestamp: {since_str}"))?;
 
-            // Cap at 24 hours to prevent runaway catch-up
-            let cap = now - chrono::Duration::hours(24);
-            let effective_since = if since_dt < cap { cap } else { since_dt };
+        // Cap at 24 hours to prevent runaway catch-up
+        let cap = now - chrono::Duration::hours(24);
+        let effective_since = if since_dt < cap { cap } else { since_dt };
 
-            // Check if any occurrence falls between since and now
-            Ok(schedule
-                .after(&effective_since)
-                .take_while(|dt| *dt <= now)
-                .next()
-                .is_some())
-        }
-        None => {
-            // Check if the schedule matches the current minute.
-            // We look for the next occurrence after 1 minute ago — if it falls
-            // within the current minute, the schedule is firing now.
-            let one_min_ago = now - chrono::Duration::minutes(1);
-            let next = schedule.after(&one_min_ago).next();
-            match next {
-                Some(dt) => {
-                    let diff = now.signed_duration_since(dt);
-                    Ok(diff >= chrono::Duration::zero() && diff < chrono::Duration::minutes(1))
-                }
-                None => Ok(false),
+        // Check if any occurrence falls between since and now
+        Ok(schedule
+            .after(&effective_since)
+            .take_while(|dt| *dt <= now)
+            .next()
+            .is_some())
+    } else {
+        // Check if the schedule matches the current minute.
+        // We look for the next occurrence after 1 minute ago — if it falls
+        // within the current minute, the schedule is firing now.
+        let one_min_ago = now - chrono::Duration::minutes(1);
+        let next = schedule.after(&one_min_ago).next();
+        match next {
+            Some(dt) => {
+                let diff = now.signed_duration_since(dt);
+                Ok(diff >= chrono::Duration::zero() && diff < chrono::Duration::minutes(1))
             }
+            None => Ok(false),
         }
     }
 }
@@ -336,7 +333,7 @@ mod tests {
         // "0-0" means only Sunday; should normalize to "7" (not invalid "1-0,7")
         let normalized = normalize_dow("0 9 * * 0-0");
         assert!(
-            normalized.ends_with("7"),
+            normalized.ends_with('7'),
             "Expected DOW field to be '7' but got: {normalized}"
         );
     }

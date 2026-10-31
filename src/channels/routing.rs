@@ -24,6 +24,7 @@ pub struct GlobalChannelConfig {
 }
 
 /// Maps channel targets to projects and vice versa.
+#[derive(Debug)]
 pub struct ChannelRouter {
     /// (channel_name, topic_or_channel_id) → repo
     target_to_repo: HashMap<(String, String), String>,
@@ -90,23 +91,21 @@ impl ChannelRouter {
     pub fn resolve_project(&self, channel: &str, topic_or_channel_id: &str) -> Option<&str> {
         self.target_to_repo
             .get(&(channel.to_string(), topic_or_channel_id.to_string()))
-            .map(|s| s.as_str())
+            .map(std::string::String::as_str)
     }
 
     /// Check if a target is the General channel.
     pub fn is_general(&self, channel: &str, topic_or_channel_id: &str) -> bool {
         self.general
             .get(channel)
-            .map(|id| id == topic_or_channel_id)
-            .unwrap_or(false)
+            .is_some_and(|id| id == topic_or_channel_id)
     }
 
     /// Check if a target is the configured control session channel.
     pub fn is_control_channel(&self, channel: &str, topic_or_channel_id: &str) -> bool {
         self.control
             .get(channel)
-            .map(|id| id == topic_or_channel_id)
-            .unwrap_or(false)
+            .is_some_and(|id| id == topic_or_channel_id)
     }
 
     /// Get the target (topic/channel ID) for a project on a given channel.
@@ -114,7 +113,7 @@ impl ChannelRouter {
         self.repo_to_targets
             .get(repo)
             .and_then(|targets| targets.get(channel))
-            .map(|s| s.as_str())
+            .map(std::string::String::as_str)
     }
 
     /// List all configured project repos.

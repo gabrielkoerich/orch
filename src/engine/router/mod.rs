@@ -19,7 +19,7 @@ mod selection;
 mod strategies;
 pub mod weights;
 
-pub use config::{parse_pool_entry, RouterConfig};
+pub use config::{RouterConfig, parse_pool_entry};
 pub use weights::AgentWeights;
 
 fn fmt_degraded(degraded: &[String]) -> String {
@@ -97,7 +97,7 @@ use crate::engine::cooldown::{
     cooldown_until, is_agent_degraded, is_agent_in_cooldown, is_model_in_cooldown,
     list_degraded_agents, record_agent_success, refresh_degraded_agents, sync_from_kv,
 };
-use crate::store::{get_task_field_direct, store_log_activity, TaskStore};
+use crate::store::{TaskStore, get_task_field_direct, store_log_activity};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -182,6 +182,12 @@ impl RouteResult {
 /// safely be called without starving write-lock waiters.
 pub struct LlmRouterHandle(std::sync::Arc<LlmRouter>);
 
+impl std::fmt::Debug for LlmRouterHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmRouterHandle").finish_non_exhaustive()
+    }
+}
+
 impl LlmRouterHandle {
     /// Invalidate the skills catalog cache so the next routing call reloads
     /// from disk.  Safe to await without holding any `RwLock` on `Router`.
@@ -191,6 +197,10 @@ impl LlmRouterHandle {
 }
 
 /// The agent router.
+#[expect(
+    clippy::struct_field_names,
+    reason = "the router holds sub-routers whose names say which backend they use"
+)]
 pub struct Router {
     /// Router configuration
     pub config: RouterConfig,
@@ -214,6 +224,22 @@ pub struct Router {
     pub(crate) router_pool: Vec<(String, String)>,
     /// Current round-robin index into router_pool
     pub(crate) pool_index: usize,
+}
+
+impl std::fmt::Debug for Router {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Router")
+            .field("config", &self.config)
+            .field("available_agents", &self.available_agents)
+            .field("weights", &self.weights)
+            .field("ollama_router", &self.ollama_router)
+            .field("rr_index", &self.rr_index)
+            .field("last_agent", &self.last_agent)
+            .field("review_rr_index", &self.review_rr_index)
+            .field("router_pool", &self.router_pool)
+            .field("pool_index", &self.pool_index)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Router {
@@ -298,7 +324,7 @@ impl Router {
     /// prevents holding the read lock across await points (which starves
     /// write-lock waiters due to Tokio's write-preferring `RwLock`).
     pub fn llm_router_handle(&self) -> LlmRouterHandle {
-        LlmRouterHandle(self.llm_router.clone())
+        LlmRouterHandle(std::sync::Arc::clone(&self.llm_router))
     }
 
     fn advance_pool_index_after_attempt(&mut self, idx: usize, pool_len: usize) {
@@ -312,7 +338,7 @@ impl Router {
         let mut agents = Vec::new();
         for agent in configured_agents {
             if crate::cmd_cache::command_exists(agent) {
-                agents.push(agent.to_string());
+                agents.push(agent.clone());
             }
         }
         agents
@@ -409,7 +435,7 @@ impl Router {
             "router reloaded (async)"
         );
         self.config = new_config;
-        self.available_agents = new_agents.clone();
+        self.available_agents.clone_from(&new_agents);
         // Ensure new agents have weight entries (preserves existing weights)
         self.weights.ensure_agents(&new_agents);
         self.router_pool = new_pool;
@@ -549,13 +575,13 @@ impl Router {
                 earliest = Some(earliest.map_or(until, |current| current.min(until)));
             }
 
-            if let Some(comp) = complexity {
-                if let Some(pool) = self.config.model_pool_for_complexity(agent, comp) {
-                    for model in pool {
-                        let key = format!("{agent}:{model}");
-                        if let Some(until) = cooldown_until(&key) {
-                            earliest = Some(earliest.map_or(until, |current| current.min(until)));
-                        }
+            if let Some(comp) = complexity
+                && let Some(pool) = self.config.model_pool_for_complexity(agent, comp)
+            {
+                for model in pool {
+                    let key = format!("{agent}:{model}");
+                    if let Some(until) = cooldown_until(&key) {
+                        earliest = Some(earliest.map_or(until, |current| current.min(until)));
                     }
                 }
             }
@@ -579,7 +605,7 @@ impl Router {
         earliest
     }
 
-    async fn wait_for_cooldown(&self, complexity: Option<&str>) -> anyhow::Result<()> {
+    fn wait_for_cooldown(&self, complexity: Option<&str>) -> anyhow::Result<()> {
         // If any cooldowns are present, return an error immediately so the
         // caller (the tick loop) can skip this task and retry on the next tick.
         // Sleeping inside the router blocks the entire tick loop for the
@@ -592,9 +618,9 @@ impl Router {
             // (e.g. over-threshold rate limiting without explicit cooldown duration).
             // Log at warn and return an error so the tick skips this task and retries after backoff.
             tracing::warn!(
-        scope = complexity.unwrap_or("all agents"),
-        "all agents degraded (no cooldown timestamp available) — skipping task, will retry after backoff"
-    );
+                scope = complexity.unwrap_or("all agents"),
+                "all agents degraded (no cooldown timestamp available) — skipping task, will retry after backoff"
+            );
             // Return an error similar to the cooldown case to trigger backoff in the tick loop
             return Err(AllAgentsCooledError::new(
                 complexity.unwrap_or("all agents").to_string(),
@@ -613,7 +639,7 @@ impl Router {
             );
             // Return a domain error indicating all candidates are cooled so the
             // caller can handle it (tick will skip this task and retry later).
-            return Err(AllAgentsCooledError::new(scope_str, Some(remaining as u64)).into());
+            return Err(AllAgentsCooledError::new(scope_str, u64::try_from(remaining).ok()).into());
         }
 
         Ok(())
@@ -790,23 +816,22 @@ impl Router {
                         );
                         // Label routing uses agent-specific role and the
                         // resolved model (may differ from from_config's default).
-                        result.profile.role = format!("{} specialist", agent);
+                        result.profile.role = format!("{agent} specialist");
                         result.model = model.clone();
                         self.log_route_activity(store, repo, &task.id.0, &result, None)
                             .await;
                         return Ok(result);
-                    } else {
-                        // No concrete model found for the labeled agent — do
-                        // not honor the label override. Fall through to the
-                        // standard routing logic so another agent or the LLM
-                        // can be chosen with a valid model.
-                        tracing::warn!(task_id = %task.id.0, agent = %agent, "label agent has no available model — falling through to LLM routing");
                     }
+                    // No concrete model found for the labeled agent — do
+                    // not honor the label override. Fall through to the
+                    // standard routing logic so another agent or the LLM
+                    // can be chosen with a valid model.
+                    tracing::warn!(task_id = %task.id.0, agent = %agent, "label agent has no available model — falling through to LLM routing");
                 }
 
                 let candidates = self.available_agents_for_complexity(&complexity);
                 if candidates.is_empty() {
-                    self.wait_for_cooldown(Some(&complexity)).await?;
+                    self.wait_for_cooldown(Some(&complexity))?;
                     continue;
                 }
                 // Label target is cooled or lacked model; fall through to standard routing.
@@ -817,7 +842,7 @@ impl Router {
             // Check if any agents have available models for this complexity
             let mut candidates = self.available_agents_for_complexity(&complexity);
             if candidates.is_empty() {
-                self.wait_for_cooldown(Some(&complexity)).await?;
+                self.wait_for_cooldown(Some(&complexity))?;
                 continue;
             }
 
@@ -906,7 +931,7 @@ impl Router {
                 );
                 let candidates = self.available_agents_for_complexity(&complexity);
                 if candidates.is_empty() {
-                    self.wait_for_cooldown(Some(&complexity)).await?;
+                    self.wait_for_cooldown(Some(&complexity))?;
                     continue;
                 }
                 let result = strategies::route_via_round_robin_stateful(
@@ -928,7 +953,7 @@ impl Router {
                 Ok(result) => {
                     let candidates = self.available_agents_for_complexity(&result.complexity);
                     if candidates.is_empty() {
-                        self.wait_for_cooldown(Some(&result.complexity)).await?;
+                        self.wait_for_cooldown(Some(&result.complexity))?;
                         continue;
                     }
 
@@ -955,7 +980,7 @@ impl Router {
                                 complexity = %result.complexity,
                                 "all available agents are the no-code agent — waiting for another agent"
                             );
-                            self.wait_for_cooldown(Some(&result.complexity)).await?;
+                            self.wait_for_cooldown(Some(&result.complexity))?;
                             continue;
                         }
                         tracing::info!(
@@ -1021,7 +1046,7 @@ impl Router {
                                 complexity = %result.complexity,
                                 "LLM-selected model(s) are cooled for the only available agent; waiting for cooldown"
                             );
-                            self.wait_for_cooldown(Some(&result.complexity)).await?;
+                            self.wait_for_cooldown(Some(&result.complexity))?;
                             continue;
                         }
 
@@ -1050,14 +1075,10 @@ impl Router {
 
                         let reason = if fallback_agent == result.agent {
                             format!(
-                                "LLM selected cooled model; using same agent {} with different model",
-                                fallback_agent
+                                "LLM selected cooled model; using same agent {fallback_agent} with different model"
                             )
                         } else {
-                            format!(
-                                "LLM selected cooled agent/model; rerouted to {}",
-                                fallback_agent
-                            )
+                            format!("LLM selected cooled agent/model; rerouted to {fallback_agent}")
                         };
 
                         let result = RouteResult {
@@ -1104,7 +1125,7 @@ impl Router {
                             "all agents" | "router pool" => None,
                             _ => Some(scope),
                         };
-                        self.wait_for_cooldown(scope_opt).await?;
+                        self.wait_for_cooldown(scope_opt)?;
                         continue;
                     }
 
@@ -1128,7 +1149,7 @@ impl Router {
                         );
                         let candidates = self.available_agents_for_complexity(&complexity);
                         if candidates.is_empty() {
-                            self.wait_for_cooldown(Some(&complexity)).await?;
+                            self.wait_for_cooldown(Some(&complexity))?;
                             continue;
                         }
                         let result = strategies::route_via_round_robin_stateful(
@@ -1145,7 +1166,7 @@ impl Router {
 
                     let candidates = self.available_agents_for_complexity(&complexity);
                     if candidates.is_empty() {
-                        self.wait_for_cooldown(Some(&complexity)).await?;
+                        self.wait_for_cooldown(Some(&complexity))?;
                         continue;
                     }
                     let result = strategies::route_via_fallback(
@@ -1173,8 +1194,7 @@ impl Router {
             Ok(Some(store_id)) => store
                 .get(store_id)
                 .await
-                .map(|t| t.route_attempts as u32)
-                .unwrap_or(0),
+                .map_or(0, |t| u32::try_from(t.route_attempts).unwrap_or(0)),
             _ => 0,
         }
     }
@@ -1187,13 +1207,12 @@ impl Router {
         store: &std::sync::Arc<TaskStore>,
         repo: &str,
     ) {
-        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
-            if let Err(e) = store
+        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await
+            && let Err(e) = store
                 .set_fields(store_id, &[("route_attempts", serde_json::json!(attempts))])
                 .await
-            {
-                tracing::warn!(task_id, error = %e, "failed to store route_attempts");
-            }
+        {
+            tracing::warn!(task_id, error = %e, "failed to store route_attempts");
         }
     }
 
@@ -1340,16 +1359,14 @@ impl Router {
                         crate::engine::runner::response::record_model_failure(agent, model_str)
                             .await;
                         return Err(e);
-                    } else {
-                        tracing::warn!(
-                            agent,
-                            model = model_str,
-                            error = %e,
-                            "pool entry failed, recording cooldown and trying next"
-                        );
-                        crate::engine::runner::response::record_model_failure(agent, model_str)
-                            .await;
                     }
+                    tracing::warn!(
+                        agent,
+                        model = model_str,
+                        error = %e,
+                        "pool entry failed, recording cooldown and trying next"
+                    );
+                    crate::engine::runner::response::record_model_failure(agent, model_str).await;
                     last_err = Some(e);
                     self.advance_pool_index_after_attempt(idx, n);
                 }
@@ -1435,19 +1452,15 @@ impl Router {
                             "fallback router LLM timed out — returning immediately to unblock tick loop"
                         );
                         return Err(e);
-                    } else {
-                        tracing::warn!(
-                            agent = %fb_agent,
-                            model = %fb_model_str,
-                            error = %e,
-                            "fallback router LLM also failed"
-                        );
-                        crate::engine::runner::response::record_model_failure(
-                            &fb_agent,
-                            fb_model_str,
-                        )
-                        .await;
                     }
+                    tracing::warn!(
+                        agent = %fb_agent,
+                        model = %fb_model_str,
+                        error = %e,
+                        "fallback router LLM also failed"
+                    );
+                    crate::engine::runner::response::record_model_failure(&fb_agent, fb_model_str)
+                        .await;
                     last_err = Some(e);
                 }
             }
@@ -1605,12 +1618,16 @@ pub async fn get_route_result(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::float_cmp,
+    reason = "the weights are stored constants, so they compare exactly"
+)]
 mod tests {
     use super::config::DEFAULT_AGENTS;
     use super::llm::LlmRouteResponse;
     use super::strategies;
     use super::weights::{
-        AgentWeights, RateLimitState, DEFAULT_WEIGHT, MIN_WEIGHT, RATE_LIMIT_DECAY, RECOVERY_DELAY,
+        AgentWeights, DEFAULT_WEIGHT, MIN_WEIGHT, RATE_LIMIT_DECAY, RECOVERY_DELAY, RateLimitState,
     };
     use super::*;
     use crate::backends::{ExternalId, ExternalTask};
@@ -1631,7 +1648,8 @@ mod tests {
             "model_map:\n  medium:\n    claude: sonnet\n",
         )
         .unwrap();
-        std::env::set_var("ORCH_HOME", home.path());
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", home.path()) };
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let store_id = store
@@ -1658,26 +1676,22 @@ mod tests {
 
         let route = get_route_result(&store, "owner/repo", "7").await;
         let stored = store.get(store_id).await.unwrap().model;
-        std::env::remove_var("ORCH_HOME");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::remove_var("ORCH_HOME") };
 
         assert_eq!(route.unwrap().model.as_deref(), Some("sonnet"));
         assert_eq!(stored.as_deref(), Some("sonnet"));
     }
 
-    // Test-only delegates so tests can call router.parse_llm_response() and
-    // router.check_routing_sanity() directly without referencing llm_router.
+    // Test-only delegate so tests can call router.parse_llm_response() directly
+    // without referencing llm_router.
     impl Router {
+        #[expect(
+            clippy::unused_self,
+            reason = "the test helper keeps the router method syntax"
+        )]
         fn parse_llm_response(&self, response: &str) -> anyhow::Result<LlmRouteResponse> {
-            self.llm_router.parse_llm_response("claude", response)
-        }
-
-        fn check_routing_sanity(
-            &self,
-            task: &ExternalTask,
-            agent: &str,
-            profile: &AgentProfile,
-        ) -> Option<String> {
-            self.llm_router.check_routing_sanity(task, agent, profile)
+            LlmRouter::parse_llm_response("claude", response)
         }
     }
 
@@ -1832,8 +1846,8 @@ mod tests {
         assert_eq!(config.router_model, "haiku");
         assert_eq!(config.fallback_executor, "codex");
         assert_eq!(config.max_route_attempts, 3);
-        assert!(!config.allowed_tools.is_empty());
-        assert!(!config.default_skills.is_empty());
+        assert_ne!(config.allowed_tools, [] as [String; 0]);
+        assert_ne!(config.default_skills, [] as [String; 0]);
 
         // Verify configurable agents list includes all 7 agents
         assert_eq!(config.agents.len(), 7);
@@ -1851,18 +1865,26 @@ mod tests {
     fn model_map_lookup_returns_none_without_config() {
         // Default config has no hardcoded models — config.yml is the source of truth.
         let config = RouterConfig::default();
-        assert!(config
-            .model_for_complexity("claude", "simple", "")
-            .is_none());
-        assert!(config
-            .model_for_complexity("claude", "medium", "")
-            .is_none());
-        assert!(config
-            .model_for_complexity("claude", "complex", "")
-            .is_none());
-        assert!(config
-            .model_for_complexity("opencode", "review", "")
-            .is_none());
+        assert!(
+            config
+                .model_for_complexity("claude", "simple", "")
+                .is_none()
+        );
+        assert!(
+            config
+                .model_for_complexity("claude", "medium", "")
+                .is_none()
+        );
+        assert!(
+            config
+                .model_for_complexity("claude", "complex", "")
+                .is_none()
+        );
+        assert!(
+            config
+                .model_for_complexity("opencode", "review", "")
+                .is_none()
+        );
     }
 
     #[serial(cooldown_state)]
@@ -1885,7 +1907,6 @@ mod tests {
     #[tokio::test]
     async fn model_pool_selection_skips_cooled() {
         crate::engine::cooldown::reset_global_state().await;
-        use std::collections::HashMap;
 
         let mut config = RouterConfig::default();
         // Set up a two-model pool for opencode/simple
@@ -1922,7 +1943,6 @@ mod tests {
         // All cooled → return None so the caller can fall back to a different agent
         let fallback = config.model_for_complexity("opencode", "simple", "task-fallback");
         assert_eq!(fallback, None);
-        let _ = HashMap::<(), ()>::new(); // suppress unused import lint
     }
 
     #[serial(cooldown_state)]
@@ -2122,8 +2142,8 @@ Hope that helps!"#;
         let parsed = router.parse_llm_response(response).unwrap();
         assert_eq!(parsed.executor, "codex");
         assert_eq!(parsed.complexity, "medium");
-        assert!(!parsed.reason.is_empty());
-        assert!(!parsed.profile.role.is_empty());
+        assert_ne!(parsed.reason, "");
+        assert_ne!(parsed.profile.role, "");
     }
 
     /// Real Claude envelope with result as JSON object (not string).
@@ -2256,9 +2276,6 @@ Hope that helps!"#;
     #[serial(cooldown_state)]
     #[test]
     fn check_routing_sanity_warnings() {
-        let config = RouterConfig::default();
-        let router = Router::new(config);
-
         // Backend task routed to claude should warn
         let task = create_test_task("1", "Fix API", vec!["backend".to_string()]);
         let profile = AgentProfile {
@@ -2267,19 +2284,19 @@ Hope that helps!"#;
             tools: vec![],
             constraints: vec![],
         };
-        let warning = router.check_routing_sanity(&task, "claude", &profile);
+        let warning = LlmRouter::check_routing_sanity(&task, "claude", &profile);
         assert!(warning.is_some());
         assert!(warning.unwrap().contains("backend"));
 
         // Docs task routed to codex should warn
         let task = create_test_task("1", "Update README", vec!["docs".to_string()]);
-        let warning = router.check_routing_sanity(&task, "codex", &profile);
+        let warning = LlmRouter::check_routing_sanity(&task, "codex", &profile);
         assert!(warning.is_some());
         assert!(warning.unwrap().contains("docs"));
 
         // Normal routing should not warn
         let task = create_test_task("1", "Fix bug", vec!["bug".to_string()]);
-        let warning = router.check_routing_sanity(&task, "codex", &profile);
+        let warning = LlmRouter::check_routing_sanity(&task, "codex", &profile);
         assert!(warning.is_none());
     }
 
@@ -2316,9 +2333,9 @@ Hope that helps!"#;
             router.config.mode
         );
         // Fallback executor should always be set
-        assert!(!router.config.fallback_executor.is_empty());
+        assert_ne!(router.config.fallback_executor, "");
         // Tools should always be populated
-        assert!(!router.config.allowed_tools.is_empty());
+        assert_ne!(router.config.allowed_tools, [] as [String; 0]);
     }
 
     // --- Weighted round-robin tests ---
@@ -2602,7 +2619,11 @@ Hope that helps!"#;
         // Set up a rate limit that looks like it happened long ago
         let state = weights.states.get_mut("claude").unwrap();
         state.weight = 0.5;
-        state.last_limited_at = Some(Instant::now() - RECOVERY_DELAY - Duration::from_secs(1));
+        state.last_limited_at = Some(
+            Instant::now()
+                .checked_sub(RECOVERY_DELAY + Duration::from_secs(1))
+                .expect("the clock is past the recovery delay"),
+        );
         state.consecutive_hits = 2;
 
         let before = weights.get_weight("claude");
@@ -2621,7 +2642,11 @@ Hope that helps!"#;
         // Set weight just below full with an old limit
         let state = weights.states.get_mut("claude").unwrap();
         state.weight = DEFAULT_WEIGHT - 0.01;
-        state.last_limited_at = Some(Instant::now() - RECOVERY_DELAY - Duration::from_secs(1));
+        state.last_limited_at = Some(
+            Instant::now()
+                .checked_sub(RECOVERY_DELAY + Duration::from_secs(1))
+                .expect("the clock is past the recovery delay"),
+        );
         state.consecutive_hits = 1;
 
         weights.tick_recovery();
@@ -3079,7 +3104,7 @@ Hope that helps!"#;
     fn router_pool_non_empty_after_construction() {
         let config = RouterConfig::default();
         let router = Router::new(config);
-        assert!(!router.router_pool.is_empty());
+        assert_ne!(router.router_pool, [] as [(String, String); 0]);
     }
 
     /**
@@ -3097,8 +3122,10 @@ Hope that helps!"#;
         impl Drop for PathRestore {
             fn drop(&mut self) {
                 match &self.0 {
-                    Some(p) => std::env::set_var("PATH", p),
-                    None => std::env::remove_var("PATH"),
+                    // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                    Some(p) => unsafe { std::env::set_var("PATH", p) },
+                    // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                    None => unsafe { std::env::remove_var("PATH") },
                 }
                 crate::cmd_cache::reset_for_test();
             }
@@ -3125,7 +3152,8 @@ Hope that helps!"#;
         if let Some(ref p) = prev_path {
             new_path.push(p);
         }
-        std::env::set_var("PATH", &new_path);
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("PATH", &new_path) };
         crate::cmd_cache::reset_for_test();
         let _restore = PathRestore(prev_path);
 

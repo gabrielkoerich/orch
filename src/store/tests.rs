@@ -1,3 +1,8 @@
+#![expect(
+    clippy::float_cmp,
+    reason = "the prices and costs are stored constants, so they compare exactly"
+)]
+
 use super::*;
 use sqlx::Row;
 use std::sync::Arc;
@@ -15,8 +20,8 @@ async fn create_and_get_task() {
             body: "Test body".to_string(),
             source: "cron".to_string(),
             source_id: "daily-sync".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -136,11 +141,11 @@ async fn update_status() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Test".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -166,11 +171,11 @@ async fn list_by_status() {
                 repo: "owner/repo".to_string(),
                 origin: "internal".to_string(),
                 title: format!("Task {i}"),
-                body: "".to_string(),
+                body: String::new(),
                 source: "cron".to_string(),
                 source_id: format!("job-{i}"),
-                author: "".to_string(),
-                url: "".to_string(),
+                author: String::new(),
+                url: String::new(),
                 labels: vec![],
                 parent_id: None,
             })
@@ -203,11 +208,11 @@ async fn increment_and_reset_counters() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Test".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -234,11 +239,11 @@ async fn increment_propagates_returned_value_decode_errors() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Test".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -430,7 +435,7 @@ async fn append_memory_fails_on_corrupt_memory_and_preserves_db_value() {
         error: None,
         files_modified: vec![],
         approach: "attempt".to_string(),
-        timestamp: "".to_string(),
+        timestamp: String::new(),
     };
 
     // append_memory should return an error and must not overwrite the DB value
@@ -545,7 +550,7 @@ async fn helper_store_set_writes_fields() {
         .await
         .unwrap();
 
-    let opt_store = Some(store.clone());
+    let opt_store = Some(std::sync::Arc::clone(&store));
     store_set(
         &opt_store,
         "owner/repo",
@@ -576,9 +581,9 @@ async fn helper_store_set_by_id_writes_fields() {
         .await
         .unwrap();
 
-    let opt_store = Some(store.clone());
+    let opt_store = Some(std::sync::Arc::clone(&store));
     let _ = store_set_by_id(
-        &opt_store.as_ref(),
+        opt_store.as_ref(),
         id,
         &[
             ("branch", serde_json::json!("fix-bug-by-id")),
@@ -619,7 +624,7 @@ async fn helper_store_reset_counters_zeroes_counters() {
         .await
         .unwrap();
 
-    let opt_store = Some(store.clone());
+    let opt_store = Some(std::sync::Arc::clone(&store));
     store_increment(&opt_store, "owner/repo", "91", "attempts")
         .await
         .unwrap();
@@ -661,7 +666,7 @@ async fn helper_store_reset_failure_counters_preserves_review_cycles_and_merge_c
         .await
         .unwrap();
 
-    let opt_store = Some(store.clone());
+    let opt_store = Some(std::sync::Arc::clone(&store));
     store_increment(&opt_store, "owner/repo", "93", "review_cycles")
         .await
         .unwrap();
@@ -704,7 +709,7 @@ async fn helper_store_increment_by_id_returns_new_value() {
         .await
         .unwrap();
 
-    let opt_store = Some(store.clone());
+    let opt_store = Some(std::sync::Arc::clone(&store));
     let v1 = store_increment_by_id(&opt_store, id, "attempts")
         .await
         .unwrap();
@@ -723,7 +728,7 @@ async fn helper_store_increment_by_id_returns_new_value() {
 async fn helper_get_recent_memory_returns_empty_without_store() {
     let store: Option<Arc<TaskStore>> = None;
     let memory = get_recent_memory(&store, "owner/repo", "any", 10).await;
-    assert!(memory.is_empty());
+    assert!(memory.is_empty(), "{memory:?}");
 }
 
 #[tokio::test]
@@ -736,11 +741,11 @@ async fn memory_append_and_recent() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Test".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -782,11 +787,11 @@ async fn task_runs_lifecycle() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Test".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -1119,11 +1124,11 @@ async fn set_fields_updates_task() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Test".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -1158,11 +1163,11 @@ async fn set_fields_redacts_last_error() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Test".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -1218,11 +1223,11 @@ async fn set_fields_rejects_unknown_column() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Test".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -1246,11 +1251,11 @@ async fn store_tokens() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Test".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -1280,11 +1285,11 @@ async fn list_cleanable() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Done task".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -1400,11 +1405,11 @@ async fn list_by_status_scopes_to_repo() {
             repo: "owner/repo-a".to_string(),
             origin: "internal".to_string(),
             title: "Task A".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -1417,11 +1422,11 @@ async fn list_by_status_scopes_to_repo() {
             repo: "owner/repo-b".to_string(),
             origin: "internal".to_string(),
             title: "Task B".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -1452,11 +1457,11 @@ async fn set_fields_empty_is_noop() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Test".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -1476,11 +1481,11 @@ async fn set_fields_with_null_value() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Test".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -1512,11 +1517,11 @@ async fn increment_rejects_disallowed_field() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Test".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -1536,11 +1541,11 @@ async fn store_route_updates_routing_fields() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Route me".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -1579,11 +1584,11 @@ async fn memory_empty_by_default() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Test".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -1591,7 +1596,7 @@ async fn memory_empty_by_default() {
         .unwrap();
 
     let memory = store.recent_memory(id, 10).await.unwrap();
-    assert!(memory.is_empty());
+    assert!(memory.is_empty(), "{memory:?}");
 }
 
 #[tokio::test]
@@ -1609,11 +1614,11 @@ async fn labels_roundtrip_as_json() {
             repo: "owner/repo".to_string(),
             origin: "github".to_string(),
             title: "Labeled task".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "webhook".to_string(),
-            source_id: "".to_string(),
+            source_id: String::new(),
             author: "user".to_string(),
-            url: "".to_string(),
+            url: String::new(),
             labels: labels.clone(),
             parent_id: None,
         })
@@ -1634,11 +1639,11 @@ async fn task_with_parent_id() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Parent".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -1651,11 +1656,11 @@ async fn task_with_parent_id() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Child".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -1713,11 +1718,11 @@ async fn multiple_runs_per_task() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Multi-run".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -1849,11 +1854,11 @@ async fn start_run_upserts_on_conflict() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Test".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -1906,11 +1911,11 @@ async fn reset_counters_preserves_other_fields() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Test".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -1957,11 +1962,11 @@ async fn reset_failure_counters_preserves_review_cycles_and_merge_conflict_retri
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Test".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -2020,11 +2025,11 @@ async fn reset_failure_counters_resets_no_code_reroutes() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "no-code-reroute regression".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -2062,11 +2067,11 @@ async fn no_code_reroutes_accumulates_when_reset_not_called() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "no-code-reroute accumulation regression".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -2096,11 +2101,11 @@ async fn status_lifecycle_full_flow() {
             repo: "owner/repo".to_string(),
             origin: "github".to_string(),
             title: "Full lifecycle".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "webhook".to_string(),
-            source_id: "".to_string(),
+            source_id: String::new(),
             author: "user".to_string(),
-            url: "".to_string(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -2133,34 +2138,34 @@ async fn list_routable_returns_only_new() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "New task".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
         .await
         .unwrap();
 
-    let _id2 = store
+    let id2 = store
         .create(&NewTask {
             external_id: None,
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Done task".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
         .await
         .unwrap();
-    store.update_status(_id2, TaskStatus::Done).await.unwrap();
+    store.update_status(id2, TaskStatus::Done).await.unwrap();
 
     let routable = store.list_routable("owner/repo").await.unwrap();
     assert_eq!(routable.len(), 1);
@@ -2177,11 +2182,11 @@ async fn cleanable_excludes_in_progress_tasks() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "In progress".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -2217,11 +2222,11 @@ async fn delegations_stored_as_json() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Test".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -2252,11 +2257,11 @@ async fn created_at_and_updated_at_are_set() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Test".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -2264,8 +2269,8 @@ async fn created_at_and_updated_at_are_set() {
         .unwrap();
 
     let task = store.get(id).await.unwrap();
-    assert!(!task.created_at.is_empty());
-    assert!(!task.updated_at.is_empty());
+    assert_ne!(task.created_at, "");
+    assert_ne!(task.updated_at, "");
     assert!(task.created_at.ends_with('Z'), "should be UTC");
     assert!(task.created_at.contains('T'), "should be RFC3339");
 }
@@ -2280,11 +2285,11 @@ async fn concurrent_increments() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Test".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -2311,11 +2316,11 @@ async fn internal_task_has_no_external_id() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Internal".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "cron".to_string(),
             source_id: "daily".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -2337,11 +2342,11 @@ async fn default_values_are_correct() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Defaults".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -2363,8 +2368,8 @@ async fn default_values_are_correct() {
     assert_eq!(task.output_tokens, 0);
     assert!((task.total_cost_usd - 0.0).abs() < f64::EPSILON);
     assert!(!task.worktree_cleaned);
-    assert!(task.memory.is_empty());
-    assert!(task.delegations.is_empty());
+    assert!(task.memory.is_empty(), "{:?}", task.memory);
+    assert!(task.delegations.is_empty(), "{:?}", task.delegations);
     assert!(task.pr_number.is_none());
     assert!(task.parent_id.is_none());
     assert!(task.agent.is_none());
@@ -2538,10 +2543,10 @@ async fn status_counts_groups_correctly() {
     for i in 0..3 {
         store
             .create(&NewTask {
-                external_id: Some(format!("{}", i)),
+                external_id: Some(format!("{i}")),
                 repo: "owner/repo".to_string(),
                 origin: "github".to_string(),
-                title: format!("Task {}", i),
+                title: format!("Task {i}"),
                 ..Default::default()
             })
             .await
@@ -2853,7 +2858,7 @@ async fn complete_run_records_all_fields() {
     assert_eq!(run.stderr, "warning: unused var");
     assert_eq!(run.parsed_response, r#"{"summary":"Fixed bug"}"#);
     assert_eq!(run.outcome, "success");
-    assert!(run.error.is_empty());
+    assert_eq!(run.error, "");
     assert_eq!(run.input_tokens, 5000);
     assert_eq!(run.output_tokens, 2000);
     assert!((run.total_cost_usd - 0.105).abs() < 0.001);
@@ -3615,11 +3620,11 @@ async fn append_memory_within_transaction() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Memory tx test".to_string(),
-            body: "".to_string(),
-            source: "".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            body: String::new(),
+            source: String::new(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -3675,11 +3680,11 @@ async fn set_fields_with_numeric_bool_null_types() {
             repo: "owner/repo".to_string(),
             origin: "github".to_string(),
             title: "Type test".to_string(),
-            body: "".to_string(),
-            source: "".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            body: String::new(),
+            source: String::new(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -3708,7 +3713,7 @@ async fn set_fields_with_numeric_bool_null_types() {
         .await
         .unwrap();
     let task = store.get(id).await.unwrap();
-    assert!(task.summary.is_empty());
+    assert_eq!(task.summary, "");
 }
 
 #[tokio::test]
@@ -3720,11 +3725,11 @@ async fn resolve_task_id_for_external_and_internal() {
             repo: "owner/repo".to_string(),
             origin: "github".to_string(),
             title: "Resolve test".to_string(),
-            body: "".to_string(),
-            source: "".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            body: String::new(),
+            source: String::new(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -3762,11 +3767,11 @@ async fn list_cleanable_excludes_active_and_already_cleaned() {
             repo: "owner/repo".to_string(),
             origin: "github".to_string(),
             title: "Done task".to_string(),
-            body: "".to_string(),
-            source: "".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            body: String::new(),
+            source: String::new(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -3787,11 +3792,11 @@ async fn list_cleanable_excludes_active_and_already_cleaned() {
             repo: "owner/repo".to_string(),
             origin: "github".to_string(),
             title: "Active task".to_string(),
-            body: "".to_string(),
-            source: "".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            body: String::new(),
+            source: String::new(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -3812,11 +3817,11 @@ async fn list_cleanable_excludes_active_and_already_cleaned() {
             repo: "owner/repo".to_string(),
             origin: "github".to_string(),
             title: "Already cleaned".to_string(),
-            body: "".to_string(),
-            source: "".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            body: String::new(),
+            source: String::new(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -3848,11 +3853,11 @@ async fn prune_old_runs_only_removes_old_terminal_tasks() {
             repo: "owner/repo".to_string(),
             origin: "github".to_string(),
             title: "Old done".to_string(),
-            body: "".to_string(),
-            source: "".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            body: String::new(),
+            source: String::new(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -3891,11 +3896,11 @@ async fn prune_old_runs_only_removes_old_terminal_tasks() {
             repo: "owner/repo".to_string(),
             origin: "github".to_string(),
             title: "Active".to_string(),
-            body: "".to_string(),
-            source: "".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            body: String::new(),
+            source: String::new(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -3958,11 +3963,11 @@ async fn set_fields_multiple_fields_at_once() {
             repo: "owner/repo".to_string(),
             origin: "github".to_string(),
             title: "Multi-field".to_string(),
-            body: "".to_string(),
-            source: "".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            body: String::new(),
+            source: String::new(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -4003,11 +4008,11 @@ async fn set_fields_silent_does_not_bump_updated_at() {
             repo: "owner/repo".to_string(),
             origin: "github".to_string(),
             title: "Silent update".to_string(),
-            body: "".to_string(),
-            source: "".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            body: String::new(),
+            source: String::new(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -4043,11 +4048,11 @@ async fn store_tokens_overwrites_previous_values() {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Token test".to_string(),
-            body: "".to_string(),
-            source: "".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            body: String::new(),
+            source: String::new(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -4080,11 +4085,11 @@ async fn cost_summary_across_multiple_tasks() {
                 repo: "owner/repo".to_string(),
                 origin: "github".to_string(),
                 title: format!("Task {i}"),
-                body: "".to_string(),
-                source: "".to_string(),
-                source_id: "".to_string(),
-                author: "".to_string(),
-                url: "".to_string(),
+                body: String::new(),
+                source: String::new(),
+                source_id: String::new(),
+                author: String::new(),
+                url: String::new(),
                 labels: vec![],
                 parent_id: None,
             })
@@ -4112,11 +4117,11 @@ async fn status_counts_with_mixed_statuses() {
                 repo: "owner/repo".to_string(),
                 origin: "github".to_string(),
                 title: format!("Task {i}"),
-                body: "".to_string(),
-                source: "".to_string(),
-                source_id: "".to_string(),
-                author: "".to_string(),
-                url: "".to_string(),
+                body: String::new(),
+                source: String::new(),
+                source_id: String::new(),
+                author: String::new(),
+                url: String::new(),
                 labels: vec![],
                 parent_id: None,
             })
@@ -4240,7 +4245,7 @@ async fn create_internal_sets_external_id() {
 
     let task = store.get(id).await.unwrap();
     assert_eq!(task.origin, "internal");
-    assert_eq!(task.external_id, Some(format!("internal:{}", id)));
+    assert_eq!(task.external_id, Some(format!("internal:{id}")));
     assert_eq!(task.title, "Test task");
     assert_eq!(task.source, "cron");
     assert_eq!(task.source_id, "job:1");
@@ -6158,7 +6163,7 @@ async fn metrics_summary_rate_limits_cross_repo_numeric_collision() {
     assert_eq!(
         bean_summary.rate_limits_24h, 0,
         "bean must not see orch's rate limit event"
-    )
+    );
 }
 
 #[tokio::test]
@@ -6212,7 +6217,7 @@ async fn subscription_round_trip_with_multiple_channels() {
     assert_eq!(orch_subs.len(), 1);
     assert_eq!(
         orch_subs[0],
-        ("discord".to_string(), "1111".to_string(), "".to_string())
+        ("discord".to_string(), "1111".to_string(), String::new())
     );
 }
 
@@ -6249,7 +6254,7 @@ async fn subscribe_with_topic_id_preserved() {
     assert_eq!(bean_subs.len(), 1);
     assert_eq!(
         bean_subs[0],
-        ("telegram".to_string(), "42".to_string(), "".to_string())
+        ("telegram".to_string(), "42".to_string(), String::new())
     );
 }
 
@@ -6629,8 +6634,7 @@ async fn control_recent_summaries_propagates_decode_errors() {
     let result = store.control_recent_summaries("default", 10).await;
     assert!(
         result.is_err(),
-        "expected decode error for BLOB summary row, got Ok: {:?}",
-        result
+        "expected decode error for BLOB summary row, got Ok: {result:?}"
     );
 }
 
@@ -6781,8 +6785,7 @@ async fn resolve_task_id_fallback_respects_repo() {
 
     assert!(
         resolved.is_none(),
-        "fallback must not resolve a task from a different repo (got {:?})",
-        resolved
+        "fallback must not resolve a task from a different repo (got {resolved:?})"
     );
 }
 
@@ -7130,11 +7133,11 @@ async fn make_task(store: &TaskStore) -> i64 {
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "Batch test".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             source: "manual".to_string(),
-            source_id: "".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })
@@ -7323,7 +7326,7 @@ async fn task_cols_count_matches_schema() {
     let schema_count: i64 = row.try_get("cnt").unwrap();
 
     assert_eq!(
-        schema_count as usize,
+        usize::try_from(schema_count).unwrap(),
         super::tasks::TASK_COLS_COUNT,
         "tasks table has {schema_count} columns after migrations but \
          TASK_COLS_COUNT = {}. Add the new column(s) to TASK_COLS and \
@@ -7350,8 +7353,8 @@ async fn task_row_deserialization_no_oob_panic() {
             body: "Regression test for #1736".to_string(),
             source: "test".to_string(),
             source_id: "oob-test".to_string(),
-            author: "".to_string(),
-            url: "".to_string(),
+            author: String::new(),
+            url: String::new(),
             labels: vec![],
             parent_id: None,
         })

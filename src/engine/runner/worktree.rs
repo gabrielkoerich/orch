@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tokio::process::Command;
 
 /// Result of worktree setup.
+#[derive(Debug)]
 pub struct WorktreeSetup {
     /// The directory where the agent will work
     pub work_dir: PathBuf,
@@ -26,8 +27,10 @@ pub struct WorktreeSetup {
 pub fn project_name(project_dir: &Path) -> String {
     project_dir
         .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "project".to_string())
+        .map_or_else(
+            || "project".to_string(),
+            |s| s.to_string_lossy().to_string(),
+        )
         .trim_end_matches(".git")
         .to_string()
 }
@@ -50,7 +53,7 @@ pub async fn list_project_worktrees(project_dir: &Path) -> anyhow::Result<Vec<Pa
 
     let mut entries = tokio::fs::read_dir(&base).await?;
     while let Some(entry) = entries.next_entry().await? {
-        if entry.metadata().await.map(|m| m.is_dir()).unwrap_or(false) {
+        if entry.metadata().await.is_ok_and(|m| m.is_dir()) {
             worktrees.push(entry.path());
         }
     }
@@ -106,11 +109,11 @@ pub async fn rebase_worktree_on_origin_main(
     )
     .await?
     {
-        crate::engine::runner::git_ops::RebaseOutcome::Succeeded => Ok(()),
+        crate::engine::runner::git_ops::RebaseOutcome::Succeeded
+        | crate::engine::runner::git_ops::RebaseOutcome::Skipped(_) => Ok(()),
         crate::engine::runner::git_ops::RebaseOutcome::Failed(e) => {
-            anyhow::bail!("git rebase {} failed: {}", origin_branch, e)
+            anyhow::bail!("git rebase {origin_branch} failed: {e}")
         }
-        crate::engine::runner::git_ops::RebaseOutcome::Skipped(_) => Ok(()),
     }
 }
 
@@ -203,12 +206,12 @@ pub async fn detect_default_branch(project_dir: &Path) -> String {
         .output_with_context()
         .await;
 
-    if let Ok(o) = &symref {
-        if o.status.success() {
-            let raw = String::from_utf8_lossy(&o.stdout);
-            if let Some(branch) = normalize_branch_name(&raw) {
-                return branch;
-            }
+    if let Ok(o) = &symref
+        && o.status.success()
+    {
+        let raw = String::from_utf8_lossy(&o.stdout);
+        if let Some(branch) = normalize_branch_name(&raw) {
+            return branch;
         }
     }
 
@@ -219,12 +222,12 @@ pub async fn detect_default_branch(project_dir: &Path) -> String {
         .output_with_context()
         .await;
 
-    if let Ok(o) = &revparse {
-        if o.status.success() {
-            let raw = String::from_utf8_lossy(&o.stdout);
-            if let Some(branch) = normalize_branch_name(&raw) {
-                return branch;
-            }
+    if let Ok(o) = &revparse
+        && o.status.success()
+    {
+        let raw = String::from_utf8_lossy(&o.stdout);
+        if let Some(branch) = normalize_branch_name(&raw) {
+            return branch;
         }
     }
 
@@ -235,18 +238,18 @@ pub async fn detect_default_branch(project_dir: &Path) -> String {
         .output_with_context()
         .await;
 
-    if let Ok(o) = &remote_show {
-        if o.status.success() {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            for line in stdout.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with("HEAD branch:") {
-                    if let Some(branch) = trimmed.split(':').nth(1) {
-                        let branch = branch.trim();
-                        if !branch.is_empty() && branch != "(unknown)" {
-                            return branch.to_string();
-                        }
-                    }
+    if let Ok(o) = &remote_show
+        && o.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("HEAD branch:")
+                && let Some(branch) = trimmed.split(':').nth(1)
+            {
+                let branch = branch.trim();
+                if !branch.is_empty() && branch != "(unknown)" {
+                    return branch.to_string();
                 }
             }
         }
@@ -269,21 +272,21 @@ pub async fn resolve_main_repo(project_dir: &Path) -> PathBuf {
         .output_with_context()
         .await;
 
-    if let Ok(o) = output {
-        if o.status.success() {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            if let Some(first_line) = stdout.lines().next() {
-                if let Some(path) = first_line.strip_prefix("worktree ") {
-                    let main_path = PathBuf::from(path);
-                    if main_path != project_dir {
-                        tracing::info!(
-                            worktree = %project_dir.display(),
-                            main = %main_path.display(),
-                            "resolved worktree to main repo"
-                        );
-                        return main_path;
-                    }
-                }
+    if let Ok(o) = output
+        && o.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        if let Some(first_line) = stdout.lines().next()
+            && let Some(path) = first_line.strip_prefix("worktree ")
+        {
+            let main_path = PathBuf::from(path);
+            if main_path != project_dir {
+                tracing::info!(
+                    worktree = %project_dir.display(),
+                    main = %main_path.display(),
+                    "resolved worktree to main repo"
+                );
+                return main_path;
             }
         }
     }
@@ -310,8 +313,7 @@ pub(super) async fn resolve_branch_start_point(
             .args(["-C", repo_root, "rev-parse", "--verify", &reference])
             .output_with_context()
             .await
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .is_ok_and(|o| o.status.success())
     };
 
     let origin_branch_ref = format!("origin/{branch}");
@@ -341,15 +343,13 @@ pub async fn validate_worktree_gitdir(worktree_dir: &Path) -> bool {
     // In a linked worktree .git is a file; in the main repo it's a directory (always valid).
     if tokio::fs::metadata(&git_file)
         .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
+        .is_ok_and(|m| m.is_dir())
     {
         return true;
     }
 
-    let content = match tokio::fs::read_to_string(&git_file).await {
-        Ok(c) => c,
-        Err(_) => return false,
+    let Ok(content) = tokio::fs::read_to_string(&git_file).await else {
+        return false;
     };
     // Expected format: "gitdir: /absolute/path/to/.git/worktrees/<name>\n"
     // Use spawn_blocking for the final exists check on the resolved path
@@ -361,8 +361,7 @@ pub async fn validate_worktree_gitdir(worktree_dir: &Path) -> bool {
         // Use async metadata for the gitdir check too.
         return tokio::fs::metadata(gitdir_path.trim())
             .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
+            .is_ok_and(|m| m.is_dir());
     }
     false
 }
@@ -372,6 +371,10 @@ pub async fn validate_worktree_gitdir(worktree_dir: &Path) -> bool {
 /// When a child task is created from a mention on a PR, it should work on the
 /// parent task's branch so changes are committed to the existing PR rather than
 /// a new one being opened.
+#[expect(
+    clippy::ref_option,
+    reason = "the store helper it calls takes the store as &Option"
+)]
 async fn resolve_parent_branch(
     store: &Option<Arc<TaskStore>>,
     parent_id: Option<i64>,
@@ -382,19 +385,18 @@ async fn resolve_parent_branch(
     if parent.branch.is_empty() {
         return None;
     }
-    let wt = if !parent.worktree.is_empty() {
+    let wt = if parent.worktree.is_empty() {
+        worktrees_base.join(&parent.branch)
+    } else {
         // Use async metadata to avoid blocking the reactor thread.
         let exists = tokio::fs::metadata(&parent.worktree)
             .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
+            .is_ok_and(|m| m.is_dir());
         if exists {
             PathBuf::from(&parent.worktree)
         } else {
             worktrees_base.join(&parent.branch)
         }
-    } else {
-        worktrees_base.join(&parent.branch)
     };
     tracing::info!(
         parent_id,
@@ -424,16 +426,14 @@ pub async fn setup_worktree(
 
     // Check if we have a saved branch/worktree in store
     let task_record = store::opt_store_get_task(store, repo, task_id).await;
-    let (saved_branch, saved_worktree, parent_id) = task_record
-        .as_ref()
-        .map(|t| {
+    let (saved_branch, saved_worktree, parent_id) =
+        task_record.as_ref().map_or((None, None, None), |t| {
             (
                 Some(t.branch.clone()),
                 Some(t.worktree.clone()),
                 t.parent_id,
             )
-        })
-        .unwrap_or((None, None, None));
+        });
 
     let mut force_fresh = false;
     if let (Some(store), Some(record)) = (store.as_ref(), task_record.as_ref()) {
@@ -500,8 +500,10 @@ pub async fn setup_worktree(
                 let bn = existing_dir
                     .file_name()
                     .filter(|n| !n.is_empty())
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| branch_name(task_id, title));
+                    .map_or_else(
+                        || branch_name(task_id, title),
+                        |n| n.to_string_lossy().to_string(),
+                    );
                 tracing::info!(task_id, worktree = %existing_dir.display(), "found existing worktree");
                 (bn, existing_dir)
             } else {
@@ -540,8 +542,7 @@ pub async fn setup_worktree(
             .current_dir(&worktree_dir)
             .output_with_context()
             .await
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+            .is_ok_and(|o| o.status.success());
 
         if !index_ok {
             let stderr_hint = Command::new("git")
@@ -737,15 +738,15 @@ pub async fn setup_worktree(
 
                 if tokio::fs::metadata(&worktree_dir).await.is_err() {
                     anyhow::bail!(
-                    "failed to create worktree at {} for task {} (stdout: {}, stderr: {}, retry stdout: {}, retry stderr: {}, retry error: {})",
-                    worktree_dir.display(),
-                    task_id,
-                    stdout,
-                    stderr,
-                    retry_stdout,
-                    retry_stderr,
-                    retry_error
-                );
+                        "failed to create worktree at {} for task {} (stdout: {}, stderr: {}, retry stdout: {}, retry stderr: {}, retry error: {})",
+                        worktree_dir.display(),
+                        task_id,
+                        stdout,
+                        stderr,
+                        retry_stdout,
+                        retry_stderr,
+                        retry_error
+                    );
                 }
             }
         }
@@ -754,20 +755,19 @@ pub async fn setup_worktree(
     // Link issue to branch via GitHub API (Development sidebar).
     // Must happen before the agent pushes — createLinkedBranch only works
     // for branches that don't yet exist on GitHub.
-    if !task_id.starts_with("internal:") {
-        if let Ok(issue_num) = task_id.parse::<u64>() {
-            if let Ok(gh) = crate::github::http::GhHttp::new() {
-                match gh
-                    .link_issue_to_branch(repo, issue_num, &branch_name_str)
-                    .await
-                {
-                    Ok(id) => {
-                        tracing::info!(task_id, branch = %branch_name_str, linked = %id, "linked issue to branch");
-                    }
-                    Err(e) => {
-                        tracing::debug!(task_id, error = %e, "failed to link issue to branch (non-fatal)");
-                    }
-                }
+    if !task_id.starts_with("internal:")
+        && let Ok(issue_num) = task_id.parse::<u64>()
+        && let Ok(gh) = crate::github::http::GhHttp::new()
+    {
+        match gh
+            .link_issue_to_branch(repo, issue_num, &branch_name_str)
+            .await
+        {
+            Ok(id) => {
+                tracing::info!(task_id, branch = %branch_name_str, linked = %id, "linked issue to branch");
+            }
+            Err(e) => {
+                tracing::debug!(task_id, error = %e, "failed to link issue to branch (non-fatal)");
             }
         }
     }
@@ -902,15 +902,14 @@ mod tests {
         let out = cmd
             .args(args)
             .output()
-            .unwrap_or_else(|e| panic!("git {:?} failed to start: {e}", args));
-        if !out.status.success() {
-            panic!(
-                "git {:?} failed:\nstdout: {}\nstderr: {}",
-                args,
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
+            .unwrap_or_else(|e| panic!("git {args:?} failed to start: {e}"));
+        assert!(
+            out.status.success(),
+            "git {:?} failed:\nstdout: {}\nstderr: {}",
+            args,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// When `origin/<branch>` exists, `resolve_branch_start_point` should
@@ -1024,15 +1023,14 @@ mod tests {
             .args(args)
             .current_dir(dir)
             .output()
-            .unwrap_or_else(|e| panic!("git {:?} failed to start: {e}", args));
-        if !out.status.success() {
-            panic!(
-                "git {:?} failed:\nstdout: {}\nstderr: {}",
-                args,
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
+            .unwrap_or_else(|e| panic!("git {args:?} failed to start: {e}"));
+        assert!(
+            out.status.success(),
+            "git {:?} failed:\nstdout: {}\nstderr: {}",
+            args,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
@@ -1046,7 +1044,8 @@ mod tests {
         // Isolate ORCH_HOME so the worktree lands in a temp dir.
         let orch_home_dir = tempfile::tempdir().unwrap();
         let prev_orch_home = std::env::var("ORCH_HOME").ok();
-        std::env::set_var("ORCH_HOME", orch_home_dir.path());
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", orch_home_dir.path()) };
 
         // Bare "remote".
         let remote = tempfile::tempdir().unwrap();
@@ -1109,8 +1108,10 @@ mod tests {
 
         // Restore ORCH_HOME.
         match prev_orch_home {
-            Some(v) => std::env::set_var("ORCH_HOME", v),
-            None => std::env::remove_var("ORCH_HOME"),
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            Some(v) => unsafe { std::env::set_var("ORCH_HOME", v) },
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            None => unsafe { std::env::remove_var("ORCH_HOME") },
         }
     }
 
@@ -1190,14 +1191,14 @@ mod tests {
     fn branch_name_all_special_chars() {
         let name = branch_name("10", "--- ??? ---");
         assert_eq!(name, "gh-issue-10");
-        assert!(!name.is_empty());
+        assert_ne!(name, "");
     }
 
     #[test]
     fn branch_name_chinese_chars_no_panic() {
         let name = branch_name("265", "implement 用户认证 user auth");
         assert!(name.starts_with("gh-issue-265-"));
-        assert!(!name.is_empty());
+        assert_ne!(name, "");
         let slug = name.strip_prefix("gh-issue-265-").unwrap();
         assert!(slug.len() <= 40, "slug too long: {}", slug.len());
         assert!(slug.is_ascii(), "slug contains non-ASCII: {slug}");

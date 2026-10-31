@@ -17,14 +17,14 @@ pub async fn show_task(id: &str) -> anyhow::Result<()> {
         .unwrap_or_default();
 
     if usage.total_tokens() == 0 {
-        println!("No token data available for task #{}", id);
+        println!("No token data available for task #{id}");
         println!("Run the task first to collect token usage.");
         return Ok(());
     }
 
     let pricing = store::pricing_for_model(&model);
 
-    println!("Task #{}: cost breakdown", id);
+    println!("Task #{id}: cost breakdown");
     println!(
         "├── Input tokens:  {:>12}",
         format_tokens(usage.input_tokens)
@@ -78,8 +78,8 @@ pub async fn show_summary() -> anyhow::Result<()> {
         println!(
             "{:<8} {:>10} {:>10} {:>10} {:>8}",
             period.label,
-            format_tokens(period.input_tokens as u64),
-            format_tokens(period.output_tokens as u64),
+            format_tokens(u64::try_from(period.input_tokens).unwrap_or(0)),
+            format_tokens(u64::try_from(period.output_tokens).unwrap_or(0)),
             format!("${:.4}", period.total_cost_usd),
             period.task_count,
         );
@@ -116,8 +116,8 @@ pub async fn show_by_agent() -> anyhow::Result<()> {
         println!(
             "{:<12} {:>10} {:>10} {:>10} {:>8}",
             group.name,
-            format_tokens(group.input_tokens as u64),
-            format_tokens(group.output_tokens as u64),
+            format_tokens(u64::try_from(group.input_tokens).unwrap_or(0)),
+            format_tokens(u64::try_from(group.output_tokens).unwrap_or(0)),
             format!("${:.4}", group.total_cost_usd),
             group.task_count,
         );
@@ -162,8 +162,8 @@ pub async fn show_by_model() -> anyhow::Result<()> {
         println!(
             "{:<20} {:>10} {:>10} {:>10} {:>8}",
             group.name,
-            format_tokens(group.input_tokens as u64),
-            format_tokens(group.output_tokens as u64),
+            format_tokens(u64::try_from(group.input_tokens).unwrap_or(0)),
+            format_tokens(u64::try_from(group.output_tokens).unwrap_or(0)),
             format!("${:.4}", group.total_cost_usd),
             group.task_count,
         );

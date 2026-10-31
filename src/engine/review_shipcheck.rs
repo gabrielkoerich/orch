@@ -27,11 +27,14 @@ static RUNS: LazyLock<Mutex<HashMap<(PathBuf, String), RunState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn run_state(key: &(PathBuf, String)) -> Option<RunState> {
-    RUNS.lock().unwrap().get(key).copied()
+    RUNS.lock()
+        .expect("shipcheck run map lock poisoned")
+        .get(key)
+        .copied()
 }
 
 fn set_run_state(key: (PathBuf, String), state: Option<RunState>) {
-    let mut runs = RUNS.lock().unwrap();
+    let mut runs = RUNS.lock().expect("shipcheck run map lock poisoned");
     match state {
         Some(state) => runs.insert(key, state),
         None => runs.remove(&key),
@@ -65,7 +68,7 @@ async fn prerun_with(bin: &Path, worktree: &Path) -> Prerun {
     }
 
     {
-        let mut runs = RUNS.lock().unwrap();
+        let mut runs = RUNS.lock().expect("shipcheck run map lock poisoned");
         if runs.contains_key(&key) {
             return Prerun::Running;
         }

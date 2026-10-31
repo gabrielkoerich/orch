@@ -11,8 +11,8 @@ use crate::cmd::CommandErrorContext;
 use crate::github::http::GhHttp;
 use regex::Regex;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::process::Command;
 
@@ -92,11 +92,10 @@ pub async fn has_changes(dir: &Path) -> bool {
         .output_with_context()
         .await;
 
-    let has_diff = diff.map(|s| !s.success()).unwrap_or(false);
-    let has_cached = cached.map(|s| !s.success()).unwrap_or(false);
-    let has_untracked = untracked
-        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
-        .unwrap_or(false);
+    let has_diff = diff.is_ok_and(|s| !s.success());
+    let has_cached = cached.is_ok_and(|s| !s.success());
+    let has_untracked =
+        untracked.is_ok_and(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty());
 
     has_diff || has_cached || has_untracked
 }
@@ -263,7 +262,7 @@ pub(crate) async fn stash_rebase_restore(
                     .await;
                 match abort {
                     Err(e) => {
-                        tracing::warn!(dir = %dir.display(), error = %e, "git rebase --abort failed — worktree may be in inconsistent state")
+                        tracing::warn!(dir = %dir.display(), error = %e, "git rebase --abort failed — worktree may be in inconsistent state");
                     }
                     Ok(o) if !o.status.success() => {
                         let stderr = String::from_utf8_lossy(&o.stderr);
@@ -284,7 +283,7 @@ pub(crate) async fn stash_rebase_restore(
                     .await;
                 match abort {
                     Err(e) => {
-                        tracing::warn!(dir = %dir.display(), error = %e, "git rebase --abort failed — worktree may be in inconsistent state")
+                        tracing::warn!(dir = %dir.display(), error = %e, "git rebase --abort failed — worktree may be in inconsistent state");
                     }
                     Ok(o) if !o.status.success() => {
                         let stderr = String::from_utf8_lossy(&o.stderr);
@@ -312,48 +311,48 @@ async fn restore_stash_by_hash(dir: &Path, stash_hash: Option<&str>) {
         .current_dir(dir)
         .output_with_context()
         .await;
-    if apply.map(|o| o.status.success()).unwrap_or(false) {
+    if apply.is_ok_and(|o| o.status.success()) {
         let list = Command::new("git")
             .args(["stash", "list", "--format=%H %gd"])
             .current_dir(dir)
             .output_with_context()
             .await;
-        if let Ok(list_out) = list {
-            if list_out.status.success() {
-                let list_str = String::from_utf8_lossy(&list_out.stdout);
-                if let Some(stash_ref) = find_stash_ref_by_hash(&list_str, stash_hash) {
-                    match Command::new("git")
-                        .args(["stash", "drop", &stash_ref])
-                        .current_dir(dir)
-                        .output_with_context()
-                        .await
-                    {
-                        Ok(drop_out) if !drop_out.status.success() => {
-                            let stderr = String::from_utf8_lossy(&drop_out.stderr);
-                            tracing::warn!(
-                                dir = %dir.display(),
-                                stash_ref = %stash_ref,
-                                err = %stderr,
-                                "stash drop failed after apply — entry may remain on stack"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                dir = %dir.display(),
-                                stash_ref = %stash_ref,
-                                error = %e,
-                                "stash drop command failed after apply — entry may remain on stack"
-                            );
-                        }
-                        _ => {}
+        if let Ok(list_out) = list
+            && list_out.status.success()
+        {
+            let list_str = String::from_utf8_lossy(&list_out.stdout);
+            if let Some(stash_ref) = find_stash_ref_by_hash(&list_str, stash_hash) {
+                match Command::new("git")
+                    .args(["stash", "drop", &stash_ref])
+                    .current_dir(dir)
+                    .output_with_context()
+                    .await
+                {
+                    Ok(drop_out) if !drop_out.status.success() => {
+                        let stderr = String::from_utf8_lossy(&drop_out.stderr);
+                        tracing::warn!(
+                            dir = %dir.display(),
+                            stash_ref = %stash_ref,
+                            err = %stderr,
+                            "stash drop failed after apply — entry may remain on stack"
+                        );
                     }
-                } else {
-                    tracing::warn!(
-                        dir = %dir.display(),
-                        stash = %stash_hash,
-                        "stash applied but could not find ref by hash — stash entry may be orphaned on stack"
-                    );
+                    Err(e) => {
+                        tracing::warn!(
+                            dir = %dir.display(),
+                            stash_ref = %stash_ref,
+                            error = %e,
+                            "stash drop command failed after apply — entry may remain on stack"
+                        );
+                    }
+                    _ => {}
                 }
+            } else {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    stash = %stash_hash,
+                    "stash applied but could not find ref by hash — stash entry may be orphaned on stack"
+                );
             }
         }
     } else {
@@ -474,8 +473,7 @@ pub async fn rebase_on_branch(dir: &Path, branch: &str) -> anyhow::Result<bool> 
 
     if commit_count > MAX_REBASE_COMMITS {
         anyhow::bail!(
-            "refusing to rebase {commit_count} commits on origin/{branch} (max {})",
-            MAX_REBASE_COMMITS
+            "refusing to rebase {commit_count} commits on origin/{branch} (max {MAX_REBASE_COMMITS})"
         );
     }
 
@@ -559,13 +557,13 @@ pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
     .await
     {
         Ok(RebaseOutcome::Succeeded) => {
-            tracing::debug!(default_branch, "rebased worktree on default branch")
+            tracing::debug!(default_branch, "rebased worktree on default branch");
         }
         Ok(RebaseOutcome::Failed(e)) => {
-            tracing::warn!(default_branch, err = %e, "rebase failed, continuing with current state")
+            tracing::warn!(default_branch, err = %e, "rebase failed, continuing with current state");
         }
         Ok(RebaseOutcome::Skipped(reason)) => {
-            tracing::warn!(default_branch, %reason, "stash failed before rebase, continuing with current state")
+            tracing::warn!(default_branch, %reason, "stash failed before rebase, continuing with current state");
         }
         Err(e) => tracing::warn!(err = %e, "rebase error"),
     }
@@ -708,7 +706,7 @@ async fn strip_workflow_files(dir: &Path, default_branch: &str) -> anyhow::Resul
     let workflow_files: Vec<String> = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|l| !l.is_empty())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
 
     if workflow_files.is_empty() {
@@ -794,7 +792,10 @@ async fn strip_workflow_files(dir: &Path, default_branch: &str) -> anyhow::Resul
 
     // Remove workflow files from the index
     let mut rm_args = vec!["rm", "--cached", "--ignore-unmatch", "--"];
-    let file_refs: Vec<&str> = workflow_files.iter().map(|s| s.as_str()).collect();
+    let file_refs: Vec<&str> = workflow_files
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
     rm_args.extend(file_refs);
 
     let rm = Command::new("git")
@@ -815,8 +816,7 @@ async fn strip_workflow_files(dir: &Path, default_branch: &str) -> anyhow::Resul
         .current_dir(dir)
         .status()
         .await
-        .map(|s| !s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| !s.success());
 
     if !has_staged {
         tracing::warn!(
@@ -1043,11 +1043,7 @@ pub(crate) async fn force_push_leased(
 /// Push the branch to origin.
 pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyhow::Result<bool> {
     let current = get_current_branch(dir).await;
-    let branch_to_push = if !current.is_empty() {
-        &current
-    } else {
-        branch
-    };
+    let branch_to_push = if current.is_empty() { branch } else { &current };
 
     // Guard against empty branch names (prevents git config corruption)
     if branch_to_push.is_empty() {
@@ -1479,7 +1475,10 @@ fn cleaned_pr_items(items: &[String]) -> Vec<String> {
 }
 
 /// Format the GitHub PR description from the agent summary, stripping push and PR-creation statements
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is one section of the PR body"
+)]
 fn build_pr_body(
     title: &str,
     summary: &str,
@@ -1490,6 +1489,7 @@ fn build_pr_body(
     agent: &str,
     model: Option<&str>,
 ) -> String {
+    use std::fmt::Write as _;
     let cleaned_summary = strip_push_and_pr_creation(summary);
     let summary_text = if cleaned_summary.is_empty() {
         title
@@ -1504,35 +1504,36 @@ fn build_pr_body(
     if !accomplished.is_empty() {
         body.push_str("\n\n### What was done\n\n");
         for item in &accomplished {
-            body.push_str(&format!("- {item}\n"));
+            let _ = writeln!(body, "- {item}");
         }
     }
 
     if !remaining.is_empty() {
         body.push_str("\n\n### Remaining\n\n");
         for item in &remaining {
-            body.push_str(&format!("- {item}\n"));
+            let _ = writeln!(body, "- {item}");
         }
     }
 
     if !files.is_empty() {
         body.push_str("\n\n### Files changed\n\n");
         for file in files {
-            body.push_str(&format!("- `{file}`\n"));
+            let _ = writeln!(body, "- `{file}`");
         }
     }
 
-    if !task_id.starts_with("internal:") {
-        if let Ok(issue_num) = task_id.parse::<u64>() {
-            body.push_str(&format!("\n\nCloses #{issue_num}"));
-        }
+    if !task_id.starts_with("internal:")
+        && let Ok(issue_num) = task_id.parse::<u64>()
+    {
+        let _ = write!(body, "\n\nCloses #{issue_num}");
     }
 
     let model_str = model.map(|m| format!(" using `{m}`")).unwrap_or_default();
     let task_ref = format_task_ref(task_id);
-    body.push_str(&format!(
+    let _ = write!(
+        body,
         "\n\n---\n*Task {task_ref} · Created by {agent}[bot] via [Orch](https://github.com/gabrielkoerich/orch){model_str}*"
-    ));
+    );
     body
 }
 
@@ -1544,7 +1545,10 @@ fn build_pr_body(
 /// # Returns
 /// - `Ok(url)` - PR URL (newly created or already existed)
 /// - `Err(PrCreateError)` - API error or other failure
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the PR needs its branch, body sections, attribution and target together"
+)]
 pub async fn create_pr_if_needed(
     dir: &Path,
     branch: &str,
@@ -1559,6 +1563,8 @@ pub async fn create_pr_if_needed(
     repo: &str,
     base_branch: &str,
 ) -> PrCreateResult<String> {
+    // Retries for transient 5xx errors on PR creation below
+    const MAX_RETRIES: u32 = 3;
     let gh = GhHttp::new()?;
 
     // Check if PR already exists using GhHttp API
@@ -1603,7 +1609,7 @@ pub async fn create_pr_if_needed(
                 git_files = String::from_utf8_lossy(&output.stdout)
                     .lines()
                     .filter(|l| !l.is_empty())
-                    .map(|l| l.to_string())
+                    .map(std::string::ToString::to_string)
                     .collect();
                 &git_files
             }
@@ -1628,7 +1634,6 @@ pub async fn create_pr_if_needed(
     let pr_title = title;
 
     // Create PR using GhHttp API with exponential backoff retry for transient 5xx errors.
-    const MAX_RETRIES: u32 = 3;
     let mut last_error: Option<anyhow::Error> = None;
     let mut created_url: Option<String> = None;
     let mut had_transient_error = false;
@@ -1701,65 +1706,63 @@ pub async fn create_pr_if_needed(
         }
     }
 
-    let url = match created_url {
-        Some(u) => u,
-        None => {
-            let e = last_error.unwrap_or_else(|| {
-                anyhow::anyhow!("PR creation failed after retries (no error captured)")
-            });
-            let err_str = format!("{e}");
-            // For transient 5xx errors, GitHub may have created the PR despite returning
-            // an error (e.g. 502 after the write succeeded). Re-check for an existing PR
-            // before propagating the failure so we don't orphan the PR from the task.
-            // Also check when the final error is non-transient but a prior attempt had a
-            // transient error — the PR may have been created on that earlier attempt (e.g.
-            // attempt 1 returns 502, attempt 2 returns 422 "already exists").
-            if is_transient_github_error(&err_str) || had_transient_error {
-                tracing::warn!(
-                    task_id,
-                    error = %e,
-                    "transient GitHub API error after all retries — checking if PR was actually created"
-                );
-                match gh.get_pr_number(repo, branch).await {
-                    Ok(Some(pr_number)) => {
-                        tracing::info!(
-                            task_id,
-                            pr = pr_number,
-                            "PR was created despite transient errors — recovering"
-                        );
-                        append_pr_footer_if_missing(&gh, repo, pr_number, task_id, agent, model)
-                            .await;
-                        match gh.get_pr(repo, pr_number).await {
-                            Ok(pr) => pr.html_url,
-                            Err(get_err) => {
-                                tracing::warn!(
-                                    task_id,
-                                    error = %get_err,
-                                    "failed to fetch PR URL after transient-error recovery"
-                                );
-                                return Err(PrCreateError::ApiError(e));
-                            }
+    let url = if let Some(u) = created_url {
+        u
+    } else {
+        let e = last_error.unwrap_or_else(|| {
+            anyhow::anyhow!("PR creation failed after retries (no error captured)")
+        });
+        let err_str = format!("{e}");
+        // For transient 5xx errors, GitHub may have created the PR despite returning
+        // an error (e.g. 502 after the write succeeded). Re-check for an existing PR
+        // before propagating the failure so we don't orphan the PR from the task.
+        // Also check when the final error is non-transient but a prior attempt had a
+        // transient error — the PR may have been created on that earlier attempt (e.g.
+        // attempt 1 returns 502, attempt 2 returns 422 "already exists").
+        if is_transient_github_error(&err_str) || had_transient_error {
+            tracing::warn!(
+                task_id,
+                error = %e,
+                "transient GitHub API error after all retries — checking if PR was actually created"
+            );
+            match gh.get_pr_number(repo, branch).await {
+                Ok(Some(pr_number)) => {
+                    tracing::info!(
+                        task_id,
+                        pr = pr_number,
+                        "PR was created despite transient errors — recovering"
+                    );
+                    append_pr_footer_if_missing(&gh, repo, pr_number, task_id, agent, model).await;
+                    match gh.get_pr(repo, pr_number).await {
+                        Ok(pr) => pr.html_url,
+                        Err(get_err) => {
+                            tracing::warn!(
+                                task_id,
+                                error = %get_err,
+                                "failed to fetch PR URL after transient-error recovery"
+                            );
+                            return Err(PrCreateError::ApiError(e));
                         }
                     }
-                    Ok(None) => {
-                        tracing::warn!(
-                            task_id,
-                            "PR was not created after all retries — propagating original error"
-                        );
-                        return Err(PrCreateError::ApiError(e));
-                    }
-                    Err(check_err) => {
-                        tracing::warn!(
-                            task_id,
-                            error = %check_err,
-                            "failed to verify PR existence after transient error retries — propagating original error"
-                        );
-                        return Err(PrCreateError::ApiError(e));
-                    }
                 }
-            } else {
-                return Err(PrCreateError::ApiError(e));
+                Ok(None) => {
+                    tracing::warn!(
+                        task_id,
+                        "PR was not created after all retries — propagating original error"
+                    );
+                    return Err(PrCreateError::ApiError(e));
+                }
+                Err(check_err) => {
+                    tracing::warn!(
+                        task_id,
+                        error = %check_err,
+                        "failed to verify PR existence after transient error retries — propagating original error"
+                    );
+                    return Err(PrCreateError::ApiError(e));
+                }
             }
+        } else {
+            return Err(PrCreateError::ApiError(e));
         }
     };
 
@@ -1783,10 +1786,7 @@ pub(crate) fn is_transient_github_error(err_str: &str) -> bool {
     }
 
     // Check for HTTP 5xx status codes
-    if extract_github_http_status(err_str)
-        .map(|s| (500..600).contains(&s))
-        .unwrap_or(false)
-    {
+    if extract_github_http_status(err_str).is_some_and(|s| (500..600).contains(&s)) {
         return true;
     }
 
@@ -1940,14 +1940,17 @@ async fn append_pr_footer_if_missing(
     );
     let new_body = format!("{body}{footer}");
 
-    if let Err(e) = gh.update_pr_body(repo, pr_number, &new_body).await {
-        tracing::warn!(task_id, error = %e, "failed to append footer to PR (non-fatal)");
-    } else {
-        tracing::info!(
-            task_id,
-            pr = pr_number,
-            "appended attribution footer to agent-created PR"
-        );
+    match gh.update_pr_body(repo, pr_number, &new_body).await {
+        Err(e) => {
+            tracing::warn!(task_id, error = %e, "failed to append footer to PR (non-fatal)");
+        }
+        _ => {
+            tracing::info!(
+                task_id,
+                pr = pr_number,
+                "appended attribution footer to agent-created PR"
+            );
+        }
     }
 }
 
@@ -2005,8 +2008,7 @@ async fn check_push_needed(dir: &Path, branch: &str, default_branch: &str) -> (b
         .current_dir(dir)
         .output_with_context()
         .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .is_ok_and(|o| o.status.success());
 
     let compare_ref = if remote_exists {
         format!("origin/{branch}..HEAD")
@@ -2054,7 +2056,7 @@ mod tests {
     #[test]
     fn pr_create_error_display() {
         let err = PrCreateError::ApiError(anyhow::anyhow!("test error"));
-        assert_eq!(format!("{}", err), "GitHub API error: test error");
+        assert_eq!(format!("{err}"), "GitHub API error: test error");
     }
 
     #[test]
@@ -2553,7 +2555,7 @@ mod tests {
             .status()
             .await;
         assert!(
-            cached.map(|s| s.success()).unwrap_or(false),
+            cached.is_ok_and(|s| s.success()),
             "files should be unstaged after commit failure"
         );
 
@@ -2670,17 +2672,16 @@ mod tests {
             .output()
             .await;
         // Fallback to "main" if origin/HEAD is not set
-        let default_branch = branch_out
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| {
+        let default_branch = branch_out.ok().filter(|o| o.status.success()).map_or_else(
+            || "main".to_string(),
+            |o| {
                 String::from_utf8_lossy(&o.stdout)
                     .trim()
                     .strip_prefix("origin/")
                     .unwrap_or("main")
                     .to_string()
-            })
-            .unwrap_or_else(|| "main".to_string());
+            },
+        );
 
         // Strip workflow files
         let stripped = strip_workflow_files(&dir, &default_branch).await.unwrap();

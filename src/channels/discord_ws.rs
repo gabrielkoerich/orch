@@ -55,6 +55,16 @@ pub struct DiscordGateway {
     shard_count: u64,
 }
 
+impl std::fmt::Debug for DiscordGateway {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscordGateway")
+            .field("channel_id", &self.channel_id)
+            .field("shard_id", &self.shard_id)
+            .field("shard_count", &self.shard_count)
+            .finish_non_exhaustive()
+    }
+}
+
 impl DiscordGateway {
     /// Create a new Gateway client.
     ///
@@ -80,14 +90,13 @@ impl DiscordGateway {
         })
     }
 
-    fn api_url(&self, endpoint: &str) -> String {
+    fn api_url(endpoint: &str) -> String {
         format!("https://discord.com/api/v10{endpoint}")
     }
 
     /// Send a message with action row buttons to a specific channel.
     ///
     /// Returns the message ID of the sent message.
-    #[allow(dead_code)]
     pub async fn send_with_buttons(
         &self,
         channel_id: &str,
@@ -111,7 +120,7 @@ impl DiscordGateway {
             "components": components
         });
 
-        let url = self.api_url(&format!("/channels/{channel_id}/messages"));
+        let url = Self::api_url(&format!("/channels/{channel_id}/messages"));
         let response = self
             .client
             .post(&url)
@@ -122,7 +131,7 @@ impl DiscordGateway {
 
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("discord API error: {}", body);
+            anyhow::bail!("discord API error: {body}");
         }
 
         let result: serde_json::Value = response.json().await?;
@@ -130,7 +139,7 @@ impl DiscordGateway {
     }
 
     async fn send_message(&self, channel_id: &str, content: &str) -> anyhow::Result<()> {
-        let url = self.api_url(&format!("/channels/{channel_id}/messages"));
+        let url = Self::api_url(&format!("/channels/{channel_id}/messages"));
         let resp = self
             .client
             .post(&url)
@@ -153,7 +162,7 @@ impl DiscordGateway {
 
 #[async_trait]
 impl Channel for DiscordGateway {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "discord"
     }
 
@@ -181,21 +190,21 @@ impl Channel for DiscordGateway {
             .ok_or_else(|| anyhow::anyhow!("no target channel for discord message"))?;
 
         // If metadata carries buttons, send as an interactive message with an ActionRow.
-        if let Some(buttons_val) = msg.metadata.get("buttons") {
-            if let Some(buttons_arr) = buttons_val.as_array() {
-                let buttons: Vec<(String, String)> = buttons_arr
-                    .iter()
-                    .filter_map(|b| {
-                        let text = b["text"].as_str()?.to_string();
-                        let custom_id = b["callback_data"].as_str()?.to_string();
-                        Some((text, custom_id))
-                    })
-                    .collect();
-                if !buttons.is_empty() {
-                    self.send_with_buttons(target_channel, &msg.body, &buttons)
-                        .await?;
-                    return Ok(());
-                }
+        if let Some(buttons_val) = msg.metadata.get("buttons")
+            && let Some(buttons_arr) = buttons_val.as_array()
+        {
+            let buttons: Vec<(String, String)> = buttons_arr
+                .iter()
+                .filter_map(|b| {
+                    let text = b["text"].as_str()?.to_string();
+                    let custom_id = b["callback_data"].as_str()?.to_string();
+                    Some((text, custom_id))
+                })
+                .collect();
+            if !buttons.is_empty() {
+                self.send_with_buttons(target_channel, &msg.body, &buttons)
+                    .await?;
+                return Ok(());
             }
         }
 
@@ -205,7 +214,7 @@ impl Channel for DiscordGateway {
     async fn health_check(&self) -> anyhow::Result<()> {
         let resp = self
             .client
-            .get(self.api_url("/users/@me"))
+            .get(Self::api_url("/users/@me"))
             .header("Authorization", format!("Bot {}", self.token))
             .send()
             .await?;
@@ -256,10 +265,10 @@ impl GatewayState {
     }
 
     fn ws_url(&self) -> String {
-        self.resume_url
-            .as_deref()
-            .map(|u| format!("{}/?v=10&encoding=json", u.trim_end_matches('/')))
-            .unwrap_or_else(|| DEFAULT_GATEWAY_URL.to_string())
+        self.resume_url.as_deref().map_or_else(
+            || DEFAULT_GATEWAY_URL.to_string(),
+            |u| format!("{}/?v=10&encoding=json", u.trim_end_matches('/')),
+        )
     }
 }
 
@@ -446,8 +455,7 @@ async fn handle_connection(
                                 // Server explicitly requested a heartbeat
                                 let d = state
                                     .last_seq
-                                    .map(|s| serde_json::json!(s))
-                                    .unwrap_or(Value::Null);
+                                    .map_or(Value::Null, |s| serde_json::json!(s));
                                 let hb_payload = Message::Text(
                                     serde_json::json!({"op": OP_HEARTBEAT, "d": d}).to_string(),
                                 );
@@ -479,17 +487,17 @@ async fn handle_connection(
                         }
                     }
                     Message::Close(frame) => {
-                        let code = frame.as_ref().map(|f| u16::from(f.code)).unwrap_or(0);
+                        let code = frame.as_ref().map_or(0, |f| u16::from(f.code));
                         // Non-resumable Discord Gateway close codes per Discord docs
                         let resumable = !matches!(code, 4004 | 4010 | 4011 | 4013 | 4014);
-                        if !resumable {
+                        if resumable {
+                            tracing::info!(code, ?frame, "discord gateway: close frame, will attempt resume");
+                        } else {
                             state.clear();
                             tracing::error!(
                                 code,
                                 "discord gateway: non-resumable close code — check bot token and intent configuration"
                             );
-                        } else {
-                            tracing::info!(code, ?frame, "discord gateway: close frame, will attempt resume");
                         }
                         return Ok(resumable);
                     }
@@ -513,8 +521,7 @@ async fn handle_connection(
                 ack_received = false;
                 let d = state
                     .last_seq
-                    .map(|s| serde_json::json!(s))
-                    .unwrap_or(Value::Null);
+                    .map_or(Value::Null, |s| serde_json::json!(s));
                 let hb_payload = Message::Text(
                     serde_json::json!({"op": OP_HEARTBEAT, "d": d}).to_string(),
                 );
@@ -535,8 +542,7 @@ where
     loop {
         match read.next().await {
             Some(Ok(Message::Text(t))) => return Ok(t),
-            Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             Some(Err(e)) => return Err(e.into()),
             None => anyhow::bail!("stream closed before receiving expected message"),
         }
@@ -593,8 +599,7 @@ async fn handle_dispatch(
             let timestamp = data["timestamp"]
                 .as_str()
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(Utc::now);
+                .map_or_else(Utc::now, |dt| dt.with_timezone(&Utc));
 
             let incoming = IncomingMessage {
                 channel: "discord".to_string(),
@@ -646,8 +651,7 @@ async fn handle_dispatch(
 
                 // Acknowledge the interaction (type 6 = DEFERRED_UPDATE_MESSAGE)
                 let callback_url = format!(
-                    "https://discord.com/api/v10/interactions/{}/{}/callback",
-                    interaction_id, interaction_token
+                    "https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
                 );
                 let http_client = client.clone();
                 if let Err(e) = http_client

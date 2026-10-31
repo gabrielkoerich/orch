@@ -78,6 +78,7 @@ use std::sync::Arc;
 /// the map (step 1) and before calling `tokio::spawn` (step 3).  Moving the guard
 /// into the spawned async block ensures the key is removed regardless of whether
 /// the block completes normally or unwinds via a panic.
+#[derive(Debug)]
 pub struct DispatchGuard {
     map: Arc<DashMap<String, String>>,
     key: String,

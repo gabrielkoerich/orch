@@ -157,8 +157,7 @@ pub fn resolve_jobs_path() -> PathBuf {
 pub fn load_jobs(path: &PathBuf) -> anyhow::Result<Vec<Job>> {
     let base_dir = path
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let mut jobs: Vec<Job> = if path.exists() {
         let content =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -271,7 +270,7 @@ pub fn scan_prompt_jobs(base_dir: &Path) -> anyhow::Result<Vec<Job>> {
     }
     let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
         .with_context(|| format!("reading {}", dir.display()))?
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("md"))
         .collect();
@@ -513,10 +512,10 @@ pub async fn tick(
         let mut should_clear_task_id = false;
         let mut should_skip = false;
 
-        if let Some(ref task_id) = state.active_task_id {
-            if task_id.is_empty() {
-                state.active_task_id = None;
-            }
+        if let Some(ref task_id) = state.active_task_id
+            && task_id.is_empty()
+        {
+            state.active_task_id = None;
         }
 
         if let Some(ref task_id) = state.active_task_id {
@@ -526,15 +525,17 @@ pub async fn tick(
                 match backend.get_task(&ExternalId(task_id_clone.clone())).await {
                     Ok(task) => {
                         let status = task.labels.iter().find(|l| l.starts_with("status:"));
-                        match status.map(|s| s.as_str()) {
-                            Some("status:in_progress")
-                            | Some("status:routed")
-                            | Some("status:new")
-                            | Some("status:needs_review")
-                            | Some("status:in_review")
-                            | Some("status:approved")
-                            | Some("status:waiting") => true,
-                            None => true,     // No status label — treat as active
+                        match status.map(std::string::String::as_str) {
+                            Some(
+                                "status:in_progress"
+                                | "status:routed"
+                                | "status:new"
+                                | "status:needs_review"
+                                | "status:in_review"
+                                | "status:approved"
+                                | "status:waiting",
+                            )
+                            | None => true, // no status label is treated as active
                             Some(_) => false, // Terminal state
                         }
                     }
@@ -627,15 +628,15 @@ pub async fn tick(
         // last_run here ensures a crash during execution won't cause the
         // job to be considered due again immediately.
         state.last_run = Some(now.format("%Y-%m-%dT%H:%M:%SZ").to_string());
-        if let Some(s) = store {
-            if let Err(e) = s.upsert_job_state(&state).await {
-                tracing::error!(
-                    job_id = job.id,
-                    ?e,
-                    "failed to persist job state before execution — skipping this tick to preserve restart safety"
-                );
-                continue; // retry next tick instead of risking duplicate execution
-            }
+        if let Some(s) = store
+            && let Err(e) = s.upsert_job_state(&state).await
+        {
+            tracing::error!(
+                job_id = job.id,
+                ?e,
+                "failed to persist job state before execution — skipping this tick to preserve restart safety"
+            );
+            continue; // retry next tick instead of risking duplicate execution
         }
 
         // Execute the job (may mutate state.active_task_id / last_task_status).
@@ -643,14 +644,14 @@ pub async fn tick(
         execute_job(job, &mut state, backend, store, repo, transport, base_dir).await;
 
         // Persist updated state (active_task_id, last_task_status) after execution.
-        if let Some(s) = store {
-            if let Err(e) = s.upsert_job_state(&state).await {
-                tracing::error!(
-                    job_id = job.id,
-                    ?e,
-                    "failed to persist job state after execution"
-                );
-            }
+        if let Some(s) = store
+            && let Err(e) = s.upsert_job_state(&state).await
+        {
+            tracing::error!(
+                job_id = job.id,
+                ?e,
+                "failed to persist job state after execution"
+            );
         }
     }
 
@@ -687,10 +688,10 @@ pub async fn execute_job(
                     labels.push("scheduled".to_string());
                     labels.push(format!("job:{}", job.id));
 
-                    if let Some(ref agent) = template.agent {
-                        if !agent.is_empty() {
-                            labels.push(format!("agent:{agent}"));
-                        }
+                    if let Some(ref agent) = template.agent
+                        && !agent.is_empty()
+                    {
+                        labels.push(format!("agent:{agent}"));
                     }
 
                     match backend.create_task(&template.title, &body, &labels).await {
@@ -714,7 +715,7 @@ pub async fn execute_job(
                         .await
                     {
                         Ok(internal_id) => {
-                            let task_id = format!("internal:{}", internal_id);
+                            let task_id = format!("internal:{internal_id}");
                             tracing::info!(job_id = job.id, task_id, "created internal task");
                             state.active_task_id = Some(task_id);
                             state.last_task_status = Some("new".to_string());
@@ -798,37 +799,37 @@ pub async fn execute_job(
     }
 
     // Send Telegram notification if requested for this job.
-    if job.notify {
-        if let Some(t) = transport {
-            let status = state
-                .last_task_status
-                .as_deref()
-                .unwrap_or("unknown")
-                .to_string();
-            let summary = match status.as_str() {
-                "done" => format!("Job `{}` completed successfully.", job.id),
-                "failed" => format!("Job `{}` failed.", job.id),
-                "new" => format!("Job `{}` created a new task.", job.id),
-                other => format!("Job `{}` finished with status: {other}.", job.id),
-            };
-            // Resolve target chat_id: job override → config default
-            let target = job
-                .notify_target
-                .clone()
-                .or_else(|| crate::config::get("channels.telegram.chat_id").ok());
-            let notification = TaskNotification {
-                task_id: job.id.clone(),
-                title: format!("Job: {}", job.id),
-                status,
-                agent: "scheduler".to_string(),
-                duration_seconds: 0.0,
-                summary,
-                repo: Some(repo.to_string()),
-                notify_target: target,
-                pr_number: None,
-            };
-            t.push_notification(notification);
-        }
+    if job.notify
+        && let Some(t) = transport
+    {
+        let status = state
+            .last_task_status
+            .as_deref()
+            .unwrap_or("unknown")
+            .to_string();
+        let summary = match status.as_str() {
+            "done" => format!("Job `{}` completed successfully.", job.id),
+            "failed" => format!("Job `{}` failed.", job.id),
+            "new" => format!("Job `{}` created a new task.", job.id),
+            other => format!("Job `{}` finished with status: {other}.", job.id),
+        };
+        // Resolve target chat_id: job override → config default
+        let target = job
+            .notify_target
+            .clone()
+            .or_else(|| crate::config::get("channels.telegram.chat_id").ok());
+        let notification = TaskNotification {
+            task_id: job.id.clone(),
+            title: format!("Job: {}", job.id),
+            status,
+            agent: "scheduler".to_string(),
+            duration_seconds: 0.0,
+            summary,
+            repo: Some(repo.to_string()),
+            notify_target: target,
+            pr_number: None,
+        };
+        t.push_notification(notification);
     }
 }
 

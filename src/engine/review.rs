@@ -106,7 +106,7 @@ pub(crate) fn parse_pr_number_from_url(url: &str) -> Result<u64, String> {
 
 fn review_started_comment(review_agent: &str, review_model: &str) -> String {
     let footer = attribution_footer("Review started", review_agent, Some(review_model));
-    format!("🔍 Automated review started{}", footer)
+    format!("🔍 Automated review started{footer}")
 }
 
 fn should_skip_no_code_reroute_increment(last_error: &str) -> bool {
@@ -122,11 +122,11 @@ use crate::engine::runner;
 use crate::engine::runner::worktree;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
-use crate::store::store_log_activity;
 use crate::store::TaskStore;
+use crate::store::store_log_activity;
+use crate::store::{CompleteRun, RunTokenUsage, StartRun};
 use crate::store::{opt_store_get_task, store_increment};
 use crate::store::{store_set, store_set_result};
-use crate::store::{CompleteRun, RunTokenUsage, StartRun};
 use crate::tmux::TmuxManager;
 use anyhow::Context;
 use std::collections::HashSet;
@@ -795,11 +795,11 @@ async fn select_review_agent(
     if !task_agent.is_empty() {
         exclude_set.insert(task_agent.to_string());
     }
-    if let Some(store_id) = store_id {
-        if let Ok(failed) = store.previous_review_agents(store_id).await {
-            for agent in failed {
-                exclude_set.insert(agent);
-            }
+    if let Some(store_id) = store_id
+        && let Ok(failed) = store.previous_review_agents(store_id).await
+    {
+        for agent in failed {
+            exclude_set.insert(agent);
         }
     }
 
@@ -810,10 +810,12 @@ async fn select_review_agent(
     let available_count = r.available_agents.len().max(1);
 
     loop {
-        let tmp_exclude_refs: Vec<&str> = exclude_set.iter().map(|s| s.as_str()).collect();
-        let agent = match r.next_round_robin_agent(&tmp_exclude_refs, "review") {
-            Some(a) => a,
-            None => break,
+        let tmp_exclude_refs: Vec<&str> = exclude_set
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
+        let Some(agent) = r.next_round_robin_agent(&tmp_exclude_refs, "review") else {
+            break;
         };
 
         if tried_agents.contains(&agent) {
@@ -838,7 +840,10 @@ async fn select_review_agent(
         let same = !task_agent.is_empty() && agent == task_agent;
         Ok((agent, chosen_model, same))
     } else {
-        let final_exclude_refs: Vec<&str> = exclude_set.iter().map(|s| s.as_str()).collect();
+        let final_exclude_refs: Vec<&str> = exclude_set
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
         let fallback_agent = r
             .next_round_robin_agent(&final_exclude_refs, "review")
             .unwrap_or_else(|| "claude".to_string());
@@ -847,8 +852,7 @@ async fn select_review_agent(
             .model_for_complexity(&fallback_agent, "review", task_id);
         if fallback_model.is_none() {
             anyhow::bail!(
-                "no review agent with a configured review model is available for task {}",
-                task_id
+                "no review agent with a configured review model is available for task {task_id}"
             );
         }
         let same = !task_agent.is_empty() && fallback_agent == task_agent;
@@ -856,7 +860,6 @@ async fn select_review_agent(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn build_review_context(
     task: &ExternalTask,
     repo: &str,
@@ -873,19 +876,21 @@ async fn build_review_context(
 
     // A commit that already has an approval must not be reviewed again. Checked before
     // the review_invocations increment so a stuck merge cannot exhaust the review quota
-    if let Some(pr_number) = stored_task.as_ref().and_then(|t| t.pr_number) {
-        let pr_number = pr_number as u64;
-        if pr_head_already_approved(store, repo, &task.id.0, pr_number).await {
-            tracing::info!(
-                task_id = task.id.0,
-                pr_number,
-                "PR head already approved — skipping review, merge retry continues"
-            );
-            record_carried_approval(store, repo, &task.id.0, pr_number).await;
-            return Ok(ReviewPhase::EarlyReturn(ReviewDecision::Approve {
-                issues: Vec::new(),
-            }));
-        }
+    if let Some(pr_number) = stored_task
+        .as_ref()
+        .and_then(|t| t.pr_number)
+        .and_then(|n| u64::try_from(n).ok())
+        && pr_head_already_approved(store, repo, &task.id.0, pr_number).await
+    {
+        tracing::info!(
+            task_id = task.id.0,
+            pr_number,
+            "PR head already approved — skipping review, merge retry continues"
+        );
+        record_carried_approval(store, repo, &task.id.0, pr_number).await;
+        return Ok(ReviewPhase::EarlyReturn(ReviewDecision::Approve {
+            issues: Vec::new(),
+        }));
     }
 
     let had_prev_push_failure = stored_task
@@ -899,7 +904,7 @@ async fn build_review_context(
     )
     .await
     {
-        Ok(v) => v as u32,
+        Ok(v) => u32::try_from(v).unwrap_or(u32::MAX),
         Err(e) => {
             tracing::warn!(task_id = task.id.0, err = %e, "failed to increment review_invocations — using fallback attempt=1");
             1
@@ -958,17 +963,15 @@ async fn build_review_context(
             }
         };
 
-        if reroutes as u32 >= max_reroutes {
+        if reroutes >= u64::from(max_reroutes) {
             tracing::error!(
                 task_id = task.id.0,
                 reroutes,
                 max_reroutes,
                 "reached max reroute attempts for no-worktree/branch/pr result — blocking for human review"
             );
-            let msg = format!(
-                "no worktree/branch/pr after {}/{} reroute attempts",
-                reroutes, max_reroutes
-            );
+            let msg =
+                format!("no worktree/branch/pr after {reroutes}/{max_reroutes} reroute attempts");
             let fields = [
                 (
                     "block_reason",
@@ -996,7 +999,7 @@ async fn build_review_context(
             max_reroutes,
             "no worktree/branch/pr for external needs_review task — re-routing to a different agent"
         );
-        if let Err(e) = store_set_result(
+        match store_set_result(
             &Some(Arc::clone(store)),
             repo,
             &task.id.0,
@@ -1011,9 +1014,14 @@ async fn build_review_context(
         )
         .await
         {
-            tracing::error!(task_id = task.id.0, err = %e, "failed to clear agent/model for reroute — skipping status transition");
-        } else if let Err(e) = task_manager.update_task_status(&task.id, Status::New).await {
-            tracing::error!(task_id = task.id.0, err = %e, "update_task_status(New) failed — task may be stuck in InReview");
+            Err(e) => {
+                tracing::error!(task_id = task.id.0, err = %e, "failed to clear agent/model for reroute — skipping status transition");
+            }
+            _ => {
+                if let Err(e) = task_manager.update_task_status(&task.id, Status::New).await {
+                    tracing::error!(task_id = task.id.0, err = %e, "update_task_status(New) failed — task may be stuck in InReview");
+                }
+            }
         }
         return Ok(ReviewPhase::EarlyReturn(ReviewDecision::Rerouted));
     }
@@ -1078,7 +1086,7 @@ async fn build_review_context(
     let stored_pr_number = stored_task
         .as_ref()
         .and_then(|t| t.pr_number)
-        .map(|n| n as u64)
+        .and_then(|n| u64::try_from(n).ok())
         .filter(|&n| n > 0);
 
     let pr_number = match ensure_pr_exists(
@@ -1256,7 +1264,10 @@ async fn build_review_context(
     }))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run record needs the outcome, the agent and the timing together"
+)]
 async fn complete_review_run(
     store: &Arc<TaskStore>,
     run_id: Option<i64>,
@@ -1268,8 +1279,8 @@ async fn complete_review_run(
     error: &str,
     tokens: RunTokenUsage,
 ) {
-    if let Some(run_id) = run_id {
-        if let Err(e) = store
+    if let Some(run_id) = run_id
+        && let Err(e) = store
             .complete_run(&CompleteRun {
                 run_id,
                 exit_code,
@@ -1281,13 +1292,12 @@ async fn complete_review_run(
                 tokens,
             })
             .await
-        {
-            tracing::warn!(
-                run_id,
-                error = %e,
-                "failed to record review run completion in audit trail"
-            );
-        }
+    {
+        tracing::warn!(
+            run_id,
+            error = %e,
+            "failed to record review run completion in audit trail"
+        );
     }
 }
 
@@ -1302,7 +1312,7 @@ async fn invoke_review_agent(
         match store
             .start_run(&StartRun {
                 task_id: sid,
-                attempt: ctx.review_attempt as i32,
+                attempt: i32::try_from(ctx.review_attempt).unwrap_or(i32::MAX),
                 run_type: "review",
                 agent: &ctx.review_agent,
                 model: ctx.review_model.as_deref().unwrap_or(""),
@@ -1351,18 +1361,17 @@ async fn invoke_review_agent(
             let app = review_app(repo).await;
             post_review_started(app.as_deref(), &gh, repo, ctx.head_sha.as_deref()).await;
             // The comment is comment mode's only start signal, the App's check run shows it already
-            if app.is_none() {
-                if let Err(e) = gh
+            if app.is_none()
+                && let Err(e) = gh
                     .add_comment(repo, &ctx.pr_number.to_string(), &start_comment)
                     .await
-                {
-                    tracing::debug!(
-                        task_id = task.id.0,
-                        pr_number = ctx.pr_number,
-                        error = %e,
-                        "failed to post review-started comment"
-                    );
-                }
+            {
+                tracing::debug!(
+                    task_id = task.id.0,
+                    pr_number = ctx.pr_number,
+                    error = %e,
+                    "failed to post review-started comment"
+                );
             }
         }
         Err(e) => {
@@ -1426,7 +1435,7 @@ async fn invoke_review_agent(
                 let agent_result =
                     runner::agents::find_agent_result(&ctx.review_agent, &raw_output);
                 // Treat as success if we found a valid result without is_error set
-                if agent_result.as_ref().map(|r| !r.is_error).unwrap_or(false) {
+                if agent_result.as_ref().is_some_and(|r| !r.is_error) {
                     tracing::info!(
                         task_id = task.id.0,
                         agent = %ctx.review_agent,
@@ -1656,9 +1665,7 @@ async fn parse_review_output(
         let review_attempt_dir_clone = ctx.review_attempt_dir.clone();
         match tokio::task::spawn_blocking(move || {
             let file_exists = output_file_clone.exists();
-            let file_size = std::fs::metadata(&output_file_clone)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let file_size = std::fs::metadata(&output_file_clone).map_or(0, |m| m.len());
             let exit_code = std::fs::read_to_string(review_attempt_dir_clone.join("exit.txt"))
                 .ok()
                 .and_then(|s| s.trim().parse::<i32>().ok())
@@ -1711,7 +1718,7 @@ async fn parse_review_output(
         duration_secs: 0.0,
     };
 
-    let agent_result_is_error = agent_result.as_ref().map(|r| r.is_error).unwrap_or(false);
+    let agent_result_is_error = agent_result.as_ref().is_some_and(|r| r.is_error);
     let ndjson_completed_no_error = raw_output.contains("\"terminal_reason\":\"completed\"")
         && !raw_output.contains("\"is_error\":true");
     // Do not short-circuit completed NDJSON sessions before rescue parsing.
@@ -1939,11 +1946,7 @@ async fn parse_review_output(
                 }
 
                 // Cut off at the output token limit (opencode step_finish reason=length)
-                if agent_result
-                    .as_ref()
-                    .map(|r| r.truncated_by_length)
-                    .unwrap_or(false)
-                {
+                if agent_result.as_ref().is_some_and(|r| r.truncated_by_length) {
                     tracing::warn!(
                         task_id = task.id.0,
                         agent = %ctx.review_agent,
@@ -2122,28 +2125,28 @@ async fn finalize_review_run(
     )
     .await;
 
-    if let Some(store_id) = ctx.store_id {
-        if parsed.token_usage.input_tokens > 0 || parsed.token_usage.output_tokens > 0 {
-            let model = if ctx.review_model_str().is_empty() {
-                "unknown"
-            } else {
-                ctx.review_model_str()
-            };
-            if let Err(e) = store
-                .store_tokens(
-                    store_id,
-                    parsed.token_usage.input_tokens,
-                    parsed.token_usage.output_tokens,
-                    model,
-                )
-                .await
-            {
-                tracing::warn!(
-                    task_id = task.id.0,
-                    ?e,
-                    "failed to store review agent token usage"
-                );
-            }
+    if let Some(store_id) = ctx.store_id
+        && (parsed.token_usage.input_tokens > 0 || parsed.token_usage.output_tokens > 0)
+    {
+        let model = if ctx.review_model_str().is_empty() {
+            "unknown"
+        } else {
+            ctx.review_model_str()
+        };
+        if let Err(e) = store
+            .store_tokens(
+                store_id,
+                parsed.token_usage.input_tokens,
+                parsed.token_usage.output_tokens,
+                model,
+            )
+            .await
+        {
+            tracing::warn!(
+                task_id = task.id.0,
+                ?e,
+                "failed to store review agent token usage"
+            );
         }
     }
 }
@@ -2188,8 +2191,7 @@ async fn restore_review_config_if_needed(
         .await
         .ok()
         .filter(|output| output.status.success())
-        .map(|output| !output.stdout.is_empty())
-        .unwrap_or(false);
+        .is_some_and(|output| !output.stdout.is_empty());
 
     if !orch_yml_changed {
         return;
@@ -2204,8 +2206,7 @@ async fn restore_review_config_if_needed(
         .current_dir(worktree_path)
         .status()
         .await
-        .map(|status| status.success())
-        .unwrap_or(false);
+        .is_ok_and(|status| status.success());
 
     if !restore_ok {
         return;
@@ -2218,8 +2219,7 @@ async fn restore_review_config_if_needed(
         .await
         .ok()
         .filter(|output| output.status.success())
-        .map(|output| !output.stdout.is_empty())
-        .unwrap_or(false);
+        .is_some_and(|output| !output.stdout.is_empty());
 
     if staged {
         let _ = Command::new("git")
@@ -2271,7 +2271,6 @@ async fn push_review_branch(
                     Ok(recovered) => {
                         worktree_path = recovered.work_dir;
                         branch_name = recovered.branch;
-                        continue;
                     }
                     Err(recover_err) => {
                         break Err(anyhow::anyhow!(
@@ -2303,8 +2302,8 @@ async fn push_review_branch(
                 })),
             )
             .await;
-            if ctx.had_prev_push_failure {
-                if let Err(e) = store_set_result(
+            if ctx.had_prev_push_failure
+                && let Err(e) = store_set_result(
                     &Some(Arc::clone(store)),
                     repo,
                     &task.id.0,
@@ -2314,9 +2313,8 @@ async fn push_review_branch(
                     ],
                 )
                 .await
-                {
-                    tracing::warn!(task_id = task.id.0, err = %e, "failed to reset push_failures — counter may drift");
-                }
+            {
+                tracing::warn!(task_id = task.id.0, err = %e, "failed to reset push_failures — counter may drift");
             }
             Ok(())
         }
@@ -2361,31 +2359,30 @@ fn append_review_issues(
     body: &mut String,
     issues: &[crate::engine::runner::response::ReviewIssue],
 ) {
+    use std::fmt::Write as _;
     if issues.is_empty() {
         return;
     }
     body.push_str("\n**Issues Found:**\n");
     for issue in issues {
-        body.push_str(&format!(
-            "- `{}` line {}: {} [{}]\n",
+        let _ = writeln!(
+            body,
+            "- `{}` line {}: {} [{}]",
             issue.file,
             issue
                 .line
-                .map(|line| line.to_string())
-                .unwrap_or_else(|| "?".to_string()),
+                .map_or_else(|| "?".to_string(), |line| line.to_string()),
             issue.description,
             issue.severity
-        ));
+        );
     }
 }
 
 fn build_pr_review_comment(decision: &ReviewDecision, review_notes_for_comment: &str) -> String {
     match decision {
         ReviewDecision::Approve { issues } => {
-            let mut body = format!(
-                "## Automated Review \u{2014} Approve\n\n{}",
-                review_notes_for_comment
-            );
+            let mut body =
+                format!("## Automated Review \u{2014} Approve\n\n{review_notes_for_comment}");
             if !issues.is_empty() && !body.ends_with('\n') {
                 body.push('\n');
             }
@@ -2393,10 +2390,7 @@ fn build_pr_review_comment(decision: &ReviewDecision, review_notes_for_comment: 
             body
         }
         ReviewDecision::RequestChanges { notes, issues } => {
-            let mut body = format!(
-                "## Automated Review \u{2014} Changes Requested\n\n{}\n",
-                notes
-            );
+            let mut body = format!("## Automated Review \u{2014} Changes Requested\n\n{notes}\n");
             append_review_issues(&mut body, issues);
             body
         }
@@ -2482,7 +2476,7 @@ async fn post_review_comment(
     if !pr_comment.is_empty() {
         let footer =
             attribution_footer("Reviewed", &ctx.review_agent, Some(ctx.review_model_str()));
-        let pr_comment_with_footer = format!("{}{}", pr_comment, footer);
+        let pr_comment_with_footer = format!("{pr_comment}{footer}");
         if let Err(e) = publish_review(
             app.as_deref(),
             &gh,
@@ -2645,7 +2639,10 @@ async fn inline_comments(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "applying a decision touches the backend, the store, tmux and the router"
+)]
 async fn apply_review_decision(
     task: &ExternalTask,
     backend: &Arc<dyn ExternalBackend>,
@@ -2788,8 +2785,8 @@ async fn count_ahead_commits(
 ) -> Result<u64, String> {
     let worktree_str = worktree_path.to_str().ok_or_else(|| {
         format!(
-            "worktree path contains non-UTF-8 characters: {:?}",
-            worktree_path
+            "worktree path contains non-UTF-8 characters: {}",
+            worktree_path.display()
         )
     })?;
 
@@ -2830,7 +2827,10 @@ async fn count_ahead_commits(
 /// If no PR exists but the branch has commits, attempts to create one and
 /// continues with the same review pass.
 /// All error and no-op paths update task status and return [`EnsurePrResult::EarlyReturn`].
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every early return path needs its own piece of review state"
+)]
 async fn ensure_pr_exists(
     task: &ExternalTask,
     branch_name: &str,
@@ -2891,8 +2891,8 @@ async fn ensure_pr_exists(
                 );
                 let worktree_str = worktree_path.to_str().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "worktree path contains non-UTF-8 characters: {:?}",
-                        worktree_path
+                        "worktree path contains non-UTF-8 characters: {}",
+                        worktree_path.display()
                     )
                 })?;
                 // Push first in case agent forgot (use token auth like git_ops::push_branch)
@@ -2920,7 +2920,9 @@ async fn ensure_pr_exists(
                         );
                     }
                     Ok(Ok(o)) => {
-                        if !o.status.success() {
+                        if o.status.success() {
+                            tracing::info!(task_id = task.id.0, branch = %branch_name, "review gate fallback push succeeded");
+                        } else {
                             tracing::warn!(
                                 task_id = task.id.0,
                                 branch = %branch_name,
@@ -2929,8 +2931,6 @@ async fn ensure_pr_exists(
                                 stderr = %String::from_utf8_lossy(&o.stderr),
                                 "review gate fallback push failed"
                             );
-                        } else {
-                            tracing::info!(task_id = task.id.0, branch = %branch_name, "review gate fallback push succeeded");
                         }
                     }
                     Ok(Err(e)) => {
@@ -2958,7 +2958,7 @@ async fn ensure_pr_exists(
                                 &Some(Arc::clone(store)),
                                 repo,
                                 &task.id.0,
-                                &[("pr_number", serde_json::json!(pr_num as i64))],
+                                &[("pr_number", serde_json::json!(pr_num))],
                             )
                             .await?;
                             tracing::info!(
@@ -3010,7 +3010,7 @@ async fn ensure_pr_exists(
                                     &Some(Arc::clone(store)),
                                     repo,
                                     &task.id.0,
-                                    &[("pr_number", serde_json::json!(n as i64))],
+                                    &[("pr_number", serde_json::json!(n))],
                                 )
                                 .await?;
                                 return Ok(EnsurePrResult::Ready(n));
@@ -3051,7 +3051,7 @@ async fn ensure_pr_exists(
                                             &Some(Arc::clone(store)),
                                             repo,
                                             &task.id.0,
-                                            &[("pr_number", serde_json::json!(pr_num as i64))],
+                                            &[("pr_number", serde_json::json!(pr_num))],
                                         )
                                         .await?;
                                         tracing::info!(
@@ -3070,55 +3070,53 @@ async fn ensure_pr_exists(
                                             "created missing PR via CLI, but failed to parse PR number"
                                         );
                                         Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Failed(
-                                            format!("created missing PR via CLI, but could not parse PR number: {e}")
+                                            format!(
+                                                "created missing PR via CLI, but could not parse PR number: {e}"
+                                            ),
                                         )))
                                     }
                                 }
                             }
                             Ok(Ok(o)) => {
                                 let stderr = String::from_utf8_lossy(&o.stderr);
-                                if stderr.contains("already exists") {
-                                    if let Some(pr_url) =
+                                if stderr.contains("already exists")
+                                    && let Some(pr_url) =
                                         stderr.lines().find(|l| l.trim().starts_with("https://"))
-                                    {
-                                        match parse_pr_number_from_url(pr_url.trim()) {
-                                            Ok(pr_num) => {
-                                                if let Err(e) = store_set_result(
-                                                    &Some(Arc::clone(store)),
-                                                    repo,
-                                                    &task.id.0,
-                                                    &[(
-                                                        "pr_number",
-                                                        serde_json::json!(pr_num as i64),
-                                                    )],
-                                                )
-                                                .await
-                                                {
-                                                    tracing::warn!(
-                                                        task_id = task.id.0,
-                                                        pr_num,
-                                                        err = %e,
-                                                        "failed to persist pr_number from already-exists recovery — downstream may retry PR creation"
-                                                    );
-                                                }
-                                                tracing::info!(
-                                                    task_id = task.id.0,
-                                                    branch = %branch_name,
-                                                    pr_url = %pr_url,
-                                                    "PR already exists (from CLI stderr) — retrying review"
-                                                );
-                                                return Ok(EnsurePrResult::Ready(pr_num));
-                                            }
-                                            Err(e) => {
+                                {
+                                    match parse_pr_number_from_url(pr_url.trim()) {
+                                        Ok(pr_num) => {
+                                            if let Err(e) = store_set_result(
+                                                &Some(Arc::clone(store)),
+                                                repo,
+                                                &task.id.0,
+                                                &[("pr_number", serde_json::json!(pr_num))],
+                                            )
+                                            .await
+                                            {
                                                 tracing::warn!(
                                                     task_id = task.id.0,
-                                                    branch = %branch_name,
-                                                    pr_url = %pr_url,
-                                                    error = %e,
-                                                    "found existing PR URL in CLI stderr, but failed to parse PR number"
+                                                    pr_num,
+                                                    err = %e,
+                                                    "failed to persist pr_number from already-exists recovery — downstream may retry PR creation"
                                                 );
-                                                // Continue to the error handling below
                                             }
+                                            tracing::info!(
+                                                task_id = task.id.0,
+                                                branch = %branch_name,
+                                                pr_url = %pr_url,
+                                                "PR already exists (from CLI stderr) — retrying review"
+                                            );
+                                            return Ok(EnsurePrResult::Ready(pr_num));
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                task_id = task.id.0,
+                                                branch = %branch_name,
+                                                pr_url = %pr_url,
+                                                error = %e,
+                                                "found existing PR URL in CLI stderr, but failed to parse PR number"
+                                            );
+                                            // Continue to the error handling below
                                         }
                                     }
                                 }
@@ -3301,10 +3299,10 @@ async fn ensure_pr_exists(
                     .await
                     .map(|t| t.last_error)
                     .unwrap_or_default();
-                let reason = if !agent_summary.is_empty() {
-                    agent_summary.to_string()
-                } else {
+                let reason = if agent_summary.is_empty() {
                     last_error.clone()
+                } else {
+                    agent_summary.to_string()
                 };
 
                 if last_error.contains("exceeded max attempts") {
@@ -3437,7 +3435,7 @@ async fn ensure_pr_exists(
                     }
                 };
 
-                if reroutes as u32 >= max_reroutes {
+                if reroutes >= u64::from(max_reroutes) {
                     tracing::error!(
                         task_id = task.id.0,
                         reroutes,
@@ -3445,8 +3443,7 @@ async fn ensure_pr_exists(
                         "reached max reroute attempts for no-pr-result — blocking for human review"
                     );
                     let msg = format!(
-                        "no PR or code changes after {}/{} reroute attempts",
-                        reroutes, max_reroutes
+                        "no PR or code changes after {reroutes}/{max_reroutes} reroute attempts"
                     );
                     // Write block_reason atomically with the status transition to prevent
                     // auto_unblock_blocked_tasks (block_reason.is_none() gate) from
@@ -3493,7 +3490,7 @@ async fn ensure_pr_exists(
                     // fact that this attempt produced no PR or code changes.
                     // Use store_set_result so we only transition status when the
                     // store write succeeds — partial failure would orphan the task.
-                    if let Err(e) = store_set_result(
+                    match store_set_result(
                         &Some(Arc::clone(store)),
                         repo,
                         &task.id.0,
@@ -3508,12 +3505,17 @@ async fn ensure_pr_exists(
                     )
                     .await
                     {
-                        tracing::error!(task_id = task.id.0, err = %e, "failed to clear agent/model for reroute — skipping status transition");
-                        // Don't update status — task stays in InReview and will be retried next tick
-                    } else if let Err(e) =
-                        task_manager.update_task_status(&task.id, Status::New).await
-                    {
-                        tracing::error!(task_id = task.id.0, err = %e, "update_task_status(New) failed — task may be stuck in InReview");
+                        Err(e) => {
+                            tracing::error!(task_id = task.id.0, err = %e, "failed to clear agent/model for reroute — skipping status transition");
+                            // Don't update status — task stays in InReview and will be retried next tick
+                        }
+                        _ => {
+                            if let Err(e) =
+                                task_manager.update_task_status(&task.id, Status::New).await
+                            {
+                                tracing::error!(task_id = task.id.0, err = %e, "update_task_status(New) failed — task may be stuck in InReview");
+                            }
+                        }
                     }
                     Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Rerouted))
                 }
@@ -3763,9 +3765,11 @@ mod tests {
         let url = "https://gitlab.com/owner/repo/merge_requests/42";
         let result = parse_pr_number_from_url(url);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("does not start with 'https://github.com/'"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("does not start with 'https://github.com/'")
+        );
     }
 
     #[test]
@@ -3806,9 +3810,11 @@ mod tests {
         let url = "http://github.com/owner/repo/pull/42";
         let result = parse_pr_number_from_url(url);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("does not start with 'https://github.com/'"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("does not start with 'https://github.com/'")
+        );
     }
 
     // ── format_review_error ─────────────────────────────────────────────────
@@ -3905,7 +3911,7 @@ mod tests {
             cmd.args(["-c", "commit.gpgsign=false"]);
         }
         let status = cmd.args(args).status().unwrap();
-        assert!(status.success(), "git {:?} failed", args);
+        assert!(status.success(), "git {args:?} failed");
     }
 
     #[test]
@@ -3985,7 +3991,7 @@ mod tests {
                     user: GitHubUser {
                         login: "reviewer".to_string(),
                     },
-                    body: "".to_string(),
+                    body: String::new(),
                     path: "src/lib.rs".to_string(),
                     line: Some(20),
                     original_line: Some(20),
@@ -4034,9 +4040,10 @@ mod tests {
         let cfg = RouterConfig::default();
         assert!(cfg.model_for_complexity("claude", "simple", "").is_none());
         assert!(cfg.model_for_complexity("opencode", "review", "").is_none());
-        assert!(cfg
-            .model_for_complexity("unknown_agent_xyz", "simple", "")
-            .is_none());
+        assert!(
+            cfg.model_for_complexity("unknown_agent_xyz", "simple", "")
+                .is_none()
+        );
     }
 
     #[test]
@@ -4087,7 +4094,7 @@ mod tests {
                     notes.contains("test_results: fail"),
                     "notes must name the failing test run, got {notes:?}"
                 );
-                assert!(issues.is_empty());
+                assert!(issues.is_empty(), "{issues:?}");
             }
             other => panic!("expected RequestChanges, got {other:?}"),
         }
@@ -4141,7 +4148,7 @@ mod tests {
     #[test]
     fn review_started_comment_includes_agent_and_model() {
         let expected_footer = attribution_footer("Review started", "kimi", Some("opus"));
-        let expected = format!("🔍 Automated review started{}", expected_footer);
+        let expected = format!("🔍 Automated review started{expected_footer}");
         assert_eq!(review_started_comment("kimi", "opus"), expected);
     }
 
@@ -4151,7 +4158,7 @@ mod tests {
         ExternalTask {
             id: crate::backends::ExternalId(id.to_string()),
             title: "opencode discovery timeout".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             state: "open".to_string(),
             labels: vec![],
             author: "tester".to_string(),
@@ -4396,7 +4403,11 @@ mod tests {
 
     #[test]
     fn only_a_merge_of_the_approved_commit_carries_the_approval() {
-        let parents = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let parents = |p: &[&str]| {
+            p.iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
             base_merge_parent("approved", &parents(&["approved", "base"])),
             Some("base")
@@ -4507,7 +4518,8 @@ mod tests {
         let orch_dir = temp_home.path().join(".orch");
         std::fs::create_dir_all(&orch_dir).unwrap();
         let old_orch_home = std::env::var_os("ORCH_HOME");
-        std::env::set_var("ORCH_HOME", &orch_dir);
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", &orch_dir) };
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let repo = "owner/repo";
@@ -4540,9 +4552,11 @@ mod tests {
         assert_eq!(stored.status, TaskStatus::Blocked);
 
         if let Some(old) = old_orch_home {
-            std::env::set_var("ORCH_HOME", old);
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::set_var("ORCH_HOME", old) };
         } else {
-            std::env::remove_var("ORCH_HOME");
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::remove_var("ORCH_HOME") };
         }
     }
 
@@ -4632,7 +4646,8 @@ mod tests {
         let orch_dir = temp_home.path().join(".orch");
         std::fs::create_dir_all(&orch_dir).unwrap();
         let old_orch_home = std::env::var_os("ORCH_HOME");
-        std::env::set_var("ORCH_HOME", &orch_dir);
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", &orch_dir) };
 
         let project_dir = temp_home.path().join("project");
         std::fs::create_dir_all(&project_dir).unwrap();
@@ -4659,7 +4674,7 @@ mod tests {
         let ext = ExternalTask {
             id: crate::backends::ExternalId("1".to_string()),
             title: "Fix review recovery".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             state: "open".to_string(),
             labels: vec![],
             author: "tester".to_string(),
@@ -4677,9 +4692,11 @@ mod tests {
         assert!(recovered.branch.starts_with("gh-issue-1-"));
 
         if let Some(old) = old_orch_home {
-            std::env::set_var("ORCH_HOME", old);
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::set_var("ORCH_HOME", old) };
         } else {
-            std::env::remove_var("ORCH_HOME");
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::remove_var("ORCH_HOME") };
         }
     }
 
@@ -4934,7 +4951,7 @@ mod tests {
         ExternalTask {
             id: crate::backends::ExternalId(id.to_string()),
             title: "Test review task".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             state: "open".to_string(),
             labels: vec![],
             author: "tester".to_string(),
@@ -5251,7 +5268,7 @@ mod tests {
     async fn finalize_review_run_success_resets_generic_model_failure_count() {
         crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        crate::engine::cooldown::init_cooldown_store(store.clone()).await;
+        crate::engine::cooldown::init_cooldown_store(std::sync::Arc::clone(&store)).await;
 
         let agent = "test-3478-agent";
         let model = "test-3478-model";
@@ -5296,7 +5313,7 @@ mod tests {
     async fn finalize_review_run_interleaved_success_keeps_generic_cooldown_at_base() {
         crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        crate::engine::cooldown::init_cooldown_store(store.clone()).await;
+        crate::engine::cooldown::init_cooldown_store(std::sync::Arc::clone(&store)).await;
 
         let agent = "test-3478-interleave-agent";
         let model = "test-3478-interleave-model";
@@ -5345,7 +5362,7 @@ mod tests {
     async fn finalize_review_run_success_does_not_reset_persistent_model_failure_count() {
         crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        crate::engine::cooldown::init_cooldown_store(store.clone()).await;
+        crate::engine::cooldown::init_cooldown_store(std::sync::Arc::clone(&store)).await;
 
         let agent = "test-3571-agent";
         let model = "test-3571-model";
@@ -5442,9 +5459,11 @@ mod tests {
                 .await
                 .is_none()
         );
-        assert!(review_app_for(ReviewMode::App, None, "org/b")
-            .await
-            .is_none());
+        assert!(
+            review_app_for(ReviewMode::App, None, "org/b")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -5482,9 +5501,11 @@ mod tests {
         post_review_started(Some(&app), &gh, "o/r", Some("abc123")).await;
         post_review_decision(Some(&app), &gh, "o/r", Some("abc123"), &decision, "fix it").await;
         let requests = server.received_requests().await.expect("requests");
-        assert!(requests
-            .iter()
-            .all(|req| !req.url.path().contains("/statuses/")));
+        assert!(
+            requests
+                .iter()
+                .all(|req| !req.url.path().contains("/statuses/"))
+        );
     }
 
     #[tokio::test]
@@ -5547,14 +5568,18 @@ mod tests {
         );
     }
 
-    #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the env lock must stay held across the awaited review call"
+    )]
     #[tokio::test]
     async fn without_an_app_the_review_path_posts_only_the_comment() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let _env = crate::github::token::ENV_LOCK.lock().unwrap();
         let prev = std::env::var_os("GH_TOKEN");
-        std::env::set_var("GH_TOKEN", "owner-token");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("GH_TOKEN", "owner-token") };
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/repos/o/r/issues/9/comments"))
@@ -5574,14 +5599,18 @@ mod tests {
         )
         .await;
         match prev {
-            Some(value) => std::env::set_var("GH_TOKEN", value),
-            None => std::env::remove_var("GH_TOKEN"),
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            Some(value) => unsafe { std::env::set_var("GH_TOKEN", value) },
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            None => unsafe { std::env::remove_var("GH_TOKEN") },
         }
         result.expect("comment posted");
         let requests = server.received_requests().await.expect("requests");
-        assert!(requests
-            .iter()
-            .all(|req| !req.url.path().contains("/reviews")));
+        assert!(
+            requests
+                .iter()
+                .all(|req| !req.url.path().contains("/reviews"))
+        );
     }
 
     #[tokio::test]

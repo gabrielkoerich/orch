@@ -35,7 +35,8 @@ struct OllamaResponse {
 ///
 /// Handles HTTP requests to localhost:11434 and parses responses
 /// using the same format as cloud LLMs.
-pub struct OllamaRouter {
+#[derive(Debug)]
+pub(super) struct OllamaRouter {
     /// Base URL for Ollama API.
     url: String,
     /// Model name to use for routing.
@@ -45,7 +46,7 @@ pub struct OllamaRouter {
 }
 
 impl OllamaRouter {
-    pub fn new(config: &RouterConfig) -> Self {
+    pub(super) fn new(config: &RouterConfig) -> Self {
         let timeout = Duration::from_secs(config.ollama_timeout_seconds);
         let client = reqwest::Client::builder()
             .timeout(timeout)
@@ -63,7 +64,7 @@ impl OllamaRouter {
     ///
     /// Builds a routing prompt, calls Ollama, parses the JSON response,
     /// and returns a RouteResult.
-    pub async fn route(
+    pub(super) async fn route(
         &self,
         task: &ExternalTask,
         config: &RouterConfig,
@@ -73,7 +74,7 @@ impl OllamaRouter {
         }
 
         // Build routing prompt
-        let prompt = self.build_routing_prompt(task, config)?;
+        let prompt = Self::build_routing_prompt(task, config);
 
         // Build HTTP request
         let request = OllamaRequest {
@@ -128,16 +129,15 @@ impl OllamaRouter {
         );
 
         // Use the same parsing logic as LlmRouter for compatibility
-        let llm_router = super::llm::LlmRouter::new();
-        let llm_response = llm_router.parse_llm_response("ollama", llm_text)?;
+        let llm_response = super::llm::LlmRouter::parse_llm_response("ollama", llm_text)?;
 
         // Validate executor against configured agents
         let mut agent = llm_response.executor.to_lowercase();
         if !config.agents.contains(&agent) {
-            agent = if !config.fallback_executor.is_empty() {
-                config.fallback_executor.clone()
-            } else {
+            agent = if config.fallback_executor.is_empty() {
                 config.agents.first().cloned().unwrap_or_default()
+            } else {
+                config.fallback_executor.clone()
             };
         }
 
@@ -185,11 +185,7 @@ impl OllamaRouter {
     }
 
     /// Build routing prompt from template.
-    fn build_routing_prompt(
-        &self,
-        task: &ExternalTask,
-        config: &RouterConfig,
-    ) -> anyhow::Result<String> {
+    fn build_routing_prompt(task: &ExternalTask, config: &RouterConfig) -> String {
         let template = include_str!("../../../prompts/route.md");
 
         // Build available agents string
@@ -217,7 +213,7 @@ impl OllamaRouter {
         let labels = task.labels.join(", ");
 
         // Simple template substitution
-        let prompt = template
+        template
             .replace("{{ROUTER_AGENT}}", "ollama")
             .replace("{{AVAILABLE_AGENTS}}", &available_agents_str)
             .replace("{{AGENT_WEIGHTS}}", &weights_str)
@@ -225,9 +221,7 @@ impl OllamaRouter {
             .replace("{{TASK_ID}}", &task.id.0)
             .replace("{{TASK_TITLE}}", &task.title)
             .replace("{{TASK_LABELS}}", &labels)
-            .replace("{{TASK_BODY}}", &task.body);
-
-        Ok(prompt)
+            .replace("{{TASK_BODY}}", &task.body)
     }
 }
 
@@ -240,13 +234,16 @@ mod tests {
         OllamaRouter::new(&RouterConfig::default())
     }
 
-    fn make_task(title: &str, body: &str, labels: Vec<&str>) -> ExternalTask {
+    fn make_task(title: &str, body: &str, labels: &[&str]) -> ExternalTask {
         ExternalTask {
             id: ExternalId("42".to_string()),
             title: title.to_string(),
             body: body.to_string(),
             state: "open".to_string(),
-            labels: labels.iter().map(|s| s.to_string()).collect(),
+            labels: labels
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             author: "testuser".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -288,7 +285,7 @@ mod tests {
     #[test]
     fn ollama_response_raw_body_used_on_json_failure() {
         // Simulate the fallback: JSON parse fails → body becomes the response
-        let raw_body = r#"Here's my routing decision: use claude for this task."#;
+        let raw_body = r"Here's my routing decision: use claude for this task.";
         let result: OllamaResponse = match serde_json::from_str::<OllamaResponse>(raw_body) {
             Ok(r) => r,
             Err(_) => OllamaResponse {
@@ -297,7 +294,7 @@ mod tests {
         };
         assert_eq!(result.response, raw_body);
         // The fallback text is then trimmed and passed to parse_llm_response
-        assert!(!result.response.trim().is_empty());
+        assert_ne!(result.response.trim(), "");
     }
 
     #[test]
@@ -313,14 +310,13 @@ mod tests {
 
     #[test]
     fn build_routing_prompt_substitutes_task_fields() {
-        let router = make_router();
         let task = make_task(
             "Fix bug in auth",
             "The login flow is broken",
-            vec!["backend", "bug"],
+            &["backend", "bug"],
         );
         let config = RouterConfig::default();
-        let prompt = router.build_routing_prompt(&task, &config).unwrap();
+        let prompt = OllamaRouter::build_routing_prompt(&task, &config);
 
         // Task fields substituted
         assert!(prompt.contains("Fix bug in auth"));
@@ -334,20 +330,18 @@ mod tests {
 
     #[test]
     fn build_routing_prompt_includes_labels() {
-        let router = make_router();
-        let task = make_task("Title", "Body", vec!["priority:high", "good-first-issue"]);
+        let task = make_task("Title", "Body", &["priority:high", "good-first-issue"]);
         let config = RouterConfig::default();
-        let prompt = router.build_routing_prompt(&task, &config).unwrap();
+        let prompt = OllamaRouter::build_routing_prompt(&task, &config);
         assert!(prompt.contains("priority:high"));
         assert!(prompt.contains("good-first-issue"));
     }
 
     #[test]
     fn build_routing_prompt_skills_catalog_replaced_with_empty() {
-        let router = make_router();
-        let task = make_task("Title", "Body", vec![]);
+        let task = make_task("Title", "Body", &[]);
         let config = RouterConfig::default();
-        let prompt = router.build_routing_prompt(&task, &config).unwrap();
+        let prompt = OllamaRouter::build_routing_prompt(&task, &config);
         // Ollama uses "[]" for skills catalog since it doesn't support dynamic skills
         // The template placeholder {{SKILLS_CATALOG}} should be replaced with "[]"
         assert!(
@@ -358,12 +352,11 @@ mod tests {
 
     #[test]
     fn build_routing_prompt_includes_weights() {
-        let router = make_router();
-        let task = make_task("Title", "Body", vec![]);
+        let task = make_task("Title", "Body", &[]);
         let mut config = RouterConfig::default();
         config.weights.insert("claude".to_string(), 0.5);
         config.weights.insert("codex".to_string(), 0.3);
-        let prompt = router.build_routing_prompt(&task, &config).unwrap();
+        let prompt = OllamaRouter::build_routing_prompt(&task, &config);
         // Weights string should be formatted
         assert!(prompt.contains("claude") || prompt.contains("codex"));
     }
@@ -393,7 +386,7 @@ mod tests {
     #[tokio::test]
     async fn route_bails_when_no_agents_configured() {
         let router = make_router();
-        let task = make_task("Title", "Body", vec![]);
+        let task = make_task("Title", "Body", &[]);
         let mut config = RouterConfig::default();
         config.agents.clear();
         let result = router.route(&task, &config).await;

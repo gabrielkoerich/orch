@@ -5,11 +5,12 @@
 
 use crate::tmux::TmuxManager;
 use std::path::Path;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 use super::{agent, response};
 
 /// Raw output collected from an agent session.
+#[derive(Debug)]
 pub struct SessionOutput {
     pub exit_code: i32,
     pub raw_stdout: String,
@@ -166,10 +167,11 @@ async fn collect_output(
 /// Kill the tmux session if it still exists, and scrub secrets from the
 /// tmux global environment so they never leak across sessions.
 pub async fn cleanup_session(task_id: &str, tmux: &TmuxManager, session: &str) {
-    if !session.is_empty() && tmux.session_exists(session).await {
-        if let Err(e) = tmux.kill_session(session).await {
-            tracing::warn!(task_id, error = ?e, "failed to kill tmux session");
-        }
+    if !session.is_empty()
+        && tmux.session_exists(session).await
+        && let Err(e) = tmux.kill_session(session).await
+    {
+        tracing::warn!(task_id, error = ?e, "failed to kill tmux session");
     }
 
     // Scrub GH_TOKEN / GITHUB_TOKEN from the tmux global environment.

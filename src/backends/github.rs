@@ -4,9 +4,9 @@
 //! (`GH_TOKEN` → `GITHUB_TOKEN` environment variables by default).
 
 use super::{ExternalBackend, ExternalId, ExternalTask, Mention, Status};
-use crate::github::http::{status_label_color, GhHttp};
-use crate::github::projects::label_status::LabelSyncConfig;
+use crate::github::http::{GhHttp, status_label_color};
 use crate::github::projects::ProjectSync;
+use crate::github::projects::label_status::LabelSyncConfig;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 
@@ -24,15 +24,13 @@ fn is_trusted_author(issue: &crate::github::types::GitHubIssue) -> bool {
     issue
         .author_association
         .as_deref()
-        .map(|a| ALLOWED_ASSOCIATIONS.contains(&a))
-        .unwrap_or(false) // missing field = untrusted
+        .is_some_and(|a| ALLOWED_ASSOCIATIONS.contains(&a)) // missing field = untrusted
 }
 
 fn is_trusted_comment_author(c: &crate::github::types::GitHubComment) -> bool {
     c.author_association
         .as_deref()
-        .map(|a| ALLOWED_ASSOCIATIONS.contains(&a))
-        .unwrap_or(false)
+        .is_some_and(|a| ALLOWED_ASSOCIATIONS.contains(&a))
 }
 
 fn trusted_mentions(
@@ -99,6 +97,7 @@ fn classify_active_open_issue(
     Some((task, status))
 }
 
+#[derive(Debug)]
 pub struct GitHubBackend {
     repo: String,
     gh: GhHttp,
@@ -148,7 +147,7 @@ impl GitHubBackend {
 
 #[async_trait]
 impl ExternalBackend for GitHubBackend {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "github"
     }
 
@@ -207,9 +206,8 @@ impl ExternalBackend for GitHubBackend {
         status: Status,
     ) -> anyhow::Result<Option<String>> {
         // Only sync if project integration is configured
-        let project = match ProjectSync::from_config() {
-            Some(p) => p,
-            None => return Ok(None),
+        let Some(project) = ProjectSync::from_config() else {
+            return Ok(None);
         };
 
         // Fetch the issue to get its node_id
@@ -239,9 +237,8 @@ impl ExternalBackend for GitHubBackend {
     }
 
     async fn sync_estimate_to_project(&self, id: &ExternalId, estimate: u8) -> anyhow::Result<()> {
-        let project = match ProjectSync::from_config() {
-            Some(p) => p,
-            None => return Ok(()),
+        let Some(project) = ProjectSync::from_config() else {
+            return Ok(());
         };
 
         // If the estimate field ID is missing from config, try to discover it
@@ -251,17 +248,18 @@ impl ExternalBackend for GitHubBackend {
             match ProjectSync::discover_fields(project.project_id()).await {
                 Ok(discovered) => {
                     if discovered.estimate_field_id().is_some() {
-                        if let Err(e) =
-                            crate::github::projects::write_project_config(&discovered).await
-                        {
-                            tracing::warn!(
-                                err = %e,
-                                "failed to persist discovered estimate field ID to config"
-                            );
-                        } else {
-                            tracing::info!(
-                                "auto-discovered and persisted project_estimate_field_id to config"
-                            );
+                        match crate::github::projects::write_project_config(&discovered).await {
+                            Err(e) => {
+                                tracing::warn!(
+                                    err = %e,
+                                    "failed to persist discovered estimate field ID to config"
+                                );
+                            }
+                            _ => {
+                                tracing::info!(
+                                    "auto-discovered and persisted project_estimate_field_id to config"
+                                );
+                            }
                         }
                         discovered
                     } else {
@@ -302,9 +300,8 @@ impl ExternalBackend for GitHubBackend {
         &self,
         issue_node_ids: &[String],
     ) -> anyhow::Result<std::collections::HashMap<String, u8>> {
-        let project = match ProjectSync::from_config() {
-            Some(p) => p,
-            None => return Ok(std::collections::HashMap::new()),
+        let Some(project) = ProjectSync::from_config() else {
+            return Ok(std::collections::HashMap::new());
         };
 
         if issue_node_ids.is_empty() {
@@ -319,6 +316,7 @@ impl ExternalBackend for GitHubBackend {
 
     /// Override default update_status to add project board sync after label update.
     async fn update_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
+        const MAX_RETRIES: u32 = 3;
         // Internal tasks (e.g. "internal:63857") are not GitHub issues — skip silently.
         if !is_github_issue_id(id) {
             return Ok(());
@@ -331,7 +329,6 @@ impl ExternalBackend for GitHubBackend {
             tracing::warn!(label, err = %e, "ensure_status_label failed, continuing");
         }
 
-        const MAX_RETRIES: u32 = 3;
         let mut last_err =
             anyhow::anyhow!("update_status({label}) failed: all {MAX_RETRIES} attempts exhausted");
 
@@ -378,33 +375,27 @@ impl ExternalBackend for GitHubBackend {
             match self.set_labels(id, &[label.to_string()]).await {
                 Ok(()) => {
                     // Label update succeeded — now sync project board (non-fatal)
-                    if let Some(ref node_id) = issue_node_id {
-                        if let Some(project) = ProjectSync::from_config() {
-                            if let Err(e) =
-                                self.sync_project_status(&project, node_id, &status).await
-                            {
-                                tracing::warn!(
-                                    task_id = id.0,
-                                    err = %e,
-                                    "project board sync failed (non-fatal)"
-                                );
-                            }
-                        }
+                    if let Some(ref node_id) = issue_node_id
+                        && let Some(project) = ProjectSync::from_config()
+                        && let Err(e) = self.sync_project_status(&project, node_id, &status).await
+                    {
+                        tracing::warn!(
+                            task_id = id.0,
+                            err = %e,
+                            "project board sync failed (non-fatal)"
+                        );
                     }
 
                     // Auto-close issue when status → Done (if auto_close enabled)
                     if status == Status::Done {
-                        let auto_close = crate::config::get("workflow.auto_close")
-                            .map(|v| v == "true")
-                            .unwrap_or(true);
-                        if auto_close {
-                            if let Err(e) = self.gh.close_issue(&self.repo, &id.0).await {
-                                tracing::warn!(
-                                    task_id = id.0,
-                                    err = %e,
-                                    "auto-close issue failed (non-fatal)"
-                                );
-                            }
+                        let auto_close =
+                            crate::config::get("workflow.auto_close").map_or(true, |v| v == "true");
+                        if auto_close && let Err(e) = self.gh.close_issue(&self.repo, &id.0).await {
+                            tracing::warn!(
+                                task_id = id.0,
+                                err = %e,
+                                "auto-close issue failed (non-fatal)"
+                            );
                         }
                     }
 
@@ -597,17 +588,15 @@ impl ExternalBackend for GitHubBackend {
         if let (Some(child_node_id), Ok(parent_issue)) = (
             child_issue.node_id,
             self.gh.get_issue(&self.repo, &parent_id.0).await,
-        ) {
-            if let Some(parent_node_id) = parent_issue.node_id {
-                if let Err(e) = self.gh.add_sub_issue(&parent_node_id, &child_node_id).await {
-                    tracing::warn!(
-                        parent = parent_id.0,
-                        child = child_id.0,
-                        err = %e,
-                        "failed to add native sub-issue link (parent label still set)"
-                    );
-                }
-            }
+        ) && let Some(parent_node_id) = parent_issue.node_id
+            && let Err(e) = self.gh.add_sub_issue(&parent_node_id, &child_node_id).await
+        {
+            tracing::warn!(
+                parent = parent_id.0,
+                child = child_id.0,
+                err = %e,
+                "failed to add native sub-issue link (parent label still set)"
+            );
         }
 
         Ok(child_id)
@@ -690,7 +679,9 @@ impl ExternalBackend for GitHubBackend {
         if issue_number <= 0 {
             return Ok(crate::backends::BlockedByFetch::Unavailable);
         }
-        self.gh.list_blocked_by(repo, issue_number as u64).await
+        self.gh
+            .list_blocked_by(repo, issue_number.cast_unsigned())
+            .await
     }
 
     async fn issue_close_state(
@@ -728,14 +719,18 @@ impl ExternalBackend for GitHubBackend {
         if pr_number <= 0 {
             return Ok(None);
         }
-        let pr = match self.gh.get_pr(repo, pr_number as u64).await {
+        let pr = match self.gh.get_pr(repo, pr_number.cast_unsigned()).await {
             Ok(pr) => pr,
             Err(err) if is_missing_issue(&err) => return Ok(None),
             Err(err) => return Err(err),
         };
         let default_branch = self.gh.get_default_branch(repo).await.unwrap_or_default();
         let app_login = crate::github::app::bot_login().await;
-        let reviews = match self.gh.get_pr_reviews(repo, pr_number as u64).await {
+        let reviews = match self
+            .gh
+            .get_pr_reviews(repo, pr_number.cast_unsigned())
+            .await
+        {
             Ok(reviews) => {
                 crate::github::app::reviews_for_gate(&reviews, &pr.head.sha, app_login.as_deref())
             }
@@ -803,7 +798,11 @@ impl ExternalBackend for GitHubBackend {
             anyhow::bail!("blocking issue {blocking_repo}#{blocking_number} has no database id");
         }
         self.gh
-            .add_blocked_by(&self.repo, issue_number as u64, blocker.id as i64)
+            .add_blocked_by(
+                &self.repo,
+                issue_number.cast_unsigned(),
+                blocker.id.cast_signed(),
+            )
             .await
     }
 }
@@ -992,7 +991,7 @@ mod tests {
 
     #[test]
     fn is_github_issue_id_rejects_empty_and_non_numeric() {
-        assert!(!is_github_issue_id(&ExternalId("".to_string())));
+        assert!(!is_github_issue_id(&ExternalId(String::new())));
         assert!(!is_github_issue_id(&ExternalId("abc".to_string())));
         assert!(!is_github_issue_id(&ExternalId("1.0".to_string())));
     }
@@ -1016,9 +1015,9 @@ mod tests {
             user: GitHubUser {
                 login: "u".to_string(),
             },
-            created_at: "".to_string(),
-            updated_at: "".to_string(),
-            html_url: "".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            html_url: String::new(),
             node_id: None,
             pull_request: None,
             state_reason: None,
@@ -1039,9 +1038,9 @@ mod tests {
             user: GitHubUser {
                 login: "u".to_string(),
             },
-            created_at: "".to_string(),
-            updated_at: "".to_string(),
-            html_url: "".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            html_url: String::new(),
             node_id: None,
             pull_request: None,
             state_reason: None,
@@ -1062,9 +1061,9 @@ mod tests {
             user: GitHubUser {
                 login: "u".to_string(),
             },
-            created_at: "".to_string(),
-            updated_at: "".to_string(),
-            html_url: "".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            html_url: String::new(),
             node_id: None,
             pull_request: None,
             state_reason: None,
@@ -1085,9 +1084,9 @@ mod tests {
             user: GitHubUser {
                 login: "u".to_string(),
             },
-            created_at: "".to_string(),
-            updated_at: "".to_string(),
-            html_url: "".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            html_url: String::new(),
             node_id: None,
             pull_request: None,
             state_reason: None,
@@ -1105,7 +1104,7 @@ mod tests {
             user: crate::github::types::GitHubUser {
                 login: "u".to_string(),
             },
-            created_at: "".to_string(),
+            created_at: String::new(),
             updated_at: None,
             html_url: None,
             issue_url: None,
@@ -1123,7 +1122,7 @@ mod tests {
             user: crate::github::types::GitHubUser {
                 login: "u".to_string(),
             },
-            created_at: "".to_string(),
+            created_at: String::new(),
             updated_at: None,
             html_url: None,
             issue_url: None,
@@ -1168,9 +1167,9 @@ mod tests {
             user: GitHubUser {
                 login: "owner".to_string(),
             },
-            created_at: "".to_string(),
-            updated_at: "".to_string(),
-            html_url: "".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            html_url: String::new(),
             node_id: None,
             pull_request: None,
             state_reason: None,
@@ -1182,7 +1181,10 @@ mod tests {
         assert!(mentions.is_empty());
     }
 
-    #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the env lock stays held across the awaits so tests do not race on GH_TOKEN"
+    )]
     #[tokio::test]
     async fn get_mentions_and_list_issue_comments_exclude_contributor_on_owner_issue() {
         use crate::github::http::GhHttp;
@@ -1191,7 +1193,8 @@ mod tests {
 
         let _env = crate::github::token::ENV_LOCK.lock().unwrap();
         let prev = std::env::var_os("GH_TOKEN");
-        std::env::set_var("GH_TOKEN", "test_token");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("GH_TOKEN", "test_token") };
 
         let server = MockServer::start().await;
         let comments = serde_json::json!([
@@ -1239,8 +1242,10 @@ mod tests {
             .expect("list_issue_comments");
 
         match prev {
-            Some(value) => std::env::set_var("GH_TOKEN", value),
-            None => std::env::remove_var("GH_TOKEN"),
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            Some(value) => unsafe { std::env::set_var("GH_TOKEN", value) },
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            None => unsafe { std::env::remove_var("GH_TOKEN") },
         }
 
         assert_eq!(mentions.len(), 1);
@@ -1268,9 +1273,9 @@ mod tests {
             user: GitHubUser {
                 login: "u".to_string(),
             },
-            created_at: "".to_string(),
-            updated_at: "".to_string(),
-            html_url: "".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            html_url: String::new(),
             node_id: None,
             pull_request: None,
             state_reason: None,

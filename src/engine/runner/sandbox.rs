@@ -2,7 +2,7 @@
 //! why it is shaped this way are in docs/plans/2026-10-28-agent-sandboxes.md
 
 use super::agent::AgentInvocation;
-use sandbox_jail::{known, Access, Backend, Policy, Sandbox};
+use sandbox_jail::{Access, Backend, Policy, Sandbox, known};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -206,7 +206,7 @@ fn policy(run: &Run) -> Policy {
             known::BASIC_MACH_SERVICES
                 .iter()
                 .chain(&[KEYCHAIN])
-                .map(|s| s.to_string())
+                .map(std::string::ToString::to_string)
                 .collect(),
         );
     } else {
@@ -647,10 +647,12 @@ mod tests {
         let Access::Only(sockets) = &p.unix_sockets else {
             panic!("every unix socket is reachable");
         };
-        assert_eq!(sockets, &vec![run.work_dir.clone(), run.temp.clone()]);
-        assert!(!sockets
-            .iter()
-            .any(|s| s.starts_with("/tmp") || s.starts_with("/private/tmp")));
+        assert_eq!(sockets, &vec![run.work_dir, run.temp]);
+        assert!(
+            !sockets
+                .iter()
+                .any(|s| s.starts_with("/tmp") || s.starts_with("/private/tmp"))
+        );
         let Access::Only(mach) = &p.mach_services else {
             panic!("every Mach service is reachable");
         };
@@ -696,9 +698,11 @@ mod tests {
     #[test]
     fn a_job_task_may_write_the_store() {
         let (_root, run) = fixture(true);
-        assert!(!policy(&run)
-            .read_only
-            .contains(&run.orch_home.join("orch.db")));
+        assert!(
+            !policy(&run)
+                .read_only
+                .contains(&run.orch_home.join("orch.db"))
+        );
     }
 
     #[test]
@@ -864,7 +868,7 @@ mod tests {
     // A logged-in claude answers under the policy with the real home: `--run-ignored only claude`
     #[cfg(target_os = "macos")]
     #[test]
-    #[ignore]
+    #[ignore = "needs a logged-in claude on the host"]
     fn claude_answers_inside_the_sandbox_with_the_real_home() {
         let root = tempfile::tempdir().unwrap();
         let work = root.path().canonicalize().unwrap();

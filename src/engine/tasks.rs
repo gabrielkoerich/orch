@@ -53,7 +53,10 @@ pub struct TaskFilter {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "tasks are few and boxing would touch every match"
+)]
 pub enum Task {
     External(ExternalTask),
     Internal(store::Task),
@@ -84,10 +87,18 @@ pub struct TaskManager {
     event_tx: Option<tokio::sync::broadcast::Sender<crate::engine::events::TaskEvent>>,
 }
 
+impl std::fmt::Debug for TaskManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskManager")
+            .field("repo", &self.repo)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Clone for TaskManager {
     fn clone(&self) -> Self {
         Self {
-            backend: self.backend.clone(),
+            backend: std::sync::Arc::clone(&self.backend),
             store: self.store.clone(),
             repo: self.repo.clone(),
             event_tx: self.event_tx.clone(),
@@ -96,7 +107,7 @@ impl Clone for TaskManager {
 }
 
 impl TaskManager {
-    #[allow(dead_code)] // Used in tests
+    #[cfg(test)]
     pub fn new(backend: Arc<dyn ExternalBackend>) -> Self {
         Self {
             backend,
@@ -104,18 +115,6 @@ impl TaskManager {
             repo: String::new(),
             event_tx: None,
         }
-    }
-
-    /// Get reference to the task store (if available).
-    #[allow(dead_code)]
-    pub fn store(&self) -> Option<&Arc<TaskStore>> {
-        self.store.as_ref()
-    }
-
-    /// Get reference to the repo identifier.
-    #[allow(dead_code)]
-    pub fn repo(&self) -> &str {
-        &self.repo
     }
 
     /// Create a TaskManager with the unified store for dual-write support.
@@ -180,15 +179,14 @@ impl TaskManager {
 
     pub async fn get_task(&self, id: i64) -> anyhow::Result<Task> {
         // Try store first (covers both internal and external tasks)
-        if let Some(ref store) = self.store {
-            if let Ok(task) = store.get(id).await {
-                if task.origin == "internal" {
-                    return Ok(Task::Internal(task));
-                }
-                // External task found in store — still return as External from backend
-                // for compatibility with callers that expect ExternalTask fields
-            }
+        if let Some(ref store) = self.store
+            && let Ok(task) = store.get(id).await
+            && task.origin == "internal"
+        {
+            return Ok(Task::Internal(task));
         }
+        // External task found in store — still return as External from backend
+        // for compatibility with callers that expect ExternalTask fields
         // Fall back to backend for external tasks
         let ext_id = ExternalId(id.to_string());
         match self.backend.get_task(&ext_id).await {
@@ -210,8 +208,7 @@ impl TaskManager {
             if !is_all {
                 let task_status = TaskStatus::from_str(status_str)
                     .ok_or_else(|| anyhow::anyhow!(
-                        "invalid status: '{}'. allowed: new, routed, in_progress, needs_review, in_review, approved, blocked, waiting, done, all",
-                        status_str
+                        "invalid status: '{status_str}'. allowed: new, routed, in_progress, needs_review, in_review, approved, blocked, waiting, done, all"
                     ))?;
                 let backend_status = match status_str.as_str() {
                     "new" => Status::New,
@@ -232,10 +229,10 @@ impl TaskManager {
                         .list_internal_by_status(&self.repo, task_status)
                         .await?;
                     for t in internal_tasks {
-                        if let Some(ref source) = filter.source {
-                            if t.source != *source {
-                                continue;
-                            }
+                        if let Some(ref source) = filter.source
+                            && t.source != *source
+                        {
+                            continue;
                         }
                         tasks.push(Task::Internal(t));
                     }
@@ -403,13 +400,12 @@ impl TaskManager {
         }
 
         // Always include internal tasks from store when available
-        if self.store.is_some() {
-            if let Ok(internal) = self
+        if self.store.is_some()
+            && let Ok(internal) = self
                 .list_internal_by_status(status_to_task_status(status))
                 .await
-            {
-                tasks.extend(internal);
-            }
+        {
+            tasks.extend(internal);
         }
 
         Ok(tasks)
@@ -490,13 +486,13 @@ impl TaskManager {
 
         // External tasks: store-first, then mirror to backend.
         // SQLite is the source of truth; backend sync is best-effort.
-        if let Some(ref store) = self.store {
-            if let Some(store_id) = snapshot_store_id {
-                if task_status != TaskStatus::Blocked {
-                    store.set_block_reason(store_id, None).await?;
-                }
-                store.update_status(store_id, task_status).await?;
+        if let Some(ref store) = self.store
+            && let Some(store_id) = snapshot_store_id
+        {
+            if task_status != TaskStatus::Blocked {
+                store.set_block_reason(store_id, None).await?;
             }
+            store.update_status(store_id, task_status).await?;
         }
 
         // Mirror to backend (GitHub labels). Log failure but don't fail the operation
@@ -547,12 +543,12 @@ impl TaskManager {
         }
 
         // External tasks: store-first, then mirror to backend.
-        if let Some(ref store) = self.store {
-            if let Some(store_id) = snapshot_store_id {
-                store
-                    .update_status_and_fields(store_id, task_status, updates)
-                    .await?;
-            }
+        if let Some(ref store) = self.store
+            && let Some(store_id) = snapshot_store_id
+        {
+            store
+                .update_status_and_fields(store_id, task_status, updates)
+                .await?;
         }
 
         // Mirror to backend (GitHub labels).
@@ -678,13 +674,13 @@ impl TaskManager {
             return Ok(());
         }
 
-        if let Some(ref store) = self.store {
-            if let Some(store_id) = snapshot_store_id {
-                if task_status != TaskStatus::Blocked {
-                    store.set_block_reason(store_id, None).await?;
-                }
-                store.update_status(store_id, task_status).await?;
+        if let Some(ref store) = self.store
+            && let Some(store_id) = snapshot_store_id
+        {
+            if task_status != TaskStatus::Blocked {
+                store.set_block_reason(store_id, None).await?;
             }
+            store.update_status(store_id, task_status).await?;
         }
 
         if let Err(e) = self.backend.update_status(id, status).await {
@@ -708,9 +704,8 @@ impl TaskManager {
         let Some(ref store) = self.store else {
             return (TaskSnapshot::default(), None);
         };
-        let store_id = match store.resolve_task_id(&self.repo, task_id).await {
-            Ok(Some(id)) => id,
-            _ => return (TaskSnapshot::default(), None),
+        let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, task_id).await else {
+            return (TaskSnapshot::default(), None);
         };
         let snapshot = Self::snapshot_for_store_id(store, store_id, task_id).await;
         (snapshot, Some(store_id))
@@ -993,7 +988,7 @@ mod tests {
 
     #[async_trait]
     impl ExternalBackend for MockBackend {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "mock"
         }
         async fn create_task(
@@ -1008,13 +1003,13 @@ mod tests {
             Ok(ExternalTask {
                 id: id.clone(),
                 title: "Mock".to_string(),
-                body: "".to_string(),
+                body: String::new(),
                 state: "open".to_string(),
                 labels: vec![],
                 author: "bot".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
-                url: "".to_string(),
+                url: String::new(),
             })
         }
         async fn list_by_status(&self, status: Status) -> anyhow::Result<Vec<ExternalTask>> {
@@ -1083,7 +1078,11 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
-        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         assert!(tm.store.is_some(), "store should be set via with_store");
         assert_eq!(tm.repo, "owner/repo");
@@ -1107,7 +1106,11 @@ mod tests {
             .await
             .unwrap();
 
-        let tm = TaskManager::with_store(backend.clone(), store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         // Update status — should write to both backend and store
         tm.update_task_status(&ExternalId("42".to_string()), Status::InProgress)
@@ -1128,7 +1131,11 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
-        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         // Update for a task not in the store — should not error
         let result = tm
@@ -1164,10 +1171,14 @@ mod tests {
             .await
             .unwrap();
 
-        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         // Update the internal task status via TaskManager
-        let id_str = format!("internal:{}", internal_id);
+        let id_str = format!("internal:{internal_id}");
         tm.update_task_status(&ExternalId(id_str), Status::Routed)
             .await
             .unwrap();
@@ -1219,7 +1230,11 @@ mod tests {
     async fn create_internal_task_via_task_manager() {
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         let task = tm
             .create_task(CreateTaskRequest {
@@ -1237,11 +1252,11 @@ mod tests {
             Task::Internal(t) => {
                 assert_eq!(t.title, "Internal task");
                 assert_eq!(t.origin, "internal");
-                assert!(t
-                    .external_id
-                    .as_deref()
-                    .map(|s| s.starts_with("internal:"))
-                    .unwrap_or(false));
+                assert!(
+                    t.external_id
+                        .as_deref()
+                        .is_some_and(|s| s.starts_with("internal:"))
+                );
             }
             Task::External(_) => panic!("expected Internal variant"),
         }
@@ -1255,11 +1270,11 @@ mod tests {
         let result = tm
             .create_task(CreateTaskRequest {
                 title: "No store".to_string(),
-                body: "".to_string(),
+                body: String::new(),
                 task_type: TaskType::Internal,
                 labels: vec![],
                 source: "manual".to_string(),
-                source_id: "".to_string(),
+                source_id: String::new(),
             })
             .await;
 
@@ -1276,8 +1291,12 @@ mod tests {
         let (event_tx, mut event_rx) =
             tokio::sync::broadcast::channel::<crate::engine::events::TaskEvent>(16);
 
-        let tm =
-            TaskManager::with_events(backend, store.clone(), "owner/repo".to_string(), event_tx);
+        let tm = TaskManager::with_events(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+            event_tx,
+        );
 
         // "internal:999" does not exist in the (empty) store
         let result = tm
@@ -1320,7 +1339,11 @@ mod tests {
         let ext_id = ExternalId(format!("internal:{store_id}"));
 
         // TaskManager scoped to a different repo than the task belongs to.
-        let tm = TaskManager::with_store(backend, store.clone(), "active/repo".to_string());
+        let tm = TaskManager::with_store(
+            backend,
+            std::sync::Arc::clone(&store),
+            "active/repo".to_string(),
+        );
 
         // The repo-scoped path fails to even find the task.
         let resolve_result = tm.update_task_status(&ext_id, Status::Done).await;
@@ -1342,7 +1365,11 @@ mod tests {
     async fn get_task_returns_internal_from_store() {
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         let id = store
             .create_internal("owner/repo", "Fetch me", "body", "cron", "job:1", None)
@@ -1360,7 +1387,11 @@ mod tests {
     async fn list_routable_includes_internal_new_tasks() {
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         // Create internal task (starts as New)
         store
@@ -1378,7 +1409,11 @@ mod tests {
     async fn list_routable_excludes_non_new_internal_tasks() {
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         let id = store
             .create_internal("owner/repo", "Already routed", "", "cron", "job:3", None)
@@ -1400,7 +1435,11 @@ mod tests {
     async fn list_internal_by_status_returns_external_tasks() {
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         store
             .create_internal("owner/repo", "Task A", "", "cron", "a", None)
@@ -1454,7 +1493,11 @@ mod tests {
     async fn list_all_internal_returns_store_tasks() {
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         store
             .create_internal("owner/repo", "T1", "", "cron", "1", None)
@@ -1480,7 +1523,11 @@ mod tests {
     async fn list_external_by_status_reads_from_store() {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend = Arc::new(MockBackend::new());
-        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         // Create an external task in the store with status Routed
         let id = store
@@ -1508,7 +1555,11 @@ mod tests {
     async fn list_external_by_status_excludes_internal_tasks() {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend = Arc::new(MockBackend::new());
-        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         // Create an internal task with Routed status
         let id = store
@@ -1545,16 +1596,20 @@ mod tests {
             vec![ExternalTask {
                 id: ExternalId("123".to_string()),
                 title: "Backend routed".to_string(),
-                body: "".to_string(),
+                body: String::new(),
                 state: "open".to_string(),
                 labels: vec!["status:routed".to_string()],
                 author: "bot".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
-                url: "".to_string(),
+                url: String::new(),
             }],
         ));
-        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         let id = store
             .create_internal("owner/repo", "Internal task", "", "cron", "1", None)
@@ -1571,7 +1626,11 @@ mod tests {
     async fn list_routable_reads_from_store_when_populated() {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend = Arc::new(MockBackend::new());
-        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         // Create a new external task
         store
@@ -1604,15 +1663,19 @@ mod tests {
         let backend = Arc::new(MockBackend::new().with_routable_tasks(vec![ExternalTask {
             id: ExternalId("55".to_string()),
             title: "Backend new".to_string(),
-            body: "".to_string(),
+            body: String::new(),
             state: "open".to_string(),
             labels: vec!["status:new".to_string()],
             author: "bot".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            url: "".to_string(),
+            url: String::new(),
         }]));
-        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         store
             .create_internal("owner/repo", "Internal new", "", "cron", "1", None)
@@ -1622,16 +1685,22 @@ mod tests {
         let routable = tm.list_routable().await.unwrap();
         assert_eq!(routable.len(), 2);
         assert!(routable.iter().any(|task| task.id.0 == "55"));
-        assert!(routable
-            .iter()
-            .any(|task| task.id.0.starts_with("internal:")));
+        assert!(
+            routable
+                .iter()
+                .any(|task| task.id.0.starts_with("internal:"))
+        );
     }
 
     #[tokio::test]
     async fn list_all_external_tasks_reads_from_store() {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend = Arc::new(MockBackend::new());
-        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         // Create tasks with different statuses
         let id1 = store
@@ -1684,16 +1753,20 @@ mod tests {
             vec![ExternalTask {
                 id: ExternalId("200".to_string()),
                 title: "Backend done".to_string(),
-                body: "".to_string(),
+                body: String::new(),
                 state: "closed".to_string(),
                 labels: vec!["status:done".to_string()],
                 author: "bot".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
-                url: "".to_string(),
+                url: String::new(),
             }],
         ));
-        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         store
             .create_internal("owner/repo", "Internal", "", "cron", "1", None)
@@ -1713,16 +1786,20 @@ mod tests {
             vec![ExternalTask {
                 id: ExternalId("301".to_string()),
                 title: "Backend new".to_string(),
-                body: "".to_string(),
+                body: String::new(),
                 state: "open".to_string(),
                 labels: vec!["status:new".to_string()],
                 author: "bot".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
-                url: "".to_string(),
+                url: String::new(),
             }],
         ));
-        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         let internal_id = store
             .create_internal("owner/repo", "Internal task", "", "cron", "1", None)
@@ -1749,16 +1826,20 @@ mod tests {
             vec![ExternalTask {
                 id: ExternalId("302".to_string()),
                 title: "Backend done".to_string(),
-                body: "".to_string(),
+                body: String::new(),
                 state: "closed".to_string(),
                 labels: vec!["status:done".to_string()],
                 author: "bot".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
-                url: "".to_string(),
+                url: String::new(),
             }],
         ));
-        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         let internal_id = store
             .create_internal("owner/repo", "Internal task", "", "cron", "1", None)
@@ -1789,7 +1870,11 @@ mod tests {
     async fn update_task_status_writes_store_first_for_external() {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
-        let tm = TaskManager::with_store(backend.clone(), store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         // Upsert an external task
         let store_id = store
@@ -1822,7 +1907,11 @@ mod tests {
     async fn update_task_status_handles_internal_tasks() {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
-        let tm = TaskManager::with_store(backend.clone(), store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         // Create an internal task
         let store_id = store
@@ -1830,7 +1919,7 @@ mod tests {
             .await
             .unwrap();
 
-        let internal_id = ExternalId(format!("internal:{}", store_id));
+        let internal_id = ExternalId(format!("internal:{store_id}"));
         tm.update_task_status(&internal_id, Status::InProgress)
             .await
             .unwrap();
@@ -1897,7 +1986,12 @@ mod tests {
             .await
             .unwrap();
 
-        let tm = TaskManager::with_events(backend, store.clone(), "owner/repo".to_string(), tx);
+        let tm = TaskManager::with_events(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+            tx,
+        );
 
         // Update New → Routed
         let ext_id = ExternalId("77".to_string());
@@ -1935,10 +2029,15 @@ mod tests {
             .await
             .unwrap();
 
-        let tm = TaskManager::with_events(backend, store.clone(), "owner/repo".to_string(), tx);
+        let tm = TaskManager::with_events(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+            tx,
+        );
 
         // Update New → Routed
-        let internal_id = ExternalId(format!("internal:{}", store_id));
+        let internal_id = ExternalId(format!("internal:{store_id}"));
         tm.update_task_status(&internal_id, Status::Routed)
             .await
             .unwrap();
@@ -1963,7 +2062,11 @@ mod tests {
     async fn update_task_status_if_applies_when_status_matches() {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
-        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        );
 
         let store_id = store
             .upsert_external(&crate::store::UpsertExternal {
@@ -2000,7 +2103,12 @@ mod tests {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
         let (tx, mut rx) = tokio::sync::broadcast::channel::<crate::engine::events::TaskEvent>(16);
-        let tm = TaskManager::with_events(backend, store.clone(), "owner/repo".to_string(), tx);
+        let tm = TaskManager::with_events(
+            backend,
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+            tx,
+        );
 
         let store_id = store
             .upsert_external(&crate::store::UpsertExternal {

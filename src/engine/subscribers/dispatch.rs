@@ -11,7 +11,7 @@ use crate::tmux::TmuxManager;
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{RwLock, Semaphore, mpsc};
 
 type SessionMap = std::collections::HashMap<String, bool>;
 
@@ -37,7 +37,10 @@ where
 /// This mirrors the logic in `tick_dispatch_tasks` but triggers instantly
 /// instead of waiting for the next tick. The dispatching set prevents
 /// double-dispatch if the tick loop picks up the same task.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments have no natural grouping"
+)]
 pub fn spawn(
     mut rx: broadcast::Receiver<TaskEvent>,
     backend: Arc<dyn ExternalBackend>,
@@ -96,7 +99,7 @@ mod tests {
     use super::*;
     use crate::engine::router::{Router, RouterConfig};
     use std::time::Duration;
-    use tokio::sync::{oneshot, Notify};
+    use tokio::sync::{Notify, oneshot};
 
     #[tokio::test]
     async fn prepare_dispatch_context_drops_read_lock_before_awaiting_session_map() {

@@ -9,8 +9,8 @@ use crate::store::{Task, TaskStatus, TaskStore};
 use crate::tmux::TmuxManager;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// What kind of automatic repair can be applied to a finding.
 ///
@@ -72,21 +72,20 @@ pub async fn run(full: bool, fix: bool, dry_run: bool) -> anyhow::Result<()> {
     let tmux = TmuxManager::new();
 
     // Resolve repos to check: current project if available, otherwise all repos in store.
-    let repos: Vec<String> = match config::get_current_repo() {
-        Ok(repo) => vec![repo],
-        Err(_) => {
-            let all = store.distinct_repos().await?;
-            if all.is_empty() {
-                println!("No tasks found in store.");
-                return Ok(());
-            }
-            all
+    let repos: Vec<String> = if let Ok(repo) = config::get_current_repo() {
+        vec![repo]
+    } else {
+        let all = store.distinct_repos().await?;
+        if all.is_empty() {
+            println!("No tasks found in store.");
+            return Ok(());
         }
+        all
     };
 
     // Spinner: show progress on stderr while checks run (erase with \r on done).
     let spinner_running = Arc::new(AtomicBool::new(true));
-    let spinner_flag = spinner_running.clone();
+    let spinner_flag = std::sync::Arc::clone(&spinner_running);
     let spinner_task = tokio::spawn(async move {
         let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let mut i = 0usize;
@@ -155,11 +154,11 @@ async fn run_checks(
                 let mut nums: Vec<u64> = recent_done_tasks
                     .iter()
                     .filter(|t| !(t.origin == "internal" && t.external_id.is_none()))
-                    .filter_map(|t| t.pr_number.map(|n| n as u64))
+                    .filter_map(|t| t.pr_number.and_then(|n| u64::try_from(n).ok()))
                     .chain(
                         active_tasks
                             .iter()
-                            .filter_map(|t| t.pr_number.map(|n| n as u64)),
+                            .filter_map(|t| t.pr_number.and_then(|n| u64::try_from(n).ok())),
                     )
                     .collect();
                 nums.sort_unstable();
@@ -244,7 +243,7 @@ async fn run_checks(
             let mut pr_by_head: std::collections::HashMap<String, serde_json::Value> =
                 std::collections::HashMap::new();
             for pr in &open_prs {
-                if let Some(n) = pr.get("number").and_then(|v| v.as_u64()) {
+                if let Some(n) = pr.get("number").and_then(serde_json::Value::as_u64) {
                     pr_by_number.insert(n, pr.clone());
                 }
                 if let Some(head) = pr.pointer("/head/ref").and_then(|v| v.as_str()) {
@@ -269,45 +268,42 @@ async fn run_checks(
                 }
 
                 // PR merged check for tasks that have a PR recorded — make one REST call per active task (few)
-                if let Some(pr_num) = task.pr_number {
-                    match gh.get_pr(repo, pr_num as u64).await {
-                        Ok(pr) => {
-                            if pr.merged.unwrap_or(false) {
-                                findings.push(Finding {
-                                    severity: Severity::Error,
-                                    task_id: task_label(task),
-                                    message: format!(
-                                        "PR #{} is merged but task status is '{}'",
-                                        pr_num,
-                                        task.status.as_str()
-                                    ),
-                                    fix: FixAction::MarkDoneFromMergedPr { store_id: task.id },
-                                });
-                            }
+                if let Some(pr_num) = task.pr_number.and_then(|n| u64::try_from(n).ok()) {
+                    if let Ok(pr) = gh.get_pr(repo, pr_num).await {
+                        if pr.merged.unwrap_or(false) {
+                            findings.push(Finding {
+                                severity: Severity::Error,
+                                task_id: task_label(task),
+                                message: format!(
+                                    "PR #{} is merged but task status is '{}'",
+                                    pr_num,
+                                    task.status.as_str()
+                                ),
+                                fix: FixAction::MarkDoneFromMergedPr { store_id: task.id },
+                            });
                         }
-                        Err(_) => {
-                            // Ignore transient failures in fast path; the full path will surface them.
-                        }
+                    } else {
+                        // Ignore transient failures in fast path; the full path will surface them.
                     }
                 } else if !task.branch.is_empty() {
                     // If task has a branch, check if there's an open PR for it
                     if let Some(pr) = pr_by_head.get(&task.branch) {
                         // PR exists and is open — link PR (warning) unless already linked
-                        if task.pr_number.is_none() {
-                            if let Some(n) = pr.get("number").and_then(|v| v.as_u64()) {
-                                findings.push(Finding {
-                                    severity: Severity::Warning,
-                                    task_id: task_label(task),
-                                    message: format!(
-                                        "branch '{}' has open PR #{} not linked in store",
-                                        task.branch, n
-                                    ),
-                                    fix: FixAction::LinkPr {
-                                        store_id: task.id,
-                                        pr_number: n,
-                                    },
-                                });
-                            }
+                        if task.pr_number.is_none()
+                            && let Some(n) = pr.get("number").and_then(serde_json::Value::as_u64)
+                        {
+                            findings.push(Finding {
+                                severity: Severity::Warning,
+                                task_id: task_label(task),
+                                message: format!(
+                                    "branch '{}' has open PR #{} not linked in store",
+                                    task.branch, n
+                                ),
+                                fix: FixAction::LinkPr {
+                                    store_id: task.id,
+                                    pr_number: n,
+                                },
+                            });
                         }
                     }
                 }
@@ -334,19 +330,19 @@ async fn run_checks(
 
             // Orphaned PRs: open PRs that don't match any active task by number or head ref
             for pr in &open_prs {
-                let pr_num = pr.get("number").and_then(|v| v.as_u64());
+                let pr_num = pr.get("number").and_then(serde_json::Value::as_u64);
                 let head = pr
                     .pointer("/head/ref")
                     .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
+                    .map(std::string::ToString::to_string);
                 let mut owned = false;
                 if let Some(n) = pr_num {
                     for t in &active_tasks {
-                        if let Some(pn) = t.pr_number {
-                            if pn as u64 == n {
-                                owned = true;
-                                break;
-                            }
+                        if let Some(pn) = t.pr_number
+                            && u64::try_from(pn) == Ok(n)
+                        {
+                            owned = true;
+                            break;
                         }
                         if !t.branch.is_empty() && Some(t.branch.clone()) == head {
                             owned = true;
@@ -355,13 +351,11 @@ async fn run_checks(
                     }
                 }
                 if !owned {
-                    let num_str = pr_num
-                        .map(|n| n.to_string())
-                        .unwrap_or_else(|| "?".to_string());
+                    let num_str = pr_num.map_or_else(|| "?".to_string(), |n| n.to_string());
                     findings.push(Finding {
                         severity: Severity::Warning,
-                        task_id: format!("pr:{}", num_str),
-                        message: format!("open PR with no active task: #{}", num_str),
+                        task_id: format!("pr:{num_str}"),
+                        message: format!("open PR with no active task: #{num_str}"),
                         fix: FixAction::None,
                     });
                 }
@@ -373,7 +367,7 @@ async fn run_checks(
         }
 
         if repos.len() > 1 && !findings.is_empty() {
-            println!("\n=== {} ===", repo);
+            println!("\n=== {repo} ===");
         }
 
         // Apply per-repo fixes immediately so store_id lookups are in scope.
@@ -443,22 +437,19 @@ async fn check_done_no_merged_pr(
     let task_label = task_label(task);
     let store_id = task.id;
 
-    match task.pr_number {
+    match task.pr_number.and_then(|n| u64::try_from(n).ok()) {
         Some(pr_num) => {
             // Use cached state; fall back to live fetch if missing (e.g. new PR since batch)
-            let (merged, state) = if let Some(s) = pr_states.get(&(pr_num as u64)) {
+            let (merged, state) = if let Some(s) = pr_states.get(&pr_num) {
                 s.clone()
             } else {
-                match gh.get_pr(repo, pr_num as u64).await {
+                match gh.get_pr(repo, pr_num).await {
                     Ok(pr) => (pr.merged.unwrap_or(false), pr.state),
                     Err(e) => {
                         findings.push(Finding {
                             severity: Severity::Warning,
                             task_id: task_label,
-                            message: format!(
-                                "done with PR #{} but failed to fetch PR: {}",
-                                pr_num, e
-                            ),
+                            message: format!("done with PR #{pr_num} but failed to fetch PR: {e}"),
                             fix: FixAction::None,
                         });
                         return;
@@ -470,8 +461,7 @@ async fn check_done_no_merged_pr(
                     severity: Severity::Error,
                     task_id: task_label,
                     message: format!(
-                        "done but PR #{} is {} (not merged) — done is terminal, file a new task to finish the work",
-                        pr_num, state
+                        "done but PR #{pr_num} is {state} (not merged) — done is terminal, file a new task to finish the work"
                     ),
                     fix: FixAction::None,
                 });
@@ -479,23 +469,28 @@ async fn check_done_no_merged_pr(
         }
         None => {
             // No PR recorded — check if branch has a PR
-            if !task.branch.is_empty() {
+            if task.branch.is_empty() {
+                findings.push(Finding {
+                    severity: Severity::Error,
+                    task_id: task_label,
+                    message: "done but no branch or PR recorded".to_string(),
+                    fix: FixAction::None,
+                });
+            } else {
                 match gh.get_pr_number(repo, &task.branch).await {
                     Ok(Some(pr_num)) => {
                         // PR exists on GitHub but not linked — check merge state
                         let merged = gh
                             .get_pr(repo, pr_num)
                             .await
-                            .map(|pr| pr.merged == Some(true))
-                            .unwrap_or(false);
+                            .is_ok_and(|pr| pr.merged == Some(true));
                         if merged {
                             // PR is merged — just link it
                             findings.push(Finding {
                                 severity: Severity::Warning,
                                 task_id: task_label,
                                 message: format!(
-                                    "done with no pr_number but branch has merged PR #{}",
-                                    pr_num
+                                    "done with no pr_number but branch has merged PR #{pr_num}"
                                 ),
                                 fix: FixAction::LinkPr {
                                     store_id,
@@ -508,8 +503,7 @@ async fn check_done_no_merged_pr(
                                 severity: Severity::Error,
                                 task_id: task_label,
                                 message: format!(
-                                    "done with no pr_number but branch has unmerged PR #{} — done is terminal, file a new task to finish the work",
-                                    pr_num
+                                    "done with no pr_number but branch has unmerged PR #{pr_num} — done is terminal, file a new task to finish the work"
                                 ),
                                 fix: FixAction::None,
                             });
@@ -533,13 +527,6 @@ async fn check_done_no_merged_pr(
                         });
                     }
                 }
-            } else {
-                findings.push(Finding {
-                    severity: Severity::Error,
-                    task_id: task_label,
-                    message: "done but no branch or PR recorded".to_string(),
-                    fix: FixAction::None,
-                });
             }
         }
     }
@@ -565,8 +552,7 @@ async fn describe_unrecovered_work(task: &Task) -> String {
         .current_dir(wt)
         .output()
         .await
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false);
+        .is_ok_and(|o| !o.stdout.is_empty());
 
     if has_dirty {
         return format!("{HEAD}; uncommitted changes left in {}", task.worktree);
@@ -578,8 +564,7 @@ async fn describe_unrecovered_work(task: &Task) -> String {
         .current_dir(wt)
         .output()
         .await
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false);
+        .is_ok_and(|o| !o.stdout.is_empty());
 
     if has_unpushed {
         return format!("{HEAD}; unpushed commits left in {}", task.worktree);
@@ -592,8 +577,7 @@ async fn describe_unrecovered_work(task: &Task) -> String {
         .current_dir(wt)
         .output()
         .await
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false);
+        .is_ok_and(|o| !o.stdout.is_empty());
 
     if branch_on_remote {
         return format!("{HEAD}; branch '{}' is pushed with no PR", task.branch);
@@ -616,9 +600,10 @@ async fn check_dirty_worktree(task: &Task, findings: &mut Vec<Finding>) {
         .current_dir(wt)
         .output()
         .await;
-    if let Ok(out) = output {
-        if !out.stdout.is_empty() {
-            findings.push(Finding {
+    if let Ok(out) = output
+        && !out.stdout.is_empty()
+    {
+        findings.push(Finding {
                 severity: Severity::Error,
                 task_id: task_label(task),
                 message: format!(
@@ -627,7 +612,6 @@ async fn check_dirty_worktree(task: &Task, findings: &mut Vec<Finding>) {
                 ),
                 fix: FixAction::None,
             });
-        }
     }
 }
 
@@ -645,10 +629,15 @@ async fn check_unpushed_commits(task: &Task, findings: &mut Vec<Finding>) {
         .current_dir(wt)
         .output()
         .await;
-    if let Ok(out) = output {
-        if !out.stdout.is_empty() {
-            let count = out.stdout.iter().filter(|&&b| b == b'\n').count();
-            findings.push(Finding {
+    if let Ok(out) = output
+        && !out.stdout.is_empty()
+    {
+        #[expect(
+            clippy::naive_bytecount,
+            reason = "a short git log does not need the bytecount crate"
+        )]
+        let count = out.stdout.iter().filter(|&&b| b == b'\n').count();
+        findings.push(Finding {
                 severity: Severity::Error,
                 task_id: task_label(task),
                 message: format!(
@@ -657,7 +646,6 @@ async fn check_unpushed_commits(task: &Task, findings: &mut Vec<Finding>) {
                 ),
                 fix: FixAction::None,
             });
-        }
     }
 }
 
@@ -672,9 +660,8 @@ fn check_issue_status_mismatch(
         None => return,
     };
 
-    let (state, _labels) = match issue_states.get(&ext_id) {
-        Some(v) => v,
-        None => return,
+    let Some((state, _labels)) = issue_states.get(&ext_id) else {
+        return;
     };
 
     let issue_closed = state == "closed";
@@ -712,9 +699,8 @@ fn check_label_mismatch(
         None => return,
     };
 
-    let (_state, labels) = match issue_states.get(&ext_id) {
-        Some(v) => v,
-        None => return,
+    let Some((_state, labels)) = issue_states.get(&ext_id) else {
+        return;
     };
 
     let expected_label = format!("status:{}", task.status.as_str());
@@ -760,10 +746,7 @@ async fn check_stale_in_progress(
         findings.push(Finding {
             severity: Severity::Error,
             task_id: task_label(task),
-            message: format!(
-                "status is 'in_progress' but no tmux session '{}' found",
-                session
-            ),
+            message: format!("status is 'in_progress' but no tmux session '{session}' found"),
             fix: FixAction::ResetToRouted { store_id: task.id },
         });
     }
@@ -771,9 +754,8 @@ async fn check_stale_in_progress(
 
 /// Check 7: Orphaned worktrees.
 async fn check_orphaned_worktrees(all_tasks: &[Task], findings: &mut Vec<Finding>) {
-    let worktrees_dir = match crate::home::worktrees_dir() {
-        Ok(d) => d,
-        Err(_) => return,
+    let Ok(worktrees_dir) = crate::home::worktrees_dir() else {
+        return;
     };
     check_orphaned_worktrees_in(&worktrees_dir, all_tasks, findings).await;
 }
@@ -783,9 +765,8 @@ async fn check_orphaned_worktrees_in(
     all_tasks: &[Task],
     findings: &mut Vec<Finding>,
 ) {
-    let project_dirs = match std::fs::read_dir(worktrees_dir) {
-        Ok(d) => d,
-        Err(_) => return,
+    let Ok(project_dirs) = std::fs::read_dir(worktrees_dir) else {
+        return;
     };
 
     // Build a HashMap for O(1) worktree-path → task lookups instead of O(T) linear scan.
@@ -803,16 +784,11 @@ async fn check_orphaned_worktrees_in(
                 continue;
             }
         };
-        if !project_entry
-            .file_type()
-            .map(|t| t.is_dir())
-            .unwrap_or(false)
-        {
+        if !project_entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
-        let branch_dirs = match std::fs::read_dir(project_entry.path()) {
-            Ok(d) => d,
-            Err(_) => continue,
+        let Ok(branch_dirs) = std::fs::read_dir(project_entry.path()) else {
+            continue;
         };
         for branch_entry in branch_dirs {
             let branch_entry = match branch_entry {
@@ -822,11 +798,7 @@ async fn check_orphaned_worktrees_in(
                     continue;
                 }
             };
-            if !branch_entry
-                .file_type()
-                .map(|t| t.is_dir())
-                .unwrap_or(false)
-            {
+            if !branch_entry.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
             let wt_path = branch_entry.path().to_string_lossy().to_string();
@@ -843,14 +815,14 @@ async fn check_orphaned_worktrees_in(
                             findings.push(Finding {
                                 severity: Severity::Warning,
                                 task_id: task_label(task),
-                                message: format!("done but worktree has unsaved work: {}", wt_path),
+                                message: format!("done but worktree has unsaved work: {wt_path}"),
                                 fix: FixAction::None,
                             });
                         } else {
                             findings.push(Finding {
                                 severity: Severity::Warning,
                                 task_id: task_label(task),
-                                message: format!("done but worktree not cleaned up: {}", wt_path),
+                                message: format!("done but worktree not cleaned up: {wt_path}"),
                                 fix: FixAction::CleanWorktree { store_id: task.id },
                             });
                         }
@@ -860,7 +832,7 @@ async fn check_orphaned_worktrees_in(
                     findings.push(Finding {
                         severity: Severity::Warning,
                         task_id: "?".to_string(),
-                        message: format!("orphaned worktree (no task owns it): {}", wt_path),
+                        message: format!("orphaned worktree (no task owns it): {wt_path}"),
                         fix: FixAction::RemoveOrphanedWorktree {
                             path: wt_path.clone(),
                         },
@@ -877,24 +849,23 @@ fn check_pr_merged_not_done(
     pr_states: &std::collections::HashMap<u64, (bool, String)>,
     findings: &mut Vec<Finding>,
 ) {
-    let pr_num = match task.pr_number {
-        Some(n) => n as u64,
-        None => return,
+    let Some(pr_num) = task.pr_number.and_then(|n| u64::try_from(n).ok()) else {
+        return;
     };
 
-    if let Some((merged, _)) = pr_states.get(&pr_num) {
-        if *merged {
-            findings.push(Finding {
-                severity: Severity::Error,
-                task_id: task_label(task),
-                message: format!(
-                    "PR #{} is merged but task status is '{}'",
-                    pr_num,
-                    task.status.as_str()
-                ),
-                fix: FixAction::MarkDoneFromMergedPr { store_id: task.id },
-            });
-        }
+    if let Some((merged, _)) = pr_states.get(&pr_num)
+        && *merged
+    {
+        findings.push(Finding {
+            severity: Severity::Error,
+            task_id: task_label(task),
+            message: format!(
+                "PR #{} is merged but task status is '{}'",
+                pr_num,
+                task.status.as_str()
+            ),
+            fix: FixAction::MarkDoneFromMergedPr { store_id: task.id },
+        });
     }
 }
 
@@ -909,16 +880,13 @@ async fn check_dead_review_session(
         Some(id) => id.clone(),
         None => format!("internal:{}", task.id),
     };
-    let review_task_id = format!("{}-review", task_id_str);
+    let review_task_id = format!("{task_id_str}-review");
     let session = tmux.session_name(repo, &review_task_id);
     if !tmux.session_exists(&session).await {
         findings.push(Finding {
             severity: Severity::Error,
             task_id: task_label(task),
-            message: format!(
-                "status is 'in_review' but no review session '{}' found",
-                session
-            ),
+            message: format!("status is 'in_review' but no review session '{session}' found"),
             fix: FixAction::ResetDeadReview { store_id: task.id },
         });
     }
@@ -934,19 +902,17 @@ async fn worktree_has_work(wt: &Path, branch: &str) -> bool {
         .current_dir(wt)
         .output()
         .await
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false);
+        .is_ok_and(|o| !o.stdout.is_empty());
     if has_dirty {
         return true;
     }
     if !branch.is_empty() {
         let has_unpushed = tokio::process::Command::new("git")
-            .args(["log", &format!("origin/{}..HEAD", branch), "--oneline"])
+            .args(["log", &format!("origin/{branch}..HEAD"), "--oneline"])
             .current_dir(wt)
             .output()
             .await
-            .map(|o| !o.stdout.is_empty())
-            .unwrap_or(false);
+            .is_ok_and(|o| !o.stdout.is_empty());
         if has_unpushed {
             return true;
         }
@@ -971,7 +937,6 @@ async fn apply_fixes(
         match &f.fix {
             FixAction::None => {
                 skipped += 1;
-                continue;
             }
             FixAction::LinkPr {
                 store_id,
@@ -987,10 +952,7 @@ async fn apply_fixes(
                 }
 
                 let _ = store
-                    .set_fields(
-                        *store_id,
-                        &[("pr_number", serde_json::json!(*pr_number as i64))],
-                    )
+                    .set_fields(*store_id, &[("pr_number", serde_json::json!(*pr_number))])
                     .await;
                 println!("  fixed #{}: linked PR #{}", f.task_id, pr_number);
                 fixed += 1;
@@ -1165,17 +1127,17 @@ async fn apply_fixes(
             }
             FixAction::RemoveOrphanedWorktree { path } => {
                 if dry_run {
-                    println!("  {}would remove orphaned worktree: {}", prefix, path);
+                    println!("  {prefix}would remove orphaned worktree: {path}");
                     fixed += 1;
                     continue;
                 }
 
                 let removed = cleanup_orphaned_worktree(&f.task_id, Path::new(path)).await;
                 if removed {
-                    println!("  fixed: removed orphaned worktree {}", path);
+                    println!("  fixed: removed orphaned worktree {path}");
                     fixed += 1;
                 } else {
-                    eprintln!("  fix failed: could not remove orphaned worktree {}", path);
+                    eprintln!("  fix failed: could not remove orphaned worktree {path}");
                     skipped += 1;
                 }
             }
@@ -1271,7 +1233,7 @@ async fn apply_fixes(
     }
 
     let action = if dry_run { "would fix" } else { "fixed" };
-    println!("\n{} {}, skipped {}.", action, fixed, skipped);
+    println!("\n{action} {fixed}, skipped {skipped}.");
 
     if !dry_run && skipped > 0 {
         println!("Reported issues with no automatic fix need a new issue or task.");
@@ -1426,9 +1388,11 @@ mod tests {
         let mut findings = Vec::new();
         super::check_orphaned_worktrees_in(base.path(), &[done], &mut findings).await;
         assert_eq!(findings.len(), 1);
-        assert!(findings[0]
-            .message
-            .contains("done but worktree not cleaned up"));
+        assert!(
+            findings[0]
+                .message
+                .contains("done but worktree not cleaned up")
+        );
         assert!(!findings[0].message.contains("orphaned"));
 
         let mut findings = Vec::new();

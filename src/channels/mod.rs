@@ -109,7 +109,6 @@ pub struct OutputChunk {
 }
 
 /// The core channel trait. All external interfaces implement this.
-#[allow(clippy::double_must_use)] // async_trait marks its boxed futures must_use twice
 #[async_trait]
 pub trait Channel: Send + Sync {
     /// Human-readable channel name.
@@ -140,6 +139,14 @@ pub struct ChannelRegistry {
     channels: Vec<Box<dyn Channel>>,
 }
 
+impl std::fmt::Debug for ChannelRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.channels.iter().map(|c| c.name()))
+            .finish()
+    }
+}
+
 impl ChannelRegistry {
     pub fn new() -> Self {
         Self {
@@ -153,6 +160,6 @@ impl ChannelRegistry {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &dyn Channel> {
-        self.channels.iter().map(|c| c.as_ref())
+        self.channels.iter().map(std::convert::AsRef::as_ref)
     }
 }

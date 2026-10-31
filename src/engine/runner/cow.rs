@@ -102,7 +102,8 @@ mod tests {
     #[serial_test::serial(orch_home)]
     async fn clone_gives_clean_worktree_or_falls_back() {
         let (_remote, project, home) = repo_with_origin();
-        std::env::set_var("ORCH_HOME", home.path());
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", home.path()) };
         let templates = home.path().join("state/templates");
         std::fs::create_dir_all(&templates).unwrap();
         let wt_dir = home.path().join("worktrees/p/task-1");
@@ -135,14 +136,16 @@ mod tests {
             assert!(res.is_err());
             assert!(!wt_dir.exists(), "failed clone must leave no directory");
         }
-        std::env::remove_var("ORCH_HOME");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::remove_var("ORCH_HOME") };
     }
 
     #[tokio::test]
     #[serial_test::serial(orch_home)]
     async fn branch_differing_from_template_gets_its_own_files() {
         let (_remote, project, home) = repo_with_origin();
-        std::env::set_var("ORCH_HOME", home.path());
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", home.path()) };
         let templates = home.path().join("state/templates");
         std::fs::create_dir_all(&templates).unwrap();
         let wt_dir = home.path().join("worktrees/p/task-3");
@@ -187,7 +190,8 @@ mod tests {
                 .unwrap();
             assert!(status.stdout.is_empty(), "clone must have a clean index");
         }
-        std::env::remove_var("ORCH_HOME");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::remove_var("ORCH_HOME") };
     }
 
     #[tokio::test]
@@ -214,7 +218,8 @@ mod tests {
         std::fs::write(project.path().join("pkg/a/keep.txt"), "k\n").unwrap();
         std::fs::write(project.path().join(".env"), "secret\n").unwrap();
 
-        std::env::set_var("ORCH_HOME", home.path());
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", home.path()) };
         let templates = home.path().join("state/templates");
         std::fs::create_dir_all(&templates).unwrap();
         let wt_dir = home.path().join("worktrees/p/task-4");
@@ -267,7 +272,8 @@ mod tests {
             assert!(wt2.join("out/sub/dep.bin").exists());
             assert!(!wt2.join("out/new.bin").exists());
         }
-        std::env::remove_var("ORCH_HOME");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::remove_var("ORCH_HOME") };
     }
 
     #[tokio::test]
@@ -290,7 +296,8 @@ mod tests {
         );
         sh(&bare, &["branch", "task-6", "main"]);
 
-        std::env::set_var("ORCH_HOME", home.path());
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", home.path()) };
         let templates = home.path().join("state/templates");
         std::fs::create_dir_all(&templates).unwrap();
         let wt_dir = home.path().join("worktrees/pb/task-6");
@@ -326,19 +333,24 @@ mod tests {
             assert!(!tpl.join("loose.log").exists());
             assert!(tpl.join(".git").is_file());
         }
-        std::env::remove_var("ORCH_HOME");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::remove_var("ORCH_HOME") };
     }
 
     #[tokio::test]
     #[serial_test::serial(orch_home)]
     async fn env_switch_disables_clone_path() {
         let (_remote, project, home) = repo_with_origin();
-        std::env::set_var("ORCH_HOME", home.path());
-        std::env::set_var("ORCH_COW_WORKTREES", "0");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", home.path()) };
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_COW_WORKTREES", "0") };
         let wt_dir = home.path().join("worktrees/p/task-2");
         let res = create_worktree(project.path(), "p", &wt_dir, "task-2", "main").await;
-        std::env::remove_var("ORCH_COW_WORKTREES");
-        std::env::remove_var("ORCH_HOME");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::remove_var("ORCH_COW_WORKTREES") };
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::remove_var("ORCH_HOME") };
         assert!(res.is_err());
         assert!(!wt_dir.exists());
     }

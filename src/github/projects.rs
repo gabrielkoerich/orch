@@ -31,6 +31,7 @@ pub struct ProjectInfo {
 ///     review: "option-id-3"
 ///     done: "option-id-4"
 /// ```
+#[derive(Debug)]
 pub struct ProjectSync {
     project_id: String,
     status_field_id: String,
@@ -86,7 +87,7 @@ impl ProjectSync {
     pub async fn discover_fields(project_id: &str) -> anyhow::Result<Self> {
         let gh = GhHttp::owner()?;
         // Fetch all field types so we can find both Status (single-select) and Estimate (number).
-        let query = r#"query($projectId: ID!) { node(id: $projectId) { ... on ProjectV2 { fields(first: 100) { nodes { ... on ProjectV2SingleSelectField { id name options { id name } } ... on ProjectV2Field { id name } ... on ProjectV2FieldNumber { id name } } } } } }"#;
+        let query = r"query($projectId: ID!) { node(id: $projectId) { ... on ProjectV2 { fields(first: 100) { nodes { ... on ProjectV2SingleSelectField { id name options { id name } } ... on ProjectV2Field { id name } ... on ProjectV2FieldNumber { id name } } } } } }";
 
         let result = gh
             .graphql_with_vars(query, serde_json::json!({ "projectId": project_id }))
@@ -103,8 +104,7 @@ impl ProjectSync {
             .find(|f| {
                 f.get("name")
                     .and_then(|n| n.as_str())
-                    .map(|n| n.eq_ignore_ascii_case("status"))
-                    .unwrap_or(false)
+                    .is_some_and(|n| n.eq_ignore_ascii_case("status"))
             })
             .ok_or_else(|| anyhow::anyhow!("no 'Status' field found in project"))?;
 
@@ -147,8 +147,7 @@ impl ProjectSync {
             .find(|f| {
                 f.get("name")
                     .and_then(|n| n.as_str())
-                    .map(|n| n.eq_ignore_ascii_case("estimate"))
-                    .unwrap_or(false)
+                    .is_some_and(|n| n.eq_ignore_ascii_case("estimate"))
             })
             .and_then(|f| f.get("id").and_then(|v| v.as_str()))
             .filter(|id| !id.is_empty())
@@ -172,42 +171,37 @@ impl ProjectSync {
         let user = gh.get_whoami().await?;
 
         // User projects
-        let query = r#"query($login: String!) { user(login: $login) { projectsV2(first: 100) { nodes { id number title } } } }"#;
+        let query = r"query($login: String!) { user(login: $login) { projectsV2(first: 100) { nodes { id number title } } } }";
         if let Ok(result) = gh
             .graphql_with_vars(query, serde_json::json!({ "login": user }))
             .await
-        {
-            if let Some(nodes) = result
+            && let Some(nodes) = result
                 .pointer("/data/user/projectsV2/nodes")
                 .and_then(|n| n.as_array())
-            {
-                for node in nodes {
-                    if let Some(info) = parse_project_node(node) {
-                        projects.push(info);
-                    }
+        {
+            for node in nodes {
+                if let Some(info) = parse_project_node(node) {
+                    projects.push(info);
                 }
             }
         }
 
         // Try org projects for the repo owner (if different from user)
-        if let Ok(repo) = config::get_current_repo() {
-            if let Some(owner) = repo.split('/').next() {
-                if owner != user {
-                    let query = r#"query($login: String!) { organization(login: $login) { projectsV2(first: 100) { nodes { id number title } } } }"#;
-                    if let Ok(result) = gh
-                        .graphql_with_vars(query, serde_json::json!({ "login": owner }))
-                        .await
-                    {
-                        if let Some(nodes) = result
-                            .pointer("/data/organization/projectsV2/nodes")
-                            .and_then(|n| n.as_array())
-                        {
-                            for node in nodes {
-                                if let Some(info) = parse_project_node(node) {
-                                    projects.push(info);
-                                }
-                            }
-                        }
+        if let Ok(repo) = config::get_current_repo()
+            && let Some(owner) = repo.split('/').next()
+            && owner != user
+        {
+            let query = r"query($login: String!) { organization(login: $login) { projectsV2(first: 100) { nodes { id number title } } } }";
+            if let Ok(result) = gh
+                .graphql_with_vars(query, serde_json::json!({ "login": owner }))
+                .await
+                && let Some(nodes) = result
+                    .pointer("/data/organization/projectsV2/nodes")
+                    .and_then(|n| n.as_array())
+            {
+                for node in nodes {
+                    if let Some(info) = parse_project_node(node) {
+                        projects.push(info);
                     }
                 }
             }
@@ -218,7 +212,7 @@ impl ProjectSync {
 
     /// Add an issue to the project board. Returns the project item ID.
     pub async fn add_item(&self, issue_node_id: &str) -> anyhow::Result<String> {
-        let query = r#"mutation($projectId: ID!, $contentId: ID!) { addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) { item { id } } }"#;
+        let query = r"mutation($projectId: ID!, $contentId: ID!) { addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) { item { id } } }";
 
         let result = self
             .gh
@@ -245,7 +239,7 @@ impl ProjectSync {
             .get(column)
             .ok_or_else(|| anyhow::anyhow!("no option ID for column: {column}"))?;
 
-        let query = r#"mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) { updateProjectV2ItemFieldValue(input: { projectId: $projectId, itemId: $itemId, fieldId: $fieldId, value: { singleSelectOptionId: $optionId } }) { projectV2Item { id } } }"#;
+        let query = r"mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) { updateProjectV2ItemFieldValue(input: { projectId: $projectId, itemId: $itemId, fieldId: $fieldId, value: { singleSelectOptionId: $optionId } }) { projectV2Item { id } } }";
 
         self.gh
             .graphql_with_vars(
@@ -322,7 +316,7 @@ impl ProjectSync {
         let item_id = self.add_item(issue_node_id).await?;
 
         // Update the estimate number field.
-        let query = r#"mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: Float!) { updateProjectV2ItemFieldValue(input: { projectId: $projectId, itemId: $itemId, fieldId: $fieldId, value: { number: $value } }) { projectV2Item { id } } }"#;
+        let query = r"mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: Float!) { updateProjectV2ItemFieldValue(input: { projectId: $projectId, itemId: $itemId, fieldId: $fieldId, value: { number: $value } }) { projectV2Item { id } } }";
 
         self.gh
             .graphql_with_vars(
@@ -352,15 +346,19 @@ impl ProjectSync {
         &self,
         issue_node_ids: &[String],
     ) -> anyhow::Result<std::collections::HashMap<String, u8>> {
+        const FIBONACCI: &[u8] = &[0, 1, 2, 3, 5, 8, 13, 21];
+
         let Some(field_id) = &self.estimate_field_id else {
             return Ok(std::collections::HashMap::new());
         };
 
-        let issue_set: std::collections::HashSet<&str> =
-            issue_node_ids.iter().map(|s| s.as_str()).collect();
+        let issue_set: std::collections::HashSet<&str> = issue_node_ids
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
 
         // Fetch all items in the project with their fieldValues filtered to the estimate field.
-        let query = r#"query($projectId: ID!) { node(id: $projectId) { ... on ProjectV2 { items(first: 100) { nodes { id content { ... on Issue { id } ... on PullRequest { id } } fieldValues(first: 10) { nodes { ... on ProjectV2ItemFieldNumberValue { field { id } number } } } } } } } }"#;
+        let query = r"query($projectId: ID!) { node(id: $projectId) { ... on ProjectV2 { items(first: 100) { nodes { id content { ... on Issue { id } ... on PullRequest { id } } fieldValues(first: 10) { nodes { ... on ProjectV2ItemFieldNumberValue { field { id } number } } } } } } } }";
 
         let result = self
             .gh
@@ -376,13 +374,11 @@ impl ProjectSync {
 
         for item in items {
             // Extract the content node ID (issue or PR).
-            let content = match item.get("content") {
-                Some(c) => c,
-                None => continue, // Item has no content (e.g. draft).
+            let Some(content) = item.get("content") else {
+                continue;
             };
-            let content_id = match content.get("id").and_then(|v| v.as_str()) {
-                Some(id) => id,
-                None => continue,
+            let Some(content_id) = content.get("id").and_then(|v| v.as_str()) else {
+                continue;
             };
 
             // Skip if this content ID is not in our target set.
@@ -391,14 +387,18 @@ impl ProjectSync {
             }
 
             // Find the estimate field value.
-            let field_values = match item
+            let Some(field_values) = item
                 .get("fieldValues")
                 .and_then(|fv| fv.get("nodes"))
                 .and_then(|n| n.as_array())
-            {
-                Some(fv) => fv,
-                None => continue,
+            else {
+                continue;
             };
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "the saturating cast is fine, only fibonacci values up to 21 are kept"
+            )]
             let estimate = field_values
                 .iter()
                 .find(|fv| {
@@ -408,11 +408,10 @@ impl ProjectSync {
                         .is_some_and(|id| id == field_id)
                 })
                 .and_then(|fv| fv.get("number"))
-                .and_then(|n| n.as_f64())
+                .and_then(serde_json::Value::as_f64)
                 .unwrap_or(0.0) as u8;
 
             // Only accept Fibonacci values (0 = not set, or 1/2/3/5/8/13/21).
-            const FIBONACCI: &[u8] = &[0, 1, 2, 3, 5, 8, 13, 21];
             if FIBONACCI.contains(&estimate) {
                 estimates.insert(content_id.to_string(), estimate);
             }
@@ -559,7 +558,8 @@ mod tests {
         std::fs::create_dir_all(&orch_dir).unwrap();
 
         std::env::set_current_dir(temp_cwd.path()).unwrap();
-        std::env::set_var("ORCH_HOME", &orch_dir);
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", &orch_dir) };
         config::clear_test_cache();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -568,9 +568,11 @@ mod tests {
 
         std::env::set_current_dir(&original_cwd).unwrap();
         if let Some(prev) = prev_orch_home {
-            std::env::set_var("ORCH_HOME", prev);
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::set_var("ORCH_HOME", prev) };
         } else {
-            std::env::remove_var("ORCH_HOME");
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::remove_var("ORCH_HOME") };
         }
         result.unwrap();
     }
@@ -613,7 +615,8 @@ mod tests {
         std::fs::create_dir_all(&orch_dir).unwrap();
 
         std::env::set_current_dir(temp_cwd.path()).unwrap();
-        std::env::set_var("ORCH_HOME", &orch_dir);
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", &orch_dir) };
         config::clear_test_cache();
 
         // Write a config with project ID and status field but NO estimate field.
@@ -645,9 +648,11 @@ gh:
 
         std::env::set_current_dir(&original_cwd).unwrap();
         if let Some(prev) = prev_orch_home {
-            std::env::set_var("ORCH_HOME", prev);
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::set_var("ORCH_HOME", prev) };
         } else {
-            std::env::remove_var("ORCH_HOME");
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::remove_var("ORCH_HOME") };
         }
         result.unwrap();
     }

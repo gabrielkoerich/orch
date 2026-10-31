@@ -39,7 +39,7 @@ pub async fn list() -> anyhow::Result<()> {
     for job in &jobs {
         let desc = match job.r#type.as_str() {
             "bash" => job.command.as_deref().unwrap_or(""),
-            _ => job.task.as_ref().map(|t| t.title.as_str()).unwrap_or(""),
+            _ => job.task.as_ref().map_or("", |t| t.title.as_str()),
         };
 
         println!(
@@ -51,14 +51,14 @@ pub async fn list() -> anyhow::Result<()> {
             desc,
         );
 
-        if let Some(state) = states.get(&job.id) {
-            if let Some(ref last_run) = state.last_run {
-                println!(
-                    "  Last run: {} (status: {})",
-                    last_run,
-                    state.last_task_status.as_deref().unwrap_or("unknown")
-                );
-            }
+        if let Some(state) = states.get(&job.id)
+            && let Some(ref last_run) = state.last_run
+        {
+            println!(
+                "  Last run: {} (status: {})",
+                last_run,
+                state.last_task_status.as_deref().unwrap_or("unknown")
+            );
         }
     }
 
@@ -87,7 +87,7 @@ pub fn add(
 
     // Check for duplicate ID
     if jobs.iter().any(|j| j.id == id) {
-        anyhow::bail!("job with id '{}' already exists", id);
+        anyhow::bail!("job with id '{id}' already exists");
     }
 
     let job = Job {
@@ -117,7 +117,7 @@ pub fn add(
     jobs.push(job);
     jobs::save_jobs(&path, &jobs)?;
 
-    println!("Added job '{}' (schedule: {})", id, schedule);
+    println!("Added job '{id}' (schedule: {schedule})");
     Ok(())
 }
 
@@ -130,11 +130,11 @@ pub fn remove(id: &str) -> anyhow::Result<()> {
     jobs.retain(|j| j.id != id);
 
     if jobs.len() == initial_len {
-        anyhow::bail!("job '{}' not found", id);
+        anyhow::bail!("job '{id}' not found");
     }
 
     jobs::save_jobs(&path, &jobs)?;
-    println!("Removed job '{}'", id);
+    println!("Removed job '{id}'");
     Ok(())
 }
 
@@ -155,7 +155,7 @@ fn toggle_job(id: &str, enabled: bool) -> anyhow::Result<()> {
     let job = all_jobs
         .iter_mut()
         .find(|j| j.id == id)
-        .with_context(|| format!("job '{}' not found", id))?;
+        .with_context(|| format!("job '{id}' not found"))?;
 
     // If the job came from a prompt file, edit the frontmatter in-place rather
     // than writing it into .orch.yml (which would create a duplicate on the
@@ -180,8 +180,8 @@ fn toggle_job(id: &str, enabled: bool) -> anyhow::Result<()> {
 /// Searches all projects for the job ID. If the ID exists in multiple projects,
 /// requires `--project` to disambiguate.
 pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
-    use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
+    use crate::backends::github::GitHubBackend;
 
     // 1. If inside an orch project (or --project given), try that first
     let mut resolved: Option<(String, jobs::Job, PathBuf)> = None;
@@ -190,14 +190,13 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
         // Check if CWD is inside an orch project
         if let Ok(cwd_repo) = config::get_current_repo() {
             let jobs_path = jobs::resolve_jobs_path();
-            if let Ok(all_jobs) = jobs::load_jobs(&jobs_path) {
-                if let Some(job) = all_jobs.into_iter().find(|j| j.id == job_id) {
-                    let base_dir = jobs_path
-                        .parent()
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| PathBuf::from("."));
-                    resolved = Some((cwd_repo, job, base_dir));
-                }
+            if let Ok(all_jobs) = jobs::load_jobs(&jobs_path)
+                && let Some(job) = all_jobs.into_iter().find(|j| j.id == job_id)
+            {
+                let base_dir = jobs_path
+                    .parent()
+                    .map_or_else(|| PathBuf::from("."), PathBuf::from);
+                resolved = Some((cwd_repo, job, base_dir));
             }
         }
     }
@@ -208,10 +207,10 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
 
         let projects = crate::config::get_projects_with_paths().unwrap_or_default();
         for (repo, dir) in &projects {
-            if let Some(filter) = project {
-                if !repo.contains(filter) {
-                    continue;
-                }
+            if let Some(filter) = project
+                && !repo.contains(filter)
+            {
+                continue;
             }
             let orch_yml = dir.join(".orch.yml");
             if let Ok(all_jobs) = jobs::load_jobs(&orch_yml) {
@@ -224,7 +223,7 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
         }
 
         match matches.len() {
-            0 => anyhow::bail!("job '{}' not found in any project", job_id),
+            0 => anyhow::bail!("job '{job_id}' not found in any project"),
             1 => resolved = matches.pop(),
             _ => {
                 let repos: Vec<&str> = matches.iter().map(|(r, _, _)| r.as_str()).collect();
@@ -239,13 +238,12 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
         }
     }
 
-    let (repo, job, base_dir) = match resolved {
-        Some(r) => r,
-        None => anyhow::bail!("job '{}' not found", job_id),
+    let Some((repo, job, base_dir)) = resolved else {
+        anyhow::bail!("job '{job_id}' not found")
     };
 
     if !job.enabled {
-        println!("Warning: job '{}' is disabled, running anyway", job_id);
+        println!("Warning: job '{job_id}' is disabled, running anyway");
     }
 
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
@@ -279,14 +277,14 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
     // state is loaded from SQLite on restart, so writing last_run first
     // prevents an immediate catch-up run.
     state.last_run = Some(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
-    if let Some(ref s) = store {
-        if let Err(e) = s.upsert_job_state(&state).await {
-            tracing::error!(
-                job_id = job_id,
-                ?e,
-                "failed to persist job state before execution",
-            );
-        }
+    if let Some(ref s) = store
+        && let Err(e) = s.upsert_job_state(&state).await
+    {
+        tracing::error!(
+            job_id = job_id,
+            ?e,
+            "failed to persist job state before execution",
+        );
     }
 
     // Execute the job (may mutate state.active_task_id / last_task_status).
@@ -303,9 +301,9 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
 
     let status = state.last_task_status.as_deref().unwrap_or("unknown");
     if let Some(ref task_id) = state.active_task_id {
-        println!("Done (status: {}, task: {})", status, task_id);
+        println!("Done (status: {status}, task: {task_id})");
     } else {
-        println!("Done (status: {})", status);
+        println!("Done (status: {status})");
     }
 
     Ok(())
@@ -313,8 +311,8 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
 
 /// Run one job scheduler tick.
 pub async fn tick() -> anyhow::Result<()> {
-    use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
+    use crate::backends::github::GitHubBackend;
 
     let repo =
         config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;

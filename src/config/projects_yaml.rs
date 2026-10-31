@@ -25,8 +25,10 @@ pub fn add_project(content: &str, path: &str) -> anyhow::Result<ProjectsEdit> {
 /// Remove list entries whose value equals any of `candidates`
 pub fn remove_project(content: &str, candidates: &[&str]) -> anyhow::Result<ProjectsEdit> {
     match parsed_string_projects(content)? {
-        ParsedProjects::Missing => anyhow::bail!("no projects list in config"),
-        ParsedProjects::NotAList => anyhow::bail!("no projects list in config"),
+        ParsedProjects::Missing | ParsedProjects::NotAList => {
+            anyhow::bail!("no projects list in config")
+        }
+
         ParsedProjects::List(items) => {
             if !items.iter().any(|p| candidates.contains(&p.as_str())) {
                 return Ok(ProjectsEdit::Unchanged);
@@ -79,10 +81,10 @@ fn insert_project(content: &str, path: &str) -> anyhow::Result<ProjectsEdit> {
                 return Ok(ProjectsEdit::Updated(join_lines(&lines, newline_at_end)));
             }
             if is_empty_list_value(value) {
-                if !comment.trim().is_empty() {
-                    lines[key_line] = format!("projects:{comment}");
-                } else {
+                if comment.trim().is_empty() {
                     lines[key_line] = "projects:".to_string();
+                } else {
+                    lines[key_line] = format!("projects:{comment}");
                 }
             } else if !value.is_empty() {
                 anyhow::bail!("could not edit projects: list as text");
@@ -117,12 +119,12 @@ fn delete_project(content: &str, candidates: &[&str]) -> anyhow::Result<Projects
         if is_section_end(&lines[idx]) {
             break;
         }
-        if let Some(item) = block_item_value(&lines[idx]) {
-            if candidates.contains(&item.as_str()) {
-                lines.remove(idx);
-                removed = true;
-                continue;
-            }
+        if let Some(item) = block_item_value(&lines[idx])
+            && candidates.contains(&item.as_str())
+        {
+            lines.remove(idx);
+            removed = true;
+            continue;
         }
         idx += 1;
     }
@@ -332,10 +334,7 @@ fn inline_comment_index(s: &str) -> Option<usize> {
             '"' if !in_single => in_double = !in_double,
             '#' if !in_single
                 && !in_double
-                && (i == 0
-                    || s.as_bytes()
-                        .get(i - 1)
-                        .is_some_and(|b| b.is_ascii_whitespace())) =>
+                && (i == 0 || s.as_bytes().get(i - 1).is_some_and(u8::is_ascii_whitespace)) =>
             {
                 return Some(i);
             }

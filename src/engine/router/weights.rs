@@ -38,9 +38,9 @@ pub(super) fn default_missing_weight(configured_weights: &HashMap<String, f64>) 
 /// Uses a simple hash to create deterministic but varied jitter per agent.
 fn generate_recovery_jitter(agent: &str) -> Duration {
     // Simple hash: sum of char values modulo a large prime
-    let hash: u64 = agent
-        .bytes()
-        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+    let hash: u64 = agent.bytes().fold(0u64, |acc, b| {
+        acc.wrapping_mul(31).wrapping_add(u64::from(b))
+    });
     // Map hash to 0..RECOVERY_JITTER_MAX range
     let max_secs = RECOVERY_JITTER_MAX.as_secs();
     let jitter_secs = hash % max_secs;
@@ -217,12 +217,15 @@ impl AgentWeights {
         let weights: Vec<f64> = agents
             .iter()
             .map(|a| {
-                self.states.get(a).map(|s| s.weight).unwrap_or_else(|| {
-                    self.base_weights
-                        .get(a)
-                        .copied()
-                        .unwrap_or_else(|| default_missing_weight(&self.base_weights))
-                })
+                self.states.get(a).map_or_else(
+                    || {
+                        self.base_weights
+                            .get(a)
+                            .copied()
+                            .unwrap_or_else(|| default_missing_weight(&self.base_weights))
+                    },
+                    |s| s.weight,
+                )
             })
             .collect();
 
@@ -251,12 +254,15 @@ impl AgentWeights {
 
     /// Get the current weight for an agent.
     pub fn get_weight(&self, agent: &str) -> f64 {
-        self.states.get(agent).map(|s| s.weight).unwrap_or_else(|| {
-            self.base_weights
-                .get(agent)
-                .copied()
-                .unwrap_or_else(|| default_missing_weight(&self.base_weights))
-        })
+        self.states.get(agent).map_or_else(
+            || {
+                self.base_weights
+                    .get(agent)
+                    .copied()
+                    .unwrap_or_else(|| default_missing_weight(&self.base_weights))
+            },
+            |s| s.weight,
+        )
     }
 
     /// Get a snapshot of all agent weights (for logging/debugging).

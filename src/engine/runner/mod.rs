@@ -108,7 +108,6 @@ fn classify_run_outcome(
             crate::engine::cooldown::detect_credit_exhaustion_outcome(message).unwrap_or("failed")
         }
         Err(agents::AgentError::InvalidResponse { .. }) => "parse_error",
-        Err(_) => "failed",
         Ok(_)
             if matches!(
                 status,
@@ -123,7 +122,7 @@ fn classify_run_outcome(
         Ok(_) if crate::status_heuristics::status_looks_like_descriptive_completion(status) => {
             "success"
         }
-        Ok(_) => "failed",
+        Err(_) | Ok(_) => "failed",
     }
 }
 
@@ -187,6 +186,7 @@ fn extract_run_tokens(
     }
 }
 
+#[expect(clippy::cast_precision_loss, reason = "a run duration in seconds")]
 fn run_duration_secs(started_at: &chrono::DateTime<Utc>) -> f64 {
     (Utc::now() - *started_at).num_milliseconds() as f64 / 1000.0
 }
@@ -222,7 +222,11 @@ fn parse_success_output(
         let assistant_text = agents::collect_assistant_messages_text(agent_name, raw_stdout);
         if !assistant_text.is_empty() {
             if let Ok(response) = crate::parser::parse(&assistant_text) {
-                tracing::debug!(task_id, agent = agent_name, "found AgentResponse JSON in earlier assistant message (terminal_reason:completed)");
+                tracing::debug!(
+                    task_id,
+                    agent = agent_name,
+                    "found AgentResponse JSON in earlier assistant message (terminal_reason:completed)"
+                );
                 return Ok(agents::ParsedResponse {
                     response,
                     input_tokens: None,
@@ -277,93 +281,85 @@ fn parse_success_output(
         }
 
         // Try to parse the inner result text as standard JSON
-        match crate::parser::parse(&agent_result.result_text) {
-            Ok(response) => {
-                return Ok(agents::ParsedResponse {
-                    response,
-                    input_tokens: agent_result.input_tokens,
-                    output_tokens: agent_result.output_tokens,
-                    duration_ms: agent_result.duration_ms,
-                });
-            }
-            Err(_) => {
-                // Strategy 2: scan all earlier assistant messages in the NDJSON
-                // stream for valid AgentResponse JSON. Agents often emit the
-                // JSON in an intermediate turn and then summarise in prose as
-                // their final output, so the `type:result` text may be pure
-                // narrative while a prior assistant turn contains the JSON.
-                let assistant_text =
-                    agents::collect_assistant_messages_text(agent_name, raw_stdout);
-                if !assistant_text.is_empty() {
-                    if let Ok(response) = crate::parser::parse(&assistant_text) {
-                        tracing::debug!(
-                            task_id,
-                            agent = agent_name,
-                            "found AgentResponse JSON in earlier assistant message"
-                        );
-                        return Ok(agents::ParsedResponse {
-                            response,
-                            input_tokens: agent_result.input_tokens,
-                            output_tokens: agent_result.output_tokens,
-                            duration_ms: agent_result.duration_ms,
-                        });
-                    }
-                }
+        if let Ok(response) = crate::parser::parse(&agent_result.result_text) {
+            return Ok(agents::ParsedResponse {
+                response,
+                input_tokens: agent_result.input_tokens,
+                output_tokens: agent_result.output_tokens,
+                duration_ms: agent_result.duration_ms,
+            });
+        }
+        // Strategy 2: scan all earlier assistant messages in the NDJSON
+        // stream for valid AgentResponse JSON. Agents often emit the
+        // JSON in an intermediate turn and then summarise in prose as
+        // their final output, so the `type:result` text may be pure
+        // narrative while a prior assistant turn contains the JSON.
+        let assistant_text = agents::collect_assistant_messages_text(agent_name, raw_stdout);
+        if !assistant_text.is_empty()
+            && let Ok(response) = crate::parser::parse(&assistant_text)
+        {
+            tracing::debug!(
+                task_id,
+                agent = agent_name,
+                "found AgentResponse JSON in earlier assistant message"
+            );
+            return Ok(agents::ParsedResponse {
+                response,
+                input_tokens: agent_result.input_tokens,
+                output_tokens: agent_result.output_tokens,
+                duration_ms: agent_result.duration_ms,
+            });
+        }
 
-                // Only fall back to text synthesis when parsing fails
-                if let Some(response) =
-                    agents::synthesize_response_from_text(&agent_result.result_text)
-                {
-                    tracing::warn!(
-                        task_id,
-                        agent = agent_name,
-                        "parse failed on agent result, synthesizing response from plain text"
-                    );
-                    return Ok(agents::ParsedResponse {
-                        response,
-                        input_tokens: agent_result.input_tokens,
-                        output_tokens: agent_result.output_tokens,
-                        duration_ms: agent_result.duration_ms,
-                    });
-                }
+        // Only fall back to text synthesis when parsing fails
+        if let Some(response) = agents::synthesize_response_from_text(&agent_result.result_text) {
+            tracing::warn!(
+                task_id,
+                agent = agent_name,
+                "parse failed on agent result, synthesizing response from plain text"
+            );
+            return Ok(agents::ParsedResponse {
+                response,
+                input_tokens: agent_result.input_tokens,
+                output_tokens: agent_result.output_tokens,
+                duration_ms: agent_result.duration_ms,
+            });
+        }
 
-                // NDJSON envelope fallback: the envelope explicitly reports
-                // success (is_error=false) but the result content is domain
-                // JSON or plain prose that doesn't match AgentResponse schema
-                // and doesn't contain completion keywords.  Rather than
-                // returning InvalidResponse (which causes the task to re-run),
-                // synthesize a minimal "done" response from the result text.
-                //
-                // Guard against kimi/minimax edge case: when terminal_reason=completed
-                // but result text is empty, synthesize returns None, parse_success_output
-                // returns InvalidResponse, and parse_session_output can intercept it
-                // before classify_error. Requiring non-empty result here means the
-                // envelope fallback only fires when we have actual text to report.
-                if !agent_result.is_error
-                    && result_envelope_completed(raw_stdout)
-                    && !agent_result.result_text.is_empty()
-                {
-                    let summary_end =
-                        agents::truncate_at_char_boundary(&agent_result.result_text, 500);
-                    let summary = agent_result.result_text[..summary_end].to_string();
-                    tracing::warn!(
-                        task_id,
-                        agent = agent_name,
-                        "NDJSON envelope indicates success but result lacks AgentResponse \
-                         schema — synthesizing done response"
-                    );
-                    return Ok(agents::ParsedResponse {
-                        response: crate::parser::AgentResponse {
-                            status: "done".to_string(),
-                            summary,
-                            ..Default::default()
-                        },
-                        input_tokens: agent_result.input_tokens,
-                        output_tokens: agent_result.output_tokens,
-                        duration_ms: agent_result.duration_ms,
-                    });
-                }
-            }
+        // NDJSON envelope fallback: the envelope explicitly reports
+        // success (is_error=false) but the result content is domain
+        // JSON or plain prose that doesn't match AgentResponse schema
+        // and doesn't contain completion keywords.  Rather than
+        // returning InvalidResponse (which causes the task to re-run),
+        // synthesize a minimal "done" response from the result text.
+        //
+        // Guard against kimi/minimax edge case: when terminal_reason=completed
+        // but result text is empty, synthesize returns None, parse_success_output
+        // returns InvalidResponse, and parse_session_output can intercept it
+        // before classify_error. Requiring non-empty result here means the
+        // envelope fallback only fires when we have actual text to report.
+        if !agent_result.is_error
+            && result_envelope_completed(raw_stdout)
+            && !agent_result.result_text.is_empty()
+        {
+            let summary_end = agents::truncate_at_char_boundary(&agent_result.result_text, 500);
+            let summary = agent_result.result_text[..summary_end].to_string();
+            tracing::warn!(
+                task_id,
+                agent = agent_name,
+                "NDJSON envelope indicates success but result lacks AgentResponse \
+                 schema — synthesizing done response"
+            );
+            return Ok(agents::ParsedResponse {
+                response: crate::parser::AgentResponse {
+                    status: "done".to_string(),
+                    summary,
+                    ..Default::default()
+                },
+                input_tokens: agent_result.input_tokens,
+                output_tokens: agent_result.output_tokens,
+                duration_ms: agent_result.duration_ms,
+            });
         }
     }
 
@@ -445,7 +441,7 @@ fn salvage_wrapup(raw: &str) -> Option<String> {
                     last_text = b["text"].as_str().unwrap_or("").to_string();
                 }
                 Some("tool_result") => {
-                    let ok = b.get("is_error").and_then(|e| e.as_bool()) != Some(true);
+                    let ok = b.get("is_error").and_then(serde_json::Value::as_bool) != Some(true);
                     // results arrive in call order, fill the first unanswered call
                     if let Some(c) = calls.iter_mut().find(|c| c.2.is_none()) {
                         c.2 = Some(ok);
@@ -491,24 +487,24 @@ pub fn parse_session_output(
         match parse_success_output(task_id, agent_name, agent_runner, &combined_output) {
             Ok(parsed) => return Ok(parsed),
             Err(err) => {
-                if session_output.exit_code == 124 {
-                    if let Some(summary) = salvage_wrapup(&combined_output) {
-                        tracing::warn!(
-                            task_id,
-                            agent = agent_name,
-                            "timed out after commit during wrap-up, salvaging as done"
-                        );
-                        return Ok(agents::ParsedResponse {
-                            response: crate::parser::AgentResponse {
-                                status: "done".to_string(),
-                                summary,
-                                ..Default::default()
-                            },
-                            input_tokens: None,
-                            output_tokens: None,
-                            duration_ms: None,
-                        });
-                    }
+                if session_output.exit_code == 124
+                    && let Some(summary) = salvage_wrapup(&combined_output)
+                {
+                    tracing::warn!(
+                        task_id,
+                        agent = agent_name,
+                        "timed out after commit during wrap-up, salvaging as done"
+                    );
+                    return Ok(agents::ParsedResponse {
+                        response: crate::parser::AgentResponse {
+                            status: "done".to_string(),
+                            summary,
+                            ..Default::default()
+                        },
+                        input_tokens: None,
+                        output_tokens: None,
+                        duration_ms: None,
+                    });
                 }
                 // If parse_success_output already returned a classified error
                 // (RateLimit, AgentFailed, Timeout, Auth, etc.), propagate it
@@ -589,6 +585,15 @@ pub struct TaskRunner {
     store: Option<Arc<crate::store::TaskStore>>,
 }
 
+impl std::fmt::Debug for TaskRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskRunner")
+            .field("repo", &self.repo)
+            .field("orch_home", &self.orch_home)
+            .finish_non_exhaustive()
+    }
+}
+
 impl TaskRunner {
     pub fn new(repo: String) -> Self {
         let orch_home = crate::home::orch_home().unwrap_or_else(|e| {
@@ -604,6 +609,7 @@ impl TaskRunner {
     }
 
     /// Set the unified task store for run audit trail.
+    #[must_use]
     pub fn with_store(mut self, store: Arc<crate::store::TaskStore>) -> Self {
         self.store = Some(store);
         self
@@ -704,10 +710,10 @@ impl TaskRunner {
 
         let (input_tokens, output_tokens) = extract_run_tokens(input.parse_result);
 
+        #[expect(clippy::cast_precision_loss, reason = "a run duration in seconds")]
         let duration_secs = input
             .elapsed_secs
-            .map(|s| s as f64)
-            .unwrap_or_else(|| run_duration_secs(input.started_at));
+            .map_or_else(|| run_duration_secs(input.started_at), |s| s as f64);
 
         RunAudit {
             stdout: input.raw_stdout.to_string(),
@@ -793,10 +799,17 @@ impl TaskRunner {
                     if route_reason.starts_with("label agent:") {
                         let agent_label = route_reason.trim_start_matches("label ");
                         let gh = crate::github::http::GhHttp::new()?;
-                        if let Err(e) = gh.remove_label(&self.repo, task_id, agent_label).await {
-                            tracing::warn!(task_id, label = agent_label, err = %e, "failed to remove agent label after max attempts");
-                        } else {
-                            tracing::info!(task_id, label = agent_label, "removed forced agent label after max attempts — /retry will use free routing");
+                        match gh.remove_label(&self.repo, task_id, agent_label).await {
+                            Err(e) => {
+                                tracing::warn!(task_id, label = agent_label, err = %e, "failed to remove agent label after max attempts");
+                            }
+                            _ => {
+                                tracing::info!(
+                                    task_id,
+                                    label = agent_label,
+                                    "removed forced agent label after max attempts — /retry will use free routing"
+                                );
+                            }
                         }
                     }
                 }
@@ -837,15 +850,14 @@ impl TaskRunner {
 
         // A sandbox that cannot start blocks the task, which never runs without it. It is the
         // operator's setup that fails, so no agent or model is cooled down
-        if init.invocation.sandbox {
-            if let Err(e) = sandbox::argv(
+        if init.invocation.sandbox
+            && let Err(e) = sandbox::argv(
                 &init.invocation,
                 &std::env::temp_dir().join("orch-sandbox-preflight"),
             )
             .await
-            {
-                return Ok(Some(self.sandbox_blocked(task_id, e.to_string()).await));
-            }
+        {
+            return Ok(Some(self.sandbox_blocked(task_id, e.to_string()).await));
         }
 
         // Run agent session: spawn in tmux, wait for completion, collect output
@@ -1050,14 +1062,12 @@ impl TaskRunner {
         // For no-op done tasks (agent finished with no code changes and no PR),
         // clean up the worktree and branch immediately — tmux session is already
         // dead so the tmux guard won't block removal.
-        if final_status.as_str() == "done" {
-            if let Some(ref st) = self.store {
-                if let Err(e) =
-                    crate::engine::cleanup::cleanup_task_worktree(task_id, &self.repo, st).await
-                {
-                    tracing::warn!(task_id, error = ?e, "worktree cleanup failed after no-op done");
-                }
-            }
+        if final_status.as_str() == "done"
+            && let Some(ref st) = self.store
+            && let Err(e) =
+                crate::engine::cleanup::cleanup_task_worktree(task_id, &self.repo, st).await
+        {
+            tracing::warn!(task_id, error = ?e, "worktree cleanup failed after no-op done");
         }
 
         // Return final status and the session exit code so callers can record it.
@@ -1079,26 +1089,30 @@ impl TaskRunner {
             .await;
 
         Ok(Some(RunExecution {
-            status: final_status.to_string(),
+            status: final_status.clone(),
             exit_code: Some(session_output.exit_code),
             audit,
         }))
     }
 
     /// Record task execution metrics to the database.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a metric row needs the agent, model, route, timing and outcome together"
+    )]
     async fn record_metrics(
         &self,
         task_id: &str,
         agent_name: &str,
-        model_name: &Option<String>,
-        route_result: &Option<RouteResult>,
+        model_name: Option<&str>,
+        route_result: Option<&RouteResult>,
         started_at: &chrono::DateTime<Utc>,
         attempts: u32,
         final_status: &str,
         error_type: Option<&str>,
     ) {
         let completed_at = Utc::now();
+        #[expect(clippy::cast_precision_loss, reason = "a run duration in seconds")]
         let duration_seconds = (completed_at - *started_at).num_milliseconds() as f64 / 1000.0;
 
         // Classify outcome based on the final status and optional error_type/last_error
@@ -1109,7 +1123,7 @@ impl TaskRunner {
             _ => "unknown",
         };
 
-        let complexity = route_result.as_ref().map(|r| r.complexity.clone());
+        let complexity = route_result.map(|r| r.complexity.clone());
         let files_changed = git_ops::count_changed_files(&PathBuf::from(
             self.get_field(task_id, "worktree")
                 .await
@@ -1130,12 +1144,12 @@ impl TaskRunner {
             let usage = store::get_token_usage(&self.store, &self.repo, task_id).await;
             let cost = store::get_cost_estimate(&self.store, &self.repo, task_id).await;
             let input_tokens = if usage.input_tokens > 0 {
-                Some(usage.input_tokens as i64)
+                Some(i64::try_from(usage.input_tokens).unwrap_or(i64::MAX))
             } else {
                 None
             };
             let output_tokens = if usage.output_tokens > 0 {
-                Some(usage.output_tokens as i64)
+                Some(i64::try_from(usage.output_tokens).unwrap_or(i64::MAX))
             } else {
                 None
             };
@@ -1159,14 +1173,14 @@ impl TaskRunner {
                 repo: &self.repo,
                 task_id,
                 agent: agent_name,
-                model: model_name.as_deref(),
+                model: model_name,
                 complexity: complexity.as_deref(),
                 outcome,
                 duration_seconds,
                 started_at,
                 completed_at: &completed_at,
-                attempts: attempts as i32 + 1,
-                files_changed: files_changed as i32,
+                attempts: i32::try_from(attempts.saturating_add(1)).unwrap_or(i32::MAX),
+                files_changed: i32::try_from(files_changed).unwrap_or(i32::MAX),
                 error_type: db_error_type.as_deref(),
                 input_tokens,
                 output_tokens,
@@ -1210,31 +1224,36 @@ impl TaskRunner {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0)
                 + 1;
-            if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, task_id).await {
-                match store
-                    .start_run(&crate::store::StartRun {
-                        task_id: store_id,
-                        attempt,
-                        run_type: "agent",
-                        agent: &agent_name,
-                        model: model.unwrap_or(""),
-                        command: &format!("{} --model {}", agent_name, model.unwrap_or("default")),
-                        prompt: &task.body,
-                    })
-                    .await
-                {
-                    Ok(run_id) => Some(run_id),
-                    Err(e) => {
-                        tracing::warn!(
-                            task_id,
-                            error = %e,
-                            "failed to record run start in audit trail"
-                        );
-                        None
+            match store.resolve_task_id(&self.repo, task_id).await {
+                Ok(Some(store_id)) => {
+                    match store
+                        .start_run(&crate::store::StartRun {
+                            task_id: store_id,
+                            attempt,
+                            run_type: "agent",
+                            agent: &agent_name,
+                            model: model.unwrap_or(""),
+                            command: &format!(
+                                "{} --model {}",
+                                agent_name,
+                                model.unwrap_or("default")
+                            ),
+                            prompt: &task.body,
+                        })
+                        .await
+                    {
+                        Ok(run_id) => Some(run_id),
+                        Err(e) => {
+                            tracing::warn!(
+                                task_id,
+                                error = %e,
+                                "failed to record run start in audit trail"
+                            );
+                            None
+                        }
                     }
                 }
-            } else {
-                None
+                _ => None,
             }
         } else {
             None
@@ -1248,65 +1267,60 @@ impl TaskRunner {
         {
             Ok(run_result) => run_result,
             Err(e) => {
-                if let Some(run_id) = run_audit_id {
-                    if let Some(ref store) = self.store {
-                        if let Err(complete_err) = store
-                            .complete_run(&crate::store::CompleteRun {
-                                run_id,
-                                exit_code: Some(-1),
-                                stdout: "",
-                                stderr: "",
-                                parsed: "",
-                                outcome: "failed",
-                                error: &e.to_string(),
-                                tokens: crate::store::RunTokenUsage::default(),
-                            })
-                            .await
-                        {
-                            tracing::warn!(
-                                task_id,
-                                run_id,
-                                error = %complete_err,
-                                "failed to record run completion in audit trail after runner error"
-                            );
-                        }
-                    }
+                if let Some(run_id) = run_audit_id
+                    && let Some(ref store) = self.store
+                    && let Err(complete_err) = store
+                        .complete_run(&crate::store::CompleteRun {
+                            run_id,
+                            exit_code: Some(-1),
+                            stdout: "",
+                            stderr: "",
+                            parsed: "",
+                            outcome: "failed",
+                            error: &e.to_string(),
+                            tokens: crate::store::RunTokenUsage::default(),
+                        })
+                        .await
+                {
+                    tracing::warn!(
+                        task_id,
+                        run_id,
+                        error = %complete_err,
+                        "failed to record run completion in audit trail after runner error"
+                    );
                 }
                 return Err(e);
             }
         };
 
         // If the runner guard skipped the task, do not re-post stale data as a new comment.
-        let (status, exit_code_opt, run_audit) = match run_result {
-            Some(result) => (result.status, result.exit_code, result.audit),
-            None => {
-                if let Some(run_id) = run_audit_id {
-                    if let Some(ref store) = self.store {
-                        if let Err(e) = store
-                            .complete_run(&crate::store::CompleteRun {
-                                run_id,
-                                exit_code: Some(-1),
-                                stdout: "",
-                                stderr: "",
-                                parsed: "",
-                                outcome: "aborted",
-                                error: "run skipped by guard",
-                                tokens: crate::store::RunTokenUsage::default(),
-                            })
-                            .await
-                        {
-                            tracing::warn!(
-                                task_id,
-                                run_id,
-                                error = %e,
-                                "failed to record skipped run completion in audit trail"
-                            );
-                        }
-                    }
-                }
-                tracing::info!(task_id, "guard skipped task — not posting stale result");
-                return Ok(WeightSignal::None);
+        let (status, exit_code_opt, run_audit) = if let Some(result) = run_result {
+            (result.status, result.exit_code, result.audit)
+        } else {
+            if let Some(run_id) = run_audit_id
+                && let Some(ref store) = self.store
+                && let Err(e) = store
+                    .complete_run(&crate::store::CompleteRun {
+                        run_id,
+                        exit_code: Some(-1),
+                        stdout: "",
+                        stderr: "",
+                        parsed: "",
+                        outcome: "aborted",
+                        error: "run skipped by guard",
+                        tokens: crate::store::RunTokenUsage::default(),
+                    })
+                    .await
+            {
+                tracing::warn!(
+                    task_id,
+                    run_id,
+                    error = %e,
+                    "failed to record skipped run completion in audit trail"
+                );
             }
+            tracing::info!(task_id, "guard skipped task — not posting stale result");
+            return Ok(WeightSignal::None);
         };
 
         // Process delegations if the agent requested subtasks
@@ -1379,28 +1393,25 @@ impl TaskRunner {
             // and we can safely clear agent/model for normal reroute.
             let silence_already_reset = store::opt_store_get_task(&self.store, &self.repo, task_id)
                 .await
-                .map(|t| !matches!(t.status, crate::store::TaskStatus::InProgress))
-                .unwrap_or(false);
+                .is_some_and(|t| !matches!(t.status, crate::store::TaskStatus::InProgress));
 
-            if !silence_already_reset {
-                if let Err(e) = store::store_set_result(
-                    &self.store,
-                    &self.repo,
-                    task_id,
-                    &[
-                        ("agent", serde_json::json!("")),
-                        ("model", serde_json::json!("")),
-                    ],
-                )
-                .await
-                {
-                    tracing::warn!(task_id, err = %e, "failed to clear agent/model for reroute in store");
-                }
-            } else {
+            if silence_already_reset {
                 tracing::debug!(
                     task_id,
                     "silence detection already set fallback agent — skipping agent/model clear"
                 );
+            } else if let Err(e) = store::store_set_result(
+                &self.store,
+                &self.repo,
+                task_id,
+                &[
+                    ("agent", serde_json::json!("")),
+                    ("model", serde_json::json!("")),
+                ],
+            )
+            .await
+            {
+                tracing::warn!(task_id, err = %e, "failed to clear agent/model for reroute in store");
             }
         }
         // Determine weight signal based on outcome.
@@ -1435,13 +1446,12 @@ impl TaskRunner {
             let has_rate_limit_error = classify_run_error_type(&last_error) == "rate_limit";
             if has_rate_limit_error {
                 // Record in the metrics store so the router's health check detects it.
-                if let Some(ref store) = self.store {
-                    if let Err(e) = store
+                if let Some(ref store) = self.store
+                    && let Err(e) = store
                         .record_rate_limit(&agent_name, "rate", Some(task_id))
                         .await
-                    {
-                        tracing::warn!(task_id, agent = %agent_name, err = %e, "failed to persist rate_limit event — router health check may miss this signal");
-                    }
+                {
+                    tracing::warn!(task_id, agent = %agent_name, err = %e, "failed to persist rate_limit event — router health check may miss this signal");
                 }
                 // Also record via the cooldown system so model_for_complexity() skips
                 // this model.  Use the stored last_error text as the message since
@@ -1481,8 +1491,8 @@ impl TaskRunner {
             self.record_metrics(
                 task_id,
                 &agent_name,
-                &model.map(|s| s.to_string()),
-                &route_result.cloned(),
+                model,
+                route_result,
                 &started_at,
                 attempts,
                 &status,
@@ -1496,34 +1506,32 @@ impl TaskRunner {
         }
 
         // Complete run in task_runs audit trail (include exit code from runner when available)
-        if let Some(run_id) = run_audit_id {
-            if let Some(ref store) = self.store {
-                if let Err(e) = store
-                    .complete_run(&crate::store::CompleteRun {
-                        run_id,
-                        exit_code: exit_code_opt,
-                        stdout: &run_audit.stdout,
-                        stderr: &run_audit.stderr,
-                        parsed: &run_audit.parsed_response,
-                        outcome: &run_audit.outcome,
-                        error: &run_audit.error,
-                        tokens: crate::store::RunTokenUsage {
-                            input_tokens: run_audit.input_tokens,
-                            output_tokens: run_audit.output_tokens,
-                            total_cost_usd: run_audit.total_cost_usd,
-                            duration_secs: run_audit.duration_secs,
-                        },
-                    })
-                    .await
-                {
-                    tracing::warn!(
-                        task_id,
-                        run_id,
-                        error = %e,
-                        "failed to record run completion in audit trail"
-                    );
-                }
-            }
+        if let Some(run_id) = run_audit_id
+            && let Some(ref store) = self.store
+            && let Err(e) = store
+                .complete_run(&crate::store::CompleteRun {
+                    run_id,
+                    exit_code: exit_code_opt,
+                    stdout: &run_audit.stdout,
+                    stderr: &run_audit.stderr,
+                    parsed: &run_audit.parsed_response,
+                    outcome: &run_audit.outcome,
+                    error: &run_audit.error,
+                    tokens: crate::store::RunTokenUsage {
+                        input_tokens: run_audit.input_tokens,
+                        output_tokens: run_audit.output_tokens,
+                        total_cost_usd: run_audit.total_cost_usd,
+                        duration_secs: run_audit.duration_secs,
+                    },
+                })
+                .await
+        {
+            tracing::warn!(
+                task_id,
+                run_id,
+                error = %e,
+                "failed to record run completion in audit trail"
+            );
         }
 
         // If task was rerouted (status=routed or new after run), update GitHub agent label
@@ -1553,22 +1561,21 @@ impl TaskRunner {
             "in_progress" => Status::InProgress,
             "in_review" => Status::InReview,
             "blocked" => Status::Blocked,
-            "needs_review" => Status::NeedsReview,
             "routed" => Status::Routed, // Rerouted (agent/model already set)
             "new" => Status::New,       // Legacy reroute path
             _ => Status::NeedsReview,
         };
         // Store-first: update SQLite (must succeed), then mirror to backend.
-        if let Some(ref store) = self.store {
-            if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &task.id.0).await {
-                store
-                    .update_status(
-                        store_id,
-                        crate::engine::tasks::status_to_task_status(new_status),
-                    )
-                    .await
-                    .context("store-first status update failed in runner")?;
-            }
+        if let Some(ref store) = self.store
+            && let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &task.id.0).await
+        {
+            store
+                .update_status(
+                    store_id,
+                    crate::engine::tasks::status_to_task_status(new_status),
+                )
+                .await
+                .context("store-first status update failed in runner")?;
         }
         if let Err(e) = backend.update_status(&task.id, new_status).await {
             tracing::warn!(
@@ -1668,13 +1675,13 @@ impl TaskRunner {
         }
 
         // Mark parent as blocked — store-first, then mirror to backend.
-        if let Some(ref store) = self.store {
-            if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &parent_id.0).await {
-                store
-                    .update_status(store_id, crate::store::TaskStatus::Blocked)
-                    .await
-                    .context("store-first: failed to block parent in store")?;
-            }
+        if let Some(ref store) = self.store
+            && let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &parent_id.0).await
+        {
+            store
+                .update_status(store_id, crate::store::TaskStatus::Blocked)
+                .await
+                .context("store-first: failed to block parent in store")?;
         }
         if let Err(e) = backend.update_status(parent_id, Status::Blocked).await {
             tracing::warn!(
@@ -1710,10 +1717,10 @@ impl TaskRunner {
     /// Resolve the project directory for this repo.
     async fn resolve_project_dir(&self) -> anyhow::Result<PathBuf> {
         // Explicit env var always wins
-        if let Ok(dir) = std::env::var("PROJECT_DIR") {
-            if !dir.is_empty() {
-                return Ok(PathBuf::from(dir));
-            }
+        if let Ok(dir) = std::env::var("PROJECT_DIR")
+            && !dir.is_empty()
+        {
+            return Ok(PathBuf::from(dir));
         }
 
         // Check projects list in global config — find path for this repo
@@ -1732,13 +1739,13 @@ impl TaskRunner {
         }
 
         // Legacy: check config project_dir
-        if let Ok(dir) = config::get("project_dir") {
-            if !dir.is_empty() {
-                let path = PathBuf::from(&dir);
-                let path_for_check = path.clone();
-                if tokio::fs::metadata(&path_for_check).await.is_ok() {
-                    return Ok(path);
-                }
+        if let Ok(dir) = config::get("project_dir")
+            && !dir.is_empty()
+        {
+            let path = PathBuf::from(&dir);
+            let path_for_check = path.clone();
+            if tokio::fs::metadata(&path_for_check).await.is_ok() {
+                return Ok(path);
             }
         }
 
@@ -1784,7 +1791,11 @@ impl TaskRunner {
 /// in the repo, then applies it. Returns `true` only when both `ensure_label` (repo label creation)
 /// and `set_labels` (issue label assignment) succeed. `remove_label` failures are non-fatal.
 async fn update_agent_label_after_reroute(
-    #[cfg_attr(test, allow(unused_variables))] repo: &str,
+    #[cfg_attr(
+        test,
+        expect(unused_variables, reason = "only the label call outside tests uses it")
+    )]
+    repo: &str,
     task: &ExternalTask,
     backend: &Arc<dyn ExternalBackend>,
     old_agent: &str,
@@ -1858,14 +1869,13 @@ mod tests {
     use crate::store::{NewTask, TaskStore};
     use async_trait::async_trait;
     use chrono::Utc;
-    use once_cell::sync::Lazy;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
-    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    fn ok_parse_result(status: &str) -> Result<agents::ParsedResponse, agents::AgentError> {
-        Ok(agents::ParsedResponse {
+    fn ok_parse_result(status: &str) -> agents::ParsedResponse {
+        agents::ParsedResponse {
             response: AgentResponse {
                 status: status.to_string(),
                 summary: String::new(),
@@ -1881,7 +1891,7 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             duration_ms: None,
-        })
+        }
     }
 
     // ── safe_utf8_tail ───────────────────────────────────────────────────────
@@ -2132,7 +2142,7 @@ mod tests {
         // "routed" is a canonical non-success status (task will be re-dispatched).
         // It should be classified as "success" so the audit trail distinguishes it
         // from genuine failures (#2801).
-        let parse_result = ok_parse_result("routed");
+        let parse_result = Ok(ok_parse_result("routed"));
         assert_eq!(
             classify_run_outcome("routed", &parse_result, false),
             "success"
@@ -2141,7 +2151,7 @@ mod tests {
 
     #[test]
     fn classify_run_outcome_blocked_is_blocked() {
-        let parse_result = ok_parse_result("blocked");
+        let parse_result = Ok(ok_parse_result("blocked"));
         assert_eq!(
             classify_run_outcome("blocked", &parse_result, false),
             "blocked"
@@ -2152,7 +2162,7 @@ mod tests {
     fn classify_run_outcome_non_canonical_is_failed() {
         // Non-canonical statuses should be classified as "failed" in the audit.
         // The explicit error message is provided by build_run_audit.
-        let parse_result = ok_parse_result("fix_deployed");
+        let parse_result = Ok(ok_parse_result("fix_deployed"));
         assert_eq!(
             classify_run_outcome("fix_deployed", &parse_result, false),
             "failed"
@@ -2251,7 +2261,7 @@ mod tests {
             .unwrap();
 
         let runner = TaskRunner::new("owner/repo".to_string()).with_store(store);
-        let parse_result = ok_parse_result("done");
+        let parse_result = Ok(ok_parse_result("done"));
         let started_at = Utc::now();
         let audit = runner
             .build_run_audit(RunAuditInput {
@@ -2268,7 +2278,7 @@ mod tests {
             .await;
 
         assert_eq!(audit.outcome, "success");
-        assert!(audit.error.is_empty());
+        assert_eq!(audit.error, "");
     }
 
     #[tokio::test]
@@ -2335,7 +2345,7 @@ mod tests {
     #[tokio::test]
     async fn build_run_audit_non_success_uses_fallback_error_when_empty() {
         let runner = TaskRunner::new("owner/repo".to_string());
-        let parse_result = ok_parse_result("new");
+        let parse_result = Ok(ok_parse_result("new"));
         let started_at = Utc::now();
         let audit = runner
             .build_run_audit(RunAuditInput {
@@ -2362,7 +2372,7 @@ mod tests {
         // should get an explicit "unrecognized status: X" message instead of
         // the opaque "no error info available" placeholder (#2801).
         let runner = TaskRunner::new("owner/repo".to_string());
-        let parse_result = ok_parse_result("fix_deployed");
+        let parse_result = Ok(ok_parse_result("fix_deployed"));
         let started_at = Utc::now();
         let audit = runner
             .build_run_audit(RunAuditInput {
@@ -2388,7 +2398,7 @@ mod tests {
         // an error message — they're expected outcomes, not failures.
         for status in &["routed"] {
             let runner = TaskRunner::new("owner/repo".to_string());
-            let parse_result = ok_parse_result(status);
+            let parse_result = Ok(ok_parse_result(status));
             let started_at = Utc::now();
             let audit = runner
                 .build_run_audit(RunAuditInput {
@@ -2466,9 +2476,11 @@ mod tests {
         // dedicated key that only this test touches. std::env::set_var is not
         // thread-safe in general, but the subsequent call is synchronous and
         // isolated to the temp dir created above.
-        std::env::set_var("PROJECT_DIR", &dir_str);
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("PROJECT_DIR", &dir_str) };
         let result = runner.resolve_project_dir().await;
-        std::env::remove_var("PROJECT_DIR");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::remove_var("PROJECT_DIR") };
 
         assert!(
             result.is_ok(),
@@ -2481,9 +2493,11 @@ mod tests {
     async fn resolve_project_dir_empty_project_dir_env_falls_through() {
         // An empty PROJECT_DIR should be ignored and fall through to other logic.
         let runner = TaskRunner::new("owner/testrepo-nonexistent".to_string());
-        std::env::set_var("PROJECT_DIR", "");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("PROJECT_DIR", "") };
         let result = runner.resolve_project_dir().await;
-        std::env::remove_var("PROJECT_DIR");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::remove_var("PROJECT_DIR") };
 
         // No active config entry, no legacy project_dir, no bare clone for this
         // repo: should return an explicit error rather than falling back to the
@@ -2519,7 +2533,7 @@ mod tests {
 
     #[async_trait]
     impl crate::backends::ExternalBackend for TrackingBackend {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "tracking"
         }
         async fn create_task(
@@ -2533,14 +2547,14 @@ mod tests {
         async fn get_task(&self, id: &ExternalId) -> anyhow::Result<ExternalTask> {
             Ok(ExternalTask {
                 id: id.clone(),
-                title: "".to_string(),
-                body: "".to_string(),
+                title: String::new(),
+                body: String::new(),
                 state: "open".to_string(),
                 labels: vec![],
-                author: "".to_string(),
+                author: String::new(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
-                url: "".to_string(),
+                url: String::new(),
             })
         }
         async fn list_by_status(&self, _s: Status) -> anyhow::Result<Vec<ExternalTask>> {
@@ -2576,7 +2590,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((title.to_string(), parent.0.clone()));
-            Ok(ExternalId(format!("child-{}", title)))
+            Ok(ExternalId(format!("child-{title}")))
         }
         async fn ensure_status_label(&self, _l: &str) -> anyhow::Result<()> {
             Ok(())
@@ -2609,19 +2623,22 @@ mod tests {
         ExternalTask {
             id: ExternalId(id.to_string()),
             title: format!("Task {id}"),
-            body: "".to_string(),
+            body: String::new(),
             state: "open".to_string(),
             labels: vec![],
             author: "bot".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            url: "".to_string(),
+            url: String::new(),
         }
     }
 
     // ── process_delegations ───────────────────────────────────────────────────
 
-    #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the env lock must stay held across the awaited calls"
+    )]
     #[tokio::test]
     async fn process_delegations_creates_subtasks_and_blocks_parent() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -2629,12 +2646,14 @@ mod tests {
         let orch_home = temp_home.path().join(".orch");
         tokio::fs::create_dir_all(&orch_home).await.unwrap();
         let old_orch_home = std::env::var("ORCH_HOME").ok();
-        std::env::set_var("ORCH_HOME", &orch_home);
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", &orch_home) };
 
         let runner = TaskRunner::new("owner/repo".to_string());
         let parent = make_task("99");
         let backend = Arc::new(TrackingBackend::new());
-        let backend_dyn: Arc<dyn crate::backends::ExternalBackend> = backend.clone();
+        let backend_dyn: Arc<dyn crate::backends::ExternalBackend> =
+            Arc::<TrackingBackend>::clone(&backend);
 
         let delegations = vec![
             crate::parser::Delegation {
@@ -2695,13 +2714,18 @@ mod tests {
         );
 
         if let Some(old) = old_orch_home {
-            std::env::set_var("ORCH_HOME", old);
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::set_var("ORCH_HOME", old) };
         } else {
-            std::env::remove_var("ORCH_HOME");
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::remove_var("ORCH_HOME") };
         }
     }
 
-    #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the env lock must stay held across the awaited calls"
+    )]
     #[tokio::test]
     async fn process_delegations_single_subtask() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -2709,12 +2733,14 @@ mod tests {
         let orch_home = temp_home.path().join(".orch");
         tokio::fs::create_dir_all(&orch_home).await.unwrap();
         let old_orch_home = std::env::var("ORCH_HOME").ok();
-        std::env::set_var("ORCH_HOME", &orch_home);
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", &orch_home) };
 
         let runner = TaskRunner::new("owner/repo".to_string());
         let parent = make_task("101");
         let backend = Arc::new(TrackingBackend::new());
-        let backend_dyn: Arc<dyn crate::backends::ExternalBackend> = backend.clone();
+        let backend_dyn: Arc<dyn crate::backends::ExternalBackend> =
+            Arc::<TrackingBackend>::clone(&backend);
 
         let delegations = vec![crate::parser::Delegation {
             title: "Only Child".to_string(),
@@ -2749,9 +2775,11 @@ mod tests {
         );
 
         if let Some(old) = old_orch_home {
-            std::env::set_var("ORCH_HOME", old);
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::set_var("ORCH_HOME", old) };
         } else {
-            std::env::remove_var("ORCH_HOME");
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            unsafe { std::env::remove_var("ORCH_HOME") };
         }
     }
 
@@ -2874,7 +2902,7 @@ mod tests {
 
     impl agents::AgentRunner for FailingMockRunner {
         #[cfg(test)]
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "opencode"
         }
 
@@ -3074,7 +3102,7 @@ mod tests {
 
     #[async_trait]
     impl crate::backends::ExternalBackend for LabelFailingBackend {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "label_failing"
         }
         async fn create_task(
@@ -3099,7 +3127,7 @@ mod tests {
         }
         async fn set_labels(&self, id: &ExternalId, labels: &[String]) -> anyhow::Result<()> {
             if let Some(ref err) = self.set_labels_err {
-                return Err(anyhow::anyhow!("{}", err));
+                return Err(anyhow::anyhow!("{err}"));
             }
             self.inner.set_labels(id, labels).await
         }
@@ -3152,7 +3180,7 @@ mod tests {
             author: "bot".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            url: "".to_string(),
+            url: String::new(),
         };
         let backend: Arc<dyn crate::backends::ExternalBackend> =
             Arc::new(LabelFailingBackend::new().with_set_labels_err("network error"));
@@ -3179,7 +3207,7 @@ mod tests {
             author: "bot".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            url: "".to_string(),
+            url: String::new(),
         };
         // LabelFailingBackend with no injected error delegates to TrackingBackend (always Ok).
         let backend: Arc<dyn crate::backends::ExternalBackend> =
@@ -3277,18 +3305,27 @@ mod tests {
 
     #[test]
     fn salvage_wrapup_accepts_commit_then_cleanup() {
-        let raw = tool_pair("1", "run_terminal_cmd", "git commit -m x", false)
-            + &tool_pair("2", "run_terminal_cmd", "git status", false);
+        let raw = format!(
+            "{}{}",
+            tool_pair("1", "run_terminal_cmd", "git commit -m x", false),
+            tool_pair("2", "run_terminal_cmd", "git status", false)
+        );
         assert!(salvage_wrapup(&raw).is_some());
     }
 
     #[test]
     fn salvage_wrapup_rejects_edit_after_commit_or_unanswered_call() {
-        let edit = tool_pair("1", "run_terminal_cmd", "git commit -m x", false)
-            + &tool_pair("2", "search_replace", "", false);
+        let edit = format!(
+            "{}{}",
+            tool_pair("1", "run_terminal_cmd", "git commit -m x", false),
+            tool_pair("2", "search_replace", "", false)
+        );
         assert!(salvage_wrapup(&edit).is_none());
-        let pending = tool_pair("1", "run_terminal_cmd", "git commit -m x", false)
-            + &serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"2","name":"run_terminal_cmd","input":{"command":"cargo test"}}]}}).to_string();
+        let pending = format!(
+            "{}{}",
+            tool_pair("1", "run_terminal_cmd", "git commit -m x", false),
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"2","name":"run_terminal_cmd","input":{"command":"cargo test"}}]}})
+        );
         assert!(salvage_wrapup(&pending).is_none());
         assert!(salvage_wrapup(&tool_pair("1", "run_terminal_cmd", "ls", false)).is_none());
     }

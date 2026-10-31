@@ -1,3 +1,9 @@
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "the CLI writes its output to the terminal"
+)]
+
 pub mod chat;
 pub mod commit;
 pub mod cooldown;
@@ -34,36 +40,33 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
 
     let config_path = orch_home.join("config.yml");
 
-    let repo_value = match repo {
-        Some(r) => {
-            // Normalize: accept SSH URLs, HTTPS URLs, or owner/repo slugs
-            if let Some((owner, name)) = parse_github_slug(&r) {
-                format!("{}/{}", owner, name)
-            } else {
-                r
-            }
+    let repo_value = if let Some(r) = repo {
+        // Normalize: accept SSH URLs, HTTPS URLs, or owner/repo slugs
+        if let Some((owner, name)) = parse_github_slug(&r) {
+            format!("{owner}/{name}")
+        } else {
+            r
         }
-        None => {
-            // Try to detect from git remote (origin) by reading the remote URL
-            let git_remote = std::process::Command::new("git")
-                .args(["remote", "get-url", "origin"])
-                .output_with_context();
+    } else {
+        // Try to detect from git remote (origin) by reading the remote URL
+        let git_remote = std::process::Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .output_with_context();
 
-            match git_remote {
-                Ok(o) if o.status.success() => {
-                    let url = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    if let Some((owner, repo)) = parse_github_slug(&url) {
-                        format!("{}/{}", owner, repo)
-                    } else {
-                        eprintln!("Could not parse repository from git remote: {}", url);
-                        eprintln!("Use --repo OWNER/REPO");
-                        std::process::exit(1);
-                    }
-                }
-                _ => {
-                    eprintln!("Could not detect repository. Use --repo OWNER/REPO");
+        match git_remote {
+            Ok(o) if o.status.success() => {
+                let url = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if let Some((owner, repo)) = parse_github_slug(&url) {
+                    format!("{owner}/{repo}")
+                } else {
+                    eprintln!("Could not parse repository from git remote: {url}");
+                    eprintln!("Use --repo OWNER/REPO");
                     std::process::exit(1);
                 }
+            }
+            _ => {
+                eprintln!("Could not detect repository. Use --repo OWNER/REPO");
+                std::process::exit(1);
             }
         }
     };
@@ -93,10 +96,10 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
 
     // Check if already registered
     let paths = config::get_project_paths().unwrap_or_default();
-    if !paths.iter().any(|p| p == &cwd_str) {
-        project_add(".")?;
-    } else {
+    if paths.iter().any(|p| p == &cwd_str) {
         println!("Project already registered in global config");
+    } else {
+        project_add(".")?;
     }
 
     // Guidance for board setup
@@ -123,21 +126,13 @@ pub fn log(lines: &str) -> anyhow::Result<()> {
     ];
 
     for path in &candidates {
-        if path.exists()
-            && std::fs::metadata(path)
-                .map(|m| m.len() > 0)
-                .unwrap_or(false)
-        {
+        if path.exists() && std::fs::metadata(path).is_ok_and(|m| m.len() > 0) {
             log_files.push(path.clone());
         } else {
             // Fall back to rotated log files (orch.log.1, orch.log.2, ...) if primary is empty
             for n in 1..=5 {
                 let rotated = std::path::PathBuf::from(format!("{}.{}", path.display(), n));
-                if rotated.exists()
-                    && std::fs::metadata(&rotated)
-                        .map(|m| m.len() > 0)
-                        .unwrap_or(false)
-                {
+                if rotated.exists() && std::fs::metadata(&rotated).is_ok_and(|m| m.len() > 0) {
                     log_files.push(rotated);
                     break;
                 }
@@ -158,24 +153,23 @@ pub fn log(lines: &str) -> anyhow::Result<()> {
             .args(&args)
             .status_with_context()?;
         std::process::exit(status.code().unwrap_or(1));
-    } else {
-        let n = lines.parse::<usize>().unwrap_or(50);
-        for path in &log_files {
-            let filename = path.file_name().unwrap_or_default().to_string_lossy();
-            println!("=== {filename} ===");
+    }
+    let n = lines.parse::<usize>().unwrap_or(50);
+    for path in &log_files {
+        let filename = path.file_name().unwrap_or_default().to_string_lossy();
+        println!("=== {filename} ===");
 
-            let content = std::fs::read_to_string(path)?;
-            let all_lines: Vec<&str> = content.lines().collect();
-            let start = if all_lines.len() > n {
-                all_lines.len() - n
-            } else {
-                0
-            };
-            for line in &all_lines[start..] {
-                println!("{line}");
-            }
-            println!();
+        let content = std::fs::read_to_string(path)?;
+        let all_lines: Vec<&str> = content.lines().collect();
+        let start = if all_lines.len() > n {
+            all_lines.len() - n
+        } else {
+            0
+        };
+        for line in &all_lines[start..] {
+            println!("{line}");
         }
+        println!();
     }
 
     Ok(())
@@ -236,7 +230,7 @@ pub async fn metrics(details: bool, since_hours: u32) -> anyhow::Result<()> {
     let window_label = hours_to_label(since_hours);
 
     println!();
-    let header = format!("Orch Metrics (Last {})", window_label);
+    let header = format!("Orch Metrics (Last {window_label})");
     let width = 58usize;
     let pad = width.saturating_sub(header.len() + 2);
     let left_pad = pad / 2;
@@ -259,17 +253,17 @@ pub async fn metrics(details: bool, since_hours: u32) -> anyhow::Result<()> {
     // Average duration by complexity
     println!(" Average Duration by Complexity:");
     if let Some(d) = summary.avg_duration_simple {
-        println!("   {:>6.1}s (simple)", d);
+        println!("   {d:>6.1}s (simple)");
     } else {
         println!("   {:>6} (simple)", "-");
     }
     if let Some(d) = summary.avg_duration_medium {
-        println!("   {:>6.1}s (medium)", d);
+        println!("   {d:>6.1}s (medium)");
     } else {
         println!("   {:>6} (medium)", "-");
     }
     if let Some(d) = summary.avg_duration_complex {
-        println!("   {:>6.1}s (complex)", d);
+        println!("   {d:>6.1}s (complex)");
     } else {
         println!("   {:>6} (complex)", "-");
     }
@@ -295,7 +289,7 @@ pub async fn metrics(details: bool, since_hours: u32) -> anyhow::Result<()> {
         // Slow tasks
         let slow = store.get_slow_tasks(since_hours).await?;
         if !slow.is_empty() {
-            println!(" Slowest Tasks (Last {}):", window_label);
+            println!(" Slowest Tasks (Last {window_label}):");
             println!(
                 "   {:<20} {:<12} {:<10} DURATION",
                 "TASK ID", "AGENT", "COMPLEXITY"
@@ -315,8 +309,11 @@ pub async fn metrics(details: bool, since_hours: u32) -> anyhow::Result<()> {
 
         // Error distribution
         let errors = store.get_error_distribution(since_hours).await?;
-        if !errors.is_empty() {
-            println!(" Error Distribution (Last {}):", window_label);
+        if errors.is_empty() {
+            println!(" Error Distribution (Last {window_label}): none");
+            println!();
+        } else {
+            println!(" Error Distribution (Last {window_label}):");
             println!("   {:<30} {:>6}", "ERROR TYPE", "COUNT");
             println!("   {}", "-".repeat(38));
             for e in &errors {
@@ -327,15 +324,12 @@ pub async fn metrics(details: bool, since_hours: u32) -> anyhow::Result<()> {
                 );
             }
             println!();
-        } else {
-            println!(" Error Distribution (Last {}): none", window_label);
-            println!();
         }
 
         // Repeated review loops
         let review_loops = store.get_high_review_cycle_tasks(since_hours).await?;
         if !review_loops.is_empty() {
-            println!(" Tasks with Repeated Review Loops (Last {}):", window_label);
+            println!(" Tasks with Repeated Review Loops (Last {window_label}):");
             println!("   {:<10} {:<12} TITLE", "CYCLES", "AGENT");
             println!("   {}", "-".repeat(60));
             for t in &review_loops {
@@ -397,14 +391,14 @@ pub async fn board_list() -> anyhow::Result<()> {
 
 /// Link current repo to a GitHub Projects V2 board by ID and discover fields.
 pub async fn board_link(project_id: &str) -> anyhow::Result<()> {
-    use crate::github::projects::{write_project_config, ProjectSync};
+    use crate::github::projects::{ProjectSync, write_project_config};
 
     println!("Discovering board fields...");
     let sync = ProjectSync::discover_fields(project_id).await?;
 
     write_project_config(&sync).await?;
 
-    println!("Linked board: {}", project_id);
+    println!("Linked board: {project_id}");
     println!("Status field: {}", sync.status_field_id());
     println!("Column mappings:");
     for (col, opt_id) in sync.status_map() {
@@ -416,7 +410,7 @@ pub async fn board_link(project_id: &str) -> anyhow::Result<()> {
 
 /// Re-discover field IDs from configured board and update config.
 pub async fn board_sync() -> anyhow::Result<()> {
-    use crate::github::projects::{write_project_config, ProjectSync};
+    use crate::github::projects::{ProjectSync, write_project_config};
 
     let project_id = config::get("gh.project_id").map_err(|_| {
         anyhow::anyhow!("no board configured — run `orch project board link <id>` first")
@@ -426,7 +420,7 @@ pub async fn board_sync() -> anyhow::Result<()> {
         anyhow::bail!("no board configured — run `orch project board link <id>` first");
     }
 
-    println!("Syncing board fields for {}...", project_id);
+    println!("Syncing board fields for {project_id}...");
     let sync = ProjectSync::discover_fields(&project_id).await?;
 
     write_project_config(&sync).await?;
@@ -451,10 +445,10 @@ pub fn board_info() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("Board ID: {}", project_id);
+    println!("Board ID: {project_id}");
 
     if let Ok(field_id) = config::get("gh.project_status_field_id") {
-        println!("Status field: {}", field_id);
+        println!("Status field: {field_id}");
     }
 
     for col in &["backlog", "in_progress", "review", "done"] {
@@ -476,7 +470,9 @@ pub async fn board_reconcile(repo: Option<&str>) -> anyhow::Result<()> {
     let config = crate::github::projects::label_status::LabelSyncConfig::from_config()?;
     let gh = crate::github::http::GhHttp::owner()?;
     let updated = board_reconcile_with(&config, &gh, &repo).await?;
-    println!("Updated {updated} project Status field(s) in this pass; skipped items are reported at debug level.");
+    println!(
+        "Updated {updated} project Status field(s) in this pass; skipped items are reported at debug level."
+    );
     Ok(())
 }
 
@@ -600,7 +596,7 @@ fn project_add_local(path: &str) -> anyhow::Result<()> {
             .and_then(|gh| gh.get("repo"))
             .and_then(|r| r.as_str())
         {
-            println!("  repo: {}", repo);
+            println!("  repo: {repo}");
         }
     }
 
@@ -668,11 +664,11 @@ fn register_project_path(path_str: &str) -> anyhow::Result<()> {
 
     match config::projects_yaml::add_project(&content, path_str)? {
         config::projects_yaml::ProjectsEdit::Unchanged => {
-            println!("Project already registered: {}", path_str);
+            println!("Project already registered: {path_str}");
         }
         config::projects_yaml::ProjectsEdit::Updated(updated) => {
             std::fs::write(&config_path, updated)?;
-            println!("Added project: {}", path_str);
+            println!("Added project: {path_str}");
         }
     }
 
@@ -694,11 +690,11 @@ pub fn project_remove(path: &str) -> anyhow::Result<()> {
     let content = std::fs::read_to_string(&config_path)?;
     match config::projects_yaml::remove_project(&content, &[&path_str, path])? {
         config::projects_yaml::ProjectsEdit::Unchanged => {
-            println!("Project not found: {}", path);
+            println!("Project not found: {path}");
         }
         config::projects_yaml::ProjectsEdit::Updated(updated) => {
             std::fs::write(&config_path, updated)?;
-            println!("Removed project: {}", path_str);
+            println!("Removed project: {path_str}");
         }
     }
 
@@ -726,7 +722,7 @@ pub fn project_list() -> anyhow::Result<()> {
 
         let status = if path.exists() { "" } else { " (missing)" };
 
-        println!("{:<50} {}{}", path_str, repo, status);
+        println!("{path_str:<50} {repo}{status}");
     }
 
     Ok(())
@@ -759,8 +755,8 @@ fn read_project_repo(project_path: &std::path::Path) -> Option<String> {
 
 /// Initialize task manager with database and backend.
 pub async fn init_task_manager() -> anyhow::Result<TaskManager> {
-    use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
+    use crate::backends::github::GitHubBackend;
 
     let repo = config::get_current_repo()
         .context("'repo' not set — run `orch init` or set gh.repo in .orch.yml")?;

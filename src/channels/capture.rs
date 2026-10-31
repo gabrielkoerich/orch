@@ -9,9 +9,9 @@
 //! Sessions are registered when tasks are dispatched and unregistered
 //! when they complete.
 
-use crate::channels::tmux;
-use crate::channels::transport::{session_key, Transport};
 use crate::channels::OutputChunk;
+use crate::channels::tmux;
+use crate::channels::transport::{Transport, session_key};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -67,6 +67,14 @@ pub struct CaptureService {
     interval: std::time::Duration,
 }
 
+impl std::fmt::Debug for CaptureService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CaptureService")
+            .field("interval", &self.interval)
+            .finish_non_exhaustive()
+    }
+}
+
 impl CaptureService {
     /// Create a new CaptureService.
     pub fn new(transport: Arc<Transport>) -> Self {
@@ -87,7 +95,7 @@ impl CaptureService {
         // re-registrations both observe the same stale generation value.
         let generation = {
             let mut buffers = self.buffers.write().await;
-            let generation = buffers.get(&skey).map(|b| b.generation + 1).unwrap_or(0);
+            let generation = buffers.get(&skey).map_or(0, |b| b.generation + 1);
             let buffer = OutputBuffer {
                 repo: repo.to_string(),
                 session: session.to_string(),
@@ -239,7 +247,7 @@ impl CaptureService {
             // engine::tick (`stuck_task_timing_from_map`).
             let suspended = crate::engine::suspend::suspended_duration_since(buf.registered_at);
             let age = (raw_age - suspended).max(chrono::Duration::zero());
-            if age.num_seconds() > grace_period.as_secs() as i64 {
+            if age.num_seconds() > i64::try_from(grace_period.as_secs()).unwrap_or(i64::MAX) {
                 silent.push((buf.task_id.clone(), buf.session.clone(), age.num_seconds()));
             }
         }
@@ -280,14 +288,11 @@ impl CaptureService {
                     // 2. It has the same generation (not re-registered)
                     // 3. It was seen alive before
                     // 4. The tmux session is actually dead
-                    let should_finalize = current
-                        .as_ref()
-                        .map(|c| {
-                            c.generation == buffer.generation
-                                && c.seen_alive
-                                && c.session == buffer.session
-                        })
-                        .unwrap_or(false);
+                    let should_finalize = current.as_ref().is_some_and(|c| {
+                        c.generation == buffer.generation
+                            && c.seen_alive
+                            && c.session == buffer.session
+                    });
 
                     if should_finalize && tmux::is_session_dead(&buffer.session).await {
                         tracing::info!(
@@ -356,31 +361,33 @@ impl OutputBuffer {
             return None;
         }
 
-        let new_content = if self.last_len > current_len {
+        let new_content = match self.last_len.cmp(&current_len) {
             // Content shrank (terminal cleared) — no incremental diff available.
             // Emitting full current_content would duplicate already-broadcast output.
-            String::new()
-        } else if self.last_len == current_len {
-            // Same-length overwrite (e.g. spinner/progress refresh).
-            // Find the longest common prefix and return only the changed suffix.
-            let common_prefix = self
-                .last_content
-                .as_bytes()
-                .iter()
-                .zip(current_content.as_bytes())
-                .take_while(|(a, b)| a == b)
-                .count();
-            let mut start = common_prefix;
-            while start < current_len && !current_content.is_char_boundary(start) {
-                start += 1;
+            std::cmp::Ordering::Greater => String::new(),
+            std::cmp::Ordering::Equal => {
+                // Same-length overwrite (e.g. spinner/progress refresh).
+                // Find the longest common prefix and return only the changed suffix.
+                let common_prefix = self
+                    .last_content
+                    .as_bytes()
+                    .iter()
+                    .zip(current_content.as_bytes())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                let mut start = common_prefix;
+                while start < current_len && !current_content.is_char_boundary(start) {
+                    start += 1;
+                }
+                current_content[start..].to_string()
             }
-            current_content[start..].to_string()
-        } else {
-            let mut offset = self.last_len;
-            while offset < current_len && !current_content.is_char_boundary(offset) {
-                offset += 1;
+            std::cmp::Ordering::Less => {
+                let mut offset = self.last_len;
+                while offset < current_len && !current_content.is_char_boundary(offset) {
+                    offset += 1;
+                }
+                String::from_utf8_lossy(&current_bytes[offset..]).to_string()
             }
-            String::from_utf8_lossy(&current_bytes[offset..]).to_string()
         };
 
         self.last_len = current_len;

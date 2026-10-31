@@ -14,8 +14,8 @@
 
 use super::claude::ClaudeRunner;
 use super::{
-    truncate_at_char_boundary, AgentError, AgentRunner, ParsedResponse, PermissionRules,
-    StreamEvent,
+    AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent,
+    truncate_at_char_boundary,
 };
 
 /// Count Edit and Write tool_use events in NDJSON stream output.
@@ -73,12 +73,12 @@ fn extract_last_assistant_text(raw: &str) -> Option<String> {
             continue;
         };
         for item in content {
-            if item.get("type").and_then(|v| v.as_str()) == Some("text") {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        last_text = Some(trimmed.to_string());
-                    }
+            if item.get("type").and_then(|v| v.as_str()) == Some("text")
+                && let Some(text) = item.get("text").and_then(|v| v.as_str())
+            {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    last_text = Some(trimmed.to_string());
                 }
             }
         }
@@ -103,11 +103,17 @@ fn extract_stream_usage(raw: &str) -> (Option<u64>, Option<u64>) {
             continue;
         }
         if let Some(usage) = val.get("message").and_then(|m| m.get("usage")) {
-            if let Some(inp) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+            if let Some(inp) = usage
+                .get("input_tokens")
+                .and_then(serde_json::Value::as_u64)
+            {
                 total_input = total_input.max(inp); // take max (cumulative reported)
                 found = true;
             }
-            if let Some(out) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+            if let Some(out) = usage
+                .get("output_tokens")
+                .and_then(serde_json::Value::as_u64)
+            {
                 total_output = total_output.max(out);
                 found = true;
             }
@@ -124,6 +130,13 @@ fn extract_stream_usage(raw: &str) -> (Option<u64>, Option<u64>) {
 /// Named `MiniMaxClaudeRunner` to distinguish from a future native MiniMax CLI runner.
 pub struct MiniMaxClaudeRunner {
     inner: ClaudeRunner,
+}
+
+impl std::fmt::Debug for MiniMaxClaudeRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MiniMaxClaudeRunner")
+            .finish_non_exhaustive()
+    }
 }
 
 impl MiniMaxClaudeRunner {
@@ -215,10 +228,10 @@ impl AgentRunner for MiniMaxClaudeRunner {
 
     fn extract_text(&self, raw: &str) -> Result<String, AgentError> {
         // Try standard Claude extraction first
-        if let Ok(text) = self.inner.extract_text(raw) {
-            if !text.is_empty() {
-                return Ok(text);
-            }
+        if let Ok(text) = self.inner.extract_text(raw)
+            && !text.is_empty()
+        {
+            return Ok(text);
         }
 
         // Fall back to extracting last assistant text from stream

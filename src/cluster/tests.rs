@@ -180,14 +180,18 @@ async fn task_writes_go_through_the_log() {
         Some("internal:2")
     );
 
-    assert!(store
-        .update_status_if(a, TaskStatus::Routed, TaskStatus::New)
-        .await
-        .unwrap());
-    assert!(!store
-        .update_status_if(a, TaskStatus::InProgress, TaskStatus::New)
-        .await
-        .unwrap());
+    assert!(
+        store
+            .update_status_if(a, TaskStatus::Routed, TaskStatus::New)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .update_status_if(a, TaskStatus::InProgress, TaskStatus::New)
+            .await
+            .unwrap()
+    );
     assert_eq!(store.get(a).await.unwrap().status, TaskStatus::Routed);
     assert_eq!(store.increment(a, "attempts").await.unwrap(), 1);
 
@@ -385,11 +389,10 @@ async fn dependency_job_and_channel_writes_go_through_the_log_and_the_snapshot()
             .len(),
         1
     );
-    assert!(b
-        .list_subscribers_for_repo("other/repo")
-        .await
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        b.list_subscribers_for_repo("other/repo").await.unwrap(),
+        [] as [(String, String, String); 0]
+    );
 }
 
 #[tokio::test]
@@ -575,7 +578,7 @@ async fn three_voters_fail_over_and_catch_up() {
     let mut members = BTreeMap::new();
     for id in 1..=3 {
         let m = start_member(
-            dirs[id as usize - 1].path(),
+            dirs[usize::try_from(id - 1).unwrap()].path(),
             id,
             &voters,
             "s3cret",
@@ -605,7 +608,7 @@ async fn three_voters_fail_over_and_catch_up() {
     assert_eq!(b, a + 1);
 
     let back = start_member(
-        dirs[first as usize - 1].path(),
+        dirs[usize::try_from(first - 1).unwrap()].path(),
         first,
         &voters,
         "s3cret",
@@ -631,7 +634,7 @@ async fn a_witness_votes_but_never_leads() {
     for id in 1..=3 {
         let witness = id == 3;
         let m = start_member(
-            dirs[id as usize - 1].path(),
+            dirs[usize::try_from(id - 1).unwrap()].path(),
             id,
             &voters,
             "s3cret",
@@ -670,7 +673,7 @@ async fn a_node_with_the_wrong_secret_gets_nothing() {
     for id in 1..=3 {
         let secret = if id == 3 { "other" } else { "s3cret" };
         let m = start_member(
-            dirs[id as usize - 1].path(),
+            dirs[usize::try_from(id - 1).unwrap()].path(),
             id,
             &voters,
             secret,
@@ -703,7 +706,7 @@ async fn a_learner_joins_through_any_node_and_catches_up() {
     let mut members = BTreeMap::new();
     for id in 1..=3 {
         let m = start_member(
-            dirs[id as usize - 1].path(),
+            dirs[usize::try_from(id - 1).unwrap()].path(),
             id,
             &voters,
             "s3cret",
@@ -753,9 +756,11 @@ async fn a_learner_joins_through_any_node_and_catches_up() {
         (hello.name.as_str(), hello.leader),
         (format!("node{follower}").as_str(), Some(leader))
     );
-    assert!(network::probe(&voters[&follower], "wrong", None)
-        .await
-        .is_none());
+    assert!(
+        network::probe(&voters[&follower], "wrong", None)
+            .await
+            .is_none()
+    );
     assert!(
         network::probe(&voters[&follower], "s3cret", Some("impostor"))
             .await
@@ -795,13 +800,16 @@ async fn a_learner_joins_through_any_node_and_catches_up() {
 async fn probe_never_sends_the_secret_and_rejects_a_peer_without_proof() {
     use axum::http::HeaderMap;
     let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let record = seen.clone();
+    let record = std::sync::Arc::clone(&seen);
     let fake = axum::Router::new().route(
         "/cluster/hello",
         axum::routing::get(move |headers: HeaderMap| {
-            let record = record.clone();
+            let record = std::sync::Arc::clone(&record);
             async move {
-                let names = headers.keys().map(|k| k.to_string()).collect::<Vec<_>>();
+                let names = headers
+                    .keys()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>();
                 let values = headers
                     .values()
                     .filter_map(|v| v.to_str().ok().map(str::to_string))
@@ -965,7 +973,7 @@ async fn exactly_one_of_three_nodes_leads() {
     let mut members = BTreeMap::new();
     for id in 1..=3 {
         let m = start_member(
-            dirs[id as usize - 1].path(),
+            dirs[usize::try_from(id - 1).unwrap()].path(),
             id,
             &voters,
             "s3cret",
@@ -1006,7 +1014,7 @@ async fn a_relayed_proof_is_rejected() {
     let mut members = BTreeMap::new();
     for id in 1..=3 {
         let m = start_member(
-            dirs[id as usize - 1].path(),
+            dirs[usize::try_from(id - 1).unwrap()].path(),
             id,
             &voters,
             "s3cret",
@@ -1026,7 +1034,7 @@ async fn a_relayed_proof_is_rejected() {
             let real = real.clone();
             async move {
                 let mut req = reqwest::Client::new().get(format!("http://{real}/cluster/hello"));
-                for (k, v) in headers.iter() {
+                for (k, v) in &headers {
                     if k.as_str().starts_with("x-orch") {
                         req = req.header(k.as_str(), v.as_bytes());
                     }
@@ -1043,9 +1051,11 @@ async fn a_relayed_proof_is_rejected() {
     let relay_addr = listener.local_addr().unwrap().to_string();
     tokio::spawn(async move { axum::serve(listener, relay).await.ok() });
 
-    assert!(network::probe(&voters[&1], "s3cret", Some("node1"))
-        .await
-        .is_some());
+    assert!(
+        network::probe(&voters[&1], "s3cret", Some("node1"))
+            .await
+            .is_some()
+    );
     assert!(network::probe(&relay_addr, "s3cret", None).await.is_none());
     for (_, m) in members {
         m.node.stop().await;
@@ -1085,15 +1095,19 @@ async fn a_replicated_write_never_touches_local_state() {
         key: "raft:vote".into(),
         value: "forged".into(),
     };
-    assert!(raft_key
-        .clone()
-        .apply(&mut conn, "2026-01-02T03:04:05Z", true)
-        .await
-        .is_err());
-    assert!(raft_key
-        .apply(&mut conn, "2026-01-02T03:04:05Z", false)
-        .await
-        .is_ok());
+    assert!(
+        raft_key
+            .clone()
+            .apply(&mut conn, "2026-01-02T03:04:05Z", true)
+            .await
+            .is_err()
+    );
+    assert!(
+        raft_key
+            .apply(&mut conn, "2026-01-02T03:04:05Z", false)
+            .await
+            .is_ok()
+    );
 
     let worktree = Command::TaskSetFields {
         id: 1,

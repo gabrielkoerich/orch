@@ -11,7 +11,7 @@ use std::sync::Arc;
 pub async fn list() -> anyhow::Result<()> {
     let store = Arc::new(crate::cli::init_store().await?);
     // Hydrate in-memory map from persisted KV so we see the full state.
-    cooldown::init_cooldown_store(store.clone()).await;
+    cooldown::init_cooldown_store(std::sync::Arc::clone(&store)).await;
 
     // Recompute degraded agents so the CLI shows the same skip reasons as the
     // service, including agents held only by the rate-limit threshold
@@ -31,7 +31,7 @@ pub async fn list() -> anyhow::Result<()> {
     for (key, until, reason) in &entries {
         let remaining_secs = until - now;
         let remaining = format_remaining(remaining_secs);
-        println!("{:<30} {:<12} {}", key, remaining, reason);
+        println!("{key:<30} {remaining:<12} {reason}");
     }
     for (agent, reason) in degraded {
         if entries.iter().any(|(key, ..)| key == &agent) {
@@ -46,7 +46,7 @@ pub async fn list() -> anyhow::Result<()> {
 pub async fn clear(key: Option<String>, all: bool) -> anyhow::Result<()> {
     let store = Arc::new(crate::cli::init_store().await?);
     // Hydrate first so clear operates on the current state.
-    cooldown::init_cooldown_store(store.clone()).await;
+    cooldown::init_cooldown_store(std::sync::Arc::clone(&store)).await;
 
     if all {
         let agents = crate::engine::router::Router::from_config().available_agents;

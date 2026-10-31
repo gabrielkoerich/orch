@@ -13,7 +13,7 @@
 
 use super::{AgentProfile, RouteResult, RouterConfig};
 use crate::backends::ExternalTask;
-use crate::engine::runner::agents::{self, claude, opencode, AgentError};
+use crate::engine::runner::agents::{self, AgentError, claude, opencode};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -62,95 +62,6 @@ pub(crate) struct LlmAgentProfile {
 /// provider (type=error, error.message, rate limit signatures, etc.), or `None`
 /// if it doesn't match any known pattern.
 fn detect_error_envelope(value: &serde_json::Value) -> Option<String> {
-    let obj = value.as_object()?;
-
-    // Direct `{"type":"error",...}` envelope — check this BEFORE nested error branch
-    // since type=error envelopes also have an `error` key that would match the nested branch.
-    if obj.get("type").and_then(|v| v.as_str()) == Some("error") {
-        if let Some(msg) = obj
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(|m| m.as_str())
-        {
-            return Some(format!("type=error: {msg}"));
-        }
-        if let Some(msg) = obj.get("error").and_then(|e| e.as_str()) {
-            return Some(format!("type=error: {msg}"));
-        }
-        // Handle `{"error":{"name":"...","data":{"message":"..."}}}` inside type=error envelope
-        if let Some(error_obj) = obj.get("error").and_then(|e| e.as_object()) {
-            if let Some(data) = error_obj.get("data").and_then(|d| d.as_object()) {
-                if let Some(data_msg) = data.get("message").and_then(|m| m.as_str()) {
-                    let name = error_obj
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("UnknownError");
-                    return Some(format!("type=error: error.name={name}: {data_msg}"));
-                }
-            }
-            if let Some(msg) = error_obj.get("message").and_then(|m| m.as_str()) {
-                let name = error_obj
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("UnknownError");
-                return Some(format!("type=error: error.name={name}: {msg}"));
-            }
-        }
-        if let Some(msg) = obj.get("message").and_then(|m| m.as_str()) {
-            return Some(format!("type=error: {msg}"));
-        }
-        if let Some(name) = obj
-            .get("error")
-            .and_then(|e| e.get("name"))
-            .and_then(|n| n.as_str())
-        {
-            return Some(format!("type=error: error.name={name}"));
-        }
-        return Some("type=error (no message extracted)".to_string());
-    }
-
-    // Nested `{"error":{"name":"...","message":"...",...}}` or `{"error":{"type":"...","message":"...",...}}` envelope
-    if let Some(error_obj) = obj.get("error").and_then(|e| e.as_object()) {
-        let name = error_obj
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("UnknownError");
-        if let Some(msg) = error_obj.get("message").and_then(|m| m.as_str()) {
-            return Some(format!("error.name={name}: {msg}"));
-        }
-        if let Some(data) = error_obj.get("data").and_then(|d| d.as_object()) {
-            if let Some(data_msg) = data.get("message").and_then(|m| m.as_str()) {
-                // PermissionError with data.message is an OpenCode tool-use rejection,
-                // not an API auth/quota error. Skip it to avoid false-positive cooldowns.
-                if name == "PermissionError" {
-                    return None;
-                }
-                return Some(format!("error.name={name}: {data_msg}"));
-            }
-        }
-        if let Some(etype) = error_obj.get("type").and_then(|t| t.as_str()) {
-            if let Some(msg) = error_obj.get("message").and_then(|m| m.as_str()) {
-                return Some(format!("error.type={etype}: {msg}"));
-            }
-            return Some(format!("error.type={etype}"));
-        }
-        return Some(format!("error.name={name}"));
-    }
-
-    // OpenAI-style `{"error": "message string"}`
-    if let Some(err_str) = obj.get("error").and_then(|e| e.as_str()) {
-        return Some(format!("error: {err_str}"));
-    }
-
-    // Error message substring detection (defense in depth).
-    // Instead of scanning the entire serialized JSON (which can contain
-    // unrelated identifiers like MCP tool names), only inspect likely
-    // error-bearing fields. Collect candidate strings from common keys
-    // such as `message`, `error`, `result`, `detail`, `reason`, and
-    // numeric `status` values. This avoids false positives when tool
-    // names or skill ids contain words like "authentication".
-    let mut candidates = Vec::new();
-
     // Helper: recursively walk an object and collect strings/numbers for
     // whitelisted keys. We still recurse into objects to find nested
     // `error.data.message` etc., but we do NOT collect values for keys
@@ -218,6 +129,95 @@ fn detect_error_envelope(value: &serde_json::Value) -> Option<String> {
         }
     }
 
+    let obj = value.as_object()?;
+
+    // Direct `{"type":"error",...}` envelope — check this BEFORE nested error branch
+    // since type=error envelopes also have an `error` key that would match the nested branch.
+    if obj.get("type").and_then(|v| v.as_str()) == Some("error") {
+        if let Some(msg) = obj
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            return Some(format!("type=error: {msg}"));
+        }
+        if let Some(msg) = obj.get("error").and_then(|e| e.as_str()) {
+            return Some(format!("type=error: {msg}"));
+        }
+        // Handle `{"error":{"name":"...","data":{"message":"..."}}}` inside type=error envelope
+        if let Some(error_obj) = obj.get("error").and_then(|e| e.as_object()) {
+            if let Some(data) = error_obj.get("data").and_then(|d| d.as_object())
+                && let Some(data_msg) = data.get("message").and_then(|m| m.as_str())
+            {
+                let name = error_obj
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("UnknownError");
+                return Some(format!("type=error: error.name={name}: {data_msg}"));
+            }
+            if let Some(msg) = error_obj.get("message").and_then(|m| m.as_str()) {
+                let name = error_obj
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("UnknownError");
+                return Some(format!("type=error: error.name={name}: {msg}"));
+            }
+        }
+        if let Some(msg) = obj.get("message").and_then(|m| m.as_str()) {
+            return Some(format!("type=error: {msg}"));
+        }
+        if let Some(name) = obj
+            .get("error")
+            .and_then(|e| e.get("name"))
+            .and_then(|n| n.as_str())
+        {
+            return Some(format!("type=error: error.name={name}"));
+        }
+        return Some("type=error (no message extracted)".to_string());
+    }
+
+    // Nested `{"error":{"name":"...","message":"...",...}}` or `{"error":{"type":"...","message":"...",...}}` envelope
+    if let Some(error_obj) = obj.get("error").and_then(|e| e.as_object()) {
+        let name = error_obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("UnknownError");
+        if let Some(msg) = error_obj.get("message").and_then(|m| m.as_str()) {
+            return Some(format!("error.name={name}: {msg}"));
+        }
+        if let Some(data) = error_obj.get("data").and_then(|d| d.as_object())
+            && let Some(data_msg) = data.get("message").and_then(|m| m.as_str())
+        {
+            // PermissionError with data.message is an OpenCode tool-use rejection,
+            // not an API auth/quota error. Skip it to avoid false-positive cooldowns.
+            if name == "PermissionError" {
+                return None;
+            }
+            return Some(format!("error.name={name}: {data_msg}"));
+        }
+        if let Some(etype) = error_obj.get("type").and_then(|t| t.as_str()) {
+            if let Some(msg) = error_obj.get("message").and_then(|m| m.as_str()) {
+                return Some(format!("error.type={etype}: {msg}"));
+            }
+            return Some(format!("error.type={etype}"));
+        }
+        return Some(format!("error.name={name}"));
+    }
+
+    // OpenAI-style `{"error": "message string"}`
+    if let Some(err_str) = obj.get("error").and_then(|e| e.as_str()) {
+        return Some(format!("error: {err_str}"));
+    }
+
+    // Error message substring detection (defense in depth).
+    // Instead of scanning the entire serialized JSON (which can contain
+    // unrelated identifiers like MCP tool names), only inspect likely
+    // error-bearing fields. Collect candidate strings from common keys
+    // such as `message`, `error`, `result`, `detail`, `reason`, and
+    // numeric `status` values. This avoids false positives when tool
+    // names or skill ids contain words like "authentication".
+    let mut candidates = Vec::new();
+
     collect_error_candidates(value, &mut candidates);
 
     let joined = candidates.join(" \n ");
@@ -268,10 +268,10 @@ fn classify_router_llm_failure(agent: &str, stdout: &str, stderr: &str) -> Strin
     // If stdout has content, try to detect structured errors or startup-only envelopes
     if !stdout_trimmed.is_empty() {
         // Try to parse stdout as JSON to detect error envelopes
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(stdout_trimmed) {
-            if let Some(err_msg) = detect_error_envelope(&val) {
-                return err_msg;
-            }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(stdout_trimmed)
+            && let Some(err_msg) = detect_error_envelope(&val)
+        {
+            return err_msg;
         }
 
         // Check for startup/system-only NDJSON by running through extract_agent_text
@@ -322,10 +322,10 @@ fn classify_router_llm_failure(agent: &str, stdout: &str, stderr: &str) -> Strin
         }
 
         // Try tolerant reparse to find embedded error envelopes
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(stdout_trimmed) {
-            if let Some(err_msg) = detect_error_envelope(&val) {
-                return err_msg;
-            }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(stdout_trimmed)
+            && let Some(err_msg) = detect_error_envelope(&val)
+        {
+            return err_msg;
         }
 
         // Last resort: check for common error indicators in stdout.
@@ -514,7 +514,7 @@ fn scan_skills_directory(skills_dir: &std::path::Path) -> Option<String> {
 }
 
 impl LlmRouter {
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             skills_catalog: tokio::sync::Mutex::new(None),
         }
@@ -525,8 +525,11 @@ impl LlmRouter {
     /// This is the core routing method. The `router_agent` and `router_model` parameters
     /// identify which LLM to use for classification (distinct from the task's target agent).
     /// The `Router` drives pool selection and calls this method for each pool entry.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn route_with_llm_using(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each argument is a separate routing input from the caller"
+    )]
+    pub(super) async fn route_with_llm_using(
         &self,
         task: &ExternalTask,
         available_agents: &[String],
@@ -536,6 +539,8 @@ impl LlmRouter {
         router_agent: &str,
         router_model: Option<&str>,
     ) -> anyhow::Result<RouteResult> {
+        const FIBONACCI_ESTIMATES: [u8; 8] = [0, 1, 2, 3, 5, 8, 13, 21];
+
         if available_agents.is_empty() {
             anyhow::bail!("no agent CLIs found in PATH");
         }
@@ -562,7 +567,7 @@ impl LlmRouter {
             .await?;
 
         // Parse the response
-        let llm_response: LlmRouteResponse = self.parse_llm_response(router_agent, &response)?;
+        let llm_response: LlmRouteResponse = Self::parse_llm_response(router_agent, &response)?;
 
         // Validate the selected agent
         let mut agent = llm_response.executor.to_lowercase();
@@ -636,7 +641,7 @@ impl LlmRouter {
         let _ = tokio::fs::write(&response_path, &response).await;
 
         // Log a concise routing summary at info level (after sanity checks complete)
-        let warning = self.check_routing_sanity(task, &agent, &profile);
+        let warning = Self::check_routing_sanity(task, &agent, &profile);
 
         tracing::info!(
             task_id = task.id.0,
@@ -650,9 +655,8 @@ impl LlmRouter {
 
         // Log clean text payload at debug level (not raw NDJSON startup noise)
         let debug_preview = {
-            let inner = self
-                .extract_agent_text(router_agent, response.trim())
-                .unwrap_or_else(|_| response.to_string());
+            let inner = Self::extract_agent_text(router_agent, response.trim())
+                .unwrap_or_else(|_| response.clone());
             let trimmed = inner.trim();
             if trimmed.len() <= 500 {
                 trimmed.to_string()
@@ -668,14 +672,13 @@ impl LlmRouter {
         );
 
         // Validate and normalize estimate to allowed Fibonacci values.
-        const FIBONACCI_ESTIMATES: [u8; 8] = [0, 1, 2, 3, 5, 8, 13, 21];
         let estimate = if FIBONACCI_ESTIMATES.contains(&llm_response.estimate) {
             llm_response.estimate
         } else {
             // Map to nearest allowed value; warn so operators can tune the prompt.
             let nearest = FIBONACCI_ESTIMATES
                 .iter()
-                .min_by_key(|&&v| (v as i16 - llm_response.estimate as i16).unsigned_abs())
+                .min_by_key(|&&v| (i16::from(v) - i16::from(llm_response.estimate)).unsigned_abs())
                 .copied()
                 .unwrap_or(0);
             tracing::warn!(
@@ -760,7 +763,7 @@ impl LlmRouter {
     /// Invalidate the skills catalog cache so the next routing call reloads from disk.
     ///
     /// Called after `skills_sync()` updates skill files on disk.
-    pub async fn invalidate_skills_catalog(&self) {
+    pub(super) async fn invalidate_skills_catalog(&self) {
         let mut cache = self.skills_catalog.lock().await;
         *cache = None;
     }
@@ -785,28 +788,26 @@ impl LlmRouter {
 
         let catalog = tokio::task::spawn_blocking(move || -> String {
             // Try skills.yml in current directory
-            if let Ok(content) = std::fs::read_to_string("skills.yml") {
-                if let Ok(yaml) = serde_norway::from_str::<serde_norway::Value>(&content) {
-                    if let Some(skills) = yaml.get("skills") {
-                        if let Ok(json) = serde_json::to_string(skills) {
-                            return json;
-                        }
-                    }
-                }
+            if let Ok(content) = std::fs::read_to_string("skills.yml")
+                && let Ok(yaml) = serde_norway::from_str::<serde_norway::Value>(&content)
+                && let Some(skills) = yaml.get("skills")
+                && let Ok(json) = serde_json::to_string(skills)
+            {
+                return json;
             }
 
             // Try ORCH_HOME/skills directory
-            if let Some(skills_dir) = skills_dir_opt.as_ref() {
-                if let Some(catalog) = scan_skills_directory(skills_dir) {
-                    return catalog;
-                }
+            if let Some(skills_dir) = skills_dir_opt.as_ref()
+                && let Some(catalog) = scan_skills_directory(skills_dir)
+            {
+                return catalog;
             }
 
             // Try ~/.orch/skills
-            if let Ok(skills_dir) = crate::home::skills_dir() {
-                if let Some(catalog) = scan_skills_directory(&skills_dir) {
-                    return catalog;
-                }
+            if let Ok(skills_dir) = crate::home::skills_dir()
+                && let Some(catalog) = scan_skills_directory(&skills_dir)
+            {
+                return catalog;
             }
 
             "[]".to_string()
@@ -832,7 +833,7 @@ impl LlmRouter {
         model: Option<&str>,
         timeout: Duration,
     ) -> anyhow::Result<String> {
-        use crate::engine::runner::direct::{run_direct_command_raw, DirectCommandError};
+        use crate::engine::runner::direct::{DirectCommandError, run_direct_command_raw};
 
         // Skip immediately if the agent itself is on cooldown (agent-level)
         if crate::engine::cooldown::is_agent_in_cooldown(agent) {
@@ -894,8 +895,7 @@ impl LlmRouter {
     /// Handles: direct JSON, Claude `--output-format stream-json` NDJSON,
     /// Claude `--output-format json` envelopes, markdown code blocks, and raw
     /// text with embedded JSON.
-    pub fn parse_llm_response(
-        &self,
+    pub(super) fn parse_llm_response(
         agent: &str,
         response: &str,
     ) -> anyhow::Result<LlmRouteResponse> {
@@ -904,7 +904,7 @@ impl LlmRouter {
             anyhow::bail!("empty LLM response");
         }
 
-        let inner = self.extract_agent_text(agent, trimmed)?;
+        let inner = Self::extract_agent_text(agent, trimmed)?;
 
         let text = inner.trim();
 
@@ -945,33 +945,33 @@ impl LlmRouter {
         }
 
         // Step 4: Try to find JSON object between curly braces
-        if let Some(start) = text.find('{') {
-            if let Some(end) = text.rfind('}') {
-                let json_str = &text[start..=end];
-                // Attempt to parse the curly-brace substring as a generic JSON
-                // value first so we can inspect keys before accepting it as a
-                // routing decision. This prevents accidental acceptance of
-                // unrelated JSON fragments embedded in prose (e.g. log
-                // snippets). Only accept the JSON if it contains an
-                // identifying routing key ("executor" or alias "agent").
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
-                    if let Some(obj) = value.as_object() {
-                        // Only accept if it contains routing-identifying keys
-                        if obj.contains_key("executor") || obj.contains_key("agent") {
-                            if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(json_str) {
-                                if parsed.executor.trim().is_empty() {
-                                    anyhow::bail!("LLM response contained empty 'executor' field");
-                                }
-                                return Ok(parsed);
-                            }
+        if let Some(start) = text.find('{')
+            && let Some(end) = text.rfind('}')
+        {
+            let json_str = &text[start..=end];
+            // Attempt to parse the curly-brace substring as a generic JSON
+            // value first so we can inspect keys before accepting it as a
+            // routing decision. This prevents accidental acceptance of
+            // unrelated JSON fragments embedded in prose (e.g. log
+            // snippets). Only accept the JSON if it contains an
+            // identifying routing key ("executor" or alias "agent").
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(obj) = value.as_object() {
+                    // Only accept if it contains routing-identifying keys
+                    if (obj.contains_key("executor") || obj.contains_key("agent"))
+                        && let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(json_str)
+                    {
+                        if parsed.executor.trim().is_empty() {
+                            anyhow::bail!("LLM response contained empty 'executor' field");
                         }
+                        return Ok(parsed);
                     }
+                }
 
-                    // json_str is valid JSON but not a routing response — check
-                    // for known error envelopes and surface those first.
-                    if let Some(err_msg) = detect_error_envelope(&value) {
-                        anyhow::bail!("router LLM returned error payload: {err_msg}");
-                    }
+                // json_str is valid JSON but not a routing response — check
+                // for known error envelopes and surface those first.
+                if let Some(err_msg) = detect_error_envelope(&value) {
+                    anyhow::bail!("router LLM returned error payload: {err_msg}");
                 }
             }
         }
@@ -983,7 +983,7 @@ impl LlmRouter {
         // conservatively scanned for JSON objects. If tolerant re-parse
         // succeeds, accept it; if it yields a known error envelope, surface
         // that error; otherwise treat as a true parse failure.
-        match self.tolerant_reparse(response) {
+        match Self::tolerant_reparse(response) {
             Ok(Some(parsed)) => Ok(parsed),
             Ok(None) => {
                 anyhow::bail!(
@@ -1001,7 +1001,7 @@ impl LlmRouter {
     /// - Ok(Some(LlmRouteResponse)) when a routing decision could be extracted
     /// - Ok(None) when no usable routing decision was found
     /// - Err(String) when a known error envelope was detected and should be surfaced
-    fn tolerant_reparse(&self, raw: &str) -> anyhow::Result<Option<LlmRouteResponse>> {
+    fn tolerant_reparse(raw: &str) -> anyhow::Result<Option<LlmRouteResponse>> {
         let raw = raw.trim();
         if raw.is_empty() {
             return Ok(None);
@@ -1021,25 +1021,24 @@ impl LlmRouter {
             if let Some(end_rel) = after_trimmed.find("```") {
                 let json_str = &after_trimmed[..end_rel].trim();
                 if !json_str.is_empty() {
-                    if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(json_str) {
-                        if !parsed.executor.trim().is_empty() {
-                            return Ok(Some(parsed));
-                        }
+                    if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(json_str)
+                        && !parsed.executor.trim().is_empty()
+                    {
+                        return Ok(Some(parsed));
                     }
                     // Try parsing generic JSON to check for error envelopes
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
-                        if let Some(err) = detect_error_envelope(&val) {
-                            return Err(anyhow::anyhow!(err));
-                        }
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str)
+                        && let Some(err) = detect_error_envelope(&val)
+                    {
+                        return Err(anyhow::anyhow!(err));
                     }
                 }
                 // Advance past this block
                 idx = abs_start + 3 + end_rel + 3;
                 continue;
-            } else {
-                // No matching end fence — break to avoid infinite loop
-                break;
             }
+            // No matching end fence — break to avoid infinite loop
+            break;
         }
 
         // 2) Try to extract balanced JSON objects from the raw text. This is a
@@ -1057,27 +1056,22 @@ impl LlmRouter {
                         depth -= 1;
                         if depth == 0 {
                             // candidate from i..=j
-                            if let Ok(candidate) = std::str::from_utf8(&bytes[i..=j]) {
-                                if let Ok(val) =
+                            if let Ok(candidate) = std::str::from_utf8(&bytes[i..=j])
+                                && let Ok(val) =
                                     serde_json::from_str::<serde_json::Value>(candidate)
+                            {
+                                // If it's an error envelope, surface it
+                                if let Some(err) = detect_error_envelope(&val) {
+                                    return Err(anyhow::anyhow!(err));
+                                }
+                                // Only accept if contains routing key
+                                if let Some(obj) = val.as_object()
+                                    && (obj.contains_key("executor") || obj.contains_key("agent"))
+                                    && let Ok(parsed) =
+                                        serde_json::from_str::<LlmRouteResponse>(candidate)
+                                    && !parsed.executor.trim().is_empty()
                                 {
-                                    // If it's an error envelope, surface it
-                                    if let Some(err) = detect_error_envelope(&val) {
-                                        return Err(anyhow::anyhow!(err));
-                                    }
-                                    // Only accept if contains routing key
-                                    if let Some(obj) = val.as_object() {
-                                        if obj.contains_key("executor") || obj.contains_key("agent")
-                                        {
-                                            if let Ok(parsed) =
-                                                serde_json::from_str::<LlmRouteResponse>(candidate)
-                                            {
-                                                if !parsed.executor.trim().is_empty() {
-                                                    return Ok(Some(parsed));
-                                                }
-                                            }
-                                        }
-                                    }
+                                    return Ok(Some(parsed));
                                 }
                             }
                             break;
@@ -1096,23 +1090,23 @@ impl LlmRouter {
         //    opencode/Claude wrappers.
         if let Some(text) = opencode::extract_router_text(raw) {
             let trimmed = text.trim();
-            if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(trimmed) {
-                if !parsed.executor.trim().is_empty() {
-                    return Ok(Some(parsed));
-                }
+            if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(trimmed)
+                && !parsed.executor.trim().is_empty()
+            {
+                return Ok(Some(parsed));
             }
             // If it's valid JSON but an error envelope, surface it
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                if let Some(err) = detect_error_envelope(&val) {
-                    return Err(anyhow::anyhow!(err));
-                }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
+                && let Some(err) = detect_error_envelope(&val)
+            {
+                return Err(anyhow::anyhow!(err));
             }
         }
 
         Ok(None)
     }
 
-    fn extract_agent_text(&self, agent: &str, raw: &str) -> anyhow::Result<String> {
+    fn extract_agent_text(agent: &str, raw: &str) -> anyhow::Result<String> {
         match router_transcript(agent) {
             agents::RouterTranscript::OpenCode => {
                 let events = agents::parse_ndjson(raw.trim());
@@ -1124,38 +1118,33 @@ impl LlmRouter {
                     // event types). If they don't, they're likely plain JSON that got
                     // parsed via the fragmented NDJSON fallback, so fall back to raw text.
                     let looks_like_opencode_ndjson = events.iter().any(|e| {
-                        e.get("type")
-                            .and_then(|v| v.as_str())
-                            .map(|t| {
-                                matches!(
-                                    t,
-                                    "step_start"
-                                        | "step_finish"
-                                        | "text"
-                                        | "message"
-                                        | "assistant"
-                                        | "error"
-                                        | "system"
-                                ) || t.contains("step")
-                                    || t.contains("text")
-                                    || t.contains("error")
-                            })
-                            .unwrap_or(false)
+                        e.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
+                            matches!(
+                                t,
+                                "step_start"
+                                    | "step_finish"
+                                    | "text"
+                                    | "message"
+                                    | "assistant"
+                                    | "error"
+                                    | "system"
+                            ) || t.contains("step")
+                                || t.contains("text")
+                                || t.contains("error")
+                        })
                     });
 
-                    match opencode::extract_ndjson_text(&events) {
-                        Some(text) => Ok(text),
-                        None => {
-                            if looks_like_opencode_ndjson {
-                                // Real opencode NDJSON events but no text payload — clear error
-                                anyhow::bail!(
-                                    "opencode produced no text output (NDJSON had no text events)"
-                                )
-                            } else {
-                                // Not opencode NDJSON — likely plain JSON from fragmented fallback
-                                Ok(raw.to_string())
-                            }
+                    if let Some(text) = opencode::extract_ndjson_text(&events) {
+                        Ok(text)
+                    } else {
+                        if looks_like_opencode_ndjson {
+                            // Real opencode NDJSON events but no text payload — clear error
+                            anyhow::bail!(
+                                "opencode produced no text output (NDJSON had no text events)"
+                            )
                         }
+                        // Not opencode NDJSON — likely plain JSON from fragmented fallback
+                        Ok(raw.to_string())
                     }
                 }
             }
@@ -1178,8 +1167,7 @@ impl LlmRouter {
                                 || val
                                     .get("subtype")
                                     .and_then(|v| v.as_str())
-                                    .map(|s| s == "init")
-                                    .unwrap_or(false)
+                                    .is_some_and(|s| s == "init")
                         } else {
                             false
                         };
@@ -1216,8 +1204,7 @@ impl LlmRouter {
     }
 
     /// Run sanity checks on routing decision.
-    pub fn check_routing_sanity(
-        &self,
+    pub(super) fn check_routing_sanity(
         task: &ExternalTask,
         agent: &str,
         _profile: &AgentProfile,
@@ -1259,17 +1246,16 @@ mod tests {
     use crate::backends::{ExternalId, ExternalTask};
     use crate::engine::router::AgentProfile;
 
-    fn make_router() -> LlmRouter {
-        LlmRouter::new()
-    }
-
-    fn make_task(labels: Vec<&str>) -> ExternalTask {
+    fn make_task(labels: &[&str]) -> ExternalTask {
         ExternalTask {
             id: ExternalId("42".to_string()),
             title: "Test task".to_string(),
             body: "Test body".to_string(),
             state: "open".to_string(),
-            labels: labels.iter().map(|s| s.to_string()).collect(),
+            labels: labels
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             author: "testuser".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -1277,10 +1263,13 @@ mod tests {
         }
     }
 
-    fn make_profile(skills: Vec<&str>) -> AgentProfile {
+    fn make_profile(skills: &[&str]) -> AgentProfile {
         AgentProfile {
             role: "developer".to_string(),
-            skills: skills.iter().map(|s| s.to_string()).collect(),
+            skills: skills
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             tools: vec!["git".to_string()],
             constraints: vec![],
         }
@@ -1405,7 +1394,7 @@ mod tests {
         // Non-object JSON values should return None
         let json: serde_json::Value = serde_json::from_str(r#""just a string""#).unwrap();
         assert!(detect_error_envelope(&json).is_none());
-        let json: serde_json::Value = serde_json::from_str(r#"[1,2,3]"#).unwrap();
+        let json: serde_json::Value = serde_json::from_str(r"[1,2,3]").unwrap();
         assert!(detect_error_envelope(&json).is_none());
     }
 
@@ -1429,9 +1418,8 @@ mod tests {
 
     #[test]
     fn parse_direct_json_executor_field() {
-        let router = make_router();
         let json = r#"{"executor":"claude","complexity":"medium","reason":"good fit"}"#;
-        let resp = router.parse_llm_response("claude", json).unwrap();
+        let resp = LlmRouter::parse_llm_response("claude", json).unwrap();
         assert_eq!(resp.executor, "claude");
         assert_eq!(resp.complexity, "medium");
     }
@@ -1439,15 +1427,13 @@ mod tests {
     #[test]
     fn parse_direct_json_agent_alias() {
         // LLM sometimes returns "agent" instead of "executor"
-        let router = make_router();
         let json = r#"{"agent":"codex","complexity":"simple","reason":"straightforward"}"#;
-        let resp = router.parse_llm_response("claude", json).unwrap();
+        let resp = LlmRouter::parse_llm_response("claude", json).unwrap();
         assert_eq!(resp.executor, "codex");
     }
 
     #[test]
     fn parse_full_json_with_profile() {
-        let router = make_router();
         let json = r#"{
             "executor": "opencode",
             "complexity": "complex",
@@ -1460,7 +1446,7 @@ mod tests {
             },
             "selected_skills": ["gh"]
         }"#;
-        let resp = router.parse_llm_response("opencode", json).unwrap();
+        let resp = LlmRouter::parse_llm_response("opencode", json).unwrap();
         assert_eq!(resp.executor, "opencode");
         assert_eq!(resp.complexity, "complex");
         assert_eq!(resp.profile.role, "architect");
@@ -1471,30 +1457,27 @@ mod tests {
     #[test]
     fn parse_claude_envelope_string_result() {
         // Claude --output-format json wraps the result in a {"type":"result","result":"..."} envelope
-        let router = make_router();
         let inner = r#"{"executor":"claude","complexity":"medium","reason":"test"}"#;
         let envelope = format!(
             r#"{{"type":"result","subtype":"text","is_error":false,"result":"{}","usage":{{"input":10,"output":5}}}}"#,
             inner.replace('"', "\\\"")
         );
-        let resp = router.parse_llm_response("claude", &envelope).unwrap();
+        let resp = LlmRouter::parse_llm_response("claude", &envelope).unwrap();
         assert_eq!(resp.executor, "claude");
     }
 
     #[test]
     fn parse_claude_envelope_object_result() {
         // When result is already a JSON object (not a string)
-        let router = make_router();
         let envelope = r#"{"type":"result","is_error":false,"result":{"executor":"kimi","complexity":"simple","reason":"fast"}}"#;
-        let resp = router.parse_llm_response("claude", envelope).unwrap();
+        let resp = LlmRouter::parse_llm_response("claude", envelope).unwrap();
         assert_eq!(resp.executor, "kimi");
     }
 
     #[test]
     fn parse_claude_error_envelope() {
-        let router = make_router();
         let envelope = r#"{"type":"result","is_error":true,"result":"auth error: invalid key"}"#;
-        let err = router.parse_llm_response("claude", envelope).unwrap_err();
+        let err = LlmRouter::parse_llm_response("claude", envelope).unwrap_err();
         assert!(
             err.to_string().contains("error"),
             "should surface the error"
@@ -1503,17 +1486,15 @@ mod tests {
 
     #[test]
     fn parse_markdown_json_fenced_block() {
-        let router = make_router();
         let md = "Here is my routing decision:\n\n```json\n{\"executor\":\"codex\",\"complexity\":\"simple\",\"reason\":\"easy\"}\n```\n\nDone.";
-        let resp = router.parse_llm_response("claude", md).unwrap();
+        let resp = LlmRouter::parse_llm_response("claude", md).unwrap();
         assert_eq!(resp.executor, "codex");
     }
 
     #[test]
     fn parse_markdown_plain_fenced_block() {
-        let router = make_router();
         let md = "```\n{\"executor\":\"minimax\",\"complexity\":\"medium\",\"reason\":\"ok\"}\n```";
-        let resp = router.parse_llm_response("claude", md).unwrap();
+        let resp = LlmRouter::parse_llm_response("claude", md).unwrap();
         assert_eq!(resp.executor, "minimax");
     }
 
@@ -1521,9 +1502,8 @@ mod tests {
     fn parse_valid_json_error_envelope_type_error() {
         // Valid JSON with {"type":"error",...} should NOT produce "could not parse" error.
         // Instead it should surface as "router LLM returned error payload: ...".
-        let router = make_router();
         let json = r#"{"type":"error","timestamp":1743212400,"error":{"name":"UnknownError","data":{"message":"Unable to connect to upstream"}}}"#;
-        let err = router.parse_llm_response("claude", json).unwrap_err();
+        let err = LlmRouter::parse_llm_response("claude", json).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("router LLM returned error payload"),
@@ -1542,9 +1522,8 @@ mod tests {
     #[test]
     fn parse_valid_json_error_envelope_kimi_style() {
         // Kimi-style error envelope with nested error object
-        let router = make_router();
         let json = r#"{"error":{"type":"permission_error","message":"You've reached your usage limit for this billing cycle."},"type":"error"}"#;
-        let err = router.parse_llm_response("kimi", json).unwrap_err();
+        let err = LlmRouter::parse_llm_response("kimi", json).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("error") && !msg.contains("could not parse"),
@@ -1555,9 +1534,8 @@ mod tests {
     #[test]
     fn parse_valid_json_error_envelope_openai_style() {
         // OpenAI-style {"error": "message string"} envelope
-        let router = make_router();
         let json = r#"{"error":"rate limit exceeded","type":"standard"}"#;
-        let err = router.parse_llm_response("claude", json).unwrap_err();
+        let err = LlmRouter::parse_llm_response("claude", json).unwrap_err();
         let msg = err.to_string();
         assert!(
             !msg.contains("could not parse"),
@@ -1568,9 +1546,8 @@ mod tests {
     #[test]
     fn parse_valid_json_error_envelope_with_indicator() {
         // Valid JSON that contains error indicators but no explicit error envelope
-        let router = make_router();
         let json = r#"{"status":503,"message":"Service overloaded, retry later","retry_after":30}"#;
-        let err = router.parse_llm_response("claude", json).unwrap_err();
+        let err = LlmRouter::parse_llm_response("claude", json).unwrap_err();
         let msg = err.to_string();
         assert!(
             !msg.contains("could not parse"),
@@ -1585,126 +1562,110 @@ mod tests {
     #[test]
     fn parse_malformed_json_produces_parse_failure() {
         // True malformed JSON must still produce "could not parse" error
-        let router = make_router();
-        let err = router
-            .parse_llm_response("claude", "{ invalid json }")
-            .unwrap_err();
+        let err = LlmRouter::parse_llm_response("claude", "{ invalid json }").unwrap_err();
         assert!(
             err.to_string().contains("could not parse"),
-            "malformed JSON must produce parse failure, got: {}",
-            err
+            "malformed JSON must produce parse failure, got: {err}"
         );
     }
 
     #[test]
     fn parse_valid_route_json_still_succeeds() {
         // Ensure the success path still works (valid JSON that is LlmRouteResponse)
-        let router = make_router();
         let json = r#"{"executor":"claude","complexity":"medium","reason":"test"}"#;
-        let resp = router.parse_llm_response("claude", json).unwrap();
+        let resp = LlmRouter::parse_llm_response("claude", json).unwrap();
         assert_eq!(resp.executor, "claude");
         assert_eq!(resp.complexity, "medium");
     }
 
     #[test]
     fn parse_embedded_json_in_prose() {
-        let router = make_router();
         let text = r#"I analyzed the task. My decision is {"executor":"claude","complexity":"complex","reason":"hard task"}. Please proceed."#;
-        let resp = router.parse_llm_response("claude", text).unwrap();
+        let resp = LlmRouter::parse_llm_response("claude", text).unwrap();
         assert_eq!(resp.executor, "claude");
         assert_eq!(resp.complexity, "complex");
     }
 
     #[test]
     fn parse_embedded_json_fragment_without_executor_is_ignored() {
-        let router = make_router();
         let text = r#"Here is a debug trace: {"trace":{"duration":123,"id":"abc"}} — end of log."#;
         // The embedded JSON does not contain an `executor`/`agent` key and
         // should not be accepted as a routing decision.
-        assert!(router.parse_llm_response("claude", text).is_err());
+        assert!(LlmRouter::parse_llm_response("claude", text).is_err());
     }
 
     #[test]
     fn parse_fenced_json_without_executor_fails() {
-        let router = make_router();
         let md = "```json\n{\"trace\":{\"duration\":10}}\n```";
-        assert!(router.parse_llm_response("claude", md).is_err());
+        assert!(LlmRouter::parse_llm_response("claude", md).is_err());
     }
 
     #[test]
     fn parse_empty_response_fails() {
-        let router = make_router();
-        assert!(router.parse_llm_response("claude", "").is_err());
-        assert!(router.parse_llm_response("claude", "   ").is_err());
+        assert!(LlmRouter::parse_llm_response("claude", "").is_err());
+        assert!(LlmRouter::parse_llm_response("claude", "   ").is_err());
     }
 
     #[test]
     fn parse_invalid_response_fails() {
-        let router = make_router();
-        assert!(router
-            .parse_llm_response("claude", "not json at all")
-            .is_err());
-        assert!(router
-            .parse_llm_response("claude", "{ invalid json }")
-            .is_err());
+        assert!(LlmRouter::parse_llm_response("claude", "not json at all").is_err());
+        assert!(LlmRouter::parse_llm_response("claude", "{ invalid json }").is_err());
     }
 
     #[test]
     fn parse_defaults_apply_for_missing_fields() {
         // Only "executor" is required — other fields should default
-        let router = make_router();
         let json = r#"{"executor":"claude"}"#;
-        let resp = router.parse_llm_response("claude", json).unwrap();
+        let resp = LlmRouter::parse_llm_response("claude", json).unwrap();
         assert_eq!(resp.executor, "claude");
         assert_eq!(resp.complexity, "");
         assert_eq!(resp.reason, "");
-        assert!(resp.selected_skills.is_empty());
+        assert!(
+            resp.selected_skills.is_empty(),
+            "{:?}",
+            resp.selected_skills
+        );
     }
 
     #[test]
     fn parse_fixture_route_response_string() {
-        let router = make_router();
         let response = include_str!("../../../tests/fixtures/route-response-string.json");
-        let resp = router.parse_llm_response("claude", response).unwrap();
+        let resp = LlmRouter::parse_llm_response("claude", response).unwrap();
         // Fixture should parse without error and produce a valid agent name
         assert!(!resp.executor.is_empty(), "executor must not be empty");
     }
 
     #[test]
     fn parse_fixture_route_response_object() {
-        let router = make_router();
         let response = include_str!("../../../tests/fixtures/route-response-object.json");
-        let resp = router.parse_llm_response("claude", response).unwrap();
+        let resp = LlmRouter::parse_llm_response("claude", response).unwrap();
         assert!(!resp.executor.is_empty(), "executor must not be empty");
     }
 
     #[test]
     fn parse_fixture_route_response_markdown() {
-        let router = make_router();
         let response = include_str!("../../../tests/fixtures/route-response-markdown.json");
-        let resp = router.parse_llm_response("claude", response).unwrap();
+        let resp = LlmRouter::parse_llm_response("claude", response).unwrap();
         assert!(!resp.executor.is_empty(), "executor must not be empty");
     }
 
     #[test]
     fn parse_opencode_ndjson_text_event() {
-        let router = make_router();
         let raw = r#"{"type":"step_start","timestamp":1}
 {"type":"text","timestamp":2,"part":{"type":"text","text":"progress update"}}
 {"type":"text","timestamp":3,"part":{"type":"text","text":"```json\n{\"executor\":\"opencode\",\"complexity\":\"medium\",\"reason\":\"ndjson\"}\n```"}}
 {"type":"step_finish","timestamp":4,"part":{"type":"step-finish","reason":"stop"}}"#;
-        let resp = router.parse_llm_response("opencode", raw).unwrap();
+        let resp = LlmRouter::parse_llm_response("opencode", raw).unwrap();
         assert_eq!(resp.executor, "opencode");
         assert_eq!(resp.complexity, "medium");
     }
 
     #[test]
     fn parse_opencode_ndjson_direct_text_field() {
-        let router = make_router();
         let raw = r#"{"type":"step_start","timestamp":1}
 {"type":"text","timestamp":2,"text":"{\"executor\":\"claude\",\"complexity\":\"simple\",\"reason\":\"direct text\"}"}
 {"type":"step_finish","timestamp":3,"part":{"type":"step-finish","reason":"stop"}}"#;
-        let resp = router.parse_llm_response("opencode", raw).unwrap();
+        let resp = LlmRouter::parse_llm_response("opencode", raw).unwrap();
         assert_eq!(resp.executor, "claude");
         assert_eq!(resp.complexity, "simple");
     }
@@ -1715,10 +1676,9 @@ mod tests {
         // no text payload, extract_agent_text must return a clear error instead
         // of falling back to the raw NDJSON string (which would cause parse_llm_response
         // to extract a step_start event and produce a misleading "could not parse" error).
-        let router = make_router();
         let raw = r#"{"type":"step_start","timestamp":1774721088828,"sessionID":"ses_abc","part":{"type":"step-start","snapshot":""}}
 {"type":"step_finish","timestamp":1774721089000,"part":{"type":"step-finish","reason":"stop","cost":0,"tokens":{"total":100,"input":99,"output":1}}}"#;
-        let err = router.parse_llm_response("opencode", raw).unwrap_err();
+        let err = LlmRouter::parse_llm_response("opencode", raw).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("no text") || msg.contains("no text events"),
@@ -1732,20 +1692,18 @@ mod tests {
 
     #[test]
     fn parse_kimi_stream_json_result() {
-        let router = make_router();
         let raw = r#"{"type":"system","subtype":"init"}
 {"type":"result","subtype":"success","is_error":false,"result":"{\"executor\":\"kimi\",\"complexity\":\"medium\",\"reason\":\"wrapper\"}"}"#;
-        let resp = router.parse_llm_response("kimi", raw).unwrap();
+        let resp = LlmRouter::parse_llm_response("kimi", raw).unwrap();
         assert_eq!(resp.executor, "kimi");
     }
 
     #[test]
     fn parse_messages_stream_follows_the_runner() {
-        let router = make_router();
         let raw = r#"{"type":"system","subtype":"init"}
 {"type":"result","subtype":"success","is_error":false,"result":"{\"executor\":\"grok\",\"complexity\":\"medium\",\"reason\":\"wrapper\"}"}"#;
         for agent in ["grok", "glm", "olm", "minimax"] {
-            let resp = router.parse_llm_response(agent, raw).unwrap();
+            let resp = LlmRouter::parse_llm_response(agent, raw).unwrap();
             assert_eq!(resp.executor, "grok", "{agent}");
         }
     }
@@ -1754,12 +1712,11 @@ mod tests {
     fn extract_agent_text_for_debug_log_ndjson_success() {
         // Regression test: extract_agent_text should return the clean text payload,
         // not the raw NDJSON startup noise that would appear in debug logs.
-        let router = make_router();
         let raw = r#"{"type":"system","subtype":"hook_started","hook_id":"abc"}
 {"type":"system","subtype":"init"}
 {"type":"text","timestamp":2,"text":"{\"executor\":\"claude\",\"complexity\":\"simple\",\"reason\":\"small fix\"}"}
 {"type":"step_finish","timestamp":3}"#;
-        let text = router.extract_agent_text("claude", raw.trim()).unwrap();
+        let text = LlmRouter::extract_agent_text("claude", raw.trim()).unwrap();
         let trimmed = text.trim();
         // Should contain the routing decision, not hook_started noise
         assert!(
@@ -1779,10 +1736,9 @@ mod tests {
 
     #[test]
     fn sanity_warns_backend_task_routed_to_claude() {
-        let router = make_router();
-        let task = make_task(vec!["backend", "priority:high"]);
-        let profile = make_profile(vec!["rust"]);
-        let warning = router.check_routing_sanity(&task, "claude", &profile);
+        let task = make_task(&["backend", "priority:high"]);
+        let profile = make_profile(&["rust"]);
+        let warning = LlmRouter::check_routing_sanity(&task, "claude", &profile);
         assert!(
             warning.is_some(),
             "should warn when backend task goes to claude"
@@ -1792,19 +1748,17 @@ mod tests {
 
     #[test]
     fn sanity_warns_api_label_routed_to_claude() {
-        let router = make_router();
-        let task = make_task(vec!["api", "feature"]);
-        let profile = make_profile(vec!["rest"]);
-        let warning = router.check_routing_sanity(&task, "claude", &profile);
+        let task = make_task(&["api", "feature"]);
+        let profile = make_profile(&["rest"]);
+        let warning = LlmRouter::check_routing_sanity(&task, "claude", &profile);
         assert!(warning.is_some());
     }
 
     #[test]
     fn sanity_warns_docs_task_routed_to_codex() {
-        let router = make_router();
-        let task = make_task(vec!["documentation"]);
-        let profile = make_profile(vec!["writing"]);
-        let warning = router.check_routing_sanity(&task, "codex", &profile);
+        let task = make_task(&["documentation"]);
+        let profile = make_profile(&["writing"]);
+        let warning = LlmRouter::check_routing_sanity(&task, "codex", &profile);
         assert!(
             warning.is_some(),
             "should warn when docs task goes to codex"
@@ -1814,38 +1768,34 @@ mod tests {
 
     #[test]
     fn sanity_warns_writing_label_routed_to_codex() {
-        let router = make_router();
-        let task = make_task(vec!["writing"]);
-        let profile = make_profile(vec!["markdown"]);
-        let warning = router.check_routing_sanity(&task, "codex", &profile);
+        let task = make_task(&["writing"]);
+        let profile = make_profile(&["markdown"]);
+        let warning = LlmRouter::check_routing_sanity(&task, "codex", &profile);
         assert!(warning.is_some());
     }
 
     #[test]
     fn sanity_no_warning_for_clean_routing() {
-        let router = make_router();
-        let task = make_task(vec!["feature", "rust"]);
-        let profile = make_profile(vec!["rust", "async"]);
-        let warning = router.check_routing_sanity(&task, "claude", &profile);
+        let task = make_task(&["feature", "rust"]);
+        let profile = make_profile(&["rust", "async"]);
+        let warning = LlmRouter::check_routing_sanity(&task, "claude", &profile);
         assert!(warning.is_none(), "no warning expected for clean routing");
     }
 
     #[test]
     fn sanity_no_warning_backend_to_codex() {
         // Backend label to codex is fine — only backend→claude warns
-        let router = make_router();
-        let task = make_task(vec!["backend"]);
-        let profile = make_profile(vec!["node"]);
-        let warning = router.check_routing_sanity(&task, "codex", &profile);
+        let task = make_task(&["backend"]);
+        let profile = make_profile(&["node"]);
+        let warning = LlmRouter::check_routing_sanity(&task, "codex", &profile);
         assert!(warning.is_none());
     }
 
     #[test]
     fn sanity_case_insensitive_label_matching() {
-        let router = make_router();
-        let task = make_task(vec!["Backend", "API"]); // mixed case
-        let profile = make_profile(vec!["rust"]);
-        let warning = router.check_routing_sanity(&task, "claude", &profile);
+        let task = make_task(&["Backend", "API"]); // mixed case
+        let profile = make_profile(&["rust"]);
+        let warning = LlmRouter::check_routing_sanity(&task, "claude", &profile);
         assert!(
             warning.is_some(),
             "label matching should be case-insensitive"
@@ -2008,7 +1958,7 @@ mod tests {
         assert!(result.is_some(), "should detect 503 or overloaded");
         // Ensure the returned string is valid (would panic if slice is misaligned)
         let msg = result.unwrap();
-        assert!(!msg.is_empty());
+        assert_ne!(msg, "");
     }
 
     #[test]

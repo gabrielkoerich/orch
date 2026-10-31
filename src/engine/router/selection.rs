@@ -15,10 +15,13 @@ pub(super) fn simple_hash_fraction_for(task_id: &str) -> f64 {
     // Use SystemTime since Instant::now().elapsed() measures time since
     // the instant was created and is nearly always ~0 here. SystemTime
     // gives a clock relative to the UNIX epoch which varies across calls.
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
+    let nanos = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    )
+    .unwrap_or(u64::MAX);
 
     let seq = HASH_COUNTER.fetch_add(1, Ordering::Relaxed);
     let task_hash = hash_task_id(task_id);
@@ -26,9 +29,9 @@ pub(super) fn simple_hash_fraction_for(task_id: &str) -> f64 {
 
     // Mix bits using a simple hash
     let hash = seed
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    (hash % 10000) as f64 / 10000.0
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    f64::from(u16::try_from(hash % 10000).unwrap_or(0)) / 10000.0
 }
 
 /// Simple index selection using instant-based hash.
@@ -38,23 +41,26 @@ pub(crate) fn simple_hash_index_for(len: usize, task_id: &str) -> usize {
     }
 
     // Use SystemTime for a variable seed instead of Instant::now().elapsed().
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
+    let nanos = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    )
+    .unwrap_or(u64::MAX);
 
     let seq = HASH_COUNTER.fetch_add(1, Ordering::Relaxed);
     let task_hash = hash_task_id(task_id);
     let seed = nanos ^ seq ^ task_hash;
 
     let hash = seed
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    (hash as usize) % len
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    usize::try_from(hash % len as u64).unwrap_or(0)
 }
 
 fn hash_task_id(task_id: &str) -> u64 {
-    task_id
-        .bytes()
-        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64))
+    task_id.bytes().fold(0u64, |acc, b| {
+        acc.wrapping_mul(31).wrapping_add(u64::from(b))
+    })
 }

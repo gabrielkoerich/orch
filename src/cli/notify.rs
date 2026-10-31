@@ -30,7 +30,7 @@ pub async fn send(message: &str, target: Option<&str>) -> anyhow::Result<()> {
 
     // Resolve chat_id: --target arg → config default
     let chat_id: Option<String> = target
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .or_else(|| crate::config::get("channels.telegram.chat_id").ok());
 
     if chat_id.is_none() {

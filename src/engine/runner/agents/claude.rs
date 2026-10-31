@@ -47,12 +47,13 @@
 #[cfg(test)]
 use super::SandboxLevel;
 use super::{
-    json_error_message, json_str, AgentError, AgentRunner, ParsedResponse, PermissionRules,
-    StreamEvent,
+    AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent, json_error_message,
+    json_str,
 };
 use crate::parser;
 
 /// Runner for Claude-compatible agents (Claude, Kimi, MiniMax).
+#[derive(Debug)]
 pub struct ClaudeRunner {
     /// The agent binary name (claude, kimi, minimax, or custom).
     binary: String,
@@ -68,7 +69,7 @@ impl ClaudeRunner {
     /// Parse the Claude `--output-format json` envelope.
     ///
     /// Extracts `result`, `usage`, and `is_error`.
-    fn parse_envelope(&self, raw: &str) -> Result<ParsedResponse, AgentError> {
+    fn parse_envelope(raw: &str) -> Result<ParsedResponse, AgentError> {
         let parsed_json: serde_json::Value = serde_json::from_str(raw).map_err(|_| {
             // Not valid JSON at all — try as raw text
             AgentError::InvalidResponse {
@@ -87,13 +88,13 @@ impl ClaudeRunner {
 
         if !is_envelope {
             // Not a Claude envelope — try direct parsing via generic parser
-            return self.parse_direct(raw);
+            return Self::parse_direct(raw);
         }
 
         // Check is_error flag
         let is_error = envelope
             .get("is_error")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
         // Extract the result text
@@ -146,7 +147,9 @@ impl ClaudeRunner {
         let (input_tokens, output_tokens) = extract_usage(envelope);
 
         // Extract duration
-        let duration_ms = envelope.get("duration_ms").and_then(|v| v.as_u64());
+        let duration_ms = envelope
+            .get("duration_ms")
+            .and_then(serde_json::Value::as_u64);
 
         // Parse the inner result text into AgentResponse.
         // Do NOT check for rate limits here — result_text is agent work product
@@ -174,7 +177,7 @@ impl ClaudeRunner {
     }
 
     /// Parse raw text directly (non-envelope response).
-    fn parse_direct(&self, raw: &str) -> Result<ParsedResponse, AgentError> {
+    fn parse_direct(raw: &str) -> Result<ParsedResponse, AgentError> {
         let response = parser::parse(raw).map_err(|_| AgentError::InvalidResponse {
             raw: raw.to_string(),
         })?;
@@ -224,7 +227,7 @@ fn extract_error_from_envelope(
     if obj.get("type").and_then(|v| v.as_str()) == Some("result")
         && obj
             .get("is_error")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
     {
         let result_text = envelope_error_text(obj);
@@ -256,12 +259,11 @@ fn extract_error_from_envelope(
 /// envelope is found.
 fn detect_error_envelope(text: &str) -> Option<AgentError> {
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(obj) = val.as_object() {
-                if let Some(err) = extract_error_from_envelope(obj, line) {
-                    return Some(err);
-                }
-            }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line)
+            && let Some(obj) = val.as_object()
+            && let Some(err) = extract_error_from_envelope(obj, line)
+        {
+            return Some(err);
         }
     }
     None
@@ -279,20 +281,20 @@ pub(crate) fn extract_stream_json_result_text(raw: &str) -> Result<String, Agent
 
     if let Some(line) = envelope_line_opt {
         // Parse the found result line.
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(obj) = parsed.as_object() {
-                // Check is_error FIRST.
-                if let Some(err) = extract_error_from_envelope(obj, line) {
-                    return Err(err);
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line)
+            && let Some(obj) = parsed.as_object()
+        {
+            // Check is_error FIRST.
+            if let Some(err) = extract_error_from_envelope(obj, line) {
+                return Err(err);
+            }
+            // Extract result text from the JSON object.
+            if let Some(result) = obj.get("result") {
+                if let Some(text) = result.as_str() {
+                    return Ok(text.to_string());
                 }
-                // Extract result text from the JSON object.
-                if let Some(result) = obj.get("result") {
-                    if let Some(text) = result.as_str() {
-                        return Ok(text.to_string());
-                    }
-                    if result.is_object() || result.is_array() {
-                        return Ok(result.to_string());
-                    }
+                if result.is_object() || result.is_array() {
+                    return Ok(result.to_string());
                 }
             }
         }
@@ -307,23 +309,23 @@ pub(crate) fn extract_stream_json_result_text(raw: &str) -> Result<String, Agent
 
     // No opencode-style text found. Try parsing the whole trimmed string as a
     // single JSON object (handles `--output-format json` plain output).
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        if let Some(obj) = parsed.as_object() {
-            // Check for error envelope in the single-line JSON.
-            if let Some(err) = extract_error_from_envelope(obj, trimmed) {
-                return Err(err);
-            }
-            // Extract result text from the JSON object.
-            if let Some(result) = obj.get("result") {
-                if let Some(text) = result.as_str() {
-                    return Ok(text.to_string());
-                }
-                if result.is_object() || result.is_array() {
-                    return Ok(result.to_string());
-                }
-            }
-            return Ok(trimmed.to_string());
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && let Some(obj) = parsed.as_object()
+    {
+        // Check for error envelope in the single-line JSON.
+        if let Some(err) = extract_error_from_envelope(obj, trimmed) {
+            return Err(err);
         }
+        // Extract result text from the JSON object.
+        if let Some(result) = obj.get("result") {
+            if let Some(text) = result.as_str() {
+                return Ok(text.to_string());
+            }
+            if result.is_object() || result.is_array() {
+                return Ok(result.to_string());
+            }
+        }
+        return Ok(trimmed.to_string());
     }
 
     // Not valid JSON at all. Before returning raw text, scan for error envelopes
@@ -422,7 +424,7 @@ impl AgentRunner for ClaudeRunner {
         // For NDJSON (--output-format stream-json): find the best result line and its
         // token count. For single-line JSON (--output-format json), returns None.
         if let Some((result_line, tokens)) = find_ndjson_result_line(trimmed) {
-            let result = self.parse_envelope(result_line)?;
+            let result = Self::parse_envelope(result_line)?;
             // If the envelope parse preserved meaningful tokens, use those.
             // Otherwise, fall back to the tokens from find_ndjson_result_line
             // (which selected the best result line by token count — issue #1387).
@@ -439,7 +441,7 @@ impl AgentRunner for ClaudeRunner {
         }
 
         // Fallback: treat the whole string as the envelope (e.g. pretty-printed JSON)
-        self.parse_envelope(trimmed)
+        Self::parse_envelope(trimmed)
     }
 
     fn classify_error(&self, exit_code: i32, stdout: &str, stderr: &str) -> AgentError {
@@ -451,7 +453,7 @@ impl AgentRunner for ClaudeRunner {
             let (line, _) = find_ndjson_result_line(trimmed)?;
             let val: serde_json::Value = serde_json::from_str(line).ok()?;
             let obj = val.as_object()?;
-            if obj.get("is_error").and_then(|v| v.as_bool()) != Some(true) {
+            if obj.get("is_error").and_then(serde_json::Value::as_bool) != Some(true) {
                 return None;
             }
             Some(envelope_error_text(obj)).filter(|t| !t.is_empty())
@@ -471,16 +473,13 @@ impl AgentRunner for ClaudeRunner {
                 if line.is_empty() {
                     continue;
                 }
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-                    if let Some(obj) = val.as_object() {
-                        if obj.get("type").and_then(|t| t.as_str()) == Some("system") {
-                            if let Some(error) = obj.get("error") {
-                                if let Some(msg) = error.get("message").and_then(|m| m.as_str()) {
-                                    return Some(msg.to_string());
-                                }
-                            }
-                        }
-                    }
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(line)
+                    && let Some(obj) = val.as_object()
+                    && obj.get("type").and_then(|t| t.as_str()) == Some("system")
+                    && let Some(error) = obj.get("error")
+                    && let Some(msg) = error.get("message").and_then(|m| m.as_str())
+                {
+                    return Some(msg.to_string());
                 }
             }
             None
@@ -507,10 +506,10 @@ impl AgentRunner for ClaudeRunner {
         };
         // Envelope billing text is prepended into the same 3000-byte head as hook
         // UUIDs, so classify the envelope before the combined scan
-        if let Some(message) = &error_result {
-            if let Some(e) = super::patterns::detect_auth_error(message) {
-                return e;
-            }
+        if let Some(message) = &error_result
+            && let Some(e) = super::patterns::detect_auth_error(message)
+        {
+            return e;
         }
         let classified = super::patterns::classify_from_text(exit_code, &combined);
 
@@ -521,12 +520,12 @@ impl AgentRunner for ClaudeRunner {
         // already extracted a clean, complete error message from the result
         // envelope but none of the specific pattern detectors matched it,
         // prefer that clean message over the byte-truncated fallback.
-        if let (AgentError::Unknown { .. }, Some(message)) = (&classified, &error_result) {
-            if !message.is_empty() {
-                return AgentError::AgentFailed {
-                    message: message.clone(),
-                };
-            }
+        if let (AgentError::Unknown { .. }, Some(message)) = (&classified, &error_result)
+            && !message.is_empty()
+        {
+            return AgentError::AgentFailed {
+                message: message.clone(),
+            };
         }
         classified
     }
@@ -618,23 +617,21 @@ pub(crate) fn find_ndjson_result_line(text: &str) -> Option<(&str, Option<(u64, 
     // Pass 1: find a result line with a JSON result field.
     // JSON results are always preferred (inner task delegate output).
     for line in lines.iter().rev() {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(obj) = val.as_object() {
-                if obj.get("type").and_then(|t| t.as_str()) == Some("result") {
-                    if let Some(result) = obj.get("result") {
-                        let is_json_result = match result {
-                            serde_json::Value::Object(_) | serde_json::Value::Array(_) => true,
-                            serde_json::Value::String(s) => {
-                                serde_json::from_str::<serde_json::Value>(s).is_ok()
-                            }
-                            _ => false,
-                        };
-                        if is_json_result {
-                            let tokens = extract_result_tokens(obj);
-                            return Some((line, tokens));
-                        }
-                    }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line)
+            && let Some(obj) = val.as_object()
+            && obj.get("type").and_then(|t| t.as_str()) == Some("result")
+            && let Some(result) = obj.get("result")
+        {
+            let is_json_result = match result {
+                serde_json::Value::Object(_) | serde_json::Value::Array(_) => true,
+                serde_json::Value::String(s) => {
+                    serde_json::from_str::<serde_json::Value>(s).is_ok()
                 }
+                _ => false,
+            };
+            if is_json_result {
+                let tokens = extract_result_tokens(obj);
+                return Some((line, tokens));
             }
         }
     }
@@ -648,16 +645,15 @@ pub(crate) fn find_ndjson_result_line(text: &str) -> Option<(&str, Option<(u64, 
     let mut best_total = 0u64;
 
     for line in &lines {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(obj) = val.as_object() {
-                if obj.get("type").and_then(|t| t.as_str()) == Some("result") {
-                    let tokens = extract_result_tokens(obj);
-                    let total = tokens.map(|(i, o)| i.saturating_add(o)).unwrap_or(0);
-                    if total >= best_total {
-                        best_total = total;
-                        best_line = Some(*line);
-                    }
-                }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line)
+            && let Some(obj) = val.as_object()
+            && obj.get("type").and_then(|t| t.as_str()) == Some("result")
+        {
+            let tokens = extract_result_tokens(obj);
+            let total = tokens.map_or(0, |(i, o)| i.saturating_add(o));
+            if total >= best_total {
+                best_total = total;
+                best_line = Some(*line);
             }
         }
     }
@@ -669,8 +665,12 @@ pub(crate) fn find_ndjson_result_line(text: &str) -> Option<(&str, Option<(u64, 
 fn extract_result_tokens(obj: &serde_json::Map<String, serde_json::Value>) -> Option<(u64, u64)> {
     // Try top-level `usage` first.
     if let Some(usage) = obj.get("usage").and_then(|v| v.as_object()) {
-        let input = usage.get("input_tokens").and_then(|v| v.as_u64());
-        let output = usage.get("output_tokens").and_then(|v| v.as_u64());
+        let input = usage
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_u64);
+        let output = usage
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_u64);
         if let (Some(i), Some(o)) = (input, output) {
             return Some((i, o));
         }
@@ -685,7 +685,7 @@ fn extract_result_tokens(obj: &serde_json::Map<String, serde_json::Value>) -> Op
                 if let Some(i) = stats
                     .get("inputTokens")
                     .or_else(|| stats.get("input_tokens"))
-                    .and_then(|v| v.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                 {
                     total_input += i;
                     found = true;
@@ -693,7 +693,7 @@ fn extract_result_tokens(obj: &serde_json::Map<String, serde_json::Value>) -> Op
                 if let Some(o) = stats
                     .get("outputTokens")
                     .or_else(|| stats.get("output_tokens"))
-                    .and_then(|v| v.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                 {
                     total_output += o;
                     found = true;
@@ -720,8 +720,12 @@ fn extract_usage(
 ) -> (Option<u64>, Option<u64>) {
     // Try top-level `usage` first
     if let Some(usage) = envelope.get("usage").and_then(|v| v.as_object()) {
-        let input = usage.get("input_tokens").and_then(|v| v.as_u64());
-        let output = usage.get("output_tokens").and_then(|v| v.as_u64());
+        let input = usage
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_u64);
+        let output = usage
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_u64);
         if input.is_some() || output.is_some() {
             return (input, output);
         }
@@ -738,7 +742,7 @@ fn extract_usage(
                 if let Some(i) = stats
                     .get("inputTokens")
                     .or_else(|| stats.get("input_tokens"))
-                    .and_then(|v| v.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                 {
                     total_input += i;
                     found = true;
@@ -746,7 +750,7 @@ fn extract_usage(
                 if let Some(o) = stats
                     .get("outputTokens")
                     .or_else(|| stats.get("output_tokens"))
-                    .and_then(|v| v.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                 {
                     total_output += o;
                     found = true;
@@ -817,10 +821,10 @@ fn last_assistant_content_type(ndjson: &str) -> Option<String> {
         else {
             continue;
         };
-        if let Some(item) = content.last() {
-            if let Some(t) = item.get("type").and_then(|v| v.as_str()) {
-                last = Some(t.to_string());
-            }
+        if let Some(item) = content.last()
+            && let Some(t) = item.get("type").and_then(|v| v.as_str())
+        {
+            last = Some(t.to_string());
         }
     }
     last
@@ -862,45 +866,46 @@ pub fn find_claude_result(ndjson: &str) -> Option<super::AgentResult> {
     }
 
     // Try to find the result envelope first
-    if let Some((result_line, _tokens)) = find_ndjson_result_line(trimmed) {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(result_line) {
-            if let Some(envelope) = parsed.as_object() {
-                let is_error = envelope
-                    .get("is_error")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+    if let Some((result_line, _tokens)) = find_ndjson_result_line(trimmed)
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(result_line)
+        && let Some(envelope) = parsed.as_object()
+    {
+        let is_error = envelope
+            .get("is_error")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
 
-                let result_text = if is_error {
-                    // Error envelopes put the real message in errors[] (billing,
-                    // rate limits) with `result` empty — don't lose it (issue #3713)
-                    envelope_error_text(envelope)
-                } else {
-                    envelope
-                        .get("result")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string()
-                };
+        let result_text = if is_error {
+            // Error envelopes put the real message in errors[] (billing,
+            // rate limits) with `result` empty — don't lose it (issue #3713)
+            envelope_error_text(envelope)
+        } else {
+            envelope
+                .get("result")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
 
-                let (input_tokens, output_tokens) = extract_usage(envelope);
-                let duration_ms = envelope.get("duration_ms").and_then(|v| v.as_u64());
+        let (input_tokens, output_tokens) = extract_usage(envelope);
+        let duration_ms = envelope
+            .get("duration_ms")
+            .and_then(serde_json::Value::as_u64);
 
-                let cost_usd = envelope
-                    .get("costUSD")
-                    .or_else(|| envelope.get("cost_usd"))
-                    .and_then(|v| v.as_f64());
+        let cost_usd = envelope
+            .get("costUSD")
+            .or_else(|| envelope.get("cost_usd"))
+            .and_then(serde_json::Value::as_f64);
 
-                return Some(super::AgentResult {
-                    is_error,
-                    result_text,
-                    input_tokens,
-                    output_tokens,
-                    cost_usd,
-                    duration_ms,
-                    truncated_by_length: false,
-                });
-            }
-        }
+        return Some(super::AgentResult {
+            is_error,
+            result_text,
+            input_tokens,
+            output_tokens,
+            cost_usd,
+            duration_ms,
+            truncated_by_length: false,
+        });
     }
 
     // Fallback for MiniMax/Kimi: extract last assistant text message
@@ -926,22 +931,28 @@ pub fn find_claude_result(ndjson: &str) -> Option<super::AgentResult> {
             .and_then(|c| c.as_array())
         {
             for item in content {
-                if item.get("type").and_then(|v| v.as_str()) == Some("text") {
-                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                        let t = text.trim();
-                        if !t.is_empty() {
-                            last_text = Some(t.to_string());
-                        }
+                if item.get("type").and_then(|v| v.as_str()) == Some("text")
+                    && let Some(text) = item.get("text").and_then(|v| v.as_str())
+                {
+                    let t = text.trim();
+                    if !t.is_empty() {
+                        last_text = Some(t.to_string());
                     }
                 }
             }
         }
         // Extract usage (take max, as Claude reports cumulative)
         if let Some(usage) = val.get("message").and_then(|m| m.get("usage")) {
-            if let Some(inp) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+            if let Some(inp) = usage
+                .get("input_tokens")
+                .and_then(serde_json::Value::as_u64)
+            {
                 input_tokens = Some(input_tokens.unwrap_or(0u64).max(inp));
             }
-            if let Some(out) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+            if let Some(out) = usage
+                .get("output_tokens")
+                .and_then(serde_json::Value::as_u64)
+            {
                 output_tokens = Some(output_tokens.unwrap_or(0u64).max(out));
             }
         }
@@ -981,12 +992,12 @@ pub fn collect_assistant_messages_text(ndjson: &str) -> String {
             .and_then(|c| c.as_array())
         {
             for item in content {
-                if item.get("type").and_then(|v| v.as_str()) == Some("text") {
-                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                        let t = text.trim();
-                        if !t.is_empty() {
-                            parts.push(t.to_string());
-                        }
+                if item.get("type").and_then(|v| v.as_str()) == Some("text")
+                    && let Some(text) = item.get("text").and_then(|v| v.as_str())
+                {
+                    let t = text.trim();
+                    if !t.is_empty() {
+                        parts.push(t.to_string());
                     }
                 }
             }
@@ -1019,7 +1030,7 @@ mod tests {
         let raw = r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#;
         match runner().parse_response(raw) {
             Err(AgentError::AgentFailed { message }) => {
-                assert_eq!(message, "error_during_execution")
+                assert_eq!(message, "error_during_execution");
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -1251,7 +1262,8 @@ mod tests {
         );
         let msg = err.to_string();
         assert_eq!(
-            msg, "agent failed: Failed to authenticate: OAuth session expired and could not be refreshed",
+            msg,
+            "agent failed: Failed to authenticate: OAuth session expired and could not be refreshed",
             "stored error must be the clean result text, not a byte-truncated JSON fragment"
         );
         assert!(
@@ -1792,7 +1804,7 @@ mod tests {
     #[test]
     fn extract_text_empty_input_returns_empty_ok() {
         let text = runner().extract_text("").unwrap();
-        assert!(text.is_empty());
+        assert_eq!(text, "");
     }
 
     // ── find_claude_result ──────────────────────────────────────
@@ -1966,7 +1978,7 @@ mod tests {
             "type": "result",
             "subtype": "success",
             "is_error": false,
-            "duration_ms": 273044,
+            "duration_ms": 273_044,
             "result": inner_result.to_string(),
             "usage": {"input_tokens": 12, "output_tokens": 1577}
         })
@@ -1981,7 +1993,7 @@ mod tests {
         })
         .to_string();
         // Concatenate without using concat! to avoid string-escaping headaches.
-        let mut ndjson = json_result_line.clone();
+        let mut ndjson = json_result_line;
         ndjson.push('\n');
         ndjson.push_str(r#"{"type":"system","subtype":"task_notification"}"#);
         ndjson.push('\n');
@@ -2026,7 +2038,7 @@ mod tests {
             "type": "result",
             "subtype": "success",
             "is_error": false,
-            "duration_ms": 273044,
+            "duration_ms": 273_044,
             "result": "All 2352 tests pass. The fix is clean and correct.",
             "usage": {"input_tokens": 12, "output_tokens": 1577}
         })

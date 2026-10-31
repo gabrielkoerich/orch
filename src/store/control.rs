@@ -1,4 +1,4 @@
-use super::*;
+use super::{Context, TaskStore};
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -14,7 +14,6 @@ const CONTROL_MESSAGE_COLS: &str = "id, session_id, role, channel, channel_threa
 
 /// A message in the control session conversation history.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields used by channel integration (Phase 2)
 pub struct ControlMessage {
     pub id: i64,
     pub session_id: String,
@@ -57,7 +56,10 @@ impl TaskStore {
     pub const DEFAULT_SESSION: &'static str = "default";
 
     /// Insert a control session message.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per column of the message row"
+    )]
     pub async fn insert_control_message(
         &self,
         session_id: &str,
@@ -381,15 +383,13 @@ pub fn parse_since_duration(s: &str) -> anyhow::Result<String> {
         (n, 'm')
     } else {
         anyhow::bail!(
-            "unrecognised --since format {:?}; expected a number followed by d, h, or m (e.g. 7d, 24h, 30m)",
-            s
+            "unrecognised --since format {s:?}; expected a number followed by d, h, or m (e.g. 7d, 24h, 30m)"
         );
     };
 
     let n: u64 = num_str.trim().parse().map_err(|_| {
         anyhow::anyhow!(
-            "invalid number in --since {:?}; expected a positive integer followed by d, h, or m",
-            s
+            "invalid number in --since {s:?}; expected a positive integer followed by d, h, or m"
         )
     })?;
     if n == 0 {
@@ -400,10 +400,7 @@ pub fn parse_since_duration(s: &str) -> anyhow::Result<String> {
         'd' => n.checked_mul(86_400),
         'h' => n.checked_mul(3_600),
         'm' => n.checked_mul(60),
-        _ => anyhow::bail!(
-            "unrecognized duration unit '{}' (expected d, h, or m)",
-            unit
-        ),
+        _ => anyhow::bail!("unrecognized duration unit '{unit}' (expected d, h, or m)"),
     }
     .ok_or_else(|| anyhow::anyhow!("--since value is too large"))?
     .try_into()
@@ -453,7 +450,7 @@ mod tests {
         assert_eq!(m.role, "user");
         assert_eq!(m.channel, "cli");
         assert_eq!(m.content, "hello world");
-        assert!(!m.created_at.is_empty());
+        assert_ne!(m.created_at, "");
     }
 
     /// Optional fields must be `Some(value)` when present and `None` when NULL.

@@ -1,4 +1,4 @@
-use super::*;
+use super::TaskStore;
 #[cfg(test)]
 use chrono::Datelike;
 use chrono::Utc;
@@ -115,6 +115,7 @@ fn self_improvement_key() -> String {
 
 impl TaskStore {
     pub async fn cost_summary(&self, repo: &str) -> anyhow::Result<(i64, i64, f64)> {
+        use sqlx::Row;
         let row = sqlx::query(
             "SELECT
             COALESCE(SUM(input_tokens), 0) as total_input,
@@ -126,7 +127,6 @@ impl TaskStore {
         .fetch_one(&self.pool)
         .await?;
 
-        use sqlx::Row;
         Ok((
             row.try_get::<i64, _>("total_input")?,
             row.try_get::<i64, _>("total_output")?,
@@ -142,13 +142,13 @@ impl TaskStore {
         &self,
         repo: &str,
     ) -> anyhow::Result<std::collections::HashMap<String, i64>> {
+        use sqlx::Row;
         let rows =
             sqlx::query("SELECT status, COUNT(*) as cnt FROM tasks WHERE repo = ? GROUP BY status")
                 .bind(repo)
                 .fetch_all(&self.pool)
                 .await?;
 
-        use sqlx::Row;
         let mut map = std::collections::HashMap::new();
         for row in &rows {
             let status: String = row.try_get("status")?;
@@ -237,6 +237,7 @@ impl TaskStore {
         .fetch_all(&self.pool)
         .await?;
 
+        #[expect(clippy::cast_precision_loss, reason = "a display percentage")]
         let agent_stats: Vec<AgentStat> = agent_rows
             .iter()
             .map(|row| {
@@ -343,6 +344,7 @@ impl TaskStore {
         .fetch_all(&self.pool)
         .await?;
 
+        #[expect(clippy::cast_precision_loss, reason = "a display percentage")]
         let agent_stats: Vec<AgentStat> = agent_rows
             .iter()
             .map(|row| {

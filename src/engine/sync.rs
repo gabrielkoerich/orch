@@ -20,7 +20,7 @@ use crate::engine::cooldown::{
 };
 use crate::engine::router::Router;
 use crate::engine::runner::agents::patterns;
-use crate::engine::tasks::{status_to_task_status, TaskManager};
+use crate::engine::tasks::{TaskManager, status_to_task_status};
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
@@ -33,7 +33,7 @@ use tokio::sync::RwLock;
 /// Returns `None` if the store is unavailable, the key doesn't exist, OR if
 /// the store query fails. Use [`try_kv_get_prefer_store`] if you need to
 /// distinguish between "key not found" and actual errors.
-async fn kv_get_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str) -> Option<String> {
+async fn kv_get_prefer_store(store: Option<&Arc<TaskStore>>, key: &str) -> Option<String> {
     match try_kv_get_prefer_store(store, key).await {
         Ok(opt) => opt,
         Err(e) => {
@@ -49,7 +49,7 @@ async fn kv_get_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str) -> Opti
 /// Returns `Ok(None)` if the store is unavailable or the key doesn't exist.
 /// Returns `Err` if the store query fails.
 async fn try_kv_get_prefer_store(
-    store: &Option<&Arc<TaskStore>>,
+    store: Option<&Arc<TaskStore>>,
     key: &str,
 ) -> anyhow::Result<Option<String>> {
     if let Some(s) = store {
@@ -64,7 +64,7 @@ async fn try_kv_get_prefer_store(
 /// Logs warnings on failure but provides no way for callers to know if the
 /// write succeeded. Use [`try_kv_set_prefer_store`] if you need to handle
 /// errors or guarantee persistence (e.g., for circuit breaker state).
-async fn kv_set_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str, value: &str) {
+async fn kv_set_prefer_store(store: Option<&Arc<TaskStore>>, key: &str, value: &str) {
     if let Err(e) = try_kv_set_prefer_store(store, key, value).await {
         tracing::error!(key, err = %e, "kv_set failed");
     }
@@ -76,7 +76,7 @@ async fn kv_set_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str, value: 
 /// Returns `Ok(())` if the store is unavailable (best-effort) or if the
 /// write succeeds. Returns `Err` if the store query fails.
 async fn try_kv_set_prefer_store(
-    store: &Option<&Arc<TaskStore>>,
+    store: Option<&Arc<TaskStore>>,
     key: &str,
     value: &str,
 ) -> anyhow::Result<()> {
@@ -86,10 +86,10 @@ async fn try_kv_set_prefer_store(
     Ok(())
 }
 
-use super::cleanup::{check_merged_prs, cleanup_done_worktrees};
-use super::commands::{parse_command, validate_and_run_command, CommandOutcome, CommandStoreOps};
-use super::review_poll::review_open_prs;
 use super::EngineConfig;
+use super::cleanup::{check_merged_prs, cleanup_done_worktrees};
+use super::commands::{CommandOutcome, CommandStoreOps, parse_command, validate_and_run_command};
+use super::review_poll::review_open_prs;
 use crate::github::types::extract_issue_number_from_url;
 
 #[derive(Debug, Clone)]
@@ -480,18 +480,17 @@ pub(crate) fn classify_comment(
         },
         // Command but no issue URL — if it's a mention, create task; otherwise skip
         (Some(_), true, None) => CommentAction::CreateMentionTask { issue_num: None },
-        (Some(_), false, None) => CommentAction::Skip,
         // Mention without command — create task for agent
         (None, true, issue_num) => CommentAction::CreateMentionTask { issue_num },
         // Neither mention nor command — skip
-        (None, false, _) => CommentAction::Skip,
+        (Some(_), false, None) | (None, false, _) => CommentAction::Skip,
     }
 }
 
 /// Handle a slash command from a mention. Records a sentinel task and advances
 /// the cursor on success; logs a warning and returns early if the mention has
 /// no valid issue URL.
-#[allow(clippy::too_many_arguments)]
+///
 /// Execute a slash command mentioned by `@orch` on a comment.
 ///
 /// Returns:
@@ -500,6 +499,10 @@ pub(crate) fn classify_comment(
 ///   GitHub error; caller must stop cursor advancement so the next tick retries
 /// - `Err(_)` — DB lookup failed for parent_id; caller must NOT advance cursor
 ///   so this mention is retried on the next sync
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the sync tick hands over its shared state piece by piece"
+)]
 async fn handle_slash_command(
     backend: &Arc<dyn ExternalBackend>,
     store: Option<&Arc<TaskStore>>,
@@ -510,16 +513,13 @@ async fn handle_slash_command(
     command: &crate::engine::commands::OwnerCommand,
     cursor: &mut MentionCursor,
 ) -> anyhow::Result<bool> {
-    let issue_num = match mention
+    let Some(issue_num) = mention
         .issue_url
         .as_deref()
         .and_then(extract_issue_number_from_url)
-    {
-        Some(num) => num,
-        None => {
-            tracing::warn!(comment_id = %mention.id, "slash command without valid issue number");
-            return Ok(true);
-        }
+    else {
+        tracing::warn!(comment_id = %mention.id, "slash command without valid issue number");
+        return Ok(true);
     };
 
     let store_opt: Option<Arc<dyn CommandStoreOps>> =
@@ -673,18 +673,15 @@ async fn try_unblock_ci_failure_task(
     task: &crate::store::Task,
     auto_merge_in_flight: &Arc<DashSet<String>>,
 ) -> anyhow::Result<bool> {
-    let pr_number = match task.pr_number {
-        Some(n) => n,
-        None => {
-            tracing::debug!(
-                task_id = task.id,
-                "CI failure blocked task has no PR number"
-            );
-            return Ok(false);
-        }
+    let Some(pr_number) = task.pr_number.and_then(|n| u64::try_from(n).ok()) else {
+        tracing::debug!(
+            task_id = task.id,
+            "CI failure blocked task has no PR number"
+        );
+        return Ok(false);
     };
 
-    let pr = match gh.get_pr(repo, pr_number as u64).await {
+    let pr = match gh.get_pr(repo, pr_number).await {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(task_id = task.id, pr_number, err = %e, "failed to get PR status for CI failure block");
@@ -749,7 +746,7 @@ async fn try_unblock_ci_failure_task(
     // can silently stall even when checks are green and the branch is up to date,
     // so after arming auto-merge we poll for completion and fall back to a direct
     // merge once the PR is mergeable and CI is passing.
-    let branch_update_result = gh.update_pr_branch(repo, pr_number as u64).await;
+    let branch_update_result = gh.update_pr_branch(repo, pr_number).await;
     match branch_update_result {
         Ok(()) => {
             tracing::info!(
@@ -770,7 +767,7 @@ async fn try_unblock_ci_failure_task(
         }
     }
 
-    if let Err(e) = gh.enable_auto_merge(repo, pr_number as u64).await {
+    if let Err(e) = gh.enable_auto_merge(repo, pr_number).await {
         tracing::warn!(task_id = task.id, pr_number, err = %e, "failed to re-enable auto-merge after branch update");
     }
 
@@ -779,13 +776,11 @@ async fn try_unblock_ci_failure_task(
     let pr_state = pr.state.as_str();
     let new_reason = if let Err(ref e) = branch_update_result {
         format!(
-            "CI failure limit reached during auto-merge (PR #{} still open, state: {}, branch update failed: {})",
-            pr_number, pr_state, e
+            "CI failure limit reached during auto-merge (PR #{pr_number} still open, state: {pr_state}, branch update failed: {e})"
         )
     } else {
         format!(
-            "CI failure limit reached during auto-merge (PR #{} still open, state: {})",
-            pr_number, pr_state
+            "CI failure limit reached during auto-merge (PR #{pr_number} still open, state: {pr_state})"
         )
     };
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -814,13 +809,11 @@ async fn try_unblock_ci_failure_task(
     let in_flight_clone = Arc::clone(auto_merge_in_flight);
 
     tokio::spawn(async move {
-        let _guard = scopeguard::guard((), |_| {
+        let _guard = scopeguard::guard((), |()| {
             in_flight_clone.remove(&task_id_str);
         });
 
-        match poll_and_merge_recovered_pr(&gh_clone, &repo_string, pr_number as u64, task_clone.id)
-            .await
-        {
+        match poll_and_merge_recovered_pr(&gh_clone, &repo_string, pr_number, task_clone.id).await {
             Ok(true) => {
                 tracing::info!(
                     task_id = task_clone.id,
@@ -903,6 +896,11 @@ async fn poll_and_merge_recovered_pr(
     pr_number: u64,
     task_id: i64,
 ) -> anyhow::Result<bool> {
+    // The branch can fall behind while CI runs. Retry the update-branch call a
+    // few times inside the poll loop instead of exiting and waiting for the next
+    // 24-hour recovery cooldown.
+    const MAX_BEHIND_RETRIES: u32 = 3;
+
     let max_wait_secs: u64 = config::get("workflow.ci_poll_max_wait_secs")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -914,10 +912,6 @@ async fn poll_and_merge_recovered_pr(
     let max_wait = std::time::Duration::from_secs(max_wait_secs);
     let start = std::time::Instant::now();
     let mut poll_count: u32 = 0;
-    // The branch can fall behind while CI runs. Retry the update-branch call a
-    // few times inside the poll loop instead of exiting and waiting for the next
-    // 24-hour recovery cooldown.
-    const MAX_BEHIND_RETRIES: u32 = 3;
     let mut behind_retries: u32 = 0;
 
     let initial_pr = gh.get_pr(repo, pr_number).await?;
@@ -1211,8 +1205,10 @@ pub(crate) async fn auto_recover_rebroadcast_blocked_tasks_global(
             .clone()
             .unwrap_or_else(|| format!("internal:{}", task.id));
 
-        if let (Some(gh), Some(pr_number)) = (&gh, task.pr_number) {
-            match gh.get_pr(&task.repo, pr_number as u64).await {
+        if let (Some(gh), Some(pr_number)) =
+            (&gh, task.pr_number.and_then(|n| u64::try_from(n).ok()))
+        {
+            match gh.get_pr(&task.repo, pr_number).await {
                 Ok(pr) => {
                     if pr.merged.unwrap_or(false) {
                         tracing::info!(
@@ -1349,21 +1345,19 @@ async fn auto_unblock_blocked_tasks(
             }
         };
         for task in ci_failure_tasks {
-            if ci_failure_unblock_cooldown_elapsed(&task) {
-                if let Some(ref gh) = gh {
-                    if let Err(e) = try_unblock_ci_failure_task(
-                        gh,
-                        repo,
-                        task_manager,
-                        store,
-                        &task,
-                        auto_merge_in_flight,
-                    )
-                    .await
-                    {
-                        tracing::warn!(task_id = task.id, err = %e, "CI failure unblock check failed");
-                    }
-                }
+            if ci_failure_unblock_cooldown_elapsed(&task)
+                && let Some(ref gh) = gh
+                && let Err(e) = try_unblock_ci_failure_task(
+                    gh,
+                    repo,
+                    task_manager,
+                    store,
+                    &task,
+                    auto_merge_in_flight,
+                )
+                .await
+            {
+                tracing::warn!(task_id = task.id, err = %e, "CI failure unblock check failed");
             }
         }
     }
@@ -1378,7 +1372,7 @@ async fn auto_unblock_blocked_tasks(
             .external_id
             .clone()
             .unwrap_or_else(|| format!("internal:{}", task.id));
-        let dispatch_key = format!("{}/{}", repo, task_id_str);
+        let dispatch_key = format!("{repo}/{task_id_str}");
         if dispatching.contains_key(&dispatch_key) {
             continue;
         }
@@ -1407,7 +1401,7 @@ async fn auto_unblock_blocked_tasks(
         }
 
         // Determine the most recent failure category as the "reason key" for this unblock.
-        let reason_key = failures.first().map(|f| f.as_str()).unwrap_or("");
+        let reason_key = failures.first().map_or("", |f| f.as_str());
 
         // Detect reason changes to reset exponential backoff.
         // New reasons bypass old cooldown windows and start fresh attempt counters.
@@ -1654,7 +1648,7 @@ pub(crate) async fn refire_and_escalate_stale_needs_review_global(
             continue;
         }
 
-        let current_refires = stored.needs_review_refires.max(0) as u64;
+        let current_refires = u64::try_from(stored.needs_review_refires).unwrap_or(0);
         let new_refires = current_refires + 1;
 
         if new_refires > MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS {
@@ -1702,7 +1696,8 @@ pub(crate) async fn refire_and_escalate_stale_needs_review_global(
         }
 
         // Exponential backoff: MIN * 2^(current_refires)
-        let required_minutes = MIN_STALE_NEEDS_REVIEW_MINUTES * (1i64 << (current_refires as u32));
+        let required_minutes =
+            MIN_STALE_NEEDS_REVIEW_MINUTES * (1i64 << u32::try_from(current_refires).unwrap_or(0));
 
         let should_fire = match age_minutes {
             Some(age) => age >= required_minutes,
@@ -1764,7 +1759,10 @@ pub(crate) async fn refire_and_escalate_stale_needs_review_global(
 /// - Cleanup finished worktrees
 /// - Check for merged PRs → mark tasks done
 /// - Scan for @mentions
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the engine passes its shared handles one by one"
+)]
 pub(crate) async fn sync_tick(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
@@ -1799,12 +1797,12 @@ pub(crate) async fn sync_tick(
         // Persist circuit breaker state as a metric for operators.
         // This is critical for avoiding thundering herd after restart during outages.
         if let Err(e) =
-            try_kv_set_prefer_store(&Some(store), "metrics:orch.github_5xx_circuit.open", "1").await
+            try_kv_set_prefer_store(Some(store), "metrics:orch.github_5xx_circuit.open", "1").await
         {
             tracing::error!(err = %e, "failed to persist circuit breaker state — may cause thundering herd after restart");
         }
     } else if let Err(e) =
-        try_kv_set_prefer_store(&Some(store), "metrics:orch.github_5xx_circuit.open", "0").await
+        try_kv_set_prefer_store(Some(store), "metrics:orch.github_5xx_circuit.open", "0").await
     {
         tracing::error!(err = %e, "failed to clear circuit breaker state");
     }
@@ -1854,7 +1852,7 @@ pub(crate) async fn sync_tick(
 
     if !gh_circuit_open {
         let mention_fallback = chrono::Utc::now() - chrono::Duration::hours(24);
-        let mention_since = kv_get_prefer_store(&Some(store), "mentions_last_checked")
+        let mention_since = kv_get_prefer_store(Some(store), "mentions_last_checked")
             .await
             .unwrap_or_else(|| mention_fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string());
         let shared_since = mention_since.clone();
@@ -1882,7 +1880,7 @@ pub(crate) async fn sync_tick(
                         return Ok(());
                     }
                 };
-                review_open_prs(
+                Box::pin(review_open_prs(
                     backend,
                     repo,
                     config,
@@ -1893,7 +1891,7 @@ pub(crate) async fn sync_tick(
                     &in_review_tasks,
                     &gh,
                     &cached_router_config,
-                )
+                ))
                 .await
             }
         );
@@ -1959,10 +1957,13 @@ pub(crate) async fn sync_tick(
             .collect();
 
         for (_stored, external) in &in_progress_tasks {
+            // A task is only considered stale if it has been in InProgress for > 5 minutes.
+            const MIN_STALE_MINUTES: i64 = 5;
+
             let task_id = &external.id.0;
 
             // Skip tasks currently being processed by the main tick (dispatch + agent flow).
-            let dispatch_key = format!("{}/{}", repo, task_id);
+            let dispatch_key = format!("{repo}/{task_id}");
             {
                 if dispatching.contains_key(&dispatch_key) {
                     tracing::debug!(
@@ -1975,8 +1976,6 @@ pub(crate) async fn sync_tick(
 
             // Skip tasks that just transitioned to InProgress — allow time for the
             // agent to start its tmux session before treating it as stale.
-            // A task is only considered stale if it has been in InProgress for > 5 minutes.
-            const MIN_STALE_MINUTES: i64 = 5;
             match chrono::DateTime::parse_from_rfc3339(&external.updated_at) {
                 Ok(updated_at) => {
                     let age = chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc);
@@ -2118,7 +2117,7 @@ async fn scan_comments(
     prefetched_comments: Option<&[Mention]>,
 ) -> anyhow::Result<()> {
     let current_user = match backend.get_authenticated_user().await {
-        Ok(Some(u)) => format!("@{}", u),
+        Ok(Some(u)) => format!("@{u}"),
         Ok(None) => {
             tracing::debug!("backend does not support user identity, skipping comment scan");
             return Ok(());
@@ -2133,7 +2132,7 @@ async fn scan_comments(
         c.to_vec()
     } else {
         let fallback = chrono::Utc::now() - chrono::Duration::hours(24);
-        let since_str = match kv_get_prefer_store(&store, "mentions_last_checked").await {
+        let since_str = match kv_get_prefer_store(store, "mentions_last_checked").await {
             Some(ts) => ts,
             None => fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         };
@@ -2191,7 +2190,7 @@ async fn scan_comments(
         .enumerate()
         .filter_map(|(i, action)| {
             if let CommentAction::CreateMentionTask {
-                issue_num: Some(ref num),
+                issue_num: Some(num),
             } = action
             {
                 Some((i, num.clone()))
@@ -2369,7 +2368,7 @@ async fn scan_comments(
     }
 
     if let Some(ts) = cursor.into_last_safe_ts() {
-        kv_set_prefer_store(&store, "mentions_last_checked", &ts).await;
+        kv_set_prefer_store(store, "mentions_last_checked", &ts).await;
     }
 
     Ok(())
@@ -2430,8 +2429,7 @@ async fn sync_one_skill(
     // performing blocking syscall on the reactor thread.
     let repo_exists = tokio::fs::metadata(&repo_dir)
         .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false);
+        .is_ok_and(|m| m.is_dir());
 
     if repo_exists {
         // Pull latest changes with timeout
@@ -2542,6 +2540,10 @@ pub(crate) async fn emit_degraded_agents_if_needed(
     config: &crate::engine::router::RouterConfig,
     store: Option<&Arc<TaskStore>>,
 ) {
+    // Edge-triggered: only log when the affected-agents set changes, so a
+    // persistent condition doesn't flood the log every sync tick.
+    const STALE_AGENTS_KV: &str = "metrics:orch.model_pool_stale_persistent.agents";
+
     // Complexity tiers to check for configured models.
     const COMPLEXITIES: &[&str] = &["simple", "medium", "complex", "review"];
     const HEAVILY_COOLED_RATIO_THRESHOLD: f64 = 0.5;
@@ -2563,7 +2565,7 @@ pub(crate) async fn emit_degraded_agents_if_needed(
                         let key = format!("{agent}:{model}");
                         if matches!(
                             cooldown_reason(&key).as_deref(),
-                            Some("persistent_model_error") | Some("model_not_found")
+                            Some("persistent_model_error" | "model_not_found")
                         ) {
                             persistent_failed_models.push(model.clone());
                         }
@@ -2605,7 +2607,7 @@ pub(crate) async fn emit_degraded_agents_if_needed(
     // Always persist the count metric so operators can scrape it every tick,
     // including when the count is 0.
     if let Err(e) = try_kv_set_prefer_store(
-        &store,
+        store,
         "metrics:orch.agents_degraded.count",
         &count.to_string(),
     )
@@ -2637,12 +2639,12 @@ pub(crate) async fn emit_degraded_agents_if_needed(
 
         // Dedicated alert metric: "1" while the threshold is exceeded.
         if let Err(e) =
-            try_kv_set_prefer_store(&store, "metrics:orch.agents_degraded.alert", "1").await
+            try_kv_set_prefer_store(store, "metrics:orch.agents_degraded.alert", "1").await
         {
             tracing::warn!(err = %e, "failed to persist degraded agents alert metric");
         }
     } else if let Err(e) =
-        try_kv_set_prefer_store(&store, "metrics:orch.agents_degraded.alert", "0").await
+        try_kv_set_prefer_store(store, "metrics:orch.agents_degraded.alert", "0").await
     {
         // Clear the alert metric when healthy.
         tracing::warn!(err = %e, "failed to clear degraded agents alert metric");
@@ -2657,6 +2659,10 @@ pub(crate) async fn emit_degraded_agents_if_needed(
             if d.total_configured_models == 0 || d.persistent_failed_models.is_empty() {
                 return None;
             }
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "model counts are far below 2^52"
+            )]
             let ratio = d.cooled_models.len() as f64 / d.total_configured_models as f64;
             (ratio >= HEAVILY_COOLED_RATIO_THRESHOLD).then(|| {
                 format!(
@@ -2670,48 +2676,39 @@ pub(crate) async fn emit_degraded_agents_if_needed(
         })
         .collect();
 
-    // Edge-triggered: only log when the affected-agents set changes, so a
-    // persistent condition doesn't flood the log every sync tick.
-    const STALE_AGENTS_KV: &str = "metrics:orch.model_pool_stale_persistent.agents";
     let current_dim = heavily_cooled_agents.join(",");
-    let prev_dim = kv_get_prefer_store(&store, STALE_AGENTS_KV)
+    let prev_dim = kv_get_prefer_store(store, STALE_AGENTS_KV)
         .await
         .unwrap_or_default();
 
-    if !heavily_cooled_agents.is_empty() {
+    if heavily_cooled_agents.is_empty() {
+        if !prev_dim.is_empty() {
+            tracing::info!("agent model pool stale condition cleared");
+        }
+        if let Err(e) = try_kv_set_prefer_store(store, STALE_AGENTS_KV, "").await {
+            tracing::warn!(err = %e, "failed to clear stale model pool agents state");
+        }
+        if let Err(e) =
+            try_kv_set_prefer_store(store, "metrics:orch.model_pool_stale_persistent.alert", "0")
+                .await
+        {
+            tracing::warn!(err = %e, "failed to clear stale model pool alert metric");
+        }
+    } else {
         if current_dim != prev_dim {
             tracing::warn!(
                 affected_agents = ?heavily_cooled_agents,
                 "agent model pool appears stale: persistent model failures in heavily cooled pool"
             );
         }
-        if let Err(e) = try_kv_set_prefer_store(&store, STALE_AGENTS_KV, &current_dim).await {
+        if let Err(e) = try_kv_set_prefer_store(store, STALE_AGENTS_KV, &current_dim).await {
             tracing::warn!(err = %e, "failed to persist stale model pool agents state");
         }
-        if let Err(e) = try_kv_set_prefer_store(
-            &store,
-            "metrics:orch.model_pool_stale_persistent.alert",
-            "1",
-        )
-        .await
+        if let Err(e) =
+            try_kv_set_prefer_store(store, "metrics:orch.model_pool_stale_persistent.alert", "1")
+                .await
         {
             tracing::warn!(err = %e, "failed to persist stale model pool alert metric");
-        }
-    } else {
-        if !prev_dim.is_empty() {
-            tracing::info!("agent model pool stale condition cleared");
-        }
-        if let Err(e) = try_kv_set_prefer_store(&store, STALE_AGENTS_KV, "").await {
-            tracing::warn!(err = %e, "failed to clear stale model pool agents state");
-        }
-        if let Err(e) = try_kv_set_prefer_store(
-            &store,
-            "metrics:orch.model_pool_stale_persistent.alert",
-            "0",
-        )
-        .await
-        {
-            tracing::warn!(err = %e, "failed to clear stale model pool alert metric");
         }
     }
 }
@@ -2829,52 +2826,52 @@ pub(crate) async fn ingest_external_tasks(
             let duplicate_target = existing_by_title
                 .get(&task.title)
                 .or_else(|| accepted_by_title.get(&task.title));
-            if let Some(target) = duplicate_target {
-                if target.id != task.id.0 {
-                    let label = target.status_label.as_str();
-                    let should_dedupe =
-                        match backend.has_open_issue_with_title(&task.title, label).await {
-                            Ok(true) => true,
-                            Ok(false) => false,
-                            Err(e) => {
-                                tracing::warn!(
-                                    task_id = task.id.0,
-                                    err = %e,
-                                    "ingest: dedup check failed — defaulting to keep issue"
-                                );
-                                false
-                            }
-                        };
-
-                    if should_dedupe {
-                        let comment = format!(
-                            "Duplicate of #{id} — closing to avoid duplicate work.{footer}",
-                            id = target.id,
-                            footer = crate::engine::orch_footer()
-                        );
-                        if let Err(e) = backend.post_comment(&task.id, &comment).await {
+            if let Some(target) = duplicate_target
+                && target.id != task.id.0
+            {
+                let label = target.status_label.as_str();
+                let should_dedupe =
+                    match backend.has_open_issue_with_title(&task.title, label).await {
+                        Ok(true) => true,
+                        Ok(false) => false,
+                        Err(e) => {
                             tracing::warn!(
                                 task_id = task.id.0,
                                 err = %e,
-                                "ingest: failed to comment on duplicate issue"
+                                "ingest: dedup check failed — defaulting to keep issue"
                             );
+                            false
                         }
-                        match backend.update_status(&task.id, Status::Done).await {
-                            Ok(()) => {
-                                tracing::info!(
-                                    task_id = task.id.0,
-                                    duplicate_of = target.id,
-                                    "ingest: closed duplicate issue"
-                                );
-                                continue;
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    task_id = task.id.0,
-                                    err = %e,
-                                    "ingest: failed to close duplicate issue — falling through to ingest normally"
-                                );
-                            }
+                    };
+
+                if should_dedupe {
+                    let comment = format!(
+                        "Duplicate of #{id} — closing to avoid duplicate work.{footer}",
+                        id = target.id,
+                        footer = crate::engine::orch_footer()
+                    );
+                    if let Err(e) = backend.post_comment(&task.id, &comment).await {
+                        tracing::warn!(
+                            task_id = task.id.0,
+                            err = %e,
+                            "ingest: failed to comment on duplicate issue"
+                        );
+                    }
+                    match backend.update_status(&task.id, Status::Done).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                task_id = task.id.0,
+                                duplicate_of = target.id,
+                                "ingest: closed duplicate issue"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                task_id = task.id.0,
+                                err = %e,
+                                "ingest: failed to close duplicate issue — falling through to ingest normally"
+                            );
                         }
                     }
                 }
@@ -2883,8 +2880,8 @@ pub(crate) async fn ingest_external_tasks(
 
         match store.ensure_external_task(repo, task).await {
             Ok(store_id) => {
-                if let Ok(number) = task.id.0.parse::<i64>() {
-                    if let Err(err) = crate::engine::dependencies::sync_issue_dependencies(
+                if let Ok(number) = task.id.0.parse::<i64>()
+                    && let Err(err) = crate::engine::dependencies::sync_issue_dependencies(
                         backend.as_ref(),
                         store,
                         store_id,
@@ -2893,13 +2890,12 @@ pub(crate) async fn ingest_external_tasks(
                         &task.body,
                     )
                     .await
-                    {
-                        tracing::warn!(
-                            task_id = task.id.0,
-                            err = %err,
-                            "ingest: dependency sync failed"
-                        );
-                    }
+                {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        err = %err,
+                        "ingest: dependency sync failed"
+                    );
                 }
                 if let Some(s) = status {
                     id_status_pairs.push((store_id, *s));
@@ -2966,14 +2962,14 @@ pub(crate) async fn ingest_external_tasks(
             }
         };
         for (store_id, status) in id_status_pairs {
-            if let Some(existing) = existing_map.get(&store_id) {
-                if existing.status == TaskStatus::New {
-                    let db_status = status_to_task_status(status);
-                    if db_status != TaskStatus::New {
-                        if let Err(e) = store.update_status(store_id, db_status).await {
-                            tracing::debug!(?e, "ingest: status sync failed");
-                        }
-                    }
+            if let Some(existing) = existing_map.get(&store_id)
+                && existing.status == TaskStatus::New
+            {
+                let db_status = status_to_task_status(status);
+                if db_status != TaskStatus::New
+                    && let Err(e) = store.update_status(store_id, db_status).await
+                {
+                    tracing::debug!(?e, "ingest: status sync failed");
                 }
             }
         }
@@ -2986,17 +2982,16 @@ pub(crate) async fn ingest_external_tasks(
         match backend.get_project_item_estimates(&node_ids).await {
             Ok(estimates) => {
                 for (store_id, node_id) in new_task_node_ids {
-                    if let Some(&estimate) = estimates.get(&node_id) {
-                        if estimate > 0 {
-                            if let Err(e) = store.set_estimate_if_zero(store_id, estimate).await {
-                                tracing::debug!(
-                                    store_id,
-                                    estimate,
-                                    err = %e,
-                                    "ingest: failed to set estimate from project"
-                                );
-                            }
-                        }
+                    if let Some(&estimate) = estimates.get(&node_id)
+                        && estimate > 0
+                        && let Err(e) = store.set_estimate_if_zero(store_id, estimate).await
+                    {
+                        tracing::debug!(
+                            store_id,
+                            estimate,
+                            err = %e,
+                            "ingest: failed to set estimate from project"
+                        );
                     }
                 }
             }
@@ -3069,7 +3064,7 @@ mod tests {
 
     #[async_trait]
     impl ExternalBackend for IngestMockBackend {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "ingest-mock"
         }
         async fn create_task(&self, _: &str, _: &str, _: &[String]) -> anyhow::Result<ExternalId> {
@@ -3098,7 +3093,6 @@ mod tests {
             let mut result = Vec::new();
             for (label, tasks) in &self.tasks {
                 let status = match label.as_str() {
-                    "status:new" => None,
                     "status:routed" => Some(Status::Routed),
                     "status:in_progress" => Some(Status::InProgress),
                     "status:needs_review" => Some(Status::NeedsReview),
@@ -3167,7 +3161,7 @@ mod tests {
         ExternalTask {
             id: ExternalId(id.to_string()),
             title: title.to_string(),
-            body: "".to_string(),
+            body: String::new(),
             state: "open".to_string(),
             labels: vec![],
             author: "user".to_string(),
@@ -3228,22 +3222,24 @@ mod tests {
         let mut old = make_ext_task("73", "Filed weeks ago, never ingested");
         old.updated_at = "2026-01-01T00:00:00Z".to_string();
         let backend = IngestMockBackend::with_tasks(vec![(Status::New, old)]);
-        let backend_dyn: Arc<dyn ExternalBackend> = backend.clone();
+        let backend_dyn: Arc<dyn ExternalBackend> = Arc::<IngestMockBackend>::clone(&backend);
         ingest_external_tasks(&backend_dyn, "owner/repo", &store)
             .await
             .unwrap();
-        assert!(store
-            .get_by_external_id("owner/repo", "73")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .get_by_external_id("owner/repo", "73")
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         // A second sync, standing in for the one right after a restart, sees a new issue.
         let backend = IngestMockBackend::with_tasks(vec![(
             Status::New,
             make_ext_task("78", "Opened after the restart"),
         )]);
-        let backend_dyn: Arc<dyn ExternalBackend> = backend.clone();
+        let backend_dyn: Arc<dyn ExternalBackend> = Arc::<IngestMockBackend>::clone(&backend);
         ingest_external_tasks(&backend_dyn, "owner/repo", &store)
             .await
             .unwrap();
@@ -3254,11 +3250,13 @@ mod tests {
             1,
             "one sync is one listing"
         );
-        assert!(store
-            .get_by_external_id("owner/repo", "78")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .get_by_external_id("owner/repo", "78")
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
             store
                 .kv_get("issues_last_ingested:owner/repo")
@@ -3309,14 +3307,15 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn ingest_closes_duplicate_titles() {
-        crate::engine::cooldown::reset_global_state().await;
         use crate::store::{NewTask, TaskStore};
+
+        crate::engine::cooldown::reset_global_state().await;
 
         let backend = IngestMockBackend::with_tasks_and_dedup(
             vec![(Status::New, make_ext_task("2", "Duplicate issue"))],
             true,
         );
-        let backend_dyn: Arc<dyn ExternalBackend> = backend.clone();
+        let backend_dyn: Arc<dyn ExternalBackend> = Arc::<IngestMockBackend>::clone(&backend);
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
         store
@@ -3431,15 +3430,16 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn ingest_sync_to_project_called_only_for_new_tasks() {
-        crate::engine::cooldown::reset_global_state().await;
         use crate::store::{NewTask, TaskStore};
+
+        crate::engine::cooldown::reset_global_state().await;
 
         // Two tasks: "10" is pre-existing, "11" is new.
         let backend = IngestMockBackend::with_tasks(vec![
             (Status::New, make_ext_task("10", "Existing task")),
             (Status::New, make_ext_task("11", "New task")),
         ]);
-        let backend_dyn: Arc<dyn ExternalBackend> = backend.clone();
+        let backend_dyn: Arc<dyn ExternalBackend> = Arc::<IngestMockBackend>::clone(&backend);
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
         // Pre-insert task "10" so it already exists in the store.
@@ -3471,7 +3471,6 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn ingest_handles_mixed_labeled_and_unlabeled_open_issues() {
-        crate::engine::cooldown::reset_global_state().await;
         // Simulate a backend where some issues have no status label (routable/unlabeled)
         // and others carry active status labels.  Both kinds must be ingested and the
         // store status must reflect the label where present.
@@ -3479,7 +3478,7 @@ mod tests {
 
         #[async_trait]
         impl ExternalBackend for MixedBackend {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "mixed"
             }
             async fn create_task(
@@ -3541,6 +3540,8 @@ mod tests {
             }
         }
 
+        crate::engine::cooldown::reset_global_state().await;
+
         let backend: Arc<dyn ExternalBackend> = Arc::new(MixedBackend);
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
@@ -3585,7 +3586,7 @@ mod tests {
         store.kv_set("k1", "store_val").await.unwrap();
 
         let opt = Some(&store);
-        let val = kv_get_prefer_store(&opt, "k1").await;
+        let val = kv_get_prefer_store(opt, "k1").await;
         assert_eq!(val.as_deref(), Some("store_val"));
     }
 
@@ -3594,7 +3595,7 @@ mod tests {
     async fn kv_get_prefer_store_returns_none_without_store() {
         crate::engine::cooldown::reset_global_state().await;
         let opt: Option<&Arc<TaskStore>> = None;
-        let val = kv_get_prefer_store(&opt, "k2").await;
+        let val = kv_get_prefer_store(opt, "k2").await;
         assert_eq!(val, None);
     }
 
@@ -3605,7 +3606,7 @@ mod tests {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
         let opt = Some(&store);
-        kv_set_prefer_store(&opt, "k3", "val3").await;
+        kv_set_prefer_store(opt, "k3", "val3").await;
 
         assert_eq!(store.kv_get("k3").await.unwrap().as_deref(), Some("val3"));
     }
@@ -3616,7 +3617,7 @@ mod tests {
         crate::engine::cooldown::reset_global_state().await;
         let opt: Option<&Arc<TaskStore>> = None;
         // Should not panic
-        kv_set_prefer_store(&opt, "k4", "val4").await;
+        kv_set_prefer_store(opt, "k4", "val4").await;
     }
 
     // ── try_kv_get_prefer_store / try_kv_set_prefer_store ────────────────
@@ -3629,7 +3630,7 @@ mod tests {
         store.kv_set("try_k1", "try_val1").await.unwrap();
 
         let opt = Some(&store);
-        let result = try_kv_get_prefer_store(&opt, "try_k1").await;
+        let result = try_kv_get_prefer_store(opt, "try_k1").await;
         assert_eq!(result.unwrap().as_deref(), Some("try_val1"));
     }
 
@@ -3640,7 +3641,7 @@ mod tests {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let opt = Some(&store);
 
-        let result = try_kv_get_prefer_store(&opt, "nonexistent_key").await;
+        let result = try_kv_get_prefer_store(opt, "nonexistent_key").await;
         assert_eq!(result.unwrap(), None); // Key doesn't exist, but query succeeded
     }
 
@@ -3649,7 +3650,7 @@ mod tests {
     async fn try_kv_get_prefer_store_returns_none_without_store() {
         crate::engine::cooldown::reset_global_state().await;
         let opt: Option<&Arc<TaskStore>> = None;
-        let result = try_kv_get_prefer_store(&opt, "try_k2").await;
+        let result = try_kv_get_prefer_store(opt, "try_k2").await;
         assert_eq!(result.unwrap(), None);
     }
 
@@ -3660,7 +3661,7 @@ mod tests {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let opt = Some(&store);
 
-        let result = try_kv_set_prefer_store(&opt, "try_k3", "try_val3").await;
+        let result = try_kv_set_prefer_store(opt, "try_k3", "try_val3").await;
         assert!(result.is_ok());
         assert_eq!(
             store.kv_get("try_k3").await.unwrap().as_deref(),
@@ -3674,7 +3675,7 @@ mod tests {
         crate::engine::cooldown::reset_global_state().await;
         let opt: Option<&Arc<TaskStore>> = None;
         // Should not error - best effort when store unavailable
-        let result = try_kv_set_prefer_store(&opt, "try_k4", "try_val4").await;
+        let result = try_kv_set_prefer_store(opt, "try_k4", "try_val4").await;
         assert!(result.is_ok());
     }
 
@@ -3687,7 +3688,7 @@ mod tests {
 
         let repo = "owner/repo";
         let task_id = "42";
-        let dispatch_key = format!("{}/{}", repo, task_id);
+        let dispatch_key = format!("{repo}/{task_id}");
 
         // Initially not in the map
         assert!(!dispatching.contains_key(&dispatch_key));
@@ -3719,11 +3720,11 @@ mod tests {
         let repo = "owner/repo";
 
         // Lock task 42
-        let key_42 = format!("{}/42", repo);
+        let key_42 = format!("{repo}/42");
         dispatching.insert(key_42.clone(), "42".to_string());
 
         // Task 43 should NOT be blocked
-        let key_43 = format!("{}/43", repo);
+        let key_43 = format!("{repo}/43");
         assert!(
             dispatching.contains_key(&key_42),
             "task 42 should be locked"
@@ -3749,8 +3750,9 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn dispatch_key_held_during_review_agent_execution() {
-        crate::engine::cooldown::reset_global_state().await;
         use tokio::sync::oneshot;
+
+        crate::engine::cooldown::reset_global_state().await;
 
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
 
@@ -3812,8 +3814,9 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn dispatch_guard_releases_key_on_panic() {
-        crate::engine::cooldown::reset_global_state().await;
         use crate::engine::dispatch_guard::DispatchGuard;
+
+        crate::engine::cooldown::reset_global_state().await;
 
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let key = "owner/repo/42".to_string();
@@ -3850,14 +3853,14 @@ mod tests {
         crate::engine::cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let mock = IngestMockBackend::with_tasks(vec![]);
-        let backend: Arc<dyn ExternalBackend> = mock.clone();
+        let backend: Arc<dyn ExternalBackend> = Arc::<IngestMockBackend>::clone(&mock);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let dispatching = Arc::new(DashMap::new());
-        sync_tick(
+        Box::pin(sync_tick(
             &backend,
             &Arc::new(TmuxManager::new()),
             "owner/repo",
@@ -3870,7 +3873,7 @@ mod tests {
             &store,
             &dispatching,
             &Arc::new(DashSet::new()),
-        )
+        ))
         .await
         .unwrap();
         assert_eq!(
@@ -3881,11 +3884,13 @@ mod tests {
         assert!(mock.project_syncs.lock().await.is_empty());
         assert!(mock.status_updates.lock().await.is_empty());
         assert!(dispatching.is_empty());
-        assert!(store
-            .existing_external_ids("owner/repo")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .existing_external_ids("owner/repo")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[serial(cooldown_state)]
@@ -3896,7 +3901,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let router = reviewer_router();
@@ -3945,7 +3950,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let router = reviewer_router();
@@ -4017,7 +4022,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let router = reviewer_router();
@@ -4071,7 +4076,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let router = reviewer_router();
@@ -4144,7 +4149,7 @@ mod tests {
         // TaskManager scoped to the active repo — NOT the repo the task belongs to.
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "active/repo".to_string(),
         ));
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
@@ -4195,7 +4200,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "active/repo".to_string(),
         ));
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
@@ -4252,7 +4257,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "active/repo".to_string(),
         ));
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
@@ -4308,7 +4313,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "active/repo".to_string(),
         ));
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
@@ -4366,7 +4371,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let router = router_with_healthy_review_agent();
@@ -4438,8 +4443,8 @@ mod tests {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
-            backend.clone(),
-            store.clone(),
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let tmux = Arc::new(TmuxManager::new());
@@ -4473,7 +4478,7 @@ mod tests {
             .unwrap();
         // Don't backdate — task is fresh (just created)
 
-        sync_tick(
+        Box::pin(sync_tick(
             &backend,
             &tmux,
             "owner/repo",
@@ -4483,7 +4488,7 @@ mod tests {
             &store,
             &dispatching,
             &auto_merge_in_flight,
-        )
+        ))
         .await
         .unwrap();
 
@@ -4500,7 +4505,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
@@ -4574,7 +4579,7 @@ mod tests {
         assert!(task.agent.is_none());
         assert!(task.model.is_none());
         assert_eq!(task.auto_unblock_count, 1);
-        assert!(!task.auto_unblock_last_at.is_empty());
+        assert_ne!(task.auto_unblock_last_at, "");
         assert_eq!(task.auto_unblock_last_reason, "RateLimit");
     }
 
@@ -4586,7 +4591,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
@@ -4687,7 +4692,10 @@ mod tests {
     #[serial(cooldown_state)]
     #[test]
     fn classify_failure_model_unavailable_phrase_is_recoverable() {
-        let category = classify_failure("model unavailable (anthropic/claude-sonnet-4-6): Model not found: anthropic/claude-sonnet-4-6", "error");
+        let category = classify_failure(
+            "model unavailable (anthropic/claude-sonnet-4-6): Model not found: anthropic/claude-sonnet-4-6",
+            "error",
+        );
         assert_eq!(
             category,
             FailureCategory::ModelUnavailable,
@@ -4799,7 +4807,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
@@ -4881,7 +4889,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
@@ -4982,7 +4990,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
@@ -5063,7 +5071,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
@@ -5206,8 +5214,9 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn emit_degraded_agents_writes_metric_when_three_or_more_agents_degraded() {
-        crate::engine::cooldown::reset_global_state().await;
         use crate::engine::router::{Router, RouterConfig};
+
+        crate::engine::cooldown::reset_global_state().await;
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
@@ -5280,8 +5289,9 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn emit_degraded_agents_clears_alert_when_below_threshold() {
-        crate::engine::cooldown::reset_global_state().await;
         use crate::engine::router::{Router, RouterConfig};
+
+        crate::engine::cooldown::reset_global_state().await;
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
@@ -5336,9 +5346,10 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn emit_degraded_agents_sets_stale_pool_alert_for_persistent_model_failures() {
-        crate::engine::cooldown::reset_global_state().await;
         use crate::engine::cooldown::record_persistent_model_failure;
         use crate::engine::router::{Router, RouterConfig};
+
+        crate::engine::cooldown::reset_global_state().await;
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
@@ -5369,7 +5380,7 @@ mod tests {
 
     // ── classify_comment tests ──────────────────────────────────────────
 
-    use super::{classify_comment, CommentAction, MentionCursor};
+    use super::{CommentAction, MentionCursor, classify_comment};
     use crate::engine::commands::OwnerCommand;
 
     #[serial(cooldown_state)]
@@ -5539,7 +5550,7 @@ mod tests {
 
     #[async_trait]
     impl ExternalBackend for AckTrackingBackend {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "ack-tracking"
         }
 
@@ -5638,8 +5649,8 @@ mod tests {
             issue_url: Some("https://api.github.com/repos/owner/repo/issues/42".into()),
         };
 
-        let backend_trait: Arc<dyn ExternalBackend> = backend.clone();
-        let task_manager = Arc::new(TaskManager::new(backend_trait.clone()));
+        let backend_trait: Arc<dyn ExternalBackend> = Arc::<AckTrackingBackend>::clone(&backend);
+        let task_manager = Arc::new(TaskManager::new(std::sync::Arc::clone(&backend_trait)));
 
         scan_comments(
             &backend_trait,
@@ -5699,8 +5710,8 @@ mod tests {
             issue_url: Some("https://api.github.com/repos/owner/repo/issues/42".into()),
         };
 
-        let backend_trait: Arc<dyn ExternalBackend> = backend.clone();
-        let task_manager = Arc::new(TaskManager::new(backend_trait.clone()));
+        let backend_trait: Arc<dyn ExternalBackend> = Arc::<AckTrackingBackend>::clone(&backend);
+        let task_manager = Arc::new(TaskManager::new(std::sync::Arc::clone(&backend_trait)));
 
         scan_comments(
             &backend_trait,
@@ -5801,8 +5812,8 @@ mod tests {
             issue_url: Some("https://api.github.com/repos/owner/repo/issues/42".into()),
         };
 
-        let backend_trait: Arc<dyn ExternalBackend> = backend.clone();
-        let task_manager = Arc::new(TaskManager::new(backend_trait.clone()));
+        let backend_trait: Arc<dyn ExternalBackend> = Arc::<AckTrackingBackend>::clone(&backend);
+        let task_manager = Arc::new(TaskManager::new(std::sync::Arc::clone(&backend_trait)));
         let gh = FlakyGh::default();
         let mut cursor = MentionCursor::default();
 
@@ -5899,8 +5910,8 @@ mod tests {
             issue_url: Some("https://api.github.com/repos/owner/repo/issues/42".into()),
         };
 
-        let backend_trait: Arc<dyn ExternalBackend> = backend.clone();
-        let task_manager = Arc::new(TaskManager::new(backend_trait.clone()));
+        let backend_trait: Arc<dyn ExternalBackend> = Arc::<AckTrackingBackend>::clone(&backend);
+        let task_manager = Arc::new(TaskManager::new(std::sync::Arc::clone(&backend_trait)));
 
         scan_comments(
             &backend_trait,
@@ -6099,7 +6110,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         auto_unblock_ci_failure_blocked_tasks_global(
@@ -6121,7 +6132,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "active/repo".to_string(),
         ));
 
@@ -6184,7 +6195,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "active/repo".to_string(),
         ));
 
@@ -6237,7 +6248,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "owner/repo".to_string(),
         ));
         let router = router_with_healthy_review_agent();
@@ -6254,7 +6265,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "active/repo".to_string(),
         ));
         let router = router_with_healthy_review_agent();
@@ -6309,7 +6320,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "active/repo".to_string(),
         ));
         let router = router_with_healthy_review_agent();
@@ -6361,7 +6372,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "active/repo".to_string(),
         ));
         let router = router_with_healthy_review_agent();
@@ -6429,7 +6440,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            store.clone(),
+            std::sync::Arc::clone(&store),
             "active/repo".to_string(),
         ));
         // RouterConfig::default() has no "review" model map entries, so the one
