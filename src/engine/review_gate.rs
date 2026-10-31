@@ -59,9 +59,11 @@ pub(crate) async fn review_ci_gate(
     let state = match ci_state(&required, &runs, &statuses) {
         CiState::Red(failed) => {
             // A check that never started for an Actions billing limit did not run, it did not fail
+            let failed_runs = runs_named(&runs, &failed);
             let unstarted =
-                crate::engine::auto_merge::billing_failed_runs(gh, repo, &sha, Some(runs)).await;
-            if unstarted as usize >= failed.len() {
+                crate::engine::auto_merge::billing_failed_runs(gh, repo, &sha, Some(failed_runs))
+                    .await;
+            if unstarted as usize == failed.len() {
                 CiState::NotStarted
             } else {
                 CiState::Red(failed)
@@ -96,6 +98,14 @@ pub(crate) async fn review_ci_gate(
     }
 
     Ok(gate)
+}
+
+/// The check runs whose name is one of the failed checks. A failed commit status has no run
+fn runs_named(runs: &[GitHubCheckRun], names: &[String]) -> Vec<GitHubCheckRun> {
+    runs.iter()
+        .filter(|r| names.contains(&r.name))
+        .cloned()
+        .collect()
 }
 
 fn is_own_check(name: &str) -> bool {
@@ -168,6 +178,33 @@ mod tests {
             context: name.to_string(),
             integration_id: None,
         }
+    }
+
+    #[test]
+    fn a_required_status_failure_stays_red_beside_failed_optional_runs() {
+        let runs = [
+            run("optional-a", "completed", Some("failure")),
+            run("optional-b", "completed", Some("failure")),
+        ];
+        let statuses = [("ci/test".to_string(), "failure".to_string())];
+        let state = ci_state(&[required("ci/test")], &runs, &statuses);
+        let CiState::Red(failed) = state else {
+            panic!("expected red, got {state:?}");
+        };
+        assert_eq!(failed, vec!["ci/test".to_string()]);
+        // No failed run is named like the failed status, so no billing count can reach it
+        assert!(runs_named(&runs, &failed).is_empty());
+    }
+
+    #[test]
+    fn runs_named_keeps_only_the_failed_checks() {
+        let runs = [
+            run("test", "completed", Some("failure")),
+            run("lint", "completed", Some("failure")),
+        ];
+        let kept = runs_named(&runs, &["test".to_string()]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].name, "test");
     }
 
     #[test]
