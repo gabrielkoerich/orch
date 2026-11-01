@@ -14,6 +14,8 @@ pub enum Priority {
     #[default]
     Normal,
     High,
+    /// A task with a linked PR, ranked above `priority:high` to ship pushed work first
+    OpenPr,
 }
 
 impl Priority {
@@ -35,13 +37,20 @@ impl Priority {
             Self::Low => "low",
             Self::Normal => "normal",
             Self::High => "high",
+            Self::OpenPr => "open-pr",
         }
+    }
+
+    /// `OpenPr` when the task has a linked PR, else the label priority
+    #[must_use]
+    pub fn with_pr(self, has_pr: bool) -> Self {
+        if has_pr { Self::OpenPr } else { self }
     }
 
     fn label(self) -> Option<&'static str> {
         match self {
             Self::Low => Some(LOW_LABEL),
-            Self::Normal => None,
+            Self::Normal | Self::OpenPr => None,
             Self::High => Some(HIGH_LABEL),
         }
     }
@@ -78,11 +87,11 @@ pub fn is_priority_label(label: &str) -> bool {
 }
 
 /// Highest priority first, arrival order kept inside a priority
-pub fn sort_by_priority<T>(tasks: &mut [T], labels_of: impl Fn(&T) -> &[String]) {
-    tasks.sort_by_key(|t| std::cmp::Reverse(Priority::from_labels(labels_of(t))));
+pub fn sort_by_priority<T>(tasks: &mut [T], priority_of: impl Fn(&T) -> Priority) {
+    tasks.sort_by_key(|t| std::cmp::Reverse(priority_of(t)));
 }
 
-/// The one slot a `priority:high` task may take beyond `max_parallel`
+/// The one slot a `priority:high` or open PR task may take beyond `max_parallel`
 fn extra_slot() -> &'static Arc<Semaphore> {
     static SLOT: OnceLock<Arc<Semaphore>> = OnceLock::new();
     SLOT.get_or_init(|| Arc::new(Semaphore::new(1)))
@@ -105,7 +114,7 @@ fn acquire_with_extra(
         return Some(permit);
     }
 
-    if priority == Priority::High {
+    if priority >= Priority::High {
         return Arc::clone(extra).try_acquire_owned().ok();
     }
 
@@ -141,12 +150,33 @@ mod tests {
             ("high-later", labels(&["priority:high"])),
             ("normal-second", labels(&[])),
         ];
-        sort_by_priority(&mut tasks, |t| &t.1);
+        sort_by_priority(&mut tasks, |t| Priority::from_labels(&t.1));
         let order: Vec<_> = tasks.iter().map(|t| t.0).collect();
         assert_eq!(
             order,
             ["high-later", "normal-first", "normal-second", "low"]
         );
+    }
+
+    #[test]
+    fn open_pr_task_dispatches_before_high_task() {
+        let mut tasks = vec![
+            ("high", Priority::High.with_pr(false)),
+            ("normal-with-pr", Priority::Normal.with_pr(true)),
+            ("normal", Priority::Normal.with_pr(false)),
+            ("low-with-pr", Priority::Low.with_pr(true)),
+        ];
+        sort_by_priority(&mut tasks, |t| t.1);
+        let order: Vec<_> = tasks.iter().map(|t| t.0).collect();
+        assert_eq!(order, ["normal-with-pr", "low-with-pr", "high", "normal"]);
+    }
+
+    #[test]
+    fn open_pr_task_may_use_the_extra_slot() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let extra = Arc::new(Semaphore::new(1));
+        let _busy = acquire_with_extra(&semaphore, &extra, Priority::Normal).unwrap();
+        assert!(acquire_with_extra(&semaphore, &extra, Priority::OpenPr).is_some());
     }
 
     #[test]

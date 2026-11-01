@@ -173,7 +173,7 @@ orch task inspect <id>        # Status, priority, agent, attempts, last error, P
 orch task priority <id> high  # high, normal or low: sets the priority label
 ```
 
-A `priority:high` label makes a routed task dispatch before normal ones, and it may take one slot beyond `engine.max_parallel`. A `priority:low` task dispatches last. A label change on GitHub applies on the next sync.
+A `priority:high` label makes a routed task dispatch before normal ones, and it may take one slot beyond `engine.max_parallel`. A routed task with a linked PR dispatches before every other task, `priority:high` included, and may also take the extra slot. A `priority:low` task dispatches last. A label change on GitHub applies on the next sync.
 
 ### Plan import
 
