@@ -647,43 +647,6 @@ impl TaskStore {
         Ok(())
     }
 
-    /// Append a lifecycle activity event for a task within a transaction.
-    #[doc(hidden)]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one argument per column of the activity row"
-    )]
-    pub async fn append_activity_tx(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        task_id: i64,
-        event_type: &str,
-        from_status: Option<&str>,
-        to_status: Option<&str>,
-        agent: Option<&str>,
-        model: Option<&str>,
-        details: Option<&serde_json::Value>,
-    ) -> anyhow::Result<()> {
-        let details_json = match details {
-            Some(v) => serde_json::to_string(&sanitize_activity_details(v))?,
-            None => "{}".to_string(),
-        };
-        sqlx::query(
-            "INSERT INTO task_activity
-              (task_id, event_type, from_status, to_status, agent, model, details)
-              VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(task_id)
-        .bind(event_type)
-        .bind(from_status)
-        .bind(to_status)
-        .bind(agent)
-        .bind(model)
-        .bind(details_json)
-        .execute(&mut **tx)
-        .await?;
-        Ok(())
-    }
-
     /// When the task last entered in_review, and whether a review decision was recorded since
     pub async fn in_review_entry(&self, task_id: i64) -> anyhow::Result<Option<(String, bool)>> {
         let row: Option<(String, bool)> = sqlx::query_as(

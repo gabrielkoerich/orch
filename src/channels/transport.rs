@@ -266,11 +266,6 @@ impl Transport {
         }
     }
 
-    /// List all active bindings.
-    pub async fn active_sessions(&self) -> Vec<SessionBinding> {
-        self.bindings.read().await.values().cloned().collect()
-    }
-
     /// Push a task completion notification to all subscribers.
     pub fn push_notification(&self, notification: TaskNotification) {
         // Ignore send errors (no active receivers)
