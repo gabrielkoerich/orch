@@ -2055,10 +2055,21 @@ async fn dispatch_tasks_for_repo(
         0
     };
 
-    let mut dispatchable = dispatchable;
-    crate::engine::priority::sort_by_priority(&mut dispatchable, |t| &t.labels);
+    let mut ranked: Vec<(crate::engine::priority::Priority, ExternalTask)> =
+        Vec::with_capacity(dispatchable.len());
+    for task in dispatchable {
+        let has_pr = match store.resolve_id_by_external(repo, &task.id.0).await {
+            Ok(Some(id)) => store.get(id).await.is_ok_and(|t| t.pr_number.is_some()),
+            _ => false,
+        };
+        ranked.push((
+            crate::engine::priority::Priority::from_labels(&task.labels).with_pr(has_pr),
+            task,
+        ));
+    }
+    crate::engine::priority::sort_by_priority(&mut ranked, |t| t.0);
 
-    for (idx, task) in dispatchable.into_iter().enumerate() {
+    for (idx, (priority, task)) in ranked.into_iter().enumerate() {
         if crate::engine::dependencies::dispatch_is_waiting(store, repo, &task.id.0).await {
             continue;
         }
@@ -2178,7 +2189,6 @@ async fn dispatch_tasks_for_repo(
         }
 
         // Try to acquire a slot
-        let priority = crate::engine::priority::Priority::from_labels(&task.labels);
         let Some(permit) = crate::engine::priority::acquire_dispatch_slot(semaphore, priority)
         else {
             tracing::debug!("all parallel slots busy, skipping remaining tasks");
