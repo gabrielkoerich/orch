@@ -868,6 +868,13 @@ enum TaskAction {
         /// Task ID (`58`, `owner/repo#58`, or `internal:58`)
         id: String,
     },
+    /// Set a task's dispatch priority (high tasks dispatch first and may use an extra slot)
+    Priority {
+        /// Task ID (`58`, `owner/repo#58`, or `internal:58`)
+        id: String,
+        /// high, normal or low
+        level: String,
+    },
     /// Stream task state-transition events in real-time
     Events {
         /// Filter by repo (substring match)
@@ -1341,6 +1348,9 @@ async fn async_main() -> anyhow::Result<()> {
             }
             TaskAction::Inspect { id } => {
                 cli::task::inspect(&id).await?;
+            }
+            TaskAction::Priority { id, level } => {
+                cli::task::priority(&id, &level).await?;
             }
             TaskAction::Events { repo, task } => {
                 cli::events::stream(repo.as_deref(), task.as_deref()).await?;

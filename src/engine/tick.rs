@@ -2055,6 +2055,9 @@ async fn dispatch_tasks_for_repo(
         0
     };
 
+    let mut dispatchable = dispatchable;
+    crate::engine::priority::sort_by_priority(&mut dispatchable, |t| &t.labels);
+
     for (idx, task) in dispatchable.into_iter().enumerate() {
         if crate::engine::dependencies::dispatch_is_waiting(store, repo, &task.id.0).await {
             continue;
@@ -2175,7 +2178,9 @@ async fn dispatch_tasks_for_repo(
         }
 
         // Try to acquire a slot
-        let Ok(permit) = std::sync::Arc::clone(semaphore).try_acquire_owned() else {
+        let priority = crate::engine::priority::Priority::from_labels(&task.labels);
+        let Some(permit) = crate::engine::priority::acquire_dispatch_slot(semaphore, priority)
+        else {
             tracing::debug!("all parallel slots busy, skipping remaining tasks");
             break; // dispatch_guard drops here, removing the key
         };

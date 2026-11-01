@@ -169,8 +169,11 @@ orch task close <id>          # Manually mark a task as done
 orch task close <id> --note "msg"  # Mark done with a comment
 orch task deps <id>           # Show what a task waits on, and what waits on it
 orch task watch <id>          # Follow the agent's output live, with its review
-orch task inspect <id>        # Status, agent, attempts, last error, PR, block reason
+orch task inspect <id>        # Status, priority, agent, attempts, last error, PR, block reason
+orch task priority <id> high  # high, normal or low: sets the priority label
 ```
+
+A `priority:high` label makes a routed task dispatch before normal ones, and it may take one slot beyond `engine.max_parallel`. A `priority:low` task dispatches last. A label change on GitHub applies on the next sync.
 
 ### Plan import
 
