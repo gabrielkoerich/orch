@@ -1252,6 +1252,42 @@ pub async fn close(id: &str, note: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Set a task's priority label, on GitHub for external tasks and in the store for all.
+pub async fn priority(id: &str, level: &str) -> anyhow::Result<()> {
+    use crate::backends::ExternalBackend;
+    use crate::backends::github::GitHubBackend;
+    use crate::engine::priority::{Priority, is_priority_label};
+
+    let wanted: Priority = level.parse()?;
+    let s = crate::cli::init_store().await?;
+    let resolved = crate::cli::task_ref::resolve(&s, id).await?;
+    let store_id = resolved.store_id.context("task missing store id")?;
+    let task = s.get(store_id).await?;
+
+    if !resolved.is_internal() {
+        let backend: Arc<dyn ExternalBackend> =
+            Arc::new(GitHubBackend::new(resolved.repo.clone())?);
+        let ext_id = ExternalId(resolved.external_id.clone());
+        for label in task.labels.iter().filter(|l| is_priority_label(l)) {
+            backend.remove_label(&ext_id, label).await?;
+        }
+        let added = wanted.apply_to(&[]);
+        if !added.is_empty() {
+            backend.set_labels(&ext_id, &added).await?;
+        }
+    }
+
+    let labels = wanted.apply_to(&task.labels);
+    s.set_fields(store_id, &[("labels", serde_json::json!(labels))])
+        .await?;
+    println!(
+        "{} priority set to {}",
+        resolved.display_spec(),
+        wanted.as_str()
+    );
+    Ok(())
+}
+
 /// Attach to a running agent's tmux session.
 pub async fn attach(id: &str) -> anyhow::Result<()> {
     let store = crate::cli::init_store().await?;
@@ -1933,6 +1969,10 @@ pub async fn inspect(id: &str) -> anyhow::Result<()> {
         task.id
     );
     println!("  Status  : {}", task.status.as_str());
+    println!(
+        "  Priority: {}",
+        crate::engine::priority::Priority::from_labels(&task.labels).as_str()
+    );
     if task.status == crate::store::TaskStatus::Waiting {
         let blockers = store
             .unmet_blocker_labels(task.id)
