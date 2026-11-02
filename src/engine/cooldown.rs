@@ -624,6 +624,16 @@ pub async fn record_credit_exhaustion(agent_name: &str, reason: CreditExhaustion
         CreditExhaustionReason::BillingCycleExhausted => "billing_cycle_exhausted",
     };
 
+    // A failure from a run that started before the cooldown is the same event
+    if is_in_cooldown_with_reason(agent_name, reason_str) {
+        tracing::debug!(
+            agent = agent_name,
+            reason = reason_str,
+            "credit exhaustion already cooled, not escalating"
+        );
+        return;
+    }
+
     let store_opt = cooldown_store().lock().await.clone();
     // Use a distinct failure counter (CREDIT_FAILURE_COUNT_PREFIX) so credit-
     // exhaustion backoff escalation is independent of generic agent failures.
@@ -660,6 +670,24 @@ pub async fn record_credit_exhaustion(agent_name: &str, reason: CreditExhaustion
         cooldown_secs,
         "credit exhaustion detected: applying exponential agent-wide cooldown"
     );
+}
+
+// Returns false when the message is no credit exhaustion. Model-scoped billing cycle cools the model only
+pub async fn record_credit_exhaustion_from_message(
+    agent_name: &str,
+    model: Option<&str>,
+    message: &str,
+) -> bool {
+    let Some(reason) = detect_credit_exhaustion(message) else {
+        return false;
+    };
+    match (reason, model) {
+        (CreditExhaustionReason::BillingCycleExhausted, Some(model)) => {
+            record_persistent_model_failure(agent_name, model).await;
+        }
+        _ => record_credit_exhaustion(agent_name, reason).await,
+    }
+    true
 }
 
 /// Record that a specific agent+model combo has failed.
@@ -1149,6 +1177,14 @@ fn github_5xx_circuit_open_lock() -> std::sync::MutexGuard<'static, Option<i64>>
     github_5xx_circuit_open().lock().unwrap_or_else(|e| {
         tracing::error!("github 5xx circuit open lock poisoned — recovering with partial state; circuit breaker may operate incorrectly");
         e.into_inner()
+    })
+}
+
+/// Check if a key is in cooldown with the given reason.
+fn is_in_cooldown_with_reason(key: &str, reason: &str) -> bool {
+    let map = cooldown_lock();
+    map.get(key).is_some_and(|entry| {
+        entry.reason == reason && chrono::Utc::now().timestamp() < entry.cooldown_until
     })
 }
 
@@ -1764,6 +1800,34 @@ mod tests {
             !is_model_in_cooldown("opencode", "old-free"),
             "expired cooldown should not be loaded"
         );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn credit_exhaustion_inside_active_cooldown_keeps_counter_at_one() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
+
+        let msg =
+            "API error (status 402 Payment Required): usage balance exhausted, out of credits";
+        assert!(record_credit_exhaustion_from_message("credit_dup_agent", Some("m"), msg).await);
+        assert!(record_credit_exhaustion_from_message("credit_dup_agent", Some("m"), msg).await);
+
+        assert!(is_agent_in_cooldown("credit_dup_agent"));
+        let count = store
+            .kv_get(&format!("{CREDIT_FAILURE_COUNT_PREFIX}credit_dup_agent"))
+            .await
+            .unwrap();
+        assert_eq!(count.as_deref(), Some("1"));
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn non_credit_message_is_not_recorded_as_credit_exhaustion() {
+        super::reset_global_state().await;
+        assert!(!record_credit_exhaustion_from_message("x_agent", Some("m"), "boom").await);
+        assert!(!is_agent_in_cooldown("x_agent"));
     }
 
     #[serial(cooldown_state)]
@@ -2510,7 +2574,11 @@ mod tests {
 
         let agent = "test_billing_cycle_agent_capped";
 
-        for _ in 0..5 {
+        for i in 0..5 {
+            if i > 0 {
+                // Each repeat is a new exhaustion after the previous cooldown ended
+                cooldowns().lock().unwrap().remove(agent);
+            }
             record_credit_exhaustion(agent, CreditExhaustionReason::BillingCycleExhausted).await;
         }
 

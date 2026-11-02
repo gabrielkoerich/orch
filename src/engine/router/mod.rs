@@ -1366,7 +1366,16 @@ impl Router {
                         error = %e,
                         "pool entry failed, recording cooldown and trying next"
                     );
-                    crate::engine::runner::response::record_model_failure(agent, model_str).await;
+                    if !crate::engine::cooldown::record_credit_exhaustion_from_message(
+                        agent,
+                        Some(model_str),
+                        &err_msg,
+                    )
+                    .await
+                    {
+                        crate::engine::runner::response::record_model_failure(agent, model_str)
+                            .await;
+                    }
                     last_err = Some(e);
                     self.advance_pool_index_after_attempt(idx, n);
                 }
