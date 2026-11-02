@@ -247,7 +247,7 @@ pub fn spawn(
                     let Ok(permit) = std::sync::Arc::clone(&semaphore).try_acquire_owned() else {
                         tracing::debug!(
                             task_id,
-                            "all parallel slots busy; sync catch-up will re-fire when a slot opens"
+                            "all review slots busy; sync catch-up will re-fire when a slot opens"
                         );
                         continue;
                     };

@@ -816,6 +816,7 @@ async fn sync_project_engines(
     tmux: &Arc<TmuxManager>,
     capture: &Arc<CaptureService>,
     semaphore: &Arc<Semaphore>,
+    review_semaphore: &Arc<Semaphore>,
     weight_tx: &mpsc::Sender<WeightSignal>,
     router: &Arc<RwLock<Router>>,
     dispatching: &Arc<dashmap::DashMap<String, String>>,
@@ -884,7 +885,7 @@ async fn sync_project_engines(
             event_bus.subscribe(),
             std::sync::Arc::clone(&engine.backend),
             std::sync::Arc::clone(tmux),
-            std::sync::Arc::clone(semaphore),
+            std::sync::Arc::clone(review_semaphore),
             std::sync::Arc::clone(&engine.task_manager),
             std::sync::Arc::clone(router),
             std::sync::Arc::clone(dispatching),
@@ -2305,6 +2306,10 @@ pub async fn serve() -> anyhow::Result<()> {
     // until the running tasks give their permits back.
     let semaphore = Arc::new(Semaphore::new(config.max_parallel));
     let mut parallel_in_force = config.max_parallel;
+    // Reviews get their own pool, one reviewer per worker, so a busy worker pool never
+    // starves a review (#3971)
+    let review_semaphore = Arc::new(Semaphore::new(config.max_parallel));
+    let mut review_in_force = config.max_parallel;
 
     // In-memory dispatch guard: tracks task IDs currently being dispatched.
     // Guards against GitHub API eventual consistency — after update_status(InProgress),
@@ -2370,7 +2375,7 @@ pub async fn serve() -> anyhow::Result<()> {
             event_bus.subscribe(),
             std::sync::Arc::clone(&engine.backend),
             std::sync::Arc::clone(&tmux),
-            std::sync::Arc::clone(&semaphore),
+            std::sync::Arc::clone(&review_semaphore),
             std::sync::Arc::clone(&engine.task_manager),
             std::sync::Arc::clone(&router),
             std::sync::Arc::clone(&dispatching),
@@ -2515,6 +2520,10 @@ pub async fn serve() -> anyhow::Result<()> {
                 // Finish a pending shrink of the dispatch pool as running tasks
                 // release their permits. Only logs when a permit was actually
                 // taken back, so a long-running task does not log every tick.
+                if review_in_force != config.max_parallel {
+                    review_in_force =
+                        resize_dispatch_pool(&review_semaphore, review_in_force, config.max_parallel);
+                }
                 if parallel_in_force != config.max_parallel {
                     let resized =
                         resize_dispatch_pool(&semaphore, parallel_in_force, config.max_parallel);
@@ -2801,6 +2810,13 @@ pub async fn serve() -> anyhow::Result<()> {
 
                     // Resize the dispatch pool. A shrink only takes the permits that are
                     // free right now; the rest are taken as running tasks finish.
+                    if review_in_force != config.max_parallel {
+                        review_in_force = resize_dispatch_pool(
+                            &review_semaphore,
+                            review_in_force,
+                            config.max_parallel,
+                        );
+                    }
                     if parallel_in_force != config.max_parallel {
                         parallel_in_force = resize_dispatch_pool(
                             &semaphore,
@@ -2828,6 +2844,7 @@ pub async fn serve() -> anyhow::Result<()> {
                         &tmux,
                         &capture_for_tick,
                         &semaphore,
+                        &review_semaphore,
                         &weight_tx,
                         &router,
                         &dispatching,
