@@ -10,6 +10,7 @@ use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
 const CURSOR_KEY: &str = "relay_cursor";
 const PING_EVERY: Duration = Duration::from_secs(300);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BACKOFF_SECS: u64 = 300;
 // A shorter session keeps the backoff growing, so a relay that closes each socket at once is not
 // hit every second, every request counts toward its daily limit
@@ -37,7 +38,7 @@ pub async fn run(url: String, token: String, store: Arc<TaskStore>, notify: Arc<
 
     loop {
         let started = Instant::now();
-        match session(&url, &token, &store, &notify).await {
+        match session(&url, &token, &store, &notify, PING_EVERY).await {
             Ok(()) => tracing::warn!("relay stream closed, reconnecting"),
             Err(e) => tracing::warn!(err = %e, "relay stream failed, reconnecting"),
         }
@@ -53,7 +54,13 @@ fn retry_after(backoff: u64, lasted: Duration) -> u64 {
     if lasted >= STABLE_SESSION { 1 } else { backoff }
 }
 
-async fn session(url: &str, token: &str, store: &TaskStore, notify: &Notify) -> anyhow::Result<()> {
+async fn session(
+    url: &str,
+    token: &str,
+    store: &TaskStore,
+    notify: &Notify,
+    ping_every: Duration,
+) -> anyhow::Result<()> {
     let ws_url = format!("{}/ws", url.trim_end_matches('/'))
         .replacen("https://", "wss://", 1)
         .replacen("http://", "ws://", 1);
@@ -61,26 +68,42 @@ async fn session(url: &str, token: &str, store: &TaskStore, notify: &Notify) -> 
     request
         .headers_mut()
         .insert("authorization", format!("Bearer {token}").parse()?);
-    let (mut ws, _) = tokio_tungstenite::connect_async(request).await?;
+    let (mut ws, _) =
+        tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
+            .await
+            .map_err(|_| anyhow::anyhow!("relay connect timed out"))??;
 
     let after = cursor(store).await;
     let hello = serde_json::json!({ "v": 1, "type": "hello", "after": after });
     ws.send(Message::Text(hello.to_string())).await?;
     tracing::info!(after, "relay stream connected");
 
-    let mut ping = tokio::time::interval(PING_EVERY);
+    let mut ping = tokio::time::interval(ping_every);
     ping.tick().await;
+    // True from a ping until any message arrives, so a socket that stays silent for a whole
+    // interval after a ping is dead
+    let mut awaiting = false;
 
     loop {
         tokio::select! {
-            _ = ping.tick() => ws.send(Message::Text("ping".to_string())).await?,
+            _ = ping.tick() => {
+                if awaiting {
+                    anyhow::bail!("relay stream idle, no pong");
+                }
+
+                ws.send(Message::Text("ping".to_string())).await?;
+                awaiting = true;
+            }
             msg = ws.next() => match msg {
                 None => return Ok(()),
-                Some(msg) => match msg? {
+                Some(msg) => {
+                    awaiting = false;
+                    match msg? {
                     Message::Text(text) => handle(&text, store, notify).await,
                     Message::Close(_) => return Ok(()),
                     _ => {}
-                },
+                    }
+                }
             },
         }
     }
@@ -256,9 +279,15 @@ mod tests {
         let store = TaskStore::open_memory().await.unwrap();
         store.kv_set(CURSOR_KEY, "4").await.unwrap();
         let notify = Notify::new();
-        session(&format!("http://{addr}"), "tok", &store, &notify)
-            .await
-            .unwrap();
+        session(
+            &format!("http://{addr}"),
+            "tok",
+            &store,
+            &notify,
+            PING_EVERY,
+        )
+        .await
+        .unwrap();
 
         let (auth, hello) = server.await.unwrap();
         assert_eq!(auth, "Bearer tok");
@@ -269,6 +298,35 @@ mod tests {
         );
         assert_eq!(cursor(&store).await, 9);
         assert!(woke(&notify).await);
+    }
+
+    #[tokio::test]
+    async fn a_silent_server_ends_the_session_with_an_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            while ws.next().await.is_some() {}
+        });
+
+        let store = TaskStore::open_memory().await.unwrap();
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            session(
+                &format!("http://{addr}"),
+                "tok",
+                &store,
+                &Notify::new(),
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("session should end on its own")
+        .unwrap_err();
+
+        assert!(err.to_string().contains("no pong"));
+        server.abort();
     }
 
     #[test]
