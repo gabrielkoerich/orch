@@ -454,26 +454,14 @@ pub async fn tick(
         let mut state = if let Some(s) = store {
             match s.get_job_state(repo, &job.id).await {
                 Ok(Some(st)) => st,
-                Ok(None) => JobState {
-                    repo: repo.to_string(),
-                    job_id: job.id.clone(),
-                    last_run: None,
-                    last_task_status: None,
-                    active_task_id: None,
-                },
+                Ok(None) => JobState::new(repo, &job.id),
                 Err(e) => {
                     tracing::error!(job_id = job.id, ?e, "failed to load job state, skipping");
                     continue;
                 }
             }
         } else {
-            JobState {
-                repo: repo.to_string(),
-                job_id: job.id.clone(),
-                last_run: None,
-                last_task_status: None,
-                active_task_id: None,
-            }
+            JobState::new(repo, &job.id)
         };
 
         // Check if schedule matches

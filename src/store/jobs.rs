@@ -21,6 +21,19 @@ pub struct JobState {
     pub active_task_id: Option<String>,
 }
 
+impl JobState {
+    /// State for a job that has never run.
+    pub fn new(repo: &str, job_id: &str) -> Self {
+        Self {
+            repo: repo.to_string(),
+            job_id: job_id.to_string(),
+            last_run: None,
+            last_task_status: None,
+            active_task_id: None,
+        }
+    }
+}
+
 impl TaskStore {
     pub async fn get_job_state(
         &self,

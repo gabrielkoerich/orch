@@ -7588,3 +7588,53 @@ async fn bundled_sqlite_is_at_least_3_54() {
         "bundled SQLite is {version}, need 3.54.0 or later"
     );
 }
+
+#[tokio::test]
+async fn job_state_is_absent_until_upserted() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    assert!(
+        store
+            .get_job_state("owner/repo", "daily")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .list_job_states("owner/repo")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn job_state_with_empty_fields_round_trips() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let state = JobState {
+        repo: "owner/repo".to_string(),
+        job_id: "daily".to_string(),
+        last_run: None,
+        last_task_status: None,
+        active_task_id: None,
+    };
+
+    store.upsert_job_state(&state).await.unwrap();
+
+    assert_eq!(
+        store.get_job_state("owner/repo", "daily").await.unwrap(),
+        Some(state.clone())
+    );
+    assert_eq!(
+        store.list_job_states("owner/repo").await.unwrap(),
+        vec![state]
+    );
+    assert!(
+        store
+            .list_job_states("other/repo")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
