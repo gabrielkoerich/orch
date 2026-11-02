@@ -4,7 +4,7 @@ You are reviewing a PR created by an AI agent. Complete all steps in order.
 
 ### Step 1: Check CI
 
-orch starts this review only after CI has run on the PR head. Before the merge, orch brings the branch up to date and waits for CI again. Do NOT rebase, do NOT push, and do NOT wait for CI.
+orch starts this review only after CI has run on the PR head. Before this review, orch checked that the PR has no conflicts, rebased it when it was behind and sent a conflicting PR back to its author. Before the merge, orch brings the branch up to date and waits for CI again. Do NOT rebase, do NOT push, and do NOT wait for CI.
 
 Read the required checks once:
 
