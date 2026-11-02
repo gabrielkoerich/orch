@@ -253,21 +253,9 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
     let mut state = if let Some(ref s) = store {
         s.get_job_state(&repo, job_id)
             .await?
-            .unwrap_or_else(|| crate::store::JobState {
-                repo: repo.clone(),
-                job_id: job_id.to_string(),
-                last_run: None,
-                last_task_status: None,
-                active_task_id: None,
-            })
+            .unwrap_or_else(|| crate::store::JobState::new(&repo, job_id))
     } else {
-        crate::store::JobState {
-            repo: repo.clone(),
-            job_id: job_id.to_string(),
-            last_run: None,
-            last_task_status: None,
-            active_task_id: None,
-        }
+        crate::store::JobState::new(&repo, job_id)
     };
 
     println!("Running job '{}' ({}) in {}", job_id, job.r#type, repo);
