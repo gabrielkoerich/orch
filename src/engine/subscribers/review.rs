@@ -674,7 +674,23 @@ async fn ci_allows_review(
     let worktree = stored
         .map(|t| std::path::PathBuf::from(t.worktree))
         .filter(|p| !p.as_os_str().is_empty() && p.exists());
-    let gate = match GhHttp::new() {
+    let gh = GhHttp::new();
+    // A conflicting or stale branch is fixed before CI is read, since a rebase starts CI again
+    if let Ok(gh) = &gh
+        && !crate::engine::auto_merge::prepare_branch_for_review(
+            task,
+            repo,
+            pr_number,
+            gh,
+            task_manager,
+            store,
+        )
+        .await
+    {
+        reset_refires(store, repo, task_id).await;
+        return false;
+    }
+    let gate = match gh {
         Ok(gh) => {
             crate::engine::review_gate::review_ci_gate(&gh, store, repo, task_id, pr_number).await
         }
@@ -712,6 +728,13 @@ async fn ci_allows_review(
     };
 
     tracing::info!(task_id, pr_number, "{hold}");
+    reset_refires(store, repo, task_id).await;
+
+    false
+}
+
+/// A task held before its review keeps its refire count at 0, so the sync sweep never blocks it
+async fn reset_refires(store: &Arc<TaskStore>, repo: &str, task_id: &str) {
     if let Err(e) = crate::store::store_set_result(
         &Some(std::sync::Arc::clone(store)),
         repo,
@@ -720,10 +743,8 @@ async fn ci_allows_review(
     )
     .await
     {
-        tracing::warn!(task_id, err = %e, "failed to reset needs_review_refires for a task held by the CI gate");
+        tracing::warn!(task_id, err = %e, "failed to reset needs_review_refires for a task held before its review");
     }
-
-    false
 }
 
 /// The task worktree, when the reviewer there would run `shipcheck run`

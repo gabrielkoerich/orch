@@ -108,10 +108,48 @@ enum WorktreeRebaseOutcome {
     Unavailable(String),
 }
 
+/// The task worktree, when it sits on the PR head and the PR base is the branch a rebase targets.
+/// Otherwise a push would carry other commits under the PR
+async fn worktree_matching_pr(
+    task_id: &str,
+    repo: &str,
+    pr_number: u64,
+    pr: &GitHubPullRequest,
+    store: &Arc<TaskStore>,
+) -> Option<String> {
+    let wt = opt_store_get_task(&Some(Arc::clone(store)), repo, task_id)
+        .await
+        .map(|t| t.worktree)
+        .filter(|wt| !wt.is_empty())?;
+    let path = std::path::Path::new(&wt);
+    let same_repo = pr
+        .head
+        .repo
+        .as_ref()
+        .is_some_and(|r| r.full_name.eq_ignore_ascii_case(repo));
+    let on_head = crate::engine::review::worktree_head_sha(path)
+        .await
+        .as_deref()
+        == Some(pr.head.sha.as_str());
+    let on_branch = git_ops::get_current_branch(path).await == pr.head.ref_;
+    let same_base = worktree::detect_default_branch(path).await == pr.base.ref_;
+    if same_repo && on_head && on_branch && same_base {
+        return Some(wt);
+    }
+    tracing::info!(
+        task_id,
+        pr_number,
+        same_repo,
+        on_head,
+        on_branch,
+        same_base,
+        "worktree does not match the PR, not rebasing it"
+    );
+    None
+}
+
 /// Rebase a PR that fell behind its base in the task's worktree and carry its approval to the
-/// rebased head. The worktree must sit on the PR head and the base must be the branch the rebase
-/// targets, or the push would carry other commits under the approval. Otherwise, or when the
-/// rebase or push fails, GitHub merges the base in
+/// rebased head. Otherwise, or when the rebase or push fails, GitHub merges the base in
 async fn bring_branch_up_to_date(
     task: &ExternalTask,
     repo: &str,
@@ -121,36 +159,7 @@ async fn bring_branch_up_to_date(
     store: &Arc<TaskStore>,
 ) {
     let task_id = task.id.0.as_str();
-    let mut worktree = opt_store_get_task(&Some(Arc::clone(store)), repo, task_id)
-        .await
-        .map(|t| t.worktree)
-        .filter(|wt| !wt.is_empty());
-    if let Some(wt) = worktree.as_deref() {
-        let path = std::path::Path::new(wt);
-        let same_repo = pr
-            .head
-            .repo
-            .as_ref()
-            .is_some_and(|r| r.full_name.eq_ignore_ascii_case(repo));
-        let on_head = crate::engine::review::worktree_head_sha(path)
-            .await
-            .as_deref()
-            == Some(pr.head.sha.as_str());
-        let on_branch = git_ops::get_current_branch(path).await == pr.head.ref_;
-        let same_base = worktree::detect_default_branch(path).await == pr.base.ref_;
-        if !(same_repo && on_head && on_branch && same_base) {
-            tracing::info!(
-                task_id,
-                pr_number,
-                same_repo,
-                on_head,
-                on_branch,
-                same_base,
-                "worktree does not match the PR, not rebasing it"
-            );
-            worktree = None;
-        }
-    }
+    let worktree = worktree_matching_pr(task_id, repo, pr_number, pr, store).await;
 
     match attempt_worktree_rebase_and_force_push(task_id, worktree.clone()).await {
         WorktreeRebaseOutcome::RebasedAndPushed => {
@@ -176,6 +185,116 @@ async fn bring_branch_up_to_date(
             }
         }
     }
+}
+
+/// The branch check before a review (#3973): a review of a PR that conflicts with its base, or
+/// that fell behind it, is wasted because the merge then rebases the branch. Returns true when the
+/// review may start. A branch that is behind or conflicting is rebased in the task worktree and
+/// the review waits for CI on the new head. A conflict the rebase cannot solve goes back to the
+/// task agent, which has the context of the change, and the reviewer never edits the branch
+pub(crate) async fn prepare_branch_for_review(
+    task: &ExternalTask,
+    repo: &str,
+    pr_number: u64,
+    gh: &GhHttp,
+    task_manager: &Arc<TaskManager>,
+    store: &Arc<TaskStore>,
+) -> bool {
+    let task_id = task.id.0.as_str();
+    let (pr, has_conflict) = match poll_mergeable_until(
+        gh,
+        repo,
+        pr_number,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    {
+        Ok(v) => v,
+        // The merge checks the branch again, so an unknown state does not hold the review
+        Err(e) => {
+            tracing::warn!(task_id, pr_number, err = %e, "mergeability unknown, starting the review");
+            return true;
+        }
+    };
+    if !has_conflict && !is_pr_behind(&pr) {
+        return true;
+    }
+    if !has_conflict {
+        bring_branch_up_to_date(task, repo, pr_number, &pr, gh, store).await;
+        return false;
+    }
+
+    let retries = opt_store_get_task(&Some(Arc::clone(store)), repo, task_id)
+        .await
+        .map_or(0, |t| u64::try_from(t.merge_conflict_retries).unwrap_or(0));
+    if retries >= MAX_MERGE_CONFLICT_RETRIES {
+        let fields = [(
+            "block_reason",
+            serde_json::json!(format!(
+                "merge conflict retry limit ({MAX_MERGE_CONFLICT_RETRIES}) reached before review"
+            )),
+        )];
+        if let Err(e) = task_manager
+            .update_task_status_and_result(&task.id, Status::Blocked, &fields)
+            .await
+        {
+            tracing::error!(task_id, err = %e, "failed to block a task that conflicts with its base");
+        }
+        return false;
+    }
+
+    let worktree = worktree_matching_pr(task_id, repo, pr_number, &pr, store).await;
+    let context = match attempt_worktree_rebase_and_force_push(task_id, worktree).await {
+        WorktreeRebaseOutcome::RebasedAndPushed => {
+            tracing::info!(
+                task_id,
+                pr_number,
+                "rebased a conflicting branch, review waits for CI on the new head"
+            );
+            return false;
+        }
+        WorktreeRebaseOutcome::RebaseConflict(_) => {
+            "Your PR conflicts with its base branch before review. Rebasing hit a content conflict and the worktree has the rebase in progress (see `git status`). Resolve the conflict markers keeping your changes, `git add` the files and run `git rebase --continue`. Do not redo the task from scratch."
+        }
+        _ => {
+            "Your PR conflicts with its base branch before review and orch could not rebase it. Rebase the branch onto the default branch (check `git status` first), resolve the conflicts and make sure the checks pass."
+        }
+    };
+
+    if let Err(e) = store_increment(
+        &Some(Arc::clone(store)),
+        repo,
+        task_id,
+        "merge_conflict_retries",
+    )
+    .await
+    {
+        tracing::warn!(task_id, err = %e, "failed to increment merge_conflict_retries, review waits");
+        return false;
+    }
+    tracing::warn!(
+        task_id,
+        pr_number,
+        "PR conflicts with its base before review, routing back to the task agent"
+    );
+    let fields = [
+        (
+            "last_error",
+            serde_json::json!(format!("PR #{pr_number} conflicts with its base branch")),
+        ),
+        (
+            "route_reason",
+            serde_json::json!("re-dispatch after a merge conflict before review"),
+        ),
+        ("pr_review_context", serde_json::json!(context)),
+    ];
+    if let Err(e) = task_manager
+        .update_task_status_and_result(&task.id, Status::Routed, &fields)
+        .await
+    {
+        tracing::error!(task_id, err = %e, "failed to route back a task that conflicts with its base");
+    }
+    false
 }
 
 pub(crate) fn is_pr_behind(pr: &GitHubPullRequest) -> bool {

@@ -60,6 +60,8 @@ Everything outside your current working directory is **read-only**. Never `cd ..
 
 **Do NOT push or create PRs** — orch handles pushing and PR creation after your work is done. Only commit your changes locally.
 
+**Before you finish**, make sure the branch holds the latest `origin/{{DEFAULT_BRANCH}}` (`git rebase origin/{{DEFAULT_BRANCH}}`, no `git fetch`), that no conflict is left and that the checks pass. Orch checks the PR for conflicts before the review starts and sends a conflicting PR back to you.
+
 **Do NOT skip any of these steps except step 1.** If you only make changes without committing, your work will be lost.
 
 **Infrastructure failures — STOP, do not file issues**: If GitHub setup operations fail (e.g., branch creation, `gh issue develop`, `gh issue link`, GraphQL link errors), **stop immediately and set status to `needs_review`**. Do NOT create GitHub issues about these failures — they are orch-level infrastructure problems, not bugs in the codebase you are working on.
