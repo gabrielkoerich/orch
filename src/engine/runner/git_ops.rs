@@ -945,6 +945,11 @@ pub(crate) async fn record_push_lease(dir: &Path, branch: &str, default_branch: 
     }
 }
 
+/// Drop the lease of a branch whose remote was deleted, so the next dispatch records one for the recreated branch
+pub(crate) async fn clear_push_lease(dir: &Path, branch: &str) {
+    let _ = git_stdout(dir, &["config", "--unset", &lease_key(branch)]).await;
+}
+
 async fn note_pushed_head(dir: &Path, branch: &str) {
     if let Some(sha) = git_stdout(dir, &["rev-parse", "--verify", "HEAD"]).await {
         write_push_lease(dir, branch, &sha).await;
@@ -978,6 +983,15 @@ async fn expected_force_sha(
     default_branch: &str,
 ) -> anyhow::Result<String> {
     let tip = remote_tracking_sha(dir, branch).await;
+    let base = format!("origin/{default_branch}");
+    if let Some(tip) = &tip {
+        // A tip the default branch already holds has no commits of its own, so a force push loses nothing
+        if is_ancestor(dir, tip, &base).await {
+            tracing::info!(branch, %tip, "remote tip is contained in the default branch, leasing it");
+            return Ok(tip.clone());
+        }
+    }
+
     match read_push_lease(dir, branch).await {
         Some(lease) if lease == LEASE_ABSENT => anyhow::bail!(
             "force push rejected: remote branch {branch} was absent when the lease was recorded"
@@ -3325,6 +3339,38 @@ mod tests {
             assert!(pushed.is_ok(), "by_rebase={by_rebase}: {pushed:?}");
             assert_eq!(git_sha(&bare, "refs/heads/feature"), git_sha(&a, "HEAD"));
         }
+    }
+
+    #[tokio::test]
+    async fn force_push_leased_accepts_a_branch_recreated_at_the_default_head() {
+        let root = tempfile::tempdir().unwrap();
+        let (bare, a) = publish_feature(root.path());
+        record_push_lease(&a, "feature", "main").await;
+        let c = clone_on(root.path(), &bare, "c", "main");
+        write_commit(&c, "feature.txt", "main version\n", "main moves");
+        git_ok(&c, &["push", "origin", "main"]);
+        git_ok(
+            &c,
+            &["push", "origin", "main:refs/heads/feature", "--force"],
+        );
+
+        git_ok(&a, &["fetch", "origin"]);
+        record_push_lease(&a, "feature", "main").await;
+        std::fs::write(a.join("feature.txt"), "feature rewritten\n").unwrap();
+        git_ok(&a, &["commit", "-am", "rewrite"]);
+        let pushed = force_push_leased(&a, "feature", "main").await;
+        assert!(pushed.is_ok(), "{pushed:?}");
+        assert_eq!(git_sha(&bare, "refs/heads/feature"), git_sha(&a, "HEAD"));
+    }
+
+    #[tokio::test]
+    async fn clear_push_lease_drops_the_recorded_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let (_bare, a) = publish_feature(root.path());
+        record_push_lease(&a, "feature", "main").await;
+        assert!(read_push_lease(&a, "feature").await.is_some());
+        clear_push_lease(&a, "feature").await;
+        assert_eq!(read_push_lease(&a, "feature").await, None);
     }
 
     #[tokio::test]

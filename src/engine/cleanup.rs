@@ -1084,6 +1084,7 @@ pub(crate) async fn delete_branches(task_id: &str, br: &str, repo_root: &std::pa
     match remote_delete {
         Ok(output) if output.status.success() => {
             tracing::info!(task_id, branch = %br, "remote branch deleted");
+            crate::engine::runner::git_ops::clear_push_lease(repo_root, br).await;
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
