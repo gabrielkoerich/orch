@@ -638,7 +638,8 @@ impl LlmRouter {
         };
 
         // Get model for complexity
-        let model = config.model_for_complexity(&agent, &complexity, &task.id.0);
+        let (model, tier_warning) =
+            RouteResult::resolve_model(config, &agent, &complexity, &task.id.0);
 
         // Build selected skills list
         let mut selected_skills = llm_response.selected_skills;
@@ -653,7 +654,7 @@ impl LlmRouter {
         let _ = tokio_fs::write(&response_path, &response).await;
 
         // Log a concise routing summary at info level (after sanity checks complete)
-        let warning = Self::check_routing_sanity(task, &agent, &profile);
+        let warning = Self::check_routing_sanity(task, &agent, &profile).or(tier_warning);
 
         tracing::info!(
             task_id = task.id.0,

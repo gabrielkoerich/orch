@@ -33,7 +33,9 @@ use crate::engine::jobs;
 use crate::engine::priority;
 use crate::engine::priority::Priority;
 use crate::engine::router::config as router_config;
-use crate::engine::router::{AllAgentsCooledError, RouteResultError, Router, get_route_result};
+use crate::engine::router::{
+    AllAgentsCooledError, RouteResultError, Router, RouterConfig, get_route_result,
+};
 use crate::engine::runner::response;
 use crate::engine::runner::{TaskRunner, WeightSignal};
 use crate::engine::sync;
@@ -365,6 +367,15 @@ fn session_alive(
         .unwrap_or(false)
 }
 
+/// The tier whose run timeout the task runs with: the tier of its stored model, which differs from
+/// its own complexity when the model came from an adjacent tier
+fn run_tier(router: &RouterConfig, task: &Task) -> String {
+    match (task.agent.as_deref(), task.model.as_deref()) {
+        (Some(a), Some(m)) if !m.is_empty() => router.tier_of_model(a, m, &task.complexity),
+        _ => task.complexity.clone(),
+    }
+}
+
 /// Start time and config for the stuck check of an in_progress task. A live session ages from
 /// the status entry, since other writes refresh `updated_at` mid-run, and is not stuck before
 /// its own run timeout ends. A dead session keeps `updated_at`, which the runner touches when it
@@ -404,8 +415,9 @@ async fn in_progress_stuck_clock(
             updated_at.to_string()
         }
     };
+    let tier = run_tier(&RouterConfig::from_config(), &task);
     let task_config = EngineConfig {
-        stuck_timeout: config.live_session_stuck_limit(Some(&task.complexity)),
+        stuck_timeout: config.live_session_stuck_limit(Some(&tier)),
         ..config.clone()
     };
     (entered_at, task_config)
@@ -5218,6 +5230,51 @@ mod tests {
             },
             ..EngineConfig::default()
         }
+    }
+
+    #[tokio::test]
+    async fn run_tier_follows_the_tier_of_the_stored_model() {
+        let mut router = RouterConfig::default();
+        router.model_map.clear();
+        for (tier, model) in [("simple", "rt-s"), ("complex", "rt-c")] {
+            router
+                .model_map
+                .entry(tier.to_string())
+                .or_default()
+                .insert("rtagent".to_string(), vec![model.to_string()]);
+        }
+        let store = TaskStore::open_memory().await.unwrap();
+        let id = store
+            .create_internal(
+                "owner/repo",
+                "Simple on a complex model",
+                "",
+                "cron",
+                "1",
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .set_fields(
+                id,
+                &[
+                    ("complexity", serde_json::json!("simple")),
+                    ("agent", serde_json::json!("rtagent")),
+                    ("model", serde_json::json!("rt-c")),
+                ],
+            )
+            .await
+            .unwrap();
+        let task = store.get(id).await.unwrap();
+        assert_eq!(run_tier(&router, &task), "complex");
+
+        store
+            .set_fields(id, &[("model", serde_json::json!("rt-s"))])
+            .await
+            .unwrap();
+        let task = store.get(id).await.unwrap();
+        assert_eq!(run_tier(&router, &task), "simple");
     }
 
     #[tokio::test]

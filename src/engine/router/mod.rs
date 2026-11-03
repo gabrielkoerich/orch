@@ -157,6 +157,25 @@ impl AgentProfile {
 }
 
 impl RouteResult {
+    /// The model for the task's tier, or one from the nearest tier with a free model. The warning
+    /// names the tier used when it differs, so the switch shows in the route activity
+    pub(crate) fn resolve_model(
+        config: &RouterConfig,
+        agent: &str,
+        complexity: &str,
+        task_id: &str,
+    ) -> (Option<String>, Option<String>) {
+        match config.model_for_complexity_or_adjacent(agent, complexity, task_id) {
+            Some((model, tier)) if tier != complexity => {
+                let warning =
+                    format!("no available {complexity} model for {agent}; using {tier} tier");
+                (Some(model), Some(warning))
+            }
+            Some((model, _)) => (Some(model), None),
+            None => (None, None),
+        }
+    }
+
     /// Build a standard route result from the three task-specific values.
     ///
     /// Fills `profile`, `selected_skills`, and `warning` with router-config
@@ -168,7 +187,7 @@ impl RouteResult {
         config: &RouterConfig,
         task_id: &str,
     ) -> Self {
-        let model = config.model_for_complexity(&agent, &complexity, task_id);
+        let (model, warning) = Self::resolve_model(config, &agent, &complexity, task_id);
         Self {
             agent,
             model,
@@ -177,7 +196,7 @@ impl RouteResult {
             reason,
             profile: AgentProfile::default_from_config(config),
             selected_skills: config.default_skills.clone(),
-            warning: None,
+            warning,
         }
     }
 }
@@ -546,7 +565,7 @@ impl Router {
         }
         if !self
             .config
-            .has_available_model_for_complexity(agent, complexity)
+            .has_available_model_in_any_tier(agent, complexity)
         {
             tracing::debug!(agent, complexity, "agent skipped: no available model");
             return false;
@@ -796,9 +815,8 @@ impl Router {
                 // model which causes some agents (e.g. opencode) to exit
                 // silently.
                 if self.agent_is_routable(&agent, &complexity) {
-                    let model = self
-                        .config
-                        .model_for_complexity(&agent, &complexity, &task.id.0);
+                    let (model, tier_warning) =
+                        RouteResult::resolve_model(&self.config, &agent, &complexity, &task.id.0);
 
                     // Only dispatch label overrides when we have a concrete
                     // model to send to the executor. Dispatching with an
@@ -825,6 +843,7 @@ impl Router {
                         // resolved model (may differ from from_config's default).
                         result.profile.role = format!("{agent} specialist");
                         result.model = model.clone();
+                        result.warning = tier_warning;
                         self.log_route_activity(store, repo, &task.id.0, &result, None)
                             .await;
                         return Ok(result);
@@ -997,7 +1016,8 @@ impl Router {
                             fallback = %fallback_agent,
                             "LLM selected the no-code agent — routing to alternative"
                         );
-                        let fallback_model = self.config.model_for_complexity(
+                        let (fallback_model, _) = RouteResult::resolve_model(
+                            &self.config,
                             &fallback_agent,
                             &result.complexity,
                             &task.id.0,
@@ -1035,7 +1055,8 @@ impl Router {
                             .find(|agent| *agent != &result.agent)
                             .cloned()
                             .unwrap_or_else(|| candidates[0].clone());
-                        let fallback_model = self.config.model_for_complexity(
+                        let (fallback_model, _) = RouteResult::resolve_model(
+                            &self.config,
                             &fallback_agent,
                             &result.complexity,
                             &task.id.0,
@@ -2753,6 +2774,39 @@ Hope that helps!"#;
         let result = router.route(&task, &store, "test/repo").await.unwrap();
         assert_eq!(result.agent, "codex");
         assert!(result.reason.contains("label"));
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn route_takes_the_adjacent_tier_model_when_the_own_tier_is_cooled() {
+        cooldown::reset_global_state().await;
+        let agent = "tierroute_agent";
+        let mut config = RouterConfig {
+            agents: vec![agent.to_string()],
+            ..Default::default()
+        };
+        config.model_map.clear();
+        for (tier, model) in [("medium", "tr-m"), ("complex", "tr-c")] {
+            config
+                .model_map
+                .entry(tier.to_string())
+                .or_default()
+                .insert(agent.to_string(), vec![model.to_string()]);
+        }
+        cooldown::record_model_failure(agent, "tr-m").await;
+        let mut router = Router::new_for_test(config, vec![agent.to_string()]);
+
+        let task = create_test_task(
+            "1",
+            "Test task",
+            vec![format!("agent:{agent}"), "complexity:medium".to_string()],
+        );
+        let store = test_store().await;
+        let result = router.route(&task, &store, "test/repo").await.unwrap();
+        assert_eq!(result.agent, agent);
+        assert_eq!(result.model.as_deref(), Some("tr-c"));
+        assert_eq!(result.complexity, "medium");
+        assert!(result.warning.unwrap().contains("complex tier"));
     }
 
     #[serial(cooldown_state)]

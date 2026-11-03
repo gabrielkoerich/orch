@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{agent, context, git_ops, worktree};
+use crate::engine::RouterConfig;
 use crate::engine::RunTimeouts;
 use crate::engine::cleanup;
 use crate::home;
@@ -338,7 +339,14 @@ pub async fn prepare_task(
     }
 
     // Stuck recovery reads the same limits, so a live session is never taken before this runs out
-    let timeout_seconds = RunTimeouts::from_config().for_complexity(complexity.as_deref());
+    // A model taken from another tier runs with that tier's timeout
+    let timeout_tier = match (complexity.as_deref(), model_name.as_deref()) {
+        (Some(c), Some(m)) if !m.is_empty() => {
+            Some(RouterConfig::from_config().tier_of_model(&agent_name, m, c))
+        }
+        (c, _) => c.map(String::from),
+    };
+    let timeout_seconds = RunTimeouts::from_config().for_complexity(timeout_tier.as_deref());
 
     // Build agent invocation
     let invocation = agent::AgentInvocation {
