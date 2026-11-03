@@ -3109,7 +3109,11 @@ pub(crate) async fn tick_all(
 
 /// Status a finished run moves to. Only a successful run with no PR (or with the review agent
 /// off) becomes `done`. A failed run stays in `needs_review` with its issue open
-fn display_status_for(signal: &WeightSignal, enable_review: bool, has_pr: bool) -> &'static str {
+pub(crate) fn display_status_for(
+    signal: &WeightSignal,
+    enable_review: bool,
+    has_pr: bool,
+) -> &'static str {
     match signal {
         WeightSignal::Success { .. } if enable_review => {
             if has_pr {

@@ -360,12 +360,16 @@ pub async fn prepare_task(
         branch: wt.branch.clone(),
     };
 
-    // Increment attempts counter — must succeed so max_attempts guard cannot be bypassed
+    // Increment attempts counter — must succeed so max_attempts guard cannot be bypassed.
+    // Also clears last_error, so a failover's error never reads as this run's outcome
     if let Err(e) = store::store_set_result(
         store,
         repo,
         task_id,
-        &[("attempts", serde_json::json!(next_attempt))],
+        &[
+            ("attempts", serde_json::json!(next_attempt)),
+            ("last_error", serde_json::json!("")),
+        ],
     )
     .await
     {
@@ -389,8 +393,116 @@ pub async fn prepare_task(
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::mem;
+    use std::process::Command;
+
     use super::*;
+    use crate::engine::runner::{WeightSignal, needs_review_signal};
+    use crate::engine::tick::display_status_for;
     use crate::store::NewTask;
+
+    const FAILOVER_ERROR: &str = "claude timed out after 1804s, clearing agent/model for re-route";
+
+    /// Seeds a no-code task with `seed_error`, then runs `prepare_task` for its next run
+    async fn prepare_run(seed_error: &str) -> (Arc<TaskStore>, i64) {
+        let orch_home = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::set_var("ORCH_HOME", orch_home.path()) };
+        mem::forget(orch_home);
+
+        let project = tempfile::tempdir().unwrap();
+        for args in [
+            &["init", "-b", "main"][..],
+            &["config", "user.email", "t@t.com"],
+            &["config", "user.name", "T"],
+            &["commit", "--allow-empty", "-m", "base"],
+        ] {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(project.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+
+        let task_store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let store_id = task_store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Check the report".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        task_store
+            .set_fields(store_id, &[("last_error", serde_json::json!(seed_error))])
+            .await
+            .unwrap();
+        let task_id = format!("internal:{store_id}");
+        let store = Some(Arc::clone(&task_store));
+
+        prepare_task(
+            &task_id,
+            Some("claude"),
+            Some("sonnet"),
+            None,
+            "owner/repo",
+            project.path(),
+            0,
+            &store,
+        )
+        .await
+        .expect("prepare_task should succeed");
+        (task_store, store_id)
+    }
+
+    async fn stored_last_error(store: &TaskStore, store_id: i64) -> String {
+        store.get(store_id).await.unwrap().last_error
+    }
+
+    #[tokio::test]
+    async fn no_code_task_is_done_after_a_failover_when_the_fallback_run_succeeds() {
+        let (store, id) = prepare_run(FAILOVER_ERROR).await;
+
+        let last_error = stored_last_error(&store, id).await;
+        assert_eq!(last_error, "", "starting a run clears the failover error");
+        // The fallback agent finishes with no commits and no PR, so nothing writes last_error
+        let signal = needs_review_signal(&last_error, "codex");
+        assert!(matches!(signal, WeightSignal::Success { .. }));
+        assert_eq!(display_status_for(&signal, true, false), "done");
+    }
+
+    #[tokio::test]
+    async fn no_code_task_is_done_after_a_first_run_with_no_commits() {
+        let (store, id) = prepare_run("").await;
+
+        let signal = needs_review_signal(&stored_last_error(&store, id).await, "claude");
+        assert!(matches!(signal, WeightSignal::Success { .. }));
+        assert_eq!(display_status_for(&signal, true, false), "done");
+    }
+
+    #[tokio::test]
+    async fn timed_out_run_with_no_fallback_stays_in_needs_review() {
+        let (store, id) = prepare_run(FAILOVER_ERROR).await;
+
+        // handle_error stores this when the run times out and no fallback agent is left
+        store
+            .set_fields(
+                id,
+                &[(
+                    "last_error",
+                    serde_json::json!("claude timed out after 1804s, no fallback agents"),
+                )],
+            )
+            .await
+            .unwrap();
+
+        let signal = needs_review_signal(&stored_last_error(&store, id).await, "claude");
+        assert!(matches!(signal, WeightSignal::Failed { .. }));
+        assert_eq!(display_status_for(&signal, true, false), "needs_review");
+    }
 
     #[test]
     fn resolve_model_name_skips_a_model_cleared_to_empty() {
