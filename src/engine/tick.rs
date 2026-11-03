@@ -290,9 +290,7 @@ fn stuck_task_timing_from_map(
     parse_error_message: &'static str,
     session_map: &std::collections::HashMap<String, bool>,
 ) -> Option<StuckTaskTiming> {
-    let session_name = tmux.session_name(repo, session_task_id);
-    // A session is "running" if it appears in the map with alive=true.
-    let has_session = session_map.get(&session_name).copied().unwrap_or(false);
+    let has_session = session_alive(tmux, repo, session_task_id, session_map);
     let threshold = if has_session {
         config.stuck_timeout
     } else {
@@ -328,6 +326,64 @@ fn stuck_task_timing_from_map(
         age,
         threshold,
     })
+}
+
+fn session_alive(
+    tmux: &TmuxManager,
+    repo: &str,
+    session_task_id: &str,
+    session_map: &std::collections::HashMap<String, bool>,
+) -> bool {
+    session_map
+        .get(&tmux.session_name(repo, session_task_id))
+        .copied()
+        .unwrap_or(false)
+}
+
+/// Start time and config for the stuck check of an in_progress task. A live session ages from
+/// the status entry, since other writes refresh `updated_at` mid-run, and is not stuck before
+/// its own run timeout ends. A dead session keeps `updated_at`, which the runner touches when it
+/// sees the session end
+async fn in_progress_stuck_clock(
+    store: &TaskStore,
+    repo: &str,
+    task_id: &str,
+    updated_at: &str,
+    has_session: bool,
+    config: &EngineConfig,
+) -> (String, EngineConfig) {
+    if !has_session {
+        return (updated_at.to_string(), config.clone());
+    }
+
+    let task = match store.resolve_task_id(repo, task_id).await {
+        Ok(Some(store_id)) => store.get(store_id).await.ok(),
+        _ => None,
+    };
+    let Some(task) = task else {
+        return (updated_at.to_string(), config.clone());
+    };
+
+    let entered_at = match store
+        .status_entered_at(task.id, crate::store::TaskStatus::InProgress)
+        .await
+    {
+        Ok(Some(ts)) => ts,
+        Ok(None) => updated_at.to_string(),
+        Err(e) => {
+            tracing::warn!(
+                task_id,
+                error = %e,
+                "failed to read in_progress entry, falling back to updated_at"
+            );
+            updated_at.to_string()
+        }
+    };
+    let task_config = EngineConfig {
+        stuck_timeout: config.live_session_stuck_limit(Some(&task.complexity)),
+        ..config.clone()
+    };
+    (entered_at, task_config)
 }
 
 /// When the task last entered in_review, and whether a review decision landed since. Age from the
@@ -700,12 +756,21 @@ pub(crate) async fn tick_recover_stuck_tasks(
         }
     };
     for task in &in_progress {
+        let (since, task_config) = in_progress_stuck_clock(
+            store,
+            repo,
+            &task.id.0,
+            &task.updated_at,
+            session_alive(tmux, repo, &task.id.0, session_map),
+            config,
+        )
+        .await;
         let Some(timing) = stuck_task_timing_from_map(
             tmux,
             repo,
             &task.id.0,
-            &task.updated_at,
-            config,
+            &since,
+            &task_config,
             "cannot parse updated_at, skipping stuck-task check",
             session_map,
         ) else {
@@ -745,6 +810,18 @@ pub(crate) async fn tick_recover_stuck_tasks(
                 threshold_mins = timing.threshold / 60,
                 "recovering stuck task: timed out with active session → new"
             );
+            // The agent would keep working under a task that is routed again, and its session
+            // name would block the next dispatch
+            let session_name = tmux.session_name(repo, &task.id.0);
+            if let Err(e) = tmux.kill_session(&session_name).await {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    session = %session_name,
+                    error = %e,
+                    "failed to kill stuck tmux session, will retry next tick"
+                );
+                continue;
+            }
         } else {
             tracing::warn!(
                 task_id = task.id.0,
@@ -1011,12 +1088,21 @@ pub(crate) async fn tick_recover_stuck_tasks(
     };
     for task in &internal_in_progress {
         let task_id = task.id.0.clone();
+        let (since, task_config) = in_progress_stuck_clock(
+            store,
+            repo,
+            &task_id,
+            &task.updated_at,
+            session_alive(tmux, repo, &task_id, session_map),
+            config,
+        )
+        .await;
         let Some(timing) = stuck_task_timing_from_map(
             tmux,
             repo,
             &task_id,
-            &task.updated_at,
-            config,
+            &since,
+            &task_config,
             "cannot parse updated_at, skipping stuck internal-task check",
             session_map,
         ) else {
@@ -1057,6 +1143,16 @@ pub(crate) async fn tick_recover_stuck_tasks(
                 threshold_mins = timing.threshold / 60,
                 "recovering stuck task: timed out with active session → new"
             );
+            let session_name = tmux.session_name(repo, &task_id);
+            if let Err(e) = tmux.kill_session(&session_name).await {
+                tracing::warn!(
+                    task_id,
+                    session = %session_name,
+                    error = %e,
+                    "failed to kill stuck tmux session, will retry next tick"
+                );
+                continue;
+            }
         } else {
             tracing::warn!(
                 task_id,
@@ -5061,6 +5157,160 @@ mod tests {
         assert!(
             !tmux.session_exists(&session_name).await,
             "recovery should kill the stale tmux session so dispatch can proceed"
+        );
+    }
+
+    /// An internal complex task that entered in_progress `minutes` ago and was last written
+    /// `updated_minutes_ago`, with a live tmux session. None when tmux is not available
+    async fn live_complex_run(
+        store: &TaskStore,
+        tmux: &TmuxManager,
+        minutes: i64,
+        updated_minutes_ago: i64,
+    ) -> Option<(i64, String)> {
+        let id = store
+            .create_internal("owner/repo", "Long complex run", "", "cron", "1", None)
+            .await
+            .unwrap();
+        store
+            .set_fields(id, &[("complexity", serde_json::json!("complex"))])
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::InProgress)
+            .await
+            .unwrap();
+        let ago = |m: i64| {
+            (chrono::Utc::now() - chrono::Duration::minutes(m))
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string()
+        };
+        let entered = ago(minutes);
+        sqlx::query(
+            "UPDATE task_activity SET timestamp = ? WHERE task_id = ? AND to_status = 'in_progress'",
+        )
+        .bind(&entered)
+        .bind(id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE tasks SET updated_at = ? WHERE id = ?")
+            .bind(ago(updated_minutes_ago))
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let session_name = tmux.session_name("owner/repo", &format!("internal:{id}"));
+        let created = tmux
+            .command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session_name,
+                "-c",
+                "/tmp",
+                "sleep 60",
+            ])
+            .output()
+            .await;
+        match created {
+            Ok(o) if o.status.success() => Some((id, session_name)),
+            _ => None,
+        }
+    }
+
+    fn long_run_config() -> EngineConfig {
+        EngineConfig {
+            stuck_timeout: 1800,
+            run_timeouts: crate::engine::RunTimeouts {
+                base: 1800,
+                medium: 2700,
+                complex: 3600,
+            },
+            ..EngineConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn recover_stuck_tasks_keeps_a_live_complex_run_inside_its_timeout() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let task_manager = Arc::new(TaskManager::with_store(
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(TmuxManager::new());
+        let Some((id, session_name)) = live_complex_run(&store, &tmux, 31, 31).await else {
+            eprintln!("Skipping test: tmux not available or failed to create test session");
+            return;
+        };
+        let session_map = tmux.batch_session_active().await;
+
+        tick_recover_stuck_tasks(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &task_manager,
+            &long_run_config(),
+            &store,
+            &session_map,
+            &Arc::new(DashMap::new()),
+        )
+        .await
+        .unwrap();
+
+        let alive = tmux.session_exists(&session_name).await;
+        let _ = tmux.kill_session(&session_name).await;
+        assert_eq!(
+            store.get(id).await.unwrap().status,
+            crate::store::TaskStatus::InProgress,
+            "a complex run at 31 minutes is inside its 3600s timeout"
+        );
+        assert!(alive, "recovery must not touch a run inside its timeout");
+    }
+
+    #[tokio::test]
+    async fn recover_stuck_tasks_kills_a_live_complex_run_past_its_timeout() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let task_manager = Arc::new(TaskManager::with_store(
+            std::sync::Arc::clone(&backend),
+            std::sync::Arc::clone(&store),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(TmuxManager::new());
+        let Some((id, session_name)) = live_complex_run(&store, &tmux, 66, 0).await else {
+            eprintln!("Skipping test: tmux not available or failed to create test session");
+            return;
+        };
+        let session_map = tmux.batch_session_active().await;
+
+        tick_recover_stuck_tasks(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &task_manager,
+            &long_run_config(),
+            &store,
+            &session_map,
+            &Arc::new(DashMap::new()),
+        )
+        .await
+        .unwrap();
+
+        let alive = tmux.session_exists(&session_name).await;
+        let _ = tmux.kill_session(&session_name).await;
+        assert_eq!(
+            store.get(id).await.unwrap().status,
+            crate::store::TaskStatus::New,
+            "a complex run past its timeout plus grace is stuck"
+        );
+        assert!(
+            !alive,
+            "recovery must kill the session it reports as killed"
         );
     }
 

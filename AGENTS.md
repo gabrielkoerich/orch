@@ -469,6 +469,8 @@ Do not add a `git push origin --delete`, a `git branch -D` or a forced `git work
 
 Many writes touch `updated_at` without changing the status. `review_open_prs` writes `pr_number` on every pass, so an `in_review` task with a PR never looked older than a minute, and a task with no reviewer sat for 10 hours (#3791). Stuck and stale checks must age a task from the `task_activity` row where it entered its current status. Do not move them back to `updated_at`. `stale_in_review_recovery_resets_orphaned_task_without_session` guards this.
 
+An `in_progress` task with a live session ages from its `in_progress` entry, and its limit is `engine.stuck_timeout` raised to the run's own timeout (`workflow.timeout_by_complexity`) plus `RUN_TIMEOUT_GRACE_SECS`. A fixed 30 minute limit reset complex runs that had an hour, while the agent still worked and committed (#3978). A dead session still ages from `updated_at`, which the session reaper touches when it sees the session end. Recovery kills a live session before the reset. `recover_stuck_tasks_keeps_a_live_complex_run_inside_its_timeout` and `recover_stuck_tasks_kills_a_live_complex_run_past_its_timeout` guard this.
+
 ### One periodic owner for an orphaned review
 
 `tick_recover_stuck_tasks` is the only periodic path that resets an `in_review` task whose review session is gone or hung. `sync_tick` had a second copy that fired after one minute, so the tick limit was unreachable and the race it guards against stayed open: a review agent ends its tmux session before its result reaches the engine, so a short limit resets a task whose finished review is still being delivered and the result is dropped as stale (#3900). Do not add a second sweep anywhere, and do not shorten the limit.

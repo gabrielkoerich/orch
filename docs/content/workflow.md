@@ -145,11 +145,12 @@ See the [Review Agent](@/review-agent.md) page for full details.
 
 The engine detects stuck tasks:
 
-1. **No tmux session found** — task `in_progress` with no live session and age >10 min → reset to `new`
-2. **Review session gone** — task `in_review` with no review session after `engine.in_review_no_session_stuck_timeout` → reset to `needs_review`. orch keeps this limit above the review timeout plus 120 seconds, so a finished review still on its way is not dropped. On startup, every `in_review` task with no review session goes back to `needs_review` at once
-3. **Max attempts exceeded** — see [Max Attempts](#max-attempts)
+1. **Live session past its limit** — see the note below
+2. **No tmux session found** — task `in_progress` with no live session and age >10 min → reset to `new`
+3. **Review session gone** — task `in_review` with no review session after `engine.in_review_no_session_stuck_timeout` → reset to `needs_review`. orch keeps this limit above the review timeout plus 120 seconds, so a finished review still on its way is not dropped. On startup, every `in_review` task with no review session goes back to `needs_review` at once
+4. **Max attempts exceeded** — see [Max Attempts](#max-attempts)
 
-Note: `stuck_timeout` is separate from the task execution timeout. Task execution is limited by `workflow.timeout_seconds` (or `workflow.timeout_by_complexity`), which controls how long an agent run is allowed to execute before being killed (exit 124 / TIMEOUT).
+An `in_progress` task with a live session is reset after `engine.stuck_timeout` or after its run timeout plus 5 minutes, whichever is longer, counted from when it entered `in_progress`. The run timeout is `workflow.timeout_seconds`, raised by `workflow.timeout_by_complexity` for medium and complex tasks. orch kills the session before the reset, so the next dispatch can start.
 
 ## Max Attempts
 

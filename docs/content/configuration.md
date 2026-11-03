@@ -14,7 +14,7 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `engine` | `tick_interval` | Main engine tick interval in seconds | `10` |
 | `engine` | `sync_interval` | Sync tick interval in seconds (GitHub ingest, cleanup) | `45` |
 | `engine` | `max_parallel` | Max tasks dispatched concurrently | `4` |
-| `engine` | `stuck_timeout` | Timeout (seconds) for detecting stuck `in_progress` tasks | `1800` |
+| `engine` | `stuck_timeout` | Seconds an `in_progress` task with a live session may run. orch raises it to the run's own timeout plus 300 seconds | `1800` |
 | `engine` | `no_session_stuck_timeout` | Timeout (seconds) for `in_progress` tasks with no tmux session | `600` |
 | `engine` | `in_review_no_session_stuck_timeout` | Seconds an `in_review` task may have no review session before it goes back to `needs_review`. orch raises it to the review timeout plus 120 seconds when it is lower | `1920` |
 | `engine` | `webhook_health_check_interval` | Health check frequency for the local webhook server | `60` |
