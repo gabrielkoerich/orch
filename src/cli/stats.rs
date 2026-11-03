@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::cli;
+use crate::cli::cost::format_cost;
 use crate::config;
 use crate::store::CostSummary;
 use crate::store::MetricsSummary;
@@ -91,15 +92,14 @@ fn print_summary_table(
 
     // Cost: show total across all recorded periods
     if let Some(c) = cost {
-        let total_cost: f64 = c.periods.iter().map(|p| p.total_cost_usd).sum();
-        if total_cost > 0.0 {
-            if let Some(period) = c.periods.iter().find(|p| p.label == window_label) {
-                println!("  Cost ({}): ${:.2}", window_label, period.total_cost_usd);
-            } else if let Some(period_24h) = c.periods.iter().find(|p| p.label == "24h")
-                && period_24h.total_cost_usd > 0.0
-            {
-                println!("  Cost (24h):   ${:.2}", period_24h.total_cost_usd);
-            }
+        if let Some(period) = c.periods.iter().find(|p| p.label == window_label) {
+            println!(
+                "  Cost ({}): {}",
+                window_label,
+                format_cost(period.total_cost_usd)
+            );
+        } else if let Some(period_24h) = c.periods.iter().find(|p| p.label == "24h") {
+            println!("  Cost (24h):   {}", format_cost(period_24h.total_cost_usd));
         }
     }
 

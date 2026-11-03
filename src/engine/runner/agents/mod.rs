@@ -222,6 +222,8 @@ pub struct ParsedResponse {
     pub input_tokens: Option<u64>,
     /// Output tokens consumed (if reported by the agent).
     pub output_tokens: Option<u64>,
+    /// Cost in USD of this run, as the agent reported it.
+    pub cost_usd: Option<f64>,
     /// Wall-clock duration in milliseconds (if reported by the agent).
     pub duration_ms: Option<u64>,
 }

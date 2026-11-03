@@ -24,8 +24,6 @@ pub struct InsertTaskMetric<'a> {
     pub error_type: Option<&'a str>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
-    pub input_cost_usd: Option<f64>,
-    pub output_cost_usd: Option<f64>,
     pub total_cost_usd: Option<f64>,
 }
 
@@ -87,8 +85,6 @@ pub struct CostPeriod {
     pub label: String,
     pub input_tokens: i64,
     pub output_tokens: i64,
-    pub input_cost_usd: f64,
-    pub output_cost_usd: f64,
     pub total_cost_usd: f64,
     pub task_count: i64,
 }
@@ -167,8 +163,8 @@ impl TaskStore {
         let row = sqlx::query(
         "INSERT INTO task_metrics (repo, task_id, agent, model, complexity, outcome, duration_seconds,
          started_at, completed_at, attempts, files_changed, error_type,
-         input_tokens, output_tokens, input_cost_usd, output_cost_usd, total_cost_usd)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         input_tokens, output_tokens, total_cost_usd)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          RETURNING id",
     )
     .bind(metric.repo)
@@ -185,8 +181,6 @@ impl TaskStore {
     .bind(metric.error_type)
     .bind(metric.input_tokens)
     .bind(metric.output_tokens)
-    .bind(metric.input_cost_usd)
-    .bind(metric.output_cost_usd)
     .bind(metric.total_cost_usd)
     .fetch_one(&mut *tx)
     .await?;
@@ -406,8 +400,6 @@ impl TaskStore {
         let row = sqlx::query(
             "SELECT COALESCE(SUM(m.input_tokens), 0) as input_tokens,
                 COALESCE(SUM(m.output_tokens), 0) as output_tokens,
-                COALESCE(SUM(m.input_cost_usd), 0.0) as input_cost_usd,
-                COALESCE(SUM(m.output_cost_usd), 0.0) as output_cost_usd,
                 COALESCE(SUM(m.total_cost_usd), 0.0) as total_cost_usd,
                 COUNT(*) as task_count
          FROM task_metrics m
@@ -434,8 +426,6 @@ impl TaskStore {
                 },
                 input_tokens: row.try_get("input_tokens")?,
                 output_tokens: row.try_get("output_tokens")?,
-                input_cost_usd: row.try_get("input_cost_usd")?,
-                output_cost_usd: row.try_get("output_cost_usd")?,
                 total_cost_usd: row.try_get("total_cost_usd")?,
                 task_count: row.try_get("task_count")?,
             }],
@@ -642,8 +632,6 @@ impl TaskStore {
             (
                 "SELECT COALESCE(SUM(input_tokens), 0) as input_tokens,
                     COALESCE(SUM(output_tokens), 0) as output_tokens,
-                    COALESCE(SUM(input_cost_usd), 0.0) as input_cost_usd,
-                    COALESCE(SUM(output_cost_usd), 0.0) as output_cost_usd,
                     COALESCE(SUM(total_cost_usd), 0.0) as total_cost_usd,
                     COUNT(*) as task_count
              FROM task_metrics
@@ -653,8 +641,6 @@ impl TaskStore {
             (
                 "SELECT COALESCE(SUM(input_tokens), 0) as input_tokens,
                     COALESCE(SUM(output_tokens), 0) as output_tokens,
-                    COALESCE(SUM(input_cost_usd), 0.0) as input_cost_usd,
-                    COALESCE(SUM(output_cost_usd), 0.0) as output_cost_usd,
                     COALESCE(SUM(total_cost_usd), 0.0) as total_cost_usd,
                     COUNT(*) as task_count
              FROM task_metrics
@@ -664,8 +650,6 @@ impl TaskStore {
             (
                 "SELECT COALESCE(SUM(input_tokens), 0) as input_tokens,
                     COALESCE(SUM(output_tokens), 0) as output_tokens,
-                    COALESCE(SUM(input_cost_usd), 0.0) as input_cost_usd,
-                    COALESCE(SUM(output_cost_usd), 0.0) as output_cost_usd,
                     COALESCE(SUM(total_cost_usd), 0.0) as total_cost_usd,
                     COUNT(*) as task_count
              FROM task_metrics
@@ -681,8 +665,6 @@ impl TaskStore {
                 label: label.to_string(),
                 input_tokens: row.try_get("input_tokens")?,
                 output_tokens: row.try_get("output_tokens")?,
-                input_cost_usd: row.try_get("input_cost_usd")?,
-                output_cost_usd: row.try_get("output_cost_usd")?,
                 total_cost_usd: row.try_get("total_cost_usd")?,
                 task_count: row.try_get("task_count")?,
             });

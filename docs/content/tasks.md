@@ -25,7 +25,7 @@ Key fields:
 | `branch`, `worktree` | Git worktree path and branch name |
 | `pr_number` | Associated PR number |
 | `input_tokens`, `output_tokens` | Token usage |
-| `input_cost_usd`, `output_cost_usd`, `total_cost_usd` | Cost tracking |
+| `total_cost_usd` | Sum of the costs the agents reported, 0 when none did |
 | `origin` | Source: `github`, `internal`, `mention`, `job` |
 | `source`, `source_id` | For dedup (e.g., mention ID, job ID) |
 

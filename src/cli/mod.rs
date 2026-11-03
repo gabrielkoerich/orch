@@ -93,7 +93,7 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
 
     // Ensure global config exists
     if !config_path.exists() {
-        let content = "# Orch global configuration\n# See: https://github.com/gabrielkoerich/orch\n\nprojects: []\n\nrouter:\n  mode: llm\n  agent: claude\n  model: haiku\n";
+        let content = "# Orch global configuration\n# See: https://github.com/gabrielkoerich/orch\n\nprojects: []\n\nrouter:\n  mode: llm\n  agent: claude\n";
         fs::write(&config_path, content)?;
     }
 

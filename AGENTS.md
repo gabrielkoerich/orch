@@ -463,6 +463,18 @@ Migration `027_drop_budget_columns.sql` removed the budget columns. They stay re
 
 If a comment says "retry budget" / "escalation budget", it refers to a **count of attempts** (a retry quota), not money or tokens. Prefer "quota" or "limit" to avoid tempting future agents into re-introducing the feature.
 
+### Model names and prices live in the config, not in code
+
+orch's code names no models and holds no price table. A model name in code goes stale the day a provider renames it. A price table is always behind, and it prices subscription runs at list API rates.
+
+- Model names live in the config: `models:`, `model_map:` and `router.model`. With no entry, orch passes no `--model` and the agent's CLI uses its own default. The control session's default model is the first entry under `models.<agent>`, and `/model <name>` picks the agent whose `models:` entry lists that name.
+- Cost is what the agent reports for its own run, or nothing. The parsers read it into `AgentResult.cost_usd` and `ParsedResponse.cost_usd` (`total_cost_usd` for Claude Code and grok, `step_finish.cost` for opencode). `store_tokens` adds it to `total_cost_usd`. A run that reports no cost adds its tokens only, and the CLI shows "not reported". orch never estimates a cost.
+- `input_cost_usd` and `output_cost_usd` stay in the schema unused, because no agent reports the split.
+
+`tests/no_model_names.rs` scans `src/` outside `#[cfg(test)]` items and test files for string literals that hold a model name from `config.example.yml`, and fails with the file and line. Do not add an allow list to make it pass. Move the name to the config. Tests may name models.
+
+#3997 removed `src/store/pricing.rs`. Do not bring back a price table, in code or in a data file.
+
 ### Security leak detection — ALL patterns block GitHub posting
 
 `has_leaks()` in `src/security.rs` checks **all** `LEAK_PATTERNS` regardless of the `high_confidence` flag. Nothing is posted to GitHub if any pattern matches — low-confidence patterns included.

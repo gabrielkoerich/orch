@@ -1883,7 +1883,10 @@ mod tests {
 
         assert_eq!(config.mode, "round_robin");
         assert_eq!(config.router_agent, "claude");
-        assert_eq!(config.router_model, "haiku");
+        assert_eq!(
+            config.router_model, "",
+            "no router.model means the router agent's CLI default"
+        );
         assert_eq!(config.fallback_executor, "codex");
         assert_eq!(config.max_route_attempts, 3);
         assert_ne!(config.allowed_tools, [] as [String; 0]);

@@ -1,3 +1,4 @@
+use crate::cli::cost::format_cost;
 use crate::cli::init_store;
 use crate::cli::ndjson;
 use crate::cli::task_ref;
@@ -279,8 +280,8 @@ async fn export_markdown(
         format_num(input_tokens),
         format_num(output_tokens)
     );
-    if cost > 0.0 {
-        println!("**Cost**: ${cost:.4}");
+    if input_tokens > 0 || output_tokens > 0 || cost > 0.0 {
+        println!("**Cost**: {}", format_cost(cost));
     }
     println!("---");
 

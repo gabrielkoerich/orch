@@ -1416,24 +1416,24 @@ async fn apply_post_decision_effects(
     }
 }
 
-/// Store token usage if both input and output token counts are known.
+/// Store token usage if both input and output token counts are known, with the cost the agent
+/// reported for the run.
 async fn store_token_usage(
     ctx: &StoreCtx<'_>,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
-    model_name: Option<&str>,
+    cost_usd: Option<f64>,
 ) {
     let (Some(input), Some(output)) = (input_tokens, output_tokens) else {
         return;
     };
-    let model = model_name.unwrap_or("haiku");
     if let Some(st) = ctx.store {
         if let Some(store_id) = ctx.store_id_opt {
-            if let Err(e) = st.store_tokens(store_id, input, output, model).await {
+            if let Err(e) = st.store_tokens(store_id, input, output, cost_usd).await {
                 tracing::warn!(task_id = ctx.task_id, ?e, "failed to store token usage");
             }
         } else if let Ok(Some(store_id)) = st.resolve_task_id(ctx.repo, ctx.task_id).await
-            && let Err(e) = st.store_tokens(store_id, input, output, model).await
+            && let Err(e) = st.store_tokens(store_id, input, output, cost_usd).await
         {
             tracing::warn!(task_id = ctx.task_id, ?e, "failed to store token usage");
         }
@@ -1464,6 +1464,7 @@ pub async fn handle_success(
     // Extract token counts before consuming parsed.
     let input_tokens = parsed.input_tokens;
     let output_tokens = parsed.output_tokens;
+    let cost_usd = parsed.cost_usd;
     let mut resp = parsed.response;
 
     tracing::info!(
@@ -1696,7 +1697,7 @@ pub async fn handle_success(
         &ctx,
         input_tokens.or(resp.input_tokens),
         output_tokens.or(resp.output_tokens),
-        model_name,
+        cost_usd,
     )
     .await;
 
@@ -1968,6 +1969,7 @@ mod tests {
             },
             input_tokens: None,
             output_tokens: None,
+            cost_usd: None,
             duration_ms: None,
         };
 

@@ -1,6 +1,7 @@
 //! CLI handlers for `orch chat` — control session interaction.
 
 use crate::cli;
+use crate::cli::cost::format_cost;
 use crate::control;
 use crate::store::{TaskStore, parse_since_duration};
 use std::io::{self, BufRead, Write};
@@ -196,7 +197,7 @@ pub async fn stats(session_id: &str) -> anyhow::Result<()> {
         }
     }
 
-    println!("Estimated cost: ${:.4}", summary.total_cost_usd);
+    println!("Cost: {}", format_cost(summary.total_cost_usd));
 
     if !summary.by_model.is_empty() {
         println!("\nBreakdown by model:");

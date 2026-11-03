@@ -229,6 +229,7 @@ impl AgentRunner for MiniMaxClaudeRunner {
             response,
             input_tokens,
             output_tokens,
+            cost_usd: None,
             duration_ms: None,
         })
     }

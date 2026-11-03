@@ -177,6 +177,7 @@ impl ClaudeRunner {
             response,
             input_tokens,
             output_tokens,
+            cost_usd: envelope_cost(envelope),
             duration_ms,
         })
     }
@@ -191,6 +192,7 @@ impl ClaudeRunner {
             response,
             input_tokens: None,
             output_tokens: None,
+            cost_usd: None,
             duration_ms: None,
         })
     }
@@ -712,6 +714,16 @@ fn extract_result_tokens_from_line(line: &str) -> Option<(u64, u64)> {
     extract_result_tokens(obj)
 }
 
+/// The run cost the envelope reports. Claude Code names it `total_cost_usd`, older builds used
+/// `costUSD` or `cost_usd`.
+fn envelope_cost(envelope: &serde_json::Map<String, serde_json::Value>) -> Option<f64> {
+    envelope
+        .get("total_cost_usd")
+        .or_else(|| envelope.get("costUSD"))
+        .or_else(|| envelope.get("cost_usd"))
+        .and_then(serde_json::Value::as_f64)
+}
+
 /// Extract input/output tokens from the Claude envelope's usage objects.
 fn extract_usage(
     envelope: &serde_json::Map<String, serde_json::Value>,
@@ -890,10 +902,7 @@ pub fn find_claude_result(ndjson: &str) -> Option<super::AgentResult> {
             .get("duration_ms")
             .and_then(serde_json::Value::as_u64);
 
-        let cost_usd = envelope
-            .get("costUSD")
-            .or_else(|| envelope.get("cost_usd"))
-            .and_then(serde_json::Value::as_f64);
+        let cost_usd = envelope_cost(envelope);
 
         return Some(super::AgentResult {
             is_error,
@@ -1823,6 +1832,22 @@ mod tests {
         assert_eq!(result.input_tokens, Some(1500));
         assert_eq!(result.output_tokens, Some(200));
         assert_eq!(result.duration_ms, Some(5000));
+    }
+
+    #[test]
+    fn find_claude_result_reads_total_cost_usd() {
+        let ndjson = r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"status\":\"done\",\"summary\":\"ok\"}","usage":{"input_tokens":10,"output_tokens":5},"total_cost_usd":0.1234}"#;
+        let result = find_claude_result(ndjson).expect("should find result");
+        assert_eq!(result.cost_usd, Some(0.1234));
+        let parsed = runner().parse_response(ndjson).expect("should parse");
+        assert_eq!(parsed.cost_usd, Some(0.1234));
+    }
+
+    #[test]
+    fn find_claude_result_without_a_cost_reports_none() {
+        let ndjson = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","usage":{"input_tokens":10,"output_tokens":5}}"#;
+        let result = find_claude_result(ndjson).expect("should find result");
+        assert_eq!(result.cost_usd, None);
     }
 
     #[test]
