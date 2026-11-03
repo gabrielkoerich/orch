@@ -34,17 +34,7 @@ pub fn status_looks_like_descriptive_completion(status: &str) -> bool {
         "already implemented",
     ]
     .iter()
-    .any(|cue| normalized.contains(cue))
-        || normalized.ends_with("_addressed")
-        || normalized.ends_with("_skipped")
-        || normalized.ends_with("_done")
-        || normalized.ends_with("_fixed")
-        || normalized.ends_with("_complete")
-        || normalized.ends_with("_completed")
-        || normalized.ends_with("_resolved")
-        || normalized.ends_with("_handled")
-        || normalized.ends_with("_applied")
-        || normalized.ends_with("_patched");
+    .any(|cue| normalized.contains(cue));
 
     if !has_success_cue {
         return false;
