@@ -547,10 +547,10 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
     store: &Arc<TaskStore>,
     opts: &JanitorOptions,
 ) -> anyhow::Result<bool> {
-    let (worktree, branch, keep_remote_branch, merged, external_id) =
+    let (worktree, branch, keep_remote_branch, merged, external_id, pr_merged) =
         store::opt_store_get_task(&Some(Arc::clone(store)), repo, task_id)
             .await
-            .map_or((None, None, false, false, None), |t| {
+            .map_or((None, None, false, false, None, false), |t| {
                 // Blocked tasks with a PR should keep their remote branch so the
                 // PR stays open for human review.
                 let keep = t.status == TaskStatus::Blocked && t.pr_number.is_some();
@@ -561,6 +561,8 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
                     keep,
                     merged,
                     t.external_id,
+                    // Done means the PR merged, and a squash leaves the branch commits on no ref
+                    merged && t.pr_number.is_some(),
                 )
             });
 
@@ -730,6 +732,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
                 Err(_) => resolve_repo_root(repo).await?,
             };
             if let Some(br) = branch.as_deref().filter(|b| !b.is_empty())
+                && !pr_merged
                 && !rescue_and_notify(
                     task_id,
                     repo,
@@ -750,7 +753,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
                 )
                 .await;
             }
-            let removed = remove_worktree_and_branch(
+            let removed = remove_worktree_and_branch_unchecked(
                 task_id,
                 &wt,
                 branch.as_deref(),
@@ -775,15 +778,16 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
             tracing::debug!(task_id, branch = %br, "no worktree on disk, cleaning up branch only");
             // Resolve repo root lazily — branch cleanup needs it.
             let repo_root = resolve_repo_root(repo).await?;
-            if !rescue_and_notify(
-                task_id,
-                repo,
-                external_id.as_deref(),
-                None,
-                br,
-                Path::new(&repo_root),
-            )
-            .await
+            if !pr_merged
+                && !rescue_and_notify(
+                    task_id,
+                    repo,
+                    external_id.as_deref(),
+                    None,
+                    br,
+                    Path::new(&repo_root),
+                )
+                .await
             {
                 return Ok(false);
             }
@@ -908,7 +912,20 @@ pub(crate) async fn rescue_unpushed_work(
         "refs/heads/{}",
         worktree::detect_default_branch(repo_root).await
     );
+    // A bare clone has no remote-tracking refs, so ask the remote for the branch tip
+    let remote_tip = git_in(repo_root, &["ls-remote", "origin", &local_ref])
+        .await
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .next()
+                .map(str::to_string)
+        });
     let mut args = vec!["rev-list", "--oneline", &local_ref, "--not", "--remotes"];
+    if let Some(tip) = remote_tip.as_deref() {
+        args.push(tip);
+    }
     let default_exists = default_ref != local_ref
         && git_in(
             repo_root,
@@ -1016,6 +1033,17 @@ pub(crate) async fn remove_worktree_and_branch(
         return false;
     }
 
+    remove_worktree_and_branch_unchecked(task_id, wt, branch, repo_root, keep_remote_branch).await
+}
+
+/// The caller has already rescued the branch or knows its PR merged
+async fn remove_worktree_and_branch_unchecked(
+    task_id: &str,
+    wt: &Path,
+    branch: Option<&str>,
+    repo_root: &Path,
+    keep_remote_branch: bool,
+) -> bool {
     let wt_str = wt.to_string_lossy().to_string();
     let repo_root_str = repo_root.to_string_lossy();
 
@@ -2675,6 +2703,18 @@ mod tests {
         assert!(removed);
         assert!(!remote_has(&clone, "rescue/feat"));
         assert!(!local_has(&clone, "feat"));
+    }
+
+    #[tokio::test]
+    async fn rescue_skips_a_branch_on_the_remote_without_a_tracking_ref() {
+        let (_tmp, clone) = origin_and_clone_with_feat();
+        git_ok(&clone, &["push", "origin", "feat"]);
+        git_ok(&clone, &["update-ref", "-d", "refs/remotes/origin/feat"]);
+
+        let rescue = rescue_unpushed_work("1", None, "feat", &clone).await;
+
+        assert_eq!(rescue, Rescue::Clean);
+        assert!(!remote_has(&clone, "rescue/feat"));
     }
 
     #[tokio::test]
