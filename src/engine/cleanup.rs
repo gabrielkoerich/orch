@@ -12,15 +12,31 @@ use crate::store::TaskStatus;
 use crate::store::TaskStore;
 use crate::store::store_log_activity;
 use dashmap::{DashMap, DashSet};
+use futures::future;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::env;
+use std::fs as std_fs;
+use std::io::ErrorKind;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::time::SystemTime;
 use std::time::{Duration, Instant};
+use tokio::fs;
 use tokio::process::Command;
 use tokio::time::sleep;
 use tokio::time::timeout;
 
 use super::sync::ReviewTaskSnapshot;
+use crate::config;
+use crate::engine;
+use crate::engine::auto_merge;
+use crate::engine::runner::cow;
+use crate::engine::runner::git_ops;
+use crate::engine::runner::worktree;
+use crate::home;
 
 /// Reconciliation calls can be slow on repos with many issues or during GitHub instability.
 /// Cleanup runs in a background task (tokio::spawn) so it does not block the main tick loop.
@@ -103,13 +119,12 @@ impl Default for JanitorOptions {
 impl JanitorOptions {
     /// Read options from the global config, falling back to defaults.
     pub fn from_config() -> Self {
-        let ttl_hours = crate::config::get("workflow.worktree_janitor_ttl_hours")
+        let ttl_hours = config::get("workflow.worktree_janitor_ttl_hours")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(24);
 
-        let dry_run =
-            crate::config::get("workflow.worktree_janitor_dry_run").is_ok_and(|v| v == "true");
+        let dry_run = config::get("workflow.worktree_janitor_dry_run").is_ok_and(|v| v == "true");
 
         Self { ttl_hours, dry_run }
     }
@@ -140,7 +155,7 @@ async fn reconcile_closed_tasks(
 ) {
     const MAX_RECONCILE_PER_CYCLE: usize = 10;
 
-    let done_set: std::collections::HashSet<String> = task_ids.iter().cloned().collect();
+    let done_set: HashSet<String> = task_ids.iter().cloned().collect();
     let closed_not_in_store: Vec<_> = all_tasks
         .iter()
         .filter(|t| t.state == "closed" && !done_set.contains(&t.id.0))
@@ -200,7 +215,7 @@ async fn reconcile_closed_tasks(
             }
         });
     }
-    let results = futures::future::join_all(futs).await;
+    let results = future::join_all(futs).await;
     task_ids.extend(results.into_iter().flatten());
 }
 
@@ -287,7 +302,7 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
         "checking all terminal tasks for cleanup"
     );
 
-    if let Err(e) = crate::engine::auto_merge::sweep_ci_timer_keys(store, repo, &task_ids).await {
+    if let Err(e) = auto_merge::sweep_ci_timer_keys(store, repo, &task_ids).await {
         tracing::warn!(err = %e, "failed to sweep CI timer keys");
     }
 
@@ -328,7 +343,7 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     // We scan all worktree directories in this repo's worktrees subdirectory and
     // remove any that are not referenced by an existing task. This catches the
     // "done but worktree not cleaned" case that `orch service doctor` reports.
-    let worktrees_base = match crate::home::worktrees_dir() {
+    let worktrees_base = match home::worktrees_dir() {
         Ok(base) => Some(base),
         Err(e) => {
             tracing::debug!(err = %e, "worktrees_dir() unavailable — skipping orphan scan");
@@ -345,7 +360,7 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
         let repo_worktrees = base.join(project);
 
         // Build set of all known worktree paths for this repo (all statuses).
-        let mut combined: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut combined: HashSet<String> = HashSet::new();
         if let Ok(tasks) = store.list_all(repo).await {
             for t in tasks {
                 if !t.worktree.is_empty() {
@@ -356,8 +371,7 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
 
         // Also include active worktrees (in case task is in-memory but has a dir).
         if let Ok(project_dir) = resolve_project_dir_for_repo(repo)
-            && let Ok(active_wts) =
-                crate::engine::runner::worktree::list_project_worktrees(&project_dir).await
+            && let Ok(active_wts) = worktree::list_project_worktrees(&project_dir).await
         {
             for wt in active_wts {
                 combined.insert(wt.to_string_lossy().to_string());
@@ -365,7 +379,7 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
         }
 
         // Scan all branch directories and remove orphaned ones.
-        if let Ok(mut entries) = tokio::fs::read_dir(&repo_worktrees).await {
+        if let Ok(mut entries) = fs::read_dir(&repo_worktrees).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let Ok(entry_meta) = entry.metadata().await else {
                     continue;
@@ -384,7 +398,7 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
                             "orphan-scan",
                             &entry.path(),
                             None,
-                            std::path::Path::new(&repo_root),
+                            Path::new(&repo_root),
                             false,
                         )
                         .await;
@@ -439,7 +453,7 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
         // not main) and would silently no-op on divergence.
         let fetch_result = timeout(
             GIT_TIMEOUT,
-            crate::engine::runner::git_ops::git()
+            git_ops::git()
                 .await
                 .args(["-C", &repo_root, "fetch", "--prune", "origin"])
                 .output_with_context(),
@@ -493,7 +507,7 @@ pub(crate) async fn cleanup_task_worktree(
         const GIT_TIMEOUT: Duration = Duration::from_secs(60);
         let fetch_result = timeout(
             GIT_TIMEOUT,
-            crate::engine::runner::git_ops::git()
+            git_ops::git()
                 .await
                 .args(["-C", &repo_root, "fetch", "--prune", "origin"])
                 .output_with_context(),
@@ -542,11 +556,10 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
                 (Some(t.worktree), Some(t.branch), keep, merged)
             });
 
-    let worktree_path = worktree.as_ref().map(std::path::PathBuf::from);
+    let worktree_path = worktree.as_ref().map(PathBuf::from);
 
     // Get worktrees base path
-    let worktrees_base = crate::home::worktrees_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from(".orch/worktrees"));
+    let worktrees_base = home::worktrees_dir().unwrap_or_else(|_| PathBuf::from(".orch/worktrees"));
 
     // Determine which directory to remove.
     //
@@ -554,7 +567,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
     //   1. stored "worktree" path, if it exists on disk.
     //   2. Construct from worktrees_base + project name + branch, if it exists.
     let worktree_to_remove = if let Some(ref wt) = worktree_path {
-        if match tokio::fs::try_exists(wt).await {
+        if match fs::try_exists(wt).await {
             Ok(true) => true,
             Ok(false) => false,
             Err(e) => {
@@ -572,7 +585,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
                     .unwrap_or(repo)
                     .trim_end_matches(".git");
                 let candidate = worktrees_base.join(project).join(b);
-                if match tokio::fs::try_exists(&candidate).await {
+                if match fs::try_exists(&candidate).await {
                     Ok(true) => true,
                     Ok(false) => false,
                     Err(e) => {
@@ -596,7 +609,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
             .unwrap_or(repo)
             .trim_end_matches(".git");
         let candidate = worktrees_base.join(project).join(b);
-        if match tokio::fs::try_exists(&candidate).await {
+        if match fs::try_exists(&candidate).await {
             Ok(true) => true,
             Ok(false) => false,
             Err(e) => {
@@ -669,7 +682,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
         // Validate git metadata before attempting any git operations.
         // If the .git file points to a deleted gitdir the worktree is
         // unrecoverable — force-remove the directory and skip git commands.
-        let gitdir_valid = crate::engine::runner::worktree::validate_worktree_gitdir(&wt).await;
+        let gitdir_valid = worktree::validate_worktree_gitdir(&wt).await;
 
         if opts.dry_run {
             tracing::info!(
@@ -685,7 +698,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
                 worktree = %wt.display(),
                 "worktree has broken git metadata — force-removing directory without git operations"
             );
-            match tokio::fs::remove_dir_all(&wt).await {
+            match fs::remove_dir_all(&wt).await {
                 Ok(()) => {
                     did_clean = true;
                 }
@@ -709,11 +722,9 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
                 Err(_) => resolve_repo_root(repo).await?,
             };
             if merged {
-                crate::engine::runner::cow::warm_from_merged(
-                    std::path::Path::new(&repo_root),
-                    &crate::engine::runner::worktree::project_name(std::path::Path::new(
-                        &repo_root,
-                    )),
+                cow::warm_from_merged(
+                    Path::new(&repo_root),
+                    &worktree::project_name(Path::new(&repo_root)),
                     &wt,
                 )
                 .await;
@@ -722,7 +733,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
                 task_id,
                 &wt,
                 branch.as_deref(),
-                std::path::Path::new(&repo_root),
+                Path::new(&repo_root),
                 keep_remote_branch,
             )
             .await;
@@ -743,7 +754,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
             tracing::debug!(task_id, branch = %br, "no worktree on disk, cleaning up branch only");
             // Resolve repo root lazily — branch cleanup needs it.
             let repo_root = resolve_repo_root(repo).await?;
-            delete_branches(task_id, br, std::path::Path::new(&repo_root)).await;
+            delete_branches(task_id, br, Path::new(&repo_root)).await;
             did_clean = true;
         }
     }
@@ -788,9 +799,9 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
 /// (either we removed it or it was already absent).
 pub(crate) async fn remove_worktree_and_branch(
     task_id: &str,
-    wt: &std::path::Path,
+    wt: &Path,
     branch: Option<&str>,
-    repo_root: &std::path::Path,
+    repo_root: &Path,
     keep_remote_branch: bool,
 ) -> bool {
     let wt_str = wt.to_string_lossy().to_string();
@@ -821,17 +832,17 @@ pub(crate) async fn remove_worktree_and_branch(
             // process. Retrying with a delay addresses "Directory not empty" errors.
             let mut removed = false;
             for attempt in 0..MAX_RETRIES {
-                match tokio::fs::remove_dir_all(wt).await {
+                match fs::remove_dir_all(wt).await {
                     Ok(()) => {
                         removed = true;
                         break;
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Err(e) if e.kind() == ErrorKind::NotFound => {
                         // Directory was already removed by git or another cleanup pass.
                         removed = true;
                         break;
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                    Err(e) if e.kind() == ErrorKind::DirectoryNotEmpty => {
                         if attempt < MAX_RETRIES - 1 {
                             tracing::debug!(
                                 task_id,
@@ -879,9 +890,9 @@ pub(crate) async fn remove_worktree_and_branch(
                     path = %wt.display(),
                     "path is not a registered worktree (stale metadata) — removing directory and pruning"
                 );
-                if let Err(e) = tokio::fs::remove_dir_all(wt).await {
+                if let Err(e) = fs::remove_dir_all(wt).await {
                     // Only warn if the directory actually still exists after removal attempt.
-                    if match tokio::fs::try_exists(wt).await {
+                    if match fs::try_exists(wt).await {
                         Ok(true) => true,
                         Ok(false) => false,
                         Err(e) => {
@@ -938,7 +949,7 @@ pub(crate) async fn remove_worktree_and_branch(
     }
 
     // Definitively check: is the worktree directory actually gone?
-    match tokio::fs::try_exists(wt).await {
+    match fs::try_exists(wt).await {
         Ok(false) => true, // confirmed gone
         Ok(true) => false, // still there
         Err(e) => {
@@ -949,7 +960,7 @@ pub(crate) async fn remove_worktree_and_branch(
 }
 
 /// Commits reachable from `rev` and from none of `others`. `None` when git cannot answer
-async fn commits_outside(repo_root: &std::path::Path, rev: &str, others: &[&str]) -> Option<u64> {
+async fn commits_outside(repo_root: &Path, rev: &str, others: &[&str]) -> Option<u64> {
     let mut args = vec![
         "rev-list".to_string(),
         "--count".to_string(),
@@ -987,8 +998,8 @@ async fn commits_outside(repo_root: &std::path::Path, rev: &str, others: &[&str]
 }
 
 /// Delete the local branch only when origin or the default branch holds every commit on it
-async fn delete_local_branch(task_id: &str, br: &str, repo_root: &std::path::Path) {
-    let default_branch = crate::engine::runner::worktree::detect_default_branch(repo_root).await;
+async fn delete_local_branch(task_id: &str, br: &str, repo_root: &Path) {
+    let default_branch = worktree::detect_default_branch(repo_root).await;
     let remote_ref = format!("refs/remotes/origin/{br}");
     let default_ref = format!("refs/remotes/origin/{default_branch}");
     let local_ref = format!("refs/heads/{br}");
@@ -1035,9 +1046,9 @@ async fn delete_local_branch(task_id: &str, br: &str, repo_root: &std::path::Pat
  * "automatically delete head branches" removes it. Every other caller (startup rebase
  * failure, closed-issue reconciliation, orphan sweeps) may hold unmerged work (#3781)
  **/
-pub(crate) async fn delete_branches(task_id: &str, br: &str, repo_root: &std::path::Path) {
-    let default_branch = crate::engine::runner::worktree::detect_default_branch(repo_root).await;
-    let _ = crate::engine::runner::git_ops::git()
+pub(crate) async fn delete_branches(task_id: &str, br: &str, repo_root: &Path) {
+    let default_branch = worktree::detect_default_branch(repo_root).await;
+    let _ = git_ops::git()
         .await
         .args([
             "-C",
@@ -1066,7 +1077,7 @@ pub(crate) async fn delete_branches(task_id: &str, br: &str, repo_root: &std::pa
         }
     }
 
-    let remote_delete = crate::engine::runner::git_ops::git()
+    let remote_delete = git_ops::git()
         .await
         .args([
             "-C",
@@ -1084,7 +1095,7 @@ pub(crate) async fn delete_branches(task_id: &str, br: &str, repo_root: &std::pa
     match remote_delete {
         Ok(output) if output.status.success() => {
             tracing::info!(task_id, branch = %br, "remote branch deleted");
-            crate::engine::runner::git_ops::clear_push_lease(repo_root, br).await;
+            git_ops::clear_push_lease(repo_root, br).await;
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1101,7 +1112,7 @@ pub(crate) async fn delete_branches(task_id: &str, br: &str, repo_root: &std::pa
 /// Uses `tmux list-panes -a -F '#{pane_current_path}'` to enumerate all
 /// pane working directories across every session. If tmux is not running
 /// (command fails), we conservatively return `false` so cleanup can proceed.
-async fn is_worktree_in_active_session(worktree: &std::path::Path) -> bool {
+async fn is_worktree_in_active_session(worktree: &Path) -> bool {
     let output = Command::new("tmux")
         .args(["list-panes", "-a", "-F", "#{pane_current_path}"])
         .output()
@@ -1125,11 +1136,11 @@ async fn is_worktree_in_active_session(worktree: &std::path::Path) -> bool {
 /// Returns how many hours old the worktree directory is, based on its mtime.
 ///
 /// Returns `None` if the directory does not exist or the mtime cannot be read.
-async fn worktree_age_hours(worktree: &std::path::Path) -> Option<u64> {
+async fn worktree_age_hours(worktree: &Path) -> Option<u64> {
     // Use tokio::fs to avoid blocking the async runtime when reading metadata.
-    let metadata = tokio::fs::metadata(worktree).await.ok()?;
+    let metadata = fs::metadata(worktree).await.ok()?;
     let modified = metadata.modified().ok()?;
-    let age = std::time::SystemTime::now().duration_since(modified).ok()?;
+    let age = SystemTime::now().duration_since(modified).ok()?;
     Some(age.as_secs() / 3600)
 }
 
@@ -1138,7 +1149,7 @@ async fn worktree_age_hours(worktree: &std::path::Path) -> Option<u64> {
 /// Used by `orch service doctor --fix` and `orch service prune` to clean up worktrees that are
 /// no longer owned by any task. Returns `true` if the worktree directory is gone
 /// after the call.
-pub(crate) async fn cleanup_orphaned_worktree(task_id: &str, wt: &std::path::Path) -> bool {
+pub(crate) async fn cleanup_orphaned_worktree(task_id: &str, wt: &Path) -> bool {
     let repo_root = match resolve_repo_root_for_orphaned_worktree(wt).await {
         Ok(root) => root,
         Err(e) => {
@@ -1150,7 +1161,7 @@ pub(crate) async fn cleanup_orphaned_worktree(task_id: &str, wt: &std::path::Pat
             return false;
         }
     };
-    remove_worktree_and_branch(task_id, wt, None, std::path::Path::new(&repo_root), false).await
+    remove_worktree_and_branch(task_id, wt, None, Path::new(&repo_root), false).await
 }
 
 /// Resolve the main git repository root for an orphaned worktree.
@@ -1159,19 +1170,17 @@ pub(crate) async fn cleanup_orphaned_worktree(task_id: &str, wt: &std::path::Pat
 /// the pointer gives the bare repo root, which is the orch convention). Falls back
 /// to looking up registered projects by directory name when the `.git` file is
 /// absent or unparseable.
-pub(crate) async fn resolve_repo_root_for_orphaned_worktree(
-    wt: &std::path::Path,
-) -> anyhow::Result<String> {
+pub(crate) async fn resolve_repo_root_for_orphaned_worktree(wt: &Path) -> anyhow::Result<String> {
     let git_file = wt.join(".git");
-    if tokio::fs::try_exists(&git_file).await.unwrap_or(false)
-        && let Ok(content) = tokio::fs::read_to_string(&git_file).await
+    if fs::try_exists(&git_file).await.unwrap_or(false)
+        && let Ok(content) = fs::read_to_string(&git_file).await
     {
         for line in content.lines() {
             if let Some(gitdir) = line.strip_prefix("gitdir: ") {
                 // gitdir points to: <repo>/.git/worktrees/<name> (non-bare)
                 //                or <repo>.git/worktrees/<name>   (bare)
                 // Two levels up reaches the .git dir / bare repo root.
-                let gitdir_path = std::path::PathBuf::from(gitdir);
+                let gitdir_path = PathBuf::from(gitdir);
                 if let Some(repo_root) = gitdir_path.parent().and_then(|p| p.parent()) {
                     return Ok(repo_root.display().to_string());
                 }
@@ -1181,15 +1190,15 @@ pub(crate) async fn resolve_repo_root_for_orphaned_worktree(
 
     // Fallback: look up registered projects by the project-name component of the
     // worktree path (format: ~/.orch/worktrees/<project>/<branch>).
-    let worktrees_dir = crate::home::worktrees_dir()?;
+    let worktrees_dir = home::worktrees_dir()?;
     if let Ok(relative) = wt.strip_prefix(&worktrees_dir)
         && let Some(project_name) = relative.components().next()
     {
         let project_name = project_name.as_os_str().to_string_lossy();
 
-        if let Ok(paths) = crate::config::get_project_paths() {
+        if let Ok(paths) = config::get_project_paths() {
             for path_str in &paths {
-                let path = std::path::Path::new(path_str);
+                let path = Path::new(path_str);
                 if let Some(name) = path.file_name()
                     && name.to_string_lossy() == project_name
                 {
@@ -1201,7 +1210,7 @@ pub(crate) async fn resolve_repo_root_for_orphaned_worktree(
         // Try bare clone at ~/.orch/projects/<owner>/<project>.git
         let parts: Vec<&str> = project_name.split('/').collect();
         let bare = if parts.len() == 2 {
-            crate::home::projects_dir()
+            home::projects_dir()
                 .map(|d| d.join(parts[0]).join(format!("{}.git", parts[1])))
                 .unwrap_or_default()
         } else {
@@ -1210,7 +1219,7 @@ pub(crate) async fn resolve_repo_root_for_orphaned_worktree(
                      bare repo location is ambiguous; register the project with 'owner/repo' format"
             ));
         };
-        if tokio::fs::try_exists(&bare).await.unwrap_or(false) {
+        if fs::try_exists(&bare).await.unwrap_or(false) {
             return Ok(bare.display().to_string());
         }
     }
@@ -1227,14 +1236,14 @@ pub(crate) async fn resolve_repo_root_for_orphaned_worktree(
 /// the worktree may belong to a different project than the current repo context.
 /// Instead, we extract the repo root from the worktree's `.git` file which contains
 /// a `gitdir:` pointer to the main repo's git directory.
-pub async fn resolve_repo_root_from_worktree(wt: &std::path::Path) -> anyhow::Result<String> {
+pub async fn resolve_repo_root_from_worktree(wt: &Path) -> anyhow::Result<String> {
     // For worktrees, .git is a file (not a directory) containing gitdir path
     let git_file = wt.join(".git");
-    if !tokio::fs::try_exists(&git_file).await.unwrap_or(false) {
+    if !fs::try_exists(&git_file).await.unwrap_or(false) {
         anyhow::bail!(".git file not found in worktree at {}", wt.display());
     }
 
-    let content = tokio::fs::read_to_string(&git_file)
+    let content = fs::read_to_string(&git_file)
         .await
         .map_err(|e| anyhow::anyhow!("failed to read .git file: {e}"))?;
 
@@ -1245,7 +1254,7 @@ pub async fn resolve_repo_root_from_worktree(wt: &std::path::Path) -> anyhow::Re
             // The main repo is the parent of the .git directory
             // gitdir points to: <repo>/.git/worktrees/<name>
             // We need to go up 3 levels: worktrees/<name> -> .git -> repo
-            let gitdir_path = std::path::Path::new(gitdir);
+            let gitdir_path = Path::new(gitdir);
             if let Some(repo_root) = gitdir_path
                 .parent() // worktrees/<name>
                 .and_then(|p| p.parent()) // .git
@@ -1269,19 +1278,19 @@ pub async fn resolve_repo_root_from_worktree(wt: &std::path::Path) -> anyhow::Re
 /// This avoids relying on cwd (which is undefined under launchd services).
 pub(crate) async fn resolve_repo_root(repo: &str) -> anyhow::Result<String> {
     // Look up the local path from registered projects
-    let paths = crate::config::get_project_paths().unwrap_or_default();
+    let paths = config::get_project_paths().unwrap_or_default();
     for path_str in &paths {
-        let path = std::path::Path::new(path_str);
+        let path = Path::new(path_str);
         let orch_yml = path.join(".orch.yml");
         let legacy = path.join(".orchestrator.yml");
-        let config_file = if tokio::fs::try_exists(&orch_yml).await.unwrap_or(false) {
+        let config_file = if fs::try_exists(&orch_yml).await.unwrap_or(false) {
             orch_yml
-        } else if tokio::fs::try_exists(&legacy).await.unwrap_or(false) {
+        } else if fs::try_exists(&legacy).await.unwrap_or(false) {
             legacy
         } else {
             continue;
         };
-        if let Ok(content) = tokio::fs::read_to_string(&config_file).await
+        if let Ok(content) = fs::read_to_string(&config_file).await
             && let Ok(doc) = serde_norway::from_str::<serde_norway::Value>(&content)
             && let Some(r) = doc
                 .get("gh")
@@ -1296,13 +1305,13 @@ pub(crate) async fn resolve_repo_root(repo: &str) -> anyhow::Result<String> {
     // Fallback: try bare clone in ~/.orch/projects/<owner>/<repo>.git
     let parts: Vec<&str> = repo.split('/').collect();
     let bare = if parts.len() == 2 {
-        crate::home::projects_dir()
+        home::projects_dir()
             .map(|d| d.join(parts[0]).join(format!("{}.git", parts[1])))
             .unwrap_or_default()
     } else {
-        std::path::PathBuf::new()
+        PathBuf::new()
     };
-    if tokio::fs::try_exists(&bare).await.unwrap_or(false) {
+    if fs::try_exists(&bare).await.unwrap_or(false) {
         return Ok(bare.display().to_string());
     }
 
@@ -1318,28 +1327,28 @@ pub(crate) async fn resolve_repo_root(repo: &str) -> anyhow::Result<String> {
 ///
 /// Replicates the logic from `TaskRunner::resolve_project_dir()` without requiring
 /// a Runner instance. Used by the orphan scanner to enumerate active worktrees.
-fn resolve_project_dir_for_repo(repo: &str) -> anyhow::Result<std::path::PathBuf> {
+fn resolve_project_dir_for_repo(repo: &str) -> anyhow::Result<PathBuf> {
     // Check PROJECT_DIR env var first
-    if let Ok(dir) = std::env::var("PROJECT_DIR")
+    if let Ok(dir) = env::var("PROJECT_DIR")
         && !dir.is_empty()
     {
-        return Ok(std::path::PathBuf::from(dir));
+        return Ok(PathBuf::from(dir));
     }
 
     // Look up registered projects in config
-    if let Ok(paths) = crate::config::get_project_paths() {
+    if let Ok(paths) = config::get_project_paths() {
         for path_str in &paths {
-            let path = std::path::Path::new(path_str);
+            let path = Path::new(path_str);
             let orch_yml = path.join(".orch.yml");
             let legacy = path.join(".orchestrator.yml");
-            let config_file = if std::path::Path::new(&orch_yml).exists() {
+            let config_file = if Path::new(&orch_yml).exists() {
                 orch_yml
-            } else if std::path::Path::new(&legacy).exists() {
+            } else if Path::new(&legacy).exists() {
                 legacy
             } else {
                 continue;
             };
-            if let Ok(content) = std::fs::read_to_string(&config_file)
+            if let Ok(content) = std_fs::read_to_string(&config_file)
                 && let Ok(doc) = serde_norway::from_str::<serde_norway::Value>(&content)
                 && let Some(r) = doc
                     .get("gh")
@@ -1367,8 +1376,7 @@ pub(crate) async fn check_merged_prs(
     in_review_tasks: &[ReviewTaskSnapshot],
     needs_review_tasks: &[ReviewTaskSnapshot],
 ) -> anyhow::Result<()> {
-    let mut branch_map: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut branch_map: HashMap<String, String> = HashMap::new();
     let all_review_tasks: Vec<&ReviewTaskSnapshot> = in_review_tasks
         .iter()
         .chain(needs_review_tasks.iter())
@@ -1444,10 +1452,7 @@ pub(crate) async fn check_merged_prs(
             tracing::warn!(task_id, err = %e, "worktree cleanup after merge failed");
         }
 
-        let comment = format!(
-            "PR merged, marking task complete{}",
-            crate::engine::orch_footer()
-        );
+        let comment = format!("PR merged, marking task complete{}", engine::orch_footer());
         if let Err(e) = backend.post_comment(&id, &comment).await {
             tracing::warn!(task_id, err = %e, "failed to post comment");
         }
@@ -1481,19 +1486,17 @@ async fn fallback_is_pr_merged_by_branch(
         })
         .collect();
 
-    futures::future::join_all(futs)
-        .await
-        .into_iter()
-        .flatten()
-        .collect()
+    future::join_all(futs).await.into_iter().flatten().collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::tasks;
     use crate::store::{NewTask, TaskStore};
     use async_trait::async_trait;
     use std::collections::HashMap;
+    use std::process;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1527,14 +1530,14 @@ mod tests {
     // cleanup_task_worktree_with_opts TTL guard (skips if git missing)
 
     /// Create a minimal git repo + worktree; return (tmp, worktree_dir).
-    fn setup_test_repo() -> Option<(tempfile::TempDir, std::path::PathBuf)> {
+    fn setup_test_repo() -> Option<(tempfile::TempDir, PathBuf)> {
         let tmp = tempfile::tempdir().ok()?;
 
         // Create a real git repo (not bare) so we can add worktrees.
         let repo_dir = tmp.path().join("repo.git");
-        std::fs::create_dir_all(&repo_dir).ok()?;
+        std_fs::create_dir_all(&repo_dir).ok()?;
 
-        let init = std::process::Command::new("git")
+        let init = process::Command::new("git")
             .args([
                 "init",
                 "--initial-branch=main",
@@ -1546,7 +1549,7 @@ mod tests {
             .ok()?;
         if !init.status.success() {
             // Older git may not have --initial-branch; fall back.
-            let _ = std::process::Command::new("git")
+            let _ = process::Command::new("git")
                 .args([
                     "init",
                     repo_dir
@@ -1559,12 +1562,12 @@ mod tests {
 
         // Create an initial commit so the repo has a HEAD.
         let readme = repo_dir.join("README.md");
-        std::fs::write(&readme, "# test").ok()?;
-        std::process::Command::new("git")
+        std_fs::write(&readme, "# test").ok()?;
+        process::Command::new("git")
             .args(["-C", repo_dir.to_str()?, "add", "."])
             .output()
             .ok()?;
-        std::process::Command::new("git")
+        process::Command::new("git")
             .args([
                 "-C",
                 repo_dir.to_str()?,
@@ -1588,8 +1591,8 @@ mod tests {
             .join("worktrees")
             .join("repo.git")
             .join("gh-issue-42-test");
-        std::fs::create_dir_all(wt_dir.parent()?).ok()?;
-        let wt_out = std::process::Command::new("git")
+        std_fs::create_dir_all(wt_dir.parent()?).ok()?;
+        let wt_out = process::Command::new("git")
             .args([
                 "-C",
                 repo_dir.to_str()?,
@@ -1705,7 +1708,7 @@ mod tests {
         // branch is known, we should construct the path correctly.
         let tmp = tempfile::tempdir().unwrap();
         let wt_dir = tmp.path().join("myrepo").join("gh-issue-7-fix");
-        std::fs::create_dir_all(&wt_dir).unwrap();
+        std_fs::create_dir_all(&wt_dir).unwrap();
 
         // Simulate: worktree=None, branch=Some("gh-issue-7-fix"), repo="owner/myrepo"
         let branch = "gh-issue-7-fix";
@@ -1743,10 +1746,7 @@ mod tests {
             })
             .await
             .unwrap();
-        store
-            .update_status(id, crate::store::TaskStatus::Done)
-            .await
-            .unwrap();
+        store.update_status(id, TaskStatus::Done).await.unwrap();
 
         let opts = JanitorOptions {
             ttl_hours: 0,
@@ -1790,10 +1790,7 @@ mod tests {
             })
             .await
             .unwrap();
-        store
-            .update_status(id, crate::store::TaskStatus::Done)
-            .await
-            .unwrap();
+        store.update_status(id, TaskStatus::Done).await.unwrap();
         // Set the stale worktree path on the task.
         store
             .set_fields(
@@ -1871,7 +1868,7 @@ mod tests {
             .expect("test repo path contains non-UTF-8 characters");
         let branch = "gh-issue-42-test";
 
-        let before = std::process::Command::new("git")
+        let before = process::Command::new("git")
             .args([
                 "-C",
                 repo_dir_str,
@@ -1891,7 +1888,7 @@ mod tests {
             remove_worktree_and_branch("42", &wt_dir, Some(branch), &repo_dir, false).await;
         assert!(removed, "worktree should be removed");
 
-        let after = std::process::Command::new("git")
+        let after = process::Command::new("git")
             .args([
                 "-C",
                 repo_dir_str,
@@ -1917,7 +1914,7 @@ mod tests {
         // Create a plain directory (not a real git worktree) — git will fail
         // to remove it, so the directory stays on disk.
         let fake_wt = tmp.path().join("not-a-worktree");
-        std::fs::create_dir_all(&fake_wt).unwrap();
+        std_fs::create_dir_all(&fake_wt).unwrap();
 
         // repo_root doesn't matter much — it just needs to exist for the -C flag.
         // Using tmp itself; git commands will fail but that's the point.
@@ -2061,7 +2058,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .update_status(task1, crate::store::TaskStatus::NeedsReview)
+            .update_status(task1, TaskStatus::NeedsReview)
             .await
             .unwrap();
         store
@@ -2071,7 +2068,7 @@ mod tests {
         // No .git file, so cleanup force-removes the directory
         let wt_dir = tempfile::tempdir().unwrap();
         let wt_path = wt_dir.path().join("branch-1");
-        std::fs::create_dir_all(&wt_path).unwrap();
+        std_fs::create_dir_all(&wt_path).unwrap();
         store
             .set_fields(
                 task1,
@@ -2091,7 +2088,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .update_status(task2, crate::store::TaskStatus::InReview)
+            .update_status(task2, TaskStatus::InReview)
             .await
             .unwrap();
         store
@@ -2100,28 +2097,28 @@ mod tests {
             .unwrap();
 
         let task_manager = Arc::new(TaskManager::with_store(
-            std::sync::Arc::clone(&backend_dyn),
-            std::sync::Arc::clone(&store),
+            Arc::clone(&backend_dyn),
+            Arc::clone(&store),
             "owner/repo".to_string(),
         ));
 
         let in_review_tasks = store
-            .list_by_status("owner/repo", crate::store::TaskStatus::InReview)
+            .list_by_status("owner/repo", TaskStatus::InReview)
             .await
             .unwrap()
             .into_iter()
             .map(|stored| ReviewTaskSnapshot {
-                external: crate::engine::tasks::store_task_to_external(&stored),
+                external: tasks::store_task_to_external(&stored),
                 stored,
             })
             .collect::<Vec<_>>();
         let needs_review_tasks = store
-            .list_by_status("owner/repo", crate::store::TaskStatus::NeedsReview)
+            .list_by_status("owner/repo", TaskStatus::NeedsReview)
             .await
             .unwrap()
             .into_iter()
             .map(|stored| ReviewTaskSnapshot {
-                external: crate::engine::tasks::store_task_to_external(&stored),
+                external: tasks::store_task_to_external(&stored),
                 stored,
             })
             .collect::<Vec<_>>();
@@ -2145,11 +2142,11 @@ mod tests {
 
         let updated_task1 = store.get(task1).await.unwrap();
         let updated_task2 = store.get(task2).await.unwrap();
-        assert_eq!(updated_task1.status, crate::store::TaskStatus::Done);
+        assert_eq!(updated_task1.status, TaskStatus::Done);
         assert!(updated_task1.worktree_cleaned);
         assert!(!wt_path.exists());
         assert!(!updated_task2.worktree_cleaned);
-        assert_eq!(updated_task2.status, crate::store::TaskStatus::InReview);
+        assert_eq!(updated_task2.status, TaskStatus::InReview);
 
         let comments = backend.posted_comments.lock().unwrap().clone();
         assert_eq!(comments.len(), 1);
@@ -2236,8 +2233,8 @@ mod tests {
             Arc::<ReconciliationMockBackend>::clone(&backend);
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let task_manager = Arc::new(TaskManager::with_store(
-            std::sync::Arc::clone(&backend_dyn),
-            std::sync::Arc::clone(&store),
+            Arc::clone(&backend_dyn),
+            Arc::clone(&store),
             repo.to_string(),
         ));
         let opts = JanitorOptions {
@@ -2272,8 +2269,8 @@ mod tests {
         });
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let task_manager = Arc::new(TaskManager::with_store(
-            std::sync::Arc::clone(&backend_dyn),
-            std::sync::Arc::clone(&store),
+            Arc::clone(&backend_dyn),
+            Arc::clone(&store),
             repo.to_string(),
         ));
 
@@ -2319,8 +2316,8 @@ mod tests {
         RECONCILIATION_LAST_RUN.remove(repo);
     }
 
-    fn git_ok(dir: &std::path::Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
+    fn git_ok(dir: &Path, args: &[&str]) -> String {
+        let out = process::Command::new("git")
             .args([
                 "-c",
                 "commit.gpgsign=false",
@@ -2342,33 +2339,33 @@ mod tests {
     }
 
     /// A clone of a bare origin with main pushed and branch `feat` one commit ahead
-    fn origin_and_clone_with_feat() -> (tempfile::TempDir, std::path::PathBuf) {
+    fn origin_and_clone_with_feat() -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let bare = tmp.path().join("origin.git");
-        std::fs::create_dir_all(&bare).unwrap();
+        std_fs::create_dir_all(&bare).unwrap();
         git_ok(&bare, &["init", "--bare", "-b", "main"]);
         git_ok(tmp.path(), &["clone", bare.to_str().unwrap(), "clone"]);
         let clone = tmp.path().join("clone");
-        std::fs::write(clone.join("base.txt"), "base").unwrap();
+        std_fs::write(clone.join("base.txt"), "base").unwrap();
         git_ok(&clone, &["add", "."]);
         git_ok(&clone, &["commit", "-m", "base"]);
         git_ok(&clone, &["push", "origin", "main"]);
         git_ok(&clone, &["checkout", "-b", "feat"]);
-        std::fs::write(clone.join("work.txt"), "work").unwrap();
+        std_fs::write(clone.join("work.txt"), "work").unwrap();
         git_ok(&clone, &["add", "."]);
         git_ok(&clone, &["commit", "-m", "work"]);
         git_ok(&clone, &["checkout", "main"]);
         (tmp, clone)
     }
 
-    fn remote_has(clone: &std::path::Path, branch: &str) -> bool {
+    fn remote_has(clone: &Path, branch: &str) -> bool {
         !git_ok(clone, &["ls-remote", "--heads", "origin", branch])
             .trim()
             .is_empty()
     }
 
-    fn local_has(clone: &std::path::Path, branch: &str) -> bool {
-        std::process::Command::new("git")
+    fn local_has(clone: &Path, branch: &str) -> bool {
+        process::Command::new("git")
             .args([
                 "show-ref",
                 "--verify",

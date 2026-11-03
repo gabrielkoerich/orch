@@ -6,7 +6,11 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fs as std_fs;
 use std::path::PathBuf;
+use tokio::fs;
+
+use crate::home;
 
 /// Persisted webhook health state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,7 +47,7 @@ impl Default for WebhookStatus {
 
 /// Path to `~/.orch/webhook_status.json`.
 pub fn status_path() -> anyhow::Result<PathBuf> {
-    Ok(crate::home::orch_home()?.join("webhook_status.json"))
+    Ok(home::orch_home()?.join("webhook_status.json"))
 }
 
 impl WebhookStatus {
@@ -55,7 +59,7 @@ impl WebhookStatus {
                 .map_err(anyhow::Error::from)
         }) {
             Ok((p, json)) => {
-                if let Err(e) = tokio::fs::write(&p, json).await {
+                if let Err(e) = fs::write(&p, json).await {
                     tracing::warn!(error = ?e, "failed to persist webhook status");
                 }
             }
@@ -67,7 +71,7 @@ impl WebhookStatus {
     /// not exist or cannot be parsed.
     pub fn load() -> Option<Self> {
         let path = status_path().ok()?;
-        let json = std::fs::read_to_string(path).ok()?;
+        let json = std_fs::read_to_string(path).ok()?;
         serde_json::from_str(&json).ok()
     }
 }

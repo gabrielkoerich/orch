@@ -288,7 +288,7 @@ pub async fn get_task_field_direct(
     task_id: &str,
     field: &str,
 ) -> Option<String> {
-    let store_opt: &Option<Arc<TaskStore>> = &Some(std::sync::Arc::clone(store));
+    let store_opt: &Option<Arc<TaskStore>> = &Some(Arc::clone(store));
     get_task_field(store_opt, repo, task_id, field).await
 }
 

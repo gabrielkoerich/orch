@@ -16,8 +16,15 @@ use futures::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
+use std::env::consts;
+use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
 use std::time::Duration;
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::time;
+use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 // ── Gateway opcodes ──────────────────────────────────────────────────────────
@@ -55,8 +62,8 @@ pub struct DiscordGateway {
     shard_count: u64,
 }
 
-impl std::fmt::Debug for DiscordGateway {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for DiscordGateway {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("DiscordGateway")
             .field("channel_id", &self.channel_id)
             .field("shard_id", &self.shard_id)
@@ -287,7 +294,7 @@ async fn run_gateway(
         let ws_url = state.ws_url();
         tracing::debug!(url = %ws_url, "connecting to discord gateway");
 
-        match tokio::time::timeout(Duration::from_secs(30), connect_async(&ws_url)).await {
+        match time::timeout(Duration::from_secs(30), connect_async(&ws_url)).await {
             Ok(Ok((ws, _))) => {
                 backoff = Duration::from_secs(1); // reset on success
 
@@ -330,7 +337,7 @@ async fn run_gateway(
             return;
         }
 
-        tokio::time::sleep(backoff).await;
+        time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(60));
     }
 }
@@ -340,9 +347,7 @@ async fn run_gateway(
 /// Returns `Ok(true)` if the session can be resumed, `Ok(false)` if we
 /// need to re-identify (invalid session or clean disconnect).
 async fn handle_connection(
-    ws: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    ws: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
     token: &str,
     shard_id: u64,
     shard_count: u64,
@@ -353,7 +358,7 @@ async fn handle_connection(
     let (mut write, mut read) = ws.split();
 
     // ── Step 1: Hello ────────────────────────────────────────────────────────
-    let text = tokio::time::timeout(Duration::from_secs(15), next_text_message(&mut read))
+    let text = time::timeout(Duration::from_secs(15), next_text_message(&mut read))
         .await
         .map_err(|_| anyhow::anyhow!("discord gateway: Hello timed out"))??;
     let hello: GatewayPayload = serde_json::from_str(&text)?;
@@ -385,7 +390,7 @@ async fn handle_connection(
                 "token": token,
                 "intents": GATEWAY_INTENTS,
                 "properties": {
-                    "os": std::env::consts::OS,
+                    "os": consts::OS,
                     "browser": "orch",
                     "device": "orch",
                 },
@@ -394,7 +399,7 @@ async fn handle_connection(
         })
     };
 
-    tokio::time::timeout(
+    time::timeout(
         Duration::from_secs(SEND_TIMEOUT_SECS),
         write.send(Message::Text(payload.to_string())),
     )
@@ -403,7 +408,7 @@ async fn handle_connection(
     .map_err(|e| anyhow::anyhow!("identify send failed: {e}"))?;
 
     // ── Step 3: Event loop ───────────────────────────────────────────────────
-    let mut hb_ticker = tokio::time::interval(Duration::from_millis(hb_interval_ms));
+    let mut hb_ticker = time::interval(Duration::from_millis(hb_interval_ms));
     hb_ticker.tick().await; // consume the immediate first tick
     let mut ack_received = true;
 
@@ -459,7 +464,7 @@ async fn handle_connection(
                                 let hb_payload = Message::Text(
                                     serde_json::json!({"op": OP_HEARTBEAT, "d": d}).to_string(),
                                 );
-                                tokio::time::timeout(Duration::from_secs(SEND_TIMEOUT_SECS), write.send(hb_payload))
+                                time::timeout(Duration::from_secs(SEND_TIMEOUT_SECS), write.send(hb_payload))
                                     .await
                                     .map_err(|_| anyhow::anyhow!("server heartbeat send timed out"))?
                                     .map_err(|e| anyhow::anyhow!("server heartbeat send failed: {e}"))?;
@@ -477,7 +482,7 @@ async fn handle_connection(
                                 if !resumable {
                                     state.clear();
                                     // Brief delay before re-identifying to avoid rate limiting
-                                    tokio::time::sleep(Duration::from_secs(5)).await;
+                                    time::sleep(Duration::from_secs(5)).await;
                                 }
                                 return Ok(resumable);
                             }
@@ -502,7 +507,7 @@ async fn handle_connection(
                         return Ok(resumable);
                     }
                     Message::Ping(data) => {
-                        tokio::time::timeout(Duration::from_secs(SEND_TIMEOUT_SECS), write.send(Message::Pong(data)))
+                        time::timeout(Duration::from_secs(SEND_TIMEOUT_SECS), write.send(Message::Pong(data)))
                             .await
                             .map_err(|_| anyhow::anyhow!("pong send timed out"))?
                             .map_err(|e| anyhow::anyhow!("pong send failed: {e}"))?;
@@ -525,7 +530,7 @@ async fn handle_connection(
                 let hb_payload = Message::Text(
                     serde_json::json!({"op": OP_HEARTBEAT, "d": d}).to_string(),
                 );
-                tokio::time::timeout(Duration::from_secs(SEND_TIMEOUT_SECS), write.send(hb_payload))
+                time::timeout(Duration::from_secs(SEND_TIMEOUT_SECS), write.send(hb_payload))
                     .await
                     .map_err(|_| anyhow::anyhow!("periodic heartbeat send timed out"))?
                     .map_err(|e| anyhow::anyhow!("periodic heartbeat send failed: {e}"))?;
@@ -537,7 +542,7 @@ async fn handle_connection(
 /// Read the next text frame from the stream, skipping non-text control frames.
 async fn next_text_message<S>(read: &mut S) -> anyhow::Result<String>
 where
-    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    S: StreamExt<Item = Result<Message, tungstenite::Error>> + Unpin,
 {
     loop {
         match read.next().await {
@@ -711,7 +716,7 @@ mod tests {
     /// All external hosts resolve to 127.0.0.1:1 and connections time out in 1ms.
     fn no_network_client() -> Client {
         Client::builder()
-            .connect_timeout(std::time::Duration::from_millis(1))
+            .connect_timeout(Duration::from_millis(1))
             .resolve("discord.com", "127.0.0.1:1".parse().unwrap())
             .build()
             .unwrap()
@@ -1032,7 +1037,7 @@ mod tests {
         // be valid for Duration::from_millis().
         let zero = serde_json::json!(0);
         let interval_ms = parse_heartbeat_interval(&zero);
-        let duration = std::time::Duration::from_millis(interval_ms);
+        let duration = Duration::from_millis(interval_ms);
         assert!(duration.as_millis() > 0, "duration must be non-zero");
     }
 }

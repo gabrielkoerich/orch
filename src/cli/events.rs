@@ -7,14 +7,27 @@
 use anyhow::Context;
 use futures::StreamExt;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::fs;
+use std::net::SocketAddr;
 use std::net::TcpStream;
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::time::Duration;
+use tokio::time;
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
+
+use crate::cli;
+use crate::engine::events::ControlMessage;
+use crate::engine::events::TaskEvent;
+use crate::home;
+use crate::store::Task;
+use crate::store::TaskStore;
 
 /// Read the websocket port from `~/.orch/state/ws.port`.
 fn read_ws_port() -> anyhow::Result<u16> {
-    let state_dir = crate::home::state_dir()?;
-    let port_str = std::fs::read_to_string(state_dir.join("ws.port"))
+    let state_dir = home::state_dir()?;
+    let port_str = fs::read_to_string(state_dir.join("ws.port"))
         .context("event bus not running — is the service started? (ws.port not found)")?;
     port_str
         .trim()
@@ -27,11 +40,7 @@ fn read_ws_port() -> anyhow::Result<u16> {
 /// Uses a short timeout (500ms) so the CLI doesn't hang on stale ports.
 fn probe_ws_port(port: u16) -> bool {
     let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
-    TcpStream::connect_timeout(
-        &std::net::SocketAddr::V4(addr),
-        std::time::Duration::from_millis(500),
-    )
-    .is_ok()
+    TcpStream::connect_timeout(&SocketAddr::V4(addr), Duration::from_millis(500)).is_ok()
 }
 
 /// Stream events from the event bus websocket. Falls back to store polling
@@ -81,13 +90,13 @@ async fn stream_from_ws(port: u16, repo: Option<&str>, task: Option<&str>) -> an
     println!("Connected to event bus (port {port}). Streaming events...\n");
 
     // Open the store for lag resyncs (best-effort — None if unavailable).
-    let store = crate::cli::init_store().await.ok();
+    let store = cli::init_store().await.ok();
 
     while let Some(msg) = read.next().await {
         let msg = msg?;
-        if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+        if let Message::Text(text) = msg {
             // First try to parse as a control message (lag notification).
-            if let Ok(ctrl) = serde_json::from_str::<crate::engine::events::ControlMessage>(&text) {
+            if let Ok(ctrl) = serde_json::from_str::<ControlMessage>(&text) {
                 if ctrl.kind == "lagged" {
                     eprintln!(
                         "WARNING: event bus lagged — {} task transition(s) were dropped. \
@@ -102,7 +111,7 @@ async fn stream_from_ws(port: u16, repo: Option<&str>, task: Option<&str>) -> an
             }
 
             // Normal task event.
-            let Ok(event) = serde_json::from_str::<crate::engine::events::TaskEvent>(&text) else {
+            let Ok(event) = serde_json::from_str::<TaskEvent>(&text) else {
                 continue;
             };
 
@@ -114,7 +123,7 @@ async fn stream_from_ws(port: u16, repo: Option<&str>, task: Option<&str>) -> an
 }
 
 /// Format and print a single task event.
-fn print_event(event: &crate::engine::events::TaskEvent) {
+fn print_event(event: &TaskEvent) {
     let time = if event.timestamp.len() >= 19 {
         &event.timestamp[11..19]
     } else {
@@ -138,7 +147,7 @@ fn print_event(event: &crate::engine::events::TaskEvent) {
 /// This gives the operator a point-in-time snapshot so they know where things
 /// stand after missed transitions.
 async fn resync_from_store(
-    store: &crate::store::TaskStore,
+    store: &TaskStore,
     repo_filter: Option<&str>,
     task_filter: Option<&str>,
 ) {
@@ -191,7 +200,7 @@ async fn stream_from_store(
     repo_filter: Option<&str>,
     task_filter: Option<&str>,
 ) -> anyhow::Result<()> {
-    let store = match crate::cli::init_store().await {
+    let store = match cli::init_store().await {
         Ok(s) => s,
         Err(e) => {
             anyhow::bail!(
@@ -215,7 +224,7 @@ async fn stream_from_store(
         );
     }
 
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+    let mut interval = time::interval(Duration::from_secs(3));
     loop {
         interval.tick().await;
 
@@ -268,7 +277,7 @@ async fn stream_from_store(
         }
 
         // Check for tasks that were removed (completed + cleaned up)
-        let active_keys: std::collections::HashSet<String> = tasks.iter().map(task_key).collect();
+        let active_keys: HashSet<String> = tasks.iter().map(task_key).collect();
         let disappeared: Vec<String> = last_status
             .keys()
             .filter(|k| !active_keys.contains(*k))
@@ -286,7 +295,7 @@ async fn stream_from_store(
 }
 
 /// Derive a display key for a task: prefer external_id, fall back to internal id.
-fn task_key(t: &crate::store::Task) -> String {
+fn task_key(t: &Task) -> String {
     t.external_id
         .clone()
         .unwrap_or_else(|| format!("internal:{}", t.id))
@@ -295,6 +304,7 @@ fn task_key(t: &crate::store::Task) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::TaskStatus;
 
     #[test]
     fn probe_ws_port_unreachable() {
@@ -304,14 +314,14 @@ mod tests {
 
     #[test]
     fn task_key_prefers_external_id() {
-        let t = crate::store::Task {
+        let t = Task {
             id: 42,
             external_id: Some("123".to_string()),
             repo: "o/r".into(),
             origin: "external".into(),
             title: "t".into(),
             body: String::new(),
-            status: crate::store::TaskStatus::New,
+            status: TaskStatus::New,
             source: String::new(),
             source_id: String::new(),
             author: String::new(),
@@ -372,14 +382,14 @@ mod tests {
 
     #[test]
     fn task_key_falls_back_to_internal() {
-        let t = crate::store::Task {
+        let t = Task {
             id: 7,
             external_id: None,
             repo: "o/r".into(),
             origin: "internal".into(),
             title: "t".into(),
             body: String::new(),
-            status: crate::store::TaskStatus::InProgress,
+            status: TaskStatus::InProgress,
             source: String::new(),
             source_id: String::new(),
             author: String::new(),

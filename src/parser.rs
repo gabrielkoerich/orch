@@ -9,8 +9,15 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 
-static TRAILING_COMMA_RE: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r",(\s*[}\]])").expect("trailing comma regex is valid"));
+use crate::status_heuristics;
+
+use std::cmp::Reverse;
+use std::fs;
+use std::io;
+use std::sync::LazyLock;
+
+static TRAILING_COMMA_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r",(\s*[}\]])").expect("trailing comma regex is valid"));
 
 /// Normalized agent response.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -57,12 +64,12 @@ pub struct Delegation {
 pub fn parse_and_print(path: &str) -> anyhow::Result<()> {
     let content = if path == "-" {
         let mut buf = String::new();
-        std::io::stdin()
+        io::stdin()
             .read_to_string(&mut buf)
             .context("reading stdin")?;
         buf
     } else {
-        std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?
+        fs::read_to_string(path).with_context(|| format!("reading {path}"))?
     };
 
     let response = parse(&content)?;
@@ -210,7 +217,7 @@ fn normalize_status(mut resp: AgentResponse) -> AgentResponse {
             || !resp.files.is_empty()
             || resp.error.is_some() =>
         {
-            if crate::status_heuristics::status_looks_like_descriptive_completion(&normalized) {
+            if status_heuristics::status_looks_like_descriptive_completion(&normalized) {
                 "done".to_string()
             } else {
                 resp.status.clone()
@@ -333,7 +340,7 @@ fn json_candidates(raw: &str) -> Vec<String> {
     // Collect ALL balanced JSON blobs and sort by how much they look like an
     // AgentResponse, so the real response is tried before telemetry blobs.
     let mut all_json = extract_all_balanced_json(raw);
-    all_json.sort_by_key(|b| std::cmp::Reverse(agent_response_score(b)));
+    all_json.sort_by_key(|b| Reverse(agent_response_score(b)));
 
     for candidate in all_json {
         if !candidates.iter().any(|existing| existing == &candidate) {

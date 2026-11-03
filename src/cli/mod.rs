@@ -27,16 +27,36 @@ pub mod task_ref;
 pub mod tree;
 pub mod webhook;
 
+use crate::backends::ExternalBackend;
+use crate::backends::github::GitHubBackend;
+use crate::cluster::local;
 use crate::cmd::SyncCommandErrorContext;
 use crate::config;
+use crate::engine;
 use crate::engine::tasks::TaskManager;
+use crate::github::http::GhHttp;
+use crate::github::projects::ProjectSync;
+use crate::github::projects::label_status::LabelSyncConfig;
+use crate::github::projects::label_status::ProjectApi;
+use crate::github::projects::write_project_config;
+use crate::home;
+use crate::store;
+use crate::store::TaskStore;
 use anyhow::Context;
+use std::env;
+use std::fs;
+use std::iter;
+use std::path;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process;
+use std::process::Command;
 use std::sync::Arc;
 
 /// Initialize orch for a project.
 pub fn init(repo: Option<String>) -> anyhow::Result<()> {
-    let orch_home = crate::home::orch_home()?;
-    std::fs::create_dir_all(&orch_home)?;
+    let orch_home = home::orch_home()?;
+    fs::create_dir_all(&orch_home)?;
 
     let config_path = orch_home.join("config.yml");
 
@@ -49,7 +69,7 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
         }
     } else {
         // Try to detect from git remote (origin) by reading the remote URL
-        let git_remote = std::process::Command::new("git")
+        let git_remote = Command::new("git")
             .args(["remote", "get-url", "origin"])
             .output_with_context();
 
@@ -61,12 +81,12 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
                 } else {
                     eprintln!("Could not parse repository from git remote: {url}");
                     eprintln!("Use --repo OWNER/REPO");
-                    std::process::exit(1);
+                    process::exit(1);
                 }
             }
             _ => {
                 eprintln!("Could not detect repository. Use --repo OWNER/REPO");
-                std::process::exit(1);
+                process::exit(1);
             }
         }
     };
@@ -74,16 +94,16 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
     // Ensure global config exists
     if !config_path.exists() {
         let content = "# Orch global configuration\n# See: https://github.com/gabrielkoerich/orch\n\nprojects: []\n\nrouter:\n  mode: llm\n  agent: claude\n  model: haiku\n";
-        std::fs::write(&config_path, content)?;
+        fs::write(&config_path, content)?;
     }
 
     println!("Initialized orch for {repo_value}");
     println!("Global config: {}", config_path.display());
 
     // Create project-local .orch.yml if not exists
-    let local_config = std::path::Path::new(".orch.yml");
+    let local_config = Path::new(".orch.yml");
     if !local_config.exists() {
-        std::fs::write(
+        fs::write(
             local_config,
             format!("# Project-specific orch config\ngh:\n  repo: \"{repo_value}\"\n"),
         )?;
@@ -91,7 +111,7 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
     }
 
     // Register project in global config
-    let cwd = std::env::current_dir()?;
+    let cwd = env::current_dir()?;
     let cwd_str = cwd.to_string_lossy().to_string();
 
     // Check if already registered
@@ -113,26 +133,26 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
 
 /// Show orch logs.
 pub fn log(lines: &str) -> anyhow::Result<()> {
-    let state_dir = crate::home::state_dir().unwrap_or_default();
-    let brew_prefix = std::env::var("HOMEBREW_PREFIX").unwrap_or_else(|_| "/opt/homebrew".into());
+    let state_dir = home::state_dir().unwrap_or_default();
+    let brew_prefix = env::var("HOMEBREW_PREFIX").unwrap_or_else(|_| "/opt/homebrew".into());
 
     let mut log_files = Vec::new();
 
     let candidates = [
         state_dir.join("orch.log"),
         state_dir.join("orch.error.log"),
-        std::path::PathBuf::from(&brew_prefix).join("var/log/orch.log"),
-        std::path::PathBuf::from(&brew_prefix).join("var/log/orch.error.log"),
+        PathBuf::from(&brew_prefix).join("var/log/orch.log"),
+        PathBuf::from(&brew_prefix).join("var/log/orch.error.log"),
     ];
 
     for path in &candidates {
-        if path.exists() && std::fs::metadata(path).is_ok_and(|m| m.len() > 0) {
+        if path.exists() && fs::metadata(path).is_ok_and(|m| m.len() > 0) {
             log_files.push(path.clone());
         } else {
             // Fall back to rotated log files (orch.log.1, orch.log.2, ...) if primary is empty
             for n in 1..=5 {
-                let rotated = std::path::PathBuf::from(format!("{}.{}", path.display(), n));
-                if rotated.exists() && std::fs::metadata(&rotated).is_ok_and(|m| m.len() > 0) {
+                let rotated = PathBuf::from(format!("{}.{}", path.display(), n));
+                if rotated.exists() && fs::metadata(&rotated).is_ok_and(|m| m.len() > 0) {
                     log_files.push(rotated);
                     break;
                 }
@@ -146,20 +166,18 @@ pub fn log(lines: &str) -> anyhow::Result<()> {
     }
 
     if lines == "watch" {
-        let args: Vec<String> = std::iter::once("-f".to_string())
+        let args: Vec<String> = iter::once("-f".to_string())
             .chain(log_files.iter().map(|p| p.to_string_lossy().to_string()))
             .collect();
-        let status = std::process::Command::new("tail")
-            .args(&args)
-            .status_with_context()?;
-        std::process::exit(status.code().unwrap_or(1));
+        let status = Command::new("tail").args(&args).status_with_context()?;
+        process::exit(status.code().unwrap_or(1));
     }
     let n = lines.parse::<usize>().unwrap_or(50);
     for path in &log_files {
         let filename = path.file_name().unwrap_or_default().to_string_lossy();
         println!("=== {filename} ===");
 
-        let content = std::fs::read_to_string(path)?;
+        let content = fs::read_to_string(path)?;
         let all_lines: Vec<&str> = content.lines().collect();
         let start = if all_lines.len() > n {
             all_lines.len() - n
@@ -177,7 +195,7 @@ pub fn log(lines: &str) -> anyhow::Result<()> {
 
 /// List installed agent CLIs.
 pub fn agents() {
-    let agents = crate::engine::configured_agents();
+    let agents = engine::configured_agents();
 
     println!("{:<12} {:<10} PATH", "AGENT", "STATUS");
     println!("{}", "-".repeat(60));
@@ -186,7 +204,7 @@ pub fn agents() {
         match which::which(agent) {
             Ok(path) => {
                 // Try to get version
-                let version = std::process::Command::new(agent)
+                let version = Command::new(agent)
                     .arg("--version")
                     .output_with_context()
                     .ok()
@@ -371,8 +389,6 @@ pub fn parse_since(s: &str) -> Option<u32> {
 
 /// List accessible GitHub Projects V2 boards.
 pub async fn board_list() -> anyhow::Result<()> {
-    use crate::github::projects::ProjectSync;
-
     let projects = ProjectSync::list_projects().await?;
 
     if projects.is_empty() {
@@ -391,8 +407,6 @@ pub async fn board_list() -> anyhow::Result<()> {
 
 /// Link current repo to a GitHub Projects V2 board by ID and discover fields.
 pub async fn board_link(project_id: &str) -> anyhow::Result<()> {
-    use crate::github::projects::{ProjectSync, write_project_config};
-
     println!("Discovering board fields...");
     let sync = ProjectSync::discover_fields(project_id).await?;
 
@@ -410,8 +424,6 @@ pub async fn board_link(project_id: &str) -> anyhow::Result<()> {
 
 /// Re-discover field IDs from configured board and update config.
 pub async fn board_sync() -> anyhow::Result<()> {
-    use crate::github::projects::{ProjectSync, write_project_config};
-
     let project_id = config::get("gh.project_id").map_err(|_| {
         anyhow::anyhow!("no board configured — run `orch project board link <id>` first")
     })?;
@@ -467,8 +479,8 @@ pub async fn board_reconcile(repo: Option<&str>) -> anyhow::Result<()> {
         Some(repo) => repo.to_owned(),
         None => config::get_current_repo()?,
     };
-    let config = crate::github::projects::label_status::LabelSyncConfig::from_config()?;
-    let gh = crate::github::http::GhHttp::owner()?;
+    let config = LabelSyncConfig::from_config()?;
+    let gh = GhHttp::owner()?;
     let updated = board_reconcile_with(&config, &gh, &repo).await?;
     println!(
         "Updated {updated} project Status field(s) in this pass; skipped items are reported at debug level."
@@ -477,8 +489,8 @@ pub async fn board_reconcile(repo: Option<&str>) -> anyhow::Result<()> {
 }
 
 pub(crate) async fn board_reconcile_with(
-    config: &crate::github::projects::label_status::LabelSyncConfig,
-    api: &impl crate::github::projects::label_status::ProjectApi,
+    config: &LabelSyncConfig,
+    api: &impl ProjectApi,
     repo: &str,
 ) -> anyhow::Result<usize> {
     if !config.configured_for_repo(repo) {
@@ -526,7 +538,7 @@ fn parse_github_slug(input: &str) -> Option<(String, String)> {
     if input.starts_with('/')
         || input.starts_with('.')
         || input.starts_with('~')
-        || (input.contains(std::path::MAIN_SEPARATOR) && std::path::MAIN_SEPARATOR != '/')
+        || (input.contains(path::MAIN_SEPARATOR) && path::MAIN_SEPARATOR != '/')
     {
         return None;
     }
@@ -564,9 +576,9 @@ pub fn project_add(input: &str) -> anyhow::Result<()> {
 /// Add a local project path to the global registry.
 fn project_add_local(path: &str) -> anyhow::Result<()> {
     let abs_path = if path == "." {
-        std::env::current_dir()?
+        env::current_dir()?
     } else {
-        std::path::PathBuf::from(path).canonicalize()?
+        PathBuf::from(path).canonicalize()?
     };
 
     // Verify .orch.yml exists in the project
@@ -589,7 +601,7 @@ fn project_add_local(path: &str) -> anyhow::Result<()> {
 
     // Show the repo from .orch.yml if available
     if orch_yml.exists() {
-        let project_content = std::fs::read_to_string(&orch_yml)?;
+        let project_content = fs::read_to_string(&orch_yml)?;
         let project_doc: serde_norway::Value = serde_norway::from_str(&project_content)?;
         if let Some(repo) = project_doc
             .get("gh")
@@ -605,7 +617,7 @@ fn project_add_local(path: &str) -> anyhow::Result<()> {
 
 /// Clone a GitHub repo as a bare clone and register it.
 fn project_add_github(owner: &str, repo: &str) -> anyhow::Result<()> {
-    let projects_dir = crate::home::projects_dir()?;
+    let projects_dir = home::projects_dir()?;
     let bare_path = projects_dir.join(owner).join(format!("{repo}.git"));
     let slug = format!("{owner}/{repo}");
 
@@ -616,10 +628,10 @@ fn project_add_github(owner: &str, repo: &str) -> anyhow::Result<()> {
         let parent = bare_path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("bare path has no parent: {}", bare_path.display()))?;
-        std::fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)?;
 
         println!("Cloning {slug} as bare repo...");
-        let status = std::process::Command::new("gh")
+        let status = Command::new("gh")
             .args([
                 "repo",
                 "clone",
@@ -641,7 +653,7 @@ fn project_add_github(owner: &str, repo: &str) -> anyhow::Result<()> {
     let orch_yml = bare_path.join(".orch.yml");
     if !orch_yml.exists() {
         let content = format!("# Project-specific orch config\ngh:\n  repo: \"{slug}\"\n");
-        std::fs::write(&orch_yml, content)?;
+        fs::write(&orch_yml, content)?;
         println!("Created .orch.yml with gh.repo: {slug}");
     }
 
@@ -655,9 +667,9 @@ fn project_add_github(owner: &str, repo: &str) -> anyhow::Result<()> {
 
 /// Register a project path in the global config (shared by local and GitHub flows).
 fn register_project_path(path_str: &str) -> anyhow::Result<()> {
-    let config_path = crate::home::config_path()?;
+    let config_path = home::config_path()?;
     let content = if config_path.exists() {
-        std::fs::read_to_string(&config_path)?
+        fs::read_to_string(&config_path)?
     } else {
         String::new()
     };
@@ -667,7 +679,7 @@ fn register_project_path(path_str: &str) -> anyhow::Result<()> {
             println!("Project already registered: {path_str}");
         }
         config::projects_yaml::ProjectsEdit::Updated(updated) => {
-            std::fs::write(&config_path, updated)?;
+            fs::write(&config_path, updated)?;
             println!("Added project: {path_str}");
         }
     }
@@ -677,23 +689,23 @@ fn register_project_path(path_str: &str) -> anyhow::Result<()> {
 
 /// Remove a project from the global registry.
 pub fn project_remove(path: &str) -> anyhow::Result<()> {
-    let abs_path = std::path::PathBuf::from(path)
+    let abs_path = PathBuf::from(path)
         .canonicalize()
-        .unwrap_or_else(|_| std::path::PathBuf::from(path));
+        .unwrap_or_else(|_| PathBuf::from(path));
     let path_str = abs_path.to_string_lossy().to_string();
 
-    let config_path = crate::home::config_path()?;
+    let config_path = home::config_path()?;
     if !config_path.exists() {
         anyhow::bail!("no global config found");
     }
 
-    let content = std::fs::read_to_string(&config_path)?;
+    let content = fs::read_to_string(&config_path)?;
     match config::projects_yaml::remove_project(&content, &[&path_str, path])? {
         config::projects_yaml::ProjectsEdit::Unchanged => {
             println!("Project not found: {path}");
         }
         config::projects_yaml::ProjectsEdit::Updated(updated) => {
-            std::fs::write(&config_path, updated)?;
+            fs::write(&config_path, updated)?;
             println!("Removed project: {path_str}");
         }
     }
@@ -715,7 +727,7 @@ pub fn project_list() -> anyhow::Result<()> {
     println!("{}", "-".repeat(80));
 
     for path_str in &projects {
-        let path = std::path::Path::new(path_str);
+        let path = Path::new(path_str);
 
         // Try to read repo from .orch.yml
         let repo = read_project_repo(path).unwrap_or_else(|| "(.orch.yml not found)".to_string());
@@ -743,9 +755,9 @@ pub async fn project_move(old: &str, new: &str) -> anyhow::Result<()> {
 }
 
 /// Read gh.repo from a project's .orch.yml.
-fn read_project_repo(project_path: &std::path::Path) -> Option<String> {
+fn read_project_repo(project_path: &Path) -> Option<String> {
     let orch_yml = project_path.join(".orch.yml");
-    let content = std::fs::read_to_string(&orch_yml).ok()?;
+    let content = fs::read_to_string(&orch_yml).ok()?;
     let doc: serde_norway::Value = serde_norway::from_str(&content).ok()?;
     doc.get("gh")
         .and_then(|gh| gh.get("repo"))
@@ -755,9 +767,6 @@ fn read_project_repo(project_path: &std::path::Path) -> Option<String> {
 
 /// Initialize task manager with database and backend.
 pub async fn init_task_manager() -> anyhow::Result<TaskManager> {
-    use crate::backends::ExternalBackend;
-    use crate::backends::github::GitHubBackend;
-
     let repo = config::get_current_repo()
         .context("'repo' not set — run `orch init` or set gh.repo in .orch.yml")?;
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
@@ -766,9 +775,9 @@ pub async fn init_task_manager() -> anyhow::Result<TaskManager> {
 }
 
 /// Initialize the unified task store for CLI commands.
-pub async fn init_store() -> anyhow::Result<crate::store::TaskStore> {
-    let store = crate::store::TaskStore::open(&crate::store::default_db_path().await?).await?;
-    if let Some(endpoint) = crate::cluster::local::daemon_endpoint().await {
+pub async fn init_store() -> anyhow::Result<TaskStore> {
+    let store = TaskStore::open(&store::default_db_path().await?).await?;
+    if let Some(endpoint) = local::daemon_endpoint().await {
         store.attach_daemon(endpoint);
     }
 

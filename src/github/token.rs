@@ -8,10 +8,13 @@
 //! 4. `gh auth token` CLI (via `allow_gh_fallback = true`)
 
 use std::env;
+use std::process::Command;
 #[cfg(test)]
 use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
+
+use crate::config;
 
 /// Centralized token resolver for GitHub authentication.
 ///
@@ -108,7 +111,7 @@ impl TokenResolver {
             return Some(t);
         }
         // Config-based token (explicit override in ~/.orch/config.yml)
-        if let Ok(t) = crate::config::get("gh.auth.token")
+        if let Ok(t) = config::get("gh.auth.token")
             && !t.is_empty()
         {
             tracing::info!("Resolved GitHub token from gh.auth.token config");
@@ -154,10 +157,7 @@ impl TokenResolver {
         reason = "the gh fallback is settled code, see issues 418 and 421"
     )]
     fn try_gh_command(gh_path: &str) -> anyhow::Result<Option<String>> {
-        match std::process::Command::new(gh_path)
-            .args(["auth", "token"])
-            .output()
-        {
+        match Command::new(gh_path).args(["auth", "token"]).output() {
             Ok(out) if out.status.success() => {
                 let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !token.is_empty() {
@@ -186,7 +186,7 @@ static SHARED_RESOLVER: OnceLock<Arc<TokenResolver>> = OnceLock::new();
 
 /// Get the process-wide shared token resolver.
 pub fn shared() -> Arc<TokenResolver> {
-    std::sync::Arc::clone(SHARED_RESOLVER.get_or_init(|| Arc::new(TokenResolver::default_env())))
+    Arc::clone(SHARED_RESOLVER.get_or_init(|| Arc::new(TokenResolver::default_env())))
 }
 
 impl Default for TokenResolver {

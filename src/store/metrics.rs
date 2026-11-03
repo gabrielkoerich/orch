@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use super::TaskStore;
 #[cfg(test)]
 use chrono::Datelike;
@@ -115,7 +117,6 @@ fn self_improvement_key() -> String {
 
 impl TaskStore {
     pub async fn cost_summary(&self, repo: &str) -> anyhow::Result<(i64, i64, f64)> {
-        use sqlx::Row;
         let row = sqlx::query(
             "SELECT
             COALESCE(SUM(input_tokens), 0) as total_input,
@@ -138,18 +139,14 @@ impl TaskStore {
     /// Returns a map of status string → count.
     /// Only needed by tests.
     #[cfg(test)]
-    pub async fn status_counts(
-        &self,
-        repo: &str,
-    ) -> anyhow::Result<std::collections::HashMap<String, i64>> {
-        use sqlx::Row;
+    pub async fn status_counts(&self, repo: &str) -> anyhow::Result<HashMap<String, i64>> {
         let rows =
             sqlx::query("SELECT status, COUNT(*) as cnt FROM tasks WHERE repo = ? GROUP BY status")
                 .bind(repo)
                 .fetch_all(&self.pool)
                 .await?;
 
-        let mut map = std::collections::HashMap::new();
+        let mut map = HashMap::new();
         for row in &rows {
             let status: String = row.try_get("status")?;
             let count: i64 = row.try_get("cnt")?;
@@ -524,7 +521,7 @@ impl TaskStore {
     pub async fn recent_rate_limit_counts(
         &self,
         window_hours: u32,
-    ) -> anyhow::Result<std::collections::HashMap<String, i64>> {
+    ) -> anyhow::Result<HashMap<String, i64>> {
         // SQLite datetime modifiers don't support parameterised intervals, so
         // we build the interval string and embed it directly.  The value comes
         // from a config integer, not user input, so this is safe.
@@ -545,7 +542,7 @@ impl TaskStore {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut map = std::collections::HashMap::new();
+        let mut map = HashMap::new();
         for row in &rows {
             let agent: String = row.try_get("agent")?;
             let cnt: i64 = row.try_get("cnt")?;

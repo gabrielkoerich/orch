@@ -1,4 +1,22 @@
+use std::env;
+use std::fs;
+use std::net;
+use std::os::unix::fs::PermissionsExt;
+use std::process;
+use std::slice;
+use std::sync::Mutex;
+
 use super::*;
+use crate::store::DepSource;
+use crate::store::JobState;
+use crate::store::NewDependency;
+use crate::store::NewTask;
+use crate::store::Task;
+use crate::store::TaskStatus;
+use crate::store::kv;
+use axum::http::HeaderMap;
+use axum::http::header;
+use axum::routing;
 use openraft::{RaftSnapshotBuilder, RaftStorage};
 
 async fn open(dir: &Path) -> TaskStore {
@@ -150,8 +168,8 @@ async fn store_without_raft_applies_directly() {
     );
 }
 
-fn new_task(title: &str, body: &str) -> crate::store::NewTask {
-    crate::store::NewTask {
+fn new_task(title: &str, body: &str) -> NewTask {
+    NewTask {
         repo: "owner/repo".into(),
         origin: "internal".into(),
         title: title.into(),
@@ -162,7 +180,6 @@ fn new_task(title: &str, body: &str) -> crate::store::NewTask {
 
 #[tokio::test]
 async fn task_writes_go_through_the_log() {
-    use crate::store::TaskStatus;
     let dir = tempfile::tempdir().unwrap();
     let store = open(dir.path()).await;
     let raft = start_single(&store, &dir.path().join("raft.db"))
@@ -243,7 +260,6 @@ async fn restart_does_not_increment_a_task_counter_twice() {
 
 #[tokio::test]
 async fn snapshot_replaces_tasks_and_keeps_local_columns() {
-    use crate::store::TaskStatus;
     let a_dir = tempfile::tempdir().unwrap();
     let a = open(a_dir.path()).await;
     let active = a.create(&new_task("active", "active body")).await.unwrap();
@@ -296,7 +312,6 @@ async fn snapshot_replaces_tasks_and_keeps_local_columns() {
 
 #[tokio::test]
 async fn snapshot_inserts_a_done_task_as_a_tombstone() {
-    use crate::store::TaskStatus;
     let a_dir = tempfile::tempdir().unwrap();
     let a = open(a_dir.path()).await;
     let done = a.create(&new_task("done", "a body")).await.unwrap();
@@ -325,7 +340,6 @@ async fn snapshot_inserts_a_done_task_as_a_tombstone() {
 
 #[tokio::test]
 async fn dependency_job_and_channel_writes_go_through_the_log_and_the_snapshot() {
-    use crate::store::{DepSource, JobState, NewDependency};
     let a_dir = tempfile::tempdir().unwrap();
     let a = open(a_dir.path()).await;
     let raft = start_single(&a, &a_dir.path().join("raft.db"))
@@ -338,7 +352,7 @@ async fn dependency_job_and_channel_writes_go_through_the_log_and_the_snapshot()
         number: 7,
         source: DepSource::Cli,
     };
-    a.replace_dependencies(task, std::slice::from_ref(&dep))
+    a.replace_dependencies(task, slice::from_ref(&dep))
         .await
         .unwrap();
     assert_eq!(
@@ -428,7 +442,7 @@ async fn cli_writes_go_through_the_daemon_log() {
 async fn cli_writes_directly_when_no_daemon_listens() {
     let dir = tempfile::tempdir().unwrap();
     let cli = open(dir.path()).await;
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
+    let port = net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
@@ -480,11 +494,10 @@ async fn daemon_endpoint_refuses_a_wrong_token_and_a_foreign_host() {
         .unwrap();
     assert_eq!(res.status(), 401, "a Host other than 127.0.0.1 is refused");
 
-    let body = std::fs::read_to_string(std::env::temp_dir().join("orch-test-state/cluster.port"))
+    let body = fs::read_to_string(env::temp_dir().join("orch-test-state/cluster.port"))
         .unwrap_or_default();
     if body.contains(&endpoint.token) {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(std::env::temp_dir().join("orch-test-state/cluster.port"))
+        let mode = fs::metadata(env::temp_dir().join("orch-test-state/cluster.port"))
             .unwrap()
             .permissions()
             .mode();
@@ -492,8 +505,8 @@ async fn daemon_endpoint_refuses_a_wrong_token_and_a_foreign_host() {
     }
 }
 
-async fn bound_listener() -> (String, tokio::net::TcpListener) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+async fn bound_listener() -> (String, TcpListener) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     (listener.local_addr().unwrap().to_string(), listener)
 }
 
@@ -508,7 +521,7 @@ async fn start_member(
     voters: &BTreeMap<NodeId, String>,
     secret: &str,
     elect: bool,
-    listener: tokio::net::TcpListener,
+    listener: TcpListener,
 ) -> Member {
     let store = open(dir).await;
     let node = start_node_on(
@@ -537,30 +550,25 @@ async fn leader_of(members: &BTreeMap<NodeId, Member>) -> NodeId {
             }
         }
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        time::sleep(Duration::from_millis(50)).await;
     }
 
     panic!("no leader elected");
 }
 
-async fn wait_for_task(store: &TaskStore, id: i64) -> crate::store::Task {
+async fn wait_for_task(store: &TaskStore, id: i64) -> Task {
     for _ in 0..200 {
         if let Ok(t) = store.get(id).await {
             return t;
         }
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        time::sleep(Duration::from_millis(50)).await;
     }
 
     panic!("task {id} never arrived");
 }
 
-async fn voters(
-    n: u64,
-) -> (
-    BTreeMap<NodeId, String>,
-    BTreeMap<NodeId, tokio::net::TcpListener>,
-) {
+async fn voters(n: u64) -> (BTreeMap<NodeId, String>, BTreeMap<NodeId, TcpListener>) {
     let mut addrs = BTreeMap::new();
     let mut listeners = BTreeMap::new();
     for id in 1..=n {
@@ -614,9 +622,7 @@ async fn three_voters_fail_over_and_catch_up() {
         "s3cret",
         true,
         // The stopped node released its port, so a restart binds it again
-        tokio::net::TcpListener::bind(&voters[&first])
-            .await
-            .unwrap(),
+        TcpListener::bind(&voters[&first]).await.unwrap(),
     )
     .await;
     assert_eq!(wait_for_task(&back.store, b).await.title, "b");
@@ -692,7 +698,7 @@ async fn a_node_with_the_wrong_secret_gets_nothing() {
         .unwrap();
     let other = if leader == 1 { 2 } else { 1 };
     wait_for_task(&members[&other].store, id).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    time::sleep(Duration::from_millis(500)).await;
     assert!(members[&3].store.get(id).await.is_err());
     for (_, m) in members {
         m.node.stop().await;
@@ -776,7 +782,7 @@ async fn a_learner_joins_through_any_node_and_catches_up() {
             break;
         }
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        time::sleep(Duration::from_millis(50)).await;
     }
 
     joined.unwrap();
@@ -798,18 +804,14 @@ async fn a_learner_joins_through_any_node_and_catches_up() {
 
 #[tokio::test]
 async fn probe_never_sends_the_secret_and_rejects_a_peer_without_proof() {
-    use axum::http::HeaderMap;
-    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let record = std::sync::Arc::clone(&seen);
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let record = Arc::clone(&seen);
     let fake = axum::Router::new().route(
         "/cluster/hello",
-        axum::routing::get(move |headers: HeaderMap| {
-            let record = std::sync::Arc::clone(&record);
+        routing::get(move |headers: HeaderMap| {
+            let record = Arc::clone(&record);
             async move {
-                let names = headers
-                    .keys()
-                    .map(std::string::ToString::to_string)
-                    .collect::<Vec<_>>();
+                let names = headers.keys().map(ToString::to_string).collect::<Vec<_>>();
                 let values = headers
                     .values()
                     .filter_map(|v| v.to_str().ok().map(str::to_string))
@@ -829,7 +831,7 @@ async fn probe_never_sends_the_secret_and_rejects_a_peer_without_proof() {
             }
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     tokio::spawn(async move { axum::serve(listener, fake).await.ok() });
 
@@ -851,7 +853,7 @@ async fn probe_never_sends_the_secret_and_rejects_a_peer_without_proof() {
 }
 
 fn git_ok(dir: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
+    let out = process::Command::new("git")
         .args([
             "-c",
             "user.name=T",
@@ -872,7 +874,7 @@ fn git_ok(dir: &Path, args: &[&str]) {
 }
 
 fn git_head(dir: &Path, rev: &str) -> String {
-    let out = std::process::Command::new("git")
+    let out = process::Command::new("git")
         .args(["rev-parse", rev])
         .current_dir(dir)
         .output()
@@ -896,7 +898,7 @@ async fn progress_commits_what_is_left_pushes_and_keeps_the_last_five() {
     git_ok(&wt, &["config", "user.name", "T"]);
     git_ok(&wt, &["config", "user.email", "t@t"]);
     git_ok(&wt, &["config", "commit.gpgsign", "false"]);
-    std::fs::write(wt.join("a.txt"), "a").unwrap();
+    fs::write(wt.join("a.txt"), "a").unwrap();
     git_ok(&wt, &["add", "a.txt"]);
     git_ok(&wt, &["commit", "-m", "base"]);
     git_ok(&wt, &["push", "origin", "main"]);
@@ -910,7 +912,7 @@ async fn progress_commits_what_is_left_pushes_and_keeps_the_last_five() {
         .await
         .unwrap();
 
-    std::fs::write(wt.join("b.txt"), "left by the agent").unwrap();
+    fs::write(wt.join("b.txt"), "left by the agent").unwrap();
     let report = progress::Report {
         worktree: path.clone(),
         done: "step one".into(),
@@ -995,7 +997,7 @@ async fn exactly_one_of_three_nodes_leads() {
             break;
         }
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        time::sleep(Duration::from_millis(50)).await;
     }
 
     for (id, m) in &members {
@@ -1030,7 +1032,7 @@ async fn a_relayed_proof_is_rejected() {
     // A host that forwards the probe to a real member and hands back its genuine answer
     let relay = axum::Router::new().route(
         "/cluster/hello",
-        axum::routing::get(move |headers: axum::http::HeaderMap| {
+        routing::get(move |headers: HeaderMap| {
             let real = real.clone();
             async move {
                 let mut req = reqwest::Client::new().get(format!("http://{real}/cluster/hello"));
@@ -1040,14 +1042,11 @@ async fn a_relayed_proof_is_rejected() {
                     }
                 }
                 let body = req.send().await.unwrap().text().await.unwrap();
-                (
-                    [(axum::http::header::CONTENT_TYPE, "application/json")],
-                    body,
-                )
+                ([(header::CONTENT_TYPE, "application/json")], body)
             }
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let relay_addr = listener.local_addr().unwrap().to_string();
     tokio::spawn(async move { axum::serve(listener, relay).await.ok() });
 
@@ -1138,9 +1137,7 @@ async fn a_snapshot_never_brings_in_local_keys() {
             "t".to_string(),
         ),
     ];
-    crate::store::kv::replace_replicated(&mut conn, &rows)
-        .await
-        .unwrap();
+    kv::replace_replicated(&mut conn, &rows).await.unwrap();
     drop(conn);
     assert_eq!(store.kv_get("raft:vote").await.unwrap(), None);
     assert_eq!(

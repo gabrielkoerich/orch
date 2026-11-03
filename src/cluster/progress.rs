@@ -4,7 +4,9 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use tokio::process::Command;
 
+use crate::engine::runner::commit::When;
 use crate::engine::runner::{git_ops, worktree};
 use crate::store::TaskStore;
 
@@ -58,7 +60,7 @@ pub async fn list(store: &TaskStore, task_id: i64) -> anyhow::Result<Vec<Record>
 }
 
 async fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = tokio::process::Command::new("git")
+    let out = Command::new("git")
         .args(args)
         .current_dir(dir)
         .output()
@@ -92,7 +94,7 @@ pub async fn handle(store: &TaskStore, node: &str, report: Report) -> anyhow::Re
         &report.done,
         "orch",
         u32::try_from(task.attempts).unwrap_or(0),
-        crate::engine::runner::commit::When::Tested,
+        When::Tested,
     )
     .await
     {

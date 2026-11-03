@@ -6,6 +6,12 @@
 //! `none` is no dependency.
 
 use std::collections::{HashMap, HashSet};
+use std::error;
+use std::fmt;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::fmt::Write as _;
+use std::hash::BuildHasher;
 
 pub const PLAN_LABEL: &str = "orch-plan";
 pub const HUMAN_LABEL: &str = "owner:human";
@@ -16,13 +22,13 @@ pub struct PlanError {
     pub message: String,
 }
 
-impl std::fmt::Display for PlanError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for PlanError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(&self.message)
     }
 }
 
-impl std::error::Error for PlanError {}
+impl error::Error for PlanError {}
 
 impl PlanError {
     fn new(message: impl Into<String>) -> Self {
@@ -345,8 +351,6 @@ pub fn issue_body_with(
     rel_path: &str,
     blocked_external: &[String],
 ) -> String {
-    use std::fmt::Write as _;
-
     let mut out = String::new();
     if !task.goal.is_empty() {
         out.push_str("## Goal\n\n");
@@ -503,7 +507,7 @@ pub fn diff_import(
 /// Dependencies outside the selected set that have no GitHub issue yet.
 ///
 /// An id that is not in the roadmap is an error. An id in the roadmap is reported
-pub fn unmet_externals<S: std::hash::BuildHasher>(
+pub fn unmet_externals<S: BuildHasher>(
     tasks: &[Task],
     roadmap: &Roadmap,
     known_ids: &HashSet<String, S>,
@@ -563,7 +567,7 @@ pub fn blocked_external_ids<'a>(unmet: &'a [UnmetExternal], task_id: &str) -> Ve
         .collect()
 }
 
-pub fn diff_links<S: std::hash::BuildHasher>(
+pub fn diff_links<S: BuildHasher>(
     tasks: &[Task],
     bindings: &[Binding],
     current: &HashMap<u64, Vec<DepRef>, S>,
@@ -643,8 +647,6 @@ pub fn render_report(
 }
 
 fn render_unmet(unmet: &[UnmetExternal], skipped: &[String]) -> String {
-    use std::fmt::Write as _;
-
     let skip: HashSet<&str> = skipped.iter().map(String::as_str).collect();
     let mut out = String::new();
     for id in skipped {
@@ -676,8 +678,6 @@ fn render_unmet(unmet: &[UnmetExternal], skipped: &[String]) -> String {
 }
 
 pub fn render_tasks(diff: &PlanDiff) -> String {
-    use std::fmt::Write as _;
-
     let mut out = String::new();
     for plan in &diff.tasks {
         let human = if plan.task.owner_human {
@@ -708,8 +708,6 @@ pub fn render_tasks(diff: &PlanDiff) -> String {
 }
 
 pub fn render_links(links: &[LinkEdit]) -> String {
-    use std::fmt::Write as _;
-
     let mut out = String::new();
     for link in links {
         match link {

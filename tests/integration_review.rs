@@ -66,6 +66,8 @@ use orch::engine::runner::agents::find_agent_result;
 use orch::engine::runner::response::{
     ReviewResponse, infer_review_response, parse_review_response,
 };
+use std::process::Command;
+use std::process::Stdio;
 
 /// Full review parsing pipeline for an agent's NDJSON output.
 ///
@@ -228,8 +230,6 @@ fn review_minimax_request_changes() {
 // cargo test --test integration_review -- --ignored --nocapture
 // ```
 
-use std::process::Command;
-
 const REVIEW_PROMPT: &str = r#"You are a code review agent. Review this trivial change and respond with ONLY this JSON (no markdown, no explanation):
 {"decision":"approve","notes":"LGTM","test_results":"pass","issues":[]}"#;
 
@@ -340,14 +340,14 @@ fn run_claude_agent(binary: &str, model: &str) -> (i32, String, String) {
     // Pipe prompt via stdin
     let mut echo = Command::new("printf")
         .arg(REVIEW_PROMPT)
-        .stdout(std::process::Stdio::piped())
+        .stdout(Stdio::piped())
         .spawn()
         .expect("printf");
 
     cmd.stdin(echo.stdout.take().expect("printf stdout is piped"));
     let _ = echo.wait(); // avoid zombie
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
 
     let output = cmd
         .output()
@@ -405,13 +405,13 @@ fn run_opencode_agent(model: &str) -> (i32, String, String) {
 
     // Pipe prompt via stdin
     let mut echo = Command::new("printf");
-    echo.arg(REVIEW_PROMPT).stdout(std::process::Stdio::piped());
+    echo.arg(REVIEW_PROMPT).stdout(Stdio::piped());
 
     let mut echo_child = echo.spawn().expect("printf");
     cmd.stdin(echo_child.stdout.take().expect("printf stdout is piped"));
     let _ = echo_child.wait(); // avoid zombie
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
 
     let output = cmd
         .output()

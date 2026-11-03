@@ -18,7 +18,16 @@
 use chrono::TimeZone;
 use regex::Regex;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::LazyLock;
+use std::sync::MutexGuard;
 use std::sync::{Arc, Mutex, OnceLock};
+use tokio::sync;
+
+use crate::engine::router::config;
+#[cfg(test)]
+use crate::engine::runner::agents::opencode;
+use crate::store::TaskStore;
 
 /// Default fallback cooldown for agents when no store is available: 30 minutes.
 ///
@@ -168,10 +177,9 @@ fn cooldowns() -> &'static Mutex<HashMap<String, CooldownEntry>> {
 /// Uses `tokio::sync::Mutex` because this value is only ever accessed from
 /// async functions. A `tokio::sync::Mutex` yields the Tokio task instead of
 /// blocking the worker thread if the lock is contended.
-fn cooldown_store() -> &'static tokio::sync::Mutex<Option<Arc<crate::store::TaskStore>>> {
-    static STORE: OnceLock<tokio::sync::Mutex<Option<Arc<crate::store::TaskStore>>>> =
-        OnceLock::new();
-    STORE.get_or_init(|| tokio::sync::Mutex::new(None))
+fn cooldown_store() -> &'static sync::Mutex<Option<Arc<TaskStore>>> {
+    static STORE: OnceLock<sync::Mutex<Option<Arc<TaskStore>>>> = OnceLock::new();
+    STORE.get_or_init(|| sync::Mutex::new(None))
 }
 
 /// Initialise persistent cooldowns.
@@ -197,7 +205,7 @@ fn parse_cooldown_value(value: &str) -> Option<(i64, String)> {
         .map(|until| (until, "persisted".to_string()))
 }
 
-pub async fn init_cooldown_store(store: Arc<crate::store::TaskStore>) {
+pub async fn init_cooldown_store(store: Arc<TaskStore>) {
     match store.kv_list_prefix(KV_PREFIX).await {
         Ok(rows) => {
             let now = chrono::Utc::now().timestamp();
@@ -264,7 +272,7 @@ pub async fn init_cooldown_store(store: Arc<crate::store::TaskStore>) {
 /// - KV row present with `cooldown_until <= now` (including the "0" tombstone
 ///   written by `clear_cooldown`): drop from memory.
 /// - KV row present with `cooldown_until > now`: insert/update memory to match.
-pub async fn sync_from_kv(store: &Arc<crate::store::TaskStore>) {
+pub async fn sync_from_kv(store: &Arc<TaskStore>) {
     let rows = match store.kv_list_prefix(KV_PREFIX).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -432,10 +440,7 @@ pub fn compute_backoff(count: u64, base: i64, max: i64, allow_extended: bool) ->
 /// Returns 1 when no store is configured (unit-test contexts without a store).
 /// Returns `u64::MAX` on store errors (e.g. lock contention) so backoff applies the cap duration
 /// instead of resetting to the base, preventing rapid re-dispatch during store outages.
-async fn read_and_increment_failure_count(
-    store_opt: Option<&Arc<crate::store::TaskStore>>,
-    key: &str,
-) -> u64 {
+async fn read_and_increment_failure_count(store_opt: Option<&Arc<TaskStore>>, key: &str) -> u64 {
     read_and_increment_failure_count_with_prefix(store_opt, FAILURE_COUNT_PREFIX, key).await
 }
 
@@ -444,7 +449,7 @@ async fn read_and_increment_failure_count(
 /// Credit exhaustion uses [`CREDIT_FAILURE_COUNT_PREFIX`] so its backoff escalation
 /// is independent of generic agent failures (which use [`FAILURE_COUNT_PREFIX`]).
 async fn read_and_increment_failure_count_with_prefix(
-    store_opt: Option<&Arc<crate::store::TaskStore>>,
+    store_opt: Option<&Arc<TaskStore>>,
     prefix: &str,
     key: &str,
 ) -> u64 {
@@ -512,7 +517,7 @@ pub async fn record_agent_failure_with_message(agent_name: &str, error_message: 
 
     let store_opt = cooldown_store().lock().await.clone();
     let count = read_and_increment_failure_count(store_opt.as_ref(), agent_name).await;
-    let base = crate::engine::router::config::get_agent_backoff_base(agent_name);
+    let base = config::get_agent_backoff_base(agent_name);
     let cooldown_until =
         chrono::Utc::now().timestamp() + compute_backoff(count, base, BACKOFF_MAX_SECS, true);
     set_cooldown_async(agent_name, cooldown_until, "agent_error").await;
@@ -697,7 +702,7 @@ pub async fn record_model_failure(agent_name: &str, model: &str) {
     let key = format!("{agent_name}:{model}");
     let store_opt = cooldown_store().lock().await.clone();
     let count = read_and_increment_failure_count(store_opt.as_ref(), &key).await;
-    let base = crate::engine::router::config::get_agent_backoff_base(agent_name);
+    let base = config::get_agent_backoff_base(agent_name);
     let cooldown_until =
         chrono::Utc::now().timestamp() + compute_backoff(count, base, BACKOFF_MAX_SECS, true);
     set_cooldown_async(&key, cooldown_until, "model_error").await;
@@ -959,9 +964,9 @@ pub fn list_all_cooldowns() -> Vec<(String, i64, String)> {
 
 /// Write `rate_limits_cleared_at:{agent}` = now so the next health check
 /// ignores older `rate_limits` rows. Rows stay in the table for metrics
-pub async fn mark_rate_limits_cleared(store: &Arc<crate::store::TaskStore>, agents: &[String]) {
+pub async fn mark_rate_limits_cleared(store: &Arc<TaskStore>, agents: &[String]) {
     let now = chrono::Utc::now().timestamp().to_string();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     for key in agents {
         let agent = agent_from_key(key);
         if agent.is_empty() || !seen.insert(agent.to_string()) {
@@ -980,7 +985,7 @@ pub async fn mark_rate_limits_cleared(store: &Arc<crate::store::TaskStore>, agen
 /// the corresponding `failure_count:` entries so the next failure starts
 /// backoff from the base duration. Also writes `rate_limits_cleared_at:{agent}`
 /// so a degraded agent held only by rate rows recovers on the next health check
-pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
+pub async fn clear_cooldown(key: &str, store: &Arc<TaskStore>) {
     let mut agents_to_mark: Vec<String> = Vec::new();
     if key == "*" {
         let keys: Vec<String> = {
@@ -1149,7 +1154,7 @@ async fn set_cooldown_async(key: &str, cooldown_until: i64, reason: &str) -> boo
 }
 
 /// Helper to acquire the cooldown map lock, logging and recovering on poison.
-fn cooldown_lock() -> std::sync::MutexGuard<'static, HashMap<String, CooldownEntry>> {
+fn cooldown_lock() -> MutexGuard<'static, HashMap<String, CooldownEntry>> {
     cooldowns().lock().unwrap_or_else(|e| {
         tracing::error!("cooldown map lock poisoned — recovering with partial state; backoff and degraded-agent decisions may be incorrect");
         e.into_inner()
@@ -1157,7 +1162,7 @@ fn cooldown_lock() -> std::sync::MutexGuard<'static, HashMap<String, CooldownEnt
 }
 
 /// Helper to acquire the degraded agents lock, logging and recovering on poison.
-fn degraded_agents_lock() -> std::sync::MutexGuard<'static, HashMap<String, String>> {
+fn degraded_agents_lock() -> MutexGuard<'static, HashMap<String, String>> {
     degraded_agents().lock().unwrap_or_else(|e| {
         tracing::error!("degraded agents lock poisoned — recovering with partial state; health check decisions may be incorrect");
         e.into_inner()
@@ -1165,7 +1170,7 @@ fn degraded_agents_lock() -> std::sync::MutexGuard<'static, HashMap<String, Stri
 }
 
 /// Helper to acquire the GitHub 5xx timestamps lock, logging and recovering on poison.
-fn github_5xx_timestamps_lock() -> std::sync::MutexGuard<'static, Vec<i64>> {
+fn github_5xx_timestamps_lock() -> MutexGuard<'static, Vec<i64>> {
     github_5xx_timestamps().lock().unwrap_or_else(|e| {
         tracing::error!("github 5xx timestamps lock poisoned — recovering with partial state; circuit breaker may operate incorrectly");
         e.into_inner()
@@ -1173,7 +1178,7 @@ fn github_5xx_timestamps_lock() -> std::sync::MutexGuard<'static, Vec<i64>> {
 }
 
 /// Helper to acquire the GitHub 5xx circuit open lock, logging and recovering on poison.
-fn github_5xx_circuit_open_lock() -> std::sync::MutexGuard<'static, Option<i64>> {
+fn github_5xx_circuit_open_lock() -> MutexGuard<'static, Option<i64>> {
     github_5xx_circuit_open().lock().unwrap_or_else(|e| {
         tracing::error!("github 5xx circuit open lock poisoned — recovering with partial state; circuit breaker may operate incorrectly");
         e.into_inner()
@@ -1271,7 +1276,7 @@ pub fn clear_agent_degraded(agent: &str) {
 /// in-memory cooldown map reflects current state. An agent should NOT be marked
 /// degraded simply because an expired cooldown entry hasn't been cleaned up yet.
 pub async fn refresh_degraded_agents(
-    store: &Arc<crate::store::TaskStore>,
+    store: &Arc<TaskStore>,
     available_agents: &[String],
     model_checker: &(dyn Fn(&str) -> bool + Send + Sync),
     window_hours: u32,
@@ -1557,7 +1562,6 @@ pub(crate) fn parse_retry_at(error_message: &str) -> Option<i64> {
                 if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&cleaned, fmt) {
                     // Vendor messages (e.g. Codex/GLM) emit times in the machine's
                     // local timezone, not UTC. Interpret naive datetime as local time.
-                    use chrono::TimeZone;
                     let utc = match chrono::Local.from_local_datetime(&dt) {
                         chrono::LocalResult::Single(local_dt) => {
                             local_dt.with_timezone(&chrono::Utc)
@@ -1610,13 +1614,10 @@ pub(crate) fn parse_retry_at(error_message: &str) -> Option<i64> {
                 let with_year = format!("{year} {md}");
                 if let Ok(dt) =
                     chrono::NaiveDateTime::parse_from_str(&with_year, "%Y %b %d %I:%M%p")
+                    && let Some(local_dt) = chrono::Local.from_local_datetime(&dt).earliest()
+                    && local_dt > now_local
                 {
-                    use chrono::TimeZone;
-                    if let Some(local_dt) = chrono::Local.from_local_datetime(&dt).earliest()
-                        && local_dt > now_local
-                    {
-                        return Some(local_dt.timestamp());
-                    }
+                    return Some(local_dt.timestamp());
                 }
             }
             let time_only = compact.as_str();
@@ -1682,7 +1683,7 @@ pub(crate) fn parse_retry_at(error_message: &str) -> Option<i64> {
 /// same window-detection the `needs_review` call site
 /// (`record_rate_limit()`, below) already uses — see issue #3580.
 pub(crate) fn parse_relative_usage_window(error_message: &str) -> Option<u64> {
-    static WINDOW_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    static WINDOW_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
             r"(?i)(?:^|\s|[\(\)\.,;:!?])(?:(\d+)\s*-?\s*(hour|hours|hr|hrs|minute|minutes|min|mins|day|days)|(hourly|daily|weekly|monthly))(?:$|\s|[\(\)\.,;:!?])"
         )
@@ -1738,20 +1739,21 @@ pub(crate) async fn reset_global_state() {
     github_5xx_timestamps().lock().unwrap().clear();
     *github_5xx_circuit_open().lock().unwrap() = None;
     degraded_agents().lock().unwrap().clear();
-    crate::engine::runner::agents::opencode::reset_model_caches_for_test();
+    opencode::reset_model_caches_for_test();
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use serial_test::serial;
+    use std::time::Duration;
 
-    async fn test_store() -> Arc<crate::store::TaskStore> {
-        Arc::new(
-            crate::store::TaskStore::open_memory()
-                .await
-                .expect("in-memory store"),
-        )
+    use super::*;
+    use chrono::Datelike;
+    use chrono::TimeZone;
+    use serial_test::serial;
+    use tokio::time;
+
+    async fn test_store() -> Arc<TaskStore> {
+        Arc::new(TaskStore::open_memory().await.expect("in-memory store"))
     }
 
     fn sqlite_datetime_offset(secs: i64) -> String {
@@ -1807,7 +1809,7 @@ mod tests {
     async fn credit_exhaustion_inside_active_cooldown_keeps_counter_at_one() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
 
         let msg =
             "API error (status 402 Payment Required): usage balance exhausted, out of credits";
@@ -1836,12 +1838,12 @@ mod tests {
         super::reset_global_state().await;
         let store = test_store().await;
 
-        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
 
         record_model_failure("testagent_persist", "testmodel_persist").await;
 
         // Give the async KV write a moment to settle before querying.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        time::sleep(Duration::from_millis(50)).await;
 
         let kv_key = format!("{KV_PREFIX}testagent_persist:testmodel_persist");
         let stored = store.kv_get(&kv_key).await.unwrap();
@@ -1861,7 +1863,7 @@ mod tests {
         let agent = "test_reason_restart";
         let future = chrono::Utc::now().timestamp() + 600;
 
-        init_cooldown_store(std::sync::Arc::clone(&store)).await;
+        init_cooldown_store(Arc::clone(&store)).await;
         set_cooldown_async(agent, future, "billing_cycle_exhausted").await;
 
         // Simulate a service restart: drop the in-memory map, reload from KV.
@@ -1885,7 +1887,7 @@ mod tests {
     async fn record_persistent_model_failure_escalates_and_increments_failure_count() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
 
         let agent = "testagent_persistent";
         let model = "testmodel_persistent";
@@ -1925,7 +1927,7 @@ mod tests {
     async fn record_agent_success_does_not_reset_persistent_failure_count() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
 
         let agent = "testagent_persistent_success";
         let model = "testmodel_persistent_success";
@@ -1974,7 +1976,7 @@ mod tests {
     async fn record_persistent_model_failure_stays_capped_at_7_days() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
 
         let agent = "testagent_persistent_capped";
         let model = "testmodel_persistent_capped";
@@ -2000,9 +2002,6 @@ mod tests {
     #[serial(cooldown_state)]
     #[test]
     fn parse_retry_at_codex_format() {
-        use chrono::Datelike;
-        use chrono::TimeZone;
-
         let msg = "You've hit your usage limit. Upgrade to Pro, visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Mar 26th, 2026 5:55 AM.";
         let ts = parse_retry_at(msg);
         assert!(ts.is_some(), "should parse codex retry-at date");
@@ -2048,7 +2047,6 @@ mod tests {
     #[serial(cooldown_state)]
     #[test]
     fn parse_retry_at_weekly_resets_without_year() {
-        use chrono::Datelike;
         let t = chrono::Local::now() + chrono::Duration::days(2);
         let msg = format!(
             "You've hit your weekly limit · resets {} {} at 1am (America/Sao_Paulo)",
@@ -2073,8 +2071,6 @@ mod tests {
     #[serial(cooldown_state)]
     #[test]
     fn parse_retry_at_glm_reset_format_with_seconds() {
-        use chrono::TimeZone;
-
         let msg = "Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-04-23 18:33:48";
         let ts = parse_retry_at(msg).expect("should parse GLM reset-at date");
 
@@ -2158,7 +2154,7 @@ mod tests {
     async fn record_rate_limit_uses_model_specific_window_cooldown() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
 
         let agent = "test_record_rl_window_agent";
         let model = "test_record_rl_window_model";
@@ -2195,7 +2191,7 @@ mod tests {
     async fn record_rate_limit_without_window_falls_back_to_agent_and_model() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
 
         let agent = "test_record_rl_fallback_agent";
         let model = "test_record_rl_fallback_model";
@@ -2277,7 +2273,7 @@ mod tests {
     async fn record_silence_detection_applies_extended_cooldown() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
 
         let agent = "test_silence_count_agent";
         let model = "test_silence_count_model";
@@ -2477,7 +2473,7 @@ mod tests {
     async fn record_credit_exhaustion_billing_cycle_applies_24h() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
 
         let agent = "test_billing_cycle_agent";
         assert!(!is_agent_in_cooldown(agent));
@@ -2506,7 +2502,7 @@ mod tests {
     async fn record_credit_exhaustion_billing_cycle_escalates() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
 
         let agent = "test_billing_cycle_escalation";
 
@@ -2570,7 +2566,7 @@ mod tests {
     async fn record_credit_exhaustion_billing_cycle_stays_capped_after_repeats() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
 
         let agent = "test_billing_cycle_agent_capped";
 
@@ -2662,7 +2658,7 @@ mod tests {
         let future = chrono::Utc::now().timestamp() + 600;
 
         // Register the store and put a cooldown in both memory and KV.
-        init_cooldown_store(std::sync::Arc::clone(&store)).await;
+        init_cooldown_store(Arc::clone(&store)).await;
         set_cooldown_async(agent, future, "test").await;
         assert!(is_agent_in_cooldown(agent));
 
@@ -2783,7 +2779,7 @@ mod tests {
         let original = chrono::Utc::now().timestamp() + 600;
         let updated = chrono::Utc::now().timestamp() + 1200;
 
-        init_cooldown_store(std::sync::Arc::clone(&store)).await;
+        init_cooldown_store(Arc::clone(&store)).await;
         set_cooldown_async(agent, original, "initial").await;
 
         store
@@ -3250,7 +3246,7 @@ mod tests {
         super::reset_global_state().await;
         let store = test_store().await;
         let agent = "test_refresh_reason_change";
-        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
 
         set_agent_cooldown(agent, 600).await;
         let agents = vec![agent.to_string()];
@@ -3367,7 +3363,7 @@ mod tests {
     async fn repeated_agent_failures_escalate_backoff() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
 
         let agent = "test_escalation_agent";
 
@@ -3410,7 +3406,7 @@ mod tests {
         // code must NOT early-return and must instead apply the normal
         // exponential backoff (increment failure count and set a future cooldown).
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
 
         let agent = "test_vendor_past_retry";
 
@@ -3459,7 +3455,7 @@ mod tests {
     async fn record_agent_success_resets_backoff() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
 
         let agent = "test_success_reset_agent";
         let model = "test_model";
@@ -3511,7 +3507,7 @@ mod tests {
     async fn record_agent_success_without_model_skips_empty_model_key() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
 
         let agent = "test_success_without_model";
 
@@ -3538,7 +3534,7 @@ mod tests {
     async fn clear_cooldown_resets_failure_counts() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
 
         let agent = "test_clear_fc_agent";
 
@@ -3588,7 +3584,7 @@ mod tests {
     async fn clear_all_cooldowns_resets_all_failure_counts() {
         super::reset_global_state().await;
         let store = test_store().await;
-        *cooldown_store().lock().await = Some(std::sync::Arc::clone(&store));
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
 
         let agents = ["test_clear_all_a", "test_clear_all_b"];
         for agent in &agents {

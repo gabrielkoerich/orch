@@ -1,5 +1,6 @@
 //! The CI gate before a review: a review starts only once CI has run on the PR head
 
+use crate::engine::auto_merge;
 use crate::github::http::GhHttp;
 use crate::github::types::{GitHubCheckRun, RequiredStatusCheck};
 use crate::store::TaskStore;
@@ -67,8 +68,7 @@ pub(crate) async fn review_ci_gate(
             // A check that never started for an Actions billing limit did not run, it did not fail
             let failed_runs = runs_named(&runs, &failed);
             let unstarted =
-                crate::engine::auto_merge::billing_failed_runs(gh, repo, &sha, Some(failed_runs))
-                    .await;
+                auto_merge::billing_failed_runs(gh, repo, &sha, Some(failed_runs)).await;
             if unstarted == failed.len() as u64 {
                 CiState::NotStarted
             } else {
@@ -234,7 +234,7 @@ mod tests {
         store.kv_set(&done, "1").await.unwrap();
         store.kv_set(&live, "1").await.unwrap();
 
-        crate::engine::auto_merge::sweep_ci_timer_keys(&store, "a/x", &["7".to_string()])
+        auto_merge::sweep_ci_timer_keys(&store, "a/x", &["7".to_string()])
             .await
             .unwrap();
 

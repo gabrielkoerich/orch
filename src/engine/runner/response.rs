@@ -8,8 +8,38 @@
 
 use crate::store;
 use crate::store::TaskStore;
+use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::fs;
+use std::fs::File;
+use std::hash::Hash;
+use std::hash::Hasher;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
+use std::result;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+use std::time::SystemTime;
+
+use tokio::fs as tokio_fs;
+use tokio::task;
+use tokio::time;
+// Cooldown tracking is implemented in `crate::engine::cooldown` (shared with the router).
+use crate::cli::ndjson;
+use crate::cmd_cache;
+use crate::engine;
+pub use crate::engine::cooldown::{
+    clear_expired_cooldowns, is_agent_in_cooldown, is_model_in_cooldown,
+    record_agent_failure_with_message, record_model_failure, set_agent_cooldown,
+};
+use crate::engine::router::config;
+use crate::home;
+use crate::parser::AgentResponse;
+use crate::store::MemoryEntry;
+use crate::store::Task;
 
 const JITTER_FACTOR: f64 = 0.3;
 
@@ -23,11 +53,8 @@ const MAX_OUTPUT_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 /// exceeds the limit, reads from the end of the file to capture the most recent
 /// output (which is typically where the result or error message is).
 fn read_file_with_limit<P: AsRef<Path>>(path: P, max_bytes: u64) -> anyhow::Result<String> {
-    use std::fs::File;
-    use std::io::{Read, Seek, SeekFrom};
-
     let path = path.as_ref();
-    let metadata = std::fs::metadata(path)?;
+    let metadata = fs::metadata(path)?;
 
     if !metadata.is_file() {
         anyhow::bail!("not a file: {}", path.display());
@@ -37,7 +64,7 @@ fn read_file_with_limit<P: AsRef<Path>>(path: P, max_bytes: u64) -> anyhow::Resu
 
     // If file is within limits, read the whole thing
     if file_size <= max_bytes {
-        return std::fs::read_to_string(path).map_err(std::convert::Into::into);
+        return fs::read_to_string(path).map_err(Into::into);
     }
 
     // File is too large - read from the end to get the most recent output
@@ -67,8 +94,8 @@ fn read_file_with_limit<P: AsRef<Path>>(path: P, max_bytes: u64) -> anyhow::Resu
 ///
 /// Delay = min(base * 2^retry_count, max) * (1 + jitter)
 pub(crate) fn calculate_backoff_delay(retry_count: usize) -> u64 {
-    let base_delay = crate::engine::router::config::retry_base_delay_ms();
-    let max_delay = crate::engine::router::config::retry_max_delay_ms();
+    let base_delay = config::retry_base_delay_ms();
+    let max_delay = config::retry_max_delay_ms();
 
     // Exponential: base * 2^retry_count
     let exponential =
@@ -87,18 +114,16 @@ pub(crate) fn calculate_backoff_delay(retry_count: usize) -> u64 {
     )]
     let jitter_range = (capped as f64 * JITTER_FACTOR) as u64;
     let jitter = {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
         let mut h = DefaultHasher::new();
-        std::time::SystemTime::now().hash(&mut h);
-        std::thread::current().id().hash(&mut h);
+        SystemTime::now().hash(&mut h);
+        thread::current().id().hash(&mut h);
         h.finish() % (jitter_range * 2 + 1)
     };
 
     capped.saturating_sub(jitter_range) + jitter
 }
 
-fn fallback_retry_count(task: Option<&crate::store::Task>) -> usize {
+fn fallback_retry_count(task: Option<&Task>) -> usize {
     task.map_or(0, |t| {
         let chain_retry_count = t
             .limit_reroute_chain
@@ -132,7 +157,7 @@ pub async fn wait_for_fallback_backoff(
             delay_ms = delay,
             "fallback backoff: waiting before retry"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        time::sleep(Duration::from_millis(delay)).await;
     }
 
     delay
@@ -163,30 +188,30 @@ pub enum WeightSignal {
 /// Output is truncated to `MAX_OUTPUT_SIZE_BYTES` to prevent runaway memory usage.
 pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) -> String {
     // Primary: explicit output file (already points to attempt dir)
-    if let Some(content) = tokio::task::spawn_blocking({
+    if let Some(content) = task::spawn_blocking({
         let p = primary_path.to_path_buf();
         move || read_file_with_limit(p, MAX_OUTPUT_SIZE_BYTES)
     })
     .await
     .ok()
-    .and_then(std::result::Result::ok)
+    .and_then(result::Result::ok)
         && !content.is_empty()
     {
         return content;
     }
 
     // Fallback: check all attempt dirs for this task (newest first)
-    if let Ok(task_dir) = crate::home::task_dir_async(repo, task_id).await {
+    if let Ok(task_dir) = home::task_dir_async(repo, task_id).await {
         let attempts_dir = task_dir.join("attempts");
         // Use async metadata for is_dir check
-        if tokio::fs::metadata(&attempts_dir)
+        if tokio_fs::metadata(&attempts_dir)
             .await
             .is_ok_and(|m| m.is_dir())
         {
-            let mut attempt_nums: Vec<u32> = tokio::task::spawn_blocking({
+            let mut attempt_nums: Vec<u32> = task::spawn_blocking({
                 let a = attempts_dir.clone();
                 move || {
-                    match std::fs::read_dir(&a) {
+                    match fs::read_dir(&a) {
                         Ok(entries) => {
                             let mut nums = Vec::new();
                             for entry in entries {
@@ -220,13 +245,13 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
             attempt_nums.sort_unstable_by(|a, b| b.cmp(a)); // newest first
             for n in attempt_nums {
                 let p = attempts_dir.join(n.to_string()).join("output.json");
-                if let Some(content) = tokio::task::spawn_blocking({
+                if let Some(content) = task::spawn_blocking({
                     let p = p.clone();
                     move || read_file_with_limit(p, MAX_OUTPUT_SIZE_BYTES)
                 })
                 .await
                 .ok()
-                .and_then(std::result::Result::ok)
+                .and_then(result::Result::ok)
                     && !content.is_empty()
                 {
                     tracing::info!(task_id, path = %p.display(), "read output from attempt dir");
@@ -237,27 +262,27 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
     }
 
     // Legacy fallback locations
-    let state_dir = crate::home::state_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+    let state_dir = home::state_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
 
     let mut fallbacks = vec![
         PathBuf::from(format!("/tmp/output-{task_id}.json")),
         state_dir.join(format!("output-{task_id}.json")),
     ];
 
-    if let Ok(legacy_path) = crate::home::state_file(&format!("output-{task_id}.json"))
+    if let Ok(legacy_path) = home::state_file(&format!("output-{task_id}.json"))
         && !fallbacks.contains(&legacy_path)
     {
         fallbacks.push(legacy_path);
     }
 
     for path in &fallbacks {
-        if let Some(content) = tokio::task::spawn_blocking({
+        if let Some(content) = task::spawn_blocking({
             let p = path.clone();
             move || read_file_with_limit(p, MAX_OUTPUT_SIZE_BYTES)
         })
         .await
         .ok()
-        .and_then(std::result::Result::ok)
+        .and_then(result::Result::ok)
             && !content.is_empty()
         {
             tracing::info!(task_id, path = %path.display(), "read output from legacy fallback");
@@ -268,12 +293,6 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
     String::new()
 }
 
-// Cooldown tracking is implemented in `crate::engine::cooldown` (shared with the router).
-pub use crate::engine::cooldown::{
-    clear_expired_cooldowns, is_agent_in_cooldown, is_model_in_cooldown,
-    record_agent_failure_with_message, record_model_failure, set_agent_cooldown,
-};
-
 /// Pick a fallback agent, avoiding agents already in the reroute chain and agents in cooldown.
 pub fn pick_fallback_agent(
     current_agent: &str,
@@ -283,8 +302,8 @@ pub fn pick_fallback_agent(
     // Clear expired cooldowns first
     clear_expired_cooldowns();
 
-    let chain_set: std::collections::HashSet<&str> = if chain.is_empty() {
-        std::collections::HashSet::new()
+    let chain_set: HashSet<&str> = if chain.is_empty() {
+        HashSet::new()
     } else {
         chain.split(',').collect()
     };
@@ -369,14 +388,14 @@ pub async fn handle_failover(
     let chain = update_reroute_chain(task_id, agent_name, &chain, store, repo).await;
 
     // Get all available agents
-    let available: Vec<String> = crate::engine::configured_agents()
+    let available: Vec<String> = engine::configured_agents()
         .into_iter()
-        .filter(|a| crate::cmd_cache::command_exists(a))
+        .filter(|a| cmd_cache::command_exists(a))
         .collect();
 
     // Check if we've exhausted all agents (build chain_set once)
-    let chain_set: std::collections::HashSet<&str> = if chain.is_empty() {
-        std::collections::HashSet::new()
+    let chain_set: HashSet<&str> = if chain.is_empty() {
+        HashSet::new()
     } else {
         chain.split(',').collect()
     };
@@ -437,7 +456,7 @@ pub async fn handle_failover(
             "agents_exhausted": true,
             "is_retryable": is_retryable,
         });
-        crate::store::store_log_activity(
+        store::store_log_activity(
             store,
             repo,
             task_id,
@@ -515,7 +534,7 @@ pub async fn handle_failover(
             "to_agent": next,
             "chain": chain,
         });
-        crate::store::store_log_activity(
+        store::store_log_activity(
             store,
             repo,
             task_id,
@@ -565,7 +584,7 @@ pub async fn handle_failover(
         "chain": chain,
         "no_fallback_available": true,
     });
-    crate::store::store_log_activity(
+    store::store_log_activity(
         store,
         repo,
         task_id,
@@ -822,7 +841,7 @@ pub async fn store_learnings_from_response(
     attempt: u32,
     agent: &str,
     model: Option<&str>,
-    response: &crate::parser::AgentResponse,
+    response: &AgentResponse,
     error: Option<&str>,
     store: &Option<Arc<TaskStore>>,
     repo: &str,
@@ -830,7 +849,7 @@ pub async fn store_learnings_from_response(
 ) {
     // Use agent self-reported files; fall back to NDJSON tool-call extraction when empty.
     let files_modified = if response.files.is_empty() {
-        let extracted = crate::cli::ndjson::extract_files_changed(raw_stdout);
+        let extracted = ndjson::extract_files_changed(raw_stdout);
         if !extracted.is_empty() {
             tracing::debug!(
                 task_id,
@@ -844,7 +863,7 @@ pub async fn store_learnings_from_response(
     };
 
     // Build the memory entry
-    let entry = crate::store::MemoryEntry {
+    let entry = MemoryEntry {
         attempt,
         agent: agent.to_string(),
         model: model.map(String::from),
@@ -879,7 +898,7 @@ pub async fn store_failure_memory(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
 ) {
-    let entry = crate::store::MemoryEntry {
+    let entry = MemoryEntry {
         attempt,
         agent: agent.to_string(),
         model: model.map(String::from),
@@ -906,8 +925,13 @@ pub async fn store_failure_memory(
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::process;
+
     use super::*;
+    use crate::engine::cooldown;
     use crate::engine::runner::agents::{AgentError, find_agent_result, patterns};
+    use crate::store::TaskStatus;
     use serial_test::serial;
 
     #[serial(cooldown_state)]
@@ -916,8 +940,8 @@ mod tests {
         // Run many samples and verify the range is [0.7*capped, 1.3*capped].
         // We can't control `now` directly, but calling the function many times
         // exercises different microsecond values and lets us check bounds.
-        let base = crate::engine::router::config::retry_base_delay_ms();
-        let max = crate::engine::router::config::retry_max_delay_ms();
+        let base = config::retry_base_delay_ms();
+        let max = config::retry_max_delay_ms();
 
         // retry_count=0 → exponential = base, capped = base (assuming base < max)
         let capped = base.min(max);
@@ -943,14 +967,14 @@ mod tests {
     #[serial(cooldown_state)]
     #[test]
     fn fallback_retry_count_uses_larger_network_retry_streak() {
-        let task = crate::store::Task {
+        let task = Task {
             id: 1,
             external_id: None,
             repo: "owner/repo".to_string(),
             origin: "internal".to_string(),
             title: "test".to_string(),
             body: String::new(),
-            status: crate::store::TaskStatus::New,
+            status: TaskStatus::New,
             source: String::new(),
             source_id: String::new(),
             author: String::new(),
@@ -1094,7 +1118,7 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn record_and_check_agent_cooldown() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         // Use unique names to avoid interference from other tests
         let agent = "test_cooldown_agent_1";
         assert!(!is_agent_in_cooldown(agent));
@@ -1105,7 +1129,7 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn record_and_check_model_cooldown() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let agent = "test_cooldown_agent_2";
         let model = "test_model_x";
         assert!(!is_model_in_cooldown(agent, model));
@@ -1118,7 +1142,7 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn clear_expired_does_not_remove_fresh_entries() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let agent = "test_cooldown_agent_3";
         record_agent_failure_with_message(agent, "").await;
         clear_expired_cooldowns();
@@ -1614,7 +1638,6 @@ That's all."#;
     /// Helper that mirrors the production path in review.rs:
     /// find_agent_result → parse_review_response → infer_review_response.
     fn parse_via_agent_path(agent: &str, output: &str) -> anyhow::Result<ReviewResponse> {
-        use crate::engine::runner::agents::find_agent_result;
         let text = find_agent_result(agent, output)
             .map(|r| r.result_text)
             .filter(|t| !t.is_empty())
@@ -1731,27 +1754,27 @@ That's all."#;
     #[serial(cooldown_state)]
     #[test]
     fn read_file_with_limit_reads_small_file_completely() {
-        let temp_dir = std::env::temp_dir();
-        let file_path = temp_dir.join(format!("orch_test_small_{}.txt", std::process::id()));
+        let temp_dir = env::temp_dir();
+        let file_path = temp_dir.join(format!("orch_test_small_{}.txt", process::id()));
         let content = "Hello, World!";
-        std::fs::write(&file_path, content).unwrap();
+        fs::write(&file_path, content).unwrap();
 
         let result = read_file_with_limit(&file_path, 1024);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), content);
 
-        let _ = std::fs::remove_file(&file_path);
+        let _ = fs::remove_file(&file_path);
     }
 
     #[serial(cooldown_state)]
     #[test]
     fn read_file_with_limit_truncates_large_file() {
-        let temp_dir = std::env::temp_dir();
-        let file_path = temp_dir.join(format!("orch_test_large_{}.txt", std::process::id()));
+        let temp_dir = env::temp_dir();
+        let file_path = temp_dir.join(format!("orch_test_large_{}.txt", process::id()));
 
         // Create a file larger than the limit (100 bytes)
         let large_content = "x".repeat(200);
-        std::fs::write(&file_path, &large_content).unwrap();
+        fs::write(&file_path, &large_content).unwrap();
 
         // Read with a 50-byte limit
         let result = read_file_with_limit(&file_path, 50);
@@ -1762,27 +1785,27 @@ That's all."#;
         assert_eq!(read_content.len(), 50);
         assert_eq!(read_content, "x".repeat(50));
 
-        let _ = std::fs::remove_file(&file_path);
+        let _ = fs::remove_file(&file_path);
     }
 
     #[serial(cooldown_state)]
     #[test]
     fn read_file_with_limit_handles_empty_file() {
-        let temp_dir = std::env::temp_dir();
-        let file_path = temp_dir.join(format!("orch_test_empty_{}.txt", std::process::id()));
-        std::fs::write(&file_path, "").unwrap();
+        let temp_dir = env::temp_dir();
+        let file_path = temp_dir.join(format!("orch_test_empty_{}.txt", process::id()));
+        fs::write(&file_path, "").unwrap();
 
         let result = read_file_with_limit(&file_path, 1024);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "");
 
-        let _ = std::fs::remove_file(&file_path);
+        let _ = fs::remove_file(&file_path);
     }
 
     #[serial(cooldown_state)]
     #[test]
     fn read_file_with_limit_handles_nonexistent_file() {
-        let temp_dir = std::env::temp_dir();
+        let temp_dir = env::temp_dir();
         let file_path = temp_dir.join("orch_test_nonexistent_xyz123.txt");
 
         let result = read_file_with_limit(&file_path, 1024);
@@ -1792,30 +1815,30 @@ That's all."#;
     #[serial(cooldown_state)]
     #[test]
     fn read_file_with_limit_reads_exact_limit() {
-        let temp_dir = std::env::temp_dir();
-        let file_path = temp_dir.join(format!("orch_test_exact_{}.txt", std::process::id()));
+        let temp_dir = env::temp_dir();
+        let file_path = temp_dir.join(format!("orch_test_exact_{}.txt", process::id()));
 
         // Create exactly 100 bytes
         let content = "y".repeat(100);
-        std::fs::write(&file_path, &content).unwrap();
+        fs::write(&file_path, &content).unwrap();
 
         // Read with exactly 100-byte limit (should read all)
         let result = read_file_with_limit(&file_path, 100);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 100);
 
-        let _ = std::fs::remove_file(&file_path);
+        let _ = fs::remove_file(&file_path);
     }
 
     #[serial(cooldown_state)]
     #[test]
     fn read_file_with_limit_handles_unicode_truncation() {
-        let temp_dir = std::env::temp_dir();
-        let file_path = temp_dir.join(format!("orch_test_unicode_{}.txt", std::process::id()));
+        let temp_dir = env::temp_dir();
+        let file_path = temp_dir.join(format!("orch_test_unicode_{}.txt", process::id()));
 
         // Create content with multi-byte UTF-8 characters
         let emoji = "🎉".repeat(100); // Each emoji is 4 bytes
-        std::fs::write(&file_path, &emoji).unwrap();
+        fs::write(&file_path, &emoji).unwrap();
 
         // Read with a limit that cuts into the emoji sequence
         let result = read_file_with_limit(&file_path, 50);
@@ -1825,7 +1848,7 @@ That's all."#;
         // from_utf8_lossy should handle invalid sequences
         assert_ne!(read_content, "");
 
-        let _ = std::fs::remove_file(&file_path);
+        let _ = fs::remove_file(&file_path);
     }
 
     // ── Fixture-based review integration tests ──────────────────────────────────

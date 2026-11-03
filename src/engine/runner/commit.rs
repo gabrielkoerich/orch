@@ -9,6 +9,7 @@ use tokio::process::Command;
 use super::agent::Shipcheck;
 use super::git_ops;
 use crate::cmd::CommandErrorContext;
+use crate::config;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -54,8 +55,8 @@ pub enum Outcome {
 }
 
 fn identity(agent: &str) -> (String, String) {
-    let name = crate::config::get("git.name").unwrap_or_else(|_| format!("{agent}[bot]"));
-    let email = crate::config::get("git.email")
+    let name = config::get("git.name").unwrap_or_else(|_| format!("{agent}[bot]"));
+    let email = config::get("git.email")
         .unwrap_or_else(|_| format!("{agent}[bot]@users.noreply.github.com"));
     (name, email)
 }
@@ -193,10 +194,16 @@ async fn unstage(dir: &Path, commit_err: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::process;
+
     use super::*;
 
     fn git(dir: &Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
+        let out = process::Command::new("git")
             .args([
                 "-c",
                 "user.name=T",
@@ -220,23 +227,22 @@ mod tests {
     fn repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         git(dir.path(), &["init", "-b", "main"]);
-        std::fs::write(dir.path().join("base.txt"), "base").unwrap();
+        fs::write(dir.path().join("base.txt"), "base").unwrap();
         git(dir.path(), &["add", "base.txt"]);
         git(dir.path(), &["commit", "-m", "base"]);
         dir
     }
 
     /// A stand-in for shipcheck: `ok` commits like `shipcheck commit`, anything else refuses
-    fn fake_shipcheck(dir: &Path, ok: bool) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
+    fn fake_shipcheck(dir: &Path, ok: bool) -> PathBuf {
         let bin = dir.join("shipcheck");
         let body = if ok {
             "#!/bin/sh\ngit add -A && git -c commit.gpgsign=false commit -q -m \"$3\"\n"
         } else {
             "#!/bin/sh\necho 'no passing result for this tree' >&2\nexit 1\n"
         };
-        std::fs::write(&bin, body).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&bin, body).unwrap();
+        fs::set_permissions(&bin, Permissions::from_mode(0o755)).unwrap();
         bin
     }
 
@@ -244,7 +250,7 @@ mod tests {
     async fn git_commits_every_change_and_reports_nothing_on_a_clean_tree() {
         let dir = repo();
         let missing = Path::new("/nonexistent/shipcheck");
-        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        fs::write(dir.path().join("a.txt"), "a").unwrap();
         let out = commit_with(
             dir.path(),
             Tool::Git,
@@ -278,7 +284,7 @@ mod tests {
         let bins = tempfile::tempdir().unwrap();
         let bin = fake_shipcheck(bins.path(), false);
         let head = git(dir.path(), &["rev-parse", "HEAD"]);
-        std::fs::write(dir.path().join("untested.txt"), "x").unwrap();
+        fs::write(dir.path().join("untested.txt"), "x").unwrap();
         let out = commit_with(
             dir.path(),
             Tool::Shipcheck,
@@ -308,7 +314,7 @@ mod tests {
         let dir = repo();
         let bins = tempfile::tempdir().unwrap();
         let bin = fake_shipcheck(bins.path(), true);
-        std::fs::write(dir.path().join("tested.txt"), "x").unwrap();
+        fs::write(dir.path().join("tested.txt"), "x").unwrap();
         let out = commit_with(
             dir.path(),
             Tool::Shipcheck,
@@ -331,7 +337,7 @@ mod tests {
         let dir = repo();
         let bins = tempfile::tempdir().unwrap();
         let bin = fake_shipcheck(bins.path(), false);
-        std::fs::write(dir.path().join("untested.txt"), "x").unwrap();
+        fs::write(dir.path().join("untested.txt"), "x").unwrap();
         let out = commit_with(
             dir.path(),
             Tool::Shipcheck,

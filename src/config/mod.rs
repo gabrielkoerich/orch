@@ -15,37 +15,46 @@ pub mod projects_yaml;
 use anyhow::Context;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
+use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+use std::sync::PoisonError;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
 
+use crate::home;
+
+use tokio::fs as tokio_fs;
+use tokio::runtime::Handle;
+use tokio::runtime::RuntimeFlavor;
+use tokio::task;
+
 /// Cached YAML values — parsed once per file, reused for all key lookups.
 /// Protected by RwLock for concurrent read access.
-static CACHE: std::sync::LazyLock<RwLock<HashMap<PathBuf, serde_norway::Value>>> =
-    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+static CACHE: LazyLock<RwLock<HashMap<PathBuf, serde_norway::Value>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Files currently being watched for changes.
-static WATCHER: std::sync::LazyLock<RwLock<HashSet<PathBuf>>> =
-    std::sync::LazyLock::new(|| RwLock::new(HashSet::new()));
+static WATCHER: LazyLock<RwLock<HashSet<PathBuf>>> = LazyLock::new(|| RwLock::new(HashSet::new()));
 
 /// Global file watcher instance (started on first use).
-static FILE_WATCHER: std::sync::LazyLock<Arc<Mutex<Option<RecommendedWatcher>>>> =
-    std::sync::LazyLock::new(|| Arc::new(Mutex::new(None)));
+static FILE_WATCHER: LazyLock<Arc<Mutex<Option<RecommendedWatcher>>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(None)));
 
 /// Config files whose content on disk does not read or parse right now.
 /// Tracked so the parse error is logged once per breakage, not once per
 /// watcher event.
-static BAD_FILES: std::sync::LazyLock<RwLock<HashSet<PathBuf>>> =
-    std::sync::LazyLock::new(|| RwLock::new(HashSet::new()));
+static BAD_FILES: LazyLock<RwLock<HashSet<PathBuf>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
 
 /// Broadcast sender for config change notifications.
 /// Sends the path of the changed config file.
-static CHANGE_TX: std::sync::LazyLock<broadcast::Sender<PathBuf>> =
-    std::sync::LazyLock::new(|| {
-        let (tx, _) = broadcast::channel(16);
-        tx
-    });
+static CHANGE_TX: LazyLock<broadcast::Sender<PathBuf>> = LazyLock::new(|| {
+    let (tx, _) = broadcast::channel(16);
+    tx
+});
 
 /// Subscribe to config change notifications.
 ///
@@ -63,7 +72,7 @@ pub fn subscribe() -> broadcast::Receiver<PathBuf> {
 pub async fn warm_cache() -> anyhow::Result<()> {
     let global_path = global_config_path()?;
     if global_path.exists() {
-        match tokio::fs::read_to_string(&global_path).await {
+        match tokio_fs::read_to_string(&global_path).await {
             Ok(content) => {
                 if let Ok(parsed) = serde_norway::from_str::<serde_norway::Value>(&content) {
                     if let Ok(mut cache) = CACHE.write() {
@@ -76,11 +85,11 @@ pub async fn warm_cache() -> anyhow::Result<()> {
         }
     }
 
-    let project_path = std::env::current_dir()
+    let project_path = env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".orch.yml");
     if project_path.exists() {
-        match tokio::fs::read_to_string(&project_path).await {
+        match tokio_fs::read_to_string(&project_path).await {
             Ok(content) => {
                 if let Ok(parsed) = serde_norway::from_str::<serde_norway::Value>(&content) {
                     if let Ok(mut cache) = CACHE.write() {
@@ -115,7 +124,7 @@ pub fn clear_test_cache() {
 /// Returns true when this call logged a newly invalid file, so repeated
 /// watcher events for one breakage produce one error line
 fn reload_file(path: &PathBuf) -> bool {
-    let parsed = std::fs::read_to_string(path)
+    let parsed = fs::read_to_string(path)
         .map_err(|e| e.to_string())
         .and_then(|content| {
             serde_norway::from_str::<serde_norway::Value>(&content).map_err(|e| e.to_string())
@@ -154,9 +163,7 @@ fn reload_file(path: &PathBuf) -> bool {
 
 /// Start the file watcher if not already running.
 fn ensure_watcher() {
-    let mut watcher_guard = FILE_WATCHER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut watcher_guard = FILE_WATCHER.lock().unwrap_or_else(PoisonError::into_inner);
     if watcher_guard.is_some() {
         return;
     }
@@ -235,13 +242,11 @@ fn watch_file(path: &PathBuf) {
 }
 
 fn read_file_to_string(path: &Path) -> anyhow::Result<String> {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            Ok(tokio::task::block_in_place(|| {
-                std::fs::read_to_string(path)
-            })?)
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            Ok(task::block_in_place(|| fs::read_to_string(path))?)
         }
-        _ => Ok(std::fs::read_to_string(path)?),
+        _ => Ok(fs::read_to_string(path)?),
     }
 }
 
@@ -266,7 +271,7 @@ fn load_cached_root(path: &PathBuf) -> anyhow::Result<serde_norway::Value> {
 
 /// Resolve the global config path: `~/.orch/config.yml`
 fn global_config_path() -> anyhow::Result<PathBuf> {
-    crate::home::config_path()
+    home::config_path()
 }
 
 /// Get a config value as a list of strings by dot-separated key.
@@ -290,7 +295,7 @@ pub fn get_list(key: &str) -> anyhow::Result<Vec<String>> {
     // Try project config first
     // Use an absolute path so the cache key is stable across tests/processes
     // that change the current working directory.
-    let project_path = std::env::current_dir()
+    let project_path = env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".orch.yml");
     if project_path.exists()
@@ -356,7 +361,7 @@ pub fn get(key: &str) -> anyhow::Result<String> {
     // Try project config first
     // Use an absolute path so the cache key is stable across tests/processes
     // that change the current working directory.
-    let project_path = std::env::current_dir()
+    let project_path = env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".orch.yml");
     if project_path.exists()
@@ -375,7 +380,7 @@ pub fn get(key: &str) -> anyhow::Result<String> {
 }
 
 /// Like [`get`], but reads the `.orch.yml` in `project_dir`, since the service runs from `/`
-pub fn get_for_project(project_dir: &std::path::Path, key: &str) -> anyhow::Result<String> {
+pub fn get_for_project(project_dir: &Path, key: &str) -> anyhow::Result<String> {
     let project_path = project_dir.join(".orch.yml");
     if project_path.exists()
         && let Ok(val) = resolve_key(&project_path, key)
@@ -392,7 +397,7 @@ pub fn get_for_project(project_dir: &std::path::Path, key: &str) -> anyhow::Resu
 }
 
 /// The project's `.orch.yml` alone, without the global fallback of [`get_for_project`]
-pub fn get_project_only(project_dir: &std::path::Path, key: &str) -> anyhow::Result<String> {
+pub fn get_project_only(project_dir: &Path, key: &str) -> anyhow::Result<String> {
     let project_path = project_dir.join(".orch.yml");
     if project_path.exists() {
         return resolve_key(&project_path, key);
@@ -432,13 +437,13 @@ pub fn get_project_paths() -> anyhow::Result<Vec<String>> {
 ///
 /// Returns `(repo_slug, project_dir)` pairs. Used by the engine to resolve
 /// per-project config (e.g., jobs from each project's `.orch.yml`).
-pub fn get_projects_with_paths() -> anyhow::Result<Vec<(String, std::path::PathBuf)>> {
+pub fn get_projects_with_paths() -> anyhow::Result<Vec<(String, PathBuf)>> {
     let paths = get_project_paths()?;
 
     if !paths.is_empty() {
         let mut results = Vec::new();
         for path_str in &paths {
-            let path = std::path::PathBuf::from(path_str);
+            let path = PathBuf::from(path_str);
             let orch_yml = path.join(".orch.yml");
 
             let config_file = if orch_yml.exists() {
@@ -452,7 +457,7 @@ pub fn get_projects_with_paths() -> anyhow::Result<Vec<(String, std::path::PathB
                 }
             };
 
-            if let Ok(content) = std::fs::read_to_string(&config_file)
+            if let Ok(content) = fs::read_to_string(&config_file)
                 && let Ok(doc) = serde_norway::from_str::<serde_norway::Value>(&content)
                 && let Some(repo) = doc
                     .get("gh")
@@ -472,7 +477,7 @@ pub fn get_projects_with_paths() -> anyhow::Result<Vec<(String, std::path::PathB
     if let Ok(repo) = get("gh.repo")
         && !repo.is_empty()
     {
-        return Ok(vec![(repo, std::path::PathBuf::from("."))]);
+        return Ok(vec![(repo, PathBuf::from("."))]);
     }
 
     Ok(vec![])
@@ -481,7 +486,7 @@ pub fn get_projects_with_paths() -> anyhow::Result<Vec<(String, std::path::PathB
 /// Resolve the repo slug for a specific project path.
 ///
 /// Reads `gh.repo` from the project's `.orch.yml`.
-pub fn get_repo_for_project(project_path: &std::path::Path) -> anyhow::Result<String> {
+pub fn get_repo_for_project(project_path: &Path) -> anyhow::Result<String> {
     let orch_yml = project_path.join(".orch.yml");
     let config_file = if orch_yml.exists() {
         orch_yml
@@ -494,7 +499,7 @@ pub fn get_repo_for_project(project_path: &std::path::Path) -> anyhow::Result<St
         }
     };
 
-    let content = std::fs::read_to_string(&config_file)?;
+    let content = fs::read_to_string(&config_file)?;
     let doc: serde_norway::Value = serde_norway::from_str(&content)?;
 
     doc.get("gh")
@@ -507,8 +512,8 @@ pub fn get_repo_for_project(project_path: &std::path::Path) -> anyhow::Result<St
 /// Resolve project path from CWD by finding the nearest `.orch.yml`.
 ///
 /// Walks up from the current directory looking for `.orch.yml` or legacy `.orchestrator.yml`.
-pub fn find_project_root() -> anyhow::Result<std::path::PathBuf> {
-    let mut dir = std::env::current_dir()?;
+pub fn find_project_root() -> anyhow::Result<PathBuf> {
+    let mut dir = env::current_dir()?;
 
     loop {
         if dir.join(".orch.yml").exists() || dir.join(".orchestrator.yml").exists() {
@@ -681,9 +686,18 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn write_yaml(dir: &std::path::Path, name: &str, content: &str) -> PathBuf {
+    use notify::event::AccessKind;
+    use notify::event::AccessMode;
+    use notify::event::CreateKind;
+    use notify::event::DataChange;
+    use notify::event::ModifyKind;
+    use tokio::sync::broadcast::Receiver;
+
+    use std::fs::File;
+
+    fn write_yaml(dir: &Path, name: &str, content: &str) -> PathBuf {
         let path = dir.join(name);
-        let mut f = std::fs::File::create(&path).unwrap();
+        let mut f = File::create(&path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
         path
     }
@@ -825,7 +839,7 @@ mod tests {
         assert!(!reload_file(&path));
 
         // Drain until we find our path on both receivers
-        let find_path = |rx: &mut tokio::sync::broadcast::Receiver<PathBuf>, expected: &PathBuf| loop {
+        let find_path = |rx: &mut Receiver<PathBuf>, expected: &PathBuf| loop {
             match rx.try_recv() {
                 Ok(p) if &p == expected => return,
                 Ok(_) => {}
@@ -905,7 +919,6 @@ mod tests {
 
     #[test]
     fn reading_a_config_file_does_not_trigger_a_reload() {
-        use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, ModifyKind};
         assert!(!is_content_change(notify::EventKind::Access(
             AccessKind::Open(AccessMode::Read)
         )));
@@ -928,14 +941,14 @@ mod tests {
         assert_eq!(cached_value(&path, "engine.max_parallel"), "8");
 
         let mut rx = subscribe();
-        std::fs::write(&path, "engine:\n  max_parallel: [unclosed\n").unwrap();
+        fs::write(&path, "engine:\n  max_parallel: [unclosed\n").unwrap();
         assert!(reload_file(&path));
 
         assert_eq!(cached_value(&path, "engine.max_parallel"), "8");
         assert!(rx.try_recv().is_err(), "a broken edit must not notify");
 
         // A later good edit is picked up again
-        std::fs::write(&path, "engine:\n  max_parallel: 12\n").unwrap();
+        fs::write(&path, "engine:\n  max_parallel: 12\n").unwrap();
         assert!(!reload_file(&path));
         assert_eq!(cached_value(&path, "engine.max_parallel"), "12");
     }
@@ -946,7 +959,7 @@ mod tests {
         let path = write_yaml(dir.path(), "config.yml", "projects:\n  - /srv/one\n");
         assert_eq!(cached_projects(&path), vec!["/srv/one"]);
 
-        std::fs::write(&path, "projects:\n  - /srv/one\n  - /srv/two\n").unwrap();
+        fs::write(&path, "projects:\n  - /srv/one\n  - /srv/two\n").unwrap();
         assert!(!reload_file(&path));
 
         assert_eq!(cached_projects(&path), vec!["/srv/one", "/srv/two"]);
@@ -958,7 +971,7 @@ mod tests {
         let path = write_yaml(dir.path(), "config.yml", "engine:\n  max_parallel: 4\n");
         reload_file(&path);
 
-        std::fs::write(&path, "engine: [broken\n").unwrap();
+        fs::write(&path, "engine: [broken\n").unwrap();
         assert!(reload_file(&path), "first bad read logs");
         assert!(!reload_file(&path), "same breakage does not log again");
     }
@@ -974,14 +987,14 @@ mod tests {
         write_yaml(home.path(), "config.yml", "workflow:\n  sandbox: os\n");
         write_yaml(with.path(), ".orch.yml", "workflow:\n  sandbox: false\n");
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("ORCH_HOME", home.path()) };
+        unsafe { env::set_var("ORCH_HOME", home.path()) };
 
         let got = (
             get_for_project(with.path(), "workflow.sandbox").unwrap(),
             get_for_project(without.path(), "workflow.sandbox").unwrap(),
         );
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::remove_var("ORCH_HOME") };
+        unsafe { env::remove_var("ORCH_HOME") };
         assert_eq!(got, ("false".to_string(), "os".to_string()));
     }
 

@@ -28,11 +28,24 @@ use super::{
     AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent, json_error_message,
     json_str,
 };
+use crate::cmd_cache;
 use crate::parser;
+use crate::parser::AgentResponse;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+use tokio::process::Command;
+use tokio::runtime::Handle;
+use tokio::runtime::Runtime;
+use tokio::time;
+
+use std::collections::BTreeMap;
+use std::process::Stdio;
+use std::sync::PoisonError;
+use std::thread;
+use std::time::Duration;
 
 /// Module-level cache for discovered free opencode models.
 /// Shared across all callers (router, runner, failover).
@@ -78,9 +91,7 @@ fn update_discovered_models_cache(
     empty_reason: &'static str,
 ) {
     let now = chrono::Utc::now().timestamp();
-    let mut guard = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
 
     if discovered.is_empty() && !guard.1.is_empty() {
         tracing::warn!(
@@ -190,7 +201,7 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
     let full = texts.join("");
     if let Some(json) = extract_json_object(&full) {
         // Prefer a full-json payload that parses as an AgentResponse.
-        if crate::parser::parse(&json).is_ok() {
+        if parser::parse(&json).is_ok() {
             return Some(json);
         }
 
@@ -214,7 +225,7 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
             // Prefer JSON blobs that parse as AgentResponse. This allows
             // accepting payloads that don't include routing keys but are
             // nevertheless valid task responses.
-            if crate::parser::parse(&json).is_ok() {
+            if parser::parse(&json).is_ok() {
                 return Some(json);
             }
 
@@ -235,7 +246,7 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
             // can be interpreted as a valid AgentResponse or if it contains
             // routing keys. This avoids accepting unrelated log blobs while
             // remaining tolerant of router-style payloads.
-            if crate::parser::parse(trimmed).is_ok() {
+            if parser::parse(trimmed).is_ok() {
                 return Some(trimmed.to_string());
             }
 
@@ -636,17 +647,13 @@ impl AgentRunner for OpenCodeRunner {
         ]
     }
 
-    fn router_command(
-        &self,
-        prompt: &str,
-        model: Option<&str>,
-    ) -> anyhow::Result<tokio::process::Command> {
+    fn router_command(&self, prompt: &str, model: Option<&str>) -> anyhow::Result<Command> {
         // Routing only needs text output — no tools fire.
         // `--dangerously-skip-permissions` prevents the user's global
         // ~/.config/opencode/opencode.json interactive defaults (e.g.
         // "edit":"ask") from producing PermissionError events that the router
         // would misclassify as model failures.
-        let mut cmd = tokio::process::Command::new("opencode");
+        let mut cmd = Command::new("opencode");
         cmd.env("OPENCODE_CONFIG_CONTENT", NO_SNAPSHOT_CONFIG)
             .arg("run")
             .arg("--format")
@@ -809,9 +816,7 @@ pub fn discover_free_opencode_models() -> Vec<String> {
     let now = chrono::Utc::now().timestamp();
     // Fast path: return cached data if still fresh (1-hour TTL).
     {
-        let guard = cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
         let (ts, models) = &*guard;
         if *ts != 0 && now.saturating_sub(*ts) < 3600 {
             return models.clone();
@@ -839,7 +844,7 @@ pub fn discover_free_opencode_models() -> Vec<String> {
             let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
             update_discovered_models_cache(cache, discovered, "free", empty_reason);
         };
-        match tokio::runtime::Handle::try_current() {
+        match Handle::try_current() {
             Ok(handle) => {
                 // Use the current tokio runtime's handle to spawn the async discovery task,
                 // avoiding the overhead of a std::thread + new tokio runtime.
@@ -848,8 +853,8 @@ pub fn discover_free_opencode_models() -> Vec<String> {
             _ => {
                 // No tokio runtime (e.g. called from a plain unit test). Spawn a thread
                 // with a dedicated runtime — this is the fallback path.
-                std::thread::spawn(move || {
-                    if let Ok(rt) = tokio::runtime::Runtime::new() {
+                thread::spawn(move || {
+                    if let Ok(rt) = Runtime::new() {
                         rt.block_on(refresh);
                     }
                 });
@@ -858,9 +863,7 @@ pub fn discover_free_opencode_models() -> Vec<String> {
     }
 
     // Return whatever is in cache (may be empty on first call).
-    let guard = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
     guard.1.clone()
 }
 
@@ -876,9 +879,7 @@ pub fn discover_opencode_models() -> Vec<String> {
     let now = chrono::Utc::now().timestamp();
 
     {
-        let guard = cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
         let (ts, models) = &*guard;
         if *ts != 0 && now.saturating_sub(*ts) < 3600 {
             return models.clone();
@@ -894,13 +895,13 @@ pub fn discover_opencode_models() -> Vec<String> {
             let cache = ALL_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
             update_discovered_models_cache(cache, discovered, "all", empty_reason);
         };
-        match tokio::runtime::Handle::try_current() {
+        match Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(refresh);
             }
             _ => {
-                std::thread::spawn(move || {
-                    if let Ok(rt) = tokio::runtime::Runtime::new() {
+                thread::spawn(move || {
+                    if let Ok(rt) = Runtime::new() {
                         rt.block_on(refresh);
                     }
                 });
@@ -908,9 +909,7 @@ pub fn discover_opencode_models() -> Vec<String> {
         }
     }
 
-    let guard = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
     guard.1.clone()
 }
 
@@ -925,7 +924,7 @@ pub fn prime_free_model_cache() {
     if skip_live_opencode_discovery() {
         return;
     }
-    let discovered_all = std::thread::spawn(|| match tokio::runtime::Runtime::new() {
+    let discovered_all = thread::spawn(|| match Runtime::new() {
         Ok(rt) => rt.block_on(run_opencode_models_discovery_async()).0,
         _ => {
             vec![]
@@ -960,13 +959,11 @@ pub fn prime_free_model_cache() {
 /// the "returned empty" warning says which of the failure branches fired,
 /// without requiring `RUST_LOG=debug` in production.
 async fn run_opencode_models_discovery_async() -> (Vec<String>, &'static str) {
-    run_opencode_models_cli(std::time::Duration::from_secs(30)).await
+    run_opencode_models_cli(Duration::from_secs(30)).await
 }
 
 /// Run `opencode models` and reap any process-group leftovers when it returns
-pub(crate) async fn run_opencode_models_cli(
-    timeout: std::time::Duration,
-) -> (Vec<String>, &'static str) {
+pub(crate) async fn run_opencode_models_cli(timeout: Duration) -> (Vec<String>, &'static str) {
     run_opencode_models_cli_inner("opencode", timeout).await
 }
 
@@ -975,7 +972,7 @@ fn opencode_program_available(program: &str) -> bool {
     if path.is_absolute() || program.contains('/') {
         path.is_file()
     } else {
-        crate::cmd_cache::command_exists(program)
+        cmd_cache::command_exists(program)
     }
 }
 
@@ -1002,17 +999,17 @@ fn kill_process_group(pgid: u32) {
 
 async fn run_opencode_models_cli_inner(
     program: &str,
-    timeout: std::time::Duration,
+    timeout: Duration,
 ) -> (Vec<String>, &'static str) {
     if !opencode_program_available(program) {
         tracing::warn!("opencode not in PATH, skipping model discovery");
         return (vec![], "command_not_found");
     }
 
-    let mut cmd = tokio::process::Command::new(program);
+    let mut cmd = Command::new(program);
     cmd.args(["models"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
@@ -1025,7 +1022,7 @@ async fn run_opencode_models_cli_inner(
         }
     };
     let pgid = child.id();
-    let wait = tokio::time::timeout(timeout, child.wait_with_output()).await;
+    let wait = time::timeout(timeout, child.wait_with_output()).await;
 
     #[cfg(unix)]
     if let Some(pid) = pgid {
@@ -1087,9 +1084,7 @@ async fn run_opencode_models_cli_inner(
 ///
 /// Status is `needs_review` because there is no text confirming completion;
 /// the agent did work but never reported on it.
-fn synthesize_response_from_events(events: &[serde_json::Value]) -> crate::parser::AgentResponse {
-    use std::collections::BTreeMap;
-
+fn synthesize_response_from_events(events: &[serde_json::Value]) -> AgentResponse {
     let mut counts: BTreeMap<String, u32> = BTreeMap::new();
     let mut tool_names: Vec<String> = Vec::new();
     let mut step_finish_reason: Option<String> = None;
@@ -1161,7 +1156,7 @@ fn synthesize_response_from_events(events: &[serde_json::Value]) -> crate::parse
          step_finish reason: {reason}"
     );
 
-    crate::parser::AgentResponse {
+    AgentResponse {
         status: "needs_review".to_string(),
         summary,
         error: Some("agent emitted no text response — only tool/step events".to_string()),
@@ -1258,6 +1253,15 @@ pub fn find_opencode_result(ndjson: &str) -> Option<super::AgentResult> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::fs::Permissions;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::time::Instant;
+
     use super::*;
 
     fn runner() -> OpenCodeRunner {
@@ -1695,12 +1699,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn models_cli_reaps_orphaned_process_group() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let sleeper_pid_path = dir.path().join("sleeper.pid");
         let script = dir.path().join("opencode");
-        std::fs::write(
+        fs::write(
             &script,
             format!(
                 "#!/bin/sh\n/bin/sleep 60 </dev/null >/dev/null 2>&1 &\necho $! > '{}'\necho test-model-free\n",
@@ -1708,26 +1710,23 @@ mod tests {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&script, Permissions::from_mode(0o755)).unwrap();
 
         // The production discovery timeout, so a loaded machine does not turn this into
         // a timeout run, which reaps the group too and would assert nothing
-        let (models, reason) = run_opencode_models_cli_inner(
-            script.to_str().unwrap(),
-            std::time::Duration::from_secs(30),
-        )
-        .await;
+        let (models, reason) =
+            run_opencode_models_cli_inner(script.to_str().unwrap(), Duration::from_secs(30)).await;
         assert_eq!(reason, "ok");
         assert_eq!(models, vec!["test-model-free".to_string()]);
 
-        let sleeper: u32 = std::fs::read_to_string(&sleeper_pid_path)
+        let sleeper: u32 = fs::read_to_string(&sleeper_pid_path)
             .unwrap()
             .trim()
             .parse()
             .expect("sleeper pid");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while pid_is_alive(sleeper) && std::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pid_is_alive(sleeper) && Instant::now() < deadline {
+            time::sleep(Duration::from_millis(20)).await;
         }
         assert!(
             !pid_is_alive(sleeper),
@@ -1746,17 +1745,13 @@ mod tests {
         reset_model_caches_for_test();
         let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
         {
-            let mut guard = cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
             *guard = (123, vec!["opencode/model-free".to_string()]);
         }
 
         update_discovered_models_cache(cache, Vec::new(), "free", "empty_output");
 
-        let guard = cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
         // Timestamp must advance on a failed refresh so the TTL provides a
         // real backoff window instead of retrying on every subsequent call.
         assert!(guard.0 > 123);
@@ -1768,9 +1763,7 @@ mod tests {
         reset_model_caches_for_test();
         let cache = ALL_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
         {
-            let mut guard = cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
             *guard = (
                 456,
                 vec![
@@ -1782,9 +1775,7 @@ mod tests {
 
         update_discovered_models_cache(cache, Vec::new(), "all", "exit_status_failure");
 
-        let guard = cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
         assert!(guard.0 > 456);
         assert_eq!(
             guard.1,
@@ -1802,9 +1793,7 @@ mod tests {
 
         update_discovered_models_cache(cache, Vec::new(), "free", "command_not_found");
 
-        let guard = cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
         assert!(guard.0 > 0);
         assert!(guard.1.is_empty(), "{:?}", guard.1);
     }

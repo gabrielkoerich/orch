@@ -2,6 +2,7 @@
 //! holds its output. Every id form `orch task inspect` accepts works everywhere
 
 use crate::config;
+use crate::home;
 use crate::store::{self, CliTaskRef, TaskStore};
 use std::path::{MAIN_SEPARATOR_STR, Path, PathBuf};
 
@@ -44,12 +45,12 @@ pub async fn resolve_in(
 
 /// `~/.orch/state/<owner>/<repo>/tasks/<id>` for a resolved task. Does not create it
 pub fn state_dir(task: &CliTaskRef) -> anyhow::Result<PathBuf> {
-    Ok(dirs_under(&crate::home::state_dir()?, task).1)
+    Ok(dirs_under(&home::state_dir()?, task).1)
 }
 
 /// A task's own state dir and its review agent's
 pub fn state_dirs(task: &CliTaskRef) -> anyhow::Result<Vec<PathBuf>> {
-    let (review, own) = dirs_under(&crate::home::state_dir()?, task);
+    let (review, own) = dirs_under(&home::state_dir()?, task);
     Ok(vec![review, own])
 }
 

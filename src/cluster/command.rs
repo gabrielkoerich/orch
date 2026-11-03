@@ -5,6 +5,7 @@ use crate::store::control::MemoryEntry;
 use crate::store::dependencies::{self, NewDependency};
 use crate::store::jobs::{self, JobState};
 use crate::store::kv;
+use crate::store::tasks;
 use crate::store::tasks::{NewTask, StoreRouteCmd, TaskStatus, UpsertExternalCmd, apply};
 
 type Updates = Vec<(String, serde_json::Value)>;
@@ -148,10 +149,7 @@ impl Command {
             | Command::TaskUpdateStatusAndFields { updates, .. } => &updates[..],
             _ => &[],
         };
-        if let Some((col, _)) = updates
-            .iter()
-            .find(|(col, _)| crate::store::tasks::is_local_column(col))
-        {
+        if let Some((col, _)) = updates.iter().find(|(col, _)| tasks::is_local_column(col)) {
             anyhow::bail!("{col} is local to each node, never replicated");
         }
 

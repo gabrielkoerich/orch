@@ -3,12 +3,35 @@
 //! Supports Claude, Codex, OpenCode, Grok (plus Kimi/MiniMax as Claude aliases).
 //! Runs the agent via a runner.sh script executed as the tmux session shell.
 
+use crate::backends::ExternalTask;
+use crate::cluster;
+use crate::engine::router::RouteResult;
 use crate::engine::runner::agents::shell_single_quote;
+use crate::github::token;
+use crate::home;
 use crate::template::render_template_str;
 use crate::tmux::TmuxManager;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::env;
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::fs::Permissions;
+use std::io::ErrorKind;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::path::PathBuf;
+use std::process::Output;
+use std::process::Stdio;
+use std::time::Duration;
+
+use tokio::fs;
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+use tokio::sync::OnceCell;
+use tokio::time;
 
 const AGENT_SYSTEM_TEMPLATE: &str = include_str!("../../../prompts/agent_system.md");
 const AGENT_MESSAGE_TEMPLATE: &str = include_str!("../../../prompts/agent_message.md");
@@ -28,9 +51,8 @@ pub enum Shipcheck {
 }
 
 impl Shipcheck {
-    pub async fn detect(work_dir: &std::path::Path) -> Self {
-        static SUPPORTS_COMMIT: tokio::sync::OnceCell<Option<bool>> =
-            tokio::sync::OnceCell::const_new();
+    pub async fn detect(work_dir: &Path) -> Self {
+        static SUPPORTS_COMMIT: OnceCell<Option<bool>> = OnceCell::const_new();
         let installed = SUPPORTS_COMMIT
             .get_or_init(|| async {
                 let bin = which::which("shipcheck").ok()?;
@@ -75,7 +97,7 @@ impl Shipcheck {
 /// The `orch progress` step appears only when a `cluster:` section turns the cluster on.
 /// Separate flags, because the template engine does not nest `{{#if}}` blocks
 fn insert_cluster_vars(shipcheck: Shipcheck, vars: &mut HashMap<String, String>) {
-    if !crate::cluster::enabled() {
+    if !cluster::enabled() {
         return;
     }
 
@@ -89,23 +111,19 @@ fn insert_cluster_vars(shipcheck: Shipcheck, vars: &mut HashMap<String, String>)
     }
 }
 
-async fn run_shipcheck(
-    bin: &std::path::Path,
-    work_dir: &std::path::Path,
-    args: &[&str],
-) -> anyhow::Result<std::process::Output> {
-    let output = tokio::process::Command::new(bin)
+async fn run_shipcheck(bin: &Path, work_dir: &Path, args: &[&str]) -> anyhow::Result<Output> {
+    let output = Command::new(bin)
         .args(args)
         .current_dir(work_dir)
-        .stdin(std::process::Stdio::null())
+        .stdin(Stdio::null())
         .kill_on_drop(true)
         .output();
-    Ok(tokio::time::timeout(std::time::Duration::from_secs(30), output).await??)
+    Ok(time::timeout(Duration::from_secs(30), output).await??)
 }
 
 // `<sub> --help` exits 0 for any word, so read the subcommands the usage line lists
-async fn supports(bin: &std::path::Path, subcommand: &str) -> bool {
-    let Ok(out) = run_shipcheck(bin, &std::env::temp_dir(), &["--help"]).await else {
+async fn supports(bin: &Path, subcommand: &str) -> bool {
+    let Ok(out) = run_shipcheck(bin, &env::temp_dir(), &["--help"]).await else {
         return false;
     };
     out.status.success()
@@ -116,11 +134,7 @@ async fn supports(bin: &std::path::Path, subcommand: &str) -> bool {
 
 /// Runs `shipcheck install` so every agent CLI gets shipcheck's hooks in this worktree.
 /// Returns whether install ran. It never fails the task
-pub async fn install_shipcheck_hooks(
-    work_dir: &std::path::Path,
-    shipcheck: Shipcheck,
-    bin: &std::path::Path,
-) -> bool {
+pub async fn install_shipcheck_hooks(work_dir: &Path, shipcheck: Shipcheck, bin: &Path) -> bool {
     if shipcheck != Shipcheck::Available {
         return false;
     }
@@ -158,16 +172,16 @@ prefix_rule(pattern=["shipcheck", "doctor"], decision="allow")
 
 // Codex runs a command a rule allows outside its sandbox, so shipcheck reaches Docker and its
 // results dir while the agent's own commands still cannot write there
-async fn install_shipcheck_rule(work_dir: &std::path::Path) -> anyhow::Result<()> {
+async fn install_shipcheck_rule(work_dir: &Path) -> anyhow::Result<()> {
     // The worktree holds repository content, so never follow a symlink it plants on the path
     let mut dir = work_dir.to_path_buf();
     for part in [".codex", "rules"] {
         dir.push(part);
-        match tokio::fs::symlink_metadata(&dir).await {
+        match fs::symlink_metadata(&dir).await {
             Ok(meta) if meta.is_dir() => {}
             Ok(_) => anyhow::bail!("{} is not a directory", dir.display()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tokio::fs::create_dir(&dir).await?;
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                fs::create_dir(&dir).await?;
             }
             Err(e) => return Err(e.into()),
         }
@@ -175,20 +189,20 @@ async fn install_shipcheck_rule(work_dir: &std::path::Path) -> anyhow::Result<()
 
     // remove_file drops a symlink itself, and create_new never follows one
     let rule = work_dir.join(SHIPCHECK_RULE_PATH);
-    match tokio::fs::remove_file(&rule).await {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+    match fs::remove_file(&rule).await {
+        Err(e) if e.kind() != ErrorKind::NotFound => return Err(e.into()),
         _ => {}
     }
 
-    let mut file = tokio::fs::OpenOptions::new()
+    let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&rule)
         .await?;
-    tokio::io::AsyncWriteExt::write_all(&mut file, SHIPCHECK_RULES.as_bytes()).await?;
+    AsyncWriteExt::write_all(&mut file, SHIPCHECK_RULES.as_bytes()).await?;
 
     // Keep the rule out of the agent's commits
-    let output = tokio::process::Command::new("git")
+    let output = Command::new("git")
         .args(["rev-parse", "--git-path", "info/exclude"])
         .current_dir(work_dir)
         .output()
@@ -199,15 +213,13 @@ async fn install_shipcheck_rule(work_dir: &std::path::Path) -> anyhow::Result<()
 
     let exclude = work_dir.join(String::from_utf8_lossy(&output.stdout).trim());
     let line = format!("/{SHIPCHECK_RULE_PATH}");
-    let current = tokio::fs::read_to_string(&exclude)
-        .await
-        .unwrap_or_default();
+    let current = fs::read_to_string(&exclude).await.unwrap_or_default();
     if current.lines().any(|l| l == line) {
         return Ok(());
     }
 
     if let Some(dir) = exclude.parent() {
-        tokio::fs::create_dir_all(dir).await?;
+        fs::create_dir_all(dir).await?;
     }
 
     let sep = if current.is_empty() || current.ends_with('\n') {
@@ -215,17 +227,17 @@ async fn install_shipcheck_rule(work_dir: &std::path::Path) -> anyhow::Result<()
     } else {
         "\n"
     };
-    tokio::fs::write(&exclude, format!("{current}{sep}{line}\n")).await?;
+    fs::write(&exclude, format!("{current}{sep}{line}\n")).await?;
     Ok(())
 }
 
 /// Run `git rev-parse <arg>` from `work_dir` and canonicalize the
 /// result. Returns `Ok(None)` when git is not available or the command fails.
 pub(crate) async fn resolve_git_dir_arg(
-    work_dir: &std::path::Path,
+    work_dir: &Path,
     arg: &str,
 ) -> anyhow::Result<Option<PathBuf>> {
-    let output = tokio::process::Command::new("git")
+    let output = Command::new("git")
         .args(["rev-parse", arg])
         .current_dir(work_dir)
         .output()
@@ -241,15 +253,13 @@ pub(crate) async fn resolve_git_dir_arg(
     }
 
     // The path may be relative to work_dir; canonicalize to absolute.
-    let candidate = if std::path::Path::new(&raw).is_absolute() {
+    let candidate = if Path::new(&raw).is_absolute() {
         PathBuf::from(&raw)
     } else {
         work_dir.join(&raw)
     };
 
-    let canonical = tokio::fs::canonicalize(&candidate)
-        .await
-        .unwrap_or(candidate);
+    let canonical = fs::canonicalize(&candidate).await.unwrap_or(candidate);
     Ok(Some(canonical))
 }
 
@@ -306,8 +316,8 @@ pub struct AgentInvocation {
 fn build_tmux_runner_scripts(
     inv: &AgentInvocation,
     agent_cmd: &str,
-    attempt_dir: &std::path::Path,
-    sandbox: Option<&[std::ffi::OsString]>,
+    attempt_dir: &Path,
+    sandbox: Option<&[OsString]>,
 ) -> (String, String) {
     let status_file = attempt_dir.join("exit.txt");
     let stderr_file = attempt_dir.join("stderr.txt");
@@ -401,8 +411,7 @@ exit $CMD_STATUS
 /// Returns the tmux session name.
 pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow::Result<String> {
     // Prepare attempt directory and prompt files (system + message).
-    let attempt_dir =
-        crate::home::task_attempt_dir_async(&inv.repo, &inv.task_id, inv.attempt).await?;
+    let attempt_dir = home::task_attempt_dir_async(&inv.repo, &inv.task_id, inv.attempt).await?;
 
     let sys_file = attempt_dir.join("prompt-sys.md");
     let msg_file = attempt_dir.join("prompt-msg.md");
@@ -421,7 +430,7 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
     let sandbox = if inv.sandbox {
         permissions.sandbox = super::agents::SandboxLevel::Os;
         let temp = super::sandbox::run_temp_dir(&attempt_dir);
-        tokio::fs::create_dir_all(&temp).await?;
+        fs::create_dir_all(&temp).await?;
 
         // The policy makes only paths that exist read-only, so the files orch writes later in the
         // attempt dir must exist now, or the agent could create them first
@@ -437,17 +446,12 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
             let path = attempt_dir.join(name);
 
             if !path.exists() {
-                tokio::fs::write(&path, "").await?;
+                fs::write(&path, "").await?;
             }
         }
 
-        if !inv.output_file.exists()
-            && inv
-                .output_file
-                .parent()
-                .is_some_and(std::path::Path::is_dir)
-        {
-            tokio::fs::write(&inv.output_file, "").await?;
+        if !inv.output_file.exists() && inv.output_file.parent().is_some_and(Path::is_dir) {
+            fs::write(&inv.output_file, "").await?;
         }
 
         Some(super::sandbox::argv(inv, &temp).await?)
@@ -509,14 +513,14 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
         format!("{}\n\n{}", inv.system_prompt, tools_prompt)
     };
 
-    tokio::fs::write(&sys_file, &sys_content).await?;
-    tokio::fs::write(&msg_file, &inv.agent_message).await?;
+    fs::write(&sys_file, &sys_content).await?;
+    fs::write(&msg_file, &inv.agent_message).await?;
 
     // Build agent command using per-agent runner (used in non-PTY path below)
     let runner = super::agents::get_runner(&inv.agent);
 
     // Prepare environment map for tmux session (does not write GH token to disk)
-    let mut env = std::collections::HashMap::new();
+    let mut env = HashMap::new();
     env.insert("GIT_AUTHOR_NAME".to_string(), inv.git_author_name.clone());
     env.insert(
         "GIT_COMMITTER_NAME".to_string(),
@@ -556,25 +560,20 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
     let agent_cmd_script_path = attempt_dir.join("agent_cmd.sh");
     let (script_content, agent_cmd_script_content) =
         build_tmux_runner_scripts(inv, &agent_cmd, &attempt_dir, sandbox.as_deref());
-    tokio::fs::write(&agent_cmd_script_path, &agent_cmd_script_content).await?;
-    tokio::fs::write(&script_path, &script_content).await?;
+    fs::write(&agent_cmd_script_path, &agent_cmd_script_content).await?;
+    fs::write(&script_path, &script_content).await?;
 
     // Make executable
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).await?;
-        tokio::fs::set_permissions(
-            &agent_cmd_script_path,
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .await?;
+        fs::set_permissions(&script_path, Permissions::from_mode(0o755)).await?;
+        fs::set_permissions(&agent_cmd_script_path, Permissions::from_mode(0o755)).await?;
     }
 
     let command = format!("bash \"{}\"", script_path.display());
 
     // Resolve GitHub token via the process-wide shared resolver (cached after first call)
-    let github_token = match crate::github::token::shared().get_token().await {
+    let github_token = match token::shared().get_token().await {
         Ok(Some(token)) => {
             tracing::debug!("Resolved GitHub token via TokenResolver for agent session");
             Some(token)
@@ -631,9 +630,9 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
 
 /// Build the system prompt for the agent.
 pub fn build_system_prompt(
-    _task: &crate::backends::ExternalTask,
+    _task: &ExternalTask,
     context: &super::context::TaskContext,
-    route_result: Option<&crate::engine::router::RouteResult>,
+    route_result: Option<&RouteResult>,
     default_branch: &str,
     shipcheck: Shipcheck,
 ) -> String {
@@ -678,7 +677,7 @@ pub fn build_system_prompt(
 
 /// Build the agent message (task prompt).
 pub fn build_agent_message(
-    task: &crate::backends::ExternalTask,
+    task: &ExternalTask,
     context: &super::context::TaskContext,
     attempts: u32,
 ) -> String {
@@ -766,7 +765,7 @@ pub fn build_agent_message(
 /// This is called when a task completes and the review agent needs to
 /// review the changes before auto-merge.
 pub fn build_review_prompt(
-    task: &crate::backends::ExternalTask,
+    task: &ExternalTask,
     agent_summary: &str,
     git_diff: &str,
     git_log: &str,
@@ -803,7 +802,7 @@ pub fn build_review_prompt(
 ///
 /// IMPORTANT: this must not embed secrets (GH_TOKEN) into the script.
 #[cfg(test)]
-fn build_runner_script_in_dir(inv: &AgentInvocation, attempt_dir: &std::path::Path) -> String {
+fn build_runner_script_in_dir(inv: &AgentInvocation, attempt_dir: &Path) -> String {
     let sys_file = attempt_dir.join("prompt-sys.md");
     let msg_file = attempt_dir.join("prompt-msg.md");
 
@@ -858,7 +857,15 @@ pub fn review_system_prompt() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::ExternalId;
+    use crate::engine::runner::agents::shell_single_quote;
+    use crate::engine::runner::sandbox;
+    use crate::template;
+    use std::fs as std_fs;
+    use std::os::unix::fs as unix_fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::process;
 
     #[test]
     fn review_system_prompt_checks_stray_files_and_trust_boundaries() {
@@ -883,7 +890,7 @@ mod tests {
             repo: "orch-runner-test/token-check".to_string(),
             attempt: 1,
             sandbox: false,
-            main_project_dir: std::path::PathBuf::from("/tmp"),
+            main_project_dir: PathBuf::from("/tmp"),
             branch: String::new(),
         }
     }
@@ -1001,7 +1008,7 @@ mod tests {
     fn tmux_runner_script_runs_the_agent_inside_the_sandbox() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let inv = test_invocation("sandbox-test");
-        let argv: Vec<std::ffi::OsString> = vec![
+        let argv: Vec<OsString> = vec![
             "/usr/bin/sandbox-exec".into(),
             "-p".into(),
             "(version 1)".into(),
@@ -1019,7 +1026,7 @@ mod tests {
         assert!(
             agent_cmd_script.contains(&format!(
                 "TMPDIR='{}'",
-                crate::engine::runner::sandbox::run_temp_dir(tmp.path()).display()
+                sandbox::run_temp_dir(tmp.path()).display()
             )),
             "the agent must get its own TMPDIR, got: {agent_cmd_script}"
         );
@@ -1039,8 +1046,8 @@ mod tests {
     fn build_runner_script_escapes_shell_injection_in_paths() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let mut inv = test_invocation("injection-test");
-        inv.work_dir = std::path::PathBuf::from("/tmp/$(whoami)/workspace");
-        inv.output_file = std::path::PathBuf::from("/tmp/evil`id`.json");
+        inv.work_dir = PathBuf::from("/tmp/$(whoami)/workspace");
+        inv.output_file = PathBuf::from("/tmp/evil`id`.json");
         let script = build_runner_script_in_dir(&inv, tmp.path());
 
         // Values must be single-quoted, neutralizing $() and backticks
@@ -1060,8 +1067,8 @@ mod tests {
         // prose "CI is still running" status update and leave the turn
         // without JSON. The prompt must explicitly route PENDING/NOT RUN CI
         // through the local-checks fallback and into the same-turn JSON output.
-        let task = crate::backends::ExternalTask {
-            id: crate::backends::ExternalId("155460".to_string()),
+        let task = ExternalTask {
+            id: ExternalId("155460".to_string()),
             title: "test task".to_string(),
             body: "test body".to_string(),
             state: "open".to_string(),
@@ -1085,8 +1092,6 @@ mod tests {
 
     #[test]
     fn shell_single_quote_escapes_embedded_quotes() {
-        use crate::engine::runner::agents::shell_single_quote;
-
         assert_eq!(shell_single_quote("hello"), "'hello'");
         assert_eq!(shell_single_quote("O'Brien"), "'O'\\''Brien'");
         assert_eq!(shell_single_quote("$(rm -rf /)"), "'$(rm -rf /)'");
@@ -1095,8 +1100,8 @@ mod tests {
         assert_eq!(shell_single_quote("$HOME"), "'$HOME'");
     }
 
-    fn git_init(dir: &std::path::Path) {
-        let out = std::process::Command::new("git")
+    fn git_init(dir: &Path) {
+        let out = process::Command::new("git")
             .args(["init", "-q"])
             .current_dir(dir)
             .output()
@@ -1112,7 +1117,7 @@ mod tests {
         install_shipcheck_rule(dir.path()).await.unwrap();
         install_shipcheck_rule(dir.path()).await.unwrap();
 
-        let rule = std::fs::read_to_string(dir.path().join(SHIPCHECK_RULE_PATH)).unwrap();
+        let rule = std_fs::read_to_string(dir.path().join(SHIPCHECK_RULE_PATH)).unwrap();
         assert_eq!(rule, SHIPCHECK_RULES);
         for cmd in ["run", "commit", "status", "logs", "doctor"] {
             assert!(
@@ -1127,9 +1132,9 @@ mod tests {
             assert!(!rule.contains(&format!(r#""{cmd}""#)), "{cmd}");
         }
 
-        let exclude = std::fs::read_to_string(dir.path().join(".git/info/exclude")).unwrap();
+        let exclude = std_fs::read_to_string(dir.path().join(".git/info/exclude")).unwrap();
         assert_eq!(exclude.matches("orch-shipcheck.rules").count(), 1);
-        let status = std::process::Command::new("git")
+        let status = process::Command::new("git")
             .args(["status", "--porcelain", "--untracked-files=all"])
             .current_dir(dir.path())
             .output()
@@ -1143,15 +1148,15 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let target = tempfile::tempdir().unwrap();
             git_init(dir.path());
-            std::fs::create_dir_all(dir.path().join(".codex")).unwrap();
+            std_fs::create_dir_all(dir.path().join(".codex")).unwrap();
             if link == ".codex" {
-                std::fs::remove_dir(dir.path().join(".codex")).unwrap();
+                std_fs::remove_dir(dir.path().join(".codex")).unwrap();
             }
-            std::os::unix::fs::symlink(target.path(), dir.path().join(link)).unwrap();
+            unix_fs::symlink(target.path(), dir.path().join(link)).unwrap();
 
             assert!(install_shipcheck_rule(dir.path()).await.is_err(), "{link}");
             assert_eq!(
-                std::fs::read_dir(target.path()).unwrap().count(),
+                std_fs::read_dir(target.path()).unwrap().count(),
                 0,
                 "{link}"
             );
@@ -1163,21 +1168,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = tempfile::tempdir().unwrap();
         let outside = target.path().join("victim");
-        std::fs::write(&outside, "keep").unwrap();
+        std_fs::write(&outside, "keep").unwrap();
         git_init(dir.path());
-        std::fs::create_dir_all(dir.path().join(".codex/rules")).unwrap();
-        std::os::unix::fs::symlink(&outside, dir.path().join(SHIPCHECK_RULE_PATH)).unwrap();
+        std_fs::create_dir_all(dir.path().join(".codex/rules")).unwrap();
+        unix_fs::symlink(&outside, dir.path().join(SHIPCHECK_RULE_PATH)).unwrap();
 
         install_shipcheck_rule(dir.path()).await.unwrap();
 
-        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
-        let meta = std::fs::symlink_metadata(dir.path().join(SHIPCHECK_RULE_PATH)).unwrap();
+        assert_eq!(std_fs::read_to_string(&outside).unwrap(), "keep");
+        let meta = std_fs::symlink_metadata(dir.path().join(SHIPCHECK_RULE_PATH)).unwrap();
         assert!(meta.is_file());
     }
 
-    fn prompt_task() -> crate::backends::ExternalTask {
-        crate::backends::ExternalTask {
-            id: crate::backends::ExternalId("1".to_string()),
+    fn prompt_task() -> ExternalTask {
+        ExternalTask {
+            id: ExternalId("1".to_string()),
             title: "t".to_string(),
             body: "b".to_string(),
             state: "open".to_string(),
@@ -1260,8 +1265,7 @@ mod tests {
     }
 
     // Mimics shipcheck, whose `--help` prints usage and exits 0 after any subcommand
-    fn fake_shipcheck(dir: &std::path::Path, commit: bool, hook: bool) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
+    fn fake_shipcheck(dir: &Path, commit: bool, hook: bool) -> PathBuf {
         let mut usage = "usage: shipcheck run [--sha <rev>] | status | logs".to_string();
         if commit {
             usage.push_str(" | commit -m <message>");
@@ -1271,14 +1275,14 @@ mod tests {
         }
         usage.push_str(" | install | doctor");
         let bin = dir.join("shipcheck");
-        std::fs::write(
+        std_fs::write(
             &bin,
             format!(
                 "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = --help ] && {{ echo '{usage}'; exit 0; }}; done\n[ \"$1\" = install ] && touch installed\nexit 0\n"
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std_fs::set_permissions(&bin, Permissions::from_mode(0o755)).unwrap();
         bin
     }
 
@@ -1320,13 +1324,13 @@ mod tests {
         let mut vars = HashMap::new();
         insert_cluster_vars(Shipcheck::Available, &mut vars);
         assert!(vars.is_empty(), "no cluster section, no cluster flags");
-        let plain = crate::template::render_template_str(AGENT_SYSTEM_TEMPLATE, &vars).unwrap();
+        let plain = template::render_template_str(AGENT_SYSTEM_TEMPLATE, &vars).unwrap();
         assert!(!plain.contains("orch progress"));
 
         for flag in ["CLUSTER", "CLUSTER_SHIPCHECK"] {
             vars.insert(flag.to_string(), "1".to_string());
         }
-        let cluster = crate::template::render_template_str(AGENT_SYSTEM_TEMPLATE, &vars).unwrap();
+        let cluster = template::render_template_str(AGENT_SYSTEM_TEMPLATE, &vars).unwrap();
         assert!(cluster.contains("orch progress"));
         assert!(cluster.contains("commits only through `shipcheck commit`"));
         assert!(!cluster.contains("It commits anything you left"));

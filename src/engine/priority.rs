@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 
@@ -88,7 +89,7 @@ pub fn is_priority_label(label: &str) -> bool {
 
 /// Highest priority first, arrival order kept inside a priority
 pub fn sort_by_priority<T>(tasks: &mut [T], priority_of: impl Fn(&T) -> Priority) {
-    tasks.sort_by_key(|t| std::cmp::Reverse(priority_of(t)));
+    tasks.sort_by_key(|t| Reverse(priority_of(t)));
 }
 
 /// The one slot a `priority:high` or open PR task may take beyond `max_parallel`

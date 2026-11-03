@@ -26,9 +26,16 @@ use orch::engine::subscribers::{dispatch, notify, review, unblock};
 use orch::engine::tasks::TaskManager;
 use orch::store::TaskStore;
 use orch::tmux::TmuxManager;
+use std::env;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
+use tokio::time;
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -112,16 +119,16 @@ fn make_event(task_id: &str, repo: &str, new_status: &str) -> TaskEvent {
 }
 
 /// Return a unique temp-DB path to avoid collisions when tests run in parallel.
-fn temp_db(label: &str) -> std::path::PathBuf {
+fn temp_db(label: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("orch-sub-{label}-{}-{n}.db", std::process::id()))
+    env::temp_dir().join(format!("orch-sub-{label}-{}-{n}.db", process::id()))
 }
 
-fn cleanup_db(path: &std::path::Path) {
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(path.with_extension("db-shm"));
-    let _ = std::fs::remove_file(path.with_extension("db-wal"));
+fn cleanup_db(path: &Path) {
+    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(path.with_extension("db-shm"));
+    let _ = fs::remove_file(path.with_extension("db-wal"));
 }
 
 // ---------------------------------------------------------------------------
@@ -137,15 +144,14 @@ async fn notify_done_event_pushes_notification() {
     let transport = Arc::new(Transport::new());
     let mut notify_rx = transport.subscribe_notifications();
 
-    notify::spawn(rx, std::sync::Arc::clone(&transport));
+    notify::spawn(rx, Arc::clone(&transport));
 
     tx.send(make_event("42", "owner/repo", "done")).unwrap();
 
-    let notification =
-        tokio::time::timeout(std::time::Duration::from_millis(300), notify_rx.recv())
-            .await
-            .expect("timed out waiting for notification")
-            .expect("notification channel closed");
+    let notification = time::timeout(Duration::from_millis(300), notify_rx.recv())
+        .await
+        .expect("timed out waiting for notification")
+        .expect("notification channel closed");
 
     assert_eq!(notification.task_id, "42");
     assert_eq!(notification.status, "done");
@@ -168,15 +174,14 @@ async fn notify_in_review_event_pushes_notification() {
     let transport = Arc::new(Transport::new());
     let mut notify_rx = transport.subscribe_notifications();
 
-    notify::spawn(rx, std::sync::Arc::clone(&transport));
+    notify::spawn(rx, Arc::clone(&transport));
 
     tx.send(make_event("7", "owner/repo", "in_review")).unwrap();
 
-    let notification =
-        tokio::time::timeout(std::time::Duration::from_millis(300), notify_rx.recv())
-            .await
-            .expect("timeout")
-            .expect("closed");
+    let notification = time::timeout(Duration::from_millis(300), notify_rx.recv())
+        .await
+        .expect("timeout")
+        .expect("closed");
 
     assert_eq!(notification.task_id, "7");
     assert_eq!(notification.status, "in_review");
@@ -192,13 +197,12 @@ async fn notify_needs_review_event_suppressed() {
     let transport = Arc::new(Transport::new());
     let mut notify_rx = transport.subscribe_notifications();
 
-    notify::spawn(rx, std::sync::Arc::clone(&transport));
+    notify::spawn(rx, Arc::clone(&transport));
 
     tx.send(make_event("7", "owner/repo", "needs_review"))
         .unwrap();
 
-    let result =
-        tokio::time::timeout(std::time::Duration::from_millis(150), notify_rx.recv()).await;
+    let result = time::timeout(Duration::from_millis(150), notify_rx.recv()).await;
     assert!(
         result.is_err(),
         "needs_review should not produce a notification under default level"
@@ -212,15 +216,14 @@ async fn notify_blocked_event_pushes_notification() {
     let transport = Arc::new(Transport::new());
     let mut notify_rx = transport.subscribe_notifications();
 
-    notify::spawn(rx, std::sync::Arc::clone(&transport));
+    notify::spawn(rx, Arc::clone(&transport));
 
     tx.send(make_event("3", "owner/repo", "blocked")).unwrap();
 
-    let notification =
-        tokio::time::timeout(std::time::Duration::from_millis(300), notify_rx.recv())
-            .await
-            .expect("timeout")
-            .expect("closed");
+    let notification = time::timeout(Duration::from_millis(300), notify_rx.recv())
+        .await
+        .expect("timeout")
+        .expect("closed");
 
     assert_eq!(notification.status, "blocked");
     drop(tx);
@@ -232,15 +235,14 @@ async fn notify_failed_event_pushes_notification() {
     let transport = Arc::new(Transport::new());
     let mut notify_rx = transport.subscribe_notifications();
 
-    notify::spawn(rx, std::sync::Arc::clone(&transport));
+    notify::spawn(rx, Arc::clone(&transport));
 
     tx.send(make_event("8", "owner/repo", "failed")).unwrap();
 
-    let notification =
-        tokio::time::timeout(std::time::Duration::from_millis(300), notify_rx.recv())
-            .await
-            .expect("timeout")
-            .expect("closed");
+    let notification = time::timeout(Duration::from_millis(300), notify_rx.recv())
+        .await
+        .expect("timeout")
+        .expect("closed");
 
     assert_eq!(notification.status, "failed");
     drop(tx);
@@ -254,15 +256,14 @@ async fn notify_intermediate_statuses_not_forwarded() {
     let transport = Arc::new(Transport::new());
     let mut notify_rx = transport.subscribe_notifications();
 
-    notify::spawn(rx, std::sync::Arc::clone(&transport));
+    notify::spawn(rx, Arc::clone(&transport));
 
     for status in &["new", "routed", "in_progress", "needs_review"] {
         tx.send(make_event("1", "owner/repo", status)).unwrap();
     }
 
     // None of these should produce a notification
-    let result =
-        tokio::time::timeout(std::time::Duration::from_millis(150), notify_rx.recv()).await;
+    let result = time::timeout(Duration::from_millis(150), notify_rx.recv()).await;
 
     assert!(
         result.is_err(),
@@ -277,7 +278,7 @@ async fn notify_multiple_terminal_events_all_forwarded() {
     let transport = Arc::new(Transport::new());
     let mut notify_rx = transport.subscribe_notifications();
 
-    notify::spawn(rx, std::sync::Arc::clone(&transport));
+    notify::spawn(rx, Arc::clone(&transport));
 
     tx.send(make_event("1", "repo/a", "done")).unwrap();
     tx.send(make_event("2", "repo/b", "blocked")).unwrap();
@@ -285,7 +286,7 @@ async fn notify_multiple_terminal_events_all_forwarded() {
 
     let mut received_ids: Vec<String> = Vec::new();
     for _ in 0..3 {
-        let n = tokio::time::timeout(std::time::Duration::from_millis(300), notify_rx.recv())
+        let n = time::timeout(Duration::from_millis(300), notify_rx.recv())
             .await
             .expect("timeout waiting for notification")
             .expect("channel closed");
@@ -313,10 +314,10 @@ async fn notify_channel_close_exits_cleanly() {
     let (tx, rx) = broadcast::channel::<TaskEvent>(16);
     let transport = Arc::new(Transport::new());
 
-    notify::spawn(rx, std::sync::Arc::clone(&transport));
+    notify::spawn(rx, Arc::clone(&transport));
 
     drop(tx); // close the channel
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    time::sleep(Duration::from_millis(50)).await;
     // Reaches here without panic — test passes
 }
 
@@ -335,7 +336,7 @@ async fn make_dispatch_harness(
 ) -> (
     broadcast::Sender<TaskEvent>,
     Arc<DashMap<String, String>>,
-    std::path::PathBuf,
+    PathBuf,
 ) {
     let tmp = temp_db(&format!("dispatch-{}", repo.replace('/', "-")));
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
@@ -343,12 +344,11 @@ async fn make_dispatch_harness(
     let transport = Arc::new(Transport::new());
     let capture = Arc::new(CaptureService::new(transport));
     let tmux = Arc::new(TmuxManager::isolated());
-    let runner =
-        Arc::new(TaskRunner::new(repo.to_string()).with_store(std::sync::Arc::clone(&store)));
+    let runner = Arc::new(TaskRunner::new(repo.to_string()).with_store(Arc::clone(&store)));
     let semaphore = Arc::new(Semaphore::new(4));
     let task_manager = Arc::new(TaskManager::with_store(
-        std::sync::Arc::clone(&backend),
-        std::sync::Arc::clone(&store),
+        Arc::clone(&backend),
+        Arc::clone(&store),
         repo.to_string(),
     ));
     let (weight_tx, _weight_rx) = mpsc::channel::<WeightSignal>(16);
@@ -372,7 +372,7 @@ async fn make_dispatch_harness(
         task_manager,
         weight_tx,
         router,
-        std::sync::Arc::clone(&dispatching),
+        Arc::clone(&dispatching),
         store,
         repo.to_string(),
     );
@@ -387,7 +387,7 @@ async fn dispatch_wrong_repo_event_ignored() {
     // Event for a different repo — subscriber should silently skip it.
     tx.send(make_event("42", "other/repo", "routed")).unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    time::sleep(Duration::from_millis(100)).await;
     cleanup_db(&tmp);
 }
 
@@ -400,7 +400,7 @@ async fn dispatch_wrong_status_events_ignored() {
         tx.send(make_event("10", "owner/repo", status)).unwrap();
     }
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    time::sleep(Duration::from_millis(100)).await;
     cleanup_db(&tmp);
 }
 
@@ -413,7 +413,7 @@ async fn dispatch_matching_event_does_not_panic_with_empty_store() {
 
     tx.send(make_event("42", "owner/repo", "routed")).unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    time::sleep(Duration::from_millis(150)).await;
     // No panic — test passes by reaching here.
     cleanup_db(&tmp);
 }
@@ -422,7 +422,7 @@ async fn dispatch_matching_event_does_not_panic_with_empty_store() {
 async fn dispatch_channel_close_exits_cleanly() {
     let (tx, _dispatching, tmp) = make_dispatch_harness("test/repo").await;
     drop(tx);
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    time::sleep(Duration::from_millis(50)).await;
     cleanup_db(&tmp);
 }
 
@@ -433,13 +433,13 @@ async fn dispatch_channel_close_exits_cleanly() {
 // calling tick_unblock_parents which is a no-op with an empty store.
 // ---------------------------------------------------------------------------
 
-async fn make_unblock_harness(repo: &str) -> (broadcast::Sender<TaskEvent>, std::path::PathBuf) {
+async fn make_unblock_harness(repo: &str) -> (broadcast::Sender<TaskEvent>, PathBuf) {
     let tmp = temp_db(&format!("unblock-{}", repo.replace('/', "-")));
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
     let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
     let task_manager = Arc::new(TaskManager::with_store(
-        std::sync::Arc::clone(&backend),
-        std::sync::Arc::clone(&store),
+        Arc::clone(&backend),
+        Arc::clone(&store),
         repo.to_string(),
     ));
 
@@ -455,7 +455,7 @@ async fn unblock_wrong_repo_event_ignored() {
 
     tx.send(make_event("10", "other/repo", "done")).unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    time::sleep(Duration::from_millis(100)).await;
     cleanup_db(&tmp);
 }
 
@@ -468,7 +468,7 @@ async fn unblock_wrong_status_events_ignored() {
         tx.send(make_event("10", "owner/repo", status)).unwrap();
     }
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    time::sleep(Duration::from_millis(100)).await;
     cleanup_db(&tmp);
 }
 
@@ -480,7 +480,7 @@ async fn unblock_done_event_right_repo_does_not_panic() {
 
     tx.send(make_event("10", "owner/repo", "done")).unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    time::sleep(Duration::from_millis(150)).await;
     cleanup_db(&tmp);
 }
 
@@ -488,7 +488,7 @@ async fn unblock_done_event_right_repo_does_not_panic() {
 async fn unblock_channel_close_exits_cleanly() {
     let (tx, tmp) = make_unblock_harness("test/repo").await;
     drop(tx);
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    time::sleep(Duration::from_millis(50)).await;
     cleanup_db(&tmp);
 }
 
@@ -506,13 +506,13 @@ async fn unblock_subscriber_only_handles_its_repo() {
     let backend_b: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
 
     let tm_a = Arc::new(TaskManager::with_store(
-        std::sync::Arc::clone(&backend_a),
-        std::sync::Arc::clone(&store_a),
+        Arc::clone(&backend_a),
+        Arc::clone(&store_a),
         "repo-a/proj".to_string(),
     ));
     let tm_b = Arc::new(TaskManager::with_store(
-        std::sync::Arc::clone(&backend_b),
-        std::sync::Arc::clone(&store_b),
+        Arc::clone(&backend_b),
+        Arc::clone(&store_b),
         "repo-b/proj".to_string(),
     ));
 
@@ -526,7 +526,7 @@ async fn unblock_subscriber_only_handles_its_repo() {
     // done event for repo-a: repo-a subscriber processes it, repo-b skips.
     tx.send(make_event("5", "repo-a/proj", "done")).unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    time::sleep(Duration::from_millis(150)).await;
     // No panic from either subscriber — test passes.
     cleanup_db(&tmp_a);
     cleanup_db(&tmp_b);
@@ -544,7 +544,7 @@ async fn make_review_harness(
 ) -> (
     broadcast::Sender<TaskEvent>,
     Arc<DashMap<String, String>>,
-    std::path::PathBuf,
+    PathBuf,
 ) {
     let tmp = temp_db(&format!("review-{}", repo.replace('/', "-")));
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
@@ -552,8 +552,8 @@ async fn make_review_harness(
     let tmux = Arc::new(TmuxManager::isolated());
     let semaphore = Arc::new(Semaphore::new(4));
     let task_manager = Arc::new(TaskManager::with_store(
-        std::sync::Arc::clone(&backend),
-        std::sync::Arc::clone(&store),
+        Arc::clone(&backend),
+        Arc::clone(&store),
         repo.to_string(),
     ));
     // No available agents — router is a no-op in these tests.
@@ -573,7 +573,7 @@ async fn make_review_harness(
         semaphore,
         task_manager,
         router,
-        std::sync::Arc::clone(&dispatching),
+        Arc::clone(&dispatching),
         store,
         repo.to_string(),
     );
@@ -588,7 +588,7 @@ async fn review_wrong_repo_event_ignored() {
     tx.send(make_event("5", "other/repo", "needs_review"))
         .unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    time::sleep(Duration::from_millis(100)).await;
     cleanup_db(&tmp);
 }
 
@@ -601,7 +601,7 @@ async fn review_wrong_status_events_ignored() {
         tx.send(make_event("5", "owner/repo", status)).unwrap();
     }
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    time::sleep(Duration::from_millis(100)).await;
     cleanup_db(&tmp);
 }
 
@@ -624,7 +624,7 @@ async fn review_dispatching_guard_prevents_double_spawn() {
     tx.send(make_event("42", "owner/repo", "needs_review"))
         .unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    time::sleep(Duration::from_millis(100)).await;
     // Dispatching map still contains the key (subscriber did not remove it
     // since it never claimed ownership via DispatchGuard).
     assert!(
@@ -647,7 +647,7 @@ async fn review_task_not_in_store_skipped_gracefully() {
     tx.send(make_event("99", "owner/repo", "needs_review"))
         .unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    time::sleep(Duration::from_millis(300)).await;
     cleanup_db(&tmp);
 }
 
@@ -655,7 +655,7 @@ async fn review_task_not_in_store_skipped_gracefully() {
 async fn review_channel_close_exits_cleanly() {
     let (tx, _dispatching, tmp) = make_review_harness("test/repo").await;
     drop(tx);
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    time::sleep(Duration::from_millis(50)).await;
     cleanup_db(&tmp);
 }
 
@@ -679,13 +679,13 @@ async fn review_subscriber_only_handles_its_repo() {
     };
 
     let tm_a = Arc::new(TaskManager::with_store(
-        std::sync::Arc::clone(&backend_a),
-        std::sync::Arc::clone(&store_a),
+        Arc::clone(&backend_a),
+        Arc::clone(&store_a),
         "repo-a/proj".to_string(),
     ));
     let tm_b = Arc::new(TaskManager::with_store(
-        std::sync::Arc::clone(&backend_b),
-        std::sync::Arc::clone(&store_b),
+        Arc::clone(&backend_b),
+        Arc::clone(&store_b),
         "repo-b/proj".to_string(),
     ));
     let router_a = Arc::new(RwLock::new(Router::new(config.clone())));
@@ -700,11 +700,11 @@ async fn review_subscriber_only_handles_its_repo() {
     review::spawn(
         rx_a,
         backend_a,
-        std::sync::Arc::clone(&tmux),
-        std::sync::Arc::clone(&semaphore),
+        Arc::clone(&tmux),
+        Arc::clone(&semaphore),
         tm_a,
         router_a,
-        std::sync::Arc::clone(&dispatching_a),
+        Arc::clone(&dispatching_a),
         store_a,
         "repo-a/proj".to_string(),
     );
@@ -715,7 +715,7 @@ async fn review_subscriber_only_handles_its_repo() {
         semaphore,
         tm_b,
         router_b,
-        std::sync::Arc::clone(&dispatching_b),
+        Arc::clone(&dispatching_b),
         store_b,
         "repo-b/proj".to_string(),
     );
@@ -724,7 +724,7 @@ async fn review_subscriber_only_handles_its_repo() {
     tx.send(make_event("7", "repo-a/proj", "needs_review"))
         .unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    time::sleep(Duration::from_millis(300)).await;
     // Neither subscriber panicked — test passes.
     cleanup_db(&tmp_a);
     cleanup_db(&tmp_b);

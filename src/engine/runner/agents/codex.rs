@@ -44,6 +44,10 @@
 //! {"type":"turn.failed","error":{"message":"..."}}
 //! ```
 
+use std::sync::LazyLock;
+
+use tokio::process::Command;
+
 use super::{
     AgentError, AgentRunner, ParsedResponse, PermissionRules, SandboxLevel, StreamEvent,
     json_error_message, json_str,
@@ -365,12 +369,8 @@ impl AgentRunner for CodexRunner {
         super::patterns::classify_from_text(exit_code, &combined)
     }
 
-    fn router_command(
-        &self,
-        prompt: &str,
-        model: Option<&str>,
-    ) -> anyhow::Result<tokio::process::Command> {
-        let mut cmd = tokio::process::Command::new("codex");
+    fn router_command(&self, prompt: &str, model: Option<&str>) -> anyhow::Result<Command> {
+        let mut cmd = Command::new("codex");
         cmd.arg("exec").arg("--json");
         if let Some(m) = model {
             cmd.arg("--model").arg(m);
@@ -443,6 +443,8 @@ pub fn find_codex_result(ndjson: &str) -> Option<super::AgentResult> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     fn runner() -> CodexRunner {
@@ -652,8 +654,8 @@ mod tests {
             allowed_edit_paths: vec![],
             deny_read_only: false,
             extra_writable_dirs: vec![
-                std::path::PathBuf::from("/Users/gb/Projects/bean/.git"),
-                std::path::PathBuf::from("/Users/gb/Projects/bean/.git/worktrees/task-123"),
+                PathBuf::from("/Users/gb/Projects/bean/.git"),
+                PathBuf::from("/Users/gb/Projects/bean/.git/worktrees/task-123"),
             ],
         };
         let cmd = runner().build_command(None, "", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
@@ -969,7 +971,7 @@ mod tests {
 }
 
 // Codex wraps every command as `/bin/zsh -lc '<command>'` or `-lc "<command>"`
-static SHELL_WRAP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+static SHELL_WRAP: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r#"(?s)^\S*/(?:ba|z)?sh -l?c (?:'(.*)'|"(.*)")$"#)
         .expect("shell wrap regex is valid")
 });

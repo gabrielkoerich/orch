@@ -19,7 +19,25 @@ mod selection;
 mod strategies;
 pub mod weights;
 
+use crate::backends::ExternalTask;
+use crate::cmd_cache;
+use crate::engine::cooldown;
+use crate::engine::cooldown::{
+    cooldown_until, is_agent_degraded, is_agent_in_cooldown, is_model_in_cooldown,
+    list_degraded_agents, record_agent_success, refresh_degraded_agents, sync_from_kv,
+};
+use crate::engine::runner::agents::opencode;
+use crate::engine::runner::response;
+use crate::store::WaitingOnDependency;
+use crate::store::{TaskStore, get_task_field_direct, store_log_activity};
 pub use config::{RouterConfig, parse_pool_entry};
+use llm::{LlmRouter, TIMEOUT_PREFIX};
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::sync::Arc;
+use tokio::task;
 pub use weights::AgentWeights;
 
 fn fmt_degraded(degraded: &[String]) -> String {
@@ -91,17 +109,6 @@ pub enum RouteResultError {
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
-
-use crate::backends::ExternalTask;
-use crate::engine::cooldown::{
-    cooldown_until, is_agent_degraded, is_agent_in_cooldown, is_model_in_cooldown,
-    list_degraded_agents, record_agent_success, refresh_degraded_agents, sync_from_kv,
-};
-use crate::store::{TaskStore, get_task_field_direct, store_log_activity};
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-
-use llm::{LlmRouter, TIMEOUT_PREFIX};
 
 /// Result of routing a task to an agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -180,10 +187,10 @@ impl RouteResult {
 /// Obtain one via [`Router::llm_router_handle`].  Holding this handle does
 /// **not** require holding the router's `RwLock`, so async operations can
 /// safely be called without starving write-lock waiters.
-pub struct LlmRouterHandle(std::sync::Arc<LlmRouter>);
+pub struct LlmRouterHandle(Arc<LlmRouter>);
 
-impl std::fmt::Debug for LlmRouterHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for LlmRouterHandle {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("LlmRouterHandle").finish_non_exhaustive()
     }
 }
@@ -210,7 +217,7 @@ pub struct Router {
     pub weights: AgentWeights,
     /// LLM routing subsystem (wrapped in Arc so callers can clone a handle
     /// without holding the router RwLock across async operations)
-    llm_router: std::sync::Arc<LlmRouter>,
+    llm_router: Arc<LlmRouter>,
     /// Ollama router for local routing (contains reusable reqwest::Client)
     ollama_router: Option<ollama::OllamaRouter>,
     /// Round-robin index for task routing
@@ -226,8 +233,8 @@ pub struct Router {
     pub(crate) pool_index: usize,
 }
 
-impl std::fmt::Debug for Router {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for Router {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Router")
             .field("config", &self.config)
             .field("available_agents", &self.available_agents)
@@ -266,7 +273,7 @@ impl Router {
         // Prime only when this config names opencode, so a default or claude-only
         // router never runs `opencode models`
         if config.uses_opencode() {
-            crate::engine::runner::agents::opencode::prime_free_model_cache();
+            opencode::prime_free_model_cache();
         }
         let ollama_router = if config.mode == "local" {
             Some(ollama::OllamaRouter::new(&config))
@@ -277,7 +284,7 @@ impl Router {
             config,
             available_agents,
             weights,
-            llm_router: std::sync::Arc::new(LlmRouter::new()),
+            llm_router: Arc::new(LlmRouter::new()),
             ollama_router,
             rr_index: 0,
             last_agent: None,
@@ -306,7 +313,7 @@ impl Router {
             config,
             available_agents,
             weights,
-            llm_router: std::sync::Arc::new(LlmRouter::new()),
+            llm_router: Arc::new(LlmRouter::new()),
             ollama_router: None,
             rr_index: 0,
             last_agent: None,
@@ -324,7 +331,7 @@ impl Router {
     /// prevents holding the read lock across await points (which starves
     /// write-lock waiters due to Tokio's write-preferring `RwLock`).
     pub fn llm_router_handle(&self) -> LlmRouterHandle {
-        LlmRouterHandle(std::sync::Arc::clone(&self.llm_router))
+        LlmRouterHandle(Arc::clone(&self.llm_router))
     }
 
     fn advance_pool_index_after_attempt(&mut self, idx: usize, pool_len: usize) {
@@ -337,7 +344,7 @@ impl Router {
     fn discover_agents(configured_agents: &[String]) -> Vec<String> {
         let mut agents = Vec::new();
         for agent in configured_agents {
-            if crate::cmd_cache::command_exists(agent) {
+            if cmd_cache::command_exists(agent) {
                 agents.push(agent.clone());
             }
         }
@@ -449,11 +456,11 @@ impl Router {
     }
 
     fn discover_free_opencode_models() -> Vec<String> {
-        crate::engine::runner::agents::opencode::discover_free_opencode_models()
+        opencode::discover_free_opencode_models()
     }
 
     async fn discover_free_opencode_models_async() -> Vec<String> {
-        tokio::task::spawn_blocking(Self::discover_free_opencode_models)
+        task::spawn_blocking(Self::discover_free_opencode_models)
             .await
             .unwrap_or_default()
     }
@@ -462,7 +469,7 @@ impl Router {
     ///
     /// Queries the `rate_limits` table for recent events and combines with
     /// cooldown state to mark agents as degraded before routing attempts them.
-    pub async fn refresh_health(&self, store: &std::sync::Arc<TaskStore>) {
+    pub async fn refresh_health(&self, store: &Arc<TaskStore>) {
         // KV is the source of truth for cooldowns. Reconcile the in-memory map
         // from KV every tick so external mutations (e.g. `orch cooldown clear`
         // from a separate CLI process) actually take effect on the running
@@ -676,7 +683,7 @@ impl Router {
     /// same agent from being selected twice in a row after a no-code failure (#2410).
     async fn skip_no_code_agent(
         &self,
-        store: &std::sync::Arc<TaskStore>,
+        store: &Arc<TaskStore>,
         repo: &str,
         task_id: &str,
         candidates: &[String],
@@ -726,7 +733,7 @@ impl Router {
     pub async fn route(
         &mut self,
         task: &ExternalTask,
-        store: &std::sync::Arc<TaskStore>,
+        store: &Arc<TaskStore>,
         repo: &str,
     ) -> anyhow::Result<RouteResult> {
         // NOTE: refresh_health() is called once per tick in tick_route_tasks()
@@ -737,7 +744,7 @@ impl Router {
         match store.resolve_id_by_external(repo, &task.id.0).await {
             Ok(Some(id)) => match store.block_claim_if_waiting(id).await {
                 Ok(Some(blockers)) => {
-                    return Err(crate::store::WaitingOnDependency { blockers }.into());
+                    return Err(WaitingOnDependency { blockers }.into());
                 }
                 Ok(None) => {}
                 Err(err) => return Err(err),
@@ -1184,12 +1191,7 @@ impl Router {
     }
 
     /// Get the number of LLM routing attempts for a task from the store.
-    async fn get_route_attempts(
-        &self,
-        task_id: &str,
-        store: &std::sync::Arc<TaskStore>,
-        repo: &str,
-    ) -> u32 {
+    async fn get_route_attempts(&self, task_id: &str, store: &Arc<TaskStore>, repo: &str) -> u32 {
         match store.resolve_task_id(repo, task_id).await {
             Ok(Some(store_id)) => store
                 .get(store_id)
@@ -1204,7 +1206,7 @@ impl Router {
         &self,
         task_id: &str,
         attempts: u32,
-        store: &std::sync::Arc<TaskStore>,
+        store: &Arc<TaskStore>,
         repo: &str,
     ) {
         if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await
@@ -1219,7 +1221,7 @@ impl Router {
     /// Log a route event to task activity timeline.
     async fn log_route_activity(
         &self,
-        store: &std::sync::Arc<TaskStore>,
+        store: &Arc<TaskStore>,
         repo: &str,
         task_id: &str,
         result: &RouteResult,
@@ -1297,7 +1299,7 @@ impl Router {
             let (agent, model) = &pool[idx];
             let model_str = model.as_str();
 
-            if crate::engine::runner::response::is_model_in_cooldown(agent, model_str) {
+            if response::is_model_in_cooldown(agent, model_str) {
                 tracing::debug!(agent, model = model_str, "pool entry on cooldown, skipping");
                 continue;
             }
@@ -1356,8 +1358,7 @@ impl Router {
                             next_pool_idx = self.pool_index,
                             "router LLM pool entry timed out — recording cooldown, will retry next tick"
                         );
-                        crate::engine::runner::response::record_model_failure(agent, model_str)
-                            .await;
+                        response::record_model_failure(agent, model_str).await;
                         return Err(e);
                     }
                     tracing::warn!(
@@ -1366,15 +1367,14 @@ impl Router {
                         error = %e,
                         "pool entry failed, recording cooldown and trying next"
                     );
-                    if !crate::engine::cooldown::record_credit_exhaustion_from_message(
+                    if !cooldown::record_credit_exhaustion_from_message(
                         agent,
                         Some(model_str),
                         &err_msg,
                     )
                     .await
                     {
-                        crate::engine::runner::response::record_model_failure(agent, model_str)
-                            .await;
+                        response::record_model_failure(agent, model_str).await;
                     }
                     last_err = Some(e);
                     self.advance_pool_index_after_attempt(idx, n);
@@ -1414,9 +1414,7 @@ impl Router {
         // Only try fallback if it wasn't already in the pool (avoid double-try)
         let fallback_already_tried = pool.iter().any(|(a, m)| a == &fb_agent && m == &fb_model);
 
-        if !fallback_already_tried
-            && !crate::engine::runner::response::is_model_in_cooldown(&fb_agent, fb_model_str)
-        {
+        if !fallback_already_tried && !response::is_model_in_cooldown(&fb_agent, fb_model_str) {
             tracing::info!(
                 agent = %fb_agent,
                 model = %fb_model_str,
@@ -1450,11 +1448,7 @@ impl Router {
                     if is_timeout {
                         // Cool down on timeout like pool entries (#3422), else a
                         // chronically-timing-out fallback burns the full timeout window every tick (#3616)
-                        crate::engine::runner::response::record_model_failure(
-                            &fb_agent,
-                            fb_model_str,
-                        )
-                        .await;
+                        response::record_model_failure(&fb_agent, fb_model_str).await;
                         tracing::warn!(
                             agent = %fb_agent,
                             model = %fb_model_str,
@@ -1468,8 +1462,7 @@ impl Router {
                         error = %e,
                         "fallback router LLM also failed"
                     );
-                    crate::engine::runner::response::record_model_failure(&fb_agent, fb_model_str)
-                        .await;
+                    response::record_model_failure(&fb_agent, fb_model_str).await;
                     last_err = Some(e);
                 }
             }
@@ -1503,7 +1496,7 @@ impl Router {
         &self,
         task_id: &str,
         result: &RouteResult,
-        store: &std::sync::Arc<TaskStore>,
+        store: &Arc<TaskStore>,
         repo: &str,
     ) -> anyhow::Result<()> {
         if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
@@ -1528,7 +1521,7 @@ impl Router {
 
 /// Retrieve routing result from the task store.
 pub async fn get_route_result(
-    store: &std::sync::Arc<TaskStore>,
+    store: &Arc<TaskStore>,
     repo: &str,
     task_id: &str,
 ) -> Result<RouteResult, RouteResultError> {
@@ -1635,6 +1628,7 @@ mod tests {
     use super::config::DEFAULT_AGENTS;
     use super::llm::LlmRouteResponse;
     use super::strategies;
+    use super::weights::default_missing_weight;
     use super::weights::{
         AgentWeights, DEFAULT_WEIGHT, MIN_WEIGHT, RATE_LIMIT_DECAY, RECOVERY_DELAY, RateLimitState,
     };
@@ -1644,25 +1638,41 @@ mod tests {
         clear_agent_degraded, is_agent_degraded, is_model_in_cooldown, mark_agent_degraded,
         record_model_failure, set_model_cooldown,
     };
+    use crate::store::NewTask;
     use crate::store::TaskStore;
     use serial_test::serial;
+    use std::collections::HashMap;
+    use std::env;
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    use std::fs;
+    #[cfg(unix)]
+    use std::fs::Permissions;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::process;
+    #[cfg(unix)]
+    use std::process::Command;
+    #[cfg(unix)]
+    use std::thread;
     use std::time::{Duration, Instant};
 
     #[tokio::test]
     #[serial_test::serial(orch_home)]
     async fn get_route_result_replaces_a_stale_model_with_the_complexity_model() {
         let home = tempfile::tempdir().unwrap();
-        std::fs::write(
+        fs::write(
             home.path().join("config.yml"),
             "model_map:\n  medium:\n    claude: sonnet\n",
         )
         .unwrap();
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("ORCH_HOME", home.path()) };
+        unsafe { env::set_var("ORCH_HOME", home.path()) };
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let store_id = store
-            .create(&crate::store::NewTask {
+            .create(&NewTask {
                 external_id: Some("7".to_string()),
                 repo: "owner/repo".to_string(),
                 origin: "github".to_string(),
@@ -1686,7 +1696,7 @@ mod tests {
         let route = get_route_result(&store, "owner/repo", "7").await;
         let stored = store.get(store_id).await.unwrap().model;
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::remove_var("ORCH_HOME") };
+        unsafe { env::remove_var("ORCH_HOME") };
 
         assert_eq!(route.unwrap().model.as_deref(), Some("sonnet"));
         assert_eq!(stored.as_deref(), Some("sonnet"));
@@ -1704,8 +1714,8 @@ mod tests {
         }
     }
 
-    async fn test_store() -> std::sync::Arc<TaskStore> {
-        std::sync::Arc::new(TaskStore::open_memory().await.unwrap())
+    async fn test_store() -> Arc<TaskStore> {
+        Arc::new(TaskStore::open_memory().await.unwrap())
     }
 
     fn create_test_task(id: &str, title: &str, labels: Vec<String>) -> ExternalTask {
@@ -1764,7 +1774,7 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn all_agents_cooled_error_names_degraded_agents() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         mark_agent_degraded("claude");
         mark_agent_degraded("grok");
         let err = AllAgentsCooledError::new("all agents".to_string(), None);
@@ -1915,7 +1925,7 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn model_pool_selection_skips_cooled() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
 
         let mut config = RouterConfig::default();
         // Set up a two-model pool for opencode/simple
@@ -2210,7 +2220,7 @@ Hope that helps!"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn route_round_robin_basic() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         // Force at least one agent to be available for testing
         // In real usage, discover_agents finds installed CLIs
         let config = RouterConfig {
@@ -2226,7 +2236,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            llm_router: std::sync::Arc::new(LlmRouter::new()),
+            llm_router: Arc::new(LlmRouter::new()),
             ollama_router: None,
             rr_index: 0,
             last_agent: None,
@@ -2248,7 +2258,7 @@ Hope that helps!"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn route_uses_label_override() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let mut config = RouterConfig::default();
         // Ensure a concrete model exists so the label override can be honored
         // in the test environment where no external config.yml is present.
@@ -2264,7 +2274,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            llm_router: std::sync::Arc::new(LlmRouter::new()),
+            llm_router: Arc::new(LlmRouter::new()),
             ollama_router: None,
             rr_index: 0,
             last_agent: None,
@@ -2312,7 +2322,7 @@ Hope that helps!"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn router_reload_preserves_structure() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let config = RouterConfig::default();
         let agents = vec!["claude".to_string()];
         let mut weights = AgentWeights::default();
@@ -2321,7 +2331,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            llm_router: std::sync::Arc::new(LlmRouter::new()),
+            llm_router: Arc::new(LlmRouter::new()),
             ollama_router: None,
             rr_index: 0,
             last_agent: None,
@@ -2453,9 +2463,7 @@ Hope that helps!"#;
 
     #[test]
     fn default_missing_weight_uses_minimum_of_configured() {
-        use super::weights::default_missing_weight;
-
-        let mut configured = std::collections::HashMap::new();
+        let mut configured = HashMap::new();
         configured.insert("claude".to_string(), 0.2);
         configured.insert("codex".to_string(), 0.2);
         configured.insert("opencode".to_string(), 0.2);
@@ -2468,9 +2476,7 @@ Hope that helps!"#;
 
     #[test]
     fn default_missing_weight_falls_back_when_none_configured() {
-        use super::weights::default_missing_weight;
-
-        let configured = std::collections::HashMap::new();
+        let configured = HashMap::new();
         assert_eq!(default_missing_weight(&configured), DEFAULT_WEIGHT);
     }
 
@@ -2478,7 +2484,7 @@ Hope that helps!"#;
     #[test]
     fn ensure_agents_with_weights_missing_agent_does_not_outrank_configured() {
         let mut weights = AgentWeights::default();
-        let mut configured = std::collections::HashMap::new();
+        let mut configured = HashMap::new();
         configured.insert("claude".to_string(), 0.2);
         configured.insert("codex".to_string(), 0.2);
         configured.insert("opencode".to_string(), 0.2);
@@ -2669,7 +2675,7 @@ Hope that helps!"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn route_weighted_round_robin_basic() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let mut config = RouterConfig {
             weighted_round_robin: true,
             ..Default::default()
@@ -2688,7 +2694,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            llm_router: std::sync::Arc::new(LlmRouter::new()),
+            llm_router: Arc::new(LlmRouter::new()),
             ollama_router: None,
             rr_index: 0,
             last_agent: None,
@@ -2713,7 +2719,7 @@ Hope that helps!"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn route_weighted_round_robin_respects_label_override() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let mut config = RouterConfig {
             weighted_round_robin: true,
             ..Default::default()
@@ -2732,7 +2738,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            llm_router: std::sync::Arc::new(LlmRouter::new()),
+            llm_router: Arc::new(LlmRouter::new()),
             ollama_router: None,
             rr_index: 0,
             last_agent: None,
@@ -2802,7 +2808,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            llm_router: std::sync::Arc::new(LlmRouter::new()),
+            llm_router: Arc::new(LlmRouter::new()),
             ollama_router: None,
             rr_index: 0,
             last_agent: None,
@@ -2844,7 +2850,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            llm_router: std::sync::Arc::new(LlmRouter::new()),
+            llm_router: Arc::new(LlmRouter::new()),
             ollama_router: None,
             rr_index: 0,
             last_agent: None,
@@ -2890,7 +2896,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            llm_router: std::sync::Arc::new(LlmRouter::new()),
+            llm_router: Arc::new(LlmRouter::new()),
             ollama_router: None,
             rr_index: 0,
             last_agent: None,
@@ -2933,7 +2939,7 @@ Hope that helps!"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn last_agent_tracks_routing() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let mut config = RouterConfig {
             mode: "round_robin".to_string(),
             ..Default::default()
@@ -2955,7 +2961,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            llm_router: std::sync::Arc::new(LlmRouter::new()),
+            llm_router: Arc::new(LlmRouter::new()),
             ollama_router: None,
             rr_index: 0,
             last_agent: None,
@@ -3125,27 +3131,25 @@ Hope that helps!"#;
     #[serial(cooldown_state)]
     #[test]
     fn building_a_router_never_runs_opencode() {
-        use std::os::unix::fs::PermissionsExt;
-
-        struct PathRestore(Option<std::ffi::OsString>);
+        struct PathRestore(Option<OsString>);
         impl Drop for PathRestore {
             fn drop(&mut self) {
                 match &self.0 {
                     // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-                    Some(p) => unsafe { std::env::set_var("PATH", p) },
+                    Some(p) => unsafe { env::set_var("PATH", p) },
                     // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-                    None => unsafe { std::env::remove_var("PATH") },
+                    None => unsafe { env::remove_var("PATH") },
                 }
-                crate::cmd_cache::reset_for_test();
+                cmd_cache::reset_for_test();
             }
         }
 
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("spawned");
         let bin_dir = dir.path().join("bin");
-        std::fs::create_dir(&bin_dir).unwrap();
+        fs::create_dir(&bin_dir).unwrap();
         let stub = bin_dir.join("opencode");
-        std::fs::write(
+        fs::write(
             &stub,
             format!(
                 "#!/bin/sh\necho \"$@\" > '{}'\necho canary-model-free\n",
@@ -3153,17 +3157,17 @@ Hope that helps!"#;
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&stub, Permissions::from_mode(0o755)).unwrap();
 
-        let prev_path = std::env::var_os("PATH");
+        let prev_path = env::var_os("PATH");
         let mut new_path = bin_dir.as_os_str().to_os_string();
         new_path.push(":");
         if let Some(ref p) = prev_path {
             new_path.push(p);
         }
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("PATH", &new_path) };
-        crate::cmd_cache::reset_for_test();
+        unsafe { env::set_var("PATH", &new_path) };
+        cmd_cache::reset_for_test();
         let _restore = PathRestore(prev_path);
 
         // A config that names opencode everywhere discovery reads from
@@ -3185,12 +3189,12 @@ Hope that helps!"#;
         let _test_router = Router::new_for_test(config.clone(), vec!["opencode".to_string()]);
         let _pool = Router::expand_pool(&config);
         // Discovery refreshes on a background thread, give it room to exec
-        std::thread::sleep(Duration::from_millis(300));
+        thread::sleep(Duration::from_millis(300));
 
         assert!(
             !marker.exists(),
             "building a router ran opencode: {}",
-            std::fs::read_to_string(&marker).unwrap_or_default().trim()
+            fs::read_to_string(&marker).unwrap_or_default().trim()
         );
         assert!(
             opencode_children().is_empty(),
@@ -3202,8 +3206,8 @@ Hope that helps!"#;
     /// Commands of this process's direct children that mention opencode
     #[cfg(unix)]
     fn opencode_children() -> Vec<String> {
-        let me = std::process::id().to_string();
-        let output = std::process::Command::new("ps")
+        let me = process::id().to_string();
+        let output = Command::new("ps")
             .args(["-axo", "ppid=,command="])
             .output()
             .expect("ps");
@@ -3219,7 +3223,7 @@ Hope that helps!"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn reload_resets_pool_index() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let config = RouterConfig::default();
         let mut router = Router::new(config);
         router.pool_index = 5;
@@ -3275,7 +3279,7 @@ Hope that helps!"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn earliest_pool_cooldown_returns_earliest_when_set() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         // Use explicit pool with predictable model names to avoid opencode discovery.
         let config = RouterConfig {
             pool: vec![
@@ -3299,7 +3303,7 @@ Hope that helps!"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn earliest_pool_cooldown_skips_non_pool_entries() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         // Use explicit pool so we can predict what entries exist.
         let config = RouterConfig {
             pool: vec![
@@ -3390,7 +3394,7 @@ Hope that helps!"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn refresh_health_marks_degraded_from_rate_limits() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let store = test_store().await;
         let agent = "test_refresh_health_agent";
 
@@ -3429,7 +3433,7 @@ Hope that helps!"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn agent_has_any_available_model_false_when_only_model_cooled() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let mut config = RouterConfig::default();
         // Agent's only model, shared across every complexity tier it resolves to.
         for tier in ["simple", "medium", "complex", "review"] {
@@ -3463,7 +3467,7 @@ Hope that helps!"#;
         // Regression test for #3509: route_with_llm's candidate filter must exclude an
         // agent that has no agent-level cooldown but whose only resolvable model (across
         // every complexity tier) is cooled, so it is never handed to the LLM classifier.
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let mut config = RouterConfig::default();
         for tier in ["simple", "medium", "complex", "review"] {
             config
@@ -3516,7 +3520,7 @@ Hope that helps!"#;
         // classifier can pick it for a `medium`/`complex` task it can't serve,
         // wasting the classification call. Mirrors the real-world shape where
         // `simple` → sonnet (uncooled) and `medium`/`complex` → opus (cooled).
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let mut config = RouterConfig::default();
         config
             .model_map

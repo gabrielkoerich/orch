@@ -4,6 +4,7 @@
 //! it never edits labels, closes issues, changes membership, or dispatches work.
 
 use super::super::http::GhHttp;
+use crate::config;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -42,7 +43,7 @@ struct BoardConfig {
 
 impl LabelSyncConfig {
     pub(crate) fn from_config() -> Result<Self> {
-        match crate::config::get("gh.project_label_sync") {
+        match config::get("gh.project_label_sync") {
             Ok(raw) => Self::parse(&raw),
             Err(error)
                 if error.to_string().starts_with("config key not found:")
@@ -504,11 +505,13 @@ async fn reconcile_board(api: &impl ProjectApi, board: &BoardConfig) -> Result<u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli;
     use std::collections::VecDeque;
+    use std::result;
     use std::sync::Mutex;
 
     struct FakeApi {
-        replies: Mutex<VecDeque<std::result::Result<Value, String>>>,
+        replies: Mutex<VecDeque<result::Result<Value, String>>>,
         calls: Mutex<Vec<(String, Value)>>,
     }
 
@@ -520,7 +523,7 @@ mod tests {
             }
         }
 
-        fn with_errors(replies: Vec<std::result::Result<Value, String>>) -> Self {
+        fn with_errors(replies: Vec<result::Result<Value, String>>) -> Self {
             Self {
                 replies: Mutex::new(replies.into()),
                 calls: Mutex::new(Vec::new()),
@@ -944,7 +947,7 @@ projects:
             ack("ONE"),
         ]);
         assert_eq!(
-            crate::cli::board_reconcile_with(&config(), &api, "example/work")
+            cli::board_reconcile_with(&config(), &api, "example/work")
                 .await
                 .unwrap(),
             1
@@ -959,16 +962,12 @@ projects:
         );
         let no_calls = FakeApi::new(vec![]);
         assert!(
-            crate::cli::board_reconcile_with(
-                &LabelSyncConfig::default(),
-                &no_calls,
-                "example/work"
-            )
-            .await
-            .is_err()
+            cli::board_reconcile_with(&LabelSyncConfig::default(), &no_calls, "example/work")
+                .await
+                .is_err()
         );
         assert!(
-            crate::cli::board_reconcile_with(&config(), &no_calls, "other/repo")
+            cli::board_reconcile_with(&config(), &no_calls, "other/repo")
                 .await
                 .is_err()
         );
@@ -978,7 +977,7 @@ projects:
             None,
         )]);
         assert_eq!(
-            crate::cli::board_reconcile_with(&config(), &noop, "example/work")
+            cli::board_reconcile_with(&config(), &noop, "example/work")
                 .await
                 .unwrap(),
             0
@@ -988,7 +987,7 @@ projects:
             json!({"data":null}),
         ]);
         assert!(
-            crate::cli::board_reconcile_with(&config(), &unknown, "example/work")
+            cli::board_reconcile_with(&config(), &unknown, "example/work")
                 .await
                 .is_err()
         );

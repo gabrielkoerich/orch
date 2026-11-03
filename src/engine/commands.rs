@@ -5,10 +5,16 @@
 //! The scanning loop lives in `sync.rs` (`scan_comments`).
 
 use crate::backends::{ExternalBackend, ExternalId, Status};
+use crate::engine;
+use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
 use crate::github::types::GitHubIssue;
 use crate::store::TaskStatus;
+use crate::store::TaskStore;
 use async_trait::async_trait;
+use std::fmt;
+use std::fmt::Display;
+use std::fmt::Formatter;
 use std::sync::Arc;
 
 /// Minimal store interface required by command execution.
@@ -30,7 +36,7 @@ pub trait CommandStoreOps: Send + Sync {
 }
 
 #[async_trait]
-impl CommandStoreOps for crate::store::TaskStore {
+impl CommandStoreOps for TaskStore {
     async fn resolve_task_id(&self, repo: &str, task_id: &str) -> anyhow::Result<Option<i64>> {
         self.resolve_task_id(repo, task_id).await
     }
@@ -96,8 +102,8 @@ pub enum OwnerCommand {
     Review,
 }
 
-impl std::fmt::Display for OwnerCommand {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for OwnerCommand {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Retry => write!(f, "/retry"),
             Self::Reroute(Some(a)) => write!(f, "/reroute {a}"),
@@ -220,7 +226,7 @@ pub async fn execute_command(
     task_id: &ExternalId,
     command: &OwnerCommand,
     store: &Option<Arc<dyn CommandStoreOps>>,
-    task_manager: &Arc<crate::engine::tasks::TaskManager>,
+    task_manager: &Arc<TaskManager>,
 ) -> anyhow::Result<String> {
     match command {
         OwnerCommand::Retry => {
@@ -353,7 +359,7 @@ pub async fn validate_and_run_command(
     command: &OwnerCommand,
     author: &str,
     store: &Option<Arc<dyn CommandStoreOps>>,
-    task_manager: &Arc<crate::engine::tasks::TaskManager>,
+    task_manager: &Arc<TaskManager>,
 ) -> CommandOutcome {
     // Check issue state
     let issue_data = match gh.get_issue(repo, issue_number).await {
@@ -393,7 +399,7 @@ pub async fn validate_and_run_command(
             tracing::info!(issue = %issue_number, author, command = %command, "executed command");
             let confirmation = format!(
                 "[{now}] {msg} — executed by @{author}{}",
-                crate::engine::orch_footer()
+                engine::orch_footer()
             );
             if let Err(e) = backend.post_comment(&task_id, &confirmation).await {
                 tracing::warn!(issue = %issue_number, err = %e, "failed to post confirmation");
@@ -403,7 +409,7 @@ pub async fn validate_and_run_command(
             tracing::warn!(issue = %issue_number, command = %command, err = %e, "failed to execute command");
             let error_msg = format!(
                 "[{now}] Failed to execute `{command}`: {e}{}",
-                crate::engine::orch_footer()
+                engine::orch_footer()
             );
             if let Err(e2) = backend.post_comment(&task_id, &error_msg).await {
                 tracing::warn!(issue = %issue_number, err = %e2, "failed to post error comment");
@@ -568,11 +574,7 @@ mod tests {
             Ok(())
         }
 
-        async fn status(
-            &self,
-            _repo: &str,
-            _task_id: &str,
-        ) -> anyhow::Result<Option<crate::store::TaskStatus>> {
+        async fn status(&self, _repo: &str, _task_id: &str) -> anyhow::Result<Option<TaskStatus>> {
             Ok(None)
         }
     }
@@ -597,13 +599,13 @@ mod tests {
             .await
             .unwrap();
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new("42"));
-        let backend_for_call = std::sync::Arc::clone(&backend);
-        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
+        let backend_for_call = Arc::clone(&backend);
+        let task_manager = Arc::new(TaskManager::with_store(
             backend,
-            std::sync::Arc::clone(&store),
+            Arc::clone(&store),
             "owner/repo".to_string(),
         ));
-        let gh = crate::github::http::GhHttp::new().unwrap();
+        let gh = GhHttp::new().unwrap();
         let task_id = ExternalId("42".to_string());
 
         execute_command(
@@ -619,7 +621,7 @@ mod tests {
         .unwrap();
 
         let task = store.get(store_id).await.unwrap();
-        assert_eq!(task.status, crate::store::TaskStatus::Blocked);
+        assert_eq!(task.status, TaskStatus::Blocked);
         assert_eq!(
             task.block_reason.as_deref(),
             Some("waiting on upstream fix")
@@ -638,7 +640,7 @@ mod tests {
         .unwrap();
 
         let task = store.get(store_id).await.unwrap();
-        assert_eq!(task.status, crate::store::TaskStatus::New);
+        assert_eq!(task.status, TaskStatus::New);
         assert!(task.block_reason.is_none());
     }
 
@@ -664,17 +666,17 @@ mod tests {
             .await
             .unwrap();
         store
-            .update_status(store_id, crate::store::TaskStatus::Done)
+            .update_status(store_id, TaskStatus::Done)
             .await
             .unwrap();
 
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new("58"));
-        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
-            std::sync::Arc::clone(&backend),
-            std::sync::Arc::clone(&store),
+        let task_manager = Arc::new(TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
             "owner/repo".to_string(),
         ));
-        let gh = crate::github::http::GhHttp::new().unwrap();
+        let gh = GhHttp::new().unwrap();
         let task_id = ExternalId("58".to_string());
 
         for command in [
@@ -696,7 +698,7 @@ mod tests {
             assert!(err.to_string().contains("done is terminal"), "got: {err}");
             assert_eq!(
                 store.get(store_id).await.unwrap().status,
-                crate::store::TaskStatus::Done,
+                TaskStatus::Done,
                 "{command} must leave a done task done"
             );
         }
@@ -864,12 +866,12 @@ mod tests {
             vec!["agent:claude".to_string()],
         ));
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
-            std::sync::Arc::clone(&backend),
-            std::sync::Arc::clone(&store),
+        let task_manager = Arc::new(TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
             "owner/repo".to_string(),
         ));
-        let gh = crate::github::http::GhHttp::new().unwrap();
+        let gh = GhHttp::new().unwrap();
         let task_id = ExternalId("42".to_string());
 
         let result = execute_command(
@@ -897,12 +899,12 @@ mod tests {
             vec!["agent:codex".to_string()],
         ));
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
-            std::sync::Arc::clone(&backend),
-            std::sync::Arc::clone(&store),
+        let task_manager = Arc::new(TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
             "owner/repo".to_string(),
         ));
-        let gh = crate::github::http::GhHttp::new().unwrap();
+        let gh = GhHttp::new().unwrap();
         let task_id = ExternalId("42".to_string());
 
         let result = execute_command(
@@ -930,12 +932,12 @@ mod tests {
     async fn block_propagates_resolve_task_id_error() {
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new("42"));
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
-            std::sync::Arc::clone(&backend),
+        let task_manager = Arc::new(TaskManager::with_store(
+            Arc::clone(&backend),
             store,
             "owner/repo".to_string(),
         ));
-        let gh = crate::github::http::GhHttp::new().unwrap();
+        let gh = GhHttp::new().unwrap();
         let task_id = ExternalId("42".to_string());
         let failing_store: Arc<dyn CommandStoreOps> = Arc::new(FailingStore);
 
@@ -964,12 +966,12 @@ mod tests {
     async fn unblock_propagates_resolve_task_id_error() {
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new("42"));
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
-            std::sync::Arc::clone(&backend),
+        let task_manager = Arc::new(TaskManager::with_store(
+            Arc::clone(&backend),
             store,
             "owner/repo".to_string(),
         ));
-        let gh = crate::github::http::GhHttp::new().unwrap();
+        let gh = GhHttp::new().unwrap();
         let task_id = ExternalId("42".to_string());
         let failing_store: Arc<dyn CommandStoreOps> = Arc::new(FailingStore);
 

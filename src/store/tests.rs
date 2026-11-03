@@ -3,8 +3,21 @@
     reason = "the prices and costs are stored constants, so they compare exactly"
 )]
 
+use super::pricing_for_model;
 use super::*;
+use crate::backends::ExternalId;
+use crate::backends::ExternalTask;
+use crate::engine::runner::TaskRunner;
+use crate::store::control::parse_since_duration;
+use chrono::TimeDelta;
+use chrono::Utc;
+use sha2::Digest;
+use sqlx::ConnectOptions;
 use sqlx::Row;
+use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::process;
 use std::sync::Arc;
 
 #[tokio::test]
@@ -550,7 +563,7 @@ async fn helper_store_set_writes_fields() {
         .await
         .unwrap();
 
-    let opt_store = Some(std::sync::Arc::clone(&store));
+    let opt_store = Some(Arc::clone(&store));
     store_set(
         &opt_store,
         "owner/repo",
@@ -581,7 +594,7 @@ async fn helper_store_set_by_id_writes_fields() {
         .await
         .unwrap();
 
-    let opt_store = Some(std::sync::Arc::clone(&store));
+    let opt_store = Some(Arc::clone(&store));
     let _ = store_set_by_id(
         opt_store.as_ref(),
         id,
@@ -624,7 +637,7 @@ async fn helper_store_reset_counters_zeroes_counters() {
         .await
         .unwrap();
 
-    let opt_store = Some(std::sync::Arc::clone(&store));
+    let opt_store = Some(Arc::clone(&store));
     store_increment(&opt_store, "owner/repo", "91", "attempts")
         .await
         .unwrap();
@@ -666,7 +679,7 @@ async fn helper_store_reset_failure_counters_preserves_review_cycles_and_merge_c
         .await
         .unwrap();
 
-    let opt_store = Some(std::sync::Arc::clone(&store));
+    let opt_store = Some(Arc::clone(&store));
     store_increment(&opt_store, "owner/repo", "93", "review_cycles")
         .await
         .unwrap();
@@ -709,7 +722,7 @@ async fn helper_store_increment_by_id_returns_new_value() {
         .await
         .unwrap();
 
-    let opt_store = Some(std::sync::Arc::clone(&store));
+    let opt_store = Some(Arc::clone(&store));
     let v1 = store_increment_by_id(&opt_store, id, "attempts")
         .await
         .unwrap();
@@ -2567,8 +2580,8 @@ async fn status_counts_groups_correctly() {
 async fn ensure_external_task_upserts() {
     let store = TaskStore::open_memory().await.unwrap();
 
-    let ext = crate::backends::ExternalTask {
-        id: crate::backends::ExternalId("42".to_string()),
+    let ext = ExternalTask {
+        id: ExternalId("42".to_string()),
         title: "Test issue".to_string(),
         body: "Body text".to_string(),
         state: "open".to_string(),
@@ -3109,8 +3122,8 @@ async fn list_all_includes_all_statuses() {
 async fn ensure_external_task_updates_on_reupsert() {
     let store = TaskStore::open_memory().await.unwrap();
 
-    let ext1 = crate::backends::ExternalTask {
-        id: crate::backends::ExternalId("42".to_string()),
+    let ext1 = ExternalTask {
+        id: ExternalId("42".to_string()),
         title: "Original title".to_string(),
         body: "Original body".to_string(),
         state: "open".to_string(),
@@ -3127,7 +3140,7 @@ async fn ensure_external_task_updates_on_reupsert() {
         .unwrap();
 
     // Update the title
-    let ext2 = crate::backends::ExternalTask {
+    let ext2 = ExternalTask {
         title: "Updated title".to_string(),
         body: "Updated body".to_string(),
         ..ext1
@@ -3603,9 +3616,6 @@ async fn increment_increases_counter() {
 
 #[tokio::test]
 async fn task_runner_with_store() {
-    use crate::engine::runner::TaskRunner;
-    use std::sync::Arc;
-
     let store = Arc::new(TaskStore::open_memory().await.unwrap());
     // Just verify it compiles and the builder works
     let _runner = TaskRunner::new("owner/repo".to_string()).with_store(store);
@@ -4146,8 +4156,6 @@ async fn status_counts_with_mixed_statuses() {
 
 #[tokio::test]
 async fn ensure_external_task_creates_then_updates() {
-    use crate::backends::{ExternalId, ExternalTask};
-
     let store = TaskStore::open_memory().await.unwrap();
 
     let ext1 = ExternalTask {
@@ -4702,7 +4710,6 @@ async fn kv_increment_independent_keys() {
 
 #[tokio::test]
 async fn insert_and_query_task_metric() {
-    use chrono::Utc;
     let store = TaskStore::open_memory().await.unwrap();
     let now = Utc::now();
 
@@ -4741,7 +4748,6 @@ async fn metrics_summary_empty() {
 
 #[tokio::test]
 async fn metrics_summary_counts_success_and_failure() {
-    use chrono::Utc;
     let store = TaskStore::open_memory().await.unwrap();
     let now = Utc::now();
 
@@ -4879,7 +4885,6 @@ async fn cost_by_model_empty() {
 
 #[tokio::test]
 async fn cost_by_agent_groups_correctly() {
-    use chrono::Utc;
     let store = TaskStore::open_memory().await.unwrap();
     let now = Utc::now();
 
@@ -4918,7 +4923,6 @@ async fn cost_by_agent_groups_correctly() {
 
 #[tokio::test]
 async fn cost_by_model_groups_correctly() {
-    use chrono::Utc;
     let store = TaskStore::open_memory().await.unwrap();
     let now = Utc::now();
 
@@ -5098,7 +5102,6 @@ async fn high_review_cycle_tasks_excludes_old_tasks() {
 
 #[tokio::test]
 async fn error_distribution_groups_by_type() {
-    use chrono::Utc;
     let store = TaskStore::open_memory().await.unwrap();
     let now = Utc::now();
 
@@ -5136,7 +5139,6 @@ async fn error_distribution_groups_by_type() {
 
 #[tokio::test]
 async fn slow_tasks_returns_sorted_by_duration() {
-    use chrono::Utc;
     let store = TaskStore::open_memory().await.unwrap();
     let now = Utc::now();
 
@@ -5179,8 +5181,6 @@ async fn slow_tasks_returns_sorted_by_duration() {
 
 #[test]
 fn pricing_known_models() {
-    use super::pricing_for_model;
-
     let opus = pricing_for_model("claude-opus-4-6");
     assert!((opus.input_per_million_usd - 15.0).abs() < 0.01);
     assert!((opus.output_per_million_usd - 75.0).abs() < 0.01);
@@ -5203,7 +5203,6 @@ fn pricing_known_models() {
 
 #[test]
 fn pricing_unknown_model_returns_fallback() {
-    use super::pricing_for_model;
     let unknown = pricing_for_model("totally-unknown-model");
     assert!((unknown.input_per_million_usd - 1.0).abs() < 0.01);
     assert!((unknown.output_per_million_usd - 4.0).abs() < 0.01);
@@ -5211,8 +5210,6 @@ fn pricing_unknown_model_returns_fallback() {
 
 #[test]
 fn pricing_free_and_subscription_models() {
-    use super::pricing_for_model;
-
     // GitHub Copilot subscription — $0
     let copilot_sonnet = pricing_for_model("github-copilot/claude-sonnet-4-6");
     assert_eq!(copilot_sonnet.input_per_million_usd, 0.0);
@@ -5248,7 +5245,6 @@ fn pricing_free_and_subscription_models() {
 
 #[tokio::test]
 async fn cost_summary_returns_three_periods() {
-    use chrono::Utc;
     let store = TaskStore::open_memory().await.unwrap();
     let now = Utc::now();
 
@@ -6262,7 +6258,6 @@ async fn subscribe_with_topic_id_preserved() {
 
 #[tokio::test]
 async fn cost_summary_by_repo_isolates_per_repo() {
-    use chrono::Utc;
     let store = TaskStore::open_memory().await.unwrap();
     let now = Utc::now();
 
@@ -6343,7 +6338,6 @@ async fn cost_summary_by_repo_isolates_per_repo() {
 
 #[tokio::test]
 async fn cost_summary_by_repo_falls_back_to_tasks_join() {
-    use chrono::Utc;
     let store = TaskStore::open_memory().await.unwrap();
     let now = Utc::now();
 
@@ -6387,10 +6381,9 @@ async fn cost_summary_by_repo_falls_back_to_tasks_join() {
 
 #[tokio::test]
 async fn cost_summary_by_repo_uses_requested_window_label() {
-    use chrono::{Duration, Utc};
     let store = TaskStore::open_memory().await.unwrap();
     let now = Utc::now();
-    let eight_days_ago = now - Duration::days(8);
+    let eight_days_ago = now - TimeDelta::days(8);
 
     store
         .insert_task_metric(&InsertTaskMetric {
@@ -6793,7 +6786,6 @@ async fn resolve_task_id_fallback_respects_repo() {
 
 #[test]
 fn parse_since_duration_days() {
-    use crate::store::control::parse_since_duration;
     let ts = parse_since_duration("7d").unwrap();
     // The timestamp must be a well-formed RFC3339 string (e.g. 2026-03-18T09:56:02Z).
     assert_eq!(ts.len(), 20, "unexpected length: {ts:?}");
@@ -6809,21 +6801,18 @@ fn parse_since_duration_days() {
 
 #[test]
 fn parse_since_duration_hours() {
-    use crate::store::control::parse_since_duration;
     let ts = parse_since_duration("24h").unwrap();
     assert_eq!(ts.len(), 20);
 }
 
 #[test]
 fn parse_since_duration_minutes() {
-    use crate::store::control::parse_since_duration;
     let ts = parse_since_duration("30m").unwrap();
     assert_eq!(ts.len(), 20);
 }
 
 #[test]
 fn parse_since_duration_invalid() {
-    use crate::store::control::parse_since_duration;
     assert!(parse_since_duration("abc").is_err());
     assert!(parse_since_duration("7").is_err());
     assert!(parse_since_duration("").is_err());
@@ -6834,8 +6823,6 @@ fn parse_since_duration_invalid() {
 
 #[tokio::test]
 async fn control_list_messages_since_filters_old() {
-    use crate::store::control::parse_since_duration;
-
     let store = TaskStore::open_memory().await.unwrap();
 
     // Insert a message with a timestamp far in the past.
@@ -6892,8 +6879,6 @@ async fn control_list_messages_since_filters_old() {
 
 #[tokio::test]
 async fn control_search_messages_since_filters_old() {
-    use crate::store::control::parse_since_duration;
-
     let store = TaskStore::open_memory().await.unwrap();
 
     // Insert an old matching message.
@@ -6979,7 +6964,7 @@ async fn migrations_run_on_fresh_db() {
 #[tokio::test]
 async fn migrations_are_idempotent() {
     // Use a file-based temp DB so we can close and reopen it
-    let tmp = std::env::temp_dir().join(format!("orch-migration-test-{}.db", std::process::id()));
+    let tmp = env::temp_dir().join(format!("orch-migration-test-{}.db", process::id()));
 
     // First open: runs all migrations
     {
@@ -6998,9 +6983,9 @@ async fn migrations_are_idempotent() {
     }
 
     // Cleanup
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
-    let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+    let _ = fs::remove_file(&tmp);
+    let _ = fs::remove_file(tmp.with_extension("db-shm"));
+    let _ = fs::remove_file(tmp.with_extension("db-wal"));
 }
 
 /**
@@ -7012,12 +6997,10 @@ async fn migrations_are_idempotent() {
  **/
 #[tokio::test]
 async fn migrations_match_committed_checksums() {
-    use sha2::Digest;
-
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
-    let committed = std::fs::read_to_string(dir.join("checksums.txt"))
-        .expect("migrations/checksums.txt must exist");
-    let mut expected: std::collections::HashMap<String, String> = committed
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let committed =
+        fs::read_to_string(dir.join("checksums.txt")).expect("migrations/checksums.txt must exist");
+    let mut expected: HashMap<String, String> = committed
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| {
@@ -7027,14 +7010,14 @@ async fn migrations_match_committed_checksums() {
         .collect();
 
     let mut actual_count = 0;
-    for entry in std::fs::read_dir(&dir).unwrap() {
+    for entry in fs::read_dir(&dir).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().and_then(|e| e.to_str()) != Some("sql") {
             continue;
         }
         actual_count += 1;
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        let sum = format!("{:x}", sha2::Sha256::digest(std::fs::read(&path).unwrap()));
+        let sum = format!("{:x}", sha2::Sha256::digest(fs::read(&path).unwrap()));
         let committed_sum = expected.remove(&name).unwrap_or_else(|| {
             panic!(
                 "{name} has no entry in checksums.txt, append its checksum when adding a migration"
@@ -7315,8 +7298,6 @@ fn task_cols_count_matches_task_cols_string() {
 /// from reaching production.
 #[tokio::test]
 async fn task_cols_count_matches_schema() {
-    use sqlx::Row as _;
-
     let store = TaskStore::open_memory().await.unwrap();
 
     let row = sqlx::query("SELECT COUNT(*) as cnt FROM pragma_table_info('tasks')")
@@ -7520,11 +7501,10 @@ async fn move_repo_refuses_when_target_has_tasks() {
     assert_eq!(n, 1);
 }
 
-async fn locking_connection(path: &std::path::Path) -> sqlx::SqliteConnection {
-    use sqlx::ConnectOptions;
+async fn locking_connection(path: &Path) -> sqlx::SqliteConnection {
     SqliteConnectOptions::new()
         .filename(path)
-        .busy_timeout(std::time::Duration::ZERO)
+        .busy_timeout(Duration::ZERO)
         .connect()
         .await
         .unwrap()
@@ -7569,7 +7549,7 @@ async fn a_store_write_waits_for_another_connection_lock() {
         .await
         .unwrap();
     let release = tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        time::sleep(Duration::from_millis(300)).await;
         sqlx::query("COMMIT").execute(&mut other).await.unwrap();
     });
 

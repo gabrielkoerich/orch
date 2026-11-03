@@ -1,17 +1,42 @@
+use crate::backends::ExternalTask;
+use crate::backends::github::GitHubBackend;
 use crate::backends::{ExternalBackend, ExternalId, Status};
+use crate::cli;
 use crate::cli::init_task_manager;
+use crate::cli::task_ref;
+use crate::cli::tree::TreeNode;
+use crate::cli::tree::build_forest;
+use crate::cli::tree::render_forest;
+use crate::cli::tree::render_single_tree;
 use crate::cmd::SyncCommandErrorContext;
 use crate::config;
+use crate::engine;
+use crate::engine::cleanup;
+use crate::engine::dependencies;
+use crate::engine::dependencies::parse_depends_on_token;
+use crate::engine::priority::Priority;
+use crate::engine::priority::is_priority_label;
 use crate::engine::router::Router;
+use crate::engine::router::get_route_result;
 use crate::engine::runner::TaskRunner;
+use crate::engine::runner::agents::patterns;
+use crate::engine::tasks::store_task_to_external;
 use crate::engine::tasks::{CreateTaskRequest, Task, TaskFilter, TaskType, status_to_task_status};
 use crate::home;
 use crate::store;
+use crate::store::BlockerSnapshot;
+use crate::store::DepSource;
+use crate::store::NewDependency;
+use crate::store::TaskStatus;
 use crate::store::TaskStore;
+use crate::store::UpsertExternal;
 use crate::tmux::TmuxManager;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
+use std::collections::HashMap;
+use std::fs;
+use std::process::Command;
 use std::sync::Arc;
 
 /// Format a timestamp as a human-readable age (e.g. "5m", "2h", "3d").
@@ -155,7 +180,7 @@ async fn refuse_external_claim(
     external_id: &str,
 ) -> anyhow::Result<()> {
     if let Some(id) = store.resolve_task_id(repo, external_id).await? {
-        crate::engine::dependencies::refuse_if_waiting(store, id).await?;
+        dependencies::refuse_if_waiting(store, id).await?;
     }
     Ok(())
 }
@@ -165,7 +190,7 @@ async fn refuse_external_claim(
 /// Done is terminal: a done task keeps the body it was created with, so
 /// reviving one re-runs a prompt that may be months stale (#3780)
 fn refuse_if_done(resolved: &store::CliTaskRef, action: &str) -> anyhow::Result<()> {
-    if resolved.status != crate::store::TaskStatus::Done.as_str() {
+    if resolved.status != TaskStatus::Done.as_str() {
         return Ok(());
     }
     anyhow::bail!(
@@ -176,7 +201,7 @@ fn refuse_if_done(resolved: &store::CliTaskRef, action: &str) -> anyhow::Result<
 
 /// True when the task still has an open dependency and must stay `waiting`.
 async fn release_or_keep_waiting(store: &TaskStore, task_id: i64) -> anyhow::Result<bool> {
-    Ok(store.status_after_unblock(task_id).await? == crate::store::TaskStatus::Waiting)
+    Ok(store.status_after_unblock(task_id).await? == TaskStatus::Waiting)
 }
 
 /// List tasks with optional filters.
@@ -208,26 +233,25 @@ pub async fn list(
         return Ok(());
     }
 
-    let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
+    let store: Option<Arc<TaskStore>> = cli::init_store().await.ok().map(Arc::new);
     let repo = config::get_current_repo().unwrap_or_default();
 
     // Preload all store tasks for this repo into a map keyed by external_id.
     // This avoids 4 SQL queries per external task (resolve_id + get, twice for agent and attempts).
-    let store_by_ext_id: std::collections::HashMap<String, crate::store::Task> =
-        if let Some(ref s) = store {
-            s.list_all(&repo)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|t| t.external_id.clone().map(|eid| (eid, t)))
-                .collect()
-        } else {
-            std::collections::HashMap::new()
-        };
+    let store_by_ext_id: HashMap<String, store::Task> = if let Some(ref s) = store {
+        s.list_all(&repo)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|t| t.external_id.clone().map(|eid| (eid, t)))
+            .collect()
+    } else {
+        HashMap::new()
+    };
     let waiting_on = if let Some(ref s) = store {
         s.unmet_labels_by_task().await.unwrap_or_default()
     } else {
-        std::collections::HashMap::new()
+        HashMap::new()
     };
 
     println!(
@@ -279,7 +303,7 @@ pub async fn list(
                     "-".to_string()
                 };
                 let blockers = waiting_on.get(&int.id).map_or(&[][..], Vec::as_slice);
-                let title = if int.status == crate::store::TaskStatus::Blocked {
+                let title = if int.status == TaskStatus::Blocked {
                     if let Some(ref reason) = int.block_reason {
                         format!("{} [blocked: {}]", int.title, reason)
                     } else {
@@ -316,7 +340,7 @@ async fn list_from_global_store(
     source: Option<String>,
     project: Option<&str>,
 ) -> anyhow::Result<()> {
-    let Ok(store) = crate::cli::init_store().await else {
+    let Ok(store) = cli::init_store().await else {
         println!("No tasks found.");
         return Ok(());
     };
@@ -325,7 +349,7 @@ async fn list_from_global_store(
         if status_str == "all" {
             store.list_all_global().await?
         } else {
-            let task_status = crate::store::TaskStatus::from_str(status_str)
+            let task_status = TaskStatus::from_str(status_str)
                 .ok_or_else(|| anyhow::anyhow!(
                     "invalid status: '{status_str}'. allowed: new, routed, in_progress, needs_review, in_review, approved, blocked, waiting, done, all"
                 ))?;
@@ -377,7 +401,7 @@ async fn list_from_global_store(
             "-".to_string()
         };
         let blockers = waiting_on.get(&task.id).map_or(&[][..], Vec::as_slice);
-        let title = if task.status == crate::store::TaskStatus::Blocked {
+        let title = if task.status == TaskStatus::Blocked {
             if let Some(ref reason) = task.block_reason {
                 format!("{} [blocked: {}]", task.title, reason)
             } else {
@@ -445,13 +469,9 @@ pub async fn add(
 }
 
 async fn link_created_dependencies(
-    task: &crate::backends::ExternalTask,
+    task: &ExternalTask,
     depends_on: &[String],
 ) -> anyhow::Result<()> {
-    use crate::backends::github::GitHubBackend;
-    use crate::engine::dependencies::parse_depends_on_token;
-    use crate::store::{DepSource, NewDependency, UpsertExternal};
-
     let repo =
         config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
     let issue_number: i64 = task
@@ -460,7 +480,7 @@ async fn link_created_dependencies(
         .parse()
         .with_context(|| format!("created issue id '{}' is not a number", task.id.0))?;
     let backend = GitHubBackend::new(repo.clone())?;
-    let store = crate::cli::init_store().await?;
+    let store = cli::init_store().await?;
     let store_id = store
         .upsert_external(&UpsertExternal {
             repo: &repo,
@@ -503,11 +523,8 @@ async fn link_created_dependencies(
 
 /// Get task details by ID.
 pub async fn get(id: &str) -> anyhow::Result<()> {
-    use crate::backends::github::GitHubBackend;
-    use crate::engine::tasks::store_task_to_external;
-
-    let store = crate::cli::init_store().await?;
-    let resolved = crate::cli::task_ref::resolve(&store, id).await?;
+    let store = cli::init_store().await?;
+    let resolved = task_ref::resolve(&store, id).await?;
     let store_arc: Option<Arc<TaskStore>> = Some(Arc::new(store.clone()));
     let repo = resolved.repo.clone();
 
@@ -529,7 +546,7 @@ pub async fn get(id: &str) -> anyhow::Result<()> {
         if let Some(reason) = &int.block_reason {
             println!("Block reason: {reason}");
         }
-        if int.status == crate::store::TaskStatus::Waiting {
+        if int.status == TaskStatus::Waiting {
             let blockers = store.unmet_blocker_labels(int.id).await.unwrap_or_default();
             if !blockers.is_empty() {
                 println!("Waiting on: {}", blockers.join(", "));
@@ -620,7 +637,7 @@ pub async fn get(id: &str) -> anyhow::Result<()> {
         if !t.last_error.is_empty() {
             println!("Last error: {}", truncate_err(&t.last_error, 200));
         }
-        if t.status == crate::store::TaskStatus::Waiting {
+        if t.status == TaskStatus::Waiting {
             let blockers = s.unmet_blocker_labels(t.id).await.unwrap_or_default();
             if !blockers.is_empty() {
                 println!("Waiting on: {}", blockers.join(", "));
@@ -643,8 +660,6 @@ pub async fn get(id: &str) -> anyhow::Result<()> {
 
 /// Show task status summary.
 pub async fn status(json: bool) -> anyhow::Result<()> {
-    use crate::store::TaskStatus;
-
     let task_manager = init_task_manager().await?;
 
     let statuses = [
@@ -695,7 +710,7 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
         .collect();
 
     // Calculate total cost using a single aggregate query instead of per-task lookups.
-    let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
+    let store: Option<Arc<TaskStore>> = cli::init_store().await.ok().map(Arc::new);
     let repo = config::get_current_repo().unwrap_or_default();
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
@@ -720,7 +735,7 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
     // KV for this one. Stale entries read as expired and are dropped.
     let rate_limited_until = match store.as_ref() {
         Some(s) => s
-            .kv_get(crate::engine::RATE_LIMITED_UNTIL_KEY)
+            .kv_get(engine::RATE_LIMITED_UNTIL_KEY)
             .await
             .ok()
             .flatten()
@@ -776,7 +791,7 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
         if let Some(reset_at) = rate_limited_until {
             println!(
                 "GitHub: rate limited until {}",
-                crate::engine::format_rate_limited_until(reset_at)
+                engine::format_rate_limited_until(reset_at)
             );
             println!();
         }
@@ -817,13 +832,8 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
 
 /// Route a task to an agent.
 pub async fn route(id: &str) -> anyhow::Result<()> {
-    use crate::backends::ExternalBackend;
-    use crate::backends::github::GitHubBackend;
-    use crate::engine::tasks::store_task_to_external;
-    use crate::store::TaskStatus;
-
-    let store: Arc<TaskStore> = Arc::new(crate::cli::init_store().await?);
-    let resolved = crate::cli::task_ref::resolve(&store, id).await?;
+    let store: Arc<TaskStore> = Arc::new(cli::init_store().await?);
+    let resolved = task_ref::resolve(&store, id).await?;
     let repo = resolved.repo.clone();
     let ext_id = ExternalId(resolved.external_id.clone());
 
@@ -831,7 +841,7 @@ pub async fn route(id: &str) -> anyhow::Result<()> {
         let store_id = resolved
             .store_id
             .context("internal task missing store id")?;
-        crate::engine::dependencies::refuse_if_waiting(&store, store_id).await?;
+        dependencies::refuse_if_waiting(&store, store_id).await?;
         (
             store_task_to_external(&store.get(store_id).await?),
             None::<Arc<dyn ExternalBackend>>,
@@ -873,15 +883,10 @@ pub async fn route(id: &str) -> anyhow::Result<()> {
 
 /// Run a task (manual execution).
 pub async fn run(id: Option<String>) -> anyhow::Result<()> {
-    use crate::backends::ExternalBackend;
-    use crate::backends::github::GitHubBackend;
-    use crate::engine::router::get_route_result;
-    use crate::store::TaskStatus;
-
-    let store: Arc<TaskStore> = Arc::new(crate::cli::init_store().await?);
+    let store: Arc<TaskStore> = Arc::new(cli::init_store().await?);
 
     let (repo, task_id, backend) = if let Some(id) = id {
-        let resolved = crate::cli::task_ref::resolve(&store, &id).await?;
+        let resolved = task_ref::resolve(&store, &id).await?;
         let backend: Option<Arc<dyn ExternalBackend>> = if resolved.is_internal() {
             None
         } else {
@@ -950,14 +955,10 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
 /// When `agent` is provided, the task is force-routed to that agent/model and
 /// set directly to `Routed` status, bypassing the router entirely.
 pub async fn retry(id: &str, agent: Option<String>, model: Option<String>) -> anyhow::Result<()> {
-    use crate::backends::ExternalBackend;
-    use crate::backends::github::GitHubBackend;
-    use crate::store::TaskStatus;
-
-    let s = Arc::new(crate::cli::init_store().await?);
-    let resolved = crate::cli::task_ref::resolve(&s, id).await?;
+    let s = Arc::new(cli::init_store().await?);
+    let resolved = task_ref::resolve(&s, id).await?;
     refuse_if_done(&resolved, "retry")?;
-    let store = Some(std::sync::Arc::clone(&s));
+    let store = Some(Arc::clone(&s));
     let repo = resolved.repo.clone();
     let shown = resolved.display_spec();
 
@@ -965,7 +966,7 @@ pub async fn retry(id: &str, agent: Option<String>, model: Option<String>) -> an
         let store_id = resolved
             .store_id
             .context("internal task missing store id")?;
-        crate::engine::dependencies::refuse_if_waiting(&s, store_id).await?;
+        dependencies::refuse_if_waiting(&s, store_id).await?;
         store::store_reset_counters(&store, &repo, &resolved.external_id).await;
 
         if let Some(ref forced_agent) = agent {
@@ -1038,15 +1039,11 @@ fn retry_force_fields<'a>(
 
 /// Unblock a task or all blocked tasks.
 pub async fn unblock(id: &str) -> anyhow::Result<()> {
-    use crate::backends::ExternalBackend;
-    use crate::backends::github::GitHubBackend;
-    use crate::store::TaskStatus;
-
     if id == "all" {
         let repo =
             config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
         let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
-        let store = crate::cli::init_store().await.ok().map(std::sync::Arc::new);
+        let store = cli::init_store().await.ok().map(Arc::new);
         let blocked = backend.list_by_status(Status::Blocked).await?;
         let needs_review = backend.list_by_status(Status::NeedsReview).await?;
 
@@ -1054,7 +1051,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
         let external_count = tasks_to_unblock.len();
         let ext_futs = tasks_to_unblock.into_iter().map(|task| {
             let store = store.clone();
-            let backend = std::sync::Arc::clone(&backend);
+            let backend = Arc::clone(&backend);
             let repo = repo.clone();
             let id = task.id.clone();
             async move {
@@ -1095,7 +1092,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
             internal_count = tasks_internal.len();
             let int_futs = tasks_internal.into_iter().map(|task| {
                 let store = store.clone();
-                let s = std::sync::Arc::clone(s);
+                let s = Arc::clone(s);
                 let repo = repo.clone();
                 let ext_id = task
                     .external_id
@@ -1122,10 +1119,10 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let s = Arc::new(crate::cli::init_store().await?);
-    let resolved = crate::cli::task_ref::resolve(&s, id).await?;
+    let s = Arc::new(cli::init_store().await?);
+    let resolved = task_ref::resolve(&s, id).await?;
     refuse_if_done(&resolved, "unblock")?;
-    let store = Some(std::sync::Arc::clone(&s));
+    let store = Some(Arc::clone(&s));
     let repo = resolved.repo.clone();
     let shown = resolved.display_spec();
 
@@ -1164,11 +1161,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
 /// Sessions are killed first (before worktree removal) so that the tmux-active
 /// guard in `cleanup_task_worktree_with_opts` does not skip the removal.
 /// Errors are logged but do not fail the close operation.
-async fn cleanup_sessions_and_worktree(
-    task_id: &str,
-    repo: &str,
-    store: Option<&Arc<crate::store::TaskStore>>,
-) {
+async fn cleanup_sessions_and_worktree(task_id: &str, repo: &str, store: Option<&Arc<TaskStore>>) {
     let tmux = TmuxManager::new();
 
     // Session names follow `orch-{project}-{task_id}` and optionally
@@ -1208,7 +1201,7 @@ async fn cleanup_sessions_and_worktree(
 
     // Remove the worktree (sessions are already gone so the tmux guard won't block).
     if let Some(s) = store {
-        match crate::engine::cleanup::cleanup_task_worktree(task_id, repo, s).await {
+        match cleanup::cleanup_task_worktree(task_id, repo, s).await {
             Ok(()) => {}
             Err(e) => {
                 tracing::warn!(task_id, err = %e, "worktree cleanup failed after task close");
@@ -1219,12 +1212,8 @@ async fn cleanup_sessions_and_worktree(
 
 /// Mark a task as done (without running an agent).
 pub async fn close(id: &str, note: Option<&str>) -> anyhow::Result<()> {
-    use crate::backends::ExternalBackend;
-    use crate::backends::github::GitHubBackend;
-    use crate::store::TaskStatus;
-
-    let s = crate::cli::init_store().await?;
-    let resolved = crate::cli::task_ref::resolve(&s, id).await?;
+    let s = cli::init_store().await?;
+    let resolved = task_ref::resolve(&s, id).await?;
     let store = Some(Arc::new(s.clone()));
     let repo = resolved.repo.clone();
     let shown = resolved.display_spec();
@@ -1254,13 +1243,9 @@ pub async fn close(id: &str, note: Option<&str>) -> anyhow::Result<()> {
 
 /// Set a task's priority label, on GitHub for external tasks and in the store for all.
 pub async fn priority(id: &str, level: &str) -> anyhow::Result<()> {
-    use crate::backends::ExternalBackend;
-    use crate::backends::github::GitHubBackend;
-    use crate::engine::priority::{Priority, is_priority_label};
-
     let wanted: Priority = level.parse()?;
-    let s = crate::cli::init_store().await?;
-    let resolved = crate::cli::task_ref::resolve(&s, id).await?;
+    let s = cli::init_store().await?;
+    let resolved = task_ref::resolve(&s, id).await?;
     let store_id = resolved.store_id.context("task missing store id")?;
     let task = s.get(store_id).await?;
 
@@ -1290,11 +1275,11 @@ pub async fn priority(id: &str, level: &str) -> anyhow::Result<()> {
 
 /// Attach to a running agent's tmux session.
 pub async fn attach(id: &str) -> anyhow::Result<()> {
-    let store = crate::cli::init_store().await?;
-    let task = crate::cli::task_ref::resolve(&store, id).await?;
+    let store = cli::init_store().await?;
+    let task = task_ref::resolve(&store, id).await?;
     let tmux = TmuxManager::new();
     let session = tmux.session_name(&task.repo, &task.external_id);
-    let status = std::process::Command::new("tmux")
+    let status = Command::new("tmux")
         .args(["attach-session", "-t", &session])
         .status_with_context()?;
 
@@ -1314,7 +1299,7 @@ pub async fn live() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
+    let store: Option<Arc<TaskStore>> = cli::init_store().await.ok().map(Arc::new);
     let repo = config::get_current_repo().unwrap_or_default();
 
     println!("{:<30} {:<15} {:<10} ACTIVE", "SESSION", "TASK", "AGENT");
@@ -1349,8 +1334,8 @@ pub async fn live() -> anyhow::Result<()> {
 
 /// Kill a running agent tmux session.
 pub async fn kill(id: &str) -> anyhow::Result<()> {
-    let store = crate::cli::init_store().await?;
-    let task = crate::cli::task_ref::resolve(&store, id).await?;
+    let store = cli::init_store().await?;
+    let task = task_ref::resolve(&store, id).await?;
     let tmux = TmuxManager::new();
     let session = tmux.session_name(&task.repo, &task.external_id);
     if let Some(store_id) = task.store_id {
@@ -1379,9 +1364,6 @@ pub async fn cost(id: &str) -> anyhow::Result<()> {
 
 /// Show task tree view (parent-child relationships).
 pub async fn tree(id: Option<i64>, deps: bool) -> anyhow::Result<()> {
-    use crate::cli::tree::{build_forest, render_forest, render_single_tree};
-    use crate::engine::tasks::TaskFilter;
-
     if deps {
         return dependency_tree(id).await;
     }
@@ -1391,10 +1373,7 @@ pub async fn tree(id: Option<i64>, deps: bool) -> anyhow::Result<()> {
     // If a specific task ID is provided, show just that tree
     if let Some(task_id) = id {
         // Find the requested task in the forest
-        fn find_node_in_forest<'a>(
-            forest: &'a [crate::cli::tree::TreeNode],
-            id: &str,
-        ) -> Option<&'a crate::cli::tree::TreeNode> {
+        fn find_node_in_forest<'a>(forest: &'a [TreeNode], id: &str) -> Option<&'a TreeNode> {
             for root in forest {
                 if root.id == id {
                     return Some(root);
@@ -1421,12 +1400,12 @@ pub async fn tree(id: Option<i64>, deps: bool) -> anyhow::Result<()> {
             // Task exists but not in any tree - show as standalone
             match &task {
                 Task::External(ext) => {
-                    let node = crate::cli::tree::TreeNode::from_external(ext);
+                    let node = TreeNode::from_external(ext);
                     let output = render_single_tree(&node, true);
                     print!("{output}");
                 }
                 Task::Internal(int) => {
-                    let node = crate::cli::tree::TreeNode::from_internal(int);
+                    let node = TreeNode::from_internal(int);
                     let output = render_single_tree(&node, true);
                     print!("{output}");
                 }
@@ -1452,11 +1431,9 @@ pub async fn tree(id: Option<i64>, deps: bool) -> anyhow::Result<()> {
 }
 
 async fn dependency_tree(focus: Option<i64>) -> anyhow::Result<()> {
-    use std::collections::HashMap;
-
-    let store = crate::cli::init_store().await?;
+    let store = cli::init_store().await?;
     let focus_id = match focus {
-        Some(id) => Some(crate::cli::task_ref::resolve_store_id(&store, &id.to_string()).await?),
+        Some(id) => Some(task_ref::resolve_store_id(&store, &id.to_string()).await?),
         None => None,
     };
     let edges = store.list_dependency_edges().await?;
@@ -1505,7 +1482,7 @@ async fn dependency_tree(focus: Option<i64>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn blocker_state_label(snap: Option<&crate::store::BlockerSnapshot>) -> String {
+fn blocker_state_label(snap: Option<&BlockerSnapshot>) -> String {
     match snap {
         Some(snap) => snap
             .unsatisfied_reason()
@@ -1516,8 +1493,8 @@ fn blocker_state_label(snap: Option<&crate::store::BlockerSnapshot>) -> String {
 
 /// List what a task waits on, and what waits on it.
 pub async fn deps(id: &str) -> anyhow::Result<()> {
-    let store = crate::cli::init_store().await?;
-    let task_id = crate::cli::task_ref::resolve_store_id(&store, id).await?;
+    let store = cli::init_store().await?;
+    let task_id = task_ref::resolve_store_id(&store, id).await?;
     let task = store.get(task_id).await?;
     let shown = task
         .external_id
@@ -1565,8 +1542,8 @@ pub async fn deps(id: &str) -> anyhow::Result<()> {
 
 /// Show logs / post-mortem for a task (internal or external).
 pub async fn logs(id: &str) -> anyhow::Result<()> {
-    let store_owned = crate::cli::init_store().await?;
-    let resolved = crate::cli::task_ref::resolve(&store_owned, id).await?;
+    let store_owned = cli::init_store().await?;
+    let resolved = task_ref::resolve(&store_owned, id).await?;
     let store: Option<Arc<TaskStore>> = Some(Arc::new(store_owned.clone()));
     let repo = resolved.repo.clone();
     let task_key = resolved.external_id.clone();
@@ -1675,9 +1652,9 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
                 let exit_file = attempt_dir.join("exit.txt");
 
                 if output_file.exists()
-                    && let Ok(content) = std::fs::read_to_string(&output_file)
+                    && let Ok(content) = fs::read_to_string(&output_file)
                 {
-                    let tail = crate::engine::runner::agents::patterns::safe_tail(&content, 2000);
+                    let tail = patterns::safe_tail(&content, 2000);
                     let truncated = if content.len() > 2000 {
                         format!(
                             "...({} chars truncated)...\n{}",
@@ -1692,7 +1669,7 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
                 }
 
                 if exit_file.exists()
-                    && let Ok(exit_code) = std::fs::read_to_string(&exit_file)
+                    && let Ok(exit_code) = fs::read_to_string(&exit_file)
                 {
                     println!("Exit code: {}", exit_code.trim());
                 }
@@ -1708,7 +1685,7 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
     if let Ok(review_attempt_dir) = home::task_attempt_dir(&repo, &review_task_id, 1) {
         let review_output_file = review_attempt_dir.join("output.json");
         if review_output_file.exists()
-            && let Ok(content) = std::fs::read_to_string(&review_output_file)
+            && let Ok(content) = fs::read_to_string(&review_output_file)
         {
             println!("\n--- Review agent output ---");
             println!("{content}");
@@ -1716,7 +1693,7 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
     }
 
     // Show audit trail from task_runs table (if available in store)
-    if let Ok(store) = crate::cli::init_store().await
+    if let Ok(store) = cli::init_store().await
         && let Ok(Some(store_id)) = store.resolve_task_id(&repo, &task_key).await
         && let Ok(runs) = store.get_runs(store_id).await
         && !runs.is_empty()
@@ -1766,8 +1743,8 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
 
 /// Show run history for a task.
 pub async fn runs(id: &str, verbose: bool) -> anyhow::Result<()> {
-    let store = crate::cli::init_store().await?;
-    let task_id = crate::cli::task_ref::resolve_store_id(&store, id).await?;
+    let store = cli::init_store().await?;
+    let task_id = task_ref::resolve_store_id(&store, id).await?;
 
     let runs = store.get_runs(task_id).await?;
     if runs.is_empty() {
@@ -1818,8 +1795,8 @@ pub async fn runs(id: &str, verbose: bool) -> anyhow::Result<()> {
 
 /// Show lifecycle activity timeline for a task.
 pub async fn activity_log(id: &str, limit: Option<usize>, json: bool) -> anyhow::Result<()> {
-    let store = crate::cli::init_store().await?;
-    let task_id = crate::cli::task_ref::resolve_store_id(&store, id).await?;
+    let store = cli::init_store().await?;
+    let task_id = task_ref::resolve_store_id(&store, id).await?;
 
     let events = store.get_activity(task_id, limit).await?;
     if events.is_empty() {
@@ -1860,8 +1837,8 @@ pub async fn activity_log(id: &str, limit: Option<usize>, json: bool) -> anyhow:
 
 /// Show task routing history with attempt timeline.
 pub async fn history(id: &str) -> anyhow::Result<()> {
-    let store = crate::cli::init_store().await?;
-    let task_id = crate::cli::task_ref::resolve_store_id(&store, id).await?;
+    let store = cli::init_store().await?;
+    let task_id = task_ref::resolve_store_id(&store, id).await?;
 
     let task = store.get(task_id).await?;
     let events = store.get_activity(task_id, None).await?;
@@ -1963,8 +1940,8 @@ pub async fn history(id: &str) -> anyhow::Result<()> {
 
 /// Unified diagnostic view for a task: status, agent, attempts, last error, PR, block reason.
 pub async fn inspect(id: &str) -> anyhow::Result<()> {
-    let store = crate::cli::init_store().await?;
-    let task_id = crate::cli::task_ref::resolve_store_id(&store, id).await?;
+    let store = cli::init_store().await?;
+    let task_id = task_ref::resolve_store_id(&store, id).await?;
 
     let task = store.get(task_id).await?;
 
@@ -1978,9 +1955,9 @@ pub async fn inspect(id: &str) -> anyhow::Result<()> {
     println!("  Status  : {}", task.status.as_str());
     println!(
         "  Priority: {}",
-        crate::engine::priority::Priority::from_labels(&task.labels).as_str()
+        Priority::from_labels(&task.labels).as_str()
     );
-    if task.status == crate::store::TaskStatus::Waiting {
+    if task.status == TaskStatus::Waiting {
         let blockers = store
             .unmet_blocker_labels(task.id)
             .await

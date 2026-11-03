@@ -6,6 +6,7 @@ use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
+use tokio::time;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
 const CURSOR_KEY: &str = "relay_cursor";
@@ -44,7 +45,7 @@ pub async fn run(url: String, token: String, store: Arc<TaskStore>, notify: Arc<
         }
 
         let wait = retry_after(backoff, started.elapsed());
-        tokio::time::sleep(Duration::from_secs(wait)).await;
+        time::sleep(Duration::from_secs(wait)).await;
         backoff = (wait * 2).min(MAX_BACKOFF_SECS);
     }
 }
@@ -68,17 +69,16 @@ async fn session(
     request
         .headers_mut()
         .insert("authorization", format!("Bearer {token}").parse()?);
-    let (mut ws, _) =
-        tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
-            .await
-            .map_err(|_| anyhow::anyhow!("relay connect timed out"))??;
+    let (mut ws, _) = time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
+        .await
+        .map_err(|_| anyhow::anyhow!("relay connect timed out"))??;
 
     let after = cursor(store).await;
     let hello = serde_json::json!({ "v": 1, "type": "hello", "after": after });
     ws.send(Message::Text(hello.to_string())).await?;
     tracing::info!(after, "relay stream connected");
 
-    let mut ping = tokio::time::interval(ping_every);
+    let mut ping = time::interval(ping_every);
     ping.tick().await;
     // True from a ping until any message arrives, so a socket that stays silent for a whole
     // interval after a ping is dead
@@ -168,10 +168,14 @@ pub(crate) async fn handle(text: &str, store: &TaskStore, notify: &Notify) {
 
 #[cfg(test)]
 mod tests {
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::handshake::server::Request;
+    use tokio_tungstenite::tungstenite::handshake::server::Response;
+
     use super::*;
 
     async fn woke(notify: &Notify) -> bool {
-        tokio::time::timeout(Duration::from_millis(200), notify.notified())
+        time::timeout(Duration::from_millis(200), notify.notified())
             .await
             .is_ok()
     }
@@ -250,9 +254,7 @@ mod tests {
     )]
     #[tokio::test]
     async fn a_session_says_hello_with_the_cursor_and_applies_events() {
-        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
@@ -302,7 +304,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_silent_server_ends_the_session_with_an_error() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
@@ -311,7 +313,7 @@ mod tests {
         });
 
         let store = TaskStore::open_memory().await.unwrap();
-        let err = tokio::time::timeout(
+        let err = time::timeout(
             Duration::from_secs(5),
             session(
                 &format!("http://{addr}"),

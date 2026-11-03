@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::sync::Mutex;
+
 use crate::backends::{ExternalId, Status};
 use crate::channels::capture::CaptureService;
 use crate::channels::routing::ChannelRouter;
@@ -21,6 +23,10 @@ use crate::store::TaskStatus;
 use crate::tmux::TmuxManager;
 
 use super::EngineRef;
+use crate::channels::stream::fanout_output;
+use crate::channels::tmux;
+use crate::channels::transport;
+use crate::control;
 
 // ── Project picker ─────────────────────────────────────────────────────────
 
@@ -56,7 +62,7 @@ impl PendingPick {
 ///
 /// The key uses the original user message ID so that the callback_data embedded in
 /// button payloads (`pick:<original_msg_id>:<repo>`) maps back unambiguously.
-pub type PendingPicks = Arc<tokio::sync::Mutex<HashMap<String, PendingPick>>>;
+pub type PendingPicks = Arc<Mutex<HashMap<String, PendingPick>>>;
 
 /// Parse a pick callback body of the form `"pick:<original_msg_id>:<repo>"`.
 ///
@@ -162,25 +168,23 @@ pub(super) async fn forward_to_tmux(
     text: &str,
 ) {
     match transport.get_binding(repo, task_id).await {
-        Some(binding) => {
-            match crate::channels::tmux::send_keys(&binding.tmux_session, text).await {
-                Err(e) => {
-                    tracing::warn!(
-                        task_id,
-                        session = %binding.tmux_session,
-                        ?e,
-                        "failed to forward message to tmux session"
-                    );
-                }
-                _ => {
-                    tracing::debug!(
-                        task_id,
-                        session = %binding.tmux_session,
-                        "forwarded message to tmux"
-                    );
-                }
+        Some(binding) => match tmux::send_keys(&binding.tmux_session, text).await {
+            Err(e) => {
+                tracing::warn!(
+                    task_id,
+                    session = %binding.tmux_session,
+                    ?e,
+                    "failed to forward message to tmux session"
+                );
             }
-        }
+            _ => {
+                tracing::debug!(
+                    task_id,
+                    session = %binding.tmux_session,
+                    "forwarded message to tmux"
+                );
+            }
+        },
         _ => {
             tracing::warn!(task_id, "no tmux binding found, cannot forward message");
         }
@@ -251,8 +255,6 @@ async fn create_and_announce_task(
     capture: &Arc<CaptureService>,
     channels: &Arc<ChannelRegistry>,
 ) {
-    use crate::channels::stream::fanout_output;
-
     let target = if let Some(repo) = forced_repo {
         engine_refs.iter().find(|(r, _, _, _)| r == repo)
     } else {
@@ -299,8 +301,8 @@ async fn create_and_announce_task(
             capture
                 .register_session(repo, &task_id, &session_name)
                 .await;
-            let transport_clone = std::sync::Arc::clone(transport);
-            let channels_clone = std::sync::Arc::clone(channels);
+            let transport_clone = Arc::clone(transport);
+            let channels_clone = Arc::clone(channels);
             let task_id_clone = task_id.clone();
             let repo_clone = repo.clone();
             tokio::spawn(async move {
@@ -372,7 +374,7 @@ pub(super) async fn handle_channel_message(
             // For external tasks the key is "repo:task_id"; for internal tasks
             // it is "internal:<id>" and we fall back to resolved_repo.
             let (repo, task_id): (&str, &str) =
-                if let Some((r, t)) = crate::channels::transport::parse_session_key(&session_key) {
+                if let Some((r, t)) = transport::parse_session_key(&session_key) {
                     (r, t)
                 } else {
                     // Internal task or unparseable key — use resolved_repo
@@ -568,7 +570,7 @@ pub(super) async fn handle_channel_message(
                 .cloned();
 
             if let Some(store) = store {
-                match crate::control::send_message(
+                match control::send_message(
                     &store,
                     &session_id,
                     &channel,
@@ -844,7 +846,7 @@ pub(super) async fn handle_subscribe_command(
         let projects: Vec<&str> = channel_router
             .projects()
             .iter()
-            .map(std::string::String::as_str)
+            .map(String::as_str)
             .collect();
         return format!(
             "Usage: `/subscribe <project>`\nAvailable projects: {}",
@@ -860,7 +862,7 @@ pub(super) async fn handle_subscribe_command(
             channel_router
                 .projects()
                 .iter()
-                .map(std::string::String::as_str)
+                .map(String::as_str)
                 .collect::<Vec<_>>()
                 .join(", ")
         );

@@ -294,6 +294,11 @@ pub enum MessageRoute {
 
 #[cfg(test)]
 mod tests {
+    use tokio::time;
+
+    use std::str as std_str;
+    use std::time::Duration;
+
     use super::*;
 
     #[tokio::test]
@@ -354,7 +359,7 @@ mod tests {
         let chunks = split_utf8(&content, 100);
         assert_eq!(chunks.join(""), content);
         for c in &chunks {
-            assert!(std::str::from_utf8(c.as_bytes()).is_ok());
+            assert!(std_str::from_utf8(c.as_bytes()).is_ok());
         }
     }
 
@@ -365,7 +370,7 @@ mod tests {
         let chunks = split_utf8(&content, 10); // 10 bytes per chunk, emoji is 4 bytes
         assert_eq!(chunks.join(""), content);
         for c in &chunks {
-            assert!(std::str::from_utf8(c.as_bytes()).is_ok());
+            assert!(std_str::from_utf8(c.as_bytes()).is_ok());
         }
     }
 
@@ -530,15 +535,14 @@ mod tests {
             .await;
 
         // repo-a receives it
-        let chunk_a = tokio::time::timeout(std::time::Duration::from_millis(100), rx_a.recv())
+        let chunk_a = time::timeout(Duration::from_millis(100), rx_a.recv())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(chunk_a.content, "hello from repo-a");
 
         // repo-b should NOT receive anything (timeout)
-        let result_b =
-            tokio::time::timeout(std::time::Duration::from_millis(100), rx_b.recv()).await;
+        let result_b = time::timeout(Duration::from_millis(100), rx_b.recv()).await;
         assert!(
             result_b.is_err(),
             "repo-b should not receive repo-a's output"

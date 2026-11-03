@@ -50,7 +50,7 @@ impl OllamaRouter {
         let timeout = Duration::from_secs(config.ollama_timeout_seconds);
         let client = reqwest::Client::builder()
             .timeout(timeout)
-            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .tcp_keepalive(Duration::from_secs(30))
             .build()
             .expect("failed to build reqwest client");
         Self {
@@ -240,10 +240,7 @@ mod tests {
             title: title.to_string(),
             body: body.to_string(),
             state: "open".to_string(),
-            labels: labels
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect(),
+            labels: labels.iter().map(ToString::to_string).collect(),
             author: "testuser".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),

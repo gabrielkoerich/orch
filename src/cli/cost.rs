@@ -1,10 +1,12 @@
+use crate::cli;
+use crate::cli::task_ref;
 use crate::store::{self, TaskStore};
 use std::sync::Arc;
 
 /// Show cost breakdown for a specific task.
 pub async fn show_task(id: &str) -> anyhow::Result<()> {
-    let owned = crate::cli::init_store().await?;
-    let resolved = crate::cli::task_ref::resolve(&owned, id).await?;
+    let owned = cli::init_store().await?;
+    let resolved = task_ref::resolve(&owned, id).await?;
     let store: Option<Arc<TaskStore>> = Some(Arc::new(owned));
     let repo = resolved.repo.clone();
     let id = resolved.external_id.as_str();
@@ -60,7 +62,7 @@ pub async fn show_task(id: &str) -> anyhow::Result<()> {
 
 /// Show aggregate cost summary over time periods (24h, 7d, 30d).
 pub async fn show_summary() -> anyhow::Result<()> {
-    let store = crate::cli::init_store().await?;
+    let store = cli::init_store().await?;
 
     let summary = store.get_cost_summary().await?;
 
@@ -91,7 +93,7 @@ pub async fn show_summary() -> anyhow::Result<()> {
 
 /// Show cost breakdown by agent.
 pub async fn show_by_agent() -> anyhow::Result<()> {
-    let store = crate::cli::init_store().await?;
+    let store = cli::init_store().await?;
 
     let groups = store.get_cost_by_agent().await?;
 
@@ -137,7 +139,7 @@ pub async fn show_by_agent() -> anyhow::Result<()> {
 
 /// Show cost breakdown by model.
 pub async fn show_by_model() -> anyhow::Result<()> {
-    let store = crate::cli::init_store().await?;
+    let store = cli::init_store().await?;
 
     let groups = store.get_cost_by_model().await?;
 

@@ -2,6 +2,7 @@
 
 use super::discovery::Tailnet;
 use super::{NodeId, discovery};
+use crate::config;
 use std::collections::BTreeMap;
 
 pub const DEFAULT_PORT: u16 = 7420;
@@ -19,22 +20,22 @@ pub struct ClusterConfig {
 impl ClusterConfig {
     /// None without a `cluster.secret`, which keeps orch on one machine
     pub fn load() -> anyhow::Result<Option<Self>> {
-        let Ok(secret) = crate::config::get("cluster.secret") else {
+        let Ok(secret) = config::get("cluster.secret") else {
             return Ok(None);
         };
         if secret.is_empty() {
             return Ok(None);
         }
 
-        let port = match crate::config::get("cluster.port") {
+        let port = match config::get("cluster.port") {
             Ok(p) => p.parse()?,
             Err(_) => DEFAULT_PORT,
         };
-        let voters = crate::config::get_list("cluster.voters")?
+        let voters = config::get_list("cluster.voters")?
             .into_iter()
             .map(|v| v.to_ascii_lowercase())
             .collect();
-        let witness = crate::config::get("cluster.witness").is_ok_and(|w| w == "true");
+        let witness = config::get("cluster.witness").is_ok_and(|w| w == "true");
         Ok(Some(Self {
             secret,
             port,

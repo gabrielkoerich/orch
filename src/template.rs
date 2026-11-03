@@ -13,14 +13,14 @@ fn compile_pattern(pattern: &str, label: &str) -> Result<Regex, String> {
 fn if_pattern() -> Result<&'static Regex, String> {
     static IF_PATTERN: LazyLock<Result<Regex, String>> =
         LazyLock::new(|| compile_pattern(r"(?s)\{\{#if\s+(\w+)\}\}(.*?)\{\{/if\}\}", "if_pattern"));
-    IF_PATTERN.as_ref().map_err(std::clone::Clone::clone)
+    IF_PATTERN.as_ref().map_err(Clone::clone)
 }
 
 /// Matches `{{VAR}}` variable placeholders.
 fn var_pattern() -> Result<&'static Regex, String> {
     static VAR_PATTERN: LazyLock<Result<Regex, String>> =
         LazyLock::new(|| compile_pattern(r"\{\{(\w+)\}\}", "var_pattern"));
-    VAR_PATTERN.as_ref().map_err(std::clone::Clone::clone)
+    VAR_PATTERN.as_ref().map_err(Clone::clone)
 }
 
 fn render_template_with_vars<S: BuildHasher>(
@@ -105,6 +105,7 @@ pub fn render_and_print(template_path: &str, extra_vars: &[String]) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
     use std::ffi::OsString;
     use std::io::Write;
     use std::sync::{Mutex, OnceLock};
@@ -122,9 +123,9 @@ mod tests {
 
     impl EnvVarGuard {
         fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(key);
+            let previous = env::var_os(key);
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            unsafe { std::env::set_var(key, value) };
+            unsafe { env::set_var(key, value) };
             Self { key, previous }
         }
     }
@@ -133,9 +134,9 @@ mod tests {
         fn drop(&mut self) {
             match self.previous.take() {
                 // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                Some(value) => unsafe { env::set_var(self.key, value) },
                 // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-                None => unsafe { std::env::remove_var(self.key) },
+                None => unsafe { env::remove_var(self.key) },
             }
         }
     }

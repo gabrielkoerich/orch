@@ -9,17 +9,24 @@
 //! and even join/intervene by sending input through the transport.
 
 use super::{Channel, IncomingMessage, OutgoingMessage};
+use crate::channels::transport::Transport;
 use crate::cmd::CommandErrorContext;
 use async_trait::async_trait;
+use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
 use std::sync::Arc;
+use tokio::process::Command;
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::Receiver;
 
 pub struct TmuxChannel {
     /// Shared transport for pushing output
-    transport: Option<Arc<crate::channels::transport::Transport>>,
+    transport: Option<Arc<Transport>>,
 }
 
-impl std::fmt::Debug for TmuxChannel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for TmuxChannel {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("TmuxChannel")
             .field("has_transport", &self.transport.is_some())
             .finish()
@@ -27,7 +34,7 @@ impl std::fmt::Debug for TmuxChannel {
 }
 
 impl TmuxChannel {
-    pub fn with_transport(transport: Arc<crate::channels::transport::Transport>) -> Self {
+    pub fn with_transport(transport: Arc<Transport>) -> Self {
         Self {
             transport: Some(transport),
         }
@@ -40,8 +47,8 @@ impl Channel for TmuxChannel {
         "tmux"
     }
 
-    async fn start(&self) -> anyhow::Result<tokio::sync::mpsc::Receiver<IncomingMessage>> {
-        let (_tx, rx) = tokio::sync::mpsc::channel(64);
+    async fn start(&self) -> anyhow::Result<Receiver<IncomingMessage>> {
+        let (_tx, rx) = mpsc::channel(64);
         tracing::info!("tmux channel started");
 
         // Output streaming is handled by CaptureService now.
@@ -61,7 +68,7 @@ impl Channel for TmuxChannel {
 
     async fn health_check(&self) -> anyhow::Result<()> {
         // Check if tmux server is running
-        let output = tokio::process::Command::new("tmux")
+        let output = Command::new("tmux")
             .args(["list-sessions"])
             .output_with_context()
             .await?;
@@ -74,7 +81,7 @@ impl Channel for TmuxChannel {
 
 /// Send keystrokes to a tmux session.
 pub async fn send_keys(session: &str, text: &str) -> anyhow::Result<()> {
-    let output = tokio::process::Command::new("tmux")
+    let output = Command::new("tmux")
         .args(["send-keys", "-t", session, text, "Enter"])
         .output_with_context()
         .await?;
@@ -87,7 +94,7 @@ pub async fn send_keys(session: &str, text: &str) -> anyhow::Result<()> {
 
 /// Capture the current content of a tmux pane.
 pub async fn capture_pane(session: &str) -> anyhow::Result<String> {
-    let output = tokio::process::Command::new("tmux")
+    let output = Command::new("tmux")
         .args(["capture-pane", "-t", session, "-p", "-S", "-"])
         .output_with_context()
         .await?;
@@ -100,7 +107,7 @@ pub async fn capture_pane(session: &str) -> anyhow::Result<String> {
 
 /// List active tmux sessions matching the orch- prefix.
 pub async fn list_orch_sessions() -> anyhow::Result<Vec<String>> {
-    let output = tokio::process::Command::new("tmux")
+    let output = Command::new("tmux")
         .args(["list-sessions", "-F", "#{session_name}"])
         .output_with_context()
         .await?;
@@ -120,7 +127,7 @@ pub async fn list_orch_sessions() -> anyhow::Result<Vec<String>> {
 /// Used by the capture service to detect ended sessions and send
 /// final output chunks.
 pub async fn is_session_dead(session: &str) -> bool {
-    let output = tokio::process::Command::new("tmux")
+    let output = Command::new("tmux")
         .args(["has-session", "-t", session])
         .output_with_context()
         .await;

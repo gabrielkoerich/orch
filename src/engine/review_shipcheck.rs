@@ -5,6 +5,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
+use crate::engine::review;
+
+use tokio::process::Command;
+use tokio::time;
+
+use std::process::Stdio;
+use std::time::Duration;
+
 /// A full run that takes longer than this is killed and the review starts without a result
 const PRERUN_TIMEOUT_SECS: u64 = 60 * 60;
 
@@ -49,7 +57,7 @@ pub(crate) async fn prerun(worktree: &Path) -> Prerun {
 }
 
 async fn prerun_with(bin: &Path, worktree: &Path) -> Prerun {
-    let Some(head) = crate::engine::review::worktree_head_sha(worktree).await else {
+    let Some(head) = review::worktree_head_sha(worktree).await else {
         return Prerun::Ready;
     };
     let key = (worktree.to_path_buf(), head);
@@ -79,16 +87,16 @@ async fn prerun_with(bin: &Path, worktree: &Path) -> Prerun {
     tracing::info!(worktree = %worktree.display(), head = %key.1, "running shipcheck before the review");
     let bin = bin.to_path_buf();
     tokio::spawn(async move {
-        let run = tokio::process::Command::new(&bin)
+        let run = Command::new(&bin)
             .arg("run")
             .current_dir(&key.0)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .kill_on_drop(true)
             .status();
-        let timeout = std::time::Duration::from_secs(PRERUN_TIMEOUT_SECS);
-        match tokio::time::timeout(timeout, run).await {
+        let timeout = Duration::from_secs(PRERUN_TIMEOUT_SECS);
+        match time::timeout(timeout, run).await {
             Ok(Ok(status)) => {
                 tracing::info!(worktree = %key.0.display(), head = %key.1, code = ?status.code(), "shipcheck run before the review ended");
             }
@@ -108,15 +116,15 @@ async fn prerun_with(bin: &Path, worktree: &Path) -> Prerun {
 /// `shipcheck status` exits 2 when the working copy's tree has no stored result. Any other
 /// outcome, an error included, does not hold the review
 async fn has_result(bin: &Path, worktree: &Path) -> bool {
-    let status = tokio::process::Command::new(bin)
+    let status = Command::new(bin)
         .args(["status", "--json"])
         .current_dir(worktree)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .kill_on_drop(true)
         .status();
-    match tokio::time::timeout(std::time::Duration::from_secs(30), status).await {
+    match time::timeout(Duration::from_secs(30), status).await {
         Ok(Ok(status)) => status.code() != Some(2),
         _ => true,
     }
@@ -125,10 +133,13 @@ async fn has_result(bin: &Path, worktree: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
+    use std::process;
 
     fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+        let out = process::Command::new("git")
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -144,7 +155,7 @@ mod tests {
     fn repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         git(dir.path(), &["init", "-b", "main"]);
-        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        fs::write(dir.path().join("a.txt"), "a").unwrap();
         git(dir.path(), &["add", "a.txt"]);
         git(
             dir.path(),
@@ -161,13 +172,13 @@ mod tests {
             "#!/bin/sh\nd='{}'\necho \"$1\" >> \"$d/calls\"\nif [ \"$1\" = status ]; then [ -f \"$d/result\" ] && exit 0; exit 2; fi\nwhile [ ! -f \"$d/go\" ]; do sleep 0.05; done\ntouch \"$d/result\"\n",
             dir.display()
         );
-        std::fs::write(&bin, body).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&bin, body).unwrap();
+        fs::set_permissions(&bin, Permissions::from_mode(0o755)).unwrap();
         bin
     }
 
     fn runs(dir: &Path) -> usize {
-        std::fs::read_to_string(dir.join("calls"))
+        fs::read_to_string(dir.join("calls"))
             .unwrap_or_default()
             .lines()
             .filter(|l| *l == "run")
@@ -175,16 +186,14 @@ mod tests {
     }
 
     async fn wait_for_finish(worktree: &Path) {
-        let head = crate::engine::review::worktree_head_sha(worktree)
-            .await
-            .unwrap();
+        let head = review::worktree_head_sha(worktree).await.unwrap();
         let key = (worktree.to_path_buf(), head);
         for _ in 0..200 {
             if run_state(&key) == Some(RunState::Finished) {
                 return;
             }
 
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            time::sleep(Duration::from_millis(25)).await;
         }
         panic!("the shipcheck run never finished");
     }
@@ -197,7 +206,7 @@ mod tests {
 
         assert_eq!(prerun_with(&bin, wt.path()).await, Prerun::Running);
         assert_eq!(prerun_with(&bin, wt.path()).await, Prerun::Running);
-        std::fs::write(bins.path().join("go"), "").unwrap();
+        fs::write(bins.path().join("go"), "").unwrap();
         wait_for_finish(wt.path()).await;
         assert_eq!(prerun_with(&bin, wt.path()).await, Prerun::Ready);
         assert_eq!(runs(bins.path()), 1);
@@ -212,8 +221,8 @@ mod tests {
         let wt = repo();
         let bins = tempfile::tempdir().unwrap();
         let bin = bins.path().join("shipcheck");
-        std::fs::write(&bin, "#!/bin/sh\n[ \"$1\" = status ] && exit 2\nexit 1\n").unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&bin, "#!/bin/sh\n[ \"$1\" = status ] && exit 2\nexit 1\n").unwrap();
+        fs::set_permissions(&bin, Permissions::from_mode(0o755)).unwrap();
 
         assert_eq!(prerun_with(&bin, wt.path()).await, Prerun::Running);
         wait_for_finish(wt.path()).await;

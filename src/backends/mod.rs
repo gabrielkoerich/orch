@@ -5,8 +5,13 @@
 
 pub mod github;
 
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::time;
 
 /// Opaque identifier from the external system (issue number, Linear ID, etc.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,8 +179,7 @@ pub trait ExternalBackend: Send + Sync {
 
         for attempt in 0..MAX_RETRIES {
             if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)))
-                    .await;
+                time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
                 tracing::debug!(attempt, label, "retrying update_status");
             }
 
@@ -273,7 +277,7 @@ pub trait ExternalBackend: Send + Sync {
     /// (e.g. GitHub) should override this to fetch all open issues in one API call and
     /// partition locally, eliminating the 1 + N fan-out.
     async fn list_active_open_issues(&self) -> anyhow::Result<Vec<(ExternalTask, Option<Status>)>> {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         let mut result = Vec::new();
 
         // Routable tasks: unlabeled issues + status:new → no status sync needed.
@@ -396,8 +400,8 @@ pub trait ExternalBackend: Send + Sync {
     async fn get_project_item_estimates(
         &self,
         _issue_node_ids: &[String],
-    ) -> anyhow::Result<std::collections::HashMap<String, u8>> {
-        Ok(std::collections::HashMap::new())
+    ) -> anyhow::Result<HashMap<String, u8>> {
+        Ok(HashMap::new())
     }
 
     /// Check if an open issue with the given title already exists.
@@ -427,8 +431,8 @@ pub trait ExternalBackend: Send + Sync {
     async fn batch_is_pr_merged(
         &self,
         branches: &[String],
-    ) -> anyhow::Result<std::collections::HashMap<String, bool>> {
-        let mut result = std::collections::HashMap::new();
+    ) -> anyhow::Result<HashMap<String, bool>> {
+        let mut result = HashMap::new();
         for branch in branches {
             match self.is_pr_merged(branch).await {
                 Ok(merged) => {
@@ -539,6 +543,7 @@ pub trait ExternalBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::TaskStatus;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
@@ -778,11 +783,8 @@ mod tests {
         assert_eq!(Status::InReview.as_label(), "status:in_review");
         assert_eq!(Status::Approved.as_label(), "status:approved");
         assert_eq!(Status::Approved.as_str(), "approved");
-        assert_eq!(
-            crate::store::TaskStatus::from_str("approved"),
-            Some(crate::store::TaskStatus::Approved)
-        );
-        assert_eq!(crate::store::TaskStatus::Approved.as_str(), "approved");
+        assert_eq!(TaskStatus::from_str("approved"), Some(TaskStatus::Approved));
+        assert_eq!(TaskStatus::Approved.as_str(), "approved");
         assert_eq!(Status::NeedsReview.as_label(), "status:needs_review");
     }
 

@@ -23,18 +23,27 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::fmt::Write as _;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::Receiver;
+use tokio::time;
 
 pub struct SlackChannel {
     pub bot_token: String,
     pub client: Client,
     pub channel_id: Option<String>,
     /// Cursor tracking the latest message timestamp seen (Slack uses `ts` as cursor).
-    pub last_ts: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
+    pub last_ts: Arc<Mutex<Option<String>>>,
 }
 
-impl std::fmt::Debug for SlackChannel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for SlackChannel {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("SlackChannel")
             .field("channel_id", &self.channel_id)
             .finish_non_exhaustive()
@@ -90,7 +99,7 @@ impl SlackChannel {
             bot_token,
             client,
             channel_id,
-            last_ts: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            last_ts: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -198,10 +207,8 @@ impl Channel for SlackChannel {
         "slack"
     }
 
-    async fn start(&self) -> anyhow::Result<tokio::sync::mpsc::Receiver<IncomingMessage>> {
-        use std::fmt::Write as _;
-
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
+    async fn start(&self) -> anyhow::Result<Receiver<IncomingMessage>> {
+        let (tx, rx) = mpsc::channel(64);
 
         // If no channel_id configured we can't poll
         if self.channel_id.is_none() {
@@ -216,7 +223,7 @@ impl Channel for SlackChannel {
             tracing::error!("slack channel_id unexpectedly None after guard check");
             return Ok(rx);
         };
-        let last_ts = std::sync::Arc::clone(&self.last_ts);
+        let last_ts = Arc::clone(&self.last_ts);
 
         let token_fingerprint = {
             let mut hasher = Sha256::new();
@@ -236,16 +243,16 @@ impl Channel for SlackChannel {
         );
 
         tokio::spawn(async move {
-            let polling_interval = std::time::Duration::from_secs(5);
+            let polling_interval = Duration::from_secs(5);
 
             loop {
-                tokio::time::sleep(polling_interval).await;
+                time::sleep(polling_interval).await;
 
                 let channel = SlackChannel {
                     bot_token: bot_token.clone(),
                     client: client.clone(),
                     channel_id: Some(channel_id.clone()),
-                    last_ts: std::sync::Arc::clone(&last_ts),
+                    last_ts: Arc::clone(&last_ts),
                 };
 
                 // Snapshot the cursor once so all pagination pages use the same lower bound.

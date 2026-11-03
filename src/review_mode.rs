@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+use crate::config;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewMode {
     /// The `## Automated Review` comment and the `orch-review.yml` gate
@@ -36,7 +38,7 @@ pub fn resolve(project: Option<&str>, global: Option<&str>) -> ReviewMode {
 
 /// The mode of the project whose `gh.repo` is `repo`, the global value when no project matches
 pub fn for_repo(repo: &str) -> ReviewMode {
-    let project_dir = crate::config::get_projects_with_paths()
+    let project_dir = config::get_projects_with_paths()
         .ok()
         .and_then(|projects| projects.into_iter().find(|(r, _)| r == repo))
         .map(|(_, dir)| dir);
@@ -44,14 +46,15 @@ pub fn for_repo(repo: &str) -> ReviewMode {
 }
 
 pub fn for_project_dir(project_dir: Option<&Path>) -> ReviewMode {
-    let project =
-        project_dir.and_then(|dir| crate::config::get_project_only(dir, "review.mode").ok());
-    let global = crate::config::get_global("review.mode").ok();
+    let project = project_dir.and_then(|dir| config::get_project_only(dir, "review.mode").ok());
+    let global = config::get_global("review.mode").ok();
     resolve(project.as_deref(), global.as_deref())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     #[test]
@@ -72,11 +75,11 @@ mod tests {
     #[test]
     fn the_project_file_is_read_without_the_global_fallback() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".orch.yml"), "review:\n  mode: app\n").unwrap();
-        let value = crate::config::get_project_only(dir.path(), "review.mode").unwrap();
+        fs::write(dir.path().join(".orch.yml"), "review:\n  mode: app\n").unwrap();
+        let value = config::get_project_only(dir.path(), "review.mode").unwrap();
         assert_eq!(value, "app");
 
         let empty = tempfile::tempdir().unwrap();
-        assert!(crate::config::get_project_only(empty.path(), "review.mode").is_err());
+        assert!(config::get_project_only(empty.path(), "review.mode").is_err());
     }
 }

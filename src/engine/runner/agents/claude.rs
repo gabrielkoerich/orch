@@ -44,12 +44,17 @@
 //! - "rate limit" / "429" — standard rate limiting
 //! - "context_length_exceeded" — context overflow
 
+use std::path::PathBuf;
+
+use tokio::process::Command;
+
 #[cfg(test)]
 use super::SandboxLevel;
 use super::{
     AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent, json_error_message,
     json_str,
 };
+use crate::engine::runner::agents::opencode;
 use crate::parser;
 
 /// Runner for Claude-compatible agents (Claude, Kimi, MiniMax).
@@ -303,7 +308,7 @@ pub(crate) fn extract_stream_json_result_text(raw: &str) -> Result<String, Agent
 
     // No JSON result line found (or it wasn't an error). Try opencode-style
     // text extraction which scans NDJSON for text/result events.
-    if let Some(fallback) = crate::engine::runner::agents::opencode::extract_router_text(trimmed) {
+    if let Some(fallback) = opencode::extract_router_text(trimmed) {
         return Ok(fallback);
     }
 
@@ -530,12 +535,8 @@ impl AgentRunner for ClaudeRunner {
         classified
     }
 
-    fn router_command(
-        &self,
-        prompt: &str,
-        model: Option<&str>,
-    ) -> anyhow::Result<tokio::process::Command> {
-        let mut cmd = tokio::process::Command::new(&self.binary);
+    fn router_command(&self, prompt: &str, model: Option<&str>) -> anyhow::Result<Command> {
+        let mut cmd = Command::new(&self.binary);
         cmd.env_remove("CLAUDECODE"); // allow nested invocation
         cmd.arg("--output-format")
             .arg("stream-json")
@@ -576,10 +577,7 @@ const CLAUDE_NATIVE_TOOLS: &[&str] = &[
 /// - Items matching known Claude tool names pass through as-is
 /// - Edit/Write are scoped to `allowed_edit_paths` when set
 /// - Other items are treated as CLI commands and become `Bash(<cmd> *)` patterns
-fn translate_allowed_tools(
-    allowed: &[String],
-    allowed_edit_paths: &[std::path::PathBuf],
-) -> Vec<String> {
+fn translate_allowed_tools(allowed: &[String], allowed_edit_paths: &[PathBuf]) -> Vec<String> {
     let mut tools = Vec::new();
     for item in allowed {
         if (item == "Edit" || item == "Write") && !allowed_edit_paths.is_empty() {
@@ -1009,6 +1007,7 @@ pub fn collect_assistant_messages_text(ndjson: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::cooldown;
 
     fn runner() -> ClaudeRunner {
         ClaudeRunner::new("claude")
@@ -1019,7 +1018,7 @@ mod tests {
         let raw = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["API error (status 402 Payment Required): usage balance exhausted"]}"#;
         match runner().parse_response(raw) {
             Err(AgentError::AgentFailed { message } | AgentError::Auth { message }) => {
-                assert!(crate::engine::cooldown::detect_credit_exhaustion(&message).is_some());
+                assert!(cooldown::detect_credit_exhaustion(&message).is_some());
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -1367,7 +1366,7 @@ mod tests {
                 "Read".to_string(),
                 "Bash".to_string(),
             ],
-            allowed_edit_paths: vec![std::path::PathBuf::from("/home/user/worktree")],
+            allowed_edit_paths: vec![PathBuf::from("/home/user/worktree")],
             deny_read_only: false,
             extra_writable_dirs: vec![],
         };
@@ -1688,7 +1687,7 @@ mod tests {
     #[test]
     fn translate_allowed_tools_scopes_edit_write() {
         let allowed = vec!["Edit".to_string(), "Write".to_string(), "Read".to_string()];
-        let paths = vec![std::path::PathBuf::from("/tmp/worktree")];
+        let paths = vec![PathBuf::from("/tmp/worktree")];
         let result = translate_allowed_tools(&allowed, &paths);
         assert_eq!(
             result,
@@ -1842,7 +1841,7 @@ mod tests {
         let result = find_claude_result(ndjson).expect("should find result");
         assert!(result.is_error);
         assert!(result.result_text.contains("usage balance exhausted"));
-        assert!(crate::engine::cooldown::detect_credit_exhaustion(&result.result_text).is_some());
+        assert!(cooldown::detect_credit_exhaustion(&result.result_text).is_some());
     }
 
     #[test]

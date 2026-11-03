@@ -1,12 +1,13 @@
 //! CLI handlers for `orch chat` — control session interaction.
 
+use crate::cli;
 use crate::control;
 use crate::store::{TaskStore, parse_since_duration};
 use std::io::{self, BufRead, Write};
 
 /// Interactive REPL mode — reads from stdin, sends to control session.
 pub async fn interactive(session_id: &str) -> anyhow::Result<()> {
-    let store = crate::cli::init_store().await?;
+    let store = cli::init_store().await?;
     let model = control::get_model(&store).await?;
     let agent = control::get_agent(&store).await?;
 
@@ -63,7 +64,7 @@ pub async fn interactive(session_id: &str) -> anyhow::Result<()> {
 
 /// Single message mode — send one message, print response, exit.
 pub async fn single_message(session_id: &str, message: &str) -> anyhow::Result<()> {
-    let store = crate::cli::init_store().await?;
+    let store = cli::init_store().await?;
     if let Some(response) =
         control::maybe_handle_control_command(&store, session_id, None, message).await?
     {
@@ -84,7 +85,7 @@ pub async fn history(
     limit: i64,
     with_cost: bool,
 ) -> anyhow::Result<()> {
-    let store = crate::cli::init_store().await?;
+    let store = cli::init_store().await?;
 
     // Parse --since into an ISO8601 cutoff timestamp if provided.
     let since_ts: Option<String> = since
@@ -158,7 +159,7 @@ pub async fn history(
 
 /// Show session cost statistics.
 pub async fn stats(session_id: &str) -> anyhow::Result<()> {
-    let store = crate::cli::init_store().await?;
+    let store = cli::init_store().await?;
 
     let summary = store.get_session_cost_summary(session_id).await?;
     let fallback_model = control::get_model(&store).await?;

@@ -39,24 +39,6 @@ pub mod tick;
 ///
 /// Append to every user-visible string posted to GitHub so activity is
 /// clearly attributed to orch rather than appearing as a human post.
-pub fn orch_footer() -> &'static str {
-    "\n\n---\n*Posted by [Orch](https://github.com/gabrielkoerich/orch)*"
-}
-
-/// Build a standard attribution footer for GitHub comments posted by orch bots.
-///
-/// `verb` is "Created", "Reviewed", or "Commented" depending on context.
-pub fn attribution_footer(verb: &str, agent: &str, model: Option<&str>) -> String {
-    match model {
-        Some(m) => format!(
-            "\n\n---\n*{verb} by {agent}[bot] via [Orch](https://github.com/gabrielkoerich/orch) using `{m}`*"
-        ),
-        None => format!(
-            "\n\n---\n*{verb} by {agent}[bot] via [Orch](https://github.com/gabrielkoerich/orch)*"
-        ),
-    }
-}
-
 use crate::backends::{ExternalBackend, ExternalId};
 use crate::channels::capture::CaptureService;
 use crate::channels::discord_ws::DiscordGateway;
@@ -83,11 +65,74 @@ use crate::store::{TaskStatus, TaskStore};
 use crate::tmux::TmuxManager;
 use runner::WeightSignal;
 // AtomicBool/Ordering removed — shutdown is now immediate (reset tasks + break)
-use std::sync::Arc;
-use tokio::process::Command;
-use tokio::sync::{Notify, RwLock, Semaphore, mpsc};
-
 use crate::backends::Status;
+use crate::backends::github::GitHubBackend;
+use crate::channels::github;
+use crate::channels::github::is_transient_bind_error;
+use crate::channels::github::webhook_backoff_delay;
+use crate::channels::notification;
+use crate::channels::notification::TaskNotification;
+use crate::channels::transport;
+use crate::cluster;
+use crate::cluster::local;
+use crate::engine::cooldown as engine_cooldown;
+use crate::engine::review as engine_review;
+use crate::engine::runner::git_ops;
+use crate::engine::runner::worktree;
+use crate::engine::suspend as engine_suspend;
+use crate::engine::suspend::SuspendDetector;
+use crate::engine::tasks as engine_tasks;
+use crate::github::app;
+use crate::home;
+use crate::secret_ref;
+use crate::store;
+use crate::webhook_status::WebhookStatus;
+use futures::future;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time as std_time;
+use std::time::Duration;
+use std::time::Instant;
+use std::time::SystemTime;
+use tokio::process::Command;
+use tokio::signal;
+use tokio::signal::unix;
+use tokio::signal::unix::SignalKind;
+use tokio::sync::Mutex;
+use tokio::sync::broadcast::Sender;
+use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::mpsc::Receiver;
+use tokio::sync::{Notify, RwLock, Semaphore, mpsc};
+use tokio::task;
+use tokio::time;
+
+pub fn orch_footer() -> &'static str {
+    "\n\n---\n*Posted by [Orch](https://github.com/gabrielkoerich/orch)*"
+}
+
+/// Build a standard attribution footer for GitHub comments posted by orch bots.
+///
+/// `verb` is "Created", "Reviewed", or "Commented" depending on context.
+pub fn attribution_footer(verb: &str, agent: &str, model: Option<&str>) -> String {
+    match model {
+        Some(m) => format!(
+            "\n\n---\n*{verb} by {agent}[bot] via [Orch](https://github.com/gabrielkoerich/orch) using `{m}`*"
+        ),
+        None => format!(
+            "\n\n---\n*{verb} by {agent}[bot] via [Orch](https://github.com/gabrielkoerich/orch)*"
+        ),
+    }
+}
 
 /// Lightweight reference tuple for channel message handling.
 type EngineRef = (
@@ -104,15 +149,15 @@ type EngineRef = (
 #[derive(Clone)]
 pub struct ProjectEngine {
     pub repo: String,
-    pub project_dir: std::path::PathBuf,
+    pub project_dir: PathBuf,
     pub backend: Arc<dyn ExternalBackend>,
     pub task_manager: Arc<TaskManager>,
     pub runner: Arc<runner::TaskRunner>,
     pub store: Arc<TaskStore>,
 }
 
-impl std::fmt::Debug for ProjectEngine {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for ProjectEngine {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProjectEngine")
             .field("repo", &self.repo)
             .field("project_dir", &self.project_dir)
@@ -130,14 +175,14 @@ pub(crate) async fn reset_orphaned_reviews(
 ) -> usize {
     // The store holds external and internal tasks, the second list is the legacy internal table
     let mut ids: Vec<ExternalId> = store
-        .list_by_status(repo, crate::store::TaskStatus::InReview)
+        .list_by_status(repo, TaskStatus::InReview)
         .await
         .unwrap_or_default()
         .iter()
-        .map(|t| crate::engine::tasks::store_task_to_external(t).id)
+        .map(|t| engine_tasks::store_task_to_external(t).id)
         .collect();
     if let Ok(legacy) = task_manager
-        .list_internal_by_status(crate::store::TaskStatus::InReview)
+        .list_internal_by_status(TaskStatus::InReview)
         .await
     {
         ids.extend(legacy.into_iter().map(|t| t.id));
@@ -190,7 +235,7 @@ pub(crate) async fn reset_orphaned_reviews(
 /// passbox prompt nobody answers never holds up the engine
 fn start_relay_client(project_engines: &[ProjectEngine], notify: &Arc<Notify>) {
     // The global config only: a project file must never point a secret at its own endpoint
-    let url = crate::config::get_global("relay.url").unwrap_or_default();
+    let url = config::get_global("relay.url").unwrap_or_default();
     let Some(store) = project_engines.first().map(|e| Arc::clone(&e.store)) else {
         return;
     };
@@ -199,13 +244,13 @@ fn start_relay_client(project_engines: &[ProjectEngine], notify: &Arc<Notify>) {
         return;
     }
 
-    let token_ref = crate::config::get_global("relay.token").unwrap_or_default();
+    let token_ref = config::get_global("relay.token").unwrap_or_default();
     let notify = Arc::clone(notify);
     tokio::spawn(async move {
         let mut warned = false;
         let token = loop {
             let reference = token_ref.clone();
-            let read = tokio::task::spawn_blocking(move || crate::secret_ref::resolve(&reference))
+            let read = task::spawn_blocking(move || secret_ref::resolve(&reference))
                 .await
                 .map_err(anyhow::Error::from)
                 .and_then(|r| r);
@@ -223,7 +268,7 @@ fn start_relay_client(project_engines: &[ProjectEngine], notify: &Arc<Notify>) {
                 Err(_) => {}
             }
 
-            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            time::sleep(Duration::from_secs(300)).await;
         };
 
         relay::run(url, token, store, notify).await;
@@ -246,7 +291,7 @@ fn spawn_sync_pass(
     router: &Arc<RwLock<Router>>,
     dispatching: &Arc<dashmap::DashMap<String, String>>,
     auto_merge_in_flight: &Arc<dashmap::DashSet<String>>,
-    sync_in_progress: &Arc<std::sync::atomic::AtomicBool>,
+    sync_in_progress: &Arc<AtomicBool>,
     trigger: &'static str,
 ) {
     let engines = project_engines.to_vec();
@@ -258,7 +303,7 @@ fn spawn_sync_pass(
     let guard = Arc::clone(sync_in_progress);
 
     tokio::spawn(async move {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let mut passes = Vec::with_capacity(engines.len());
         for engine in &engines {
             passes.push(REPO_CONTEXT.scope(
@@ -273,7 +318,7 @@ fn spawn_sync_pass(
                 ),
             ));
         }
-        futures::future::join_all(passes).await;
+        future::join_all(passes).await;
 
         sync::sync_shared_tail(&router, engines.first().map(|e| &e.store)).await;
         tracing::info!(
@@ -281,7 +326,7 @@ fn spawn_sync_pass(
             elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "sync tick complete"
         );
-        guard.store(false, std::sync::atomic::Ordering::Release);
+        guard.store(false, Ordering::Release);
     });
 }
 
@@ -339,7 +384,7 @@ pub(crate) fn log_phase_timings(group: &str, repo: &str, phases: &[(&str, u128)]
 /// because `config::get` serializes nested YAML arrays via `serde_norway::to_string`
 /// which produces YAML block format, not JSON — breaking downstream parsing.
 pub fn configured_agents() -> Vec<String> {
-    if let Ok(agents_str) = crate::config::get("agents")
+    if let Ok(agents_str) = config::get("agents")
         && !agents_str.is_empty()
         && agents_str != "[]"
     {
@@ -359,7 +404,7 @@ pub fn configured_agents() -> Vec<String> {
     }
     router::config::DEFAULT_AGENTS
         .iter()
-        .map(std::string::ToString::to_string)
+        .map(ToString::to_string)
         .collect()
 }
 
@@ -389,9 +434,8 @@ impl RunTimeouts {
     /// `workflow.timeout_seconds` (at least 1800), raised by
     /// `workflow.timeout_by_complexity.{medium,complex}` but never below the base
     pub fn from_config() -> Self {
-        let read = |key: &str| -> Option<u64> {
-            crate::config::get(key).ok().and_then(|s| s.parse().ok())
-        };
+        let read =
+            |key: &str| -> Option<u64> { config::get(key).ok().and_then(|s| s.parse().ok()) };
         let base = read("workflow.timeout_seconds").unwrap_or(1800).max(1800);
         Self {
             base,
@@ -417,11 +461,11 @@ impl RunTimeouts {
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     /// Main tick interval
-    pub tick_interval: std::time::Duration,
+    pub tick_interval: Duration,
     /// GitHub sync interval (cleanup, PR review, mentions)
-    pub sync_interval: std::time::Duration,
+    pub sync_interval: Duration,
     /// Webhook health check interval (seconds)
-    pub webhook_health_check_interval: Option<std::time::Duration>,
+    pub webhook_health_check_interval: Option<Duration>,
     /// Maximum parallel task executions
     pub max_parallel: usize,
     /// Stuck task timeout for tasks with an active tmux session (seconds)
@@ -441,7 +485,7 @@ pub struct EngineConfig {
     /// Auto-create follow-up tasks when PR reviews request changes
     pub auto_create_followup_on_changes: bool,
     /// Graceful shutdown timeout — how long to wait for running agents before exiting.
-    pub graceful_shutdown_timeout: std::time::Duration,
+    pub graceful_shutdown_timeout: Duration,
     /// Grace period before silence detection kicks in (seconds).
     /// Allows time for agent startup, model download, API handshake.
     pub silence_grace_period: u64,
@@ -460,16 +504,16 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            tick_interval: std::time::Duration::from_secs(10),
-            sync_interval: std::time::Duration::from_secs(45),
-            webhook_health_check_interval: Some(std::time::Duration::from_secs(60)),
+            tick_interval: Duration::from_secs(10),
+            sync_interval: Duration::from_secs(45),
+            webhook_health_check_interval: Some(Duration::from_secs(60)),
             max_parallel: 4,
             stuck_timeout: 1800,
             no_session_stuck_timeout: 600,
             in_review_no_session_stuck_timeout: 1920,
             run_timeouts: RunTimeouts::default(),
             auto_create_followup_on_changes: true,
-            graceful_shutdown_timeout: std::time::Duration::from_secs(600),
+            graceful_shutdown_timeout: Duration::from_secs(600),
             silence_grace_period: 300,
             silence_cooldown: 3600,
             upgrade_check_interval: 3600,
@@ -493,23 +537,23 @@ impl EngineConfig {
     pub fn from_config() -> Self {
         let mut config = Self::default();
 
-        if let Ok(val) = crate::config::get("engine.tick_interval") {
+        if let Ok(val) = config::get("engine.tick_interval") {
             if let Ok(secs) = val.parse::<u64>() {
-                config.tick_interval = std::time::Duration::from_secs(secs);
+                config.tick_interval = Duration::from_secs(secs);
             } else {
                 tracing::warn!(key = "engine.tick_interval", value = %val, default_secs = config.tick_interval.as_secs(), "invalid value for engine.tick_interval, using default");
             }
         }
 
-        if let Ok(val) = crate::config::get("engine.sync_interval") {
+        if let Ok(val) = config::get("engine.sync_interval") {
             if let Ok(secs) = val.parse::<u64>() {
-                config.sync_interval = std::time::Duration::from_secs(secs);
+                config.sync_interval = Duration::from_secs(secs);
             } else {
                 tracing::warn!(key = "engine.sync_interval", value = %val, default_secs = config.sync_interval.as_secs(), "invalid value for engine.sync_interval, using default");
             }
         }
 
-        if let Ok(val) = crate::config::get("engine.max_parallel") {
+        if let Ok(val) = config::get("engine.max_parallel") {
             if let Ok(n) = val.parse::<usize>() {
                 config.max_parallel = n;
             } else {
@@ -517,7 +561,7 @@ impl EngineConfig {
             }
         }
 
-        if let Ok(val) = crate::config::get("engine.stuck_timeout") {
+        if let Ok(val) = config::get("engine.stuck_timeout") {
             if let Ok(secs) = val.parse::<u64>() {
                 config.stuck_timeout = secs;
             } else {
@@ -525,7 +569,7 @@ impl EngineConfig {
             }
         }
 
-        if let Ok(val) = crate::config::get("engine.no_session_stuck_timeout") {
+        if let Ok(val) = config::get("engine.no_session_stuck_timeout") {
             if let Ok(secs) = val.parse::<u64>() {
                 config.no_session_stuck_timeout = secs;
             } else {
@@ -534,7 +578,7 @@ impl EngineConfig {
         }
 
         let mut in_review_from_config = false;
-        if let Ok(val) = crate::config::get("engine.in_review_no_session_stuck_timeout") {
+        if let Ok(val) = config::get("engine.in_review_no_session_stuck_timeout") {
             if let Ok(secs) = val.parse::<u64>() {
                 config.in_review_no_session_stuck_timeout = secs;
                 in_review_from_config = true;
@@ -546,8 +590,8 @@ impl EngineConfig {
         // Keep the no-session review limit over the review agent's own timeout plus delivery
         // time, whatever either is set to. Under that, recovery resets a task whose finished
         // review is still on its way to the engine and the result is dropped as stale
-        let review_timeout = crate::engine::review::review_timeout_seconds();
-        let floored = crate::engine::review::no_session_review_floor(
+        let review_timeout = engine_review::review_timeout_seconds();
+        let floored = engine_review::no_session_review_floor(
             config.in_review_no_session_stuck_timeout,
             review_timeout,
         );
@@ -571,11 +615,10 @@ impl EngineConfig {
 
         config.run_timeouts = RunTimeouts::from_config();
 
-        if let Ok(val) = crate::config::get("engine.webhook_health_check_interval") {
+        if let Ok(val) = config::get("engine.webhook_health_check_interval") {
             if let Ok(secs) = val.parse::<u64>() {
                 if secs > 0 {
-                    config.webhook_health_check_interval =
-                        Some(std::time::Duration::from_secs(secs));
+                    config.webhook_health_check_interval = Some(Duration::from_secs(secs));
                 } else {
                     config.webhook_health_check_interval = None;
                 }
@@ -584,19 +627,19 @@ impl EngineConfig {
             }
         }
 
-        if let Ok(val) = crate::config::get("workflow.auto_create_followup_on_changes") {
+        if let Ok(val) = config::get("workflow.auto_create_followup_on_changes") {
             config.auto_create_followup_on_changes = !val.eq_ignore_ascii_case("false");
         }
 
-        if let Ok(val) = crate::config::get("engine.graceful_shutdown_timeout") {
+        if let Ok(val) = config::get("engine.graceful_shutdown_timeout") {
             if let Ok(secs) = val.parse::<u64>() {
-                config.graceful_shutdown_timeout = std::time::Duration::from_secs(secs);
+                config.graceful_shutdown_timeout = Duration::from_secs(secs);
             } else {
                 tracing::warn!(key = "engine.graceful_shutdown_timeout", value = %val, default_secs = config.graceful_shutdown_timeout.as_secs(), "invalid value for engine.graceful_shutdown_timeout, using default");
             }
         }
 
-        if let Ok(val) = crate::config::get("engine.silence_grace_period") {
+        if let Ok(val) = config::get("engine.silence_grace_period") {
             if let Ok(secs) = val.parse::<u64>() {
                 config.silence_grace_period = secs;
             } else {
@@ -604,7 +647,7 @@ impl EngineConfig {
             }
         }
 
-        if let Ok(val) = crate::config::get("engine.silence_cooldown") {
+        if let Ok(val) = config::get("engine.silence_cooldown") {
             if let Ok(secs) = val.parse::<u64>() {
                 config.silence_cooldown = secs;
             } else {
@@ -612,7 +655,7 @@ impl EngineConfig {
             }
         }
 
-        if let Ok(val) = crate::config::get("engine.upgrade_check_interval") {
+        if let Ok(val) = config::get("engine.upgrade_check_interval") {
             if let Ok(secs) = val.parse::<u64>() {
                 config.upgrade_check_interval = secs;
             } else {
@@ -620,7 +663,7 @@ impl EngineConfig {
             }
         }
 
-        if let Ok(val) = crate::config::get("engine.startup_failure_escalation_secs") {
+        if let Ok(val) = config::get("engine.startup_failure_escalation_secs") {
             if let Ok(secs) = val.parse::<u64>() {
                 config.startup_failure_escalation_secs = secs;
             } else {
@@ -658,7 +701,7 @@ pub fn format_rate_limited_until(reset_at: i64) -> String {
 async fn report_rate_limited(
     reset_at: i64,
     store: Option<&Arc<TaskStore>>,
-    transport: Option<&Arc<crate::channels::transport::Transport>>,
+    transport: Option<&Arc<Transport>>,
 ) {
     let m = rate_limit_metrics();
     let until = format_rate_limited_until(reset_at);
@@ -681,7 +724,7 @@ async fn report_rate_limited(
     }
 
     if let Some(transport) = transport {
-        transport.push_notification(crate::channels::notification::TaskNotification {
+        transport.push_notification(TaskNotification {
             task_id: "github".to_string(),
             title: "GitHub rate limit".to_string(),
             status: "blocked".to_string(),
@@ -723,7 +766,7 @@ const RESTART_ONLY_KEYS: [&str; 3] = ["channels", "webhook", "relay"];
 fn restart_only_snapshot() -> Vec<Option<String>> {
     RESTART_ONLY_KEYS
         .iter()
-        .map(|key| crate::config::get(key).ok())
+        .map(|key| config::get(key).ok())
         .collect()
 }
 
@@ -774,7 +817,7 @@ fn log_engine_config_changes(old: &EngineConfig, new: &EngineConfig) {
 }
 
 fn should_run_upgrade_check(
-    last_upgrade_check: Option<std::time::Instant>,
+    last_upgrade_check: Option<Instant>,
     upgrade_check_interval: u64,
 ) -> bool {
     if upgrade_check_interval == 0 {
@@ -782,7 +825,7 @@ fn should_run_upgrade_check(
     }
 
     last_upgrade_check
-        .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(upgrade_check_interval))
+        .is_none_or(|last| last.elapsed() >= Duration::from_secs(upgrade_check_interval))
 }
 
 /// Connect one project's backend and build its task manager and runner over
@@ -793,12 +836,11 @@ fn should_run_upgrade_check(
 /// once it does
 async fn connect_project_engine(
     repo: String,
-    project_dir: std::path::PathBuf,
+    project_dir: PathBuf,
     store: Arc<TaskStore>,
-    event_tx: Option<tokio::sync::broadcast::Sender<events::TaskEvent>>,
+    event_tx: Option<Sender<events::TaskEvent>>,
 ) -> anyhow::Result<ProjectEngine> {
-    let backend: Arc<dyn ExternalBackend> =
-        Arc::new(crate::backends::github::GitHubBackend::new(repo.clone())?);
+    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
 
     // A failed health check (rate limit, network, auth) must not drop the project: it would have
     // no review subscriber until the next restart. Later ticks hit the API again and retry on
@@ -813,20 +855,12 @@ async fn connect_project_engine(
     }
 
     let task_manager = Arc::new(match event_tx {
-        Some(tx) => TaskManager::with_events(
-            std::sync::Arc::clone(&backend),
-            std::sync::Arc::clone(&store),
-            repo.clone(),
-            tx,
-        ),
-        None => TaskManager::with_store(
-            std::sync::Arc::clone(&backend),
-            std::sync::Arc::clone(&store),
-            repo.clone(),
-        ),
+        Some(tx) => {
+            TaskManager::with_events(Arc::clone(&backend), Arc::clone(&store), repo.clone(), tx)
+        }
+        None => TaskManager::with_store(Arc::clone(&backend), Arc::clone(&store), repo.clone()),
     });
-    let runner =
-        Arc::new(runner::TaskRunner::new(repo.clone()).with_store(std::sync::Arc::clone(&store)));
+    let runner = Arc::new(runner::TaskRunner::new(repo.clone()).with_store(Arc::clone(&store)));
 
     Ok(ProjectEngine {
         repo,
@@ -845,11 +879,10 @@ async fn connect_project_engine(
  * running, or silently never picks a new one up
  **/
 fn diff_configured_projects(
-    configured: &[(String, std::path::PathBuf)],
-    active_repos: &std::collections::HashSet<String>,
-) -> (Vec<(String, std::path::PathBuf)>, Vec<String>) {
-    let configured_repos: std::collections::HashSet<&str> =
-        configured.iter().map(|(r, _)| r.as_str()).collect();
+    configured: &[(String, PathBuf)],
+    active_repos: &HashSet<String>,
+) -> (Vec<(String, PathBuf)>, Vec<String>) {
+    let configured_repos: HashSet<&str> = configured.iter().map(|(r, _)| r.as_str()).collect();
 
     let added = configured
         .iter()
@@ -876,7 +909,7 @@ fn diff_configured_projects(
 )]
 async fn sync_project_engines(
     project_engines: &mut Vec<ProjectEngine>,
-    active_repos: &mut std::collections::HashSet<String>,
+    active_repos: &mut HashSet<String>,
     event_bus: &events::EventBus,
     tmux: &Arc<TmuxManager>,
     capture: &Arc<CaptureService>,
@@ -894,10 +927,7 @@ async fn sync_project_engines(
             return;
         }
     };
-    let Some(store) = project_engines
-        .first()
-        .map(|e| std::sync::Arc::clone(&e.store))
-    else {
+    let Some(store) = project_engines.first().map(|e| Arc::clone(&e.store)) else {
         return;
     };
 
@@ -914,7 +944,7 @@ async fn sync_project_engines(
         let engine = match connect_project_engine(
             repo.clone(),
             project_dir,
-            std::sync::Arc::clone(&store),
+            Arc::clone(&store),
             Some(event_bus.sender()),
         )
         .await
@@ -934,34 +964,34 @@ async fn sync_project_engines(
 
         subscribers::dispatch::spawn(
             event_bus.subscribe(),
-            std::sync::Arc::clone(&engine.backend),
-            std::sync::Arc::clone(tmux),
-            std::sync::Arc::clone(&engine.runner),
-            std::sync::Arc::clone(capture),
-            std::sync::Arc::clone(semaphore),
-            std::sync::Arc::clone(&engine.task_manager),
+            Arc::clone(&engine.backend),
+            Arc::clone(tmux),
+            Arc::clone(&engine.runner),
+            Arc::clone(capture),
+            Arc::clone(semaphore),
+            Arc::clone(&engine.task_manager),
             weight_tx.clone(),
-            std::sync::Arc::clone(router),
-            std::sync::Arc::clone(dispatching),
-            std::sync::Arc::clone(&engine.store),
+            Arc::clone(router),
+            Arc::clone(dispatching),
+            Arc::clone(&engine.store),
             engine.repo.clone(),
         );
         subscribers::review::spawn(
             event_bus.subscribe(),
-            std::sync::Arc::clone(&engine.backend),
-            std::sync::Arc::clone(tmux),
-            std::sync::Arc::clone(review_semaphore),
-            std::sync::Arc::clone(&engine.task_manager),
-            std::sync::Arc::clone(router),
-            std::sync::Arc::clone(dispatching),
-            std::sync::Arc::clone(&engine.store),
+            Arc::clone(&engine.backend),
+            Arc::clone(tmux),
+            Arc::clone(review_semaphore),
+            Arc::clone(&engine.task_manager),
+            Arc::clone(router),
+            Arc::clone(dispatching),
+            Arc::clone(&engine.store),
             engine.repo.clone(),
         );
         subscribers::unblock::spawn(
             event_bus.subscribe(),
-            std::sync::Arc::clone(&engine.backend),
-            std::sync::Arc::clone(&engine.task_manager),
-            std::sync::Arc::clone(&engine.store),
+            Arc::clone(&engine.backend),
+            Arc::clone(&engine.task_manager),
+            Arc::clone(&engine.store),
             engine.repo.clone(),
         );
 
@@ -980,7 +1010,7 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
     tracing::info!(repos = ?repos, "loading projects from config");
 
     if projects.is_empty() {
-        let config_path = crate::home::config_path().map_or_else(
+        let config_path = home::config_path().map_or_else(
             |_| "~/.orch/config.yml".to_string(),
             |p| p.display().to_string(),
         );
@@ -991,23 +1021,21 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
 
     // Initialize unified task store once — all project engines share the same SQLite file.
     // Creating one pool here avoids N separate connection pools for the same database.
-    let store = Arc::new(TaskStore::open(&crate::store::default_db_path().await?).await?);
-    if crate::cluster::enabled() {
-        crate::cluster::start(&store, &crate::home::orch_home()?.join("raft.db")).await?;
-        crate::cluster::local::serve((*store).clone()).await?;
+    let store = Arc::new(TaskStore::open(&store::default_db_path().await?).await?);
+    if cluster::enabled() {
+        cluster::start(&store, &home::orch_home()?.join("raft.db")).await?;
+        local::serve((*store).clone()).await?;
     }
 
     // Load persisted model cooldowns and register store for future writes.
     // Runs once here so the global cooldown store is not overwritten per project.
-    crate::engine::cooldown::init_cooldown_store(std::sync::Arc::clone(&store)).await;
+    engine_cooldown::init_cooldown_store(Arc::clone(&store)).await;
 
     for (repo, project_dir) in projects {
         tracing::info!(repo = %repo, "initializing project engine");
         config::watch(&project_dir.join(".orch.yml"));
 
-        engines.push(
-            connect_project_engine(repo, project_dir, std::sync::Arc::clone(&store), None).await?,
-        );
+        engines.push(connect_project_engine(repo, project_dir, Arc::clone(&store), None).await?);
     }
 
     Ok(engines)
@@ -1015,16 +1043,14 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
 
 async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyhow::Result<()> {
     for engine in project_engines {
-        let repo_root =
-            crate::engine::runner::worktree::resolve_main_repo(&engine.project_dir).await;
-        let repo_root_path = std::path::PathBuf::from(&repo_root);
-        let default_branch =
-            crate::engine::runner::worktree::detect_default_branch(&repo_root_path).await;
+        let repo_root = worktree::resolve_main_repo(&engine.project_dir).await;
+        let repo_root_path = PathBuf::from(&repo_root);
+        let default_branch = worktree::detect_default_branch(&repo_root_path).await;
         let worktrees = list_project_worktrees(&repo_root_path).await?;
 
         // Fetch refs once for all worktrees in this project, so rebase below
         // operates on up-to-date origin/* refs without N sequential fetches.
-        if let Err(e) = crate::engine::runner::git_ops::git()
+        if let Err(e) = git_ops::git()
             .await
             .args(["-C", &repo_root.to_string_lossy(), "fetch", "origin"])
             .output_with_context()
@@ -1124,10 +1150,7 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
                             }
                             if let Err(e) = engine
                                 .task_manager
-                                .update_task_status(
-                                    &ExternalId(task_id.clone()),
-                                    crate::backends::Status::New,
-                                )
+                                .update_task_status(&ExternalId(task_id.clone()), Status::New)
                                 .await
                             {
                                 tracing::warn!(task_id, err = %e, "failed to update backend status during reconciliation");
@@ -1199,8 +1222,6 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
 /// configured. The underlying mutations are idempotent, so re-syncing an
 /// already-correct estimate is harmless.
 async fn reconcile_startup_estimates(project_engines: &[ProjectEngine]) {
-    use crate::backends::ExternalId;
-
     for engine in project_engines {
         let tasks = match engine.store.list_external_tasks_with_estimates().await {
             Ok(t) => t,
@@ -1248,12 +1269,12 @@ async fn reconcile_startup_estimates(project_engines: &[ProjectEngine]) {
 }
 
 /// Read per-project channel configuration from `.orch.yml`.
-fn read_project_channel_config(project_dir: &std::path::Path) -> ProjectChannelConfig {
+fn read_project_channel_config(project_dir: &Path) -> ProjectChannelConfig {
     let config_path = project_dir.join(".orch.yml");
     if !config_path.exists() {
         return ProjectChannelConfig::default();
     }
-    let content = match std::fs::read_to_string(&config_path) {
+    let content = match fs::read_to_string(&config_path) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
@@ -1330,7 +1351,7 @@ async fn check_and_notify_upgrade(
     store: &Arc<TaskStore>,
     channels: &Arc<ChannelRegistry>,
     current_version: &str,
-    check_interval: std::time::Duration,
+    check_interval: Duration,
 ) {
     let last_check_key = "upgrade:last_check_at";
     let last_notified_key = "upgrade:last_notified_version";
@@ -1437,7 +1458,7 @@ async fn check_and_notify_upgrade(
 /// without relying on `ChannelRegistry`.
 async fn send_startup_escalation_notification(elapsed_secs: u64) {
     #[expect(clippy::cast_precision_loss, reason = "a display duration")]
-    let duration = crate::channels::notification::format_duration(elapsed_secs as f64);
+    let duration = notification::format_duration(elapsed_secs as f64);
 
     let msg_telegram = format!(
         "🚨 <b>Orch startup blocked — GitHub unreachable</b>\n\n\
@@ -1461,8 +1482,8 @@ async fn send_startup_escalation_notification(elapsed_secs: u64) {
     );
 
     // Telegram
-    let tg_token = crate::secret_ref::config_secret("channels.telegram.bot_token").await;
-    let tg_chat_id = crate::config::get("channels.telegram.chat_id");
+    let tg_token = secret_ref::config_secret("channels.telegram.bot_token").await;
+    let tg_chat_id = config::get("channels.telegram.chat_id");
     if let (Ok(token), Ok(chat_id)) = (&tg_token, &tg_chat_id)
         && !token.is_empty()
         && !chat_id.is_empty()
@@ -1473,7 +1494,7 @@ async fn send_startup_escalation_notification(elapsed_secs: u64) {
             body: msg_telegram.clone(),
             reply_to: None,
             metadata: serde_json::json!({ "preformatted_html": true }),
-            topic_id: crate::config::get("channels.telegram.general_topic_id").ok(),
+            topic_id: config::get("channels.telegram.general_topic_id").ok(),
         };
         match channel.send(&msg).await {
             Err(e) => {
@@ -1486,17 +1507,17 @@ async fn send_startup_escalation_notification(elapsed_secs: u64) {
     }
 
     // Discord
-    if let Ok(token) = crate::secret_ref::config_secret("channels.discord.bot_token").await {
-        let channel_id = crate::config::get("channels.discord.channel_id")
-            .or_else(|_| crate::config::get("channels.discord.general_channel_id"));
+    if let Ok(token) = secret_ref::config_secret("channels.discord.bot_token").await {
+        let channel_id = config::get("channels.discord.channel_id")
+            .or_else(|_| config::get("channels.discord.general_channel_id"));
         if !token.is_empty()
             && let Some(cid) = channel_id.ok().filter(|s| !s.is_empty())
         {
-            let shard_id = crate::config::get("channels.discord.shard_id")
+            let shard_id = config::get("channels.discord.shard_id")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
-            let shard_count = crate::config::get("channels.discord.shard_count")
+            let shard_count = config::get("channels.discord.shard_count")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(1);
@@ -1521,8 +1542,8 @@ async fn send_startup_escalation_notification(elapsed_secs: u64) {
     }
 
     // Slack
-    if let Ok(token) = crate::secret_ref::config_secret("channels.slack.bot_token").await {
-        let channel_id = crate::config::get("channels.slack.channel_id");
+    if let Ok(token) = secret_ref::config_secret("channels.slack.bot_token").await {
+        let channel_id = config::get("channels.slack.channel_id");
         if !token.is_empty()
             && let Ok(cid) = channel_id
             && let Ok(channel) = SlackChannel::new(token, Some(cid))
@@ -1550,7 +1571,7 @@ async fn send_startup_escalation_notification(elapsed_secs: u64) {
 ///
 /// This is the main entry point — called by `orch serve`.
 pub async fn serve() -> anyhow::Result<()> {
-    let killed = crate::home::kill_other_orch_serve_processes(std::time::Duration::from_secs(30));
+    let killed = home::kill_other_orch_serve_processes(Duration::from_secs(30));
     if killed > 0 {
         tracing::info!(count = killed, "terminated stale orch serve processes");
     }
@@ -1560,13 +1581,13 @@ pub async fn serve() -> anyhow::Result<()> {
     // Pre-create standard directories with async I/O so subsequent synchronous
     // callers (state_dir, orch_home, etc.) find them already present and their
     // create_dir_all calls become fast no-ops.
-    if let Err(e) = crate::home::init_dirs().await {
+    if let Err(e) = home::init_dirs().await {
         tracing::warn!("failed to initialize orch directories: {e}");
     }
 
     // Pre-warm the config cache with async I/O so get() / get_list() calls in
     // hot async paths never block a Tokio thread on std::fs::read_to_string.
-    if let Err(e) = crate::config::warm_cache().await {
+    if let Err(e) = config::warm_cache().await {
         tracing::warn!("failed to warm config cache: {e}");
     }
 
@@ -1587,7 +1608,7 @@ pub async fn serve() -> anyhow::Result<()> {
         let mut delay_secs = 5u64;
         let mut attempt = 0u32;
         let mut escalated = false;
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         loop {
             attempt += 1;
             match init_project_engines().await {
@@ -1606,7 +1627,7 @@ pub async fn serve() -> anyhow::Result<()> {
                     {
                         escalated = true;
                         #[expect(clippy::cast_precision_loss, reason = "a display duration")]
-                        let outage = crate::channels::notification::format_duration(elapsed as f64);
+                        let outage = notification::format_duration(elapsed as f64);
                         tracing::error!(
                             delay_secs,
                             attempt,
@@ -1626,7 +1647,7 @@ pub async fn serve() -> anyhow::Result<()> {
                         );
                     }
 
-                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                    time::sleep(Duration::from_secs(delay_secs)).await;
                     delay_secs = (delay_secs * 2).min(120);
                 }
             }
@@ -1641,7 +1662,7 @@ pub async fn serve() -> anyhow::Result<()> {
     // Full set of currently-configured project repos, used by the per-tick global
     // sweeps (e.g. `dispatch_routed_tasks_global`) to distinguish "orphaned" tasks
     // (repo no longer in config) from tasks belonging to some other active project.
-    let mut active_repos: std::collections::HashSet<String> =
+    let mut active_repos: HashSet<String> =
         project_engines.iter().map(|e| e.repo.clone()).collect();
 
     // Create the event bus for task status transitions
@@ -1674,8 +1695,8 @@ pub async fn serve() -> anyhow::Result<()> {
     // Re-create task managers with shared store and event bus
     for engine in &mut project_engines {
         engine.task_manager = Arc::new(TaskManager::with_events(
-            std::sync::Arc::clone(&engine.backend),
-            std::sync::Arc::clone(&engine.store),
+            Arc::clone(&engine.backend),
+            Arc::clone(&engine.store),
             engine.repo.clone(),
             event_bus.sender(),
         ));
@@ -1699,10 +1720,10 @@ pub async fn serve() -> anyhow::Result<()> {
 
     // Build ChannelRouter from global config + per-project configs
     let global_channel_config = GlobalChannelConfig {
-        telegram_general_topic_id: crate::config::get("channels.telegram.general_topic_id").ok(),
-        discord_general_channel_id: crate::config::get("channels.discord.general_channel_id").ok(),
-        control_telegram_topic_id: crate::config::get("control.channels.telegram.topic_id").ok(),
-        control_discord_channel_id: crate::config::get("control.channels.discord.channel_id").ok(),
+        telegram_general_topic_id: config::get("channels.telegram.general_topic_id").ok(),
+        discord_general_channel_id: config::get("channels.discord.general_channel_id").ok(),
+        control_telegram_topic_id: config::get("control.channels.telegram.topic_id").ok(),
+        control_discord_channel_id: config::get("control.channels.discord.channel_id").ok(),
     };
     let project_channel_configs: Vec<(String, ProjectChannelConfig)> = project_engines
         .iter()
@@ -1730,8 +1751,8 @@ pub async fn serve() -> anyhow::Result<()> {
     let transport = Arc::new(Transport::new());
 
     // Initialize capture service and start background loop
-    let capture = Arc::new(CaptureService::new(std::sync::Arc::clone(&transport)));
-    let capture_for_tick = std::sync::Arc::clone(&capture);
+    let capture = Arc::new(CaptureService::new(Arc::clone(&transport)));
+    let capture_for_tick = Arc::clone(&capture);
     tokio::spawn(async move {
         capture.start().await;
     });
@@ -1740,10 +1761,10 @@ pub async fn serve() -> anyhow::Result<()> {
     let mut channel_registry = ChannelRegistry::new();
 
     // Try to initialize Telegram channel
-    if let Ok(token) = crate::secret_ref::config_secret("channels.telegram.bot_token").await
+    if let Ok(token) = secret_ref::config_secret("channels.telegram.bot_token").await
         && !token.is_empty()
     {
-        let chat_id = crate::config::get("channels.telegram.chat_id").ok();
+        let chat_id = config::get("channels.telegram.chat_id").ok();
         match TelegramChannel::new(token, chat_id) {
             Ok(telegram) => {
                 if let Err(e) = telegram.health_check().await {
@@ -1760,15 +1781,15 @@ pub async fn serve() -> anyhow::Result<()> {
     }
 
     // Try to initialize Discord Gateway channel (websocket)
-    if let Ok(token) = crate::secret_ref::config_secret("channels.discord.bot_token").await
+    if let Ok(token) = secret_ref::config_secret("channels.discord.bot_token").await
         && !token.is_empty()
     {
-        let channel_id = crate::config::get("channels.discord.channel_id").ok();
-        let shard_id = crate::config::get("channels.discord.shard_id")
+        let channel_id = config::get("channels.discord.channel_id").ok();
+        let shard_id = config::get("channels.discord.shard_id")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
-        let shard_count = crate::config::get("channels.discord.shard_count")
+        let shard_count = config::get("channels.discord.shard_count")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(1);
@@ -1788,10 +1809,10 @@ pub async fn serve() -> anyhow::Result<()> {
     }
 
     // Try to initialize Slack channel
-    if let Ok(token) = crate::secret_ref::config_secret("channels.slack.bot_token").await
+    if let Ok(token) = secret_ref::config_secret("channels.slack.bot_token").await
         && !token.is_empty()
     {
-        let channel_id = crate::config::get("channels.slack.channel_id").ok();
+        let channel_id = config::get("channels.slack.channel_id").ok();
         match SlackChannel::new(token, channel_id) {
             Ok(slack) => {
                 if let Err(e) = slack.health_check().await {
@@ -1808,12 +1829,12 @@ pub async fn serve() -> anyhow::Result<()> {
     }
 
     // Initialize tmux channel with transport for output streaming
-    let tmux_channel = TmuxChannel::with_transport(std::sync::Arc::clone(&transport));
+    let tmux_channel = TmuxChannel::with_transport(Arc::clone(&transport));
     channel_registry.register(Box::new(tmux_channel));
     tracing::info!("tmux channel registered");
 
     // Start all channels and collect their message receivers
-    let mut channel_receivers: Vec<tokio::sync::mpsc::Receiver<IncomingMessage>> = Vec::new();
+    let mut channel_receivers: Vec<Receiver<IncomingMessage>> = Vec::new();
     for channel in channel_registry.iter() {
         match channel.start().await {
             Ok(rx) => {
@@ -1830,34 +1851,33 @@ pub async fn serve() -> anyhow::Result<()> {
     let channel_registry = Arc::new(channel_registry);
 
     // Spawn tasks to handle incoming channel messages (if any channels are active)
-    let transport_for_messages = std::sync::Arc::clone(&transport);
-    let tmux_for_messages = std::sync::Arc::clone(&tmux);
-    let capture_for_messages = std::sync::Arc::clone(&capture_for_tick);
-    let channels_for_messages = std::sync::Arc::clone(&channel_registry);
+    let transport_for_messages = Arc::clone(&transport);
+    let tmux_for_messages = Arc::clone(&tmux);
+    let capture_for_messages = Arc::clone(&capture_for_tick);
+    let channels_for_messages = Arc::clone(&channel_registry);
     // Lightweight engine references for command execution and task creation
     let engine_refs: Vec<EngineRef> = project_engines
         .iter()
         .map(|e| {
             (
                 e.repo.clone(),
-                std::sync::Arc::clone(&e.backend),
-                std::sync::Arc::clone(&e.task_manager),
-                Some(std::sync::Arc::clone(&e.store)),
+                Arc::clone(&e.backend),
+                Arc::clone(&e.task_manager),
+                Some(Arc::clone(&e.store)),
             )
         })
         .collect();
     // Shared in-memory map for pending project picks (General channel multi-project picker).
-    let pending_picks: channel_handler::PendingPicks =
-        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-    let router_for_messages = std::sync::Arc::clone(&channel_router);
+    let pending_picks: channel_handler::PendingPicks = Arc::new(Mutex::new(HashMap::new()));
+    let router_for_messages = Arc::clone(&channel_router);
     for mut rx in channel_receivers {
-        let transport = std::sync::Arc::clone(&transport_for_messages);
-        let tmux = std::sync::Arc::clone(&tmux_for_messages);
-        let capture = std::sync::Arc::clone(&capture_for_messages);
-        let channels = std::sync::Arc::clone(&channels_for_messages);
+        let transport = Arc::clone(&transport_for_messages);
+        let tmux = Arc::clone(&tmux_for_messages);
+        let capture = Arc::clone(&capture_for_messages);
+        let channels = Arc::clone(&channels_for_messages);
         let engine_refs = engine_refs.clone();
-        let ch_router = std::sync::Arc::clone(&router_for_messages);
-        let picks = std::sync::Arc::clone(&pending_picks);
+        let ch_router = Arc::clone(&router_for_messages);
+        let picks = Arc::clone(&pending_picks);
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 tracing::debug!(channel = %msg.channel, thread = %msg.thread_id, "received message from channel");
@@ -1880,17 +1900,15 @@ pub async fn serve() -> anyhow::Result<()> {
     // a KV marker was stored before shutdown. Send a confirmation to the originating channel now
     // that we're back online. Use a short delay to let the channel connections re-establish.
     {
-        let restart_channels = std::sync::Arc::clone(&channel_registry);
-        let restart_store = project_engines
-            .first()
-            .map(|e| std::sync::Arc::clone(&e.store));
+        let restart_channels = Arc::clone(&channel_registry);
+        let restart_store = project_engines.first().map(|e| Arc::clone(&e.store));
         if let Some(store) = restart_store {
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                time::sleep(Duration::from_secs(5)).await;
                 match store.kv_get("control:restart_pending").await {
                     Ok(Some(conv_key)) => {
                         if let Some((ch_name, thread_id, topic_id)) =
-                            crate::channels::transport::parse_conversation_key(&conv_key)
+                            transport::parse_conversation_key(&conv_key)
                         {
                             for ch in restart_channels.iter() {
                                 if ch.name() == ch_name {
@@ -1899,7 +1917,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                         body: "orch restarted successfully.".to_string(),
                                         reply_to: None,
                                         metadata: serde_json::json!({}),
-                                        topic_id: topic_id.map(std::string::ToString::to_string),
+                                        topic_id: topic_id.map(ToString::to_string),
                                     };
                                     if let Err(e) = ch.send(&msg).await {
                                         tracing::warn!(
@@ -1937,12 +1955,11 @@ pub async fn serve() -> anyhow::Result<()> {
     //    channels without a topic_id (legacy behaviour).
     {
         let mut notification_rx = transport.subscribe_notifications();
-        let channels = std::sync::Arc::clone(&channel_registry);
-        let notif_router = std::sync::Arc::clone(&channel_router);
+        let channels = Arc::clone(&channel_registry);
+        let notif_router = Arc::clone(&channel_router);
         // Grab a store reference for subscription lookups.
-        let notif_store: Option<Arc<TaskStore>> = project_engines
-            .first()
-            .map(|e| std::sync::Arc::clone(&e.store));
+        let notif_store: Option<Arc<TaskStore>> =
+            project_engines.first().map(|e| Arc::clone(&e.store));
         tokio::spawn(async move {
             loop {
                 match notification_rx.recv().await {
@@ -2009,8 +2026,7 @@ pub async fn serve() -> anyhow::Result<()> {
                             // don't double-fire the same Telegram/Discord destination
                             // when a repo's configured topic and a `channel_subscriptions`
                             // row resolve to the same `(channel, topic_id)`.
-                            let mut sent: std::collections::HashSet<(String, Option<String>)> =
-                                std::collections::HashSet::new();
+                            let mut sent: HashSet<(String, Option<String>)> = HashSet::new();
 
                             // 1. Dedicated channel targets for this repo.
                             for channel in channels.iter() {
@@ -2157,10 +2173,10 @@ pub async fn serve() -> anyhow::Result<()> {
                             }
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    Err(RecvError::Lagged(n)) => {
                         tracing::warn!(missed = n, "notification receiver lagged");
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    Err(RecvError::Closed) => {
                         tracing::debug!("notification channel closed");
                         break;
                     }
@@ -2177,12 +2193,12 @@ pub async fn serve() -> anyhow::Result<()> {
     // tick always runs every `engine.sync_interval` whether or not webhooks work
     let webhook_port: Option<u16>;
     let mut webhook_healthy: bool;
-    let mut last_webhook_health_check = std::time::Instant::now();
+    let mut last_webhook_health_check = Instant::now();
     // Start webhook server if configured
-    let webhook_enabled = crate::config::get_global("webhook.enabled").is_ok_and(|v| v == "true");
+    let webhook_enabled = config::get_global("webhook.enabled").is_ok_and(|v| v == "true");
     // No readable secret keeps the webhook server off, it never accepts unsigned requests
     let webhook_secret = if webhook_enabled {
-        crate::secret_ref::config_secret("webhook.secret")
+        secret_ref::config_secret("webhook.secret")
             .await
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -2198,16 +2214,14 @@ pub async fn serve() -> anyhow::Result<()> {
     let webhook_secret = webhook_secret.unwrap_or_default();
 
     // Shared status updated by the server-spawn task and the health-check loop.
-    let webhook_status = Arc::new(tokio::sync::Mutex::new(
-        crate::webhook_status::WebhookStatus::default(),
-    ));
+    let webhook_status = Arc::new(Mutex::new(WebhookStatus::default()));
 
     if webhook_enabled {
         // Spawn the HTTP server with exponential-backoff retry on transient
         // bind errors (e.g. EADDRINUSE).  After MAX_ATTEMPTS the engine falls
         // back to polling and updates the shared status accordingly.
         const WEBHOOK_MAX_ATTEMPTS: u32 = 5;
-        let port: u16 = crate::config::get("webhook.port")
+        let port: u16 = config::get("webhook.port")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8080);
@@ -2218,7 +2232,7 @@ pub async fn serve() -> anyhow::Result<()> {
             .map(|e| e.repo.clone())
             .unwrap_or_default();
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(64);
+        let (tx, mut rx) = mpsc::channel::<IncomingMessage>(64);
 
         // Initialise status: configured, not yet healthy.
         let to_save = {
@@ -2231,9 +2245,8 @@ pub async fn serve() -> anyhow::Result<()> {
         };
         to_save.save().await;
 
-        let status_for_spawn = std::sync::Arc::clone(&webhook_status);
+        let status_for_spawn = Arc::clone(&webhook_status);
         tokio::spawn(async move {
-            use crate::channels::github::{is_transient_bind_error, webhook_backoff_delay};
             let mut attempt = 0u32;
             loop {
                 attempt += 1;
@@ -2288,15 +2301,15 @@ pub async fn serve() -> anyhow::Result<()> {
                             };
                             to_save.save().await;
                         }
-                        tokio::time::sleep(delay).await;
+                        time::sleep(delay).await;
                     }
                 }
             }
         });
 
         // Spawn the message forwarding task (reads from webhook channel)
-        let notify = std::sync::Arc::clone(&webhook_notify);
-        let transport_for_webhook = std::sync::Arc::clone(&transport);
+        let notify = Arc::clone(&webhook_notify);
+        let transport_for_webhook = Arc::clone(&transport);
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 tracing::info!(
@@ -2338,17 +2351,17 @@ pub async fn serve() -> anyhow::Result<()> {
     }
 
     start_relay_client(&project_engines, &webhook_notify);
-    crate::github::app::start_loader();
+    app::start_loader();
 
     // Agent router (selects agent + model per task) - shared across projects.
     // Router::from_config() may run `opencode models` when the config uses opencode.
     // spawn_blocking keeps the Tokio runtime thread free during that I/O
     let router = Arc::new(RwLock::new(
-        match tokio::task::spawn_blocking(Router::from_config).await {
+        match task::spawn_blocking(Router::from_config).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(?e, "router init panicked in spawn_blocking, using default");
-                tokio::task::spawn_blocking(|| Router::new(RouterConfig::default()))
+                task::spawn_blocking(|| Router::new(RouterConfig::default()))
                     .await
                     .unwrap_or_else(|e2| {
                         panic!("router default init also panicked in spawn_blocking — cannot start engine without a router: {e2:?}");
@@ -2390,13 +2403,13 @@ pub async fn serve() -> anyhow::Result<()> {
     let auto_merge_in_flight: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
 
     // Subscribe to config file changes for hot reload
-    let mut config_rx = crate::config::subscribe();
+    let mut config_rx = config::subscribe();
 
     // Track sync interval
-    let mut last_sync = std::time::Instant::now();
+    let mut last_sync = Instant::now();
 
     // Track upgrade check interval
-    let mut last_upgrade_check: Option<std::time::Instant> = None;
+    let mut last_upgrade_check: Option<Instant> = None;
 
     // Reset epoch of the GitHub rate-limit window already reported, so the log line,
     // the KV flag and the channel notification fire once per window instead of per tick
@@ -2419,16 +2432,16 @@ pub async fn serve() -> anyhow::Result<()> {
     for engine in &project_engines {
         subscribers::dispatch::spawn(
             event_bus.subscribe(),
-            std::sync::Arc::clone(&engine.backend),
-            std::sync::Arc::clone(&tmux),
-            std::sync::Arc::clone(&engine.runner),
-            std::sync::Arc::clone(&capture_for_tick),
-            std::sync::Arc::clone(&semaphore),
-            std::sync::Arc::clone(&engine.task_manager),
+            Arc::clone(&engine.backend),
+            Arc::clone(&tmux),
+            Arc::clone(&engine.runner),
+            Arc::clone(&capture_for_tick),
+            Arc::clone(&semaphore),
+            Arc::clone(&engine.task_manager),
             weight_tx.clone(),
-            std::sync::Arc::clone(&router),
-            std::sync::Arc::clone(&dispatching),
-            std::sync::Arc::clone(&engine.store),
+            Arc::clone(&router),
+            Arc::clone(&dispatching),
+            Arc::clone(&engine.store),
             engine.repo.clone(),
         );
     }
@@ -2438,13 +2451,13 @@ pub async fn serve() -> anyhow::Result<()> {
     for engine in &project_engines {
         subscribers::review::spawn(
             event_bus.subscribe(),
-            std::sync::Arc::clone(&engine.backend),
-            std::sync::Arc::clone(&tmux),
-            std::sync::Arc::clone(&review_semaphore),
-            std::sync::Arc::clone(&engine.task_manager),
-            std::sync::Arc::clone(&router),
-            std::sync::Arc::clone(&dispatching),
-            std::sync::Arc::clone(&engine.store),
+            Arc::clone(&engine.backend),
+            Arc::clone(&tmux),
+            Arc::clone(&review_semaphore),
+            Arc::clone(&engine.task_manager),
+            Arc::clone(&router),
+            Arc::clone(&dispatching),
+            Arc::clone(&engine.store),
             engine.repo.clone(),
         );
     }
@@ -2454,9 +2467,9 @@ pub async fn serve() -> anyhow::Result<()> {
     for engine in &project_engines {
         subscribers::unblock::spawn(
             event_bus.subscribe(),
-            std::sync::Arc::clone(&engine.backend),
-            std::sync::Arc::clone(&engine.task_manager),
-            std::sync::Arc::clone(&engine.store),
+            Arc::clone(&engine.backend),
+            Arc::clone(&engine.task_manager),
+            Arc::clone(&engine.store),
             engine.repo.clone(),
         );
     }
@@ -2464,7 +2477,7 @@ pub async fn serve() -> anyhow::Result<()> {
 
     // Spawn notify subscriber — reacts to ALL events, pushes to transport.
     // Spawned once (not per-project) since the transport handles all repos.
-    subscribers::notify::spawn(event_bus.subscribe(), std::sync::Arc::clone(&transport));
+    subscribers::notify::spawn(event_bus.subscribe(), Arc::clone(&transport));
     tracing::info!("notify subscriber started");
 
     // Main loop
@@ -2478,20 +2491,20 @@ pub async fn serve() -> anyhow::Result<()> {
     // tell the operator their edit needs a restart.
     let mut restart_only = restart_only_snapshot();
 
-    let mut interval = tokio::time::interval(config.tick_interval);
+    let mut interval = time::interval(config.tick_interval);
 
     // Signal handlers (launchd/systemd send SIGTERM to stop services, SIGHUP for reload/restart)
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let mut sigterm = unix::signal(SignalKind::terminate())?;
+    let mut sighup = unix::signal(SignalKind::hangup())?;
 
     // Guard to prevent concurrent sync_tick runs (sync is spawned as a background task).
-    let sync_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sync_in_progress = Arc::new(AtomicBool::new(false));
 
     // Tick watchdog: detects when the main loop hasn't completed a tick in > 60s.
     // Updates an atomic timestamp at the end of each tick iteration.
-    let last_tick_epoch = Arc::new(std::sync::atomic::AtomicU64::new(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+    let last_tick_epoch = Arc::new(AtomicU64::new(
+        SystemTime::now()
+            .duration_since(std_time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
     ));
@@ -2500,18 +2513,18 @@ pub async fn serve() -> anyhow::Result<()> {
         let tick_interval_secs = config.tick_interval.as_secs();
         tokio::spawn(async move {
             // Check every 30s whether the main loop is still ticking.
-            let mut watchdog_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            let mut watchdog_interval = time::interval(Duration::from_secs(30));
             // Own suspend baseline, independent of the main loop's checkpoint(). The
             // watchdog's interval timer also freezes during a host suspend, so this
             // detects the gap from its own wake-up instead of racing the main loop's
             // checkpoint() for the same GAP_LOG entry (see #3544).
-            let mut suspend_detector = crate::engine::suspend::SuspendDetector::new();
+            let mut suspend_detector = SuspendDetector::new();
             loop {
                 watchdog_interval.tick().await;
                 let own_gap = suspend_detector.check();
-                let last = last_tick_epoch.load(std::sync::atomic::Ordering::Relaxed);
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
+                let last = last_tick_epoch.load(Ordering::Relaxed);
+                let now = SystemTime::now()
+                    .duration_since(std_time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
                 let stale_secs = now.saturating_sub(last);
@@ -2524,9 +2537,8 @@ pub async fn serve() -> anyhow::Result<()> {
                     // watchdog's own detector (immune to the checkpoint race above);
                     // fall back to the shared log in case the main loop's checkpoint()
                     // already ran and recorded a larger gap.
-                    let shared_gap = crate::engine::suspend::gap_detected_within(
-                        std::time::Duration::from_secs(stale_secs),
-                    );
+                    let shared_gap =
+                        engine_suspend::gap_detected_within(Duration::from_secs(stale_secs));
                     let gap = match (own_gap, shared_gap) {
                         (Some(a), Some(b)) => Some(a.max(b)),
                         (Some(a), None) => Some(a),
@@ -2570,12 +2582,12 @@ pub async fn serve() -> anyhow::Result<()> {
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let tick_start = std::time::Instant::now();
+                let tick_start = Instant::now();
 
                 // Detect a host suspend/resume gap once per iteration, in one place.
                 // The watchdog and stuck-task recovery both read from this instead of
                 // re-deriving suspend information from their own wall-clock deltas.
-                if let Some(gap) = crate::engine::suspend::checkpoint() {
+                if let Some(gap) = engine_suspend::checkpoint() {
                     tracing::info!(
                         gap_secs = gap.num_seconds(),
                         "host suspend/resume gap detected, discounting from stuck-task age checks"
@@ -2668,8 +2680,8 @@ pub async fn serve() -> anyhow::Result<()> {
                     if sync_in_progress.compare_exchange(
                         false,
                         true,
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Relaxed,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
                     ).is_ok() {
                         spawn_sync_pass(
                             &project_engines,
@@ -2687,18 +2699,18 @@ pub async fn serve() -> anyhow::Result<()> {
                     // Records sync *schedule* time (not completion). This prevents
                     // re-entering the sync branch every tick while one is in flight.
                     // The sync_in_progress guard handles actual concurrency control.
-                    last_sync = std::time::Instant::now();
+                    last_sync = Instant::now();
                 }
 
                 // Periodic webhook health check
                 if webhook_enabled {
                     let health_check_interval = config.webhook_health_check_interval
-                        .unwrap_or(std::time::Duration::from_secs(60));
+                        .unwrap_or(Duration::from_secs(60));
 
                     if last_webhook_health_check.elapsed() >= health_check_interval {
                         if let Some(port) = webhook_port {
                             let (health, failure_reason) =
-                                crate::channels::github::check_webhook_health(port).await;
+                                github::check_webhook_health(port).await;
                             if health != webhook_healthy {
                                 webhook_healthy = health;
                                 if webhook_healthy {
@@ -2728,23 +2740,23 @@ pub async fn serve() -> anyhow::Result<()> {
                                 to_save.save().await;
                             }
                         }
-                        last_webhook_health_check = std::time::Instant::now();
+                        last_webhook_health_check = Instant::now();
                     }
                 }
 
                 // Periodic upgrade check — notify channels when a newer release is available.
                 if should_run_upgrade_check(last_upgrade_check, config.upgrade_check_interval) {
-                    if let Some(store) = project_engines.first().map(|e| std::sync::Arc::clone(&e.store)) {
-                        let channels = std::sync::Arc::clone(&channel_registry);
+                    if let Some(store) = project_engines.first().map(|e| Arc::clone(&e.store)) {
+                        let channels = Arc::clone(&channel_registry);
                         let current = env!("ORCH_VERSION").to_string();
                         let check_interval =
-                            std::time::Duration::from_secs(config.upgrade_check_interval);
+                            Duration::from_secs(config.upgrade_check_interval);
                         tokio::spawn(async move {
                             check_and_notify_upgrade(&store, &channels, &current, check_interval)
                                 .await;
                         });
                     }
-                    last_upgrade_check = Some(std::time::Instant::now());
+                    last_upgrade_check = Some(Instant::now());
                 }
 
                 // Update watchdog timestamp + log tick duration.
@@ -2761,11 +2773,11 @@ pub async fn serve() -> anyhow::Result<()> {
                     );
                 }
                 last_tick_epoch.store(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
+                    SystemTime::now()
+                        .duration_since(std_time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs(),
-                    std::sync::atomic::Ordering::Relaxed,
+                    Ordering::Relaxed,
                 );
             }
             // Webhook events trigger an immediate tick (bypass polling interval)
@@ -2814,8 +2826,8 @@ pub async fn serve() -> anyhow::Result<()> {
                 if sync_in_progress.compare_exchange(
                     false,
                     true,
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Relaxed,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
                 ).is_ok() {
                     spawn_sync_pass(
                         &project_engines,
@@ -2828,7 +2840,7 @@ pub async fn serve() -> anyhow::Result<()> {
                         "webhook",
                     );
                     // Record schedule time so periodic sync doesn't immediately re-run.
-                    last_sync = std::time::Instant::now();
+                    last_sync = Instant::now();
                 } else {
                     tracing::debug!("sync tick still in progress, skipping webhook-triggered immediate sync");
                 }
@@ -2845,11 +2857,11 @@ pub async fn serve() -> anyhow::Result<()> {
                         tracing::info!(path = %path.display(), "config file changed, reloading");
                         true
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    Err(RecvError::Lagged(n)) => {
                         tracing::warn!(missed = n, "config change receiver lagged, reloading");
                         true
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    Err(RecvError::Closed) => {
                         tracing::warn!("config change channel closed");
                         false
                     }
@@ -2869,7 +2881,7 @@ pub async fn serve() -> anyhow::Result<()> {
 
                     // Reset tick interval if it changed
                     if tick_changed {
-                        interval = tokio::time::interval(config.tick_interval);
+                        interval = time::interval(config.tick_interval);
                         tracing::info!(tick = ?config.tick_interval, "tick interval updated");
                     }
 
@@ -2926,7 +2938,7 @@ pub async fn serve() -> anyhow::Result<()> {
             }
             signal_name = async {
                 tokio::select! {
-                    _ = tokio::signal::ctrl_c() => "SIGINT",
+                    _ = signal::ctrl_c() => "SIGINT",
                     _ = sigterm.recv() => "SIGTERM",
                     _ = sighup.recv() => "SIGHUP",
                 }
@@ -2935,7 +2947,7 @@ pub async fn serve() -> anyhow::Result<()> {
 
                 // Wrap the entire shutdown sequence in a timeout to enforce the configured limit.
                 // This prevents indefinite blocking if status updates or tmux operations hang.
-                let shutdown_result = tokio::time::timeout(
+                let shutdown_result = time::timeout(
                     config.graceful_shutdown_timeout,
                     async {
                         // Reset in_progress tasks to routed so they re-dispatch after restart.
@@ -2971,11 +2983,11 @@ pub async fn serve() -> anyhow::Result<()> {
                                 }
                             }
                             // Also reset internal in_progress tasks
-                            if let Ok(tasks) = engine.store.list_internal_by_status(&engine.repo, crate::store::TaskStatus::InProgress).await {
+                            if let Ok(tasks) = engine.store.list_internal_by_status(&engine.repo, TaskStatus::InProgress).await {
                                 for task in &tasks {
                                     let task_id = format!("internal:{}", task.id);
                                     if let Err(e) = engine.task_manager.update_task_status(
-                                        &crate::backends::ExternalId(task_id.clone()),
+                                        &ExternalId(task_id.clone()),
                                         Status::Routed,
                                     ).await {
                                         tracing::warn!(task_id, ?e, "failed to reset internal task on shutdown");
@@ -3027,11 +3039,11 @@ pub async fn serve() -> anyhow::Result<()> {
                                 }
                             }
                             // Also reset internal in_review tasks
-                            if let Ok(tasks) = engine.store.list_internal_by_status(&engine.repo, crate::store::TaskStatus::InReview).await {
+                            if let Ok(tasks) = engine.store.list_internal_by_status(&engine.repo, TaskStatus::InReview).await {
                                 for task in &tasks {
                                     let task_id = format!("internal:{}", task.id);
                                     if let Err(e) = engine.task_manager.update_task_status(
-                                        &crate::backends::ExternalId(task_id.clone()),
+                                        &ExternalId(task_id.clone()),
                                         Status::NeedsReview,
                                     ).await {
                                         tracing::warn!(task_id, ?e, "failed to reset internal in_review task on shutdown");
@@ -3087,8 +3099,8 @@ pub async fn serve() -> anyhow::Result<()> {
                             let still_alive = tmux
                                 .wait_for_sessions_dead(
                                     &killed_sessions,
-                                    std::time::Duration::from_millis(100),
-                                    std::time::Duration::from_secs(5),
+                                    Duration::from_millis(100),
+                                    Duration::from_secs(5),
                                 )
                                 .await;
                             if still_alive > 0 {
@@ -3116,7 +3128,7 @@ pub async fn serve() -> anyhow::Result<()> {
 
     // Clean up event bus port file and service version file
     events::cleanup_port_file().await;
-    crate::cluster::local::cleanup().await;
+    local::cleanup().await;
     events::cleanup_version_file();
 
     // transport and channels drop here at end of scope
@@ -3127,7 +3139,14 @@ pub async fn serve() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::backends::test_helpers::NoopBackend;
+    use crate::channels::capture::CaptureService;
+    use crate::channels::transport::Transport;
+    use crate::tmux::SessionGuard;
+    use crate::tmux::TmuxManager;
 
     async fn in_review_task(store: &TaskStore, number: &str) -> i64 {
         let id = store
@@ -3143,23 +3162,16 @@ mod tests {
             })
             .await
             .unwrap();
-        store
-            .update_status(id, crate::store::TaskStatus::InReview)
-            .await
-            .unwrap();
+        store.update_status(id, TaskStatus::InReview).await.unwrap();
         id
     }
 
     #[tokio::test]
     async fn a_review_without_a_session_goes_back_to_needs_review_and_a_live_one_stays() {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        let backend: Arc<dyn ExternalBackend> =
-            Arc::new(crate::backends::test_helpers::NoopBackend);
-        let task_manager = TaskManager::with_store(
-            backend,
-            std::sync::Arc::clone(&store),
-            "owner/repo".to_string(),
-        );
+        let backend: Arc<dyn ExternalBackend> = Arc::new(NoopBackend);
+        let task_manager =
+            TaskManager::with_store(backend, Arc::clone(&store), "owner/repo".to_string());
         let tmux = TmuxManager::isolated();
         let orphaned = in_review_task(&store, "11").await;
         let live = in_review_task(&store, "12").await;
@@ -3167,35 +3179,26 @@ mod tests {
             .create_session("owner/repo", "12-review", "/tmp", "sleep 30", &[])
             .await
             .unwrap();
-        let _guard = crate::tmux::SessionGuard(session);
+        let _guard = SessionGuard(session);
 
         let reset = reset_orphaned_reviews(&task_manager, &store, "owner/repo", &tmux).await;
 
         assert_eq!(reset, 1);
         assert_eq!(
             store.get(orphaned).await.unwrap().status,
-            crate::store::TaskStatus::NeedsReview
+            TaskStatus::NeedsReview
         );
-        assert_eq!(
-            store.get(live).await.unwrap().status,
-            crate::store::TaskStatus::InReview
-        );
+        assert_eq!(store.get(live).await.unwrap().status, TaskStatus::InReview);
     }
 
     #[test]
     fn growing_max_parallel_lets_more_tasks_run_without_a_restart() {
         let semaphore = Arc::new(Semaphore::new(4));
         let held: Vec<_> = (0..4)
-            .map(|_| {
-                std::sync::Arc::clone(&semaphore)
-                    .try_acquire_owned()
-                    .unwrap()
-            })
+            .map(|_| Arc::clone(&semaphore).try_acquire_owned().unwrap())
             .collect();
         assert!(
-            std::sync::Arc::clone(&semaphore)
-                .try_acquire_owned()
-                .is_err(),
+            Arc::clone(&semaphore).try_acquire_owned().is_err(),
             "pool is full"
         );
 
@@ -3203,17 +3206,11 @@ mod tests {
         assert_eq!(in_force, 8);
 
         let grown: Vec<_> = (0..4)
-            .map(|_| {
-                std::sync::Arc::clone(&semaphore)
-                    .try_acquire_owned()
-                    .unwrap()
-            })
+            .map(|_| Arc::clone(&semaphore).try_acquire_owned().unwrap())
             .collect();
         assert_eq!(held.len() + grown.len(), 8, "8 tasks run at once");
         assert!(
-            std::sync::Arc::clone(&semaphore)
-                .try_acquire_owned()
-                .is_err(),
+            Arc::clone(&semaphore).try_acquire_owned().is_err(),
             "pool is full"
         );
     }
@@ -3222,11 +3219,7 @@ mod tests {
     fn shrinking_max_parallel_never_cancels_a_running_task() {
         let semaphore = Arc::new(Semaphore::new(8));
         let mut held: Vec<_> = (0..8)
-            .map(|_| {
-                std::sync::Arc::clone(&semaphore)
-                    .try_acquire_owned()
-                    .unwrap()
-            })
+            .map(|_| Arc::clone(&semaphore).try_acquire_owned().unwrap())
             .collect();
 
         // Nothing is free, so all 8 tasks keep their permits and keep running.
@@ -3238,53 +3231,31 @@ mod tests {
         held.truncate(5);
         in_force = resize_dispatch_pool(&semaphore, in_force, 4);
         assert_eq!(in_force, 5);
-        assert!(
-            std::sync::Arc::clone(&semaphore)
-                .try_acquire_owned()
-                .is_err()
-        );
+        assert!(Arc::clone(&semaphore).try_acquire_owned().is_err());
 
         // One more finishes and the pool settles at the new limit.
         held.truncate(4);
         in_force = resize_dispatch_pool(&semaphore, in_force, 4);
         assert_eq!(in_force, 4);
-        assert!(
-            std::sync::Arc::clone(&semaphore)
-                .try_acquire_owned()
-                .is_err()
-        );
+        assert!(Arc::clone(&semaphore).try_acquire_owned().is_err());
 
         // A slot freed after that is handed out, since 4 is now the real limit.
         held.truncate(3);
-        assert!(
-            std::sync::Arc::clone(&semaphore)
-                .try_acquire_owned()
-                .is_ok()
-        );
+        assert!(Arc::clone(&semaphore).try_acquire_owned().is_ok());
     }
 
     #[test]
     fn a_project_added_to_the_config_is_picked_up_and_running_ones_are_not_respawned() {
         let configured = vec![
-            (
-                "owner/one".to_string(),
-                std::path::PathBuf::from("/srv/one"),
-            ),
-            (
-                "owner/two".to_string(),
-                std::path::PathBuf::from("/srv/two"),
-            ),
+            ("owner/one".to_string(), PathBuf::from("/srv/one")),
+            ("owner/two".to_string(), PathBuf::from("/srv/two")),
         ];
-        let active: std::collections::HashSet<String> =
-            ["owner/one".to_string()].into_iter().collect();
+        let active: HashSet<String> = ["owner/one".to_string()].into_iter().collect();
 
         let (added, removed) = diff_configured_projects(&configured, &active);
         assert_eq!(
             added,
-            vec![(
-                "owner/two".to_string(),
-                std::path::PathBuf::from("/srv/two")
-            )],
+            vec![("owner/two".to_string(), PathBuf::from("/srv/two"))],
             "only the new project is started, so owner/one keeps its single set of subscribers"
         );
         assert!(removed.is_empty(), "{removed:?}");
@@ -3292,14 +3263,10 @@ mod tests {
 
     #[test]
     fn a_project_dropped_from_the_config_is_reported_and_not_restarted() {
-        let configured = vec![(
-            "owner/one".to_string(),
-            std::path::PathBuf::from("/srv/one"),
-        )];
-        let active: std::collections::HashSet<String> =
-            ["owner/one".to_string(), "owner/gone".to_string()]
-                .into_iter()
-                .collect();
+        let configured = vec![("owner/one".to_string(), PathBuf::from("/srv/one"))];
+        let active: HashSet<String> = ["owner/one".to_string(), "owner/gone".to_string()]
+            .into_iter()
+            .collect();
 
         let (added, removed) = diff_configured_projects(&configured, &active);
         assert!(added.is_empty(), "nothing new to start");
@@ -3308,12 +3275,8 @@ mod tests {
 
     #[test]
     fn an_unchanged_project_list_starts_nothing() {
-        let configured = vec![(
-            "owner/one".to_string(),
-            std::path::PathBuf::from("/srv/one"),
-        )];
-        let active: std::collections::HashSet<String> =
-            ["owner/one".to_string()].into_iter().collect();
+        let configured = vec![("owner/one".to_string(), PathBuf::from("/srv/one"))];
+        let active: HashSet<String> = ["owner/one".to_string()].into_iter().collect();
 
         assert_eq!(
             diff_configured_projects(&configured, &active),
@@ -3393,8 +3356,8 @@ mod tests {
     #[test]
     fn engine_config_defaults() {
         let config = EngineConfig::default();
-        assert_eq!(config.tick_interval, std::time::Duration::from_secs(10));
-        assert_eq!(config.sync_interval, std::time::Duration::from_secs(45));
+        assert_eq!(config.tick_interval, Duration::from_secs(10));
+        assert_eq!(config.sync_interval, Duration::from_secs(45));
         assert_eq!(config.max_parallel, 4);
         assert_eq!(config.stuck_timeout, 1800);
         assert_eq!(config.no_session_stuck_timeout, 600);
@@ -3402,26 +3365,20 @@ mod tests {
             config.no_session_stuck_timeout < config.stuck_timeout,
             "no_session_stuck_timeout must be shorter than stuck_timeout"
         );
-        assert_eq!(
-            config.graceful_shutdown_timeout,
-            std::time::Duration::from_secs(600)
-        );
+        assert_eq!(config.graceful_shutdown_timeout, Duration::from_secs(600));
         assert_eq!(config.upgrade_check_interval, 3600);
     }
 
     #[test]
     fn engine_config_from_config_uses_defaults_when_no_config() {
         let config = EngineConfig::from_config();
-        assert_eq!(config.tick_interval, std::time::Duration::from_secs(10));
-        assert_eq!(config.sync_interval, std::time::Duration::from_secs(45));
+        assert_eq!(config.tick_interval, Duration::from_secs(10));
+        assert_eq!(config.sync_interval, Duration::from_secs(45));
         // max_parallel may be overridden by user config; just check it's reasonable
         assert!(config.max_parallel >= 1 && config.max_parallel <= 64);
         assert_eq!(config.stuck_timeout, 1800);
         assert_eq!(config.no_session_stuck_timeout, 600);
-        assert_eq!(
-            config.graceful_shutdown_timeout,
-            std::time::Duration::from_secs(600)
-        );
+        assert_eq!(config.graceful_shutdown_timeout, Duration::from_secs(600));
         assert_eq!(config.upgrade_check_interval, 3600);
     }
 
@@ -3442,10 +3399,7 @@ mod tests {
 
     #[test]
     fn upgrade_check_waits_for_interval_after_first_run() {
-        assert!(!should_run_upgrade_check(
-            Some(std::time::Instant::now()),
-            3600
-        ));
+        assert!(!should_run_upgrade_check(Some(Instant::now()), 3600));
     }
 
     #[test]
@@ -3488,14 +3442,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "capture-pane timing is unreliable on CI runners"]
     async fn integration_channel_to_tmux_to_capture() {
-        use crate::channels::capture::CaptureService;
-        use crate::channels::transport::Transport;
-        use crate::tmux::{SessionGuard, TmuxManager};
-        use std::sync::Arc;
-
         // Create transport and capture service
         let transport = Arc::new(Transport::new());
-        let capture = Arc::new(CaptureService::new(std::sync::Arc::clone(&transport)));
+        let capture = Arc::new(CaptureService::new(Arc::clone(&transport)));
         let tmux = TmuxManager::new();
 
         let task_id = "testtask1".to_string();
@@ -3528,7 +3477,7 @@ mod tests {
             .await;
 
         // Spawn capture.run() which exits when session is unregistered
-        let capture_clone = std::sync::Arc::clone(&capture);
+        let capture_clone = Arc::clone(&capture);
         let capture_handle = tokio::spawn(async move { capture_clone.run().await });
 
         // Subscribe to transport output for this task
@@ -3555,8 +3504,7 @@ mod tests {
         // Wait for an output chunk from capture -> transport
         let mut got = false;
         for _ in 0..20 {
-            if let Ok(Ok(c)) =
-                tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
+            if let Ok(Ok(c)) = time::timeout(Duration::from_millis(500), rx.recv()).await
                 && c.content.contains("from-channel")
             {
                 got = true;
@@ -3587,7 +3535,7 @@ mod tests {
     fn read_project_channel_config_parses_telegram_and_discord() {
         let dir = tempfile::tempdir().expect("tempdir");
         let orch_yml = dir.path().join(".orch.yml");
-        std::fs::write(
+        fs::write(
             &orch_yml,
             "channels:\n  telegram:\n    topic_id: \"42\"\n  discord:\n    channel_id: \"9999\"\n",
         )
@@ -3601,7 +3549,7 @@ mod tests {
     fn read_project_channel_config_handles_partial_channels() {
         let dir = tempfile::tempdir().expect("tempdir");
         let orch_yml = dir.path().join(".orch.yml");
-        std::fs::write(&orch_yml, "channels:\n  telegram:\n    topic_id: \"7\"\n")
+        fs::write(&orch_yml, "channels:\n  telegram:\n    topic_id: \"7\"\n")
             .expect("write .orch.yml");
         let cfg = read_project_channel_config(dir.path());
         assert_eq!(cfg.telegram_topic_id.as_deref(), Some("7"));
@@ -3612,7 +3560,7 @@ mod tests {
     fn read_project_channel_config_handles_malformed_yaml() {
         let dir = tempfile::tempdir().expect("tempdir");
         let orch_yml = dir.path().join(".orch.yml");
-        std::fs::write(&orch_yml, "channels: [\nbad yaml").expect("write .orch.yml");
+        fs::write(&orch_yml, "channels: [\nbad yaml").expect("write .orch.yml");
         let cfg = read_project_channel_config(dir.path());
         // Should return defaults (not panic) and emit a warn! log with the parse error.
         assert!(cfg.telegram_topic_id.is_none());
@@ -3624,7 +3572,7 @@ mod tests {
     fn read_project_channel_config_handles_unreadable_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         // A directory fails to read for every user, root included, where chmod 000 does not
-        std::fs::create_dir(dir.path().join(".orch.yml")).expect("create .orch.yml dir");
+        fs::create_dir(dir.path().join(".orch.yml")).expect("create .orch.yml dir");
         let cfg = read_project_channel_config(dir.path());
         // Should return defaults (not panic) and emit a warn! log with the read error.
         assert!(cfg.telegram_topic_id.is_none());

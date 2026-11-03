@@ -3,12 +3,25 @@
 //! Auth is resolved once at startup using the centralized [`TokenResolver`]
 //! (`GH_TOKEN` → `GITHUB_TOKEN` environment variables by default).
 
+use std::collections::HashMap;
+use std::time as std_time;
+
 use super::{ExternalBackend, ExternalId, ExternalTask, Mention, Status};
+use crate::backends;
+use crate::backends::BlockedByFetch;
+use crate::backends::PullRequestCompletion;
+use crate::config;
+use crate::github::app;
 use crate::github::http::{GhHttp, status_label_color};
+use crate::github::projects;
 use crate::github::projects::ProjectSync;
 use crate::github::projects::label_status::LabelSyncConfig;
+use crate::github::types::GitHubComment;
+use crate::github::types::GitHubIssue;
+use crate::github::types::GitHubReview;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
+use tokio::time;
 
 /// Author associations that are allowed to create tasks.
 /// Only repository OWNER or COLLABORATOR authors are considered trusted for
@@ -20,22 +33,20 @@ use chrono::{Duration, Utc};
 const ALLOWED_ASSOCIATIONS: &[&str] = &["OWNER", "MEMBER", "COLLABORATOR"];
 
 /// Check if an issue author is trusted
-fn is_trusted_author(issue: &crate::github::types::GitHubIssue) -> bool {
+fn is_trusted_author(issue: &GitHubIssue) -> bool {
     issue
         .author_association
         .as_deref()
         .is_some_and(|a| ALLOWED_ASSOCIATIONS.contains(&a)) // missing field = untrusted
 }
 
-fn is_trusted_comment_author(c: &crate::github::types::GitHubComment) -> bool {
+fn is_trusted_comment_author(c: &GitHubComment) -> bool {
     c.author_association
         .as_deref()
         .is_some_and(|a| ALLOWED_ASSOCIATIONS.contains(&a))
 }
 
-fn trusted_mentions(
-    comments: impl IntoIterator<Item = crate::github::types::GitHubComment>,
-) -> Vec<Mention> {
+fn trusted_mentions(comments: impl IntoIterator<Item = GitHubComment>) -> Vec<Mention> {
     comments
         .into_iter()
         .filter_map(|c| {
@@ -71,9 +82,7 @@ fn active_status_from_label(label: &str) -> Option<Status> {
     }
 }
 
-fn classify_active_open_issue(
-    issue: crate::github::types::GitHubIssue,
-) -> Option<(ExternalTask, Option<Status>)> {
+fn classify_active_open_issue(issue: GitHubIssue) -> Option<(ExternalTask, Option<Status>)> {
     // Guard: open issues tagged as done should never be re-ingested as new.
     if issue.labels.iter().any(|l| l.name == "status:done") {
         return None;
@@ -248,7 +257,7 @@ impl ExternalBackend for GitHubBackend {
             match ProjectSync::discover_fields(project.project_id()).await {
                 Ok(discovered) => {
                     if discovered.estimate_field_id().is_some() {
-                        match crate::github::projects::write_project_config(&discovered).await {
+                        match projects::write_project_config(&discovered).await {
                             Err(e) => {
                                 tracing::warn!(
                                     err = %e,
@@ -299,13 +308,13 @@ impl ExternalBackend for GitHubBackend {
     async fn get_project_item_estimates(
         &self,
         issue_node_ids: &[String],
-    ) -> anyhow::Result<std::collections::HashMap<String, u8>> {
+    ) -> anyhow::Result<HashMap<String, u8>> {
         let Some(project) = ProjectSync::from_config() else {
-            return Ok(std::collections::HashMap::new());
+            return Ok(HashMap::new());
         };
 
         if issue_node_ids.is_empty() {
-            return Ok(std::collections::HashMap::new());
+            return Ok(HashMap::new());
         }
 
         project
@@ -336,8 +345,7 @@ impl ExternalBackend for GitHubBackend {
 
         for attempt in 0..MAX_RETRIES {
             if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)))
-                    .await;
+                time::sleep(std_time::Duration::from_millis(500 * u64::from(attempt))).await;
                 tracing::debug!(attempt, label, "retrying update_status");
             }
 
@@ -389,7 +397,7 @@ impl ExternalBackend for GitHubBackend {
                     // Auto-close issue when status → Done (if auto_close enabled)
                     if status == Status::Done {
                         let auto_close =
-                            crate::config::get("workflow.auto_close").map_or(true, |v| v == "true");
+                            config::get("workflow.auto_close").map_or(true, |v| v == "true");
                         if auto_close && let Err(e) = self.gh.close_issue(&self.repo, &id.0).await {
                             tracing::warn!(
                                 task_id = id.0,
@@ -521,7 +529,7 @@ impl ExternalBackend for GitHubBackend {
     /// single `list_all_open_issues` request.
     async fn list_active_open_issues(
         &self,
-    ) -> anyhow::Result<Vec<(ExternalTask, Option<crate::backends::Status>)>> {
+    ) -> anyhow::Result<Vec<(ExternalTask, Option<backends::Status>)>> {
         let issues = self.gh.list_all_open_issues(&self.repo).await?;
 
         Ok(issues
@@ -638,7 +646,7 @@ impl ExternalBackend for GitHubBackend {
     async fn batch_is_pr_merged(
         &self,
         branches: &[String],
-    ) -> anyhow::Result<std::collections::HashMap<String, bool>> {
+    ) -> anyhow::Result<HashMap<String, bool>> {
         self.gh
             .batch_is_pr_merged_by_branch(&self.repo, branches)
             .await
@@ -671,13 +679,9 @@ impl ExternalBackend for GitHubBackend {
             .await
     }
 
-    async fn blocked_by(
-        &self,
-        repo: &str,
-        issue_number: i64,
-    ) -> anyhow::Result<crate::backends::BlockedByFetch> {
+    async fn blocked_by(&self, repo: &str, issue_number: i64) -> anyhow::Result<BlockedByFetch> {
         if issue_number <= 0 {
-            return Ok(crate::backends::BlockedByFetch::Unavailable);
+            return Ok(BlockedByFetch::Unavailable);
         }
         self.gh
             .list_blocked_by(repo, issue_number.cast_unsigned())
@@ -715,7 +719,7 @@ impl ExternalBackend for GitHubBackend {
         &self,
         repo: &str,
         pr_number: i64,
-    ) -> anyhow::Result<Option<crate::backends::PullRequestCompletion>> {
+    ) -> anyhow::Result<Option<PullRequestCompletion>> {
         if pr_number <= 0 {
             return Ok(None);
         }
@@ -725,15 +729,13 @@ impl ExternalBackend for GitHubBackend {
             Err(err) => return Err(err),
         };
         let default_branch = self.gh.get_default_branch(repo).await.unwrap_or_default();
-        let app_login = crate::github::app::bot_login().await;
+        let app_login = app::bot_login().await;
         let reviews = match self
             .gh
             .get_pr_reviews(repo, pr_number.cast_unsigned())
             .await
         {
-            Ok(reviews) => {
-                crate::github::app::reviews_for_gate(&reviews, &pr.head.sha, app_login.as_deref())
-            }
+            Ok(reviews) => app::reviews_for_gate(&reviews, &pr.head.sha, app_login.as_deref()),
             Err(err) => {
                 tracing::warn!(repo, pr_number, err = %err, "pull request reviews unreadable");
                 Vec::new()
@@ -767,7 +769,7 @@ impl ExternalBackend for GitHubBackend {
             .any(|login| latest_automated_review_approves(&comment_refs, login));
         // An App review on the head replaces the comment, as in review_poll, so a stale
         // approving comment cannot outvote an App change request
-        let (comment_approved, _) = crate::github::app::effective_comment_flags(
+        let (comment_approved, _) = app::effective_comment_flags(
             &reviews,
             &pr.head.sha,
             app_login.as_deref(),
@@ -775,7 +777,7 @@ impl ExternalBackend for GitHubBackend {
             false,
         );
         let merged = pr.merged.unwrap_or(false);
-        Ok(Some(crate::backends::PullRequestCompletion {
+        Ok(Some(PullRequestCompletion {
             merged,
             base_ref: pr.base.ref_,
             default_branch,
@@ -815,7 +817,7 @@ fn is_missing_issue(err: &anyhow::Error) -> bool {
 /// Latest substantive review wins. Comments and dismissed reviews are ignored.
 ///
 /// `CHANGES_REQUESTED` after `APPROVED` means the pull request is not approved
-pub(crate) fn latest_review_approves(reviews: &[crate::github::types::GitHubReview]) -> bool {
+pub(crate) fn latest_review_approves(reviews: &[GitHubReview]) -> bool {
     let mut latest: Option<(&str, &str)> = None;
     for review in reviews {
         let state = review.state.as_str();
@@ -886,7 +888,19 @@ pub(crate) fn latest_automated_review_approves(
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+
     use super::*;
+    use crate::github::http::GhHttp;
+    use crate::github::token;
+    use crate::github::types::GitHubComment;
+    use crate::github::types::GitHubLabel;
     use crate::github::types::{GitHubIssue, GitHubReview, GitHubUser};
 
     fn review(state: &str, at: &str) -> GitHubReview {
@@ -1097,11 +1111,10 @@ mod tests {
 
     #[test]
     fn is_trusted_comment_author_direct() {
-        use crate::github::types::GitHubComment;
         let c = GitHubComment {
             id: 1,
             body: "hi".to_string(),
-            user: crate::github::types::GitHubUser {
+            user: GitHubUser {
                 login: "u".to_string(),
             },
             created_at: String::new(),
@@ -1115,11 +1128,10 @@ mod tests {
 
     #[test]
     fn is_trusted_comment_author_member() {
-        use crate::github::types::GitHubComment;
         let c = GitHubComment {
             id: 1,
             body: "hi".to_string(),
-            user: crate::github::types::GitHubUser {
+            user: GitHubUser {
                 login: "u".to_string(),
             },
             created_at: String::new(),
@@ -1144,7 +1156,6 @@ mod tests {
 
     #[test]
     fn trusted_mentions_drops_contributor_on_owner_issue() {
-        use crate::github::types::GitHubComment;
         let comment = GitHubComment {
             id: 42,
             body: "@orch please look".to_string(),
@@ -1187,14 +1198,10 @@ mod tests {
     )]
     #[tokio::test]
     async fn get_mentions_and_list_issue_comments_exclude_contributor_on_owner_issue() {
-        use crate::github::http::GhHttp;
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let _env = crate::github::token::ENV_LOCK.lock().unwrap();
-        let prev = std::env::var_os("GH_TOKEN");
+        let _env = token::ENV_LOCK.lock().unwrap();
+        let prev = env::var_os("GH_TOKEN");
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("GH_TOKEN", "test_token") };
+        unsafe { env::set_var("GH_TOKEN", "test_token") };
 
         let server = MockServer::start().await;
         let comments = serde_json::json!([
@@ -1243,9 +1250,9 @@ mod tests {
 
         match prev {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            Some(value) => unsafe { std::env::set_var("GH_TOKEN", value) },
+            Some(value) => unsafe { env::set_var("GH_TOKEN", value) },
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            None => unsafe { std::env::remove_var("GH_TOKEN") },
+            None => unsafe { env::remove_var("GH_TOKEN") },
         }
 
         assert_eq!(mentions.len(), 1);
@@ -1265,7 +1272,7 @@ mod tests {
             state: "open".to_string(),
             labels: labels
                 .iter()
-                .map(|label| crate::github::types::GitHubLabel {
+                .map(|label| GitHubLabel {
                     name: (*label).to_string(),
                     color: None,
                 })

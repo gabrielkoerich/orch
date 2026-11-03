@@ -146,7 +146,7 @@ impl AgentWeights {
     pub fn ensure_agents_with_weights(
         &mut self,
         agents: &[String],
-        configured_weights: &std::collections::HashMap<String, f64>,
+        configured_weights: &HashMap<String, f64>,
     ) {
         for agent in agents {
             let base = configured_weights

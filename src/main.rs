@@ -4,10 +4,21 @@
     reason = "the CLI writes its output to the terminal"
 )]
 
+use std::env;
+use std::fs;
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process;
+
 use orch::{cli, config, cron, engine, home, parser, template};
 
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
+use orch::cli::session::ExportFormat;
+use tokio::runtime::Builder;
 
 const MAX_SERVICE_LOG_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ROTATED_SERVICE_LOGS: usize = 3;
@@ -18,15 +29,15 @@ const MAX_ROTATED_SERVICE_LOGS: usize = 3;
 /// well-known directories as a fallback. This is needed because launchd services
 /// inherit a minimal PATH that excludes Homebrew, Cargo, npm globals, etc.
 fn ensure_path() {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = env::var("HOME").unwrap_or_default();
 
     // Source ~/.path — a shell snippet that exports PATH entries.
     // We parse `export PATH="..."` lines and extract the directories.
     let dotpath = format!("{home}/.path");
-    if std::path::Path::new(&dotpath).is_file()
-        && let Ok(contents) = std::fs::read_to_string(&dotpath)
+    if Path::new(&dotpath).is_file()
+        && let Ok(contents) = fs::read_to_string(&dotpath)
     {
-        let current = std::env::var("PATH").unwrap_or_default();
+        let current = env::var("PATH").unwrap_or_default();
         let mut path = current.clone();
         for line in contents.lines() {
             let line = line.trim();
@@ -46,9 +57,7 @@ fn ensure_path() {
                 .replace("$HOME", &home)
                 .trim_end_matches(':')
                 .to_string();
-                if !dir.is_empty()
-                    && !path.split(':').any(|d| d == dir)
-                    && std::path::Path::new(&dir).is_dir()
+                if !dir.is_empty() && !path.split(':').any(|d| d == dir) && Path::new(&dir).is_dir()
                 {
                     path = format!("{dir}:{path}");
                 }
@@ -56,7 +65,7 @@ fn ensure_path() {
         }
         if path != current {
             // SAFETY: main calls this before it builds the tokio runtime, so the process has one thread
-            unsafe { std::env::set_var("PATH", &path) };
+            unsafe { env::set_var("PATH", &path) };
             return;
         }
     }
@@ -70,16 +79,16 @@ fn ensure_path() {
         &format!("{home}/.local/bin"),
         &format!("{home}/.bun/bin"),
     ];
-    let current = std::env::var("PATH").unwrap_or_default();
+    let current = env::var("PATH").unwrap_or_default();
     let mut new_path = current.clone();
     for dir in &extra {
-        if !new_path.split(':').any(|d| d == *dir) && std::path::Path::new(dir).is_dir() {
+        if !new_path.split(':').any(|d| d == *dir) && Path::new(dir).is_dir() {
             new_path = format!("{dir}:{new_path}");
         }
     }
     if new_path != current {
         // SAFETY: main calls this before it builds the tokio runtime, so the process has one thread
-        unsafe { std::env::set_var("PATH", &new_path) };
+        unsafe { env::set_var("PATH", &new_path) };
     }
 }
 
@@ -88,9 +97,9 @@ fn ensure_path() {
 /// Called once at startup so all child processes (router LLM, agent runners)
 /// inherit tokens like KIMI_API_KEY without requiring a shell source.
 fn load_private_env() {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = env::var("HOME").unwrap_or_default();
     let path = format!("{home}/.private");
-    let Ok(contents) = std::fs::read_to_string(&path) else {
+    let Ok(contents) = fs::read_to_string(&path) else {
         return;
     };
     for line in contents.lines() {
@@ -104,15 +113,15 @@ fn load_private_env() {
         };
         let key = key.trim();
         let val = val.trim().trim_matches('"');
-        if !key.is_empty() && std::env::var(key).is_err() {
+        if !key.is_empty() && env::var(key).is_err() {
             // SAFETY: main calls this before it builds the tokio runtime, so the process has one thread
-            unsafe { std::env::set_var(key, val) };
+            unsafe { env::set_var(key, val) };
         }
     }
 }
 
-fn rotate_log_if_needed(path: &std::path::Path) {
-    let Ok(meta) = std::fs::metadata(path) else {
+fn rotate_log_if_needed(path: &Path) {
+    let Ok(meta) = fs::metadata(path) else {
         return;
     };
 
@@ -121,56 +130,62 @@ fn rotate_log_if_needed(path: &std::path::Path) {
     }
 
     let oldest = rotated_log_path(path, MAX_ROTATED_SERVICE_LOGS);
-    let _ = std::fs::remove_file(&oldest);
+    let _ = fs::remove_file(&oldest);
 
     for suffix in (1..MAX_ROTATED_SERVICE_LOGS).rev() {
         let from = rotated_log_path(path, suffix);
         let to = rotated_log_path(path, suffix + 1);
-        let _ = std::fs::rename(from, to);
+        let _ = fs::rename(from, to);
     }
 
     // Copy then truncate so launchd's already-open stdout keeps writing to this path
     // A rename would move the inode it holds, and later writes would land in orch.log.1
     let backup = rotated_log_path(path, 1);
-    if std::fs::copy(path, &backup).is_err() {
+    if fs::copy(path, &backup).is_err() {
         return;
     }
-    let _ = std::fs::OpenOptions::new()
+    let _ = OpenOptions::new()
         .write(true)
         .open(path)
         .and_then(|f| f.set_len(0));
 }
 
 fn rotate_service_logs_if_needed() {
-    let brew_prefix = std::env::var("HOMEBREW_PREFIX").unwrap_or_else(|_| "/opt/homebrew".into());
-    let brew_log_dir = std::path::PathBuf::from(&brew_prefix).join("var/log");
+    let brew_prefix = env::var("HOMEBREW_PREFIX").unwrap_or_else(|_| "/opt/homebrew".into());
+    let brew_log_dir = PathBuf::from(&brew_prefix).join("var/log");
     rotate_log_if_needed(&brew_log_dir.join("orch.log"));
     // Truncate error log on every startup so agents never see stale panics from previous runs
     // and file duplicate issues based on old errors.
-    let _ = std::fs::File::create(brew_log_dir.join("orch.error.log"));
+    let _ = File::create(brew_log_dir.join("orch.error.log"));
 
     if let Ok(state_dir) = home::state_dir() {
         rotate_log_if_needed(&state_dir.join("orch.log"));
     }
 }
 
-fn rotated_log_path(path: &std::path::Path, suffix: usize) -> std::path::PathBuf {
+fn rotated_log_path(path: &Path, suffix: usize) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(format!(".{suffix}"));
-    std::path::PathBuf::from(name)
+    PathBuf::from(name)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::path::Path;
+    use std::path::PathBuf;
+
     use super::{Cli, Commands, MAX_SERVICE_LOG_BYTES, rotate_log_if_needed, rotated_log_path};
     use clap::{CommandFactory, Parser, error::ErrorKind};
 
     #[test]
     fn rotated_log_path_appends_suffix() {
-        let path = std::path::Path::new("/opt/homebrew/var/log/orch.log");
+        let path = Path::new("/opt/homebrew/var/log/orch.log");
         assert_eq!(
             rotated_log_path(path, 2),
-            std::path::PathBuf::from("/opt/homebrew/var/log/orch.log.2")
+            PathBuf::from("/opt/homebrew/var/log/orch.log.2")
         );
     }
 
@@ -179,61 +194,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("orch.log");
 
-        std::fs::write(
+        fs::write(
             &path,
             vec![b'a'; usize::try_from(MAX_SERVICE_LOG_BYTES + 1).unwrap()],
         )
         .unwrap();
-        std::fs::write(path.with_file_name("orch.log.1"), b"one").unwrap();
-        std::fs::write(path.with_file_name("orch.log.2"), b"two").unwrap();
-        std::fs::write(path.with_file_name("orch.log.3"), b"three").unwrap();
+        fs::write(path.with_file_name("orch.log.1"), b"one").unwrap();
+        fs::write(path.with_file_name("orch.log.2"), b"two").unwrap();
+        fs::write(path.with_file_name("orch.log.3"), b"three").unwrap();
 
         rotate_log_if_needed(&path);
 
-        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        assert_eq!(fs::read(&path).unwrap(), b"");
         assert_eq!(
-            std::fs::read(path.with_file_name("orch.log.1"))
-                .unwrap()
-                .len() as u64,
+            fs::read(path.with_file_name("orch.log.1")).unwrap().len() as u64,
             MAX_SERVICE_LOG_BYTES + 1
         );
-        assert_eq!(
-            std::fs::read(path.with_file_name("orch.log.2")).unwrap(),
-            b"one"
-        );
-        assert_eq!(
-            std::fs::read(path.with_file_name("orch.log.3")).unwrap(),
-            b"two"
-        );
+        assert_eq!(fs::read(path.with_file_name("orch.log.2")).unwrap(), b"one");
+        assert_eq!(fs::read(path.with_file_name("orch.log.3")).unwrap(), b"two");
     }
 
     #[test]
     fn rotate_log_if_needed_keeps_an_open_append_fd_on_the_live_path() {
-        use std::io::Write;
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("orch.log");
-        std::fs::write(
+        fs::write(
             &path,
             vec![b'a'; usize::try_from(MAX_SERVICE_LOG_BYTES + 1).unwrap()],
         )
         .unwrap();
 
-        let mut live = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
+        let mut live = OpenOptions::new().append(true).open(&path).unwrap();
 
         rotate_log_if_needed(&path);
 
         live.write_all(b"after-rotate").unwrap();
         live.flush().unwrap();
 
-        assert_eq!(std::fs::read(&path).unwrap(), b"after-rotate");
+        assert_eq!(fs::read(&path).unwrap(), b"after-rotate");
         assert_eq!(
-            std::fs::read(path.with_file_name("orch.log.1"))
-                .unwrap()
-                .len() as u64,
+            fs::read(path.with_file_name("orch.log.1")).unwrap().len() as u64,
             MAX_SERVICE_LOG_BYTES + 1
         );
     }
@@ -242,11 +242,11 @@ mod tests {
     fn rotate_log_if_needed_leaves_small_files_alone() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("orch.log");
-        std::fs::write(&path, b"small").unwrap();
+        fs::write(&path, b"small").unwrap();
 
         rotate_log_if_needed(&path);
 
-        assert_eq!(std::fs::read(&path).unwrap(), b"small");
+        assert_eq!(fs::read(&path).unwrap(), b"small");
         assert!(!path.with_file_name("orch.log.1").exists());
     }
 
@@ -1154,7 +1154,7 @@ fn main() -> anyhow::Result<()> {
     // (router, agents) without requiring the shell to source the file first.
     load_private_env();
 
-    tokio::runtime::Builder::new_multi_thread()
+    Builder::new_multi_thread()
         .enable_all()
         .build()?
         .block_on(async_main())
@@ -1219,7 +1219,7 @@ async fn async_main() -> anyhow::Result<()> {
         Commands::Cron { expression, since } => {
             eprintln!("warning: `orch cron` is deprecated; use `orch job cron` instead");
             let matches = cron::check(&expression, since.as_deref())?;
-            std::process::exit(i32::from(!matches));
+            process::exit(i32::from(!matches));
         }
         Commands::Config { key, action } => match (action, key) {
             (Some(ConfigAction::Agents), _) => cli::agents(),
@@ -1234,7 +1234,7 @@ async fn async_main() -> anyhow::Result<()> {
             (None, None) => {
                 eprintln!("Usage: orch config <key>");
                 eprintln!("       orch config agents");
-                std::process::exit(2);
+                process::exit(2);
             }
         },
         Commands::Stream {
@@ -1361,7 +1361,6 @@ async fn async_main() -> anyhow::Result<()> {
                     attempt,
                     format,
                 } => {
-                    use orch::cli::session::ExportFormat;
                     let fmt = format
                         .parse::<ExportFormat>()
                         .unwrap_or(ExportFormat::Markdown);
@@ -1405,7 +1404,7 @@ async fn async_main() -> anyhow::Result<()> {
             }
             JobAction::Cron { expression, since } => {
                 let matches = cron::check(&expression, since.as_deref())?;
-                std::process::exit(i32::from(!matches));
+                process::exit(i32::from(!matches));
             }
         },
         Commands::Plan { action } => match action {
@@ -1524,7 +1523,7 @@ async fn async_main() -> anyhow::Result<()> {
         },
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
-            generate(shell, &mut cmd, "orch", &mut std::io::stdout());
+            generate(shell, &mut cmd, "orch", &mut io::stdout());
         }
         Commands::Events { repo, task } => {
             eprintln!("warning: `orch events` is deprecated; use `orch task events` instead");
@@ -1551,7 +1550,6 @@ async fn async_main() -> anyhow::Result<()> {
                     attempt,
                     format,
                 } => {
-                    use orch::cli::session::ExportFormat;
                     let fmt = format
                         .parse::<ExportFormat>()
                         .unwrap_or(ExportFormat::Markdown);

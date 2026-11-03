@@ -12,11 +12,18 @@
 //! This runner overrides `parse_response` to handle these differences
 //! while delegating command building and routing to `ClaudeRunner`.
 
+use tokio::process::Command;
+
+use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+
 use super::claude::ClaudeRunner;
 use super::{
     AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent,
     truncate_at_char_boundary,
 };
+use crate::parser::AgentResponse;
 
 /// Count Edit and Write tool_use events in NDJSON stream output.
 fn count_edit_tools(raw: &str) -> usize {
@@ -132,8 +139,8 @@ pub struct MiniMaxClaudeRunner {
     inner: ClaudeRunner,
 }
 
-impl std::fmt::Debug for MiniMaxClaudeRunner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for MiniMaxClaudeRunner {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("MiniMaxClaudeRunner")
             .finish_non_exhaustive()
     }
@@ -202,7 +209,7 @@ impl AgentRunner for MiniMaxClaudeRunner {
             "minimax: built response from stream (no result event)"
         );
 
-        let response = crate::parser::AgentResponse {
+        let response = AgentResponse {
             status,
             summary: {
                 let end = truncate_at_char_boundary(&summary, 500);
@@ -244,11 +251,7 @@ impl AgentRunner for MiniMaxClaudeRunner {
         self.inner.classify_error(exit_code, stdout, stderr)
     }
 
-    fn router_command(
-        &self,
-        prompt: &str,
-        model: Option<&str>,
-    ) -> anyhow::Result<tokio::process::Command> {
+    fn router_command(&self, prompt: &str, model: Option<&str>) -> anyhow::Result<Command> {
         self.inner.router_command(prompt, model)
     }
 }

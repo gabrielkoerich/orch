@@ -7,6 +7,9 @@ use crate::engine::runner::agents::{
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
+use std::env;
+use std::fmt;
+use std::fmt::Debug;
 use std::sync::LazyLock;
 
 /// Prefix of a tool result line, printed right under its tool call
@@ -34,8 +37,8 @@ pub struct Formatter {
     changed: BTreeSet<String>,
 }
 
-impl std::fmt::Debug for Formatter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for Formatter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Formatter")
             .field("color", &self.color)
             .field("tools", &self.tools)
@@ -299,7 +302,7 @@ fn summarize_input(input: &Value) -> String {
 /// Drop the worktree root from paths and abbreviate the home dir
 fn shorten(text: &str) -> String {
     let text = WORKTREE.replace_all(text, "");
-    match std::env::var("HOME") {
+    match env::var("HOME") {
         Ok(home) if !home.is_empty() => text.replace(&home, "~"),
         _ => text.into_owned(),
     }

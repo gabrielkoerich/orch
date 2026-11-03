@@ -1,12 +1,24 @@
 //! `orch stream` and `orch task watch`: tail each running agent's `output.json` through the
 //! NDJSON formatter. The runner tees agent stdout there, so lines arrive whole
 
+use crate::channels::tmux;
+use crate::cli;
 use crate::cli::ndjson::{self, Formatter};
+use crate::cli::task_ref;
+use crate::home;
+use crate::store::TaskStatus;
+use crate::tmux::TmuxManager;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+use tokio::time;
+
+use std::fs;
+use std::io;
+use std::mem;
 
 // Replayed when a file is first opened, so a new viewer sees recent context
 const BACKLOG_BYTES: u64 = 64 * 1024;
@@ -21,7 +33,7 @@ struct Tail {
 
 impl Tail {
     fn open(path: PathBuf, color: bool) -> Self {
-        let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+        let len = fs::metadata(&path).map_or(0, |m| m.len());
         let offset = len.saturating_sub(BACKLOG_BYTES);
         Self {
             path,
@@ -50,13 +62,13 @@ impl Tail {
         };
 
         let rest = self.partial.split_off(end + 1);
-        let complete = std::mem::replace(&mut self.partial, rest);
+        let complete = mem::replace(&mut self.partial, rest);
         let mut lines: Vec<String> = String::from_utf8_lossy(&complete)
             .lines()
             .map(String::from)
             .collect();
         // The backlog starts mid-line
-        if std::mem::take(&mut self.skip_first) && !lines.is_empty() {
+        if mem::take(&mut self.skip_first) && !lines.is_empty() {
             lines.remove(0);
         }
 
@@ -66,7 +78,7 @@ impl Tail {
 
 /// Follow one task (and its review) when `task_id` is set, else every running agent session
 pub async fn run(task_id: Option<&str>, formatted: bool) -> anyhow::Result<()> {
-    let color = formatted && std::io::stdout().is_terminal();
+    let color = formatted && io::stdout().is_terminal();
     let watched = if let Some(id) = task_id {
         println!("Watching task {id}. Ctrl+C to stop");
         Some(Watched::resolve(id).await?)
@@ -133,8 +145,8 @@ pub async fn run(task_id: Option<&str>, formatted: bool) -> anyhow::Result<()> {
         }
         tails.retain(|key, _| live.contains(key));
 
-        std::io::stdout().flush()?;
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        io::stdout().flush()?;
+        time::sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -148,14 +160,14 @@ struct Watched {
 
 impl Watched {
     async fn resolve(id: &str) -> anyhow::Result<Self> {
-        let store = crate::cli::init_store().await?;
+        let store = cli::init_store().await?;
         // The review dir is watched anyway, so `<id>-review` watches the same pair
         let id = id.strip_suffix("-review").unwrap_or(id);
-        let task = crate::cli::task_ref::resolve(&store, id).await?;
+        let task = task_ref::resolve(&store, id).await?;
         Ok(Self {
             id: task.display_spec(),
             status: task.status.clone(),
-            dirs: crate::cli::task_ref::state_dirs(&task)?,
+            dirs: task_ref::state_dirs(&task)?,
         })
     }
 
@@ -168,7 +180,7 @@ impl Watched {
 
     /// A running task with no output file is a problem, so name the path instead of waiting quietly
     fn nothing_yet(&self) -> String {
-        if self.status != crate::store::TaskStatus::InProgress.as_str() {
+        if self.status != TaskStatus::InProgress.as_str() {
             return format!(
                 "No output for task {} yet, waiting for it to start",
                 self.id
@@ -190,8 +202,8 @@ impl Watched {
 
 /// Output files of every running agent session, keyed by session name
 async fn session_sources() -> Vec<(String, PathBuf)> {
-    let tmux = crate::tmux::TmuxManager::new();
-    crate::channels::tmux::list_orch_sessions()
+    let tmux = TmuxManager::new();
+    tmux::list_orch_sessions()
         .await
         .unwrap_or_default()
         .into_iter()
@@ -213,7 +225,7 @@ fn task_dir_name(task: &str) -> String {
 
 /// A tmux session names the repo without its owner, so look under every owner
 fn session_output(project: &str, name: &str) -> Option<PathBuf> {
-    let state = crate::home::state_dir().ok()?;
+    let state = home::state_dir().ok()?;
     let dirs: Vec<PathBuf> = subdirs(&state)
         .iter()
         .flat_map(|owner| subdirs(owner))
@@ -242,7 +254,7 @@ fn newest_output(dirs: &[PathBuf]) -> Option<PathBuf> {
 }
 
 fn subdirs(dir: &Path) -> Vec<PathBuf> {
-    std::fs::read_dir(dir)
+    fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
@@ -298,20 +310,20 @@ fn path_parts(path: &Path) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
+    use std::thread;
+
     use super::*;
 
     #[test]
     fn tail_returns_only_complete_lines() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("output.json");
-        std::fs::write(&path, "one\ntw").unwrap();
+        fs::write(&path, "one\ntw").unwrap();
         let mut tail = Tail::open(path.clone(), false);
         assert_eq!(tail.read_lines(), vec!["one"]);
 
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
         f.write_all(b"o\nthree\n").unwrap();
         assert_eq!(tail.read_lines(), vec!["two", "three"]);
         assert_eq!(tail.read_lines(), [] as [String; 0]);
@@ -323,7 +335,7 @@ mod tests {
         let path = dir.path().join("output.json");
         let long = "x".repeat(usize::try_from(BACKLOG_BYTES).unwrap());
 
-        std::fs::write(&path, format!("{long}\nlast\n")).unwrap();
+        fs::write(&path, format!("{long}\nlast\n")).unwrap();
         assert_eq!(Tail::open(path, false).read_lines(), vec!["last"]);
     }
 
@@ -337,7 +349,7 @@ mod tests {
     fn in_progress_without_output_names_the_path() {
         let watched = Watched {
             id: "owner/repo#5".to_string(),
-            status: crate::store::TaskStatus::InProgress.as_str().to_string(),
+            status: TaskStatus::InProgress.as_str().to_string(),
             dirs: vec![
                 PathBuf::from("/state/owner/repo/tasks/5-review"),
                 PathBuf::from("/state/owner/repo/tasks/5"),
@@ -352,7 +364,7 @@ mod tests {
         );
 
         let waiting = Watched {
-            status: crate::store::TaskStatus::Routed.as_str().to_string(),
+            status: TaskStatus::Routed.as_str().to_string(),
             ..watched
         };
         let msg = waiting.nothing_yet();
@@ -366,10 +378,10 @@ mod tests {
         let task = dir.path().join("tasks").join("5");
         for attempt in ["1", "2"] {
             let d = task.join("attempts").join(attempt);
-            std::fs::create_dir_all(&d).unwrap();
-            std::fs::write(d.join("output.json"), attempt).unwrap();
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("output.json"), attempt).unwrap();
             // mtime resolution is coarse on some filesystems
-            std::thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(10));
         }
         let found = newest_output(&[task.join("5-review"), task.clone()]).unwrap();
         assert_eq!(found, task.join("attempts").join("2").join("output.json"));

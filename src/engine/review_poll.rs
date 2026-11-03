@@ -32,11 +32,22 @@ use crate::store::TaskStore;
 use crate::store::{store_increment_by_id, store_reset_failure_counters, store_set_result_by_id};
 use async_trait::async_trait;
 use dashmap::{DashMap, DashSet};
+use futures::future;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time;
 
 use super::sync::ReviewTaskSnapshot;
+use crate::backends::ExternalTask;
+use crate::engine::auto_merge;
+use crate::engine::router::config::RouterConfig;
+use crate::engine::runner::git_ops;
+use crate::github::app;
+use crate::store::Task;
+use crate::store::TaskStatus;
 
 /// Abstraction over the GitHub HTTP calls used by `review_open_prs`.
 ///
@@ -274,16 +285,14 @@ pub(crate) async fn review_open_prs(
     auto_merge_in_flight: &Arc<DashSet<String>>,
     in_review_tasks: &[ReviewTaskSnapshot],
     gh: &dyn GhReviewClient,
-    router_config: &crate::engine::router::config::RouterConfig,
+    router_config: &RouterConfig,
 ) -> anyhow::Result<()> {
-    use std::fmt::Write as _;
-
     const MAX_REVIEW_CONTEXT_BYTES: usize = 16 * 1024;
 
     struct ReadyTask {
-        task: crate::backends::ExternalTask,
+        task: ExternalTask,
         store_id: i64,
-        stored: crate::store::Task,
+        stored: Task,
         branch: String,
         /// `Some` = already stored in DB, `None` = needs REST lookup.
         pr_number: Option<u64>,
@@ -367,7 +376,7 @@ pub(crate) async fn review_open_prs(
             .collect();
 
         let pr_number_results =
-            futures::future::join_all(branches.iter().map(|b| gh.get_pr_number(repo, b))).await;
+            future::join_all(branches.iter().map(|b| gh.get_pr_number(repo, b))).await;
 
         for (&task_idx, result) in lookup_indices.iter().zip(pr_number_results.iter()) {
             let task_id = ready_tasks[task_idx].task.id.0.clone();
@@ -392,7 +401,7 @@ pub(crate) async fn review_open_prs(
                     let e_str = format!("{e}");
                     // If transient GitHub 5xx/transport error, skip incrementing counters
                     // and let the task be retried on the next tick.
-                    if crate::engine::runner::git_ops::is_transient_github_api_error(&e_str) {
+                    if git_ops::is_transient_github_api_error(&e_str) {
                         tracing::warn!(task_id, branch = %branch, err = %e, "transient failure getting PR number; will retry later");
                     } else {
                         tracing::warn!(task_id, branch = %branch, err = %e, "failed to get PR number");
@@ -419,8 +428,7 @@ pub(crate) async fn review_open_prs(
 
     if !no_pr_tasks.is_empty() {
         let merged_results =
-            futures::future::join_all(no_pr_tasks.iter().map(|t| gh.is_pr_merged(repo, &t.branch)))
-                .await;
+            future::join_all(no_pr_tasks.iter().map(|t| gh.is_pr_merged(repo, &t.branch))).await;
 
         for (task_info, merged_result) in no_pr_tasks.into_iter().zip(merged_results) {
             let task_id = task_info.task.id.0.as_str();
@@ -430,7 +438,7 @@ pub(crate) async fn review_open_prs(
                 Ok(v) => v,
                 Err(e) => {
                     let e_str = format!("{e}");
-                    if crate::engine::runner::git_ops::is_transient_github_api_error(&e_str) {
+                    if git_ops::is_transient_github_api_error(&e_str) {
                         tracing::warn!(task_id, branch = %branch, err = %e, "transient GitHub error checking merge status; will retry later");
                         continue;
                     }
@@ -447,7 +455,7 @@ pub(crate) async fn review_open_prs(
                 {
                     tracing::warn!(task_id, err = %e, "failed to update status to done");
                 }
-            } else if task_info.stored.status == crate::store::TaskStatus::Approved {
+            } else if task_info.stored.status == TaskStatus::Approved {
                 block_closed_approved_pr(task_manager, &task_info.task.id).await;
             } else {
                 let max_reroutes: u32 = config::get("workflow.max_reroute_attempts")
@@ -464,7 +472,7 @@ pub(crate) async fn review_open_prs(
                 // Avoid incrementing persistent reroute counters when the last
                 // store error indicates a transient GitHub 5xx/transport failure.
                 let last_error = task_info.stored.last_error.clone();
-                if crate::engine::runner::git_ops::is_transient_github_api_error(&last_error) {
+                if git_ops::is_transient_github_api_error(&last_error) {
                     tracing::warn!(
                         task_id,
                         "transient GitHub error recorded in last_error; skipping persistent no_pr_reroutes increment and retrying later"
@@ -588,13 +596,13 @@ pub(crate) async fn review_open_prs(
     // call per task.
 
     // The App posts orch's comments when it is configured, and it is never a collaborator
-    let app_login = crate::github::app::bot_login().await;
+    let app_login = app::bot_login().await;
     let is_app = |login: &str| {
         app_login
             .as_deref()
-            .is_some_and(|app| crate::github::app::same_login(login, app))
+            .is_some_and(|app| app::same_login(login, app))
     };
-    let mut unique_users: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut unique_users: HashSet<String> = HashSet::new();
     let mut app_users: Vec<String> = Vec::new();
     for data in batch.values() {
         for c in &data.issue_comments {
@@ -611,7 +619,7 @@ pub(crate) async fn review_open_prs(
 
     let collab_logins: Vec<String> = unique_users.into_iter().collect();
     let collab_results =
-        futures::future::join_all(collab_logins.iter().map(|u| gh.is_collaborator(repo, u))).await;
+        future::join_all(collab_logins.iter().map(|u| gh.is_collaborator(repo, u))).await;
     let collab_cache: HashMap<String, Option<bool>> = collab_logins
         .into_iter()
         .zip(collab_results)
@@ -666,7 +674,7 @@ pub(crate) async fn review_open_prs(
             };
 
         // App reviews count only on the current head, an older sha does not pass the gate
-        let gate_reviews = crate::github::app::reviews_for_gate(
+        let gate_reviews = app::reviews_for_gate(
             &batch_data.reviews,
             &batch_data.head_sha,
             app_login.as_deref(),
@@ -686,14 +694,13 @@ pub(crate) async fn review_open_prs(
         // Determine automated review status from batch issue comments + collaborator cache.
         let automated_review =
             automated_review_from_comments(&batch_data.issue_comments, &collab_cache, pr_number);
-        let (comment_approved, comment_changes_requested) =
-            crate::github::app::effective_comment_flags(
-                &batch_data.reviews,
-                &batch_data.head_sha,
-                app_login.as_deref(),
-                automated_review.as_deref() == Some("approve"),
-                automated_review.as_deref() == Some("changes_requested"),
-            );
+        let (comment_approved, comment_changes_requested) = app::effective_comment_flags(
+            &batch_data.reviews,
+            &batch_data.head_sha,
+            app_login.as_deref(),
+            automated_review.as_deref() == Some("approve"),
+            automated_review.as_deref() == Some("changes_requested"),
+        );
 
         // Handle fully-approved PRs: mark done only when actually merged,
         // otherwise attempt auto-merge. Never mark done on approval alone.
@@ -772,7 +779,7 @@ pub(crate) async fn review_open_prs(
                             in_flight_clone.remove(&task_clone.id.0);
                         });
 
-                        if let Err(e) = crate::engine::auto_merge::auto_merge_pr(
+                        if let Err(e) = auto_merge::auto_merge_pr(
                             &task_clone,
                             &branch_clone,
                             &backend_clone,
@@ -881,7 +888,7 @@ pub(crate) async fn review_open_prs(
             // Defensive: ensure comments are processed in chronological order
             // and find the newest matching automated changes-requested comment
             // that is newer than the stored watermark.
-            let mut newest_match: Option<&crate::github::types::GitHubComment> = None;
+            let mut newest_match: Option<&GitHubComment> = None;
             for c in &batch_data.issue_comments {
                 if !c
                     .body
@@ -939,7 +946,7 @@ pub(crate) async fn review_open_prs(
                 .unwrap_or_else(|| "unknown".to_string());
             let review_cycles = u32::try_from(stored_task.review_cycles).unwrap_or(0);
 
-            let max_cycles: u32 = crate::config::get("workflow.max_review_cycles")
+            let max_cycles: u32 = config::get("workflow.max_review_cycles")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2);
@@ -986,7 +993,7 @@ pub(crate) async fn review_open_prs(
                     save_ok = true;
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                time::sleep(Duration::from_millis(200)).await;
             }
             if !save_ok {
                 tracing::error!(
@@ -1088,15 +1095,25 @@ mod tests {
     use super::*;
     use crate::backends::{ExternalId, ExternalTask, Mention};
     use crate::engine::EngineConfig;
+    use crate::engine::router;
+    use crate::engine::sync;
+    use crate::engine::tasks;
     use crate::github::http::PrReviewBatchData;
     use crate::github::types::{GitHubComment, GitHubReview, GitHubUser};
+    use crate::store;
     use crate::store::{NewTask, TaskStatus, TaskStore};
     use async_trait::async_trait;
     use dashmap::{DashMap, DashSet};
     use std::collections::HashMap;
+    use std::io;
+    use std::io::Write;
+    use std::str as std_str;
     use std::sync::{Arc, Mutex};
+    use tokio::runtime::Builder;
     use tracing::Level;
+    use tracing::subscriber;
     use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::fmt::writer::MakeWriter;
 
     // ─── Mock GhReviewClient ─────────────────────────────────────────────────
 
@@ -1142,7 +1159,7 @@ mod tests {
     struct MockBackend;
 
     #[async_trait]
-    impl crate::backends::ExternalBackend for MockBackend {
+    impl ExternalBackend for MockBackend {
         fn name(&self) -> &'static str {
             "mock"
         }
@@ -1157,10 +1174,7 @@ mod tests {
         async fn get_task(&self, id: &ExternalId) -> anyhow::Result<ExternalTask> {
             Ok(make_ext_task(&id.0))
         }
-        async fn list_by_status(
-            &self,
-            _s: crate::backends::Status,
-        ) -> anyhow::Result<Vec<ExternalTask>> {
+        async fn list_by_status(&self, _s: Status) -> anyhow::Result<Vec<ExternalTask>> {
             Ok(vec![])
         }
         async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
@@ -1205,11 +1219,7 @@ mod tests {
         async fn get_mentions(&self, _s: &str) -> anyhow::Result<Vec<Mention>> {
             Ok(vec![])
         }
-        async fn update_status(
-            &self,
-            _id: &ExternalId,
-            _s: crate::backends::Status,
-        ) -> anyhow::Result<()> {
+        async fn update_status(&self, _id: &ExternalId, _s: Status) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -1274,21 +1284,21 @@ mod tests {
     }
 
     struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
-    impl std::io::Write for CaptureWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    impl Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(buf);
             Ok(buf.len())
         }
 
-        fn flush(&mut self) -> std::io::Result<()> {
+        fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
 
-    impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for CaptureWriter {
+    impl<'a> MakeWriter<'a> for CaptureWriter {
         type Writer = CaptureWriter;
         fn make_writer(&'a self) -> Self::Writer {
-            CaptureWriter(std::sync::Arc::clone(&self.0))
+            CaptureWriter(Arc::clone(&self.0))
         }
     }
 
@@ -1302,7 +1312,7 @@ mod tests {
             .with_writer(CaptureWriter(Arc::clone(&output)))
             .with_ansi(false)
             .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
+        let guard = subscriber::set_default(subscriber);
         f();
         drop(guard);
 
@@ -1435,8 +1445,8 @@ mod tests {
     #[tokio::test]
     async fn review_open_prs_empty_tasks_returns_ok_without_info_log() {
         let store = make_store().await;
-        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
-        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(TaskManager::with_store(
             Arc::clone(&backend),
             Arc::clone(&store),
             "owner/repo".to_string(),
@@ -1455,7 +1465,7 @@ mod tests {
             &in_flight,
             &[],
             &gh,
-            &crate::engine::router::RouterConfig::default(),
+            &router::RouterConfig::default(),
         ))
         .await;
 
@@ -1467,8 +1477,8 @@ mod tests {
     #[tokio::test]
     async fn review_open_prs_dispatching_guard_skips_task() {
         let store = make_store().await;
-        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
-        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(TaskManager::with_store(
             Arc::clone(&backend),
             Arc::clone(&store),
             "owner/repo".to_string(),
@@ -1484,7 +1494,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let _ = crate::store::store_set_by_id(
+        let _ = store::store_set_by_id(
             Some(&store),
             task_store_id,
             &[("branch", serde_json::json!("my-branch"))],
@@ -1495,8 +1505,8 @@ mod tests {
             .await
             .unwrap();
         let stored = store.get(task_store_id).await.unwrap();
-        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
-            external: crate::engine::tasks::store_task_to_external(&stored),
+        let snapshot = sync::ReviewTaskSnapshot {
+            external: tasks::store_task_to_external(&stored),
             stored,
         };
 
@@ -1525,7 +1535,7 @@ mod tests {
             &in_flight,
             &[snapshot],
             &gh,
-            &crate::engine::router::RouterConfig::default(),
+            &router::RouterConfig::default(),
         ))
         .await;
 
@@ -1540,8 +1550,8 @@ mod tests {
     #[tokio::test]
     async fn review_open_prs_no_pr_merged_marks_done() {
         let store = make_store().await;
-        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
-        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(TaskManager::with_store(
             Arc::clone(&backend),
             Arc::clone(&store),
             "owner/repo".to_string(),
@@ -1556,7 +1566,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let _ = crate::store::store_set_by_id(
+        let _ = store::store_set_by_id(
             Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
@@ -1567,8 +1577,8 @@ mod tests {
             .await
             .unwrap();
         let stored = store.get(task_id).await.unwrap();
-        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
-            external: crate::engine::tasks::store_task_to_external(&stored),
+        let snapshot = sync::ReviewTaskSnapshot {
+            external: tasks::store_task_to_external(&stored),
             stored,
         };
 
@@ -1589,7 +1599,7 @@ mod tests {
             &in_flight,
             &[snapshot],
             &gh,
-            &crate::engine::router::RouterConfig::default(),
+            &router::RouterConfig::default(),
         ))
         .await
         .unwrap();
@@ -1603,8 +1613,8 @@ mod tests {
     #[tokio::test]
     async fn review_open_prs_no_pr_not_merged_reroutes() {
         let store = make_store().await;
-        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
-        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(TaskManager::with_store(
             Arc::clone(&backend),
             Arc::clone(&store),
             "owner/repo".to_string(),
@@ -1619,7 +1629,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let _ = crate::store::store_set_by_id(
+        let _ = store::store_set_by_id(
             Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
@@ -1630,8 +1640,8 @@ mod tests {
             .await
             .unwrap();
         let stored = store.get(task_id).await.unwrap();
-        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
-            external: crate::engine::tasks::store_task_to_external(&stored),
+        let snapshot = sync::ReviewTaskSnapshot {
+            external: tasks::store_task_to_external(&stored),
             stored,
         };
 
@@ -1650,7 +1660,7 @@ mod tests {
             &in_flight,
             &[snapshot],
             &gh,
-            &crate::engine::router::RouterConfig::default(),
+            &router::RouterConfig::default(),
         ))
         .await
         .unwrap();
@@ -1665,8 +1675,8 @@ mod tests {
     #[tokio::test]
     async fn review_open_prs_blocks_an_approved_task_whose_pr_closed_unmerged() {
         let store = make_store().await;
-        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
-        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(TaskManager::with_store(
             Arc::clone(&backend),
             Arc::clone(&store),
             "owner/repo".to_string(),
@@ -1681,7 +1691,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let _ = crate::store::store_set_by_id(
+        let _ = store::store_set_by_id(
             Some(&store),
             task_id,
             &[("branch", serde_json::json!("approved-branch"))],
@@ -1692,8 +1702,8 @@ mod tests {
             .await
             .unwrap();
         let stored = store.get(task_id).await.unwrap();
-        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
-            external: crate::engine::tasks::store_task_to_external(&stored),
+        let snapshot = sync::ReviewTaskSnapshot {
+            external: tasks::store_task_to_external(&stored),
             stored,
         };
 
@@ -1709,7 +1719,7 @@ mod tests {
             &in_flight,
             &[snapshot],
             &MockGh::default(),
-            &crate::engine::router::RouterConfig::default(),
+            &router::RouterConfig::default(),
         ))
         .await
         .unwrap();
@@ -1731,8 +1741,8 @@ mod tests {
     #[tokio::test]
     async fn review_open_prs_no_pr_max_reroutes_blocks_task() {
         let store = make_store().await;
-        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
-        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(TaskManager::with_store(
             Arc::clone(&backend),
             Arc::clone(&store),
             "owner/repo".to_string(),
@@ -1747,7 +1757,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let _ = crate::store::store_set_by_id(
+        let _ = store::store_set_by_id(
             Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
@@ -1760,7 +1770,7 @@ mod tests {
 
         // Pre-set no_code_reroutes to a high value that exceeds any configured max after increment.
         // The default max is 3; use 99 to be robust against any real config on the test machine.
-        let _ = crate::store::store_set_by_id(
+        let _ = store::store_set_by_id(
             Some(&store),
             task_id,
             &[("no_code_reroutes", serde_json::json!(99i64))],
@@ -1768,8 +1778,8 @@ mod tests {
         .await;
 
         let stored = store.get(task_id).await.unwrap();
-        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
-            external: crate::engine::tasks::store_task_to_external(&stored),
+        let snapshot = sync::ReviewTaskSnapshot {
+            external: tasks::store_task_to_external(&stored),
             stored,
         };
 
@@ -1786,7 +1796,7 @@ mod tests {
             &in_flight,
             &[snapshot],
             &gh,
-            &crate::engine::router::RouterConfig::default(),
+            &router::RouterConfig::default(),
         ))
         .await
         .unwrap();
@@ -1830,8 +1840,8 @@ mod tests {
         }
 
         let store = make_store().await;
-        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
-        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(TaskManager::with_store(
             Arc::clone(&backend),
             Arc::clone(&store),
             "owner/repo".to_string(),
@@ -1846,7 +1856,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let _ = crate::store::store_set_by_id(
+        let _ = store::store_set_by_id(
             Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
@@ -1857,8 +1867,8 @@ mod tests {
             .await
             .unwrap();
         let stored = store.get(task_id).await.unwrap();
-        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
-            external: crate::engine::tasks::store_task_to_external(&stored),
+        let snapshot = sync::ReviewTaskSnapshot {
+            external: tasks::store_task_to_external(&stored),
             stored,
         };
 
@@ -1874,7 +1884,7 @@ mod tests {
             &in_flight,
             &[snapshot],
             &TransientGh,
-            &crate::engine::router::RouterConfig::default(),
+            &router::RouterConfig::default(),
         ))
         .await
         .unwrap();
@@ -1890,8 +1900,8 @@ mod tests {
     #[tokio::test]
     async fn review_open_prs_batch_fetch_failure_returns_ok() {
         let store = make_store().await;
-        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
-        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(TaskManager::with_store(
             Arc::clone(&backend),
             Arc::clone(&store),
             "owner/repo".to_string(),
@@ -1906,14 +1916,14 @@ mod tests {
             })
             .await
             .unwrap();
-        let _ = crate::store::store_set_by_id(
+        let _ = store::store_set_by_id(
             Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
         )
         .await;
         // Set pr_number so task reaches Phase 4.
-        let _ = crate::store::store_set_by_id(
+        let _ = store::store_set_by_id(
             Some(&store),
             task_id,
             &[("pr_number", serde_json::json!(99i64))],
@@ -1924,8 +1934,8 @@ mod tests {
             .await
             .unwrap();
         let stored = store.get(task_id).await.unwrap();
-        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
-            external: crate::engine::tasks::store_task_to_external(&stored),
+        let snapshot = sync::ReviewTaskSnapshot {
+            external: tasks::store_task_to_external(&stored),
             stored,
         };
 
@@ -1945,7 +1955,7 @@ mod tests {
             &in_flight,
             &[snapshot],
             &gh,
-            &crate::engine::router::RouterConfig::default(),
+            &router::RouterConfig::default(),
         ))
         .await;
 
@@ -1959,8 +1969,8 @@ mod tests {
     #[tokio::test]
     async fn review_open_prs_conflict_with_max_attempts_blocks_instead_of_reroute() {
         let store = make_store().await;
-        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
-        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(TaskManager::with_store(
             Arc::clone(&backend),
             Arc::clone(&store),
             "owner/repo".to_string(),
@@ -1975,7 +1985,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let _ = crate::store::store_set_by_id(
+        let _ = store::store_set_by_id(
             Some(&store),
             task_id,
             &[
@@ -1990,8 +2000,8 @@ mod tests {
             .await
             .unwrap();
         let stored = store.get(task_id).await.unwrap();
-        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
-            external: crate::engine::tasks::store_task_to_external(&stored),
+        let snapshot = sync::ReviewTaskSnapshot {
+            external: tasks::store_task_to_external(&stored),
             stored,
         };
 
@@ -2026,7 +2036,7 @@ mod tests {
             &in_flight,
             &[snapshot],
             &gh,
-            &crate::engine::router::RouterConfig::default(),
+            &router::RouterConfig::default(),
         ))
         .await
         .unwrap();
@@ -2058,10 +2068,7 @@ mod tests {
         };
 
         let logs = with_captured_warn_logs(|| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
+            let rt = Builder::new_current_thread().enable_all().build().unwrap();
             let ok = rt.block_on(reset_batch_fail_counter(&store, key));
             assert!(ok, "fallback zero-reset should succeed");
         });
@@ -2086,10 +2093,7 @@ mod tests {
         };
 
         let logs = with_captured_warn_logs(|| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
+            let rt = Builder::new_current_thread().enable_all().build().unwrap();
             let ok = rt.block_on(reset_batch_fail_counter(&store, key));
             assert!(
                 !ok,
@@ -2110,8 +2114,8 @@ mod tests {
     #[tokio::test]
     async fn review_open_prs_watermark_dedup_skips_already_processed_review() {
         let store = make_store().await;
-        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
-        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(TaskManager::with_store(
             Arc::clone(&backend),
             Arc::clone(&store),
             "owner/repo".to_string(),
@@ -2128,7 +2132,7 @@ mod tests {
             .unwrap();
         // Pre-set review_ts_map so the reviewer's review is already watermarked.
         let ts = "2026-01-05T00:00:00Z";
-        let _ = crate::store::store_set_by_id(
+        let _ = store::store_set_by_id(
             Some(&store),
             task_id,
             &[
@@ -2146,8 +2150,8 @@ mod tests {
             .await
             .unwrap();
         let stored = store.get(task_id).await.unwrap();
-        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
-            external: crate::engine::tasks::store_task_to_external(&stored),
+        let snapshot = sync::ReviewTaskSnapshot {
+            external: tasks::store_task_to_external(&stored),
             stored,
         };
 
@@ -2176,7 +2180,7 @@ mod tests {
             &in_flight,
             &[snapshot],
             &gh,
-            &crate::engine::router::RouterConfig::default(),
+            &router::RouterConfig::default(),
         ))
         .await
         .unwrap();
@@ -2189,8 +2193,8 @@ mod tests {
     #[tokio::test]
     async fn review_open_prs_does_not_rewrite_stored_pr_number() {
         let store = make_store().await;
-        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
-        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(TaskManager::with_store(
             Arc::clone(&backend),
             Arc::clone(&store),
             "owner/repo".to_string(),
@@ -2205,7 +2209,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let _ = crate::store::store_set_by_id(
+        let _ = store::store_set_by_id(
             Some(&store),
             task_id,
             &[
@@ -2219,8 +2223,8 @@ mod tests {
             .await
             .unwrap();
         let stored = store.get(task_id).await.unwrap();
-        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
-            external: crate::engine::tasks::store_task_to_external(&stored),
+        let snapshot = sync::ReviewTaskSnapshot {
+            external: tasks::store_task_to_external(&stored),
             stored,
         };
         sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
@@ -2241,7 +2245,7 @@ mod tests {
             &in_flight,
             &[snapshot],
             &MockGh::default(),
-            &crate::engine::router::RouterConfig::default(),
+            &router::RouterConfig::default(),
         ))
         .await
         .unwrap();
@@ -2259,8 +2263,8 @@ mod tests {
     #[tokio::test]
     async fn review_open_prs_last_comment_review_ts_dedup_skips_old_comment() {
         let store = make_store().await;
-        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
-        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(TaskManager::with_store(
             Arc::clone(&backend),
             Arc::clone(&store),
             "owner/repo".to_string(),
@@ -2275,13 +2279,13 @@ mod tests {
             })
             .await
             .unwrap();
-        let _ = crate::store::store_set_by_id(
+        let _ = store::store_set_by_id(
             Some(&store),
             task_id,
             &[("branch", serde_json::json!("feat-branch"))],
         )
         .await;
-        let _ = crate::store::store_set_by_id(
+        let _ = store::store_set_by_id(
             Some(&store),
             task_id,
             &[("pr_number", serde_json::json!(20i64))],
@@ -2289,7 +2293,7 @@ mod tests {
         .await;
         // Set last_comment_review_ts to match the comment's created_at so it is deduplicated.
         let ts = "2026-01-05T00:00:00Z";
-        let _ = crate::store::store_set_by_id(
+        let _ = store::store_set_by_id(
             Some(&store),
             task_id,
             &[("last_comment_review_ts", serde_json::json!(ts))],
@@ -2300,8 +2304,8 @@ mod tests {
             .await
             .unwrap();
         let stored = store.get(task_id).await.unwrap();
-        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
-            external: crate::engine::tasks::store_task_to_external(&stored),
+        let snapshot = sync::ReviewTaskSnapshot {
+            external: tasks::store_task_to_external(&stored),
             stored,
         };
 
@@ -2331,7 +2335,7 @@ mod tests {
             &in_flight,
             &[snapshot],
             &gh,
-            &crate::engine::router::RouterConfig::default(),
+            &router::RouterConfig::default(),
         ))
         .await
         .unwrap();
@@ -2375,6 +2379,6 @@ mod tests {
         assert!(review_context.len() <= MAX_REVIEW_CONTEXT_BYTES + 40); // suffix is short
         assert!(review_context.ends_with("... (review context truncated)"));
         // Must be valid UTF-8 after truncation (no split multi-byte chars).
-        assert!(std::str::from_utf8(review_context.as_bytes()).is_ok());
+        assert!(std_str::from_utf8(review_context.as_bytes()).is_ok());
     }
 }

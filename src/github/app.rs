@@ -4,13 +4,37 @@
 //! JWT, exchanges it for an installation token, and decides which reviews count.
 
 use super::types::GitHubReview;
+use crate::config;
+use crate::engine::runner::response::ReviewIssue;
+use crate::secret_ref;
+use crate::security;
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+#[cfg(test)]
+use rand::rngs::OsRng;
 use reqwest::{Client, StatusCode, header};
+#[cfg(test)]
+use rsa::pkcs8::EncodePrivateKey;
+#[cfg(test)]
+use rsa::pkcs8::EncodePublicKey;
+#[cfg(test)]
+use rsa::pkcs8::LineEnding;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::env;
+use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::fs;
+use std::sync::MutexGuard;
+#[cfg(test)]
+use std::sync::OnceLock;
+use std::sync::PoisonError;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration as StdDuration;
+use tokio::sync;
+use tokio::task;
+use tokio::time;
 
 const JWT_IAT_SKEW_SECS: i64 = 60;
 const JWT_EXP_FROM_NOW_SECS: i64 = 9 * 60;
@@ -98,7 +122,7 @@ pub(crate) fn right_side_ranges(patch: &str) -> Vec<(u32, u32)> {
 
 /// Split issues into inline comments on a hunk line and the rest, which GitHub would refuse
 pub(crate) fn split_inline(
-    issues: &[crate::engine::runner::response::ReviewIssue],
+    issues: &[ReviewIssue],
     hunks: &HashMap<String, Vec<(u32, u32)>>,
 ) -> (Vec<InlineComment>, Vec<String>) {
     let mut inline = Vec::new();
@@ -135,24 +159,22 @@ pub(crate) struct AppAuth {
     installations: Mutex<HashMap<String, Option<u64>>>,
     tokens: Mutex<HashMap<u64, CachedToken>>,
     login: Mutex<Option<String>>,
-    refresh: tokio::sync::Mutex<()>,
+    refresh: sync::Mutex<()>,
     http: Client,
     api_base: String,
 }
 
 // Keeps the key and the token out of any `{:?}` that reaches a log
-impl std::fmt::Debug for AppAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for AppAuth {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("AppAuth")
             .field("app_id", &self.app_id)
             .finish_non_exhaustive()
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 static SHARED: RwLock<Option<Arc<AppAuth>>> = RwLock::new(None);
@@ -162,14 +184,12 @@ const LOAD_RETRY: StdDuration = StdDuration::from_secs(300);
 pub(crate) fn shared() -> Option<Arc<AppAuth>> {
     SHARED
         .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(PoisonError::into_inner)
         .clone()
 }
 
 fn publish(app: Arc<AppAuth>) {
-    *SHARED
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(app);
+    *SHARED.write().unwrap_or_else(PoisonError::into_inner) = Some(app);
 }
 
 /// Reads the App key in the background, once per daemon start. A passbox key waits on Touch
@@ -194,7 +214,7 @@ where
 
     loop {
         let attempt = load.clone();
-        let result = tokio::task::spawn_blocking(attempt)
+        let result = task::spawn_blocking(attempt)
             .await
             .map_err(anyhow::Error::from)
             .and_then(|r| r);
@@ -213,7 +233,7 @@ where
             Err(_) => {}
         }
 
-        tokio::time::sleep(retry).await;
+        time::sleep(retry).await;
     }
 }
 
@@ -247,7 +267,7 @@ impl AppAuth {
             installations: Mutex::new(HashMap::new()),
             tokens: Mutex::new(HashMap::new()),
             login: Mutex::new(None),
-            refresh: tokio::sync::Mutex::new(()),
+            refresh: sync::Mutex::new(()),
             http,
             api_base,
         }
@@ -483,7 +503,7 @@ fn error_message(body: &str) -> String {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
         return String::new();
     };
-    let safe = |text: String| (!crate::security::has_leaks(&text)).then_some(text);
+    let safe = |text: String| (!security::has_leaks(&text)).then_some(text);
     let message = value
         .get("message")
         .and_then(|msg| msg.as_str())
@@ -534,7 +554,7 @@ fn token_is_fresh(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
 
 // The global config only: a project file must never point the App's key or id elsewhere
 fn nonempty_config(key: &str) -> Option<String> {
-    crate::config::get_global(key)
+    config::get_global(key)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -543,15 +563,15 @@ fn nonempty_config(key: &str) -> Option<String> {
 fn read_key() -> anyhow::Result<String> {
     // `passbox:<name>` keeps the key out of every file an agent can read
     if let Some(reference) = nonempty_config("gh.app.private_key") {
-        return normalize_pem(&crate::secret_ref::resolve(&reference)?);
+        return normalize_pem(&secret_ref::resolve(&reference)?);
     }
     if let Some(path) = nonempty_config("gh.app.private_key_path") {
-        let raw = std::fs::read_to_string(&path)
+        let raw = fs::read_to_string(&path)
             .map_err(|err| anyhow::anyhow!("failed to read GitHub App private key file: {err}"))?;
         return normalize_pem(&raw);
     }
     if let Some(name) = nonempty_config("gh.app.private_key_env") {
-        let raw = std::env::var(&name).unwrap_or_default();
+        let raw = env::var(&name).unwrap_or_default();
         return normalize_pem(&raw).map_err(|_| {
             anyhow::anyhow!("GitHub App private key variable {name} is unset or empty")
         });
@@ -648,10 +668,9 @@ pub(crate) fn effective_comment_flags(
 /// A throwaway RSA key pair, private then public PEM, made once per test process
 #[cfg(test)]
 fn test_keys() -> &'static (String, String) {
-    use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
-    static KEYS: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+    static KEYS: OnceLock<(String, String)> = OnceLock::new();
     KEYS.get_or_init(|| {
-        let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).expect("rsa");
+        let key = rsa::RsaPrivateKey::new(&mut OsRng, 2048).expect("rsa");
         let private = key.to_pkcs8_pem(LineEnding::LF).expect("pem").to_string();
         let public = rsa::RsaPublicKey::from(&key)
             .to_public_key_pem(LineEnding::LF)
@@ -668,6 +687,7 @@ pub(crate) fn test_pem() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::runner::response::ReviewIssue;
     use crate::github::types::GitHubUser;
     use jsonwebtoken::{DecodingKey, Validation, decode};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -717,12 +737,9 @@ mod tests {
         assert_eq!(claims.iss, "12345");
         assert_eq!(claims.iat, now - 60);
         assert!(claims.exp > now && claims.exp - now <= 600);
+        assert!(security::has_leaks(&jwt), "a jwt must trip the leak scan");
         assert!(
-            crate::security::has_leaks(&jwt),
-            "a jwt must trip the leak scan"
-        );
-        assert!(
-            crate::security::has_leaks(test_pem()),
+            security::has_leaks(test_pem()),
             "a key must trip the leak scan"
         );
     }
@@ -777,7 +794,7 @@ mod tests {
         let server = MockServer::start().await;
         installed(&server, "o/r", 42).await;
         let posts = Arc::new(AtomicUsize::new(0));
-        let counter = std::sync::Arc::clone(&posts);
+        let counter = Arc::clone(&posts);
         Mock::given(method("POST"))
             .and(path("/app/installations/42/access_tokens"))
             .respond_with(move |_req: &Request| {
@@ -998,7 +1015,6 @@ mod tests {
 
     #[test]
     fn issues_on_a_hunk_line_go_inline_and_the_rest_are_listed() {
-        use crate::engine::runner::response::ReviewIssue;
         let issue = |file: &str, line: Option<u32>| ReviewIssue {
             file: file.to_string(),
             line,

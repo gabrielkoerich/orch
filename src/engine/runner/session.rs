@@ -4,10 +4,14 @@
 //! spawning the agent, waiting for completion, reading output files, and cleanup.
 
 use crate::tmux::TmuxManager;
+use std::fs;
 use std::path::Path;
+use std::time::Instant;
+use tokio::task;
 use tokio::time::{Duration, timeout};
 
 use super::{agent, response};
+use crate::home;
 
 /// Raw output collected from an agent session.
 #[derive(Debug)]
@@ -39,7 +43,7 @@ pub async fn run_agent_session(
 
     // Start timing before session setup so elapsed includes spawn/setup time.
     // This helps distinguish "never started" vs "ran for a while then stopped".
-    let session_start = std::time::Instant::now();
+    let session_start = Instant::now();
 
     let session = match agent::spawn_in_tmux(&tmux, invocation).await {
         Ok(s) => s,
@@ -110,12 +114,12 @@ async fn collect_output(
 ) -> SessionOutput {
     // Compute exit code on blocking pool
     let attempt_exit = attempt_dir.join("exit.txt");
-    let legacy_exit = crate::home::state_file(&format!("exit-{task_id}.txt"))
+    let legacy_exit = home::state_file(&format!("exit-{task_id}.txt"))
         .unwrap_or_else(|_| orch_home.join("state").join(format!("exit-{task_id}.txt")));
 
-    let exit_code: i32 = match tokio::task::spawn_blocking(move || {
-        std::fs::read_to_string(&attempt_exit)
-            .or_else(|_| std::fs::read_to_string(&legacy_exit))
+    let exit_code: i32 = match task::spawn_blocking(move || {
+        fs::read_to_string(&attempt_exit)
+            .or_else(|_| fs::read_to_string(&legacy_exit))
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(-1)
@@ -134,16 +138,16 @@ async fn collect_output(
         response::read_output_file(task_id, &invocation.output_file, &invocation.repo).await;
 
     let stderr_path_attempt = attempt_dir.join("stderr.txt");
-    let stderr_path_legacy = crate::home::state_file(&format!("stderr-{task_id}.txt"))
-        .unwrap_or_else(|_| {
+    let stderr_path_legacy =
+        home::state_file(&format!("stderr-{task_id}.txt")).unwrap_or_else(|_| {
             orch_home
                 .join("state")
                 .join(format!("stderr-{task_id}.txt"))
         });
 
-    let raw_stderr: String = match tokio::task::spawn_blocking(move || {
-        std::fs::read_to_string(&stderr_path_attempt)
-            .or_else(|_| std::fs::read_to_string(&stderr_path_legacy))
+    let raw_stderr: String = match task::spawn_blocking(move || {
+        fs::read_to_string(&stderr_path_attempt)
+            .or_else(|_| fs::read_to_string(&stderr_path_legacy))
             .unwrap_or_default()
     })
     .await

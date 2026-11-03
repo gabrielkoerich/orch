@@ -2,8 +2,16 @@
 //! why it is shaped this way are in docs/plans/2026-10-28-agent-sandboxes.md
 
 use super::agent::AgentInvocation;
+use crate::config;
+use crate::home;
 use sandbox_jail::{Access, Backend, Policy, Sandbox, known};
+use std::env;
+use std::error;
 use std::ffi::OsString;
+use std::fmt;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Top-level dirs of the home that stay read-only: what loads or runs later as the operator, the
@@ -51,12 +59,12 @@ pub fn run_temp_dir(attempt_dir: &Path) -> PathBuf {
 /// Whether the project runs its agents in the sandbox: `workflow.sandbox: os` in its `.orch.yml`
 /// or the global config. `false` or no setting leaves it off
 pub fn enabled(project_dir: &Path) -> bool {
-    crate::config::get_for_project(project_dir, "workflow.sandbox").is_ok_and(|v| v.trim() == "os")
+    config::get_for_project(project_dir, "workflow.sandbox").is_ok_and(|v| v.trim() == "os")
 }
 
 /// Like [`enabled`] from the global config alone, for a run whose project is unknown
 pub fn enabled_globally() -> bool {
-    crate::config::get_global("workflow.sandbox").is_ok_and(|v| v.trim() == "os")
+    config::get_global("workflow.sandbox").is_ok_and(|v| v.trim() == "os")
 }
 
 /**
@@ -74,13 +82,13 @@ pub async fn argv(inv: &AgentInvocation, temp: &Path) -> anyhow::Result<Vec<OsSt
 #[derive(Debug)]
 pub struct SandboxFailed(pub String);
 
-impl std::fmt::Display for SandboxFailed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for SandboxFailed {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "the OS sandbox cannot start: {}", self.0)
     }
 }
 
-impl std::error::Error for SandboxFailed {}
+impl error::Error for SandboxFailed {}
 
 async fn build(inv: &AgentInvocation, temp: &Path) -> anyhow::Result<Vec<OsString>> {
     let backend = Backend::detect()?;
@@ -95,17 +103,17 @@ async fn build(inv: &AgentInvocation, temp: &Path) -> anyhow::Result<Vec<OsStrin
         common_dir.as_deref(),
     )?;
 
-    let home = std::env::var_os("HOME")
+    let home = env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("HOME is not set, so the sandbox cannot hide its keys"))?;
-    let mut projects: Vec<PathBuf> = crate::config::get_projects_with_paths()
+    let mut projects: Vec<PathBuf> = config::get_projects_with_paths()
         .unwrap_or_default()
         .into_iter()
         .map(|(_, dir)| dir)
         .collect();
     projects.push(inv.main_project_dir.clone());
-    let path_dirs = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
+    let path_dirs = env::var_os("PATH")
+        .map(|p| env::split_paths(&p).collect())
         .unwrap_or_default();
 
     let run = Run {
@@ -114,7 +122,7 @@ async fn build(inv: &AgentInvocation, temp: &Path) -> anyhow::Result<Vec<OsStrin
         common_dir,
         own_ref: (!inv.branch.is_empty()).then(|| format!("refs/heads/{}", inv.branch)),
         home,
-        orch_home: crate::home::orch_home()?,
+        orch_home: home::orch_home()?,
         projects,
         path_dirs,
         temp: temp.to_path_buf(),
@@ -152,7 +160,7 @@ fn check_git_dirs(
                 git.display(),
                 common.display()
             );
-            let back = std::fs::read_to_string(git.join("gitdir")).unwrap_or_default();
+            let back = fs::read_to_string(git.join("gitdir")).unwrap_or_default();
             anyhow::ensure!(
                 real(Path::new(back.trim())) == real(&work_dir.join(".git")),
                 "the git dir {} belongs to another worktree",
@@ -206,7 +214,7 @@ fn policy(run: &Run) -> Policy {
             known::BASIC_MACH_SERVICES
                 .iter()
                 .chain(&[KEYCHAIN])
-                .map(std::string::ToString::to_string)
+                .map(ToString::to_string)
                 .collect(),
         );
     } else {
@@ -319,7 +327,7 @@ fn find_git_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         return;
     }
 
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
         let name = entry.file_name();
 
         if entry.file_type().is_ok_and(|t| t.is_dir()) && name != ".git" && name != "node_modules" {
@@ -332,12 +340,12 @@ fn find_git_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
 /// ssh-agent keep running outside the sandbox
 fn socket_dirs(temp: &Path) -> Vec<PathBuf> {
     let mut roots = vec![PathBuf::from("/private/tmp"), PathBuf::from("/tmp")];
-    roots.extend(std::env::var_os("TMUX_TMPDIR").map(PathBuf::from));
+    roots.extend(env::var_os("TMUX_TMPDIR").map(PathBuf::from));
     roots.push(temp.to_path_buf());
 
     roots
         .iter()
-        .filter_map(|r| std::fs::read_dir(r).ok())
+        .filter_map(|r| fs::read_dir(r).ok())
         .flatten()
         .flatten()
         .filter(|e| {
@@ -352,7 +360,7 @@ fn socket_dirs(temp: &Path) -> Vec<PathBuf> {
 /// The home's writable parts: its top-level dirs but [`HOME_READ_ONLY`], and [`HOME_WRITABLE`]
 /// inside those. The home itself stays read-only, so no new dotfile appears at its top
 fn home_writable(home: &Path) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(home)
+    let mut dirs: Vec<PathBuf> = fs::read_dir(home)
         .into_iter()
         .flatten()
         .flatten()
@@ -416,7 +424,7 @@ fn git_rules(
         _ => read_only_around(&common.join("refs/heads"), &own, out),
     }
 
-    let packed = std::fs::read_to_string(common.join("packed-refs")).unwrap_or_default();
+    let packed = fs::read_to_string(common.join("packed-refs")).unwrap_or_default();
     for name in packed
         .lines()
         .filter_map(|l| l.split_once(' ').map(|(_, r)| r))
@@ -435,7 +443,7 @@ fn git_rules(
  * around its `.git`. A missing `dir` adds nothing
  **/
 fn read_only_around(dir: &Path, keep: &[PathBuf], out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
 
@@ -461,6 +469,10 @@ fn read_only_around(dir: &Path, keep: &[PathBuf], out: &mut Vec<PathBuf>) {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(target_os = "macos")]
+    use std::os::unix::net::UnixListener;
+    #[cfg(target_os = "macos")]
+    use std::thread;
 
     #[tokio::test]
     async fn argv_error_is_tagged_so_spawn_blocks_the_task() {
@@ -773,8 +785,8 @@ mod tests {
         let (_root, mut run) = fixture(false);
         run.seatbelt = backend == Backend::Seatbelt;
         for dir in [&run.work_dir, &run.home] {
-            let listener = std::os::unix::net::UnixListener::bind(dir.join("s")).unwrap();
-            std::thread::spawn(move || listener.incoming().for_each(drop));
+            let listener = UnixListener::bind(dir.join("s")).unwrap();
+            thread::spawn(move || listener.incoming().for_each(drop));
         }
         let git = run.home.join("proj/.git");
         let script = format!(
@@ -872,7 +884,7 @@ mod tests {
     fn claude_answers_inside_the_sandbox_with_the_real_home() {
         let root = tempfile::tempdir().unwrap();
         let work = root.path().canonicalize().unwrap();
-        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let home = PathBuf::from(env::var_os("HOME").unwrap());
         let run = Run {
             work_dir: work.clone(),
             git_dir: None,
@@ -881,8 +893,8 @@ mod tests {
             home: home.clone(),
             orch_home: home.join(".orch"),
             projects: vec![],
-            path_dirs: std::env::split_paths(&std::env::var_os("PATH").unwrap()).collect(),
-            temp: std::env::temp_dir(),
+            path_dirs: env::split_paths(&env::var_os("PATH").unwrap()).collect(),
+            temp: env::temp_dir(),
             internal: false,
             seatbelt: true,
         };

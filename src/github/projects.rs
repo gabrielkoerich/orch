@@ -3,12 +3,16 @@
 //! Uses GitHub's Projects V2 GraphQL API via the native `GhHttp` reqwest client.
 //! All operations are best-effort: failures are logged but never block task execution.
 
+pub(crate) mod label_status;
+
 use crate::backends::Status;
 use crate::config;
 use crate::github::http::GhHttp;
+use crate::home;
 use std::collections::HashMap;
+use std::collections::HashSet;
 
-pub(crate) mod label_status;
+use tokio::fs;
 
 /// Project board info returned by list queries.
 #[derive(Debug, Clone)]
@@ -345,17 +349,14 @@ impl ProjectSync {
     pub async fn get_estimates_for_issues(
         &self,
         issue_node_ids: &[String],
-    ) -> anyhow::Result<std::collections::HashMap<String, u8>> {
+    ) -> anyhow::Result<HashMap<String, u8>> {
         const FIBONACCI: &[u8] = &[0, 1, 2, 3, 5, 8, 13, 21];
 
         let Some(field_id) = &self.estimate_field_id else {
-            return Ok(std::collections::HashMap::new());
+            return Ok(HashMap::new());
         };
 
-        let issue_set: std::collections::HashSet<&str> = issue_node_ids
-            .iter()
-            .map(std::string::String::as_str)
-            .collect();
+        let issue_set: HashSet<&str> = issue_node_ids.iter().map(String::as_str).collect();
 
         // Fetch all items in the project with their fieldValues filtered to the estimate field.
         let query = r"query($projectId: ID!) { node(id: $projectId) { ... on ProjectV2 { items(first: 100) { nodes { id content { ... on Issue { id } ... on PullRequest { id } } fieldValues(first: 10) { nodes { ... on ProjectV2ItemFieldNumberValue { field { id } number } } } } } } } }";
@@ -370,7 +371,7 @@ impl ProjectSync {
             .and_then(|n| n.as_array())
             .ok_or_else(|| anyhow::anyhow!("failed to parse project items"))?;
 
-        let mut estimates = std::collections::HashMap::new();
+        let mut estimates = HashMap::new();
 
         for item in items {
             // Extract the content node ID (issue or PR).
@@ -432,9 +433,9 @@ fn parse_project_node(node: &serde_json::Value) -> Option<ProjectInfo> {
 
 /// Write project config fields to `~/.orch/config.yml`.
 pub async fn write_project_config(sync: &ProjectSync) -> anyhow::Result<()> {
-    let config_path = crate::home::config_path()?;
+    let config_path = home::config_path()?;
     let content = if config_path.exists() {
-        tokio::fs::read_to_string(&config_path).await?
+        fs::read_to_string(&config_path).await?
     } else {
         String::new()
     };
@@ -494,12 +495,17 @@ pub async fn write_project_config(sync: &ProjectSync) -> anyhow::Result<()> {
         );
     }
 
-    tokio::fs::write(&config_path, serde_norway::to_string(&doc)?).await?;
+    fs::write(&config_path, serde_norway::to_string(&doc)?).await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::fs as std_fs;
+    use std::panic;
+    use std::panic::AssertUnwindSafe;
+
     use super::*;
     use crate::backends::Status;
 
@@ -549,30 +555,30 @@ mod tests {
         // 1. Change to a temp dir so project config lookup finds no .orch.yml
         // 2. Point ORCH_HOME at a separate temp dir so the global config is not found
         // 3. Clear the config cache so no previously-cached values are reused
-        let original_cwd = std::env::current_dir().unwrap();
-        let prev_orch_home = std::env::var("ORCH_HOME").ok();
+        let original_cwd = env::current_dir().unwrap();
+        let prev_orch_home = env::var("ORCH_HOME").ok();
 
         let temp_cwd = tempfile::tempdir().unwrap();
         let temp_orch_home = tempfile::tempdir().unwrap();
         let orch_dir = temp_orch_home.path().join(".orch");
-        std::fs::create_dir_all(&orch_dir).unwrap();
+        std_fs::create_dir_all(&orch_dir).unwrap();
 
-        std::env::set_current_dir(temp_cwd.path()).unwrap();
+        env::set_current_dir(temp_cwd.path()).unwrap();
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("ORCH_HOME", &orch_dir) };
+        unsafe { env::set_var("ORCH_HOME", &orch_dir) };
         config::clear_test_cache();
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
             assert!(ProjectSync::from_config().is_none());
         }));
 
-        std::env::set_current_dir(&original_cwd).unwrap();
+        env::set_current_dir(&original_cwd).unwrap();
         if let Some(prev) = prev_orch_home {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            unsafe { std::env::set_var("ORCH_HOME", prev) };
+            unsafe { env::set_var("ORCH_HOME", prev) };
         } else {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            unsafe { std::env::remove_var("ORCH_HOME") };
+            unsafe { env::remove_var("ORCH_HOME") };
         }
         result.unwrap();
     }
@@ -606,22 +612,22 @@ mod tests {
     fn estimate_field_id_is_optional() {
         // ProjectSync should be constructable with no estimate field.
         // estimate_field_id() should return None when not configured.
-        let original_cwd = std::env::current_dir().unwrap();
-        let prev_orch_home = std::env::var("ORCH_HOME").ok();
+        let original_cwd = env::current_dir().unwrap();
+        let prev_orch_home = env::var("ORCH_HOME").ok();
 
         let temp_cwd = tempfile::tempdir().unwrap();
         let temp_orch_home = tempfile::tempdir().unwrap();
         let orch_dir = temp_orch_home.path().join(".orch");
-        std::fs::create_dir_all(&orch_dir).unwrap();
+        std_fs::create_dir_all(&orch_dir).unwrap();
 
-        std::env::set_current_dir(temp_cwd.path()).unwrap();
+        env::set_current_dir(temp_cwd.path()).unwrap();
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("ORCH_HOME", &orch_dir) };
+        unsafe { env::set_var("ORCH_HOME", &orch_dir) };
         config::clear_test_cache();
 
         // Write a config with project ID and status field but NO estimate field.
         let config_path = orch_dir.join("config.yml");
-        std::fs::write(
+        std_fs::write(
             &config_path,
             r#"
 gh:
@@ -633,7 +639,7 @@ gh:
         )
         .unwrap();
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
             let sync = ProjectSync::from_config();
             assert!(
                 sync.is_some(),
@@ -646,13 +652,13 @@ gh:
             );
         }));
 
-        std::env::set_current_dir(&original_cwd).unwrap();
+        env::set_current_dir(&original_cwd).unwrap();
         if let Some(prev) = prev_orch_home {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            unsafe { std::env::set_var("ORCH_HOME", prev) };
+            unsafe { env::set_var("ORCH_HOME", prev) };
         } else {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            unsafe { std::env::remove_var("ORCH_HOME") };
+            unsafe { env::remove_var("ORCH_HOME") };
         }
         result.unwrap();
     }

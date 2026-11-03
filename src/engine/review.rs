@@ -7,8 +7,56 @@
 //! - [`super::review_poll`] — polling open PRs for human review feedback
 //! - [`super::auto_merge`] — merging approved PRs and handling change requests
 
+use super::router::Router;
 /// Maximum consecutive review agent failures before the task is blocked
 /// for human intervention. Exported so `tick` and `sync` use the same threshold.
+use crate::backends::{ExternalBackend, ExternalTask, Status};
+use crate::cmd::CommandErrorContext;
+use crate::config;
+use crate::engine::attribution_footer;
+use crate::engine::auto_merge::{auto_merge_pr, handle_review_changes};
+use crate::engine::cooldown;
+use crate::engine::cooldown::CreditExhaustionReason;
+use crate::engine::router::RouterConfig;
+use crate::engine::runner;
+use crate::engine::runner::git_ops;
+use crate::engine::runner::response::ReviewIssue;
+use crate::engine::runner::worktree;
+use crate::engine::tasks;
+use crate::engine::tasks::TaskManager;
+use crate::github::app;
+use crate::github::app::AppAuth;
+use crate::github::app::CheckRunState;
+use crate::github::app::InlineComment;
+use crate::github::app::ReviewEvent;
+use crate::github::http::GhHttp;
+use crate::github::types::GitHubPullRequest;
+use crate::home;
+use crate::review_mode;
+use crate::review_mode::ReviewMode;
+use crate::store;
+use crate::store::TaskStore;
+use crate::store::store_log_activity;
+use crate::store::{CompleteRun, RunTokenUsage, StartRun};
+use crate::store::{opt_store_get_task, store_increment};
+use crate::store::{store_set, store_set_result};
+use crate::tmux::TmuxManager;
+use anyhow::Context;
+use std::collections::HashSet;
+use std::fmt::Write as _;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::fs as tokio_fs;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+use tokio::sync::RwLock;
+use tokio::task;
+use tokio::time;
+
 pub(crate) const MAX_REVIEW_AGENT_FAILURES: u64 = 3;
 
 /// Maximum consecutive PR-creation failures before blocking the task.
@@ -27,12 +75,10 @@ fn outcome_for_agent_error(err: &runner::agents::AgentError) -> &'static str {
         // reviews on a billing-cycle-exhausted model must not be stored as a
         // plain "rate_limit"/"auth_error" outcome (issue #3529).
         runner::agents::AgentError::RateLimit { message } => {
-            crate::engine::cooldown::detect_credit_exhaustion_outcome(message)
-                .unwrap_or("rate_limit")
+            cooldown::detect_credit_exhaustion_outcome(message).unwrap_or("rate_limit")
         }
         runner::agents::AgentError::Auth { message } => {
-            crate::engine::cooldown::detect_credit_exhaustion_outcome(message)
-                .unwrap_or("auth_error")
+            cooldown::detect_credit_exhaustion_outcome(message).unwrap_or("auth_error")
         }
         runner::agents::AgentError::InvalidResponse { .. } => "parse_error",
         _ => "failed",
@@ -110,43 +156,18 @@ fn review_started_comment(review_agent: &str, review_model: &str) -> String {
 }
 
 fn should_skip_no_code_reroute_increment(last_error: &str) -> bool {
-    crate::engine::runner::git_ops::is_transient_github_api_error(last_error)
+    git_ops::is_transient_github_api_error(last_error)
 }
-
-use crate::backends::{ExternalBackend, ExternalTask, Status};
-use crate::cmd::CommandErrorContext;
-use crate::config;
-use crate::engine::attribution_footer;
-use crate::engine::auto_merge::{auto_merge_pr, handle_review_changes};
-use crate::engine::runner;
-use crate::engine::runner::worktree;
-use crate::engine::tasks::TaskManager;
-use crate::github::http::GhHttp;
-use crate::store::TaskStore;
-use crate::store::store_log_activity;
-use crate::store::{CompleteRun, RunTokenUsage, StartRun};
-use crate::store::{opt_store_get_task, store_increment};
-use crate::store::{store_set, store_set_result};
-use crate::tmux::TmuxManager;
-use anyhow::Context;
-use std::collections::HashSet;
-use std::sync::Arc;
-use tokio::process::Command;
-use tokio::sync::RwLock;
-
-use super::router::Router;
 
 /// Review agent decision result.
 #[derive(Debug, Clone)]
 pub(crate) enum ReviewDecision {
     /// Review approved, PR can be merged.
-    Approve {
-        issues: Vec<crate::engine::runner::response::ReviewIssue>,
-    },
+    Approve { issues: Vec<ReviewIssue> },
     /// Changes requested, PR needs fixes.
     RequestChanges {
         notes: String,
-        issues: Vec<crate::engine::runner::response::ReviewIssue>,
+        issues: Vec<ReviewIssue>,
     },
     /// Review agent failed or crashed (reason stored for logging).
     Failed(String),
@@ -175,7 +196,7 @@ struct ReviewContext {
     store_id: Option<i64>,
     had_prev_push_failure: bool,
     review_attempt: u32,
-    worktree_path: std::path::PathBuf,
+    worktree_path: PathBuf,
     branch_name: String,
     pr_number: u64,
     /// PR head SHA when the review started, the commit the decision applies to
@@ -184,8 +205,8 @@ struct ReviewContext {
     review_agent: String,
     review_model: Option<String>,
     review_task_id: String,
-    review_attempt_dir: std::path::PathBuf,
-    output_file: std::path::PathBuf,
+    review_attempt_dir: PathBuf,
+    output_file: PathBuf,
     invocation: runner::agent::AgentInvocation,
     same_agent_fallback: bool,
 }
@@ -227,8 +248,8 @@ fn review_timeout_secs(configured: Option<u64>) -> u64 {
 }
 
 /// Read `HEAD` of a worktree. `None` when the worktree is gone or not a repository
-pub(crate) async fn worktree_head_sha(dir: &std::path::Path) -> Option<String> {
-    let out = tokio::process::Command::new("git")
+pub(crate) async fn worktree_head_sha(dir: &Path) -> Option<String> {
+    let out = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(dir)
         .kill_on_drop(true)
@@ -303,7 +324,7 @@ async fn record_approved_sha(
     repo: &str,
     task_id: &str,
     pr_number: u64,
-    dir: &std::path::Path,
+    dir: &Path,
     branch: &str,
     base: &str,
 ) {
@@ -379,7 +400,7 @@ async fn pr_head_already_approved(
     if approved.is_none() {
         return false;
     }
-    let gh = match crate::github::http::GhHttp::new() {
+    let gh = match GhHttp::new() {
         Ok(gh) => gh,
         Err(e) => {
             tracing::warn!(task_id, err = %e, "cannot check PR head against recorded approval");
@@ -399,7 +420,7 @@ async fn pr_head_already_approved(
 /// The task, PR and approval a carried approval must all agree on
 struct CarryContext {
     approval: ApprovalEvent,
-    worktree: std::path::PathBuf,
+    worktree: PathBuf,
 }
 
 /**
@@ -412,7 +433,7 @@ async fn carry_context(
     store: &Arc<TaskStore>,
     repo: &str,
     task_id: &str,
-    pr: &crate::github::types::GitHubPullRequest,
+    pr: &GitHubPullRequest,
     pr_number: u64,
 ) -> Option<CarryContext> {
     let approval = read_approval(store, repo, task_id, pr_number)
@@ -428,9 +449,9 @@ async fn carry_context(
         );
         return None;
     }
-    let worktree = std::path::PathBuf::from(&task.worktree);
+    let worktree = PathBuf::from(&task.worktree);
     if runner::git_ops::get_current_branch(&worktree).await != approval.branch
-        || crate::engine::runner::worktree::detect_default_branch(&worktree).await != approval.base
+        || worktree::detect_default_branch(&worktree).await != approval.base
     {
         tracing::warn!(
             task_id,
@@ -445,7 +466,7 @@ async fn carry_context(
 /// The PR's head repository, head branch and base are the approved ones, and the head branch is
 /// the task's. A record without these fields (written before events) never matches
 fn pr_matches_approval(
-    pr: &crate::github::types::GitHubPullRequest,
+    pr: &GitHubPullRequest,
     approval: &ApprovalEvent,
     task_branch: &str,
 ) -> bool {
@@ -475,7 +496,7 @@ pub(crate) async fn carry_approval_across_base_update(
     gh: &GhHttp,
     repo: &str,
     task_id: &str,
-    pr: &crate::github::types::GitHubPullRequest,
+    pr: &GitHubPullRequest,
     pr_number: u64,
 ) {
     let head_sha = pr.head.sha.as_str();
@@ -555,7 +576,7 @@ pub(crate) async fn carry_approval_after_rebase(
     gh: &GhHttp,
     repo: &str,
     task_id: &str,
-    pr: &crate::github::types::GitHubPullRequest,
+    pr: &GitHubPullRequest,
     pr_number: u64,
 ) {
     let Some(ctx) = carry_context(store, repo, task_id, pr, pr_number).await else {
@@ -587,7 +608,7 @@ pub(crate) async fn carry_approval_after_rebase(
             pushed = true;
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        time::sleep(Duration::from_secs(2)).await;
     }
     if !pushed {
         tracing::warn!(
@@ -612,12 +633,7 @@ pub(crate) async fn carry_approval_after_rebase(
 
 /// The commits from the merge base of `old_head` and `base` up to `old_head`, replayed onto `base`
 /// as `new_head`: same count, same patch ids, same authors, same order, and `new_head` sits on `base`
-async fn same_commits_rebased(
-    dir: &std::path::Path,
-    old_head: &str,
-    base: &str,
-    new_head: &str,
-) -> bool {
+async fn same_commits_rebased(dir: &Path, old_head: &str, base: &str, new_head: &str) -> bool {
     let Some(fork_point) = git_output(dir, &["merge-base", old_head, base]).await else {
         return false;
     };
@@ -631,7 +647,7 @@ async fn same_commits_rebased(
 
 /// `(patch id, author)` for each commit in `range`, oldest first. `None` for a merge commit or
 /// any git failure
-async fn commit_fingerprints(dir: &std::path::Path, range: &str) -> Option<Vec<(String, String)>> {
+async fn commit_fingerprints(dir: &Path, range: &str) -> Option<Vec<(String, String)>> {
     let log = git_output(
         dir,
         &["log", "--reverse", "--format=%H %P%x00%an <%ae>", range],
@@ -651,14 +667,13 @@ async fn commit_fingerprints(dir: &std::path::Path, range: &str) -> Option<Vec<(
 }
 
 /// `git patch-id --stable` of one commit, identical for the same change on another base
-async fn patch_id(dir: &std::path::Path, sha: &str) -> Option<String> {
-    use tokio::io::AsyncWriteExt;
+async fn patch_id(dir: &Path, sha: &str) -> Option<String> {
     let diff = git_output(dir, &["show", "--format=", sha]).await?;
-    let mut child = tokio::process::Command::new("git")
+    let mut child = Command::new("git")
         .args(["patch-id", "--stable"])
         .current_dir(dir)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .ok()?;
@@ -709,8 +724,8 @@ async fn publish_carried_approval(
 }
 
 /// Trimmed stdout of a git command, `None` when it fails
-async fn git_output(dir: &std::path::Path, args: &[&str]) -> Option<String> {
-    let out = tokio::process::Command::new("git")
+async fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
         .args(args)
         .current_dir(dir)
         .kill_on_drop(true)
@@ -723,12 +738,7 @@ async fn git_output(dir: &std::path::Path, args: &[&str]) -> Option<String> {
 }
 
 /// True when `head` holds exactly the tree of a conflict-free merge of `approved` and `base_parent`
-async fn is_clean_merge(
-    dir: &std::path::Path,
-    approved: &str,
-    base_parent: &str,
-    head: &str,
-) -> bool {
+async fn is_clean_merge(dir: &Path, approved: &str, base_parent: &str, head: &str) -> bool {
     let merged = git_output(dir, &["merge-tree", "--write-tree", approved, base_parent]).await;
     let head_tree = git_output(dir, &["rev-parse", &format!("{head}^{{tree}}")]).await;
     match (merged, head_tree) {
@@ -753,7 +763,7 @@ fn approval_covers_head(approved: Option<&str>, pr_head: Option<&str>) -> bool {
     }
 }
 
-fn build_review_disallowed_tools(worktree_path: &std::path::Path) -> Vec<String> {
+fn build_review_disallowed_tools(worktree_path: &Path) -> Vec<String> {
     let mut tools = vec![
         "Bash(rm *)".to_string(),
         "Bash(rm -*)".to_string(),
@@ -768,7 +778,7 @@ fn build_review_disallowed_tools(worktree_path: &std::path::Path) -> Vec<String>
         format!("Write({orch_yml_str})"),
         format!("Edit({orch_yml_str})"),
     ]);
-    if let Ok(orch_home) = crate::home::orch_home() {
+    if let Ok(orch_home) = home::orch_home() {
         for path in [
             orch_home.join("config.yml"),
             orch_home.join("config.example.yml"),
@@ -810,10 +820,7 @@ async fn select_review_agent(
     let available_count = r.available_agents.len().max(1);
 
     loop {
-        let tmp_exclude_refs: Vec<&str> = exclude_set
-            .iter()
-            .map(std::string::String::as_str)
-            .collect();
+        let tmp_exclude_refs: Vec<&str> = exclude_set.iter().map(String::as_str).collect();
         let Some(agent) = r.next_round_robin_agent(&tmp_exclude_refs, "review") else {
             break;
         };
@@ -840,10 +847,7 @@ async fn select_review_agent(
         let same = !task_agent.is_empty() && agent == task_agent;
         Ok((agent, chosen_model, same))
     } else {
-        let final_exclude_refs: Vec<&str> = exclude_set
-            .iter()
-            .map(std::string::String::as_str)
-            .collect();
+        let final_exclude_refs: Vec<&str> = exclude_set.iter().map(String::as_str).collect();
         let fallback_agent = r
             .next_round_robin_agent(&final_exclude_refs, "review")
             .unwrap_or_else(|| "claude".to_string());
@@ -915,7 +919,7 @@ async fn build_review_context(
         t.worktree.trim().is_empty() && t.branch.trim().is_empty() && t.pr_number.is_none()
     });
     if no_code_review {
-        if crate::engine::tasks::is_internal_id(&task.id.0) {
+        if tasks::is_internal_id(&task.id.0) {
             // Internal tasks legitimately reach needs_review with nothing to review.
             tracing::info!(
                 task_id = task.id.0,
@@ -1027,7 +1031,7 @@ async fn build_review_context(
     }
 
     let mut worktree_path = match stored_task.as_ref().map(|t| t.worktree.as_str()) {
-        Some(w) if !w.is_empty() => std::path::PathBuf::from(w),
+        Some(w) if !w.is_empty() => PathBuf::from(w),
         _ => {
             tracing::warn!(task_id = task.id.0, "no worktree found for review");
             return Ok(ReviewPhase::EarlyReturn(ReviewDecision::Failed(
@@ -1109,7 +1113,7 @@ async fn build_review_context(
     // review pipeline indefinitely. Treat a timeout or non-zero exit as a
     // non-fatal warning (stale remote refs are acceptable for the review).
     {
-        let fetch_timeout = std::time::Duration::from_secs(60);
+        let fetch_timeout = Duration::from_secs(60);
         let fetch_future = async {
             let mut cmd = runner::git_ops::git().await;
             cmd.args(["fetch", "origin", "--prune"])
@@ -1119,7 +1123,7 @@ async fn build_review_context(
             cmd.output_with_context().await
         };
 
-        match tokio::time::timeout(fetch_timeout, fetch_future).await {
+        match time::timeout(fetch_timeout, fetch_future).await {
             Ok(Ok(o)) if o.status.success() => {
                 // ok
             }
@@ -1212,12 +1216,11 @@ async fn build_review_context(
 
     let review_task_id = format!("{}-review", task.id.0);
     let review_attempt_dir =
-        crate::home::task_attempt_dir_async(repo, &review_task_id, review_attempt).await?;
+        home::task_attempt_dir_async(repo, &review_task_id, review_attempt).await?;
     let output_file = review_attempt_dir.join("output.json");
 
-    let git_name =
-        crate::config::get("git.name").unwrap_or_else(|_| format!("{review_agent}[bot]"));
-    let git_email = crate::config::get("git.email")
+    let git_name = config::get("git.name").unwrap_or_else(|_| format!("{review_agent}[bot]"));
+    let git_email = config::get("git.email")
         .unwrap_or_else(|_| format!("{review_agent}[bot]@users.noreply.github.com"));
     let review_timeout_secs = review_timeout_seconds();
 
@@ -1384,9 +1387,9 @@ async fn invoke_review_agent(
         }
     }
 
-    let poll_interval = std::time::Duration::from_secs(5);
-    let timeout_duration = std::time::Duration::from_secs(ctx.invocation.timeout_seconds);
-    let wait_result = tokio::time::timeout(timeout_duration, async {
+    let poll_interval = Duration::from_secs(5);
+    let timeout_duration = Duration::from_secs(ctx.invocation.timeout_seconds);
+    let wait_result = time::timeout(timeout_duration, async {
         tokio::select! {
             result = tmux.wait_for_completion(&session, poll_interval) => result,
             // An agent can write its decision and still hold the session open
@@ -1412,10 +1415,10 @@ async fn invoke_review_agent(
             // code" agent like kimi/minimax. Read the output file and check for a valid
             // result with is_error=false — if found, treat as success and proceed to
             // parse_review_output where the real result will be extracted.
-            let exit_code: i32 = tokio::task::spawn_blocking({
+            let exit_code: i32 = task::spawn_blocking({
                 let review_attempt_dir = ctx.review_attempt_dir.clone();
                 move || {
-                    std::fs::read_to_string(review_attempt_dir.join("exit.txt"))
+                    fs::read_to_string(review_attempt_dir.join("exit.txt"))
                         .ok()
                         .and_then(|s| s.trim().parse().ok())
                         .unwrap_or(-1)
@@ -1508,7 +1511,7 @@ async fn store_review_timeout<T>(
 /// The decision is in when this attempt's final result parses as a review, whatever the session
 /// does. Only this attempt's file counts, an older attempt may have reviewed another commit
 async fn review_output_has_decision(ctx: &ReviewContext) -> bool {
-    let raw = tokio::fs::read_to_string(&ctx.output_file)
+    let raw = tokio_fs::read_to_string(&ctx.output_file)
         .await
         .unwrap_or_default();
     output_has_review_decision(&ctx.review_agent, &raw)
@@ -1521,9 +1524,9 @@ fn output_has_review_decision(agent: &str, raw: &str) -> bool {
         .is_some_and(|result| runner::response::parse_review_response(&result.result_text).is_ok())
 }
 
-async fn wait_for_review_decision(ctx: &ReviewContext, poll_interval: std::time::Duration) {
+async fn wait_for_review_decision(ctx: &ReviewContext, poll_interval: Duration) {
     loop {
-        tokio::time::sleep(poll_interval).await;
+        time::sleep(poll_interval).await;
         if review_output_has_decision(ctx).await {
             return;
         }
@@ -1544,22 +1547,16 @@ async fn record_review_agent_failure(
                 agent = %review_agent,
                 "review agent hit error — adding to cooldown"
             );
-            if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
-                if reason == crate::engine::cooldown::CreditExhaustionReason::BillingCycleExhausted
-                {
+            if let Some(reason) = cooldown::detect_credit_exhaustion(message) {
+                if reason == CreditExhaustionReason::BillingCycleExhausted {
                     if let Some(model) = review_model {
                         // Quota is model-scoped: don't penalize the whole agent.
-                        crate::engine::cooldown::record_persistent_model_failure(
-                            review_agent,
-                            model,
-                        )
-                        .await;
+                        cooldown::record_persistent_model_failure(review_agent, model).await;
                     } else {
-                        crate::engine::cooldown::record_credit_exhaustion(review_agent, reason)
-                            .await;
+                        cooldown::record_credit_exhaustion(review_agent, reason).await;
                     }
                 } else {
-                    crate::engine::cooldown::record_credit_exhaustion(review_agent, reason).await;
+                    cooldown::record_credit_exhaustion(review_agent, reason).await;
                 }
             } else {
                 runner::response::record_agent_failure_with_message(review_agent, &err.to_string())
@@ -1571,21 +1568,20 @@ async fn record_review_agent_failure(
         runner::agents::AgentError::InvalidResponse { .. } => {
             // No usable review output, a short backoff since the model itself still works
             if let Some(model) = review_model {
-                crate::engine::cooldown::record_transient_model_failure(review_agent, model).await;
+                cooldown::record_transient_model_failure(review_agent, model).await;
             }
         }
         runner::agents::AgentError::ModelUnavailable { message, .. } => {
             // The agent is not penalized, its other models still route normally
             if let Some(model) = review_model {
-                crate::engine::cooldown::record_model_unavailable(review_agent, model, message)
-                    .await;
+                cooldown::record_model_unavailable(review_agent, model, message).await;
             }
         }
         _ => {
             // Generic failure (AgentFailed, NetworkError, etc.)
             // Apply standard model backoff (5min→4h max) to prevent immediate re-selection.
             if let Some(model) = review_model {
-                crate::engine::cooldown::record_model_failure(review_agent, model).await;
+                cooldown::record_model_failure(review_agent, model).await;
             }
         }
     }
@@ -1663,15 +1659,15 @@ async fn parse_review_output(
     let (file_exists, file_size, exit_code, stderr) = {
         let output_file_clone = ctx.output_file.clone();
         let review_attempt_dir_clone = ctx.review_attempt_dir.clone();
-        match tokio::task::spawn_blocking(move || {
+        match task::spawn_blocking(move || {
             let file_exists = output_file_clone.exists();
-            let file_size = std::fs::metadata(&output_file_clone).map_or(0, |m| m.len());
-            let exit_code = std::fs::read_to_string(review_attempt_dir_clone.join("exit.txt"))
+            let file_size = fs::metadata(&output_file_clone).map_or(0, |m| m.len());
+            let exit_code = fs::read_to_string(review_attempt_dir_clone.join("exit.txt"))
                 .ok()
                 .and_then(|s| s.trim().parse::<i32>().ok())
                 .unwrap_or(-1);
-            let stderr = std::fs::read_to_string(review_attempt_dir_clone.join("stderr.txt"))
-                .unwrap_or_default();
+            let stderr =
+                fs::read_to_string(review_attempt_dir_clone.join("stderr.txt")).unwrap_or_default();
             (file_exists, file_size, exit_code, stderr)
         })
         .await
@@ -1955,11 +1951,7 @@ async fn parse_review_output(
                          (token budget exceeded before completion)"
                     );
                     if let Some(model) = ctx.review_model.as_deref() {
-                        crate::engine::cooldown::record_transient_model_failure(
-                            &ctx.review_agent,
-                            model,
-                        )
-                        .await;
+                        cooldown::record_transient_model_failure(&ctx.review_agent, model).await;
                     }
                     let stored_error = "truncated: review output was cut off before completion \
                         (output/reasoning token budget exceeded)"
@@ -2015,11 +2007,7 @@ async fn parse_review_output(
                     "failed to parse review response"
                 );
                 if let Some(model) = ctx.review_model.as_deref() {
-                    crate::engine::cooldown::record_transient_model_failure(
-                        &ctx.review_agent,
-                        model,
-                    )
-                    .await;
+                    cooldown::record_transient_model_failure(&ctx.review_agent, model).await;
                 }
                 complete_review_run(
                     store,
@@ -2064,7 +2052,7 @@ async fn parse_review_output(
         })),
     )
     .await;
-    if let Err(e) = crate::store::store_set_result(
+    if let Err(e) = store::store_set_result(
         &Some(Arc::clone(store)),
         repo,
         &task.id.0,
@@ -2108,8 +2096,7 @@ async fn finalize_review_run(
     if outcome == "success" {
         // Mirror the runner's success path so review-only models don't ratchet
         // into multi-day cooldowns from isolated failures never offset by resets.
-        crate::engine::cooldown::record_agent_success(&ctx.review_agent, ctx.review_model_str())
-            .await;
+        cooldown::record_agent_success(&ctx.review_agent, ctx.review_model_str()).await;
     }
 
     complete_review_run(
@@ -2153,7 +2140,7 @@ async fn finalize_review_run(
 
 async fn restore_review_config_if_needed(
     task_id: &str,
-    worktree_path: &std::path::Path,
+    worktree_path: &Path,
     default_branch: &str,
 ) {
     let _ = Command::new("git")
@@ -2355,11 +2342,7 @@ async fn push_review_branch(
     }
 }
 
-fn append_review_issues(
-    body: &mut String,
-    issues: &[crate::engine::runner::response::ReviewIssue],
-) {
-    use std::fmt::Write as _;
+fn append_review_issues(body: &mut String, issues: &[ReviewIssue]) {
     if issues.is_empty() {
         return;
     }
@@ -2501,17 +2484,17 @@ async fn post_review_comment(
 }
 
 /// The App to review `repo` with, `None` in comment mode or where the App is not installed
-async fn review_app(repo: &str) -> Option<Arc<crate::github::app::AppAuth>> {
-    let mode = crate::review_mode::for_repo(repo);
-    review_app_for(mode, crate::github::app::shared(), repo).await
+async fn review_app(repo: &str) -> Option<Arc<AppAuth>> {
+    let mode = review_mode::for_repo(repo);
+    review_app_for(mode, app::shared(), repo).await
 }
 
 async fn review_app_for(
-    mode: crate::review_mode::ReviewMode,
-    app: Option<Arc<crate::github::app::AppAuth>>,
+    mode: ReviewMode,
+    app: Option<Arc<AppAuth>>,
     repo: &str,
-) -> Option<Arc<crate::github::app::AppAuth>> {
-    if mode != crate::review_mode::ReviewMode::App {
+) -> Option<Arc<AppAuth>> {
+    if mode != ReviewMode::App {
         return None;
     }
 
@@ -2533,13 +2516,7 @@ async fn review_app_for(
 }
 
 /// `orch/review` as an App check run in app mode, as a commit status in comment mode
-async fn post_review_started(
-    app: Option<&crate::github::app::AppAuth>,
-    gh: &GhHttp,
-    repo: &str,
-    sha: Option<&str>,
-) {
-    use crate::github::app::CheckRunState;
+async fn post_review_started(app: Option<&AppAuth>, gh: &GhHttp, repo: &str, sha: Option<&str>) {
     match (app, sha) {
         (Some(app), Some(sha)) => {
             if let Err(e) = app
@@ -2554,14 +2531,13 @@ async fn post_review_started(
 }
 
 async fn post_review_decision(
-    app: Option<&crate::github::app::AppAuth>,
+    app: Option<&AppAuth>,
     gh: &GhHttp,
     repo: &str,
     sha: Option<&str>,
     decision: &ReviewDecision,
     notes: &str,
 ) {
-    use crate::github::app::CheckRunState;
     let Some((state, description)) = review_status(decision) else {
         return;
     };
@@ -2585,7 +2561,7 @@ async fn post_review_decision(
 /// as inline comments. The `## Automated Review` comment goes out only without an App or when
 /// GitHub refuses the review, so the decision always lands somewhere
 async fn publish_review(
-    app: Option<&crate::github::app::AppAuth>,
+    app: Option<&AppAuth>,
     gh: &GhHttp,
     repo: &str,
     pr_number: u64,
@@ -2593,7 +2569,6 @@ async fn publish_review(
     decision: &ReviewDecision,
     comment: &str,
 ) -> anyhow::Result<()> {
-    use crate::github::app::ReviewEvent;
     let event = match decision {
         ReviewDecision::Approve { .. } => Some(ReviewEvent::Approve),
         ReviewDecision::RequestChanges { .. } => Some(ReviewEvent::RequestChanges),
@@ -2617,11 +2592,11 @@ async fn publish_review(
 /// Issues on a changed line become inline comments, the rest stay in the review body, which
 /// already lists every issue. GitHub refuses a review whose comment points outside the diff
 async fn inline_comments(
-    app: &crate::github::app::AppAuth,
+    app: &AppAuth,
     repo: &str,
     pr_number: u64,
     decision: &ReviewDecision,
-) -> Vec<crate::github::app::InlineComment> {
+) -> Vec<InlineComment> {
     let ReviewDecision::RequestChanges { issues, .. } = decision else {
         return Vec::new();
     };
@@ -2631,7 +2606,7 @@ async fn inline_comments(
     }
 
     match app.pull_request_hunks(repo, pr_number).await {
-        Ok(hunks) => crate::github::app::split_inline(issues, &hunks).0,
+        Ok(hunks) => app::split_inline(issues, &hunks).0,
         Err(e) => {
             tracing::warn!(pr_number, error = %e, "could not read the PR diff, issues stay in the review body");
             Vec::new()
@@ -2651,7 +2626,7 @@ async fn apply_review_decision(
     store: &Arc<TaskStore>,
     ctx: &ReviewContext,
     parsed: &ParsedReview,
-    router_config: &crate::engine::router::RouterConfig,
+    router_config: &RouterConfig,
 ) -> anyhow::Result<ReviewDecision> {
     restore_review_config_if_needed(&task.id.0, &ctx.worktree_path, &ctx.default_branch).await;
 
@@ -2745,7 +2720,7 @@ async fn recover_missing_review_worktree(
     repo: &str,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<worktree::WorktreeSetup> {
-    let project_dir = crate::config::get_projects_with_paths()?
+    let project_dir = config::get_projects_with_paths()?
         .into_iter()
         .find(|(candidate_repo, _)| candidate_repo == repo)
         .map(|(_, project_dir)| project_dir)
@@ -2779,10 +2754,7 @@ async fn recover_missing_review_worktree(
 /// Returns `Err` when the git command cannot determine the count (e.g., missing
 /// remote ref, non-zero exit, unparseable output). Callers must NOT treat this
 /// as zero — a failure means the ancestry relationship is unknown.
-async fn count_ahead_commits(
-    worktree_path: &std::path::Path,
-    default_branch: &str,
-) -> Result<u64, String> {
+async fn count_ahead_commits(worktree_path: &Path, default_branch: &str) -> Result<u64, String> {
     let worktree_str = worktree_path.to_str().ok_or_else(|| {
         format!(
             "worktree path contains non-UTF-8 characters: {}",
@@ -2790,7 +2762,7 @@ async fn count_ahead_commits(
         )
     })?;
 
-    let output = tokio::process::Command::new("git")
+    let output = Command::new("git")
         .args([
             "-C",
             worktree_str,
@@ -2834,7 +2806,7 @@ async fn count_ahead_commits(
 async fn ensure_pr_exists(
     task: &ExternalTask,
     branch_name: &str,
-    worktree_path: &std::path::Path,
+    worktree_path: &Path,
     repo: &str,
     agent_summary: &str,
     store: &Arc<TaskStore>,
@@ -2901,10 +2873,10 @@ async fn ensure_pr_exists(
                 // visible in logs instead of being silently discarded.
                 // Wrap with a timeout to prevent indefinitely blocking a Tokio worker on a
                 // hung network connection (corporate proxy, partial GitHub outage, TCP hang).
-                let push_timeout = std::time::Duration::from_secs(120);
-                match tokio::time::timeout(
+                let push_timeout = Duration::from_secs(120);
+                match time::timeout(
                     push_timeout,
-                    crate::engine::runner::git_ops::git()
+                    git_ops::git()
                         .await
                         .args(["-C", worktree_str, "push", "-u", "origin", branch_name])
                         .output(),
@@ -2991,8 +2963,7 @@ async fn ensure_pr_exists(
                             let backoff_delays = [2u64, 4u64];
                             let mut found_pr: Option<u64> = None;
                             for delay_secs in backoff_delays {
-                                tokio::time::sleep(tokio::time::Duration::from_secs(delay_secs))
-                                    .await;
+                                time::sleep(time::Duration::from_secs(delay_secs)).await;
                                 if let Ok(Some(n)) = gh_check.get_pr_number(repo, branch_name).await
                                 {
                                     found_pr = Some(n);
@@ -3024,8 +2995,8 @@ async fn ensure_pr_exists(
                         );
                         // Fall back to CLI. Wrap the `gh pr create` call in a timeout so
                         // a hung CLI/network does not block the review pipeline.
-                        let pr_timeout = std::time::Duration::from_secs(120);
-                        let mut gh_cmd = tokio::process::Command::new("gh");
+                        let pr_timeout = Duration::from_secs(120);
+                        let mut gh_cmd = Command::new("gh");
                         gh_cmd.args([
                             "pr",
                             "create",
@@ -3041,7 +3012,7 @@ async fn ensure_pr_exists(
                         gh_cmd.current_dir(worktree_path);
                         gh_cmd.kill_on_drop(true);
 
-                        let pr_result = tokio::time::timeout(pr_timeout, gh_cmd.output()).await;
+                        let pr_result = time::timeout(pr_timeout, gh_cmd.output()).await;
                         match pr_result {
                             Ok(Ok(o)) if o.status.success() => {
                                 let stdout = String::from_utf8_lossy(&o.stdout);
@@ -3133,9 +3104,7 @@ async fn ensure_pr_exists(
                                 // engine retry later. Detect via git_ops::is_transient_github_api_error
                                 // so generic agent/model transport errors (e.g. broken pipe)
                                 // are NOT mis-classified as GitHub API transients.
-                                if crate::engine::runner::git_ops::is_transient_github_api_error(
-                                    &stderr,
-                                ) {
+                                if git_ops::is_transient_github_api_error(&stderr) {
                                     tracing::warn!(
                                         task_id = task.id.0,
                                         branch = %branch_name,
@@ -3179,9 +3148,7 @@ async fn ensure_pr_exists(
                                     "failed to run gh pr create"
                                 );
                                 let e_str = format!("{e}");
-                                if crate::engine::runner::git_ops::is_transient_github_api_error(
-                                    &e_str,
-                                ) {
+                                if git_ops::is_transient_github_api_error(&e_str) {
                                     tracing::warn!(
                                         task_id = task.id.0,
                                         branch = %branch_name,
@@ -3227,9 +3194,7 @@ async fn ensure_pr_exists(
                                     "gh pr create timed out after {}s",
                                     pr_timeout.as_secs()
                                 );
-                                if crate::engine::runner::git_ops::is_transient_github_api_error(
-                                    &e_str,
-                                ) {
+                                if git_ops::is_transient_github_api_error(&e_str) {
                                     tracing::warn!(
                                         task_id = task.id.0,
                                         branch = %branch_name,
@@ -3535,15 +3500,15 @@ async fn ensure_pr_exists(
     }
 }
 
-fn review_project_dir(repo: &str) -> Option<std::path::PathBuf> {
-    crate::config::get_projects_with_paths()
+fn review_project_dir(repo: &str) -> Option<PathBuf> {
+    config::get_projects_with_paths()
         .unwrap_or_default()
         .into_iter()
         .find(|(candidate, _)| candidate == repo)
         .map(|(_, dir)| dir)
 }
 
-fn sandboxed_in(project_dir: Option<&std::path::Path>) -> bool {
+fn sandboxed_in(project_dir: Option<&Path>) -> bool {
     match project_dir {
         Some(dir) => runner::sandbox::enabled(dir),
         None => runner::sandbox::enabled_globally(),
@@ -3558,7 +3523,7 @@ pub(crate) fn review_sandboxed(repo: &str) -> bool {
 /// The review agent's own time limit, as configured.
 pub(crate) fn review_timeout_seconds() -> u64 {
     review_timeout_secs(
-        crate::config::get("workflow.review_timeout_seconds")
+        config::get("workflow.review_timeout_seconds")
             .ok()
             .and_then(|s| s.parse().ok()),
     )
@@ -3623,7 +3588,27 @@ pub(crate) async fn review_and_merge(
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::process;
+
     use super::*;
+    use crate::backends::ExternalId;
+    use crate::backends::ExternalTask;
+    use crate::backends::test_helpers::NoopBackend;
+    use crate::engine::router::RouterConfig;
+    use crate::engine::runner::response::ReviewIssue;
+    use crate::github::token;
+    use crate::github::types::{GitHubReview, GitHubReviewComment, GitHubUser, PullRequestReview};
+    use crate::review_mode::ReviewMode;
+    use crate::store::{TaskStatus, TaskStore};
+    use tempfile::TempDir;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::body_partial_json;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+    use wiremock::matchers::query_param;
 
     #[test]
     fn a_review_decision_counts_only_from_a_successful_result() {
@@ -3646,12 +3631,6 @@ mod tests {
         assert_eq!(review_timeout_secs(Some(60)), 300);
         assert_eq!(review_timeout_secs(Some(3600)), 3600);
     }
-
-    use crate::backends::ExternalTask;
-    use crate::engine::router::RouterConfig;
-    use crate::github::types::{GitHubReview, GitHubReviewComment, GitHubUser, PullRequestReview};
-    use crate::store::{TaskStatus, TaskStore};
-    use tempfile::TempDir;
 
     // ── outcome_for_agent_error ─────────────────────────────────────────────
 
@@ -3895,7 +3874,7 @@ mod tests {
         );
 
         let err = runner::agents::AgentError::Timeout {
-            elapsed: std::time::Duration::from_secs(1801),
+            elapsed: Duration::from_secs(1801),
         };
         assert_eq!(
             format_review_error("kimi", &err),
@@ -3903,8 +3882,8 @@ mod tests {
         );
     }
 
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let mut cmd = std::process::Command::new("git");
+    fn git(dir: &Path, args: &[&str]) {
+        let mut cmd = process::Command::new("git");
         cmd.current_dir(dir);
         // Global commit.gpgsign calls the operator's signer (1Password)
         if args.first() == Some(&"commit") {
@@ -4156,7 +4135,7 @@ mod tests {
 
     fn no_code_review_task(id: &str) -> ExternalTask {
         ExternalTask {
-            id: crate::backends::ExternalId(id.to_string()),
+            id: ExternalId(id.to_string()),
             title: "opencode discovery timeout".to_string(),
             body: String::new(),
             state: "open".to_string(),
@@ -4179,10 +4158,7 @@ mod tests {
             .await
             .unwrap();
         let task_id = format!("internal:{id}");
-        store
-            .update_status(id, crate::store::TaskStatus::InReview)
-            .await
-            .unwrap();
+        store.update_status(id, TaskStatus::InReview).await.unwrap();
         assert_eq!(
             store.in_review_entry(id).await.unwrap().map(|e| e.1),
             Some(false)
@@ -4215,11 +4191,7 @@ mod tests {
         assert!(!approval_covers_head(Some(""), Some("")));
     }
 
-    fn pr_for(
-        head_repo: Option<&str>,
-        head: &str,
-        base: &str,
-    ) -> crate::github::types::GitHubPullRequest {
+    fn pr_for(head_repo: Option<&str>, head: &str, base: &str) -> GitHubPullRequest {
         serde_json::from_value(serde_json::json!({
             "number": 7,
             "title": "t",
@@ -4276,7 +4248,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = process::Command::new("git")
                 .args([
                     "-c",
                     "user.name=agent",
@@ -4301,7 +4273,7 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
         let write_commit = |file: &str, body: &str| {
-            std::fs::write(path.join(file), body).unwrap();
+            fs::write(path.join(file), body).unwrap();
             git(&["add", file]);
             git(&["commit", "-q", "-m", body]);
         };
@@ -4345,7 +4317,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = process::Command::new("git")
                 .args([
                     "-c",
                     "user.name=t",
@@ -4370,7 +4342,7 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
         let commit = |file: &str, msg: &str| {
-            std::fs::write(path.join(file), msg).unwrap();
+            fs::write(path.join(file), msg).unwrap();
             git(&["add", file]);
             git(&["commit", "-q", "-m", msg]);
             git(&["rev-parse", "HEAD"])
@@ -4386,7 +4358,7 @@ mod tests {
         let clean = git(&["rev-parse", "HEAD"]);
         assert!(is_clean_merge(path, &approved, &base_tip, &clean).await);
 
-        std::fs::write(path.join("d"), "unreviewed").unwrap();
+        fs::write(path.join("d"), "unreviewed").unwrap();
         git(&["add", "d"]);
         git(&["commit", "-q", "--amend", "--no-edit"]);
         let forged = git(&["rev-parse", "HEAD"]);
@@ -4395,7 +4367,7 @@ mod tests {
 
     #[test]
     fn a_review_agent_cannot_change_the_repository_remotes() {
-        let tools = build_review_disallowed_tools(std::path::Path::new("/tmp/wt"));
+        let tools = build_review_disallowed_tools(Path::new("/tmp/wt"));
         for guard in runner::git_ops::remote_change_tools() {
             assert!(tools.contains(&guard), "missing {guard}");
         }
@@ -4403,11 +4375,7 @@ mod tests {
 
     #[test]
     fn only_a_merge_of_the_approved_commit_carries_the_approval() {
-        let parents = |p: &[&str]| {
-            p.iter()
-                .map(std::string::ToString::to_string)
-                .collect::<Vec<_>>()
-        };
+        let parents = |p: &[&str]| p.iter().map(ToString::to_string).collect::<Vec<_>>();
         assert_eq!(
             base_merge_parent("approved", &parents(&["approved", "base"])),
             Some("base")
@@ -4435,7 +4403,7 @@ mod tests {
         git(wt, &["init", "-b", "main"]);
         git(wt, &["config", "user.name", "Test"]);
         git(wt, &["config", "user.email", "test@test.com"]);
-        std::fs::write(wt.join("fix.txt"), "the fix").unwrap();
+        fs::write(wt.join("fix.txt"), "the fix").unwrap();
         git(wt, &["add", "."]);
         git(wt, &["commit", "-m", "apply the fix"]);
 
@@ -4483,7 +4451,7 @@ mod tests {
         let ext = no_code_review_task("3617");
         store.ensure_external_task(repo, &ext).await.unwrap();
 
-        let backend = Arc::new(crate::backends::test_helpers::NoopBackend);
+        let backend = Arc::new(NoopBackend);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
             Arc::clone(&store),
@@ -4516,17 +4484,17 @@ mod tests {
         // workflow.max_attempts) so the default of 3 reroutes is deterministic.
         let temp_home = TempDir::new().unwrap();
         let orch_dir = temp_home.path().join(".orch");
-        std::fs::create_dir_all(&orch_dir).unwrap();
-        let old_orch_home = std::env::var_os("ORCH_HOME");
+        fs::create_dir_all(&orch_dir).unwrap();
+        let old_orch_home = env::var_os("ORCH_HOME");
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("ORCH_HOME", &orch_dir) };
+        unsafe { env::set_var("ORCH_HOME", &orch_dir) };
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let repo = "owner/repo";
         let ext = no_code_review_task("3618");
         store.ensure_external_task(repo, &ext).await.unwrap();
 
-        let backend = Arc::new(crate::backends::test_helpers::NoopBackend);
+        let backend = Arc::new(NoopBackend);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
             Arc::clone(&store),
@@ -4553,10 +4521,10 @@ mod tests {
 
         if let Some(old) = old_orch_home {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            unsafe { std::env::set_var("ORCH_HOME", old) };
+            unsafe { env::set_var("ORCH_HOME", old) };
         } else {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            unsafe { std::env::remove_var("ORCH_HOME") };
+            unsafe { env::remove_var("ORCH_HOME") };
         }
     }
 
@@ -4571,7 +4539,7 @@ mod tests {
         let ext_id = format!("internal:{internal_id}");
         let ext = no_code_review_task(&ext_id);
 
-        let backend = Arc::new(crate::backends::test_helpers::NoopBackend);
+        let backend = Arc::new(NoopBackend);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
             Arc::clone(&store),
@@ -4644,26 +4612,26 @@ mod tests {
     async fn recover_missing_review_worktree_recreates_worktree() {
         let temp_home = TempDir::new().unwrap();
         let orch_dir = temp_home.path().join(".orch");
-        std::fs::create_dir_all(&orch_dir).unwrap();
-        let old_orch_home = std::env::var_os("ORCH_HOME");
+        fs::create_dir_all(&orch_dir).unwrap();
+        let old_orch_home = env::var_os("ORCH_HOME");
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("ORCH_HOME", &orch_dir) };
+        unsafe { env::set_var("ORCH_HOME", &orch_dir) };
 
         let project_dir = temp_home.path().join("project");
-        std::fs::create_dir_all(&project_dir).unwrap();
+        fs::create_dir_all(&project_dir).unwrap();
         git(&project_dir, &["init", "-b", "main"]);
         git(&project_dir, &["config", "user.name", "Test User"]);
         git(&project_dir, &["config", "user.email", "test@example.com"]);
-        std::fs::write(project_dir.join("README.md"), "hello").unwrap();
+        fs::write(project_dir.join("README.md"), "hello").unwrap();
         git(&project_dir, &["add", "README.md"]);
         git(&project_dir, &["commit", "-m", "init"]);
 
-        std::fs::write(
+        fs::write(
             orch_dir.join("config.yml"),
             format!("projects:\n  - {}\n", project_dir.display()),
         )
         .unwrap();
-        std::fs::write(project_dir.join(".orch.yml"), "gh:\n  repo: owner/repo\n").unwrap();
+        fs::write(project_dir.join(".orch.yml"), "gh:\n  repo: owner/repo\n").unwrap();
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let repo = "owner/repo";
@@ -4672,7 +4640,7 @@ mod tests {
             .await
             .unwrap();
         let ext = ExternalTask {
-            id: crate::backends::ExternalId("1".to_string()),
+            id: ExternalId("1".to_string()),
             title: "Fix review recovery".to_string(),
             body: String::new(),
             state: "open".to_string(),
@@ -4693,10 +4661,10 @@ mod tests {
 
         if let Some(old) = old_orch_home {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            unsafe { std::env::set_var("ORCH_HOME", old) };
+            unsafe { env::set_var("ORCH_HOME", old) };
         } else {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            unsafe { std::env::remove_var("ORCH_HOME") };
+            unsafe { env::remove_var("ORCH_HOME") };
         }
     }
 
@@ -4709,8 +4677,8 @@ mod tests {
 
         // Create a bare repo to act as the 'origin' remote
         let bare = temp.path().join("bare.git");
-        std::fs::create_dir_all(&bare).unwrap();
-        std::process::Command::new("git")
+        fs::create_dir_all(&bare).unwrap();
+        process::Command::new("git")
             .args(["init", "--bare"])
             .current_dir(&bare)
             .output()
@@ -4719,15 +4687,15 @@ mod tests {
         git(dir, &["init", "-b", "main"]);
         git(dir, &["config", "user.name", "Test"]);
         git(dir, &["config", "user.email", "test@test.com"]);
-        std::fs::write(dir.join("f"), "a").unwrap();
+        fs::write(dir.join("f"), "a").unwrap();
         git(dir, &["add", "f"]);
         git(dir, &["commit", "-m", "init"]);
-        std::process::Command::new("git")
+        process::Command::new("git")
             .args(["remote", "add", "origin", bare.to_str().unwrap()])
             .current_dir(dir)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        process::Command::new("git")
             .args(["push", "origin", "main"])
             .current_dir(dir)
             .output()
@@ -4753,7 +4721,7 @@ mod tests {
         git(dir, &["init", "-b", "main"]);
         git(dir, &["config", "user.name", "Test"]);
         git(dir, &["config", "user.email", "test@test.com"]);
-        std::fs::write(dir.join("f"), "a").unwrap();
+        fs::write(dir.join("f"), "a").unwrap();
         git(dir, &["add", "f"]);
         git(dir, &["commit", "-m", "init"]);
         // No remote 'origin' configured — rev-list will fail
@@ -4788,13 +4756,13 @@ mod tests {
     #[serial_test::serial(cooldown_state)]
     #[tokio::test]
     async fn review_invalid_response_applies_short_model_cooldown() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let agent = "opencode-3314-review-invalid";
         let model = "opencode/north-mini-code-free";
         let key = format!("{agent}:{model}");
 
         assert!(
-            !crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            !cooldown::is_model_in_cooldown(agent, model),
             "model should not be in cooldown before record_review_agent_failure"
         );
 
@@ -4804,10 +4772,10 @@ mod tests {
         record_review_agent_failure("test-3314-a", agent, Some(model), &err).await;
 
         let now = chrono::Utc::now().timestamp();
-        let until = crate::engine::cooldown::cooldown_until(&key)
+        let until = cooldown::cooldown_until(&key)
             .expect("review InvalidResponse should set model cooldown");
         let remaining = until.saturating_sub(now);
-        let base = crate::engine::cooldown::TRANSIENT_MODEL_BACKOFF_BASE_SECS;
+        let base = cooldown::TRANSIENT_MODEL_BACKOFF_BASE_SECS;
         assert!(
             (base - 30..=base).contains(&remaining),
             "first unusable review output must cool the model for 5 minutes, got {remaining}s"
@@ -4818,7 +4786,7 @@ mod tests {
     #[serial_test::serial(cooldown_state)]
     #[tokio::test]
     async fn review_model_unavailable_transient_applies_short_cooldown() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let agent = "test-review-unavailable-transient";
         let model = "test-model";
         let key = format!("{agent}:{model}");
@@ -4830,10 +4798,10 @@ mod tests {
         record_review_agent_failure("test-unavailable-a", agent, Some(model), &err).await;
 
         let now = chrono::Utc::now().timestamp();
-        let until = crate::engine::cooldown::cooldown_until(&key)
+        let until = cooldown::cooldown_until(&key)
             .expect("review ModelUnavailable should set model cooldown");
         let remaining = until.saturating_sub(now);
-        let base = crate::engine::cooldown::BACKOFF_BASE_SECS;
+        let base = cooldown::BACKOFF_BASE_SECS;
         assert!(
             (base - 30..=base).contains(&remaining),
             "a non-permanent ModelUnavailable must get the 5 minute base, got {remaining}s"
@@ -4844,7 +4812,7 @@ mod tests {
     #[serial_test::serial(cooldown_state)]
     #[tokio::test]
     async fn review_model_not_found_applies_persistent_cooldown() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let agent = "test-review-unavailable-gone";
         let model = "test-model";
         let key = format!("{agent}:{model}");
@@ -4856,10 +4824,10 @@ mod tests {
         record_review_agent_failure("test-unavailable-b", agent, Some(model), &err).await;
 
         let now = chrono::Utc::now().timestamp();
-        let until = crate::engine::cooldown::cooldown_until(&key)
+        let until = cooldown::cooldown_until(&key)
             .expect("review model not found should set model cooldown");
         let remaining = until.saturating_sub(now);
-        let base = crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS;
+        let base = cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS;
         assert!(
             (base - 30..=base).contains(&remaining),
             "model not found must get the 4 hour persistent base, got {remaining}s"
@@ -4870,14 +4838,14 @@ mod tests {
     #[serial_test::serial(cooldown_state)]
     #[tokio::test]
     async fn review_output_cooldown_caps_at_fifteen_minutes() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        crate::engine::cooldown::init_cooldown_store(store).await;
+        cooldown::init_cooldown_store(store).await;
         let agent = "opencode-review-output-cap";
         let model = "opencode/north-mini-code-free";
         let key = format!("{agent}:{model}");
-        let base = crate::engine::cooldown::TRANSIENT_MODEL_BACKOFF_BASE_SECS;
-        let max = crate::engine::cooldown::TRANSIENT_MODEL_BACKOFF_MAX_SECS;
+        let base = cooldown::TRANSIENT_MODEL_BACKOFF_BASE_SECS;
+        let max = cooldown::TRANSIENT_MODEL_BACKOFF_MAX_SECS;
 
         for (i, expected) in [base, max, max].into_iter().enumerate() {
             let err = runner::agents::AgentError::InvalidResponse {
@@ -4885,7 +4853,7 @@ mod tests {
             };
             record_review_agent_failure("test-review-output-cap", agent, Some(model), &err).await;
             let now = chrono::Utc::now().timestamp();
-            let remaining = crate::engine::cooldown::cooldown_until(&key)
+            let remaining = cooldown::cooldown_until(&key)
                 .expect("unusable review output should set model cooldown")
                 .saturating_sub(now);
             assert!(
@@ -4904,7 +4872,7 @@ mod tests {
     #[serial_test::serial(cooldown_state)]
     #[tokio::test]
     async fn review_inline_scan_billing_cycle_message_gets_model_scoped_cooldown() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let agent = "kimi-3551-review-inline";
         let model = "opus";
         let key = format!("{agent}:{model}");
@@ -4930,7 +4898,7 @@ mod tests {
         record_review_agent_failure("test-3551", agent, Some(model), &err).await;
 
         let now = chrono::Utc::now().timestamp();
-        let until = crate::engine::cooldown::cooldown_until(&key)
+        let until = cooldown::cooldown_until(&key)
             .expect("billing-cycle exhaustion must set a model-scoped cooldown");
         let remaining = until.saturating_sub(now);
         // Known model + BillingCycleExhausted routes to record_persistent_model_failure
@@ -4938,7 +4906,7 @@ mod tests {
         // the quota is scoped to this model, so unrelated models on the same agent must
         // stay routable.
         assert!(
-            remaining >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
+            remaining >= cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
             "billing-cycle exhaustion for a known model must apply the ~4h persistent \
              model cooldown, got {remaining}s — may have used the generic short agent \
              cooldown instead"
@@ -4949,7 +4917,7 @@ mod tests {
 
     fn test_review_task(id: &str) -> ExternalTask {
         ExternalTask {
-            id: crate::backends::ExternalId(id.to_string()),
+            id: ExternalId(id.to_string()),
             title: "Test review task".to_string(),
             body: String::new(),
             state: "open".to_string(),
@@ -4961,7 +4929,7 @@ mod tests {
         }
     }
 
-    fn test_review_context(agent: &str, model: &str, work_dir: &std::path::Path) -> ReviewContext {
+    fn test_review_context(agent: &str, model: &str, work_dir: &Path) -> ReviewContext {
         ReviewContext {
             store_id: None,
             had_prev_push_failure: false,
@@ -5011,10 +4979,10 @@ mod tests {
         }
     }
 
-    fn write_review_output(dir: &std::path::Path, stdout: &str, exit_code: i32) {
-        std::fs::write(dir.join("output.txt"), stdout).unwrap();
-        std::fs::write(dir.join("exit.txt"), exit_code.to_string()).unwrap();
-        std::fs::write(dir.join("stderr.txt"), "").unwrap();
+    fn write_review_output(dir: &Path, stdout: &str, exit_code: i32) {
+        fs::write(dir.join("output.txt"), stdout).unwrap();
+        fs::write(dir.join("exit.txt"), exit_code.to_string()).unwrap();
+        fs::write(dir.join("stderr.txt"), "").unwrap();
     }
 
     /// A kimi review that exits mid-thought (no result envelope, last content is a
@@ -5023,7 +4991,7 @@ mod tests {
     #[serial_test::serial(cooldown_state)]
     #[tokio::test]
     async fn parse_review_output_mid_thought_is_incomplete_without_persistent_cooldown() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let work_dir = TempDir::new().unwrap();
         let agent = "kimi";
@@ -5061,7 +5029,7 @@ mod tests {
             ReviewPhase::Ready(_) => panic!("expected Failed(incomplete), got Ready"),
         }
         assert!(
-            !crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            !cooldown::is_model_in_cooldown(agent, model),
             "mid-thought incomplete must not apply persistent model cooldown"
         );
     }
@@ -5071,7 +5039,7 @@ mod tests {
     #[serial_test::serial(cooldown_state)]
     #[tokio::test]
     async fn parse_review_output_exit_124_is_timeout_without_cooldown() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let work_dir = TempDir::new().unwrap();
         let agent = "claude";
@@ -5097,7 +5065,7 @@ mod tests {
             ReviewPhase::EarlyReturn(_) => panic!("expected Failed(timeout)"),
             ReviewPhase::Ready(_) => panic!("expected Failed(timeout), got Ready"),
         }
-        assert!(!crate::engine::cooldown::is_model_in_cooldown(agent, model));
+        assert!(!cooldown::is_model_in_cooldown(agent, model));
     }
 
     /// A tool_use as the last assistant content with no result envelope is the
@@ -5105,7 +5073,7 @@ mod tests {
     #[serial_test::serial(cooldown_state)]
     #[tokio::test]
     async fn parse_review_output_tool_use_without_envelope_is_incomplete() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let work_dir = TempDir::new().unwrap();
         let agent = "kimi";
@@ -5134,7 +5102,7 @@ mod tests {
             ReviewPhase::EarlyReturn(_) => panic!("expected Failed(incomplete)"),
             ReviewPhase::Ready(_) => panic!("expected Failed(incomplete), got Ready"),
         }
-        assert!(!crate::engine::cooldown::is_model_in_cooldown(agent, model));
+        assert!(!cooldown::is_model_in_cooldown(agent, model));
     }
 
     /// A finished result envelope whose text is not a review decision still
@@ -5142,7 +5110,7 @@ mod tests {
     #[serial_test::serial(cooldown_state)]
     #[tokio::test]
     async fn parse_review_output_unparseable_envelope_applies_short_cooldown() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let work_dir = TempDir::new().unwrap();
         let agent = "kimi";
@@ -5176,11 +5144,11 @@ mod tests {
             ReviewPhase::Ready(_) => panic!("expected Failed(parse error), got Ready"),
         }
         let now = chrono::Utc::now().timestamp();
-        let remaining = crate::engine::cooldown::cooldown_until(&format!("{agent}:{model}"))
+        let remaining = cooldown::cooldown_until(&format!("{agent}:{model}"))
             .expect("finished format failure must apply a model cooldown")
             .saturating_sub(now);
         assert!(
-            remaining <= crate::engine::cooldown::TRANSIENT_MODEL_BACKOFF_BASE_SECS,
+            remaining <= cooldown::TRANSIENT_MODEL_BACKOFF_BASE_SECS,
             "finished format failure must apply the 5 minute cooldown, got {remaining}s"
         );
     }
@@ -5190,7 +5158,7 @@ mod tests {
     #[serial_test::serial(cooldown_state)]
     #[tokio::test]
     async fn parse_review_output_missing_envelope_uses_assistant_decision() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let work_dir = TempDir::new().unwrap();
         let agent = "kimi";
@@ -5217,7 +5185,7 @@ mod tests {
                 panic!("expected Ready(Approve) from assistant text, got EarlyReturn")
             }
         }
-        assert!(!crate::engine::cooldown::is_model_in_cooldown(agent, model));
+        assert!(!cooldown::is_model_in_cooldown(agent, model));
     }
 
     /// MiniMax/Kimi parse_response synthesizes status=done from any assistant
@@ -5225,7 +5193,7 @@ mod tests {
     #[serial_test::serial(cooldown_state)]
     #[tokio::test]
     async fn parse_review_output_does_not_treat_task_done_synthesis_as_approval() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let work_dir = TempDir::new().unwrap();
         let agent = "kimi";
@@ -5266,9 +5234,9 @@ mod tests {
     #[serial_test::serial(cooldown_state)]
     #[tokio::test]
     async fn finalize_review_run_success_resets_generic_model_failure_count() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        crate::engine::cooldown::init_cooldown_store(std::sync::Arc::clone(&store)).await;
+        cooldown::init_cooldown_store(Arc::clone(&store)).await;
 
         let agent = "test-3478-agent";
         let model = "test-3478-model";
@@ -5281,7 +5249,7 @@ mod tests {
             message: "agent reported a generic failure".to_string(),
         };
         record_review_agent_failure("task-3478-a", agent, Some(model), &err).await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             store.kv_get(&failure_key).await.unwrap().as_deref(),
             Some("1"),
@@ -5294,7 +5262,7 @@ mod tests {
         let task = test_review_task("1");
 
         finalize_review_run(&task, &ctx, &parsed, &store).await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        time::sleep(Duration::from_millis(50)).await;
 
         assert_eq!(
             store.kv_get(&failure_key).await.unwrap().as_deref(),
@@ -5311,9 +5279,9 @@ mod tests {
     #[serial_test::serial(cooldown_state)]
     #[tokio::test]
     async fn finalize_review_run_interleaved_success_keeps_generic_cooldown_at_base() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        crate::engine::cooldown::init_cooldown_store(std::sync::Arc::clone(&store)).await;
+        cooldown::init_cooldown_store(Arc::clone(&store)).await;
 
         let agent = "test-3478-interleave-agent";
         let model = "test-3478-interleave-model";
@@ -5330,17 +5298,17 @@ mod tests {
             record_review_agent_failure("task-3478-b", agent, Some(model), &err).await;
 
             let now = chrono::Utc::now().timestamp();
-            let until = crate::engine::cooldown::cooldown_until(&cooldown_key)
-                .expect("failure should set cooldown");
+            let until =
+                cooldown::cooldown_until(&cooldown_key).expect("failure should set cooldown");
             let remaining = until.saturating_sub(now);
 
             assert!(
-                remaining <= crate::engine::cooldown::BACKOFF_BASE_SECS + 60,
+                remaining <= cooldown::BACKOFF_BASE_SECS + 60,
                 "failure #{} must stay at base backoff since the prior success reset the \
                  counter (issue #3478); got {remaining}s, base is {}s — an escalating value \
                  here means review successes are not resetting failure_count",
                 i + 1,
-                crate::engine::cooldown::BACKOFF_BASE_SECS
+                cooldown::BACKOFF_BASE_SECS
             );
 
             // A successful review interleaves between each failure, mirroring the
@@ -5348,7 +5316,7 @@ mod tests {
             // in between isolated failures for this model).
             let parsed = test_parsed_review(ReviewDecision::Approve { issues: vec![] });
             finalize_review_run(&task, &ctx, &parsed, &store).await;
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -5360,9 +5328,9 @@ mod tests {
     #[serial_test::serial(cooldown_state)]
     #[tokio::test]
     async fn finalize_review_run_success_does_not_reset_persistent_model_failure_count() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        crate::engine::cooldown::init_cooldown_store(std::sync::Arc::clone(&store)).await;
+        cooldown::init_cooldown_store(Arc::clone(&store)).await;
 
         let agent = "test-3571-agent";
         let model = "test-3571-model";
@@ -5378,13 +5346,13 @@ mod tests {
             model: model.to_string(),
         };
         record_review_agent_failure("task-3571-a", agent, Some(model), &err).await;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        time::sleep(Duration::from_millis(20)).await;
 
         // A successful review for the same model interleaves, exactly like the
         // real-world pattern from issue #3571.
         let parsed = test_parsed_review(ReviewDecision::Approve { issues: vec![] });
         finalize_review_run(&task, &ctx, &parsed, &store).await;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        time::sleep(Duration::from_millis(20)).await;
 
         // Second persistent failure must escalate from count 2 (~12h), not
         // reset back to the 4h base, despite the intervening success.
@@ -5393,32 +5361,30 @@ mod tests {
             model: model.to_string(),
         };
         record_review_agent_failure("task-3571-b", agent, Some(model), &err2).await;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        time::sleep(Duration::from_millis(20)).await;
 
         let now = chrono::Utc::now().timestamp();
-        let until = crate::engine::cooldown::cooldown_until(&cooldown_key)
-            .expect("second failure should set cooldown");
+        let until =
+            cooldown::cooldown_until(&cooldown_key).expect("second failure should set cooldown");
         let remaining = until.saturating_sub(now);
 
         assert!(
-            remaining > crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS,
+            remaining > cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS,
             "second persistent model failure should escalate past the 4h base despite an \
              intervening success (issue #3571); got {remaining}s, base is {}s",
-            crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS
+            cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS
         );
     }
 
-    fn app_for_test(server: &wiremock::MockServer) -> Arc<crate::github::app::AppAuth> {
-        Arc::new(crate::github::app::AppAuth::new(
+    fn app_for_test(server: &wiremock::MockServer) -> Arc<AppAuth> {
+        Arc::new(AppAuth::new(
             "12345".to_string(),
-            crate::github::app::test_pem().to_string(),
+            app::test_pem().to_string(),
             server.uri(),
         ))
     }
 
     async fn mount_installed(server: &wiremock::MockServer, repo: &str) {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, ResponseTemplate};
         Mock::given(method("GET"))
             .and(path(format!("/repos/{repo}/installation")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 42})))
@@ -5436,9 +5402,6 @@ mod tests {
 
     #[tokio::test]
     async fn app_mode_falls_back_to_comments_where_the_app_is_not_installed() {
-        use crate::review_mode::ReviewMode;
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/repos/org/b/installation"))
@@ -5468,8 +5431,6 @@ mod tests {
 
     #[tokio::test]
     async fn the_check_run_starts_and_completes_on_the_reviewed_sha() {
-        use wiremock::matchers::{body_partial_json, method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
         mount_installed(&server, "o/r").await;
         Mock::given(method("POST"))
@@ -5510,9 +5471,6 @@ mod tests {
 
     #[tokio::test]
     async fn issues_on_diff_lines_go_inline_and_the_rest_stay_in_the_body() {
-        use crate::engine::runner::response::ReviewIssue;
-        use wiremock::matchers::{method, path, query_param};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
         mount_installed(&server, "o/r").await;
         Mock::given(method("GET"))
@@ -5574,12 +5532,10 @@ mod tests {
     )]
     #[tokio::test]
     async fn without_an_app_the_review_path_posts_only_the_comment() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-        let _env = crate::github::token::ENV_LOCK.lock().unwrap();
-        let prev = std::env::var_os("GH_TOKEN");
+        let _env = token::ENV_LOCK.lock().unwrap();
+        let prev = env::var_os("GH_TOKEN");
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("GH_TOKEN", "owner-token") };
+        unsafe { env::set_var("GH_TOKEN", "owner-token") };
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/repos/o/r/issues/9/comments"))
@@ -5600,9 +5556,9 @@ mod tests {
         .await;
         match prev {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            Some(value) => unsafe { std::env::set_var("GH_TOKEN", value) },
+            Some(value) => unsafe { env::set_var("GH_TOKEN", value) },
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            None => unsafe { std::env::remove_var("GH_TOKEN") },
+            None => unsafe { env::remove_var("GH_TOKEN") },
         }
         result.expect("comment posted");
         let requests = server.received_requests().await.expect("requests");
@@ -5615,8 +5571,6 @@ mod tests {
 
     #[tokio::test]
     async fn with_an_app_the_review_is_submitted_on_the_reviewed_sha() {
-        use wiremock::matchers::{body_partial_json, method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/app/installations/42/access_tokens"))
@@ -5647,9 +5601,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 42})))
             .mount(&server)
             .await;
-        let app = Arc::new(crate::github::app::AppAuth::new(
+        let app = Arc::new(AppAuth::new(
             "12345".to_string(),
-            crate::github::app::test_pem().to_string(),
+            app::test_pem().to_string(),
             server.uri(),
         ));
         let gh = GhHttp::for_test(server.uri(), Some(Arc::clone(&app)));

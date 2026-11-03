@@ -1,8 +1,13 @@
 use crate::cmd::SyncCommandErrorContext;
 #[cfg(any(test, not(target_os = "macos")))]
 use anyhow::Context;
+#[cfg(not(target_os = "macos"))]
+use std::env;
+#[cfg(any(test, not(target_os = "macos")))]
+use std::fs;
 #[cfg(any(test, not(target_os = "macos")))]
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Run a service subcommand for orch: `brew services` on macOS, the `orch` systemd user unit elsewhere.
 fn service(action: &str) -> anyhow::Result<()> {
@@ -14,9 +19,7 @@ fn service(action: &str) -> anyhow::Result<()> {
         ("systemctl", vec!["--user", action, "orch"])
     };
 
-    let status = std::process::Command::new(program)
-        .args(&args)
-        .status_with_context()?;
+    let status = Command::new(program).args(&args).status_with_context()?;
 
     if !status.success() {
         anyhow::bail!("{program} {} failed", args.join(" "));
@@ -116,7 +119,7 @@ fn linux_install(
     let unit_path = unit_dir.join("orch.service");
     let unit = unit_contents(binary);
     if unit_path.exists() && !force {
-        let existing = std::fs::read_to_string(&unit_path)
+        let existing = fs::read_to_string(&unit_path)
             .with_context(|| format!("reading {}", unit_path.display()))?;
         if existing != unit {
             print_unit_diff(&existing, &unit);
@@ -126,10 +129,8 @@ fn linux_install(
             unit_path.display()
         );
     }
-    std::fs::create_dir_all(unit_dir)
-        .with_context(|| format!("creating {}", unit_dir.display()))?;
-    std::fs::write(&unit_path, &unit)
-        .with_context(|| format!("writing {}", unit_path.display()))?;
+    fs::create_dir_all(unit_dir).with_context(|| format!("creating {}", unit_dir.display()))?;
+    fs::write(&unit_path, &unit).with_context(|| format!("writing {}", unit_path.display()))?;
     println!("Wrote {}", unit_path.display());
     run_systemctl(systemctl, &["daemon-reload"])?;
     run_systemctl(systemctl, &["enable", "--now", "orch"])?;
@@ -148,8 +149,7 @@ fn linux_uninstall(unit_dir: &Path, systemctl: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     run_systemctl(systemctl, &["disable", "--now", "orch"])?;
-    std::fs::remove_file(&unit_path)
-        .with_context(|| format!("removing {}", unit_path.display()))?;
+    fs::remove_file(&unit_path).with_context(|| format!("removing {}", unit_path.display()))?;
     println!("Removed {}", unit_path.display());
     run_systemctl(systemctl, &["daemon-reload"])?;
     Ok(())
@@ -206,7 +206,7 @@ fn print_unit_diff(existing: &str, proposed: &str) {
 
 #[cfg(any(test, not(target_os = "macos")))]
 fn run_systemctl(systemctl: &Path, args: &[&str]) -> anyhow::Result<()> {
-    let status = std::process::Command::new(systemctl)
+    let status = Command::new(systemctl)
         .arg("--user")
         .args(args)
         .status_with_context()?;
@@ -218,7 +218,7 @@ fn run_systemctl(systemctl: &Path, args: &[&str]) -> anyhow::Result<()> {
 
 #[cfg(not(target_os = "macos"))]
 fn systemd_user_dir() -> anyhow::Result<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+    if let Ok(xdg) = env::var("XDG_CONFIG_HOME")
         && !xdg.is_empty()
     {
         return Ok(PathBuf::from(xdg).join("systemd").join("user"));
@@ -229,7 +229,7 @@ fn systemd_user_dir() -> anyhow::Result<PathBuf> {
 
 #[cfg(not(target_os = "macos"))]
 fn current_binary() -> anyhow::Result<PathBuf> {
-    let exe = std::env::current_exe().context("cannot resolve the orch binary path")?;
+    let exe = env::current_exe().context("cannot resolve the orch binary path")?;
     Ok(exe.canonicalize().unwrap_or(exe))
 }
 

@@ -1,6 +1,13 @@
 //! The localhost endpoint the CLI sends replicated writes to, so they go through the daemon's log
 
+use std::env;
+use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 use std::path::PathBuf;
+use std::process;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -10,8 +17,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use subtle::ConstantTimeEq;
+use tokio::fs as tokio_fs;
+use tokio::net::TcpListener;
+use tokio::task;
 
 use super::{Command, Reply};
+use crate::cluster::discovery;
+use crate::home;
 use crate::store::TaskStore;
 
 static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -30,11 +42,9 @@ pub struct Endpoint {
 
 fn port_path() -> anyhow::Result<PathBuf> {
     if cfg!(test) {
-        Ok(std::env::temp_dir()
-            .join("orch-test-state")
-            .join("cluster.port"))
+        Ok(env::temp_dir().join("orch-test-state").join("cluster.port"))
     } else {
-        Ok(crate::home::state_dir()?.join("cluster.port"))
+        Ok(home::state_dir()?.join("cluster.port"))
     }
 }
 
@@ -47,17 +57,14 @@ struct App {
 
 /// Serve `POST /write` on 127.0.0.1 and record the port, a fresh token and the pid for the CLI
 pub async fn serve(store: TaskStore) -> anyhow::Result<Endpoint> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let token = format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
     );
-    write_private(
-        &port_path()?,
-        &format!("{port} {token} {}", std::process::id()),
-    )?;
+    write_private(&port_path()?, &format!("{port} {token} {}", process::id()))?;
     let app = Router::new()
         .route("/write", post(write))
         .route("/progress", post(progress))
@@ -80,22 +87,20 @@ pub async fn serve(store: TaskStore) -> anyhow::Result<Endpoint> {
 }
 
 /// Owner-only file, written to a temp name and renamed so a reader never sees half of it
-fn write_private(path: &std::path::Path, body: &str) -> anyhow::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+fn write_private(path: &Path, body: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)?;
     }
 
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    let mut file = std::fs::OpenOptions::new()
+    let tmp = path.with_extension(format!("tmp.{}", process::id()));
+    let mut file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .open(&tmp)?;
     file.write_all(body.as_bytes())?;
-    std::fs::rename(&tmp, path)?;
+    fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -139,7 +144,7 @@ async fn progress(
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    let node = crate::cluster::discovery::status()
+    let node = discovery::status()
         .await
         .map_or_else(|_| "local".to_string(), |t| t.me.name);
     match super::progress::handle(&app.store, &node, report).await {
@@ -188,18 +193,18 @@ pub async fn send_progress(
 
 pub async fn cleanup() {
     if let Ok(path) = port_path() {
-        let _ = tokio::fs::remove_file(path).await;
+        let _ = tokio_fs::remove_file(path).await;
     }
 }
 
 /// The running daemon's endpoint. A file left by a daemon that is gone names nothing
 pub async fn daemon_endpoint() -> Option<Endpoint> {
-    let body = tokio::fs::read_to_string(port_path().ok()?).await.ok()?;
+    let body = tokio_fs::read_to_string(port_path().ok()?).await.ok()?;
     let mut parts = body.split_whitespace();
     let port: u16 = parts.next()?.parse().ok()?;
     let token = parts.next()?.to_string();
     let pid: u32 = parts.next()?.parse().ok()?;
-    let alive = tokio::task::spawn_blocking(move || crate::home::pid_is_orch_serve(pid))
+    let alive = task::spawn_blocking(move || home::pid_is_orch_serve(pid))
         .await
         .ok()?;
     alive.then(|| Endpoint {

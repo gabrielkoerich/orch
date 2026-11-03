@@ -9,19 +9,40 @@
 //! - `gh auth token` CLI fallback (default — just run `gh auth login`)
 
 use super::token;
+use super::types::GitHubUser;
 use super::types::{
     GitHubAnnotation, GitHubCheckRun, GitHubComment, GitHubIssue, GitHubPullRequest, GitHubReview,
     GitHubReviewComment, RequiredStatusCheck,
 };
+use crate::backends::BlockedByFetch;
+use crate::backends::BlockedByIssue;
+use crate::config;
 use crate::engine::cooldown as engine_cooldown;
+use crate::engine::cooldown;
+use crate::github::types;
+use crate::security;
 use anyhow::Context;
 use reqwest::{Client, Response, StatusCode, header};
 use serde::Serialize;
+use serde::de::DeserializeOwned;
+use std::any;
+use std::cmp::Reverse;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::fmt::Write as _;
+use std::sync::LazyLock;
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
+use std::time as std_time;
+use std::time::SystemTime;
 use std::time::{Duration, Instant};
+use tokio::runtime::Handle;
+use tokio::time;
 use urlencoding;
 
 #[cfg(not(test))]
@@ -64,17 +85,17 @@ fn repo_from_url(url: &str) -> Option<String> {
 }
 
 pub(crate) fn redact_posted_body(body: &str) -> String {
-    if !crate::security::has_leaks(body) {
+    if !security::has_leaks(body) {
         return body.to_string();
     }
-    let leaks = crate::security::scan(body);
+    let leaks = security::scan(body);
     let rules: Vec<&str> = leaks.iter().map(|leak| leak.rule).collect();
     let warning = format!(
         "\n\n> ⚠️ **Security Notice**: {} potential secret(s) detected and redacted: {}",
         leaks.len(),
         rules.join(", ")
     );
-    format!("{}{warning}", crate::security::redact(body))
+    format!("{}{warning}", security::redact(body))
 }
 
 fn merge_pr_body(head_sha: &str) -> serde_json::Value {
@@ -114,15 +135,15 @@ struct RateLimit {
 
 impl RateLimit {
     fn new() -> Self {
-        let base = crate::config::get("gh.backoff.base_seconds")
+        let base = config::get("gh.backoff.base_seconds")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(30);
-        let max = crate::config::get("gh.backoff.max_seconds")
+        let max = config::get("gh.backoff.max_seconds")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(900);
-        let threshold = crate::config::get("gh.rate_limit.throttle_threshold")
+        let threshold = config::get("gh.rate_limit.throttle_threshold")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(200);
@@ -163,7 +184,7 @@ impl RateLimit {
 
         // Prefer reset_at when available — avoids over-waiting with exponential backoff
         if let Some(reset_epoch) = self.reset_at {
-            match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            match SystemTime::now().duration_since(std_time::UNIX_EPOCH) {
                 Ok(since_epoch) => {
                     let now_epoch = since_epoch.as_secs();
                     if reset_epoch > now_epoch {
@@ -225,8 +246,8 @@ impl RateLimit {
             && remaining < self.throttle_threshold
             && let Some(reset_epoch) = self.reset_at
         {
-            let now_epoch = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            let now_epoch = SystemTime::now()
+                .duration_since(std_time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
             if now_epoch < reset_epoch {
@@ -245,12 +266,11 @@ impl RateLimit {
 
 // ── Global state ─────────────────────────────────────────────────────
 
-static REST_RATE_LIMIT: std::sync::LazyLock<Mutex<RateLimit>> =
-    std::sync::LazyLock::new(|| Mutex::new(RateLimit::new()));
+static REST_RATE_LIMIT: LazyLock<Mutex<RateLimit>> = LazyLock::new(|| Mutex::new(RateLimit::new()));
 
 /// Separate rate-limit tracker for the GraphQL endpoint (distinct quota from REST).
-static GRAPHQL_RATE_LIMIT: std::sync::LazyLock<Mutex<RateLimit>> =
-    std::sync::LazyLock::new(|| Mutex::new(RateLimit::new()));
+static GRAPHQL_RATE_LIMIT: LazyLock<Mutex<RateLimit>> =
+    LazyLock::new(|| Mutex::new(RateLimit::new()));
 
 // ── Rate-limit metrics ────────────────────────────────────────────────
 
@@ -283,8 +303,8 @@ fn check_rate_limit_backoff(cell: &Mutex<RateLimit>, api: &str) -> anyhow::Resul
 }
 
 /// API calls since the last drain, keyed by (project, call type), for the per-tick debug report.
-static CALL_COUNTS: std::sync::LazyLock<Mutex<std::collections::HashMap<(String, String), u64>>> =
-    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+static CALL_COUNTS: LazyLock<Mutex<HashMap<(String, String), u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Project is `owner/repo` from a `/repos/` URL and call type is the path segment after it
 /// (`pulls`, `issues`, `check-runs`), so non-repo endpoints land under `-`.
@@ -314,7 +334,7 @@ pub fn drain_call_counts() -> Vec<(String, String, u64)> {
         .lock()
         .map(|mut c| c.drain().map(|((p, k), n)| (p, k, n)).collect())
         .unwrap_or_default();
-    rows.sort_by_key(|r| std::cmp::Reverse(r.2));
+    rows.sort_by_key(|r| Reverse(r.2));
     rows
 }
 
@@ -335,8 +355,8 @@ struct CachedPage {
  * does not count against the core quota, so the listing endpoints orch polls every tick
  * cost one request per hour of quiet instead of one per tick
  **/
-static PAGE_CACHE: std::sync::LazyLock<Mutex<std::collections::HashMap<String, CachedPage>>> =
-    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+static PAGE_CACHE: LazyLock<Mutex<HashMap<String, CachedPage>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Distinct cacheable list URLs are few (per repo, per query), so the cap only guards a
 /// leak. Each entry holds a full page body, so keep it small.
@@ -346,7 +366,7 @@ const PAGE_CACHE_MAX: usize = 64;
 /// stored. A `since` filter is computed from the clock on every call, so its key never
 /// recurs and caching it would only grow the map with page-sized bodies.
 fn page_cache_key<T>(url: &str, query: Option<&[(&str, &str)]>) -> Option<String> {
-    let mut key = String::from(std::any::type_name::<T>());
+    let mut key = String::from(any::type_name::<T>());
     key.push(' ');
     key.push_str(url);
     if let Some(q) = query {
@@ -417,9 +437,9 @@ fn record_response_for_limiter(cell: &Mutex<RateLimit>, resp: &Response) {
     let status = resp.status();
     if status.is_server_error() {
         METRIC_5XX_HITS.fetch_add(1, Ordering::Relaxed);
-        if tokio::runtime::Handle::try_current().is_ok() {
+        if Handle::try_current().is_ok() {
             tokio::spawn(async move {
-                crate::engine::cooldown::record_github_5xx().await;
+                cooldown::record_github_5xx().await;
             });
         }
     }
@@ -444,8 +464,8 @@ pub struct GhHttp {
     api_base: Option<String>,
 }
 
-impl std::fmt::Debug for GhHttp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for GhHttp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("GhHttp")
             .field("owner_only", &self.owner_only)
             .finish_non_exhaustive()
@@ -609,19 +629,19 @@ impl GhHttp {
         }
 
         // Configurable retry params (defaults chosen conservatively)
-        let attempts = crate::config::get("gh.5xx.retry_attempts")
+        let attempts = config::get("gh.5xx.retry_attempts")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(3);
-        let base_secs = crate::config::get("gh.5xx.base_backoff_seconds")
+        let base_secs = config::get("gh.5xx.base_backoff_seconds")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(1);
-        let max_secs = crate::config::get("gh.5xx.max_backoff_seconds")
+        let max_secs = config::get("gh.5xx.max_backoff_seconds")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(30);
-        let circuit_cooldown_secs = crate::config::get("gh.5xx.circuit_breaker_cooldown_seconds")
+        let circuit_cooldown_secs = config::get("gh.5xx.circuit_breaker_cooldown_seconds")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(300);
@@ -718,7 +738,7 @@ impl GhHttp {
                             let jitter_ms = u64::from(attempt) * 100;
                             let sleep_dur = Duration::from_secs(backoff)
                                 + Duration::from_millis(jitter_ms.min(1000));
-                            tokio::time::sleep(sleep_dur).await;
+                            time::sleep(sleep_dur).await;
                             continue;
                         }
                         // Exhausted attempts — set circuit-breaker and break so last_err is read
@@ -752,7 +772,7 @@ impl GhHttp {
                         let backoff = base_secs.saturating_mul(exp);
                         let sleep_dur = Duration::from_secs(backoff)
                             + Duration::from_millis((u64::from(attempt) * 100).min(1000));
-                        tokio::time::sleep(sleep_dur).await;
+                        time::sleep(sleep_dur).await;
                         continue;
                     }
                     // Exhausted attempts — break so last_err is read. Deliberately does not
@@ -771,7 +791,7 @@ impl GhHttp {
     }
 
     /// GET request, returns deserialized JSON.
-    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> anyhow::Result<T> {
+    async fn get_json<T: DeserializeOwned>(&self, url: &str) -> anyhow::Result<T> {
         Self::check_backoff(url)?;
         let auth = self.auth_header(url).await?;
         // Use send_with_retries to handle transient 5xx/network failures
@@ -818,7 +838,7 @@ impl GhHttp {
     }
 
     /// GET with query params, returns deserialized JSON.
-    async fn get_with_query<T: serde::de::DeserializeOwned>(
+    async fn get_with_query<T: DeserializeOwned>(
         &self,
         url: &str,
         query: &[(&str, &str)],
@@ -872,7 +892,7 @@ impl GhHttp {
     }
 
     /// POST with JSON body, returns deserialized JSON.
-    async fn post_json<T: serde::de::DeserializeOwned>(
+    async fn post_json<T: DeserializeOwned>(
         &self,
         url: &str,
         body: &serde_json::Value,
@@ -932,7 +952,7 @@ impl GhHttp {
     ///
     /// Each page is sent with `If-None-Match` when a prior ETag is known; GitHub's 304
     /// reply is free of quota and the stored body is replayed.
-    async fn get_all_pages<T: serde::de::DeserializeOwned>(
+    async fn get_all_pages<T: DeserializeOwned>(
         &self,
         url: &str,
         query: &[(&str, &str)],
@@ -982,12 +1002,12 @@ impl GhHttp {
                     .headers()
                     .get(header::ETAG)
                     .and_then(|v| v.to_str().ok())
-                    .map(std::string::ToString::to_string);
+                    .map(ToString::to_string);
                 let content_type = resp
                     .headers()
                     .get(header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
-                    .map_or_else(|| "<missing>".to_string(), std::string::ToString::to_string);
+                    .map_or_else(|| "<missing>".to_string(), ToString::to_string);
 
                 if status == StatusCode::NOT_MODIFIED {
                     if let Some((body, next)) = cache_key.as_deref().and_then(page_cache_hit) {
@@ -1031,7 +1051,7 @@ impl GhHttp {
                                 err = %decode_error,
                                 "json decode failed; retrying paginated GET"
                             );
-                            tokio::time::sleep(Duration::from_millis(
+                            time::sleep(Duration::from_millis(
                                 JSON_DECODE_RETRY_BACKOFF_MS * u64::from(decode_attempt),
                             ))
                             .await;
@@ -1063,7 +1083,7 @@ impl GhHttp {
     /// array.  Using `get_all_pages` on those endpoints would fail at the
     /// `serde_json::from_str::<Vec<T>>` step because the body is an object, not an
     /// array.
-    async fn get_all_pages_from_wrapper<T: serde::de::DeserializeOwned>(
+    async fn get_all_pages_from_wrapper<T: DeserializeOwned>(
         &self,
         url: &str,
         array_field: &str,
@@ -1317,9 +1337,7 @@ impl GhHttp {
         &self,
         repo: &str,
         issue_number: u64,
-    ) -> anyhow::Result<crate::backends::BlockedByFetch> {
-        use crate::backends::{BlockedByFetch, BlockedByIssue};
-
+    ) -> anyhow::Result<BlockedByFetch> {
         let mut next = Some(format!(
             "{GITHUB_API}/repos/{repo}/issues/{issue_number}/dependencies/blocked_by?per_page=100"
         ));
@@ -1828,11 +1846,9 @@ impl GhHttp {
         &self,
         repo: &str,
         branches: &[String],
-    ) -> anyhow::Result<std::collections::HashMap<String, bool>> {
-        use std::fmt::Write as _;
-
+    ) -> anyhow::Result<HashMap<String, bool>> {
         if branches.is_empty() {
-            return Ok(std::collections::HashMap::new());
+            return Ok(HashMap::new());
         }
 
         let (owner, name) = repo
@@ -1883,7 +1899,7 @@ impl GhHttp {
     fn parse_batch_pr_merged_response(
         resp: &serde_json::Value,
         branches: &[String],
-    ) -> anyhow::Result<std::collections::HashMap<String, bool>> {
+    ) -> anyhow::Result<HashMap<String, bool>> {
         let repo_data = resp.pointer("/data/repository").ok_or_else(|| {
             // Check for errors array to provide a more helpful error message
             let error_msg = resp
@@ -1896,7 +1912,7 @@ impl GhHttp {
             anyhow::anyhow!("missing /data/repository in GraphQL response: {error_msg}")
         })?;
 
-        let mut result = std::collections::HashMap::new();
+        let mut result = HashMap::new();
         for (i, branch) in branches.iter().enumerate() {
             let alias = format!("b{i}");
             let merged = repo_data
@@ -2001,8 +2017,6 @@ impl GhHttp {
         head: &str,
         base: &str,
     ) -> anyhow::Result<String> {
-        use reqwest::header;
-
         #[derive(Serialize)]
         struct CreatePullRequest<'a> {
             title: &'a str,
@@ -2076,19 +2090,19 @@ impl GhHttp {
         &self,
         repo: &str,
         pr_numbers: &[u64],
-    ) -> anyhow::Result<std::collections::HashMap<u64, (bool, String)>> {
+    ) -> anyhow::Result<HashMap<u64, (bool, String)>> {
         // GitHub GraphQL complexity limit: chunk at 50 to avoid slow/rejected queries.
         const CHUNK_SIZE: usize = 50;
 
         if pr_numbers.is_empty() {
-            return Ok(std::collections::HashMap::new());
+            return Ok(HashMap::new());
         }
 
         let (owner, name) = repo
             .split_once('/')
             .ok_or_else(|| anyhow::anyhow!("invalid repo format: {repo}"))?;
 
-        let mut result = std::collections::HashMap::new();
+        let mut result = HashMap::new();
 
         for chunk in pr_numbers.chunks(CHUNK_SIZE) {
             let aliases: String = chunk
@@ -2136,12 +2150,12 @@ impl GhHttp {
         repo: &str,
         issue_numbers: &[u64],
         caller_context: &str,
-    ) -> anyhow::Result<std::collections::HashMap<String, (String, Vec<String>)>> {
+    ) -> anyhow::Result<HashMap<String, (String, Vec<String>)>> {
         // GitHub GraphQL complexity limit: chunk at 50 to avoid slow/rejected queries.
         const CHUNK_SIZE: usize = 50;
 
         if issue_numbers.is_empty() {
-            return Ok(std::collections::HashMap::new());
+            return Ok(HashMap::new());
         }
 
         let (valid_issue_numbers, invalid_issue_numbers) =
@@ -2156,14 +2170,14 @@ impl GhHttp {
             );
         }
         if valid_issue_numbers.is_empty() {
-            return Ok(std::collections::HashMap::new());
+            return Ok(HashMap::new());
         }
 
         let (owner, name) = repo
             .split_once('/')
             .ok_or_else(|| anyhow::anyhow!("invalid repo format: {repo}"))?;
 
-        let mut result = std::collections::HashMap::new();
+        let mut result = HashMap::new();
 
         for chunk in valid_issue_numbers.chunks(CHUNK_SIZE) {
             let aliases: String = chunk
@@ -2378,7 +2392,7 @@ impl GhHttp {
         value
             .pointer("/commit/committer/date")
             .and_then(|v| v.as_str())
-            .map(std::string::ToString::to_string)
+            .map(ToString::to_string)
             .ok_or_else(|| anyhow::anyhow!("commit {sha} has no committer date"))
     }
 
@@ -2940,7 +2954,7 @@ impl GhHttp {
             cursor = page_info
                 .and_then(|p| p.get("endCursor"))
                 .and_then(|c| c.as_str())
-                .map(std::string::ToString::to_string);
+                .map(ToString::to_string);
         }
 
         Ok(all_numbers)
@@ -3060,9 +3074,9 @@ impl GhHttp {
         &self,
         repo: &str,
         pr_numbers: &[u64],
-    ) -> anyhow::Result<std::collections::HashMap<u64, PrReviewBatchData>> {
+    ) -> anyhow::Result<HashMap<u64, PrReviewBatchData>> {
         if pr_numbers.is_empty() {
-            return Ok(std::collections::HashMap::new());
+            return Ok(HashMap::new());
         }
 
         let (owner, name) = repo
@@ -3087,7 +3101,7 @@ impl GhHttp {
             .pointer("/data/repository")
             .ok_or_else(|| anyhow::anyhow!("missing /data/repository in GraphQL response"))?;
 
-        let mut result = std::collections::HashMap::new();
+        let mut result = HashMap::new();
         for &n in pr_numbers {
             let Some(pr_data) = repo_data.get(format!("pr{n}")) else {
                 continue;
@@ -3150,7 +3164,7 @@ impl GhHttp {
                     fetched_threads = pr_data
                         .pointer("/reviewThreads/nodes")
                         .and_then(|v| v.as_array())
-                        .map_or(0, std::vec::Vec::len),
+                        .map_or(0, Vec::len),
                     "batch review fetch truncated reviewThreads connection at first page"
                 );
             }
@@ -3275,7 +3289,7 @@ impl GhHttp {
 
         // Find the most recent automated review comment authored by a collaborator or the App
         let app_login = super::app::bot_login().await;
-        let mut newest: Option<&crate::github::types::GitHubComment> = None;
+        let mut newest: Option<&types::GitHubComment> = None;
         for c in &comments {
             if !c.body.starts_with("## Automated Review") {
                 continue;
@@ -3453,7 +3467,7 @@ fn merge_required_status_checks(
     extra: Vec<RequiredStatusCheck>,
 ) -> Vec<RequiredStatusCheck> {
     checks.extend(extra);
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     checks.retain(|c| seen.insert((c.context.clone(), c.integration_id)));
     checks
 }
@@ -3672,7 +3686,6 @@ fn connection_end_cursor(page_info: Option<&serde_json::Value>) -> Option<String
 }
 
 fn parse_graphql_review(node: &serde_json::Value) -> Option<GitHubReview> {
-    use super::types::GitHubUser;
     Some(GitHubReview {
         id: node.get("databaseId").and_then(serde_json::Value::as_u64)?,
         user: GitHubUser {
@@ -3697,7 +3710,6 @@ fn parse_graphql_review(node: &serde_json::Value) -> Option<GitHubReview> {
 }
 
 fn parse_graphql_review_comment(node: &serde_json::Value) -> Option<GitHubReviewComment> {
-    use super::types::GitHubUser;
     Some(GitHubReviewComment {
         id: node.get("databaseId").and_then(serde_json::Value::as_u64)?,
         user: GitHubUser {
@@ -3756,7 +3768,6 @@ fn parse_graphql_review_comment(node: &serde_json::Value) -> Option<GitHubReview
 }
 
 fn parse_graphql_issue_comment(node: &serde_json::Value) -> Option<GitHubComment> {
-    use super::types::GitHubUser;
     Some(GitHubComment {
         id: node.get("databaseId").and_then(serde_json::Value::as_u64)?,
         body: node.get("body").and_then(|v| v.as_str())?.to_string(),
@@ -3783,7 +3794,13 @@ fn parse_graphql_issue_comment(node: &serde_json::Value) -> Option<GitHubComment
 
 #[cfg(test)]
 mod tests {
+    // Secret redaction on posted bodies (wiremock)
+    mod leak_redaction;
+
+    use std::env;
+
     use super::*;
+    use crate::github::token::TokenResolver;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -4005,7 +4022,7 @@ mod tests {
     fn test_client() -> GhHttp {
         GhHttp {
             client: reqwest::Client::new(),
-            token_resolver: Arc::new(crate::github::token::TokenResolver::default_env()),
+            token_resolver: Arc::new(TokenResolver::default_env()),
             app: None,
             owner_only: false,
             cached_username: OnceLock::new(),
@@ -4279,8 +4296,8 @@ mod tests {
         let mut rl = make_rl(30, 900);
         rl.remaining = Some(0);
         rl.reset_at = Some(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            SystemTime::now()
+                .duration_since(std_time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs()
                 + 3600,
@@ -4312,8 +4329,8 @@ mod tests {
         let mut rl = make_rl(30, 900);
         // Simulate: 0 remaining (below default threshold of 10), reset 60s in the future
         rl.remaining = Some(0);
-        let future_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let future_epoch = SystemTime::now()
+            .duration_since(std_time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
             + 60;
@@ -4329,8 +4346,8 @@ mod tests {
         let mut rl = make_rl(30, 900);
         // remaining=15 is above default threshold of 10 — no proactive wait
         rl.remaining = Some(15);
-        let future_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let future_epoch = SystemTime::now()
+            .duration_since(std_time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
             + 60;
@@ -4389,8 +4406,8 @@ mod tests {
     fn rate_limit_uses_reset_at_for_backoff() {
         let mut rl = make_rl(30, 900);
         // Set reset_at to 45s in the future
-        let future_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let future_epoch = SystemTime::now()
+            .duration_since(std_time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
             + 45;
@@ -4403,9 +4420,9 @@ mod tests {
 
     #[tokio::test]
     async fn send_with_retries_propagates_make_req_error() {
-        let guard = std::env::var_os("GH_TOKEN");
+        let guard = env::var_os("GH_TOKEN");
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("GH_TOKEN", "test_token") };
+        unsafe { env::set_var("GH_TOKEN", "test_token") };
         let gh = test_client();
         let result = gh
             .send_with_retries(
@@ -4418,9 +4435,9 @@ mod tests {
         assert_eq!(err, "simulated request clone failure");
         match guard {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            Some(v) => unsafe { std::env::set_var("GH_TOKEN", v) },
+            Some(v) => unsafe { env::set_var("GH_TOKEN", v) },
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            None => unsafe { std::env::remove_var("GH_TOKEN") },
+            None => unsafe { env::remove_var("GH_TOKEN") },
         }
     }
 
@@ -4431,15 +4448,15 @@ mod tests {
     /// local connectivity blip says nothing about.
     #[tokio::test]
     async fn send_with_retries_transport_error_does_not_trip_5xx_breaker() {
-        let guard = std::env::var_os("GH_TOKEN");
+        let guard = env::var_os("GH_TOKEN");
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("GH_TOKEN", "test_token") };
+        unsafe { env::set_var("GH_TOKEN", "test_token") };
 
         // Bind then immediately drop a listener to get a port nothing is
         // listening on, so connecting reliably fails with "connection refused"
         // rather than depending on an external unreachable host.
         let addr = {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             listener.local_addr().unwrap()
         };
         let url = format!("http://{addr}/");
@@ -4450,24 +4467,24 @@ mod tests {
 
         assert!(result.is_err());
         assert!(
-            !crate::engine::cooldown::is_agent_in_cooldown("github:5xx"),
+            !cooldown::is_agent_in_cooldown("github:5xx"),
             "transport error must not trip the github:5xx circuit breaker"
         );
-        assert!(crate::engine::cooldown::cooldown_until("github:5xx").is_none());
+        assert!(cooldown::cooldown_until("github:5xx").is_none());
 
         match guard {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            Some(v) => unsafe { std::env::set_var("GH_TOKEN", v) },
+            Some(v) => unsafe { env::set_var("GH_TOKEN", v) },
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            None => unsafe { std::env::remove_var("GH_TOKEN") },
+            None => unsafe { env::remove_var("GH_TOKEN") },
         }
     }
 
     #[tokio::test]
     async fn post_json_raw_propagates_body_read_errors_on_success() {
-        let guard = std::env::var_os("GH_TOKEN");
+        let guard = env::var_os("GH_TOKEN");
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("GH_TOKEN", "test_token") };
+        unsafe { env::set_var("GH_TOKEN", "test_token") };
         let server_url = spawn_truncated_body_server("{").await;
         let gh = test_client();
 
@@ -4492,17 +4509,17 @@ mod tests {
 
         match guard {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            Some(v) => unsafe { std::env::set_var("GH_TOKEN", v) },
+            Some(v) => unsafe { env::set_var("GH_TOKEN", v) },
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            None => unsafe { std::env::remove_var("GH_TOKEN") },
+            None => unsafe { env::remove_var("GH_TOKEN") },
         }
     }
 
     #[tokio::test]
     async fn patch_json_raw_propagates_body_read_errors_on_success() {
-        let guard = std::env::var_os("GH_TOKEN");
+        let guard = env::var_os("GH_TOKEN");
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("GH_TOKEN", "test_token") };
+        unsafe { env::set_var("GH_TOKEN", "test_token") };
         let server_url = spawn_truncated_body_server("{").await;
         let gh = test_client();
 
@@ -4527,17 +4544,17 @@ mod tests {
 
         match guard {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            Some(v) => unsafe { std::env::set_var("GH_TOKEN", v) },
+            Some(v) => unsafe { env::set_var("GH_TOKEN", v) },
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            None => unsafe { std::env::remove_var("GH_TOKEN") },
+            None => unsafe { env::remove_var("GH_TOKEN") },
         }
     }
 
     #[tokio::test]
     async fn graphql_request_propagates_body_read_errors_on_success() {
-        let guard = std::env::var_os("GH_TOKEN");
+        let guard = env::var_os("GH_TOKEN");
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("GH_TOKEN", "test_token") };
+        unsafe { env::set_var("GH_TOKEN", "test_token") };
         let server_url = spawn_truncated_body_server("{").await;
         let gh = test_client();
         let query = "query { viewer { login } }";
@@ -4565,9 +4582,9 @@ mod tests {
 
         match guard {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            Some(v) => unsafe { std::env::set_var("GH_TOKEN", v) },
+            Some(v) => unsafe { env::set_var("GH_TOKEN", v) },
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            None => unsafe { std::env::remove_var("GH_TOKEN") },
+            None => unsafe { env::remove_var("GH_TOKEN") },
         }
     }
 
@@ -4576,8 +4593,12 @@ mod tests {
     #[cfg(test)]
     mod pagination {
         use super::super::*;
+        use crate::github::token::TokenResolver;
+        use std::env;
         use std::ffi::OsString;
         use std::sync::Arc;
+        use std::time;
+        use std::time::SystemTime;
         use wiremock::matchers::{method, path};
         use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate, matchers};
 
@@ -4598,9 +4619,9 @@ mod tests {
 
         impl EnvVarGuard {
             fn set(key: &'static str, value: &str) -> Self {
-                let previous = std::env::var_os(key);
+                let previous = env::var_os(key);
                 // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-                unsafe { std::env::set_var(key, value) };
+                unsafe { env::set_var(key, value) };
                 Self { key, previous }
             }
         }
@@ -4609,9 +4630,9 @@ mod tests {
             fn drop(&mut self) {
                 match self.previous.take() {
                     // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-                    Some(value) => unsafe { std::env::set_var(self.key, value) },
+                    Some(value) => unsafe { env::set_var(self.key, value) },
                     // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-                    None => unsafe { std::env::remove_var(self.key) },
+                    None => unsafe { env::remove_var(self.key) },
                 }
             }
         }
@@ -4623,7 +4644,7 @@ mod tests {
             let guard = EnvVarGuard::set("GH_TOKEN", "test_token");
             let client = GhHttp {
                 client: reqwest::Client::new(),
-                token_resolver: Arc::new(crate::github::token::TokenResolver::default_env()),
+                token_resolver: Arc::new(TokenResolver::default_env()),
                 app: None,
                 owner_only: false,
                 cached_username: OnceLock::new(),
@@ -4842,8 +4863,8 @@ mod tests {
             let _reset = GlobalStateGuard;
             let server = MockServer::start().await;
 
-            let reset_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            let reset_at = SystemTime::now()
+                .duration_since(time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs()
                 + 600;
@@ -5022,6 +5043,8 @@ mod tests {
     #[cfg(test)]
     mod auth_retry {
         use super::test_client;
+        use crate::github::token;
+        use std::env;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use wiremock::matchers::method;
@@ -5040,21 +5063,21 @@ mod tests {
         )]
         #[tokio::test]
         async fn retries_once_with_fresh_token_after_401() {
-            let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
-            let prev = std::env::var_os("GH_TOKEN");
+            let _env_guard = token::ENV_LOCK.lock().unwrap();
+            let prev = env::var_os("GH_TOKEN");
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            unsafe { std::env::set_var("GH_TOKEN", "bad_token") };
+            unsafe { env::set_var("GH_TOKEN", "bad_token") };
 
             let server = MockServer::start().await;
             let hits = Arc::new(AtomicUsize::new(0));
-            let hits_in_handler = std::sync::Arc::clone(&hits);
+            let hits_in_handler = Arc::clone(&hits);
             Mock::given(method("GET"))
                 .respond_with(move |_req: &Request| {
                     if hits_in_handler.fetch_add(1, Ordering::SeqCst) == 0 {
                         // The 401 handler clears the cache and re-resolves; simulate the
                         // operator having fixed the env var in the meantime
                         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-                        unsafe { std::env::set_var("GH_TOKEN", "good_token") };
+                        unsafe { env::set_var("GH_TOKEN", "good_token") };
                         bad_credentials()
                     } else {
                         ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ok": true }))
@@ -5069,9 +5092,9 @@ mod tests {
 
             match prev {
                 // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-                Some(v) => unsafe { std::env::set_var("GH_TOKEN", v) },
+                Some(v) => unsafe { env::set_var("GH_TOKEN", v) },
                 // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-                None => unsafe { std::env::remove_var("GH_TOKEN") },
+                None => unsafe { env::remove_var("GH_TOKEN") },
             }
 
             assert!(
@@ -5088,14 +5111,14 @@ mod tests {
         )]
         #[tokio::test]
         async fn double_401_bails_with_distinct_auth_error() {
-            let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
-            let prev = std::env::var_os("GH_TOKEN");
+            let _env_guard = token::ENV_LOCK.lock().unwrap();
+            let prev = env::var_os("GH_TOKEN");
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            unsafe { std::env::set_var("GH_TOKEN", "bad_token") };
+            unsafe { env::set_var("GH_TOKEN", "bad_token") };
 
             let server = MockServer::start().await;
             let hits = Arc::new(AtomicUsize::new(0));
-            let hits_in_handler = std::sync::Arc::clone(&hits);
+            let hits_in_handler = Arc::clone(&hits);
             Mock::given(method("GET"))
                 .respond_with(move |_req: &Request| {
                     hits_in_handler.fetch_add(1, Ordering::SeqCst);
@@ -5110,9 +5133,9 @@ mod tests {
 
             match prev {
                 // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-                Some(v) => unsafe { std::env::set_var("GH_TOKEN", v) },
+                Some(v) => unsafe { env::set_var("GH_TOKEN", v) },
                 // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-                None => unsafe { std::env::remove_var("GH_TOKEN") },
+                None => unsafe { env::remove_var("GH_TOKEN") },
             }
 
             let err = result.expect_err("persisting 401 must fail").to_string();
@@ -5125,190 +5148,6 @@ mod tests {
                 2,
                 "must retry exactly once, not loop"
             );
-        }
-    }
-
-    // ── secret redaction on posted bodies (wiremock) ─────────────────────
-
-    mod leak_redaction {
-        use super::GhHttp;
-        use super::test_client;
-        use std::sync::{Arc, Mutex};
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-
-        const TOKEN: &str = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
-
-        fn leaky_body() -> String {
-            format!("agent notes mentioning {TOKEN}")
-        }
-
-        fn client_for(server: &MockServer) -> GhHttp {
-            let mut gh = test_client();
-            gh.api_base = Some(server.uri());
-            gh
-        }
-
-        fn posted_json_body(raw: &str) -> String {
-            let payload: serde_json::Value =
-                serde_json::from_str(raw).expect("request body is JSON");
-            payload["body"]
-                .as_str()
-                .expect("payload has a string body")
-                .to_string()
-        }
-
-        fn assert_token_redacted(raw: &str) {
-            assert!(
-                !raw.contains(TOKEN),
-                "planted token must not appear in the request payload, got: {raw}"
-            );
-            let body = posted_json_body(raw);
-            assert!(
-                body.contains("[REDACTED:github_token]"),
-                "redacted marker missing from posted body: {body}"
-            );
-            assert!(
-                body.contains("potential secret(s) detected and redacted"),
-                "security notice missing from posted body: {body}"
-            );
-        }
-
-        #[expect(
-            clippy::await_holding_lock,
-            reason = "the env lock stays held across the awaits so tests do not race on GH_TOKEN"
-        )]
-        #[tokio::test]
-        async fn add_comment_redacts_github_token() {
-            let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
-            let prev = std::env::var_os("GH_TOKEN");
-            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            unsafe { std::env::set_var("GH_TOKEN", "test_token") };
-
-            let server = MockServer::start().await;
-            let captured = Arc::new(Mutex::new(None::<String>));
-            let captured_in_handler = std::sync::Arc::clone(&captured);
-            Mock::given(method("POST"))
-                .and(path("/repos/owner/repo/issues/1/comments"))
-                .respond_with(move |req: &Request| {
-                    *captured_in_handler.lock().unwrap() =
-                        Some(String::from_utf8_lossy(&req.body).into_owned());
-                    ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": 1 }))
-                })
-                .expect(1)
-                .mount(&server)
-                .await;
-
-            let gh = client_for(&server);
-            gh.add_comment("owner/repo", "1", &leaky_body())
-                .await
-                .expect("add_comment should succeed");
-
-            match prev {
-                // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-                Some(v) => unsafe { std::env::set_var("GH_TOKEN", v) },
-                // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-                None => unsafe { std::env::remove_var("GH_TOKEN") },
-            }
-
-            let raw = captured
-                .lock()
-                .unwrap()
-                .clone()
-                .expect("add_comment must send a request body");
-            assert_token_redacted(&raw);
-        }
-
-        #[expect(
-            clippy::await_holding_lock,
-            reason = "the env lock stays held across the awaits so tests do not race on GH_TOKEN"
-        )]
-        #[tokio::test]
-        async fn create_pr_redacts_github_token() {
-            let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
-            let prev = std::env::var_os("GH_TOKEN");
-            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            unsafe { std::env::set_var("GH_TOKEN", "test_token") };
-
-            let server = MockServer::start().await;
-            let captured = Arc::new(Mutex::new(None::<String>));
-            let captured_in_handler = std::sync::Arc::clone(&captured);
-            Mock::given(method("POST"))
-                .and(path("/repos/owner/repo/pulls"))
-                .respond_with(move |req: &Request| {
-                    *captured_in_handler.lock().unwrap() =
-                        Some(String::from_utf8_lossy(&req.body).into_owned());
-                    ResponseTemplate::new(201).set_body_json(serde_json::json!({
-                        "html_url": "https://github.com/owner/repo/pull/1"
-                    }))
-                })
-                .expect(1)
-                .mount(&server)
-                .await;
-
-            let gh = client_for(&server);
-            gh.create_pr("owner/repo", "title", &leaky_body(), "head", "main")
-                .await
-                .expect("create_pr should succeed");
-
-            match prev {
-                // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-                Some(v) => unsafe { std::env::set_var("GH_TOKEN", v) },
-                // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-                None => unsafe { std::env::remove_var("GH_TOKEN") },
-            }
-
-            let raw = captured
-                .lock()
-                .unwrap()
-                .clone()
-                .expect("create_pr must send a request body");
-            assert_token_redacted(&raw);
-        }
-
-        #[expect(
-            clippy::await_holding_lock,
-            reason = "the env lock stays held across the awaits so tests do not race on GH_TOKEN"
-        )]
-        #[tokio::test]
-        async fn update_pr_body_redacts_github_token() {
-            let _env_guard = crate::github::token::ENV_LOCK.lock().unwrap();
-            let prev = std::env::var_os("GH_TOKEN");
-            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            unsafe { std::env::set_var("GH_TOKEN", "test_token") };
-
-            let server = MockServer::start().await;
-            let captured = Arc::new(Mutex::new(None::<String>));
-            let captured_in_handler = std::sync::Arc::clone(&captured);
-            Mock::given(method("PATCH"))
-                .and(path("/repos/owner/repo/pulls/7"))
-                .respond_with(move |req: &Request| {
-                    *captured_in_handler.lock().unwrap() =
-                        Some(String::from_utf8_lossy(&req.body).into_owned());
-                    ResponseTemplate::new(200).set_body_json(serde_json::json!({}))
-                })
-                .expect(1)
-                .mount(&server)
-                .await;
-
-            let gh = client_for(&server);
-            gh.update_pr_body("owner/repo", 7, &leaky_body())
-                .await
-                .expect("update_pr_body should succeed");
-
-            match prev {
-                // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-                Some(v) => unsafe { std::env::set_var("GH_TOKEN", v) },
-                // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-                None => unsafe { std::env::remove_var("GH_TOKEN") },
-            }
-
-            let raw = captured
-                .lock()
-                .unwrap()
-                .clone()
-                .expect("update_pr_body must send a request body");
-            assert_token_redacted(&raw);
         }
     }
 }

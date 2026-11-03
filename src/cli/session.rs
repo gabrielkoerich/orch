@@ -1,9 +1,15 @@
 use crate::cli::init_store;
 use crate::cli::ndjson;
+use crate::cli::task_ref;
+use crate::store::Task;
 use crate::store::{TaskStatus, TaskStore};
 use anyhow::Context;
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::collections::HashSet;
+use std::fs;
+use std::str::FromStr;
 use std::sync::Arc;
 
 pub async fn export(
@@ -13,7 +19,7 @@ pub async fn export(
 ) -> anyhow::Result<()> {
     let store = Arc::new(init_store().await?);
 
-    let resolved = crate::cli::task_ref::resolve(&store, task_id).await?;
+    let resolved = task_ref::resolve(&store, task_id).await?;
     let internal_id = resolved
         .store_id
         .ok_or_else(|| anyhow::anyhow!("task not found in store: {task_id}"))?;
@@ -31,7 +37,7 @@ pub async fn export(
         u32::try_from(max_attempt).unwrap_or(1)
     };
 
-    let output_path = crate::cli::task_ref::state_dir(&resolved)?
+    let output_path = task_ref::state_dir(&resolved)?
         .join("attempts")
         .join(attempt.to_string())
         .join("output.json");
@@ -43,7 +49,7 @@ pub async fn export(
         );
     }
 
-    let content = std::fs::read_to_string(&output_path)?;
+    let content = fs::read_to_string(&output_path)?;
 
     match format {
         ExportFormat::Markdown => export_markdown(&task, attempt, &content, &store, &repo).await,
@@ -86,8 +92,8 @@ impl ParsedOutput {
 /// with `git` are captured as `git_commands`.  Assistant text messages
 /// longer than 40 chars are kept as `key_messages` (capped at 10).
 fn parse_output(content: &str) -> ParsedOutput {
-    let mut files_changed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut files_read: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut files_changed: BTreeSet<String> = BTreeSet::new();
+    let mut files_read: BTreeSet<String> = BTreeSet::new();
     let mut tool_counts: BTreeMap<String, usize> = BTreeMap::default();
     let mut git_commands: Vec<String> = Vec::new();
     let mut key_messages: Vec<String> = Vec::new();
@@ -194,7 +200,7 @@ fn parse_output(content: &str) -> ParsedOutput {
         files_changed: files_changed
             .into_iter()
             .chain(ndjson::extract_files_changed(content))
-            .collect::<std::collections::BTreeSet<_>>()
+            .collect::<BTreeSet<_>>()
             .into_iter()
             .collect(),
         files_read: files_read.into_iter().collect(),
@@ -208,8 +214,8 @@ fn parse_output(content: &str) -> ParsedOutput {
 fn record_file_or_command(
     name: &str,
     input: Option<&serde_json::Value>,
-    files_changed: &mut std::collections::BTreeSet<String>,
-    files_read: &mut std::collections::BTreeSet<String>,
+    files_changed: &mut BTreeSet<String>,
+    files_read: &mut BTreeSet<String>,
     git_commands: &mut Vec<String>,
 ) {
     let Some(input) = input else { return };
@@ -239,7 +245,7 @@ fn record_file_or_command(
 }
 
 async fn export_markdown(
-    task: &crate::store::Task,
+    task: &Task,
     attempt: u32,
     content: &str,
     store: &Arc<TaskStore>,
@@ -312,7 +318,7 @@ async fn export_markdown(
             println!();
             println!("### Git Context");
             // Deduplicate while preserving order
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = HashSet::new();
             for cmd in &parsed.git_commands {
                 if seen.insert(cmd.as_str()) {
                     println!("- `{cmd}`");
@@ -369,7 +375,7 @@ async fn export_markdown(
     Ok(())
 }
 
-fn export_json(task: &crate::store::Task, attempt: u32, content: &str) -> anyhow::Result<()> {
+fn export_json(task: &Task, attempt: u32, content: &str) -> anyhow::Result<()> {
     #[derive(Serialize)]
     struct SessionExport {
         task_id: i64,
@@ -506,7 +512,7 @@ pub enum ExportFormat {
     Raw,
 }
 
-impl std::str::FromStr for ExportFormat {
+impl FromStr for ExportFormat {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
