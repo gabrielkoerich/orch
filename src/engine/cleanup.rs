@@ -20,6 +20,7 @@ use std::fs as std_fs;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Output;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::SystemTime;
@@ -36,6 +37,7 @@ use crate::engine::auto_merge;
 use crate::engine::runner::cow;
 use crate::engine::runner::git_ops;
 use crate::engine::runner::worktree;
+use crate::github::http::GhHttp;
 use crate::home;
 
 /// Reconciliation calls can be slow on repos with many issues or during GitHub instability.
@@ -545,15 +547,23 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
     store: &Arc<TaskStore>,
     opts: &JanitorOptions,
 ) -> anyhow::Result<bool> {
-    let (worktree, branch, keep_remote_branch, merged) =
+    let (worktree, branch, keep_remote_branch, merged, external_id, pr_merged) =
         store::opt_store_get_task(&Some(Arc::clone(store)), repo, task_id)
             .await
-            .map_or((None, None, false, false), |t| {
+            .map_or((None, None, false, false, None, false), |t| {
                 // Blocked tasks with a PR should keep their remote branch so the
                 // PR stays open for human review.
                 let keep = t.status == TaskStatus::Blocked && t.pr_number.is_some();
                 let merged = t.status == TaskStatus::Done;
-                (Some(t.worktree), Some(t.branch), keep, merged)
+                (
+                    Some(t.worktree),
+                    Some(t.branch),
+                    keep,
+                    merged,
+                    t.external_id,
+                    // Done means the PR merged, and a squash leaves the branch commits on no ref
+                    merged && t.pr_number.is_some(),
+                )
             });
 
     let worktree_path = worktree.as_ref().map(PathBuf::from);
@@ -721,6 +731,20 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
                 Ok(root) => root,
                 Err(_) => resolve_repo_root(repo).await?,
             };
+            if let Some(br) = branch.as_deref().filter(|b| !b.is_empty())
+                && !pr_merged
+                && !rescue_and_notify(
+                    task_id,
+                    repo,
+                    external_id.as_deref(),
+                    Some(&wt),
+                    br,
+                    Path::new(&repo_root),
+                )
+                .await
+            {
+                return Ok(false);
+            }
             if merged {
                 cow::warm_from_merged(
                     Path::new(&repo_root),
@@ -729,7 +753,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
                 )
                 .await;
             }
-            let removed = remove_worktree_and_branch(
+            let removed = remove_worktree_and_branch_unchecked(
                 task_id,
                 &wt,
                 branch.as_deref(),
@@ -754,6 +778,19 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
             tracing::debug!(task_id, branch = %br, "no worktree on disk, cleaning up branch only");
             // Resolve repo root lazily — branch cleanup needs it.
             let repo_root = resolve_repo_root(repo).await?;
+            if !pr_merged
+                && !rescue_and_notify(
+                    task_id,
+                    repo,
+                    external_id.as_deref(),
+                    None,
+                    br,
+                    Path::new(&repo_root),
+                )
+                .await
+            {
+                return Ok(false);
+            }
             delete_branches(task_id, br, Path::new(&repo_root)).await;
             did_clean = true;
         }
@@ -791,6 +828,192 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
     Ok(did_clean)
 }
 
+/// Result of saving a task branch's unpushed work before cleanup deletes it
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Rescue {
+    /// Every commit is on a remote ref already
+    Clean,
+    /// The commits were pushed to `rescue/<branch>`
+    Pushed {
+        branch: String,
+        commits: Vec<String>,
+    },
+    /// Git failed, so the worktree and branch must stay
+    Failed,
+}
+
+async fn git_in(dir: &Path, args: &[&str]) -> Option<Output> {
+    git_ops::git()
+        .await
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output_with_context()
+        .await
+        .ok()
+}
+
+/**
+ * Cleanup deletes the worktree and the local branch, which can be the only refs to commits the
+ * agent made before its run ended without a push (#3999). Uncommitted changes are committed
+ * first, then everything not on a remote ref goes to `rescue/<branch>`
+ **/
+pub(crate) async fn rescue_unpushed_work(
+    task_id: &str,
+    wt: Option<&Path>,
+    br: &str,
+    repo_root: &Path,
+) -> Rescue {
+    if let Some(wt) = wt
+        && fs::try_exists(wt.join(".git")).await.unwrap_or(false)
+    {
+        let Some(status) = git_in(wt, &["status", "--porcelain"]).await else {
+            tracing::warn!(task_id, branch = %br, "cannot read worktree status, keeping worktree");
+            return Rescue::Failed;
+        };
+        if !status.status.success() {
+            tracing::warn!(task_id, branch = %br, "git status failed, keeping worktree");
+            return Rescue::Failed;
+        }
+        if !status.stdout.is_empty() {
+            let committed = git_in(wt, &["add", "-A"])
+                .await
+                .is_some_and(|o| o.status.success())
+                && git_in(
+                    wt,
+                    &[
+                        "-c",
+                        "user.name=orch",
+                        "-c",
+                        "user.email=orch@localhost",
+                        "commit",
+                        "-m",
+                        "rescue: uncommitted changes saved by orch cleanup",
+                    ],
+                )
+                .await
+                .is_some_and(|o| o.status.success());
+            if !committed {
+                tracing::warn!(task_id, branch = %br, "cannot commit uncommitted changes, keeping worktree");
+                return Rescue::Failed;
+            }
+        }
+    }
+
+    let local_ref = format!("refs/heads/{br}");
+    let exists = git_in(repo_root, &["rev-parse", "--verify", "--quiet", &local_ref])
+        .await
+        .is_some_and(|o| o.status.success());
+    if !exists {
+        return Rescue::Clean;
+    }
+    // Commits on the local default branch survive the branch delete, so they do not count
+    let default_ref = format!(
+        "refs/heads/{}",
+        worktree::detect_default_branch(repo_root).await
+    );
+    // A bare clone has no remote-tracking refs, so ask the remote for the branch tip
+    let remote_tip = git_in(repo_root, &["ls-remote", "origin", &local_ref])
+        .await
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .next()
+                .map(str::to_string)
+        });
+    let mut args = vec!["rev-list", "--oneline", &local_ref, "--not", "--remotes"];
+    if let Some(tip) = remote_tip.as_deref() {
+        args.push(tip);
+    }
+    let default_exists = default_ref != local_ref
+        && git_in(
+            repo_root,
+            &["rev-parse", "--verify", "--quiet", &default_ref],
+        )
+        .await
+        .is_some_and(|o| o.status.success());
+    if default_exists {
+        args.push(&default_ref);
+    }
+    let Some(list) = git_in(repo_root, &args)
+        .await
+        .filter(|o| o.status.success())
+    else {
+        tracing::warn!(task_id, branch = %br, "cannot list unpushed commits, keeping worktree and branch");
+        return Rescue::Failed;
+    };
+    let commits: Vec<String> = String::from_utf8_lossy(&list.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    if commits.is_empty() {
+        return Rescue::Clean;
+    }
+
+    let rescue = format!("rescue/{br}");
+    let refspec = format!("{local_ref}:refs/heads/{rescue}");
+    let pushed = git_in(
+        repo_root,
+        &["-c", "lfs.locksverify=false", "push", "origin", &refspec],
+    )
+    .await;
+    if pushed.is_some_and(|o| o.status.success()) {
+        tracing::warn!(task_id, branch = %br, rescue = %rescue, commits = commits.len(), "pushed unpushed commits to rescue branch");
+        Rescue::Pushed {
+            branch: rescue,
+            commits,
+        }
+    } else {
+        tracing::warn!(task_id, branch = %br, rescue = %rescue, "rescue push failed, keeping worktree and branch");
+        Rescue::Failed
+    }
+}
+
+fn rescue_comment(rescue_branch: &str, commits: &[String]) -> String {
+    let list = commits
+        .iter()
+        .map(|c| format!("- `{c}`"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Cleanup found commits on this task's branch that were never pushed. They are saved on `{rescue_branch}`:\n\n{list}"
+    )
+}
+
+/// Save unpushed work and tell the task about it. Returns false when cleanup must not go on
+async fn rescue_and_notify(
+    task_id: &str,
+    repo: &str,
+    external_id: Option<&str>,
+    wt: Option<&Path>,
+    br: &str,
+    repo_root: &Path,
+) -> bool {
+    match rescue_unpushed_work(task_id, wt, br, repo_root).await {
+        Rescue::Clean => true,
+        Rescue::Failed => false,
+        Rescue::Pushed { branch, commits } => {
+            if let Some(number) = external_id.filter(|n| n.parse::<u64>().is_ok()) {
+                match GhHttp::new() {
+                    Ok(gh) => {
+                        if let Err(e) = gh
+                            .add_comment(repo, number, &rescue_comment(&branch, &commits))
+                            .await
+                        {
+                            tracing::warn!(task_id, err = %e, "failed to comment on rescue branch");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(task_id, err = %e, "cannot comment on rescue branch");
+                    }
+                }
+            }
+            true
+        }
+    }
+}
+
 /// Remove a git worktree directory and its local + remote branches.
 /// When `keep_remote_branch` is true, only the worktree and local branch are
 /// removed — the remote branch stays so that any linked PR remains open
@@ -798,6 +1021,23 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
 /// Returns `true` if the worktree directory is gone after the call
 /// (either we removed it or it was already absent).
 pub(crate) async fn remove_worktree_and_branch(
+    task_id: &str,
+    wt: &Path,
+    branch: Option<&str>,
+    repo_root: &Path,
+    keep_remote_branch: bool,
+) -> bool {
+    if let Some(br) = branch.filter(|b| !b.is_empty())
+        && rescue_unpushed_work(task_id, Some(wt), br, repo_root).await == Rescue::Failed
+    {
+        return false;
+    }
+
+    remove_worktree_and_branch_unchecked(task_id, wt, branch, repo_root, keep_remote_branch).await
+}
+
+/// The caller has already rescued the branch or knows its PR merged
+async fn remove_worktree_and_branch_unchecked(
     task_id: &str,
     wt: &Path,
     branch: Option<&str>,
@@ -1004,10 +1244,11 @@ async fn delete_local_branch(task_id: &str, br: &str, repo_root: &Path) {
     let default_ref = format!("refs/remotes/origin/{default_branch}");
     let local_ref = format!("refs/heads/{br}");
     let local_default_ref = format!("refs/heads/{default_branch}");
+    let rescue_ref = format!("refs/remotes/origin/rescue/{br}");
     match commits_outside(
         repo_root,
         &local_ref,
-        &[&remote_ref, &default_ref, &local_default_ref],
+        &[&remote_ref, &default_ref, &local_default_ref, &rescue_ref],
     )
     .await
     {
@@ -2408,6 +2649,88 @@ mod tests {
 
         assert!(!remote_has(&clone, "feat"));
         assert!(!local_has(&clone, "feat"));
+    }
+
+    fn add_worktree(clone: &Path, tmp: &Path, branch: &str) -> PathBuf {
+        let wt = tmp.join("wt");
+        git_ok(clone, &["worktree", "add", wt.to_str().unwrap(), branch]);
+        wt
+    }
+
+    #[tokio::test]
+    async fn cleanup_pushes_unpushed_commits_to_a_rescue_branch() {
+        let (tmp, clone) = origin_and_clone_with_feat();
+        let wt = add_worktree(&clone, tmp.path(), "feat");
+
+        let sha = git_ok(&clone, &["rev-parse", "--short", "feat"]);
+        let sha = sha.trim();
+        match rescue_unpushed_work("1", Some(&wt), "feat", &clone).await {
+            Rescue::Pushed { branch, commits } => {
+                assert_eq!(branch, "rescue/feat");
+                assert!(rescue_comment(&branch, &commits).contains(sha));
+            }
+            other => panic!("expected a rescue push, got {other:?}"),
+        }
+
+        let removed = remove_worktree_and_branch("1", &wt, Some("feat"), &clone, false).await;
+
+        assert!(removed);
+        assert!(remote_has(&clone, "rescue/feat"));
+        assert!(!local_has(&clone, "feat"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_commits_uncommitted_changes_before_the_rescue() {
+        let (tmp, clone) = origin_and_clone_with_feat();
+        git_ok(&clone, &["push", "origin", "feat"]);
+        let wt = add_worktree(&clone, tmp.path(), "feat");
+        std_fs::write(wt.join("dirty.txt"), "dirty").unwrap();
+
+        let removed = remove_worktree_and_branch("1", &wt, Some("feat"), &clone, false).await;
+
+        assert!(removed);
+        assert!(remote_has(&clone, "rescue/feat"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_makes_no_rescue_branch_for_a_pushed_branch() {
+        let (tmp, clone) = origin_and_clone_with_feat();
+        git_ok(&clone, &["push", "origin", "feat"]);
+        let wt = add_worktree(&clone, tmp.path(), "feat");
+
+        let removed = remove_worktree_and_branch("1", &wt, Some("feat"), &clone, false).await;
+
+        assert!(removed);
+        assert!(!remote_has(&clone, "rescue/feat"));
+        assert!(!local_has(&clone, "feat"));
+    }
+
+    #[tokio::test]
+    async fn rescue_skips_a_branch_on_the_remote_without_a_tracking_ref() {
+        let (_tmp, clone) = origin_and_clone_with_feat();
+        git_ok(&clone, &["push", "origin", "feat"]);
+        git_ok(&clone, &["update-ref", "-d", "refs/remotes/origin/feat"]);
+
+        let rescue = rescue_unpushed_work("1", None, "feat", &clone).await;
+
+        assert_eq!(rescue, Rescue::Clean);
+        assert!(!remote_has(&clone, "rescue/feat"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_worktree_and_branch_when_the_rescue_push_fails() {
+        let (tmp, clone) = origin_and_clone_with_feat();
+        let wt = add_worktree(&clone, tmp.path(), "feat");
+        git_ok(
+            &clone,
+            &["remote", "set-url", "origin", "/nonexistent/origin.git"],
+        );
+
+        let removed = remove_worktree_and_branch("1", &wt, Some("feat"), &clone, false).await;
+
+        assert!(!removed);
+        assert!(wt.exists());
+        assert!(local_has(&clone, "feat"));
     }
 
     #[tokio::test]
