@@ -99,6 +99,7 @@ fn serialize_parsed_response(
             "response": parsed.response,
             "input_tokens": parsed.input_tokens,
             "output_tokens": parsed.output_tokens,
+            "cost_usd": parsed.cost_usd,
             "duration_ms": parsed.duration_ms,
         })
         .to_string(),
@@ -252,6 +253,7 @@ fn parse_success_output(
                     response,
                     input_tokens: None,
                     output_tokens: None,
+                    cost_usd: None,
                     duration_ms: None,
                 });
             }
@@ -265,6 +267,7 @@ fn parse_success_output(
                     response,
                     input_tokens: None,
                     output_tokens: None,
+                    cost_usd: None,
                     duration_ms: None,
                 });
             }
@@ -307,6 +310,7 @@ fn parse_success_output(
                 response,
                 input_tokens: agent_result.input_tokens,
                 output_tokens: agent_result.output_tokens,
+                cost_usd: agent_result.cost_usd,
                 duration_ms: agent_result.duration_ms,
             });
         }
@@ -328,6 +332,7 @@ fn parse_success_output(
                 response,
                 input_tokens: agent_result.input_tokens,
                 output_tokens: agent_result.output_tokens,
+                cost_usd: agent_result.cost_usd,
                 duration_ms: agent_result.duration_ms,
             });
         }
@@ -343,6 +348,7 @@ fn parse_success_output(
                 response,
                 input_tokens: agent_result.input_tokens,
                 output_tokens: agent_result.output_tokens,
+                cost_usd: agent_result.cost_usd,
                 duration_ms: agent_result.duration_ms,
             });
         }
@@ -379,6 +385,7 @@ fn parse_success_output(
                 },
                 input_tokens: agent_result.input_tokens,
                 output_tokens: agent_result.output_tokens,
+                cost_usd: agent_result.cost_usd,
                 duration_ms: agent_result.duration_ms,
             });
         }
@@ -400,11 +407,13 @@ fn parse_success_output(
                 let agent_result = agents::find_agent_result(agent_name, raw_stdout);
                 let input_tokens = agent_result.as_ref().and_then(|r| r.input_tokens);
                 let output_tokens = agent_result.as_ref().and_then(|r| r.output_tokens);
+                let cost_usd = agent_result.as_ref().and_then(|r| r.cost_usd);
                 let duration_ms = agent_result.as_ref().and_then(|r| r.duration_ms);
                 Ok(agents::ParsedResponse {
                     response,
                     input_tokens,
                     output_tokens,
+                    cost_usd,
                     duration_ms,
                 })
             } else {
@@ -523,6 +532,7 @@ pub fn parse_session_output(
                         },
                         input_tokens: None,
                         output_tokens: None,
+                        cost_usd: None,
                         duration_ms: None,
                     });
                 }
@@ -719,14 +729,12 @@ impl TaskRunner {
             }
         };
 
-        let total_cost_usd = match &self.store {
-            Some(_) => {
-                store::get_cost_estimate(&self.store, &self.repo, input.task_id)
-                    .await
-                    .total_cost_usd
-            }
-            None => 0.0,
-        };
+        let total_cost_usd = input
+            .parse_result
+            .as_ref()
+            .ok()
+            .and_then(|p| p.cost_usd)
+            .unwrap_or(0.0);
 
         let (input_tokens, output_tokens) = extract_run_tokens(input.parse_result);
 
@@ -1157,9 +1165,8 @@ impl TaskRunner {
                 Some(outcome.to_string())
             };
 
-            // Read cost data from store
             let usage = store::get_token_usage(&self.store, &self.repo, task_id).await;
-            let cost = store::get_cost_estimate(&self.store, &self.repo, task_id).await;
+            let total_cost = store::get_reported_cost(&self.store, &self.repo, task_id).await;
             let input_tokens = if usage.input_tokens > 0 {
                 Some(i64::try_from(usage.input_tokens).unwrap_or(i64::MAX))
             } else {
@@ -1167,21 +1174,6 @@ impl TaskRunner {
             };
             let output_tokens = if usage.output_tokens > 0 {
                 Some(i64::try_from(usage.output_tokens).unwrap_or(i64::MAX))
-            } else {
-                None
-            };
-            let input_cost = if cost.input_cost_usd > 0.0 {
-                Some(cost.input_cost_usd)
-            } else {
-                None
-            };
-            let output_cost = if cost.output_cost_usd > 0.0 {
-                Some(cost.output_cost_usd)
-            } else {
-                None
-            };
-            let total_cost = if cost.total_cost_usd > 0.0 {
-                Some(cost.total_cost_usd)
             } else {
                 None
             };
@@ -1201,8 +1193,6 @@ impl TaskRunner {
                 error_type: db_error_type.as_deref(),
                 input_tokens,
                 output_tokens,
-                input_cost_usd: input_cost,
-                output_cost_usd: output_cost,
                 total_cost_usd: total_cost,
             };
 
@@ -1913,6 +1903,7 @@ mod tests {
             },
             input_tokens: None,
             output_tokens: None,
+            cost_usd: None,
             duration_ms: None,
         }
     }
@@ -2343,6 +2334,7 @@ mod tests {
                 },
                 input_tokens: None,
                 output_tokens: None,
+                cost_usd: None,
                 duration_ms: None,
             });
             let started_at = Utc::now();
@@ -2463,6 +2455,7 @@ mod tests {
             },
             input_tokens: None,
             output_tokens: None,
+            cost_usd: None,
             duration_ms: None,
         });
         let started_at = Utc::now();

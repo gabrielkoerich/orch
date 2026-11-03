@@ -316,6 +316,7 @@ impl AgentRunner for CodexRunner {
                     response: resp,
                     input_tokens: None,
                     output_tokens: None,
+                    cost_usd: None,
                     duration_ms: None,
                 });
             }
@@ -353,6 +354,7 @@ impl AgentRunner for CodexRunner {
             response,
             input_tokens: None,
             output_tokens: None,
+            cost_usd: None,
             duration_ms: None,
         })
     }

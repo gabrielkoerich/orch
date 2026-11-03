@@ -2115,17 +2115,13 @@ async fn finalize_review_run(
     if let Some(store_id) = ctx.store_id
         && (parsed.token_usage.input_tokens > 0 || parsed.token_usage.output_tokens > 0)
     {
-        let model = if ctx.review_model_str().is_empty() {
-            "unknown"
-        } else {
-            ctx.review_model_str()
-        };
+        let cost_usd = Some(parsed.token_usage.total_cost_usd).filter(|c| *c > 0.0);
         if let Err(e) = store
             .store_tokens(
                 store_id,
                 parsed.token_usage.input_tokens,
                 parsed.token_usage.output_tokens,
-                model,
+                cost_usd,
             )
             .await
         {

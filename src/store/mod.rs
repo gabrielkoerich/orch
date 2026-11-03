@@ -29,11 +29,11 @@ mod helpers;
 pub(crate) mod jobs;
 pub(crate) mod kv;
 mod metrics;
-mod pricing;
 pub(crate) mod replica;
 pub(crate) mod tasks;
 #[cfg(test)]
 mod tests;
+mod usage;
 
 use anyhow::Context;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
@@ -52,8 +52,8 @@ pub use dependencies::{
     dep_label, worktree_refresh_key,
 };
 pub use helpers::{
-    StoreResult, get_cost_estimate, get_cost_estimate_result, get_recent_memory,
-    get_recent_memory_result, get_task_field, get_task_field_direct, get_token_usage,
+    StoreResult, get_recent_memory, get_recent_memory_result, get_reported_cost,
+    get_reported_cost_result, get_task_field, get_task_field_direct, get_token_usage,
     get_token_usage_result, opt_store_get_task, opt_store_get_task_by_id, resolve_store_id,
     store_increment, store_increment_by_id, store_log_activity, store_reset_counters,
     store_reset_failure_counters, store_set, store_set_by_id, store_set_result,
@@ -64,13 +64,13 @@ pub use metrics::{
     AgentStat, CostByGroup, CostPeriod, CostSummary, ErrorStat, HighReviewCycleTask,
     InsertTaskMetric, MetricsSummary, SlowTaskInfo,
 };
-pub use pricing::{CostEstimate, ModelPricing, TokenUsage, pricing_for_model};
 use sqlx::error::DatabaseError;
 pub use tasks::{
     CliTaskRef, CliTaskSpec, CompleteRun, NewTask, RunTokenUsage, StartRun, StoreRoute, Task,
     TaskActivity, TaskRun, TaskStatus, UpsertExternal, parse_cli_task_spec,
 };
 use tokio::time;
+pub use usage::TokenUsage;
 
 use crate::cluster;
 use crate::cluster::Command;

@@ -4,7 +4,7 @@
 //! `Option<Arc<TaskStore>>` because parts of the engine can run before the store is
 //! initialized.
 
-use crate::store::{CostEstimate, MemoryEntry, Task, TaskStore, TokenUsage};
+use crate::store::{MemoryEntry, Task, TaskStore, TokenUsage};
 use anyhow::anyhow;
 use std::sync::Arc;
 
@@ -372,12 +372,12 @@ pub async fn get_token_usage(
     }
 }
 
-/// Get cost estimate from the store, surfacing DB read errors.
-pub async fn get_cost_estimate_result(
+/// Get the cost the task's agents reported, surfacing DB read errors.
+pub async fn get_reported_cost_result(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
     task_id: &str,
-) -> StoreResult<CostEstimate> {
+) -> StoreResult<f64> {
     let s = store
         .as_ref()
         .ok_or_else(|| anyhow!("task store unavailable"))?;
@@ -386,28 +386,23 @@ pub async fn get_cost_estimate_result(
         .await?
         .ok_or_else(|| anyhow!("task {repo}/{task_id} not found in store"))?;
     let task = s.get(store_id).await?;
-    Ok(Some(CostEstimate {
-        input_cost_usd: task.input_cost_usd,
-        output_cost_usd: task.output_cost_usd,
-        total_cost_usd: task.total_cost_usd,
-    }))
+    Ok(task.reported_cost_usd())
 }
 
-/// Get cost estimate from the store.
+/// Get the cost the task's agents reported.
 ///
-/// Returns `CostEstimate::default()` when the store is unavailable or the task is not found.
-/// DB read errors are logged as warnings and return the default.
-pub async fn get_cost_estimate(
+/// Returns `None` when no run reported a cost, the store is unavailable or the task is not
+/// found. DB read errors are logged as warnings and return `None`.
+pub async fn get_reported_cost(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
     task_id: &str,
-) -> CostEstimate {
-    match get_cost_estimate_result(store, repo, task_id).await {
-        Ok(Some(cost)) => cost,
-        Ok(None) => CostEstimate::default(),
+) -> Option<f64> {
+    match get_reported_cost_result(store, repo, task_id).await {
+        Ok(cost) => cost,
         Err(e) => {
-            tracing::warn!(task_id, error = %e, "get_cost_estimate failed — returning zero cost");
-            CostEstimate::default()
+            tracing::warn!(task_id, error = %e, "get_reported_cost failed — returning no cost");
+            None
         }
     }
 }

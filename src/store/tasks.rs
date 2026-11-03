@@ -4,7 +4,7 @@ pub(crate) mod apply;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use super::{Context, MemoryEntry, SqlitePool, TaskStore, TokenUsage, pricing_for_model};
+use super::{Context, MemoryEntry, SqlitePool, TaskStore};
 use crate::backends::ExternalTask;
 use crate::cluster;
 use crate::cluster::Command;
@@ -271,8 +271,7 @@ pub struct Task {
     // Tokens & Cost
     pub input_tokens: i64,
     pub output_tokens: i64,
-    pub input_cost_usd: f64,
-    pub output_cost_usd: f64,
+    // Sum of the costs the task's runs reported, 0 when none did
     pub total_cost_usd: f64,
 
     // Recovery
@@ -299,6 +298,13 @@ pub struct Task {
     // Timestamps
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl Task {
+    /// The cost the task's runs reported, `None` when no run reported one.
+    pub fn reported_cost_usd(&self) -> Option<f64> {
+        (self.total_cost_usd > 0.0).then_some(self.total_cost_usd)
+    }
 }
 
 /// Parameters for creating a new task.
@@ -1456,28 +1462,19 @@ impl TaskStore {
     // Tokens
     // ---------------------------------------------------------------
 
-    /// Store token usage and cost for a task.
+    /// Add a run's token usage to a task, and its cost when the agent reported one.
     pub async fn store_tokens(
         &self,
         id: i64,
         input: u64,
         output: u64,
-        model: &str,
+        cost_usd: Option<f64>,
     ) -> anyhow::Result<()> {
-        let pricing = pricing_for_model(model);
-        let usage = TokenUsage {
-            input_tokens: input,
-            output_tokens: output,
-        };
-        let cost = pricing.estimate_cost_usd(usage);
-
         sqlx::query(
             "UPDATE tasks SET
             input_tokens = COALESCE(input_tokens, 0) + ?,
             output_tokens = COALESCE(output_tokens, 0) + ?,
-            input_cost_usd = COALESCE(input_cost_usd, 0.0) + ?,
-            output_cost_usd = COALESCE(output_cost_usd, 0.0) + ?,
-            total_cost_usd = COALESCE(total_cost_usd, 0.0) + ?,
+            total_cost_usd = COALESCE(total_cost_usd, 0.0) + COALESCE(?, 0.0),
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          WHERE id = ?",
         )
@@ -1489,9 +1486,7 @@ impl TaskStore {
             tracing::warn!(output, "output_tokens overflows i64, clamping to MAX");
             i64::MAX
         }))
-        .bind(cost.input_cost_usd)
-        .bind(cost.output_cost_usd)
-        .bind(cost.total_cost_usd)
+        .bind(cost_usd)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -2233,8 +2228,6 @@ impl TaskStore {
             needs_review_refires: row.try_get::<i32, _>("needs_review_refires").unwrap_or(0),
             input_tokens: row.try_get("input_tokens").unwrap_or(0),
             output_tokens: row.try_get("output_tokens").unwrap_or(0),
-            input_cost_usd: row.try_get("input_cost_usd").unwrap_or(0.0),
-            output_cost_usd: row.try_get("output_cost_usd").unwrap_or(0.0),
             total_cost_usd: row.try_get("total_cost_usd").unwrap_or(0.0),
             model_reroute_chain: row.try_get("model_reroute_chain").unwrap_or_default(),
             limit_reroute_chain: row.try_get("limit_reroute_chain").unwrap_or_default(),

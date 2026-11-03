@@ -237,7 +237,8 @@ impl Default for RouterConfig {
         Self {
             mode: "round_robin".to_string(),
             router_agent: "claude".to_string(),
-            router_model: "haiku".to_string(),
+            // Empty passes no `--model`, so the router agent's CLI uses its own default
+            router_model: String::new(),
             timeout_seconds: 45,
             fallback_executor: "codex".to_string(),
             agents: DEFAULT_AGENTS.iter().map(ToString::to_string).collect(),
@@ -606,6 +607,11 @@ impl RouterConfig {
     /// a model string might have been incorrectly formatted.
     pub fn normalize_model_identifier(model: &str) -> String {
         model.trim_end_matches('/').to_string()
+    }
+
+    /// The models listed for the agent under `models:` in the config, empty when it has none.
+    pub fn configured_models(agent: &str) -> Vec<String> {
+        Self::read_model_pool_from_config(&format!("models.{agent}")).unwrap_or_default()
     }
 
     fn read_model_pool_from_config(key: &str) -> Option<Vec<String>> {

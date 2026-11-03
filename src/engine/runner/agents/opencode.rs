@@ -573,6 +573,7 @@ impl AgentRunner for OpenCodeRunner {
                     response: resp,
                     input_tokens: None,
                     output_tokens: None,
+                    cost_usd: None,
                     duration_ms: None,
                 });
             }
@@ -601,6 +602,7 @@ impl AgentRunner for OpenCodeRunner {
                 response,
                 input_tokens,
                 output_tokens,
+                cost_usd: extract_cost(&events),
                 duration_ms: None,
             });
         };
@@ -620,6 +622,7 @@ impl AgentRunner for OpenCodeRunner {
             response,
             input_tokens,
             output_tokens,
+            cost_usd: extract_cost(&events),
             duration_ms: None,
         })
     }
@@ -1164,6 +1167,21 @@ fn synthesize_response_from_events(events: &[serde_json::Value]) -> AgentRespons
     }
 }
 
+/// The cost opencode reports in the last `step_finish` event, if any.
+fn extract_cost(events: &[serde_json::Value]) -> Option<f64> {
+    events.iter().rev().find_map(|event| {
+        if event.get("type").and_then(|v| v.as_str()) == Some("step_finish") {
+            event
+                .get("part")
+                .and_then(|p| p.get("cost"))
+                .and_then(serde_json::Value::as_f64)
+                .filter(|&c| c > 0.0)
+        } else {
+            None
+        }
+    })
+}
+
 /// Extract a structured `AgentResult` from OpenCode NDJSON output.
 ///
 /// Concatenates text from `type:text` events (both `part.text` and direct
@@ -1227,18 +1245,7 @@ pub fn find_opencode_result(ndjson: &str) -> Option<super::AgentResult> {
         return None;
     }
 
-    // Extract cost from step_finish if available
-    let cost_usd = events.iter().rev().find_map(|event| {
-        if event.get("type").and_then(|v| v.as_str()) == Some("step_finish") {
-            event
-                .get("part")
-                .and_then(|p| p.get("cost"))
-                .and_then(serde_json::Value::as_f64)
-                .filter(|&c| c > 0.0)
-        } else {
-            None
-        }
-    });
+    let cost_usd = extract_cost(&events);
 
     Some(super::AgentResult {
         is_error,

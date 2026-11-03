@@ -12,7 +12,7 @@ pub async fn show_task(id: &str) -> anyhow::Result<()> {
     let id = resolved.external_id.as_str();
 
     let usage = store::get_token_usage(&store, &repo, id).await;
-    let cost_estimate = store::get_cost_estimate(&store, &repo, id).await;
+    let cost = store::get_reported_cost(&store, &repo, id).await;
     let model = store::opt_store_get_task(&store, &repo, id)
         .await
         .and_then(|t| t.model)
@@ -24,8 +24,6 @@ pub async fn show_task(id: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let pricing = store::pricing_for_model(&model);
-
     println!("Task #{id}: cost breakdown");
     println!(
         "├── Input tokens:  {:>12}",
@@ -36,25 +34,13 @@ pub async fn show_task(id: &str) -> anyhow::Result<()> {
         format_tokens(usage.output_tokens)
     );
     println!(
-        "├── Input cost:    {:>12}",
-        format!("${:.4}", cost_estimate.input_cost_usd)
-    );
-    println!(
-        "├── Output cost:   {:>12}",
-        format!("${:.4}", cost_estimate.output_cost_usd)
-    );
-    println!(
-        "└── Total cost:    {:>12}",
-        format!("${:.4}", cost_estimate.total_cost_usd)
+        "└── Cost:          {:>12}",
+        format_cost(cost.unwrap_or(0.0))
     );
     println!();
     println!(
         "Model: {}",
         if model.is_empty() { "unknown" } else { &model }
-    );
-    println!(
-        "Pricing: ${:.2}/${:.2} per 1M tokens",
-        pricing.input_per_million_usd, pricing.output_per_million_usd
     );
 
     Ok(())
@@ -82,7 +68,7 @@ pub async fn show_summary() -> anyhow::Result<()> {
             period.label,
             format_tokens(u64::try_from(period.input_tokens).unwrap_or(0)),
             format_tokens(u64::try_from(period.output_tokens).unwrap_or(0)),
-            format!("${:.4}", period.total_cost_usd),
+            format_cost(period.total_cost_usd),
             period.task_count,
         );
     }
@@ -120,7 +106,7 @@ pub async fn show_by_agent() -> anyhow::Result<()> {
             group.name,
             format_tokens(u64::try_from(group.input_tokens).unwrap_or(0)),
             format_tokens(u64::try_from(group.output_tokens).unwrap_or(0)),
-            format!("${:.4}", group.total_cost_usd),
+            format_cost(group.total_cost_usd),
             group.task_count,
         );
     }
@@ -130,7 +116,7 @@ pub async fn show_by_agent() -> anyhow::Result<()> {
         "",
         "",
         "",
-        format!("${:.4}", total_cost)
+        format_cost(total_cost)
     );
     println!();
 
@@ -166,7 +152,7 @@ pub async fn show_by_model() -> anyhow::Result<()> {
             group.name,
             format_tokens(u64::try_from(group.input_tokens).unwrap_or(0)),
             format_tokens(u64::try_from(group.output_tokens).unwrap_or(0)),
-            format!("${:.4}", group.total_cost_usd),
+            format_cost(group.total_cost_usd),
             group.task_count,
         );
     }
@@ -176,7 +162,7 @@ pub async fn show_by_model() -> anyhow::Result<()> {
         "",
         "",
         "",
-        format!("${:.4}", total_cost)
+        format_cost(total_cost)
     );
     println!();
 
@@ -184,6 +170,15 @@ pub async fn show_by_model() -> anyhow::Result<()> {
 }
 
 /// Format token counts with thousands separators.
+/// A cost the agents reported, or "not reported" when none did. orch never estimates one.
+pub(crate) fn format_cost(cost_usd: f64) -> String {
+    if cost_usd > 0.0 {
+        format!("${cost_usd:.4}")
+    } else {
+        "not reported".to_string()
+    }
+}
+
 fn format_tokens(n: u64) -> String {
     if n == 0 {
         return "0".to_string();

@@ -3,7 +3,6 @@
     reason = "the prices and costs are stored constants, so they compare exactly"
 )]
 
-use super::pricing_for_model;
 use super::*;
 use crate::backends::ExternalId;
 use crate::backends::ExternalTask;
@@ -339,7 +338,7 @@ async fn helper_get_token_usage_negative_tokens_clamp_to_zero() {
 }
 
 #[tokio::test]
-async fn helper_get_cost_estimate_from_store() {
+async fn helper_get_reported_cost_from_store() {
     let store = Arc::new(TaskStore::open_memory().await.unwrap());
     let id = store
         .create(&NewTask {
@@ -353,22 +352,13 @@ async fn helper_get_cost_estimate_from_store() {
         .unwrap();
 
     store
-        .set_fields(
-            id,
-            &[
-                ("input_cost_usd", serde_json::json!(0.05)),
-                ("output_cost_usd", serde_json::json!(0.10)),
-                ("total_cost_usd", serde_json::json!(0.15)),
-            ],
-        )
+        .set_fields(id, &[("total_cost_usd", serde_json::json!(0.15))])
         .await
         .unwrap();
 
     let opt_store = Some(store);
-    let cost = get_cost_estimate(&opt_store, "owner/repo", "71").await;
-    assert!((cost.input_cost_usd - 0.05).abs() < f64::EPSILON);
-    assert!((cost.output_cost_usd - 0.10).abs() < f64::EPSILON);
-    assert!((cost.total_cost_usd - 0.15).abs() < f64::EPSILON);
+    let cost = get_reported_cost(&opt_store, "owner/repo", "71").await;
+    assert_eq!(cost, Some(0.15));
 }
 
 #[tokio::test]
@@ -1276,14 +1266,17 @@ async fn store_tokens() {
         .unwrap();
 
     store
-        .store_tokens(id, 50000, 10000, "sonnet")
+        .store_tokens(id, 50000, 10000, Some(0.42))
         .await
         .unwrap();
 
     let task = store.get(id).await.unwrap();
     assert_eq!(task.input_tokens, 50000);
     assert_eq!(task.output_tokens, 10000);
-    assert!(task.total_cost_usd > 0.0);
+    assert_eq!(
+        task.total_cost_usd, 0.42,
+        "the reported cost is stored exactly"
+    );
     // model must NOT be overwritten by store_tokens — it is set exclusively by routing
     assert_eq!(task.model, None);
 }
@@ -2540,13 +2533,19 @@ async fn cost_summary_aggregates_correctly() {
         .await
         .unwrap();
 
-    store.store_tokens(id1, 1000, 500, "sonnet").await.unwrap();
-    store.store_tokens(id2, 2000, 1000, "opus").await.unwrap();
+    store
+        .store_tokens(id1, 1000, 500, Some(0.25))
+        .await
+        .unwrap();
+    store
+        .store_tokens(id2, 2000, 1000, Some(0.5))
+        .await
+        .unwrap();
 
     let (input, output, cost) = store.cost_summary("owner/repo").await.unwrap();
     assert_eq!(input, 3000);
     assert_eq!(output, 1500);
-    assert!(cost > 0.0);
+    assert_eq!(cost, 0.75);
 }
 
 #[tokio::test]
@@ -3569,19 +3568,38 @@ async fn store_tokens_accumulates_across_calls() {
         .await
         .unwrap();
 
-    store.store_tokens(id, 1000, 500, "sonnet").await.unwrap();
+    store.store_tokens(id, 1000, 500, Some(0.25)).await.unwrap();
     let task = store.get(id).await.unwrap();
     assert_eq!(task.input_tokens, 1000);
     assert_eq!(task.output_tokens, 500);
-    let cost1 = task.total_cost_usd;
-    assert!(cost1 > 0.0);
+    assert_eq!(task.total_cost_usd, 0.25);
 
     // Second call accumulates (not replaces)
-    store.store_tokens(id, 2000, 1000, "sonnet").await.unwrap();
+    store.store_tokens(id, 2000, 1000, Some(0.5)).await.unwrap();
     let task = store.get(id).await.unwrap();
     assert_eq!(task.input_tokens, 3000);
     assert_eq!(task.output_tokens, 1500);
-    assert!(task.total_cost_usd > cost1);
+    assert_eq!(task.total_cost_usd, 0.75);
+}
+
+#[tokio::test]
+async fn store_tokens_without_a_reported_cost_stores_none() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let id = store
+        .create(&NewTask {
+            repo: "owner/repo".to_string(),
+            origin: "internal".to_string(),
+            title: "No cost".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    store.store_tokens(id, 1000, 500, None).await.unwrap();
+    let task = store.get(id).await.unwrap();
+    assert_eq!(task.input_tokens, 1000);
+    assert_eq!(task.output_tokens, 500);
+    assert_eq!(task.reported_cost_usd(), None);
 }
 
 // ── increment field ─────────────────────────────────────────────────────
@@ -4070,13 +4088,13 @@ async fn store_tokens_overwrites_previous_values() {
         .unwrap();
 
     // First token store
-    store.store_tokens(id, 1000, 500, "haiku").await.unwrap();
+    store.store_tokens(id, 1000, 500, None).await.unwrap();
     let task = store.get(id).await.unwrap();
     assert_eq!(task.input_tokens, 1000);
     assert_eq!(task.output_tokens, 500);
 
     // Second store accumulates (not overwrites)
-    store.store_tokens(id, 2000, 1000, "sonnet").await.unwrap();
+    store.store_tokens(id, 2000, 1000, None).await.unwrap();
     let task = store.get(id).await.unwrap();
     assert_eq!(task.input_tokens, 3000);
     assert_eq!(task.output_tokens, 1500);
@@ -4106,7 +4124,7 @@ async fn cost_summary_across_multiple_tasks() {
             .await
             .unwrap();
         store
-            .store_tokens(id, 1000 * i, 500 * i, "haiku")
+            .store_tokens(id, 1000 * i, 500 * i, None)
             .await
             .unwrap();
     }
@@ -4728,8 +4746,6 @@ async fn insert_and_query_task_metric() {
         error_type: None,
         input_tokens: Some(5000),
         output_tokens: Some(2000),
-        input_cost_usd: Some(0.05),
-        output_cost_usd: Some(0.10),
         total_cost_usd: Some(0.15),
     };
 
@@ -4768,8 +4784,6 @@ async fn metrics_summary_counts_success_and_failure() {
             error_type: None,
             input_tokens: None,
             output_tokens: None,
-            input_cost_usd: None,
-            output_cost_usd: None,
             total_cost_usd: None,
         })
         .await
@@ -4792,8 +4806,6 @@ async fn metrics_summary_counts_success_and_failure() {
             error_type: Some("timeout"),
             input_tokens: None,
             output_tokens: None,
-            input_cost_usd: None,
-            output_cost_usd: None,
             total_cost_usd: None,
         })
         .await
@@ -4845,8 +4857,6 @@ async fn metrics_summary_excludes_rows_before_cutoff_on_same_calendar_day() {
             error_type: None,
             input_tokens: None,
             output_tokens: None,
-            input_cost_usd: None,
-            output_cost_usd: None,
             total_cost_usd: None,
         })
         .await
@@ -4905,8 +4915,6 @@ async fn cost_by_agent_groups_correctly() {
                 error_type: None,
                 input_tokens: None,
                 output_tokens: None,
-                input_cost_usd: None,
-                output_cost_usd: None,
                 total_cost_usd: Some(*cost),
             })
             .await
@@ -4943,8 +4951,6 @@ async fn cost_by_model_groups_correctly() {
                 error_type: None,
                 input_tokens: None,
                 output_tokens: None,
-                input_cost_usd: None,
-                output_cost_usd: None,
                 total_cost_usd: Some(*cost),
             })
             .await
@@ -5122,8 +5128,6 @@ async fn error_distribution_groups_by_type() {
                 error_type: Some(error_type),
                 input_tokens: None,
                 output_tokens: None,
-                input_cost_usd: None,
-                output_cost_usd: None,
                 total_cost_usd: None,
             })
             .await
@@ -5160,8 +5164,6 @@ async fn slow_tasks_returns_sorted_by_duration() {
                 error_type: None,
                 input_tokens: None,
                 output_tokens: None,
-                input_cost_usd: None,
-                output_cost_usd: None,
                 total_cost_usd: None,
             })
             .await
@@ -5175,70 +5177,6 @@ async fn slow_tasks_returns_sorted_by_duration() {
     assert!((slow[0].duration_seconds - 300.0).abs() < 0.01);
     assert_eq!(slow[1].task_id, "t1");
     assert_eq!(slow[2].task_id, "t3");
-}
-
-// ── pricing_for_model ──────────────────────────────────────────────
-
-#[test]
-fn pricing_known_models() {
-    let opus = pricing_for_model("claude-opus-4-6");
-    assert!((opus.input_per_million_usd - 15.0).abs() < 0.01);
-    assert!((opus.output_per_million_usd - 75.0).abs() < 0.01);
-
-    let sonnet = pricing_for_model("claude-sonnet-4-6");
-    assert!((sonnet.input_per_million_usd - 3.0).abs() < 0.01);
-
-    let haiku = pricing_for_model("Haiku");
-    assert!((haiku.input_per_million_usd - 0.8).abs() < 0.01);
-
-    let o3 = pricing_for_model("o3");
-    assert!((o3.input_per_million_usd - 2.0).abs() < 0.01);
-
-    let gpt_mini = pricing_for_model("o4-mini");
-    assert!((gpt_mini.input_per_million_usd - 0.15).abs() < 0.01);
-
-    let gpt41 = pricing_for_model("gpt-4.1");
-    assert!((gpt41.input_per_million_usd - 2.0).abs() < 0.01);
-}
-
-#[test]
-fn pricing_unknown_model_returns_fallback() {
-    let unknown = pricing_for_model("totally-unknown-model");
-    assert!((unknown.input_per_million_usd - 1.0).abs() < 0.01);
-    assert!((unknown.output_per_million_usd - 4.0).abs() < 0.01);
-}
-
-#[test]
-fn pricing_free_and_subscription_models() {
-    // GitHub Copilot subscription — $0
-    let copilot_sonnet = pricing_for_model("github-copilot/claude-sonnet-4-6");
-    assert_eq!(copilot_sonnet.input_per_million_usd, 0.0);
-    assert_eq!(copilot_sonnet.output_per_million_usd, 0.0);
-
-    let copilot_gpt = pricing_for_model("github-copilot/gpt-5.4-mini");
-    assert_eq!(copilot_gpt.input_per_million_usd, 0.0);
-
-    // Free-tier suffix — $0
-    let minimax_free = pricing_for_model("minimax-m2.5-free");
-    assert_eq!(minimax_free.input_per_million_usd, 0.0);
-
-    let nemotron_free = pricing_for_model("nemotron-3-super-free");
-    assert_eq!(nemotron_free.input_per_million_usd, 0.0);
-
-    // DeepSeek
-    let deepseek = pricing_for_model("deepseek-r1");
-    assert!((deepseek.input_per_million_usd - 0.55).abs() < 0.01);
-    assert!((deepseek.output_per_million_usd - 2.19).abs() < 0.01);
-
-    // Codex v5 mini
-    let codex_mini = pricing_for_model("gpt-5.1-codex-mini");
-    assert!((codex_mini.input_per_million_usd - 0.15).abs() < 0.01);
-    assert!((codex_mini.output_per_million_usd - 0.6).abs() < 0.01);
-
-    // Codex v5 full
-    let codex_full = pricing_for_model("gpt-5.2-codex");
-    assert!((codex_full.input_per_million_usd - 2.0).abs() < 0.01);
-    assert!((codex_full.output_per_million_usd - 8.0).abs() < 0.01);
 }
 
 // ── cost_summary static queries ──────────────────────────────────────
@@ -5264,8 +5202,6 @@ async fn cost_summary_returns_three_periods() {
             error_type: None,
             input_tokens: Some(1000),
             output_tokens: Some(500),
-            input_cost_usd: Some(0.003),
-            output_cost_usd: Some(0.0075),
             total_cost_usd: Some(0.0105),
         })
         .await
@@ -5845,8 +5781,6 @@ async fn metrics_summary_by_repo_filters_correctly() {
             error_type: None,
             input_tokens: None,
             output_tokens: None,
-            input_cost_usd: None,
-            output_cost_usd: None,
             total_cost_usd: None,
         })
         .await
@@ -5869,8 +5803,6 @@ async fn metrics_summary_by_repo_filters_correctly() {
             error_type: None,
             input_tokens: None,
             output_tokens: None,
-            input_cost_usd: None,
-            output_cost_usd: None,
             total_cost_usd: None,
         })
         .await
@@ -5946,8 +5878,6 @@ async fn metrics_summary_by_repo_no_duplication_on_id_collision() {
             error_type: None,
             input_tokens: None,
             output_tokens: None,
-            input_cost_usd: None,
-            output_cost_usd: None,
             total_cost_usd: None,
         })
         .await
@@ -5970,8 +5900,6 @@ async fn metrics_summary_by_repo_no_duplication_on_id_collision() {
             error_type: None,
             input_tokens: None,
             output_tokens: None,
-            input_cost_usd: None,
-            output_cost_usd: None,
             total_cost_usd: None,
         })
         .await
@@ -6278,8 +6206,6 @@ async fn cost_summary_by_repo_isolates_per_repo() {
             error_type: None,
             input_tokens: Some(1000),
             output_tokens: Some(500),
-            input_cost_usd: Some(0.003),
-            output_cost_usd: Some(0.0075),
             total_cost_usd: Some(0.0105),
         })
         .await
@@ -6302,8 +6228,6 @@ async fn cost_summary_by_repo_isolates_per_repo() {
             error_type: None,
             input_tokens: Some(2000),
             output_tokens: Some(1000),
-            input_cost_usd: Some(0.006),
-            output_cost_usd: Some(0.015),
             total_cost_usd: Some(0.021),
         })
         .await
@@ -6364,8 +6288,6 @@ async fn cost_summary_by_repo_falls_back_to_tasks_join() {
             error_type: None,
             input_tokens: Some(500),
             output_tokens: Some(200),
-            input_cost_usd: Some(0.0015),
-            output_cost_usd: Some(0.003),
             total_cost_usd: Some(0.0045),
         })
         .await
@@ -6401,8 +6323,6 @@ async fn cost_summary_by_repo_uses_requested_window_label() {
             error_type: None,
             input_tokens: Some(100),
             output_tokens: Some(50),
-            input_cost_usd: Some(0.001),
-            output_cost_usd: Some(0.002),
             total_cost_usd: Some(0.003),
         })
         .await
@@ -6424,8 +6344,6 @@ async fn cost_summary_by_repo_uses_requested_window_label() {
             error_type: None,
             input_tokens: Some(200),
             output_tokens: Some(100),
-            input_cost_usd: Some(0.002),
-            output_cost_usd: Some(0.004),
             total_cost_usd: Some(0.006),
         })
         .await
@@ -7361,9 +7279,9 @@ async fn helper_get_token_usage_result_without_store_returns_err() {
 }
 
 #[tokio::test]
-async fn helper_get_cost_estimate_result_without_store_returns_err() {
+async fn helper_get_reported_cost_result_without_store_returns_err() {
     let store: Option<Arc<TaskStore>> = None;
-    let res = get_cost_estimate_result(&store, "owner/repo", "any").await;
+    let res = get_reported_cost_result(&store, "owner/repo", "any").await;
     assert!(res.is_err());
 }
 

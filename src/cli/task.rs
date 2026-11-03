@@ -2,6 +2,7 @@ use crate::backends::ExternalTask;
 use crate::backends::github::GitHubBackend;
 use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::cli;
+use crate::cli::cost::format_cost;
 use crate::cli::init_task_manager;
 use crate::cli::task_ref;
 use crate::cli::tree::TreeNode;
@@ -576,8 +577,10 @@ pub async fn get(id: &str) -> anyhow::Result<()> {
         }
         if int.input_tokens > 0 || int.output_tokens > 0 {
             println!(
-                "Tokens: {} in / {} out — ${:.6}",
-                int.input_tokens, int.output_tokens, int.total_cost_usd
+                "Tokens: {} in / {} out — cost {}",
+                int.input_tokens,
+                int.output_tokens,
+                format_cost(int.total_cost_usd)
             );
         }
         println!("Created: {}", int.created_at);
@@ -645,11 +648,13 @@ pub async fn get(id: &str) -> anyhow::Result<()> {
         }
     }
     let usage = store::get_token_usage(&store_arc, &repo, &ext.id.0).await;
-    let cost = store::get_cost_estimate(&store_arc, &repo, &ext.id.0).await;
-    if usage.total_tokens() > 0 || cost.total_cost_usd > 0.0 {
+    let cost = store::get_reported_cost(&store_arc, &repo, &ext.id.0).await;
+    if usage.total_tokens() > 0 || cost.is_some() {
         println!(
-            "Tokens: {} in / {} out — ${:.6}",
-            usage.input_tokens, usage.output_tokens, cost.total_cost_usd
+            "Tokens: {} in / {} out — cost {}",
+            usage.input_tokens,
+            usage.output_tokens,
+            format_cost(cost.unwrap_or(0.0))
         );
     }
 
@@ -1597,14 +1602,14 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
 
             // Token & cost summary
             let usage = store::get_token_usage(&store, &repo, &task_key).await;
-            let cost = store::get_cost_estimate(&store, &repo, &task_key).await;
+            let cost = store::get_reported_cost(&store, &repo, &task_key).await;
             let total_tokens = usage.total_tokens();
-            if total_tokens > 0 || cost.total_cost_usd > 0.0 {
+            if total_tokens > 0 || cost.is_some() {
                 println!("\nCost summary:");
                 println!("  input tokens:  {}", usage.input_tokens);
                 println!("  output tokens: {}", usage.output_tokens);
                 println!("  total tokens:  {total_tokens}");
-                println!("  estimated $:   ${:.6}", cost.total_cost_usd);
+                println!("  cost:          {}", format_cost(cost.unwrap_or(0.0)));
             }
 
             // Memory (recent attempts)
@@ -1710,10 +1715,13 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
             if !run.error.is_empty() {
                 println!("    error: {}", run.error);
             }
-            if run.total_cost_usd > 0.0 {
+            if run.input_tokens > 0 || run.output_tokens > 0 || run.total_cost_usd > 0.0 {
                 println!(
-                    "    tokens: {}in/{}out  cost: ${:.6}  duration: {:.1}s",
-                    run.input_tokens, run.output_tokens, run.total_cost_usd, run.duration_secs,
+                    "    tokens: {}in/{}out  cost: {}  duration: {:.1}s",
+                    run.input_tokens,
+                    run.output_tokens,
+                    format_cost(run.total_cost_usd),
+                    run.duration_secs,
                 );
             }
             println!("    started: {}", run.started_at);
@@ -1921,10 +1929,7 @@ pub async fn history(id: &str) -> anyhow::Result<()> {
     if total_tokens > 0 {
         println!("  Input tokens:  {}", task.input_tokens);
         println!("  Output tokens: {}", task.output_tokens);
-        println!(
-            "  Total cost:    ${:.6}",
-            task.input_cost_usd + task.output_cost_usd
-        );
+        println!("  Total cost:    {}", format_cost(task.total_cost_usd));
     }
 
     // Show current assigned agent/model if available
@@ -2066,7 +2071,7 @@ pub async fn inspect(id: &str) -> anyhow::Result<()> {
             "  Tokens : {}in / {}out",
             task.input_tokens, task.output_tokens
         );
-        println!("  Total  : ${:.6}", task.total_cost_usd);
+        println!("  Total  : {}", format_cost(task.total_cost_usd));
     }
 
     // ── Live session ─────────────────────────────────────────────────────────

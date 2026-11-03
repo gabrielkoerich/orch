@@ -59,7 +59,7 @@ pub async fn clear(key: Option<String>, all: bool) -> anyhow::Result<()> {
         cooldown::clear_cooldown(&k, &store).await;
         println!("Cleared cooldown: {k}");
     } else {
-        anyhow::bail!("specify a key (e.g. 'claude' or 'claude:sonnet') or use --all");
+        anyhow::bail!("specify a key (e.g. 'claude' or 'claude:<model>') or use --all");
     }
     Ok(())
 }

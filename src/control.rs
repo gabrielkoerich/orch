@@ -35,9 +35,7 @@ use crate::engine::runner::agents;
 use crate::engine::runner::agents::opencode;
 use crate::engine::runner::direct;
 use crate::home;
-use crate::store;
 use crate::store::TaskStore;
-use crate::store::TokenUsage;
 use anyhow::{Context, Result};
 use regex::Regex;
 use tokio::fs;
@@ -97,14 +95,19 @@ pub enum ControlCommand {
     Restart,
 }
 
-fn default_model_for_agent(agent: &str) -> &'static str {
-    match agent {
-        "codex" => "gpt-4o",
-        "opencode" => "deepseek-r1",
-        // Empty means omit --model and let the grok CLI use its configured default
-        "grok" => "",
-        _ => "sonnet",
-    }
+/// The agent's first model under `models:` in the config. Empty means orch passes no `--model`
+/// and the agent's CLI uses its own default.
+fn default_model_for_agent(agent: &str) -> String {
+    first_model(&RouterConfig::configured_models(agent))
+}
+
+// A pool keyword such as `opencode:free` names no model, so it is skipped
+fn first_model(models: &[String]) -> String {
+    models
+        .iter()
+        .find(|m| !m.contains(':'))
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Parse a control-session command.
@@ -132,38 +135,35 @@ pub fn parse_control_command(message: &str) -> Option<ControlCommand> {
 /// Formats:
 /// - `agent:model` → explicit (e.g., `minimax:sonnet`, `opencode:minimax-m2.5-free`)
 /// - `model` → infer agent from model name
-pub fn parse_model_spec(spec: &str) -> ModelSpec {
+pub fn parse_model_spec(spec: &str, current_agent: &str) -> ModelSpec {
     if let Some((agent, model)) = spec.split_once(':') {
         ModelSpec {
             agent: agent.to_string(),
             model: RouterConfig::normalize_model_identifier(model),
         }
     } else {
+        let model = RouterConfig::normalize_model_identifier(spec);
+        let configured: Vec<(String, Vec<String>)> = engine::configured_agents()
+            .into_iter()
+            .map(|agent| {
+                let models = RouterConfig::configured_models(&agent);
+                (agent, models)
+            })
+            .collect();
         ModelSpec {
-            agent: infer_agent(spec).to_string(),
-            model: RouterConfig::normalize_model_identifier(spec),
+            agent: infer_agent(&model, &configured, current_agent),
+            model,
         }
     }
 }
 
-/// Infer which agent CLI should run a given model name.
-fn infer_agent(model: &str) -> &'static str {
-    let lower = model.to_lowercase();
-    if lower.contains("gpt")
-        || lower.contains("o1")
-        || lower.contains("o3")
-        || lower.contains("o4")
-        || lower.contains("codex")
-    {
-        "codex"
-    } else if lower.contains("deepseek") || lower.contains("qwen") {
-        "opencode"
-    } else if lower.contains("grok") {
-        "grok"
-    } else {
-        // claude models (sonnet, opus, haiku) and unknown → default to claude
-        "claude"
-    }
+/// The agent whose `models:` entry lists the model, or the current agent when none does.
+fn infer_agent(model: &str, configured: &[(String, Vec<String>)], current_agent: &str) -> String {
+    configured
+        .iter()
+        .find(|(_, models)| models.iter().any(|m| m == model))
+        .map_or(current_agent, |(agent, _)| agent.as_str())
+        .to_string()
 }
 
 /// Validate that an agent name is known and installed.
@@ -344,14 +344,17 @@ pub async fn assemble_context(store: &TaskStore, session_id: &str) -> Result<Cha
     Ok(ChatContext { system, state })
 }
 
-/// Get the current model spec from KV, defaulting to `"sonnet"` when the key is absent.
-/// Returns an error if the store read fails.
+/// Get the current model from KV, defaulting to the current agent's configured model when the
+/// key is absent. Returns an error if the store read fails.
 pub async fn get_model(store: &TaskStore) -> Result<String> {
-    Ok(store
+    match store
         .kv_get("control:model")
         .await
         .context("reading control:model from store")?
-        .unwrap_or_else(|| "sonnet".to_string()))
+    {
+        Some(model) => Ok(model),
+        None => Ok(default_model_for_agent(&get_agent(store).await?)),
+    }
 }
 
 /// Get the current agent from KV, defaulting to `"claude"` when the key is absent.
@@ -401,7 +404,7 @@ pub async fn set_model_spec(store: &TaskStore, spec: &ModelSpec) -> Result<()> {
 pub async fn set_agent_spec(store: &TaskStore, agent: &str) -> Result<ModelSpec> {
     let spec = ModelSpec {
         agent: agent.to_string(),
-        model: default_model_for_agent(agent).to_string(),
+        model: default_model_for_agent(agent),
     };
     set_model_spec(store, &spec).await?;
     Ok(spec)
@@ -434,7 +437,7 @@ async fn handle_control_command(
             Ok(format_current_spec(&get_current_spec(store).await?))
         }
         ControlCommand::Model(Some(new_spec)) => {
-            let spec = parse_model_spec(&new_spec);
+            let spec = parse_model_spec(&new_spec, &get_agent(store).await?);
             validate_model(&spec).await?;
             set_model_spec(store, &spec).await?;
             // Reset session UUID so next message starts a fresh conversation
@@ -548,6 +551,13 @@ pub struct InvokeResult {
     pub text: String,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// Cost in USD as the agent reported it
+    pub cost_usd: Option<f64>,
+}
+
+// An empty model omits `--model`, so the agent's CLI uses its own default
+fn model_arg(model: &str) -> Option<&str> {
+    (!model.is_empty()).then_some(model)
 }
 
 fn token_u64_to_i64_saturating(tokens: u64) -> i64 {
@@ -595,13 +605,21 @@ pub async fn invoke_agent(
 ) -> Result<InvokeResult> {
     let dir = prepare_temp_dir().await?;
 
-    let result =
-        direct::run_direct(agent, Some(model), context, message, AGENT_TIMEOUT, &dir).await?;
+    let result = direct::run_direct(
+        agent,
+        model_arg(model),
+        context,
+        message,
+        AGENT_TIMEOUT,
+        &dir,
+    )
+    .await?;
 
     Ok(InvokeResult {
         text: result.text,
         input_tokens: result.input_tokens,
         output_tokens: result.output_tokens,
+        cost_usd: result.cost_usd,
     })
 }
 
@@ -676,7 +694,7 @@ pub async fn invoke_agent_with_session(
 
     let result = direct::run_direct_with_session(
         agent,
-        Some(model),
+        model_arg(model),
         context,
         message,
         AGENT_TIMEOUT,
@@ -689,6 +707,7 @@ pub async fn invoke_agent_with_session(
         text: result.text,
         input_tokens: result.input_tokens,
         output_tokens: result.output_tokens,
+        cost_usd: result.cost_usd,
     })
 }
 
@@ -864,17 +883,7 @@ pub async fn send_message(
                 );
                 let input_tokens = opt_token_u64_to_i64_saturating(chunk_result.input_tokens);
                 let output_tokens = opt_token_u64_to_i64_saturating(chunk_result.output_tokens);
-                let cost_usd = match (chunk_result.input_tokens, chunk_result.output_tokens) {
-                    (Some(input), Some(output)) => {
-                        let pricing = store::pricing_for_model(&model);
-                        let usage = TokenUsage {
-                            input_tokens: input,
-                            output_tokens: output,
-                        };
-                        Some(pricing.estimate_cost_usd(usage).total_cost_usd)
-                    }
-                    _ => None,
-                };
+                let cost_usd = chunk_result.cost_usd;
                 store
                     .insert_control_message(
                         session_id,
@@ -916,17 +925,7 @@ pub async fn send_message(
                 );
                 let input_tokens = opt_token_u64_to_i64_saturating(chunk_result.input_tokens);
                 let output_tokens = opt_token_u64_to_i64_saturating(chunk_result.output_tokens);
-                let cost_usd = match (chunk_result.input_tokens, chunk_result.output_tokens) {
-                    (Some(input), Some(output)) => {
-                        let pricing = store::pricing_for_model(&model);
-                        let usage = TokenUsage {
-                            input_tokens: input,
-                            output_tokens: output,
-                        };
-                        Some(pricing.estimate_cost_usd(usage).total_cost_usd)
-                    }
-                    _ => None,
-                };
+                let cost_usd = chunk_result.cost_usd;
                 store
                     .insert_control_message(
                         session_id,
@@ -1009,17 +1008,7 @@ pub async fn send_message(
             );
             let input_tokens = opt_token_u64_to_i64_saturating(chunk_result.input_tokens);
             let output_tokens = opt_token_u64_to_i64_saturating(chunk_result.output_tokens);
-            let cost_usd = match (chunk_result.input_tokens, chunk_result.output_tokens) {
-                (Some(input), Some(output)) => {
-                    let pricing = store::pricing_for_model(&model);
-                    let usage = TokenUsage {
-                        input_tokens: input,
-                        output_tokens: output,
-                    };
-                    Some(pricing.estimate_cost_usd(usage).total_cost_usd)
-                }
-                _ => None,
-            };
+            let cost_usd = chunk_result.cost_usd;
             store
                 .insert_control_message(
                     session_id,
@@ -1159,42 +1148,60 @@ mod tests {
 
     use super::*;
     use crate::store::TaskStore;
-    use crate::store::TokenUsage;
-    use crate::store::pricing_for_model;
 
     #[test]
     fn parse_spec_agent_model() {
-        let spec = parse_model_spec("minimax:sonnet");
+        let spec = parse_model_spec("minimax:sonnet", "claude");
         assert_eq!(spec.agent, "minimax");
         assert_eq!(spec.model, "sonnet");
     }
 
     #[test]
     fn parse_spec_opencode_model() {
-        let spec = parse_model_spec("opencode:minimax-m2.5-free");
+        let spec = parse_model_spec("opencode:minimax-m2.5-free", "claude");
         assert_eq!(spec.agent, "opencode");
         assert_eq!(spec.model, "minimax-m2.5-free");
     }
 
-    #[test]
-    fn parse_spec_model_only_infers_claude() {
-        let spec = parse_model_spec("sonnet");
-        assert_eq!(spec.agent, "claude");
-        assert_eq!(spec.model, "sonnet");
+    fn configured(entries: &[(&str, &[&str])]) -> Vec<(String, Vec<String>)> {
+        entries
+            .iter()
+            .map(|(agent, models)| {
+                (
+                    agent.to_string(),
+                    models.iter().map(ToString::to_string).collect(),
+                )
+            })
+            .collect()
     }
 
     #[test]
-    fn parse_spec_model_only_infers_codex() {
-        let spec = parse_model_spec("gpt-4o");
-        assert_eq!(spec.agent, "codex");
-        assert_eq!(spec.model, "gpt-4o");
+    fn infer_agent_finds_the_agent_whose_config_lists_the_model() {
+        let configured = configured(&[("claude", &["sonnet"]), ("codex", &["gpt-4o"])]);
+        assert_eq!(infer_agent("gpt-4o", &configured, "claude"), "codex");
+        assert_eq!(infer_agent("sonnet", &configured, "codex"), "claude");
     }
 
     #[test]
-    fn parse_spec_model_only_infers_opencode() {
-        let spec = parse_model_spec("deepseek-r1");
-        assert_eq!(spec.agent, "opencode");
-        assert_eq!(spec.model, "deepseek-r1");
+    fn infer_agent_keeps_the_current_agent_for_an_unlisted_model() {
+        let configured = configured(&[("claude", &["sonnet"])]);
+        assert_eq!(
+            infer_agent("deepseek-r1", &configured, "opencode"),
+            "opencode"
+        );
+    }
+
+    #[test]
+    fn first_model_skips_pool_keywords() {
+        let models = vec!["opencode:free".to_string(), "provider/model".to_string()];
+        assert_eq!(first_model(&models), "provider/model");
+    }
+
+    #[test]
+    fn first_model_is_empty_without_models() {
+        assert_eq!(first_model(&[]), "");
+        assert_eq!(model_arg(""), None);
+        assert_eq!(model_arg("sonnet"), Some("sonnet"));
     }
 
     #[tokio::test]
@@ -1295,26 +1302,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_agent_from_model() {
-        assert_eq!(infer_agent("sonnet"), "claude");
-        assert_eq!(infer_agent("opus"), "claude");
-        assert_eq!(infer_agent("haiku"), "claude");
-        assert_eq!(infer_agent("gpt-4o"), "codex");
-        assert_eq!(infer_agent("o3"), "codex");
-        assert_eq!(infer_agent("deepseek-r1"), "opencode");
-        assert_eq!(infer_agent("grok"), "grok");
-    }
-
     #[tokio::test]
     async fn send_message_model_switch() {
         let store = TaskStore::open_memory().await.unwrap();
+        set_agent(&store, "unlisted-agent").await.unwrap();
         let model = get_model(&store).await.unwrap();
-        assert_eq!(model, "sonnet");
+        assert_eq!(model, "", "an agent with no models: entry gets no --model");
 
         // /model with explicit agent:model — will fail validation (no binary in test)
         // so test parse_model_spec + set_model_spec directly
-        let spec = parse_model_spec("minimax:sonnet");
+        let spec = parse_model_spec("minimax:sonnet", "claude");
         set_model_spec(&store, &spec).await.unwrap();
         assert_eq!(get_model(&store).await.unwrap(), "sonnet");
         assert_eq!(get_agent(&store).await.unwrap(), "minimax");
@@ -1323,32 +1320,35 @@ mod tests {
     #[tokio::test]
     async fn send_message_model_show_current() {
         let store = TaskStore::open_memory().await.unwrap();
+        set_agent(&store, "unlisted-agent").await.unwrap();
         let response = send_message(&store, "default", "cli", None, "/model")
             .await
             .unwrap();
-        assert!(response.contains("claude"));
-        assert!(response.contains("sonnet"));
+        assert_eq!(response, "Current: unlisted-agent:default");
     }
 
     #[tokio::test]
     async fn send_message_agent_show_current() {
         let store = TaskStore::open_memory().await.unwrap();
+        set_agent(&store, "unlisted-agent").await.unwrap();
         let response = send_message(&store, "default", "cli", None, "/agent")
             .await
             .unwrap();
-        assert!(response.contains("claude"));
-        assert!(response.contains("sonnet"));
+        assert_eq!(response, "Current: unlisted-agent:default");
     }
 
     #[tokio::test]
     async fn send_message_agent_switches_with_default_model() {
         let store = TaskStore::open_memory().await.unwrap();
         // Directly set agent spec to bypass validation (no binary in test env)
-        let spec = set_agent_spec(&store, "codex").await.unwrap();
-        assert_eq!(spec.agent, "codex");
-        assert_eq!(spec.model, "gpt-4o");
-        assert_eq!(get_agent(&store).await.unwrap(), "codex");
-        assert_eq!(get_model(&store).await.unwrap(), "gpt-4o");
+        let spec = set_agent_spec(&store, "unlisted-agent").await.unwrap();
+        assert_eq!(spec.agent, "unlisted-agent");
+        assert_eq!(
+            spec.model, "",
+            "an agent with no models: entry gets no --model"
+        );
+        assert_eq!(get_agent(&store).await.unwrap(), "unlisted-agent");
+        assert_eq!(get_model(&store).await.unwrap(), "");
     }
 
     #[test]
@@ -1398,18 +1398,18 @@ mod tests {
     #[tokio::test]
     async fn set_agent_spec_persists_default_model() {
         let store = TaskStore::open_memory().await.unwrap();
-        let spec = set_agent_spec(&store, "codex").await.unwrap();
-        assert_eq!(spec.agent, "codex");
-        assert_eq!(spec.model, "gpt-4o");
-        assert_eq!(get_agent(&store).await.unwrap(), "codex");
-        assert_eq!(get_model(&store).await.unwrap(), "gpt-4o");
+        let spec = set_agent_spec(&store, "unlisted-agent").await.unwrap();
+        assert_eq!(spec.agent, "unlisted-agent");
+        assert_eq!(spec.model, "");
+        assert_eq!(get_agent(&store).await.unwrap(), "unlisted-agent");
+        assert_eq!(get_model(&store).await.unwrap(), "");
     }
 
     #[tokio::test]
     async fn send_message_model_switch_does_not_store() {
         let store = TaskStore::open_memory().await.unwrap();
         // set directly to avoid validation in test env
-        let spec = parse_model_spec("claude:haiku");
+        let spec = parse_model_spec("claude:haiku", "claude");
         set_model_spec(&store, &spec).await.unwrap();
         let messages = store
             .list_control_messages("default", None, 10)
@@ -1462,26 +1462,6 @@ mod tests {
     }
 
     #[test]
-    fn cost_usd_computed_from_token_counts() {
-        let model = "sonnet";
-        let input_tokens: u64 = 1_000_000;
-        let output_tokens: u64 = 1_000_000;
-        let pricing = pricing_for_model(model);
-        let usage = TokenUsage {
-            input_tokens,
-            output_tokens,
-        };
-        let cost = pricing.estimate_cost_usd(usage);
-
-        // sonnet: $3/M input, $15/M output → $18 total for 1M each
-        assert!(cost.total_cost_usd > 0.0, "cost must be non-zero");
-        assert!(
-            (cost.total_cost_usd - 18.0).abs() < 0.01,
-            "expected ~$18 for 1M+1M sonnet tokens"
-        );
-    }
-
-    #[test]
     fn token_u64_to_i64_saturating_caps_large_values() {
         assert_eq!(token_u64_to_i64_saturating(u64::MAX), i64::MAX);
     }
@@ -1508,12 +1488,7 @@ mod tests {
 
         let input_tokens: u64 = 500_000;
         let output_tokens: u64 = 100_000;
-        let pricing = pricing_for_model("sonnet");
-        let usage = TokenUsage {
-            input_tokens,
-            output_tokens,
-        };
-        let cost_usd = Some(pricing.estimate_cost_usd(usage).total_cost_usd);
+        let cost_usd = Some(0.25);
 
         store
             .insert_control_message(
@@ -1540,8 +1515,11 @@ mod tests {
         assert_eq!(messages.len(), 1);
         let msg = &messages[0];
         assert!(msg.cost_usd.is_some(), "cost_usd must be stored, not NULL");
-        let stored = msg.cost_usd.unwrap();
-        assert!(stored > 0.0, "stored cost must be positive");
+        assert_eq!(
+            msg.cost_usd,
+            Some(0.25),
+            "the reported cost is stored as is"
+        );
     }
 
     #[tokio::test]

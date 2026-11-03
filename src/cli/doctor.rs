@@ -1367,8 +1367,6 @@ mod tests {
             needs_review_refires: 0,
             input_tokens: 0,
             output_tokens: 0,
-            input_cost_usd: 0.0,
-            output_cost_usd: 0.0,
             total_cost_usd: 0.0,
             model_reroute_chain: String::new(),
             limit_reroute_chain: String::new(),

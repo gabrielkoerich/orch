@@ -4,7 +4,8 @@
 //! in a fire-and-forget mode without a persistent tmux session.
 
 use crate::engine::runner::agents::{
-    AgentError, PermissionRules, get_runner, shell_single_quote, supports_session,
+    AgentError, PermissionRules, find_agent_result, get_runner, shell_single_quote,
+    supports_session,
 };
 use anyhow::Result;
 use std::error;
@@ -25,6 +26,7 @@ pub struct DirectResult {
     pub text: String,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub cost_usd: Option<f64>,
 }
 
 /// Error type for `run_direct_command_raw()` — carries stdout on non-zero exit
@@ -227,6 +229,7 @@ fn finish_output(output: &Output, agent: &str) -> Result<DirectResult> {
                 text,
                 input_tokens: parsed.input_tokens,
                 output_tokens: parsed.output_tokens,
+                cost_usd: parsed.cost_usd,
             })
         }
         Err(AgentError::InvalidResponse { .. }) => {
@@ -235,6 +238,7 @@ fn finish_output(output: &Output, agent: &str) -> Result<DirectResult> {
                 text,
                 input_tokens,
                 output_tokens,
+                cost_usd: find_agent_result(agent, &stdout).and_then(|r| r.cost_usd),
             })
         }
         Err(err) => anyhow::bail!("{err}"),
@@ -403,6 +407,7 @@ mod tests {
             text: "hi".to_string(),
             input_tokens: Some(1),
             output_tokens: Some(2),
+            cost_usd: None,
         };
         assert!(format!("{r:?}").contains("hi"));
     }

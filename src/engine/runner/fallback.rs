@@ -866,6 +866,7 @@ mod tests {
                 },
                 input_tokens: None,
                 output_tokens: None,
+                cost_usd: None,
                 duration_ms: None,
             })
         }
@@ -922,6 +923,7 @@ mod tests {
                 },
                 input_tokens: None,
                 output_tokens: None,
+                cost_usd: None,
                 duration_ms: None,
             })
         }
