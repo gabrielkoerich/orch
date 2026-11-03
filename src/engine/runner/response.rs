@@ -30,6 +30,7 @@ use tokio::time;
 // Cooldown tracking is implemented in `crate::engine::cooldown` (shared with the router).
 use crate::cli::ndjson;
 use crate::cmd_cache;
+use crate::config as app_config;
 use crate::engine;
 pub use crate::engine::cooldown::{
     clear_expired_cooldowns, is_agent_in_cooldown, is_model_in_cooldown,
@@ -390,6 +391,13 @@ pub async fn handle_failover(
     let chain = get_reroute_chain(task_id, store, repo).await;
     let chain = update_reroute_chain(task_id, agent_name, &chain, store, repo).await;
 
+    if error_type == RetryableError::Timeout
+        && let Some(status) =
+            block_after_repeated_timeouts(task_id, error_message, store, repo).await
+    {
+        return status;
+    }
+
     // Get all available agents
     let available: Vec<String> = engine::configured_agents()
         .into_iter()
@@ -556,6 +564,15 @@ pub async fn handle_failover(
     // No fallback available
     tracing::warn!(task_id, agent = agent_name, "no fallback agents available");
 
+    let is_retryable = matches!(
+        error_type,
+        RetryableError::UsageLimit
+            | RetryableError::AuthError
+            | RetryableError::ModelUnavailable
+            | RetryableError::Timeout
+            | RetryableError::Interrupted
+    );
+
     // Timeouts and interrupts are not agent faults, skip the agent cooldown
     if !matches!(
         error_type,
@@ -566,6 +583,49 @@ pub async fn handle_failover(
     ) && !credit_recorded
     {
         record_agent_failure_with_message(agent_name, error_message).await;
+    }
+
+    if is_retryable {
+        // The other agents are in cooldown, so wait out the backoff and let the router
+        // pick the task up again. A fresh chain keeps the next run from seeing every agent as tried
+        wait_for_fallback_backoff(task_id, store, repo).await;
+
+        let msg = format!("{error_message} (no fallback agents, will retry)");
+        if let Err(e) = store::store_set_result(
+            store,
+            repo,
+            task_id,
+            &[
+                ("last_error", serde_json::json!(msg)),
+                ("limit_reroute_chain", serde_json::json!("")),
+            ],
+        )
+        .await
+        {
+            tracing::warn!(task_id, err = %e, "failed to write no_fallback retry fields to store");
+        }
+
+        let details = serde_json::json!({
+            "failure_reason": error_type.type_str(),
+            "error_message": error_message,
+            "chain": chain,
+            "no_fallback_available": true,
+            "is_retryable": true,
+        });
+        store::store_log_activity(
+            store,
+            repo,
+            task_id,
+            "rerouted",
+            Some("in_progress"),
+            Some("new"),
+            None::<&str>,
+            None::<&str>,
+            Some(&details),
+        )
+        .await;
+
+        return "new".to_string();
     }
 
     let msg = format!("{error_message}, no fallback agents");
@@ -601,6 +661,73 @@ pub async fn handle_failover(
     .await;
 
     "needs_review".to_string()
+}
+
+/// Count a timeout against the task. Returns "blocked" once the task has timed out
+/// `workflow.max_timeout_retries` times (default 3), so a task that always times out does not loop
+pub async fn block_after_repeated_timeouts(
+    task_id: &str,
+    error_message: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+) -> Option<String> {
+    let max: i64 = app_config::get("workflow.max_timeout_retries")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let count = match store::store_increment(store, repo, task_id, "timeout_retries").await {
+        Ok(count) => i64::try_from(count).unwrap_or(i64::MAX),
+        Err(e) => {
+            tracing::warn!(task_id, err = %e, "failed to increment timeout_retries");
+            return None;
+        }
+    };
+    if count < max {
+        return None;
+    }
+
+    let block_reason = format!("timed out {count} times");
+    tracing::warn!(
+        task_id,
+        count,
+        max,
+        "timeout retries exhausted, blocking task"
+    );
+    if let Err(e) = store::store_set_result(
+        store,
+        repo,
+        task_id,
+        &[
+            (
+                "last_error",
+                serde_json::json!(format!("{error_message} ({block_reason})")),
+            ),
+            ("block_reason", serde_json::json!(block_reason)),
+            ("limit_reroute_chain", serde_json::json!("")),
+        ],
+    )
+    .await
+    {
+        tracing::warn!(task_id, err = %e, "failed to write timeout block fields to store");
+    }
+    let details = serde_json::json!({
+        "failure_reason": "timeout",
+        "error_message": error_message,
+        "timeout_retries": count,
+    });
+    store::store_log_activity(
+        store,
+        repo,
+        task_id,
+        "rerouted",
+        Some("in_progress"),
+        Some("blocked"),
+        None::<&str>,
+        None::<&str>,
+        Some(&details),
+    )
+    .await;
+    Some("blocked".to_string())
 }
 
 /// Get the reroute chain from store.
@@ -1010,6 +1137,7 @@ mod tests {
             pr_create_failures: 0,
             push_failures: 0,
             network_retries: 3,
+            timeout_retries: 0,
             review_agent_failures: 0,
             review_resets: 0,
             review_cycles: 0,
@@ -2061,5 +2189,145 @@ That's all."#;
         let result = find_agent_result("claude", raw).expect("should find result");
         assert!(result.is_error, "should be flagged as error");
         assert!(result.result_text.contains("rate limit"));
+    }
+
+    /// Two fake agents on PATH, a config that names them and a 1 ms backoff. Each nextest test
+    /// runs in its own process, so the environment is not restored
+    #[cfg(unix)]
+    fn failover_env() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        for agent in ["claude", "codex"] {
+            let path = bin.join(agent);
+            fs::write(&path, "#!/bin/sh\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let home = dir.path().join("home");
+        fs::create_dir(&home).unwrap();
+        fs::write(
+            home.join("config.yml"),
+            "agents: [claude, codex]\ndispatch:\n  retry_base_delay_ms: 1\n  retry_max_delay_ms: 1\nworkflow:\n  max_timeout_retries: 3\n",
+        )
+        .unwrap();
+        let mut path = bin.as_os_str().to_os_string();
+        path.push(":");
+        path.push(env::var_os("PATH").unwrap_or_default());
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::set_var("PATH", path) };
+        // SAFETY: same as above
+        unsafe { env::set_var("ORCH_HOME", &home) };
+        cmd_cache::reset_for_test();
+        dir
+    }
+
+    async fn failover_task() -> (Arc<TaskStore>, String) {
+        let store = Arc::new(TaskStore::open_memory().await.expect("in-memory store"));
+        let id = store
+            .create_internal("owner/repo", "t", "b", "test", "", None)
+            .await
+            .unwrap();
+        (store, format!("internal:{id}"))
+    }
+
+    /// Every other agent is in cooldown, so the timed-out task retries from `new` after the backoff
+    #[cfg(unix)]
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn timeout_with_every_other_agent_cooled_retries_as_new() {
+        let _env = failover_env();
+        cooldown::reset_global_state().await;
+        set_agent_cooldown("codex", 600).await;
+        let (store, task_id) = failover_task().await;
+        let store = Some(store);
+
+        let status = handle_failover(
+            &task_id,
+            "claude",
+            RetryableError::Timeout,
+            "claude timed out after 1804s",
+            false,
+            &store,
+            "owner/repo",
+        )
+        .await;
+
+        assert_eq!(status, "new");
+        let task = store::opt_store_get_task(&store, "owner/repo", &task_id)
+            .await
+            .unwrap();
+        assert!(task.limit_reroute_chain.is_empty(), "chain must be cleared");
+        assert!(
+            task.last_error.contains("will retry"),
+            "{}",
+            task.last_error
+        );
+        assert_eq!(task.timeout_retries, 1);
+    }
+
+    /// Another agent is free, so the timeout still reroutes to it
+    #[cfg(unix)]
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn timeout_with_a_free_agent_reroutes_to_it() {
+        let _env = failover_env();
+        cooldown::reset_global_state().await;
+        let (store, task_id) = failover_task().await;
+        let store = Some(store);
+
+        let status = handle_failover(
+            &task_id,
+            "claude",
+            RetryableError::Timeout,
+            "claude timed out after 1804s",
+            false,
+            &store,
+            "owner/repo",
+        )
+        .await;
+
+        assert_eq!(status, "new");
+        let task = store::opt_store_get_task(&store, "owner/repo", &task_id)
+            .await
+            .unwrap();
+        assert_eq!(task.limit_reroute_chain, "claude");
+        assert!(task.last_error.contains("re-route"), "{}", task.last_error);
+    }
+
+    /// A task that times out on every run blocks after `max_timeout_retries` and keeps its issue open
+    #[cfg(unix)]
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn repeated_timeouts_block_the_task() {
+        let _env = failover_env();
+        cooldown::reset_global_state().await;
+        set_agent_cooldown("codex", 600).await;
+        let (store, task_id) = failover_task().await;
+        let store = Some(store);
+
+        let mut statuses = Vec::new();
+        for _ in 0..3 {
+            statuses.push(
+                handle_failover(
+                    &task_id,
+                    "claude",
+                    RetryableError::Timeout,
+                    "claude timed out after 1804s",
+                    false,
+                    &store,
+                    "owner/repo",
+                )
+                .await,
+            );
+        }
+
+        assert_eq!(statuses, ["new", "new", "blocked"]);
+        let task = store::opt_store_get_task(&store, "owner/repo", &task_id)
+            .await
+            .unwrap();
+        assert_eq!(task.block_reason.as_deref(), Some("timed out 3 times"));
+        assert_eq!(task.timeout_retries, 3);
     }
 }

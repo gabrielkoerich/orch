@@ -5937,6 +5937,7 @@ mod tests {
             pr_create_failures: 0,
             push_failures: 0,
             network_retries: 0,
+            timeout_retries: 0,
             review_agent_failures: 0,
             review_resets: 0,
             review_cycles: 0,
