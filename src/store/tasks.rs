@@ -647,6 +647,24 @@ impl TaskStore {
         Ok(())
     }
 
+    /// When the task last entered `status`
+    pub async fn status_entered_at(
+        &self,
+        task_id: i64,
+        status: TaskStatus,
+    ) -> anyhow::Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT timestamp FROM task_activity
+             WHERE task_id = ? AND event_type = 'status_change' AND to_status = ?
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(status.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(ts,)| ts))
+    }
+
     /// When the task last entered in_review, and whether a review decision was recorded since
     pub async fn in_review_entry(&self, task_id: i64) -> anyhow::Result<Option<(String, bool)>> {
         let row: Option<(String, bool)> = sqlx::query_as(

@@ -363,6 +363,56 @@ pub fn configured_agents() -> Vec<String> {
         .collect()
 }
 
+/// Seconds a live session may run past its own timeout before stuck recovery takes it. The
+/// `timeout` wrapper ends the agent at the limit, and the runner still collects the result
+pub const RUN_TIMEOUT_GRACE_SECS: u64 = 300;
+
+/// The limit the `timeout` wrapper puts on one agent run, per complexity
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunTimeouts {
+    pub base: u64,
+    pub medium: u64,
+    pub complex: u64,
+}
+
+impl Default for RunTimeouts {
+    fn default() -> Self {
+        Self {
+            base: 1800,
+            medium: 1800,
+            complex: 1800,
+        }
+    }
+}
+
+impl RunTimeouts {
+    /// `workflow.timeout_seconds` (at least 1800), raised by
+    /// `workflow.timeout_by_complexity.{medium,complex}` but never below the base
+    pub fn from_config() -> Self {
+        let read = |key: &str| -> Option<u64> {
+            crate::config::get(key).ok().and_then(|s| s.parse().ok())
+        };
+        let base = read("workflow.timeout_seconds").unwrap_or(1800).max(1800);
+        Self {
+            base,
+            medium: read("workflow.timeout_by_complexity.medium")
+                .unwrap_or(base)
+                .max(base),
+            complex: read("workflow.timeout_by_complexity.complex")
+                .unwrap_or(base)
+                .max(base),
+        }
+    }
+
+    pub fn for_complexity(&self, complexity: Option<&str>) -> u64 {
+        match complexity {
+            Some("complex") => self.complex,
+            Some("medium") => self.medium,
+            _ => self.base,
+        }
+    }
+}
+
 /// Engine configuration.
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
@@ -386,6 +436,8 @@ pub struct EngineConfig {
     /// `from_config` keeps it above the review agent's own timeout plus
     /// `review::REVIEW_RESULT_DELIVERY_SECS`.
     pub in_review_no_session_stuck_timeout: u64,
+    /// Per-run agent timeouts. A live session is not stuck before its own timeout runs out
+    pub run_timeouts: RunTimeouts,
     /// Auto-create follow-up tasks when PR reviews request changes
     pub auto_create_followup_on_changes: bool,
     /// Graceful shutdown timeout — how long to wait for running agents before exiting.
@@ -415,6 +467,7 @@ impl Default for EngineConfig {
             stuck_timeout: 1800,
             no_session_stuck_timeout: 600,
             in_review_no_session_stuck_timeout: 1920,
+            run_timeouts: RunTimeouts::default(),
             auto_create_followup_on_changes: true,
             graceful_shutdown_timeout: std::time::Duration::from_secs(600),
             silence_grace_period: 300,
@@ -426,6 +479,16 @@ impl Default for EngineConfig {
 }
 
 impl EngineConfig {
+    /// Stuck limit for an in_progress task whose session is alive: `stuck_timeout`, raised to the
+    /// run's own timeout plus `RUN_TIMEOUT_GRACE_SECS`
+    pub fn live_session_stuck_limit(&self, complexity: Option<&str>) -> u64 {
+        self.stuck_timeout.max(
+            self.run_timeouts
+                .for_complexity(complexity)
+                .saturating_add(RUN_TIMEOUT_GRACE_SECS),
+        )
+    }
+
     /// Load engine configuration from config files, falling back to defaults.
     pub fn from_config() -> Self {
         let mut config = Self::default();
@@ -505,6 +568,8 @@ impl EngineConfig {
             }
             config.in_review_no_session_stuck_timeout = floored;
         }
+
+        config.run_timeouts = RunTimeouts::from_config();
 
         if let Ok(val) = crate::config::get("engine.webhook_health_check_interval") {
             if let Ok(secs) = val.parse::<u64>() {
@@ -3292,6 +3357,37 @@ mod tests {
         let semaphore = Arc::new(Semaphore::new(4));
         assert_eq!(resize_dispatch_pool(&semaphore, 4, 4), 4);
         assert_eq!(semaphore.available_permits(), 4);
+    }
+
+    #[test]
+    fn live_session_stuck_limit_follows_the_run_timeout() {
+        let config = EngineConfig {
+            stuck_timeout: 1800,
+            run_timeouts: RunTimeouts {
+                base: 1800,
+                medium: 2700,
+                complex: 3600,
+            },
+            ..EngineConfig::default()
+        };
+        assert_eq!(
+            config.live_session_stuck_limit(Some("simple")),
+            1800 + RUN_TIMEOUT_GRACE_SECS
+        );
+        assert_eq!(
+            config.live_session_stuck_limit(Some("medium")),
+            2700 + RUN_TIMEOUT_GRACE_SECS
+        );
+        assert_eq!(
+            config.live_session_stuck_limit(Some("complex")),
+            3600 + RUN_TIMEOUT_GRACE_SECS
+        );
+
+        let long_stuck = EngineConfig {
+            stuck_timeout: 7200,
+            ..config
+        };
+        assert_eq!(long_stuck.live_session_stuck_limit(Some("complex")), 7200);
     }
 
     #[test]
