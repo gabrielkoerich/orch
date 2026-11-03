@@ -22,13 +22,36 @@ Run unit and integration tests with `cargo nextest run` (preferred, matches CI) 
 
 ## Required checks before committing
 
-CI enforces all three -- run them locally before pushing:
+CI enforces all four, run them locally before pushing:
 
 ```bash
 cargo fmt -- --check                       # formatting
 cargo clippy --all-targets -- -D warnings  # lints (warnings are errors, incl. test code)
 cargo nextest run                          # tests
+DYLINT_RUSTFLAGS="-D warnings" cargo dylint --all -- --all-targets  # use_in_fn lint
 ```
+
+Install dylint with `cargo +stable install cargo-dylint dylint-link --version 6.3.2 --locked`. The pinned 1.94.1 is too old to build cargo-dylint.
+
+## Import rules
+
+Every import is a `use` at the top of its module. Lint rules enforce it, because agents copy the style they see and an instruction alone did not stop inline paths from spreading.
+
+| Rule | Lint |
+|------|------|
+| No crate-rooted path of more than two segments in code (`crate::db::Store`, `std::fs::read`) | `clippy::absolute_paths` with `absolute-paths-max-segments = 2` |
+| `mod` declarations, then `use`, then all other items | `clippy::arbitrary_source_item_ordering`, module groups in `clippy.toml`, no alphabetical order inside a group |
+| No `use` after a statement | `clippy::items_after_statements` (pedantic) |
+| No `use` inside a function, method or closure body | `use_in_fn`, a [dylint](https://github.com/trailofbits/dylint) library in `lints/use_in_fn` |
+
+No Clippy or rustc lint catches a `use` at the start of a body, so `use_in_fn` fills that gap. It is an early lint pass over the expanded AST, so it also flags a `use` that a local `macro_rules!` expands into a body. It skips macros from other crates. A test that greps the source was rejected: it is not a lint, and it misses macro output.
+
+`arbitrary_source_item_ordering` skips `#[cfg(test)]` modules, so a test module stays at the bottom of its file. Any other inline module goes in its own file and is declared at the top.
+
+Costs:
+
+- The lint library builds with the nightly that `dylint_linting` 6.3 needs, pinned in `lints/use_in_fn/rust-toolchain.toml`. A `dylint_linting` upgrade moves that pin, and rustc's internal API can break the lint on the way.
+- Each CI run of `check` installs that nightly with `rustc-dev`, builds the dylint driver and the lint library, and runs one more `cargo check` of orch on the nightly. A rustc warning that only the nightly knows also fails that step.
 
 Or all at once:
 
