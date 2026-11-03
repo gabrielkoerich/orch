@@ -32,10 +32,10 @@ pub(crate) const TASK_COLS: &str = "id, external_id, repo, origin, title, body, 
     memory, delegations, created_at, updated_at, \
      review_invocations, needs_review_refires, push_failures, auto_unblock_count, auto_unblock_last_at, \
      ci_recovery_count, auto_unblock_last_reason, no_code_reroutes, network_retries, no_code_last_agent, \
-     owner_node";
+     owner_node, timeout_retries";
 
 /// Number of columns in TASK_COLS (used for diagnostic verification).
-pub(crate) const TASK_COLS_COUNT: usize = 61;
+pub(crate) const TASK_COLS_COUNT: usize = 62;
 
 /// Explicit column list for `SELECT` queries on the `task_runs` table.
 const TASK_RUN_COLS: &str = "id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, \
@@ -96,6 +96,7 @@ const ALLOWED_FIELDS: &[&str] = &[
     "ci_recovery_count",
     "no_code_reroutes",
     "network_retries",
+    "timeout_retries",
     "no_code_last_agent",
 ];
 
@@ -116,6 +117,7 @@ const INCREMENTABLE_FIELDS: &[&str] = &[
     "ci_recovery_count",
     "no_code_reroutes",
     "network_retries",
+    "timeout_retries",
 ];
 
 fn sanitize_activity_details(value: &serde_json::Value) -> serde_json::Value {
@@ -256,6 +258,8 @@ pub struct Task {
     pub pr_create_failures: i32,
     pub push_failures: i32,
     pub network_retries: i32,
+    /// Runs that ended in a timeout, reset by retry.
+    pub timeout_retries: i32,
     pub review_agent_failures: i32,
     // Review retries that ended without a decision and without counting as a failure
     pub review_resets: i32,
@@ -1613,6 +1617,7 @@ impl TaskStore {
             pr_create_failures = 0,
             push_failures = 0,
             network_retries = 0,
+            timeout_retries = 0,
             auto_unblock_count = 0,
             auto_unblock_last_at = '',
             auto_unblock_last_reason = '',
@@ -2220,6 +2225,7 @@ impl TaskStore {
             pr_create_failures: row.try_get("pr_create_failures").unwrap_or(0),
             push_failures: row.try_get::<i32, _>("push_failures").unwrap_or(0),
             network_retries: row.try_get::<i32, _>("network_retries").unwrap_or(0),
+            timeout_retries: row.try_get::<i32, _>("timeout_retries").unwrap_or(0),
             review_agent_failures: row.try_get("review_agent_failures").unwrap_or(0),
             review_resets: row.try_get::<i32, _>("review_resets").unwrap_or(0),
             review_cycles: row.try_get("review_cycles").unwrap_or(0),

@@ -372,6 +372,7 @@ pub(crate) async fn reset_counters(
         pr_create_failures = 0,
         push_failures = 0,
         network_retries = 0,
+        timeout_retries = 0,
         auto_unblock_count = 0,
         auto_unblock_last_at = '',
         auto_unblock_last_reason = '',
