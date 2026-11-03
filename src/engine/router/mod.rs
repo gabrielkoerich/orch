@@ -157,6 +157,25 @@ impl AgentProfile {
 }
 
 impl RouteResult {
+    /// The model for the task's tier, or one from the nearest tier with a free model. The warning
+    /// names the tier used when it differs, so the switch shows in the route activity
+    pub(crate) fn resolve_model(
+        config: &RouterConfig,
+        agent: &str,
+        complexity: &str,
+        task_id: &str,
+    ) -> (Option<String>, Option<String>) {
+        match config.model_for_complexity_or_adjacent(agent, complexity, task_id) {
+            Some((model, tier)) if tier != complexity => {
+                let warning =
+                    format!("no available {complexity} model for {agent}; using {tier} tier");
+                (Some(model), Some(warning))
+            }
+            Some((model, _)) => (Some(model), None),
+            None => (None, None),
+        }
+    }
+
     /// Build a standard route result from the three task-specific values.
     ///
     /// Fills `profile`, `selected_skills`, and `warning` with router-config
@@ -168,7 +187,7 @@ impl RouteResult {
         config: &RouterConfig,
         task_id: &str,
     ) -> Self {
-        let model = config.model_for_complexity(&agent, &complexity, task_id);
+        let (model, warning) = Self::resolve_model(config, &agent, &complexity, task_id);
         Self {
             agent,
             model,
@@ -177,7 +196,7 @@ impl RouteResult {
             reason,
             profile: AgentProfile::default_from_config(config),
             selected_skills: config.default_skills.clone(),
-            warning: None,
+            warning,
         }
     }
 }
@@ -796,9 +815,8 @@ impl Router {
                 // model which causes some agents (e.g. opencode) to exit
                 // silently.
                 if self.agent_is_routable(&agent, &complexity) {
-                    let model = self
-                        .config
-                        .model_for_complexity(&agent, &complexity, &task.id.0);
+                    let (model, tier_warning) =
+                        RouteResult::resolve_model(&self.config, &agent, &complexity, &task.id.0);
 
                     // Only dispatch label overrides when we have a concrete
                     // model to send to the executor. Dispatching with an
@@ -825,6 +843,7 @@ impl Router {
                         // resolved model (may differ from from_config's default).
                         result.profile.role = format!("{agent} specialist");
                         result.model = model.clone();
+                        result.warning = tier_warning;
                         self.log_route_activity(store, repo, &task.id.0, &result, None)
                             .await;
                         return Ok(result);
@@ -997,7 +1016,8 @@ impl Router {
                             fallback = %fallback_agent,
                             "LLM selected the no-code agent — routing to alternative"
                         );
-                        let fallback_model = self.config.model_for_complexity(
+                        let (fallback_model, _) = RouteResult::resolve_model(
+                            &self.config,
                             &fallback_agent,
                             &result.complexity,
                             &task.id.0,
@@ -1035,7 +1055,8 @@ impl Router {
                             .find(|agent| *agent != &result.agent)
                             .cloned()
                             .unwrap_or_else(|| candidates[0].clone());
-                        let fallback_model = self.config.model_for_complexity(
+                        let (fallback_model, _) = RouteResult::resolve_model(
+                            &self.config,
                             &fallback_agent,
                             &result.complexity,
                             &task.id.0,

@@ -147,7 +147,8 @@ impl OllamaRouter {
             llm_response.complexity.to_lowercase()
         };
 
-        let model = config.model_for_complexity(&agent, &complexity, &task.id.0);
+        let (model, tier_warning) =
+            RouteResult::resolve_model(config, &agent, &complexity, &task.id.0);
 
         let mut profile = AgentProfile {
             role: llm_response.profile.role,
@@ -180,7 +181,7 @@ impl OllamaRouter {
             reason: llm_response.reason,
             profile,
             selected_skills,
-            warning: None,
+            warning: tier_warning,
         })
     }
 

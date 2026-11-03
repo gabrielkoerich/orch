@@ -11,6 +11,9 @@ use crate::engine::cooldown;
 use crate::engine::router::selection;
 use crate::engine::runner::agents::opencode;
 
+/// Model tiers in ascending order
+const COMPLEXITY_TIERS: [&str; 3] = ["simple", "medium", "complex"];
+
 /// Minimum healthy agents threshold for graceful degradation.
 /// When healthy agents fall below this number, dispatch switches to sequential mode.
 pub fn min_healthy_agents_threshold() -> usize {
@@ -726,6 +729,47 @@ impl RouterConfig {
         None
     }
 
+    /// Tiers to try for `complexity`, in order: its own, the higher tiers nearest first, then the
+    /// lower tiers nearest first. A tier outside simple, medium and complex has only itself
+    fn tier_search_order(complexity: &str) -> Vec<&str> {
+        let Some(idx) = COMPLEXITY_TIERS.iter().position(|t| *t == complexity) else {
+            return vec![complexity];
+        };
+        let mut order = vec![COMPLEXITY_TIERS[idx]];
+        order.extend(&COMPLEXITY_TIERS[idx + 1..]);
+        order.extend(COMPLEXITY_TIERS[..idx].iter().rev());
+        order
+    }
+
+    /// Like `model_for_complexity`, but when the task's own tier has no available model it takes
+    /// one from the tiers above, then below. Returns the model and the tier it came from
+    pub fn model_for_complexity_or_adjacent(
+        &self,
+        agent: &str,
+        complexity: &str,
+        task_id: &str,
+    ) -> Option<(String, String)> {
+        Self::tier_search_order(complexity)
+            .into_iter()
+            .find_map(|tier| {
+                self.model_for_complexity(agent, tier, task_id)
+                    .map(|model| (model, tier.to_string()))
+            })
+    }
+
+    /// The tier `model` runs from for a task of `complexity`: the first tier in the search order
+    /// whose pool lists it, or `complexity` itself when none does
+    pub fn tier_of_model(&self, agent: &str, model: &str, complexity: &str) -> String {
+        Self::tier_search_order(complexity)
+            .into_iter()
+            .find(|tier| {
+                self.expanded_model_pool(agent, tier)
+                    .is_some_and(|pool| pool.iter().any(|m| m == model))
+            })
+            .unwrap_or(complexity)
+            .to_string()
+    }
+
     /// True when this config can reach opencode: a `model_map` tier lists it, or the
     /// effective router pool or fallback names it. Those are the only entries read out of
     /// `opencode models`, so every other config can skip the call
@@ -829,6 +873,82 @@ mod tests {
         assert!(
             result.is_none(),
             "should return None when all models in pool are in cooldown, got {result:?}"
+        );
+    }
+
+    fn tiered_config(agent: &str, tiers: &[(&str, &str)]) -> RouterConfig {
+        let mut config = RouterConfig::default();
+        config.model_map.clear();
+        for (tier, model) in tiers {
+            config
+                .model_map
+                .entry((*tier).to_string())
+                .or_default()
+                .insert(agent.to_string(), vec![(*model).to_string()]);
+        }
+        config
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn adjacent_tier_prefers_higher_over_lower() {
+        cooldown::reset_global_state().await;
+        let agent = "tieragent_higher";
+        let config = tiered_config(
+            agent,
+            &[("simple", "t-s"), ("medium", "t-m"), ("complex", "t-c")],
+        );
+        cooldown::record_model_failure(agent, "t-m").await;
+
+        let got = config.model_for_complexity_or_adjacent(agent, "medium", "t");
+        assert_eq!(got, Some(("t-c".to_string(), "complex".to_string())));
+        assert_eq!(config.tier_of_model(agent, "t-c", "medium"), "complex");
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn simple_task_tries_medium_then_complex_before_lower() {
+        cooldown::reset_global_state().await;
+        let agent = "tieragent_simple";
+        let config = tiered_config(
+            agent,
+            &[("simple", "u-s"), ("medium", "u-m"), ("complex", "u-c")],
+        );
+        cooldown::record_model_failure(agent, "u-s").await;
+        cooldown::record_model_failure(agent, "u-m").await;
+
+        let got = config.model_for_complexity_or_adjacent(agent, "simple", "t");
+        assert_eq!(got, Some(("u-c".to_string(), "complex".to_string())));
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn adjacent_tier_falls_back_to_lower_when_higher_tiers_are_unavailable() {
+        cooldown::reset_global_state().await;
+        let agent = "tieragent_lower";
+        let config = tiered_config(agent, &[("simple", "v-s"), ("medium", "v-m")]);
+        cooldown::record_model_failure(agent, "v-m").await;
+
+        let got = config.model_for_complexity_or_adjacent(agent, "complex", "t");
+        assert_eq!(got, Some(("v-s".to_string(), "simple".to_string())));
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn adjacent_tier_returns_none_when_every_tier_is_cooled() {
+        cooldown::reset_global_state().await;
+        let agent = "tieragent_allcooled";
+        let config = tiered_config(
+            agent,
+            &[("simple", "w-s"), ("medium", "w-m"), ("complex", "w-c")],
+        );
+        for m in ["w-s", "w-m", "w-c"] {
+            cooldown::record_model_failure(agent, m).await;
+        }
+
+        assert_eq!(
+            config.model_for_complexity_or_adjacent(agent, "medium", "t"),
+            None
         );
     }
 
