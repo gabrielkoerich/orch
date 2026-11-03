@@ -1167,9 +1167,15 @@ fn agent_blocked_reason(resp: &crate::parser::AgentResponse) -> String {
 fn is_denied_push_block(resp: &crate::parser::AgentResponse) -> bool {
     let r = agent_blocked_reason(resp).to_lowercase();
     r.contains("push")
-        && ["denied", "not allowed", "permission", "disallowed"]
-            .iter()
-            .any(|p| r.contains(p))
+        && [
+            "denied",
+            "not allowed",
+            "permission",
+            "disallowed",
+            "approval",
+        ]
+        .iter()
+        .any(|p| r.contains(p))
 }
 
 /// Heuristic classifier for agent-returned blocked reasons.
@@ -2046,6 +2052,13 @@ mod tests {
         assert!(is_denied_push_block(&resp(
             "Work committed, but `git push -u origin HEAD` was denied"
         )));
+        assert!(is_denied_push_block(&resp(
+            "It is not pushed: `git push --force-with-lease` needs approval that this session could not get."
+        )));
+        assert!(is_denied_push_block(&resp(
+            "`git push --force-with-lease` was denied because this session cannot get approval"
+        )));
+        assert!(is_denied_push_block(&resp("The push requires approval")));
         assert!(!is_denied_push_block(&resp("Missing API key")));
     }
 
