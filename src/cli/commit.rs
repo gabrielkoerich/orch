@@ -1,9 +1,16 @@
+use crate::cli;
 use crate::cmd::SyncCommandErrorContext;
+use crate::config;
+use crate::control;
+use crate::engine::runner::commit;
 use crate::engine::runner::diff::parse_unified_diff_hunks;
 use anyhow::Context;
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::io::{self, Write};
+use std::iter;
 use std::path::Path;
+use std::process::Command;
 
 /// Default cap on diff bytes sent to the LLM per commit group.
 const DEFAULT_MAX_DIFF_BYTES: usize = 32 * 1024;
@@ -84,7 +91,7 @@ pub async fn run(
 /// On any error (no store, no agent, cooldowns, timeout) the heuristic
 /// message survives and a one-line warning is logged.
 async fn enrich_with_llm(plans: &mut [CommitPlan]) {
-    let store = match crate::cli::init_store().await {
+    let store = match cli::init_store().await {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(
@@ -95,14 +102,14 @@ async fn enrich_with_llm(plans: &mut [CommitPlan]) {
         }
     };
 
-    let agent = match crate::control::get_agent(&store).await {
+    let agent = match control::get_agent(&store).await {
         Ok(a) => a,
         Err(e) => {
             tracing::warn!(error = %e, "orch commit: could not resolve agent; using heuristic messages");
             return;
         }
     };
-    let model = match crate::control::get_model(&store).await {
+    let model = match control::get_model(&store).await {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(error = %e, "orch commit: could not resolve model; using heuristic messages");
@@ -126,7 +133,7 @@ async fn enrich_with_llm(plans: &mut [CommitPlan]) {
 }
 
 fn resolve_max_diff_bytes() -> usize {
-    crate::config::get("commit.max_diff_bytes")
+    config::get("commit.max_diff_bytes")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|n| *n > 0)
@@ -143,7 +150,7 @@ async fn draft_message_for_plan(
     let paths: Vec<String> = plan
         .files
         .iter()
-        .flat_map(|f| std::iter::once(f.path.clone()).chain(f.old_path.clone()))
+        .flat_map(|f| iter::once(f.path.clone()).chain(f.old_path.clone()))
         .collect();
 
     let diff_text = diff_for_paths(&paths)?;
@@ -173,7 +180,7 @@ async fn draft_message_for_plan(
         .replace("{{DIFF}}", &diff_for_prompt)
         .replace("{{TRUNCATED_NOTE}}", &truncated_note);
 
-    let result = crate::control::invoke_agent(agent, model, "", &prompt).await?;
+    let result = control::invoke_agent(agent, model, "", &prompt).await?;
     let cleaned = clean_llm_message(&result.text);
     if cleaned.is_empty() {
         anyhow::bail!("LLM returned an empty commit message");
@@ -274,7 +281,7 @@ fn diff_for_paths(paths: &[String]) -> anyhow::Result<String> {
 /// path here, since we are always comparing to an empty file. Treat exit 0 and
 /// 1 as success and surface anything else as an error.
 fn diff_for_untracked(path: &str) -> anyhow::Result<String> {
-    let out = std::process::Command::new("git")
+    let out = Command::new("git")
         .args([
             "diff",
             "--no-color",
@@ -297,9 +304,7 @@ fn diff_for_untracked(path: &str) -> anyhow::Result<String> {
 }
 
 fn run_git(args: &[String]) -> anyhow::Result<String> {
-    let out = std::process::Command::new("git")
-        .args(args)
-        .output_with_context()?;
+    let out = Command::new("git").args(args).output_with_context()?;
     if !out.status.success() {
         anyhow::bail!("git {} failed", args.join(" "));
     }
@@ -308,8 +313,7 @@ fn run_git(args: &[String]) -> anyhow::Result<String> {
 
 /// shipcheck commits exactly the tree that passed, so in a shipcheck repository the groups become one commit
 async fn execute(plans: &[CommitPlan]) -> anyhow::Result<()> {
-    use crate::engine::runner::commit;
-    let dir = std::env::current_dir()?;
+    let dir = env::current_dir()?;
     if commit::Tool::detect(&dir).await != commit::Tool::Shipcheck {
         return execute_plans(plans);
     }
@@ -344,7 +348,7 @@ fn execute_plans(plans: &[CommitPlan]) -> anyhow::Result<()> {
             path_set.insert(file.path.clone());
         }
 
-        let mut cmd = std::process::Command::new("git");
+        let mut cmd = Command::new("git");
         cmd.arg("add").arg("-A").arg("--");
         for path in path_set {
             cmd.arg(path);
@@ -357,7 +361,7 @@ fn execute_plans(plans: &[CommitPlan]) -> anyhow::Result<()> {
             );
         }
 
-        let commit = std::process::Command::new("git")
+        let commit = Command::new("git")
             .args(["commit", "-m", &plan.message])
             .output_with_context()
             .context("failed to run git commit")?;
@@ -550,7 +554,7 @@ fn infer_scope(paths: &[&str]) -> Option<String> {
         .parent()
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
-        .map(std::string::ToString::to_string);
+        .map(ToString::to_string);
 
     if paths.iter().all(|p| {
         Path::new(p)
@@ -566,7 +570,7 @@ fn infer_scope(paths: &[&str]) -> Option<String> {
 }
 
 fn is_doc(path: &str) -> bool {
-    std::path::Path::new(path)
+    Path::new(path)
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
         || path.starts_with("docs/")
@@ -595,7 +599,7 @@ fn is_config(path: &str) -> bool {
 }
 
 fn ensure_git_repo() -> anyhow::Result<()> {
-    let out = std::process::Command::new("git")
+    let out = Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .output_with_context()?;
     if !out.status.success() {
@@ -613,10 +617,10 @@ fn ensure_no_merge_conflicts() -> anyhow::Result<()> {
 }
 
 fn has_changes() -> anyhow::Result<bool> {
-    let unstaged = std::process::Command::new("git")
+    let unstaged = Command::new("git")
         .args(["diff", "--quiet"])
         .status_with_context()?;
-    let staged = std::process::Command::new("git")
+    let staged = Command::new("git")
         .args(["diff", "--cached", "--quiet"])
         .status_with_context()?;
     let untracked = git_output(["ls-files", "--others", "--exclude-standard"])?;
@@ -625,9 +629,7 @@ fn has_changes() -> anyhow::Result<bool> {
 }
 
 fn git_reset_unstage_all() -> anyhow::Result<()> {
-    let out = std::process::Command::new("git")
-        .args(["reset"])
-        .output_with_context()?;
+    let out = Command::new("git").args(["reset"]).output_with_context()?;
     if !out.status.success() {
         anyhow::bail!("git reset failed: {}", String::from_utf8_lossy(&out.stderr));
     }
@@ -742,9 +744,7 @@ fn collect_changed_files() -> anyhow::Result<Vec<ChangedFile>> {
 }
 
 fn git_output<const N: usize>(args: [&str; N]) -> anyhow::Result<String> {
-    let out = std::process::Command::new("git")
-        .args(args)
-        .output_with_context()?;
+    let out = Command::new("git").args(args).output_with_context()?;
     if !out.status.success() {
         anyhow::bail!("git {} failed", args.join(" "));
     }
@@ -755,6 +755,8 @@ fn git_output<const N: usize>(args: [&str; N]) -> anyhow::Result<String> {
 mod tests {
     use super::{build_plans, collect_changed_files, git_output, run};
     use serial_test::serial;
+    use std::env;
+    use std::fs;
     use std::process::Command;
 
     fn init_temp_repo() -> tempfile::TempDir {
@@ -780,7 +782,7 @@ mod tests {
             .current_dir(dir.path())
             .output()
             .unwrap();
-        std::fs::write(dir.path().join("README.md"), "hello\n").unwrap();
+        fs::write(dir.path().join("README.md"), "hello\n").unwrap();
         Command::new("git")
             .args(["add", "."])
             .current_dir(dir.path())
@@ -815,8 +817,8 @@ mod tests {
     #[serial]
     async fn dry_run_works_in_temp_repo() {
         let dir = init_temp_repo();
-        std::env::set_current_dir(dir.path()).unwrap();
-        std::fs::write(dir.path().join("src.rs"), "fn main() {}\n").unwrap();
+        env::set_current_dir(dir.path()).unwrap();
+        fs::write(dir.path().join("src.rs"), "fn main() {}\n").unwrap();
 
         run(true, true, None, true).await.unwrap();
 
@@ -828,8 +830,8 @@ mod tests {
     #[serial]
     async fn commits_in_temp_repo_with_yes() {
         let dir = init_temp_repo();
-        std::env::set_current_dir(dir.path()).unwrap();
-        std::fs::write(dir.path().join("notes.md"), "updated\n").unwrap();
+        env::set_current_dir(dir.path()).unwrap();
+        fs::write(dir.path().join("notes.md"), "updated\n").unwrap();
 
         run(false, true, None, true).await.unwrap();
 
@@ -849,9 +851,9 @@ mod tests {
     #[serial]
     async fn message_override_skips_llm_and_commits_once() {
         let dir = init_temp_repo();
-        std::env::set_current_dir(dir.path()).unwrap();
-        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
-        std::fs::write(dir.path().join("b.md"), "b\n").unwrap();
+        env::set_current_dir(dir.path()).unwrap();
+        fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        fs::write(dir.path().join("b.md"), "b\n").unwrap();
 
         // no_llm=false on purpose — the override must take priority over the LLM path.
         run(
@@ -874,8 +876,8 @@ mod tests {
     #[serial]
     fn parses_name_status() {
         let dir = init_temp_repo();
-        std::env::set_current_dir(dir.path()).unwrap();
-        std::fs::write(dir.path().join("x.txt"), "a\n").unwrap();
+        env::set_current_dir(dir.path()).unwrap();
+        fs::write(dir.path().join("x.txt"), "a\n").unwrap();
         Command::new("git")
             .args(["add", "-A"])
             .current_dir(dir.path())
@@ -930,11 +932,11 @@ mod tests {
     #[serial]
     fn diff_for_paths_includes_untracked_file_contents() {
         let dir = init_temp_repo();
-        std::env::set_current_dir(dir.path()).unwrap();
+        env::set_current_dir(dir.path()).unwrap();
         // Brand-new file: never staged, never tracked. The LLM path must still
         // see its contents — otherwise the message would be drafted from the
         // filename alone, which is exactly the regression this guards against.
-        std::fs::write(dir.path().join("brand_new.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        fs::write(dir.path().join("brand_new.txt"), "alpha\nbeta\ngamma\n").unwrap();
 
         let diff = super::diff_for_paths(&["brand_new.txt".to_string()]).unwrap();
         assert!(

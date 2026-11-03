@@ -1,6 +1,11 @@
+use crate::backends::ExternalBackend;
+use crate::backends::github::GitHubBackend;
+use crate::cli;
 use crate::config;
 use crate::engine::jobs::{self, Job, TaskTemplate};
+use crate::store::JobState;
 use anyhow::Context;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,19 +21,18 @@ pub async fn list() -> anyhow::Result<()> {
     }
 
     // Load runtime state from SQLite
-    let store = crate::cli::init_store().await.ok().map(Arc::new);
+    let store = cli::init_store().await.ok().map(Arc::new);
     let repo = config::get_current_repo().unwrap_or_default();
-    let states: std::collections::HashMap<String, crate::store::JobState> =
-        if let Some(ref s) = store {
-            s.list_job_states(&repo)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|st| (st.job_id.clone(), st))
-                .collect()
-        } else {
-            std::collections::HashMap::new()
-        };
+    let states: HashMap<String, JobState> = if let Some(ref s) = store {
+        s.list_job_states(&repo)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|st| (st.job_id.clone(), st))
+            .collect()
+    } else {
+        HashMap::new()
+    };
 
     println!(
         "{:<20} {:<8} {:<20} {:<10} TITLE/COMMAND",
@@ -180,9 +184,6 @@ fn toggle_job(id: &str, enabled: bool) -> anyhow::Result<()> {
 /// Searches all projects for the job ID. If the ID exists in multiple projects,
 /// requires `--project` to disambiguate.
 pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
-    use crate::backends::ExternalBackend;
-    use crate::backends::github::GitHubBackend;
-
     // 1. If inside an orch project (or --project given), try that first
     let mut resolved: Option<(String, jobs::Job, PathBuf)> = None;
 
@@ -205,7 +206,7 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
     if resolved.is_none() {
         let mut matches: Vec<(String, jobs::Job, PathBuf)> = Vec::new();
 
-        let projects = crate::config::get_projects_with_paths().unwrap_or_default();
+        let projects = config::get_projects_with_paths().unwrap_or_default();
         for (repo, dir) in &projects {
             if let Some(filter) = project
                 && !repo.contains(filter)
@@ -247,15 +248,15 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
     }
 
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
-    let store = crate::cli::init_store().await.ok().map(Arc::new);
+    let store = cli::init_store().await.ok().map(Arc::new);
 
     // Load or create job state
     let mut state = if let Some(ref s) = store {
         s.get_job_state(&repo, job_id)
             .await?
-            .unwrap_or_else(|| crate::store::JobState::new(&repo, job_id))
+            .unwrap_or_else(|| JobState::new(&repo, job_id))
     } else {
-        crate::store::JobState::new(&repo, job_id)
+        JobState::new(&repo, job_id)
     };
 
     println!("Running job '{}' ({}) in {}", job_id, job.r#type, repo);
@@ -299,13 +300,10 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
 
 /// Run one job scheduler tick.
 pub async fn tick() -> anyhow::Result<()> {
-    use crate::backends::ExternalBackend;
-    use crate::backends::github::GitHubBackend;
-
     let repo =
         config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
-    let store = crate::cli::init_store().await.ok().map(std::sync::Arc::new);
+    let store = cli::init_store().await.ok().map(Arc::new);
 
     let path = jobs::resolve_jobs_path();
     jobs::tick(&path, &backend, store.as_ref(), &repo, None).await?;

@@ -3,7 +3,12 @@
     reason = "openraft's trait methods return its own StorageError, so its size is not ours to change"
 )]
 
+use std::collections::BTreeMap;
+use std::error;
+use std::fmt;
 use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::io;
 use std::io::Cursor;
 use std::ops::{Bound, RangeBounds};
 use std::path::Path;
@@ -15,6 +20,7 @@ use openraft::{
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sqlx::sqlite::SqliteJournalMode;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::{Acquire, SqliteConnection};
 
@@ -26,7 +32,7 @@ type Err = StorageError<NodeId>;
 const APPLIED_KEY: &str = "raft:applied";
 const MEMBERSHIP_KEY: &str = "raft:membership";
 
-fn io<E: std::error::Error + 'static>(e: E) -> Err {
+fn io<E: error::Error + 'static>(e: E) -> Err {
     StorageIOError::read(&e).into()
 }
 
@@ -35,7 +41,7 @@ fn io<E: std::error::Error + 'static>(e: E) -> Err {
     reason = "map_err passes the error by value"
 )]
 fn io_any(e: anyhow::Error) -> Err {
-    io(std::io::Error::other(format!("{e:#}")))
+    io(io::Error::other(format!("{e:#}")))
 }
 
 /// The replicated rows plus the Raft position they reflect
@@ -44,7 +50,7 @@ struct SnapshotData {
     last_applied: Option<LogId<NodeId>>,
     membership: StoredMembership<NodeId, BasicNode>,
     tasks: Vec<serde_json::Value>,
-    tables: std::collections::BTreeMap<String, Vec<serde_json::Value>>,
+    tables: BTreeMap<String, Vec<serde_json::Value>>,
     kv: Vec<kv::Row>,
 }
 
@@ -66,7 +72,7 @@ pub struct RaftStore {
 }
 
 impl Debug for RaftStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("RaftStore")
             .field("log", &self.log)
             .finish_non_exhaustive()
@@ -77,7 +83,7 @@ impl RaftStore {
     pub async fn open(raft_db: &Path, store: TaskStore) -> anyhow::Result<Self> {
         let options = SqliteConnectOptions::new()
             .filename(raft_db)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .journal_mode(SqliteJournalMode::Wal)
             .create_if_missing(true);
         let log = SqlitePoolOptions::new()
             .max_connections(1)
@@ -160,7 +166,7 @@ impl RaftLogReader<TypeConfig> for RaftStore {
 
 impl RaftSnapshotBuilder<TypeConfig> for RaftStore {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, Err> {
-        let mut tables = std::collections::BTreeMap::new();
+        let mut tables = BTreeMap::new();
         for table in replica::TABLES {
             let rows = replica::table_rows(self.store.pool(), table)
                 .await

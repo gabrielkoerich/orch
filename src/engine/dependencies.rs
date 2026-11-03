@@ -7,10 +7,12 @@
 use crate::backends::{BlockedByFetch, ExternalBackend, ExternalId, PullRequestCompletion};
 use crate::channels::notification::TaskNotification;
 use crate::channels::transport::Transport;
+use crate::engine;
 use crate::store::{
     BlockerSnapshot, DepSource, NewDependency, ObservedPullRequest, TaskStore,
     blocker_failure_kind, blocker_is_satisfied, dep_label,
 };
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
@@ -30,7 +32,7 @@ fn blocker_read_key(repo: &str, number: i64) -> String {
  * own slot across ticks instead of drifting on every read
  **/
 fn blocker_refresh_ttl_secs(repo: &str, number: i64) -> i64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = DefaultHasher::new();
     repo.hash(&mut hasher);
     number.hash(&mut hasher);
     let offset = i64::try_from(hasher.finish() % BLOCKER_REFRESH_SPREAD_SECS as u64).unwrap_or(0);
@@ -633,7 +635,7 @@ async fn cycle_notices(store: &TaskStore) -> anyhow::Result<Vec<DepNotice>> {
         let path = named.join(" -> ");
         let comment = format!(
             "Dependency cycle: {path}. Orch will not run these tasks until the cycle is removed.{}",
-            crate::engine::orch_footer()
+            engine::orch_footer()
         );
         for node in &cycle {
             let Some((repo, number, task_id, title)) = issue_for_node.get(node) else {
@@ -698,12 +700,12 @@ async fn failure_notices(store: &TaskStore) -> anyhow::Result<Vec<DepNotice>> {
             let text = format!(
                 "Blocked by {label}, which was closed as not planned. This task stays waiting."
             );
-            (format!("{text}{}", crate::engine::orch_footer()), text)
+            (format!("{text}{}", engine::orch_footer()), text)
         } else {
             let text = format!(
                 "Blocked by {label}, which is blocked and needs a person. This task stays waiting."
             );
-            (format!("{text}{}", crate::engine::orch_footer()), text)
+            (format!("{text}{}", engine::orch_footer()), text)
         };
         let issue_number = edge
             .task_external_id
@@ -823,9 +825,24 @@ fn visit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::PullRequestCompletion;
+    use crate::backends::github;
+    use crate::backends::github::AutomatedReviewComment;
+    use crate::backends::test_helpers::NoopBackend;
     use crate::backends::{BlockedByIssue, ExternalTask, Status};
+    use crate::engine::cooldown;
+    use crate::engine::router::Router;
+    use crate::engine::router::RouterConfig;
+    use crate::engine::tasks;
+    use crate::engine::tasks::TaskManager;
+    use crate::engine::tasks::store_task_to_external;
+    use crate::engine::tick::RoutingTickQuota;
+    use crate::engine::tick::tick_route_tasks;
+    use crate::store::WaitingOnDependency;
     use crate::store::{NewTask, TaskStatus};
     use async_trait::async_trait;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -870,11 +887,11 @@ See #4 in the notes
         blocked: Mutex<HashMap<i64, BlockedByFetch>>,
         comments: Mutex<Vec<(String, String)>>,
         close_state: Mutex<HashMap<i64, (String, Option<String>)>>,
-        pulls: Mutex<HashMap<i64, Option<crate::backends::PullRequestCompletion>>>,
+        pulls: Mutex<HashMap<i64, Option<PullRequestCompletion>>>,
         review_comments: Mutex<HashMap<i64, Vec<ScriptedReviewComment>>>,
         reviewer: Mutex<Option<String>>,
         /// Counts the blocker reads that cost a GitHub call.
-        reads: std::sync::atomic::AtomicUsize,
+        reads: AtomicUsize,
     }
 
     impl ScriptedBackend {
@@ -885,7 +902,7 @@ See #4 in the notes
                 close_state: Mutex::new(HashMap::new()),
                 pulls: Mutex::new(HashMap::new()),
                 review_comments: Mutex::new(HashMap::new()),
-                reads: std::sync::atomic::AtomicUsize::new(0),
+                reads: AtomicUsize::new(0),
                 reviewer: Mutex::new(None),
             }
         }
@@ -967,8 +984,7 @@ See #4 in the notes
             _repo: &str,
             issue_number: i64,
         ) -> anyhow::Result<Option<(String, Option<String>)>> {
-            self.reads
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.reads.fetch_add(1, Ordering::Relaxed);
             Ok(self.close_state.lock().unwrap().get(&issue_number).cloned())
         }
 
@@ -976,9 +992,8 @@ See #4 in the notes
             &self,
             _repo: &str,
             pr_number: i64,
-        ) -> anyhow::Result<Option<crate::backends::PullRequestCompletion>> {
-            self.reads
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ) -> anyhow::Result<Option<PullRequestCompletion>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
             let mut completion = self
                 .pulls
                 .lock()
@@ -997,7 +1012,7 @@ See #4 in the notes
                     .cloned()
                     .unwrap_or_default();
                 let reviewer = self.reviewer.lock().unwrap().clone().unwrap_or_default();
-                let mapped: Vec<crate::backends::github::AutomatedReviewComment<'_>> = comments
+                let mapped: Vec<AutomatedReviewComment<'_>> = comments
                     .iter()
                     .map(|comment| crate::backends::github::AutomatedReviewComment {
                         login: &comment.login,
@@ -1005,8 +1020,7 @@ See #4 in the notes
                         created_at: &comment.created_at,
                     })
                     .collect();
-                done.approved =
-                    crate::backends::github::latest_automated_review_approves(&mapped, &reviewer);
+                done.approved = github::latest_automated_review_approves(&mapped, &reviewer);
             }
             Ok(completion)
         }
@@ -1309,11 +1323,7 @@ See #4 in the notes
 
     #[tokio::test]
     async fn waiting_task_is_not_routed_until_the_blocker_is_done() {
-        use crate::engine::router::{Router, RouterConfig};
-        use crate::engine::tasks::TaskManager;
-        use crate::engine::tick::{RoutingTickQuota, tick_route_tasks};
-
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let a = insert(&store, "owner/repo", "1", "A", "").await;
         let b = insert(&store, "owner/repo", "2", "B", "").await;
@@ -1329,11 +1339,10 @@ See #4 in the notes
             .await
             .unwrap();
 
-        let backend: Arc<dyn ExternalBackend> =
-            Arc::new(crate::backends::test_helpers::NoopBackend);
+        let backend: Arc<dyn ExternalBackend> = Arc::new(NoopBackend);
         let task_manager = Arc::new(TaskManager::with_store(
-            std::sync::Arc::clone(&backend),
-            std::sync::Arc::clone(&store),
+            Arc::clone(&backend),
+            Arc::clone(&store),
             "owner/repo".into(),
         ));
         let mut tier = HashMap::new();
@@ -1372,16 +1381,13 @@ See #4 in the notes
             ..Default::default()
         };
         let mut llm_router = Router::new_for_test(llm, vec!["claude".into()]);
-        let ext = crate::engine::tasks::store_task_to_external(&store.get(b).await.unwrap());
+        let ext = tasks::store_task_to_external(&store.get(b).await.unwrap());
         store.update_status(b, TaskStatus::New).await.unwrap();
         let err = llm_router
             .route(&ext, &store, "owner/repo")
             .await
             .unwrap_err();
-        assert!(
-            err.downcast_ref::<crate::store::WaitingOnDependency>()
-                .is_some()
-        );
+        assert!(err.downcast_ref::<WaitingOnDependency>().is_some());
         assert_eq!(store.get(b).await.unwrap().status, TaskStatus::Waiting);
         assert_eq!(store.get(b).await.unwrap().route_attempts, 0);
 
@@ -1434,10 +1440,7 @@ See #4 in the notes
 
     #[tokio::test]
     async fn round_robin_route_returns_waiting_on_dependency() {
-        use crate::engine::router::{Router, RouterConfig};
-        use crate::engine::tasks::store_task_to_external;
-
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let b = insert(&store, "owner/repo", "2", "B", "").await;
         store
@@ -1464,10 +1467,7 @@ See #4 in the notes
         };
         let mut router = Router::new_for_test(config, vec!["claude".into()]);
         let err = router.route(&ext, &store, "owner/repo").await.unwrap_err();
-        assert!(
-            err.downcast_ref::<crate::store::WaitingOnDependency>()
-                .is_some()
-        );
+        assert!(err.downcast_ref::<WaitingOnDependency>().is_some());
         assert_eq!(store.get(b).await.unwrap().status, TaskStatus::Waiting);
         assert_eq!(store.get(b).await.unwrap().route_attempts, 0);
     }
@@ -1502,7 +1502,7 @@ See #4 in the notes
             .lock()
             .unwrap()
             .insert(1, ("open".into(), None));
-        let reads = || backend.reads.load(std::sync::atomic::Ordering::Relaxed);
+        let reads = || backend.reads.load(Ordering::Relaxed);
 
         refresh_blocker_snapshots(&backend, &store).await.unwrap();
         let first = reads();
@@ -1555,18 +1555,16 @@ See #4 in the notes
 
     #[tokio::test]
     async fn a_blockers_task_going_done_makes_the_next_refresh_read_it() {
-        use crate::engine::tasks::TaskManager;
-
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         insert(&store, "owner/repo", "1", "A", "").await;
         let backend = read_open_blocker_once(&store).await;
-        let reads = || backend.reads.load(std::sync::atomic::Ordering::Relaxed);
+        let reads = || backend.reads.load(Ordering::Relaxed);
         let first = reads();
         assert!(first > 0, "the first refresh has to read the blocker");
 
         let task_manager = TaskManager::with_store(
-            std::sync::Arc::clone(&backend) as Arc<dyn ExternalBackend>,
-            std::sync::Arc::clone(&store),
+            Arc::clone(&backend) as Arc<dyn ExternalBackend>,
+            Arc::clone(&store),
             "owner/repo".into(),
         );
         task_manager
@@ -1583,18 +1581,16 @@ See #4 in the notes
 
     #[tokio::test]
     async fn a_blocker_orch_does_not_manage_keeps_its_ttl() {
-        use crate::engine::tasks::TaskManager;
-
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend = read_open_blocker_once(&store).await;
-        let reads = || backend.reads.load(std::sync::atomic::Ordering::Relaxed);
+        let reads = || backend.reads.load(Ordering::Relaxed);
         let first = reads();
         assert!(first > 0, "the first refresh has to read the blocker");
 
         // `#1` has no task row here, so finishing the dependent must not clear its entry
         let task_manager = TaskManager::with_store(
-            std::sync::Arc::clone(&backend) as Arc<dyn ExternalBackend>,
-            std::sync::Arc::clone(&store),
+            Arc::clone(&backend) as Arc<dyn ExternalBackend>,
+            Arc::clone(&store),
             "owner/repo".into(),
         );
         task_manager
@@ -1655,14 +1651,14 @@ See #4 in the notes
             .insert(1, ("closed".into(), Some("completed".into())));
 
         refresh_blocker_snapshots(&backend, &store).await.unwrap();
-        let first = backend.reads.load(std::sync::atomic::Ordering::Relaxed);
+        let first = backend.reads.load(Ordering::Relaxed);
         assert!(first > 0, "the first refresh has to read the blocker");
         assert!(store.block_claim_if_waiting(b).await.unwrap().is_none());
 
         refresh_blocker_snapshots(&backend, &store).await.unwrap();
         refresh_blocker_snapshots(&backend, &store).await.unwrap();
         assert_eq!(
-            backend.reads.load(std::sync::atomic::Ordering::Relaxed),
+            backend.reads.load(Ordering::Relaxed),
             first,
             "a blocker closed as completed must not be read again"
         );
@@ -1670,8 +1666,6 @@ See #4 in the notes
 
     #[tokio::test]
     async fn refresh_holds_until_the_pr_is_merged_into_the_default_branch() {
-        use crate::backends::PullRequestCompletion;
-
         let store = TaskStore::open_memory().await.unwrap();
         let a = insert(&store, "owner/repo", "1", "A", "").await;
         let b = insert(&store, "owner/repo", "2", "B", "").await;
@@ -1764,8 +1758,6 @@ See #4 in the notes
 
     #[tokio::test]
     async fn superseded_blocker_releases_the_waiter_but_a_human_close_does_not() {
-        use crate::backends::PullRequestCompletion;
-
         let store = TaskStore::open_memory().await.unwrap();
         let a = insert(&store, "owner/repo", "1", "A", "").await;
         let b = insert(&store, "owner/repo", "2", "B", "").await;
@@ -1815,8 +1807,6 @@ See #4 in the notes
 
     #[tokio::test]
     async fn merged_unapproved_pr_releases_the_waiter() {
-        use crate::backends::PullRequestCompletion;
-
         let store = TaskStore::open_memory().await.unwrap();
         let a = insert(&store, "owner/repo", "1", "A", "").await;
         let b = insert(&store, "owner/repo", "2", "B", "").await;
@@ -1904,10 +1894,7 @@ See #4 in the notes
 
     #[tokio::test]
     async fn two_route_calls_cannot_claim_a_waiting_task() {
-        use crate::engine::router::{Router, RouterConfig};
-        use crate::engine::tasks::store_task_to_external;
-
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let b = insert(&store, "owner/repo", "2", "B", "").await;
         store
@@ -1932,8 +1919,8 @@ See #4 in the notes
             model_map,
             ..Default::default()
         };
-        let left_store = std::sync::Arc::clone(&store);
-        let right_store = std::sync::Arc::clone(&store);
+        let left_store = Arc::clone(&store);
+        let right_store = Arc::clone(&store);
         let left_task = ext.clone();
         let right_task = ext;
         let right_config = config.clone();

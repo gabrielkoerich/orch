@@ -8,13 +8,19 @@
 //! environments and simplify testing.
 
 use crate::cmd::CommandErrorContext;
+use crate::github::http;
 use crate::github::http::GhHttp;
+use crate::github::token;
+use crate::security;
 use regex::Regex;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::process::Command;
+use tokio::time;
 
 /// Format a task ID for display in PR/issue footers.
 ///
@@ -420,8 +426,8 @@ pub async fn rebase_on_branch(dir: &Path, branch: &str) -> anyhow::Result<bool> 
 
     // Fetch the remote branch to get latest state.
     // 2-minute timeout mirrors the push timeout to prevent indefinite stalls.
-    let fetch = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
+    let fetch = time::timeout(
+        Duration::from_secs(120),
         git()
             .await
             .args(["fetch", "origin", branch])
@@ -631,11 +637,7 @@ pub(crate) async fn git() -> Command {
 ///
 /// Signing is switched off too, `commit.gpgsign=false` and `tag.gpgsign=false`
 pub(crate) async fn build_git_auth_env() -> Vec<(String, String)> {
-    let token = crate::github::token::shared()
-        .get_token()
-        .await
-        .ok()
-        .flatten();
+    let token = token::shared().get_token().await.ok().flatten();
     build_git_auth_env_for_token(token)
 }
 
@@ -706,7 +708,7 @@ async fn strip_workflow_files(dir: &Path, default_branch: &str) -> anyhow::Resul
     let workflow_files: Vec<String> = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|l| !l.is_empty())
-        .map(std::string::ToString::to_string)
+        .map(ToString::to_string)
         .collect();
 
     if workflow_files.is_empty() {
@@ -792,10 +794,7 @@ async fn strip_workflow_files(dir: &Path, default_branch: &str) -> anyhow::Resul
 
     // Remove workflow files from the index
     let mut rm_args = vec!["rm", "--cached", "--ignore-unmatch", "--"];
-    let file_refs: Vec<&str> = workflow_files
-        .iter()
-        .map(std::string::String::as_str)
-        .collect();
+    let file_refs: Vec<&str> = workflow_files.iter().map(String::as_str).collect();
     rm_args.extend(file_refs);
 
     let rm = Command::new("git")
@@ -916,7 +915,7 @@ async fn remote_tracking_sha(dir: &Path, branch: &str) -> Option<String> {
     let rev = format!("refs/remotes/origin/{branch}");
     git_stdout(dir, &["rev-parse", "--verify", "--quiet", &rev])
         .await
-        .filter(|sha| crate::github::http::is_full_commit_sha(sha))
+        .filter(|sha| http::is_full_commit_sha(sha))
 }
 
 async fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> bool {
@@ -1103,8 +1102,8 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
     // on that endpoint must not fail the whole push.
     // A 2-minute timeout prevents an indefinitely-stalled push from blocking
     // post-processing and triggering a stuck-task re-dispatch race.
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
+    let output = time::timeout(
+        Duration::from_secs(120),
         git()
             .await
             .args([
@@ -1138,8 +1137,8 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
             stderr = %sanitize_push_error(&stderr),
             "push failed with transient network error — retrying once"
         );
-        let retry_output = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
+        let retry_output = time::timeout(
+            Duration::from_secs(120),
             git()
                 .await
                 .args([
@@ -1186,8 +1185,8 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
         match strip_workflow_files(dir, default_branch).await {
             Ok(true) => {
                 // Workflow files stripped, retry push
-                let retry_output = tokio::time::timeout(
-                    std::time::Duration::from_secs(120),
+                let retry_output = time::timeout(
+                    Duration::from_secs(120),
                     git()
                         .await
                         .args([
@@ -1376,7 +1375,7 @@ fn sanitize_push_error(stderr: &str) -> String {
     static URL_USERINFO: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"://[^/@\s]+@").expect("valid url userinfo regex"));
     let no_userinfo = URL_USERINFO.replace_all(stderr, "://***@");
-    crate::security::redact(&no_userinfo)
+    security::redact(&no_userinfo)
 }
 
 /// Drop sentences and list items about pushing or opening the PR
@@ -1503,7 +1502,6 @@ fn build_pr_body(
     agent: &str,
     model: Option<&str>,
 ) -> String {
-    use std::fmt::Write as _;
     let cleaned_summary = strip_push_and_pr_creation(summary);
     let summary_text = if cleaned_summary.is_empty() {
         title
@@ -1609,7 +1607,7 @@ pub async fn create_pr_if_needed(
     // When the agent didn't self-report files, derive them from git.
     let git_files: Vec<String>;
     let effective_files: &[String] = if files.is_empty() {
-        match tokio::process::Command::new("git")
+        match Command::new("git")
             .args([
                 "diff",
                 &format!("origin/{base_branch}...HEAD"),
@@ -1623,7 +1621,7 @@ pub async fn create_pr_if_needed(
                 git_files = String::from_utf8_lossy(&output.stdout)
                     .lines()
                     .filter(|l| !l.is_empty())
-                    .map(std::string::ToString::to_string)
+                    .map(ToString::to_string)
                     .collect();
                 &git_files
             }
@@ -1668,7 +1666,7 @@ pub async fn create_pr_if_needed(
                 if is_transient_github_error(&err_str) {
                     had_transient_error = true;
                     if attempt < MAX_RETRIES {
-                        let delay = std::time::Duration::from_secs(2u64.pow(attempt));
+                        let delay = Duration::from_secs(2u64.pow(attempt));
                         tracing::warn!(
                             task_id,
                             attempt,
@@ -1676,7 +1674,7 @@ pub async fn create_pr_if_needed(
                             error = %e,
                             "transient GitHub API error during PR creation — retrying"
                         );
-                        tokio::time::sleep(delay).await;
+                        time::sleep(delay).await;
                     }
                 } else if is_invalid_base_error(&err_str) && !tried_api_fallback {
                     // Local base branch detection was wrong (e.g. "remotes/origin/main").
@@ -2065,6 +2063,13 @@ async fn check_push_needed(dir: &Path, branch: &str, default_branch: &str) -> (b
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::process;
+
     use super::*;
 
     #[test]
@@ -2375,10 +2380,9 @@ mod tests {
     #[tokio::test]
     async fn auto_commit_unstages_files_on_commit_failure() {
         // Create a temp git repo with one initial commit
-        let dir =
-            std::env::temp_dir().join(format!("orch_test_auto_commit_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = env::temp_dir().join(format!("orch_test_auto_commit_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
 
         // Init repo
         let _ = Command::new("git")
@@ -2397,7 +2401,7 @@ mod tests {
             .output()
             .await;
         // Create initial file and commit
-        std::fs::write(dir.join("init.txt"), "init").unwrap();
+        fs::write(dir.join("init.txt"), "init").unwrap();
         let _ = Command::new("git")
             .args(["add", "init.txt"])
             .current_dir(&dir)
@@ -2410,7 +2414,7 @@ mod tests {
             .await;
 
         // Create a new file (unstaged)
-        std::fs::write(dir.join("new_file.txt"), "content").unwrap();
+        fs::write(dir.join("new_file.txt"), "content").unwrap();
 
         // Verify has_changes sees it
         assert!(has_changes(&dir).await);
@@ -2434,17 +2438,16 @@ mod tests {
         assert!(!has_changes(&dir).await);
 
         // Cleanup
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn auto_commit_ignores_repo_signing_config() {
         // Repo demands signing via a signer that always fails — auto_commit
         // must still commit (it passes -c commit.gpgsign=false)
-        let dir =
-            std::env::temp_dir().join(format!("orch_test_auto_commit_gpg_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = env::temp_dir().join(format!("orch_test_auto_commit_gpg_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
 
         for args in [
             vec!["init"],
@@ -2459,7 +2462,7 @@ mod tests {
                 .output()
                 .await;
         }
-        std::fs::write(dir.join("init.txt"), "init").unwrap();
+        fs::write(dir.join("init.txt"), "init").unwrap();
         let _ = Command::new("git")
             .args(["add", "init.txt"])
             .current_dir(&dir)
@@ -2471,7 +2474,7 @@ mod tests {
             .output()
             .await;
 
-        std::fs::write(dir.join("signed_off.txt"), "content").unwrap();
+        fs::write(dir.join("signed_off.txt"), "content").unwrap();
         assert!(has_changes(&dir).await);
 
         let result = auto_commit(
@@ -2486,16 +2489,15 @@ mod tests {
         assert!(result.unwrap());
         assert!(!has_changes(&dir).await);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn auto_commit_unstages_on_pre_commit_hook_failure() {
         // Create a temp git repo where commit always fails (via pre-commit hook)
-        let dir =
-            std::env::temp_dir().join(format!("orch_test_auto_commit_hook_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = env::temp_dir().join(format!("orch_test_auto_commit_hook_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
 
         // Init repo
         let _ = Command::new("git")
@@ -2514,7 +2516,7 @@ mod tests {
             .output()
             .await;
         // Create initial commit
-        std::fs::write(dir.join("init.txt"), "init").unwrap();
+        fs::write(dir.join("init.txt"), "init").unwrap();
         let _ = Command::new("git")
             .args(["add", "init.txt"])
             .current_dir(&dir)
@@ -2528,20 +2530,19 @@ mod tests {
 
         // Install a pre-commit hook that always fails
         let hooks_dir = dir.join(".git/hooks");
-        std::fs::create_dir_all(&hooks_dir).unwrap();
-        std::fs::write(hooks_dir.join("pre-commit"), "#!/bin/sh\nexit 1\n").unwrap();
+        fs::create_dir_all(&hooks_dir).unwrap();
+        fs::write(hooks_dir.join("pre-commit"), "#!/bin/sh\nexit 1\n").unwrap();
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(hooks_dir.join("pre-commit"))
+            let mut perms = fs::metadata(hooks_dir.join("pre-commit"))
                 .unwrap()
                 .permissions();
             perms.set_mode(0o755);
-            std::fs::set_permissions(hooks_dir.join("pre-commit"), perms).unwrap();
+            fs::set_permissions(hooks_dir.join("pre-commit"), perms).unwrap();
         }
 
         // Create a new file
-        std::fs::write(dir.join("staged_file.txt"), "content").unwrap();
+        fs::write(dir.join("staged_file.txt"), "content").unwrap();
 
         // Verify has_changes sees it
         assert!(has_changes(&dir).await);
@@ -2574,7 +2575,7 @@ mod tests {
         );
 
         // Cleanup
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2606,9 +2607,9 @@ mod tests {
     #[tokio::test]
     async fn strip_workflow_files_removes_workflow_from_commits() {
         // Create a temp git repo simulating the scenario
-        let dir = std::env::temp_dir().join(format!("orch_test_strip_wf_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = env::temp_dir().join(format!("orch_test_strip_wf_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
 
         // Init repo with initial commit
         let _ = Command::new("git")
@@ -2626,7 +2627,7 @@ mod tests {
             .current_dir(&dir)
             .output()
             .await;
-        std::fs::write(dir.join("init.txt"), "init").unwrap();
+        fs::write(dir.join("init.txt"), "init").unwrap();
         let _ = Command::new("git")
             .args(["add", "."])
             .current_dir(&dir)
@@ -2658,10 +2659,10 @@ mod tests {
             .await;
 
         // Add both a normal file and a workflow file
-        std::fs::write(dir.join("feature.txt"), "feature work").unwrap();
+        fs::write(dir.join("feature.txt"), "feature work").unwrap();
         let wf_dir = dir.join(".github/workflows");
-        std::fs::create_dir_all(&wf_dir).unwrap();
-        std::fs::write(wf_dir.join("ci.yml"), "name: CI\non: push").unwrap();
+        fs::create_dir_all(&wf_dir).unwrap();
+        fs::write(wf_dir.join("ci.yml"), "name: CI\non: push").unwrap();
         let _ = Command::new("git")
             .args(["add", "."])
             .current_dir(&dir)
@@ -2719,15 +2720,14 @@ mod tests {
         );
 
         // Cleanup
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn strip_workflow_files_returns_false_when_no_workflows() {
-        let dir =
-            std::env::temp_dir().join(format!("orch_test_strip_wf_none_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = env::temp_dir().join(format!("orch_test_strip_wf_none_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
 
         // Init repo
         let _ = Command::new("git")
@@ -2745,7 +2745,7 @@ mod tests {
             .current_dir(&dir)
             .output()
             .await;
-        std::fs::write(dir.join("init.txt"), "init").unwrap();
+        fs::write(dir.join("init.txt"), "init").unwrap();
         let _ = Command::new("git")
             .args(["add", "."])
             .current_dir(&dir)
@@ -2775,7 +2775,7 @@ mod tests {
             .await;
 
         // Only non-workflow files
-        std::fs::write(dir.join("feature.txt"), "feature").unwrap();
+        fs::write(dir.join("feature.txt"), "feature").unwrap();
         let _ = Command::new("git")
             .args(["add", "."])
             .current_dir(&dir)
@@ -2797,7 +2797,7 @@ mod tests {
         assert!(!stripped, "should not strip when no workflow files exist");
 
         // Cleanup
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2924,8 +2924,8 @@ mod tests {
         assert!(body.contains(" using `sonnet`"));
     }
 
-    fn sh_git(dir: &std::path::Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+    fn sh_git(dir: &Path, args: &[&str]) {
+        let out = process::Command::new("git")
             .args([
                 "-c",
                 "commit.gpgsign=false",
@@ -2945,8 +2945,8 @@ mod tests {
         );
     }
 
-    fn commit_file(dir: &std::path::Path, name: &str) {
-        std::fs::write(dir.join(name), name).unwrap();
+    fn commit_file(dir: &Path, name: &str) {
+        fs::write(dir.join(name), name).unwrap();
         sh_git(dir, &["add", name]);
         sh_git(dir, &["commit", "-m", name]);
     }
@@ -2962,7 +2962,7 @@ mod tests {
         let bare = temp.path().join("origin.git");
         let a = temp.path().join("a");
         let b = temp.path().join("b");
-        std::fs::create_dir_all(&bare).unwrap();
+        fs::create_dir_all(&bare).unwrap();
         sh_git(&bare, &["init", "--bare", "-b", "main"]);
         sh_git(temp.path(), &["clone", bare.to_str().unwrap(), "a"]);
         // push_branch's own rebase commits, and CI runners have no global identity
@@ -3012,8 +3012,8 @@ mod tests {
         ));
     }
 
-    fn git_ok(dir: &std::path::Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let out = process::Command::new("git")
             .args(args)
             .current_dir(dir)
             .output()
@@ -3026,8 +3026,8 @@ mod tests {
         );
     }
 
-    fn git_sha(dir: &std::path::Path, rev: &str) -> String {
-        let out = std::process::Command::new("git")
+    fn git_sha(dir: &Path, rev: &str) -> String {
+        let out = process::Command::new("git")
             .args(["rev-parse", rev])
             .current_dir(dir)
             .output()
@@ -3036,20 +3036,20 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    fn init_identity(dir: &std::path::Path) {
+    fn init_identity(dir: &Path) {
         git_ok(dir, &["config", "user.email", "test@example.com"]);
         git_ok(dir, &["config", "user.name", "Test"]);
         git_ok(dir, &["config", "commit.gpgsign", "false"]);
     }
 
-    fn write_commit(dir: &std::path::Path, file: &str, body: &str, msg: &str) {
-        std::fs::write(dir.join(file), body).unwrap();
+    fn write_commit(dir: &Path, file: &str, body: &str, msg: &str) {
+        fs::write(dir.join(file), body).unwrap();
         git_ok(dir, &["add", file]);
         git_ok(dir, &["commit", "-m", msg]);
     }
 
     /// A bare origin with `main` and a pushed `feature`, and a clone `a` on `feature`
-    fn publish_feature(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    fn publish_feature(root: &Path) -> (PathBuf, PathBuf) {
         let bare = root.join("bare.git");
         let a = root.join("a");
         git_ok(root, &["init", "-b", "main", a.to_str().unwrap()]);
@@ -3067,12 +3067,7 @@ mod tests {
         (bare, a)
     }
 
-    fn clone_on(
-        root: &std::path::Path,
-        bare: &std::path::Path,
-        name: &str,
-        branch: &str,
-    ) -> std::path::PathBuf {
+    fn clone_on(root: &Path, bare: &Path, name: &str, branch: &str) -> PathBuf {
         let dir = root.join(name);
         git_ok(
             root,
@@ -3126,7 +3121,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (bare, a) = publish_feature(root.path());
         record_push_lease(&a, "feature", "main").await;
-        std::fs::write(a.join("feature.txt"), "rewritten\n").unwrap();
+        fs::write(a.join("feature.txt"), "rewritten\n").unwrap();
         git_ok(&a, &["commit", "-am", "--amend", "-m", "feature rewritten"]);
 
         let pushed = push_branch(&a, "feature", "main").await;
@@ -3199,7 +3194,7 @@ mod tests {
     }
 
     /// GitHub's "Update branch" by merge: main moves, then main is merged into feature
-    fn github_update_by_merge(root: &std::path::Path, bare: &std::path::Path, name: &str) {
+    fn github_update_by_merge(root: &Path, bare: &Path, name: &str) {
         let c = clone_on(root, bare, name, "main");
         write_commit(&c, "main.txt", "main\n", "main moves");
         git_ok(&c, &["push", "origin", "main"]);
@@ -3218,11 +3213,7 @@ mod tests {
     }
 
     /// GitHub's "Update branch" by rebase: main moves, then feature is replayed on it
-    fn github_update_by_rebase(
-        root: &std::path::Path,
-        bare: &std::path::Path,
-        name: &str,
-    ) -> std::path::PathBuf {
+    fn github_update_by_rebase(root: &Path, bare: &Path, name: &str) -> PathBuf {
         let c = clone_on(root, bare, name, "main");
         write_commit(&c, "main.txt", "main\n", "main moves");
         git_ok(&c, &["push", "origin", "main"]);
@@ -3232,7 +3223,7 @@ mod tests {
         c
     }
 
-    fn remote_has(root: &std::path::Path, bare: &std::path::Path, file: &str) -> bool {
+    fn remote_has(root: &Path, bare: &Path, file: &str) -> bool {
         let check = root.join("check");
         if !check.exists() {
             git_ok(
@@ -3356,7 +3347,7 @@ mod tests {
 
         git_ok(&a, &["fetch", "origin"]);
         record_push_lease(&a, "feature", "main").await;
-        std::fs::write(a.join("feature.txt"), "feature rewritten\n").unwrap();
+        fs::write(a.join("feature.txt"), "feature rewritten\n").unwrap();
         git_ok(&a, &["commit", "-am", "rewrite"]);
         let pushed = force_push_leased(&a, "feature", "main").await;
         assert!(pushed.is_ok(), "{pushed:?}");
@@ -3385,7 +3376,7 @@ mod tests {
 
         git_ok(&a, &["fetch", "origin"]);
         record_push_lease(&a, "feature", "main").await;
-        std::fs::write(a.join("feature.txt"), "rewritten\n").unwrap();
+        fs::write(a.join("feature.txt"), "rewritten\n").unwrap();
         git_ok(&a, &["commit", "-am", "--amend", "-m", "rewritten"]);
         assert!(force_push_leased(&a, "feature", "main").await.is_err());
         assert_eq!(git_sha(&bare, "refs/heads/feature"), foreign);

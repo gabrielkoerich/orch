@@ -1,11 +1,20 @@
 //! Router configuration — loading, defaults, and model map.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::env;
+use std::sync::OnceLock;
+
+use crate::config;
+use crate::engine;
+use crate::engine::cooldown;
+use crate::engine::router::selection;
+use crate::engine::runner::agents::opencode;
 
 /// Minimum healthy agents threshold for graceful degradation.
 /// When healthy agents fall below this number, dispatch switches to sequential mode.
 pub fn min_healthy_agents_threshold() -> usize {
-    crate::config::get("dispatch.min_healthy_agents")
+    config::get("dispatch.min_healthy_agents")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2)
@@ -13,7 +22,7 @@ pub fn min_healthy_agents_threshold() -> usize {
 
 /// Base delay in milliseconds between dispatches in sequential (degraded) mode.
 pub fn sequential_dispatch_delay_ms() -> u64 {
-    crate::config::get("dispatch.sequential_delay_ms")
+    config::get("dispatch.sequential_delay_ms")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1000)
@@ -24,10 +33,10 @@ pub fn sequential_dispatch_delay_ms() -> u64 {
 /// The health check queries `rate_limits` for events within this window.
 /// Configurable via `dispatch.health_check_window_hours` (default: 6).
 pub fn health_check_window_hours() -> u32 {
-    crate::config::get("dispatch.health_check_window_hours")
+    config::get("dispatch.health_check_window_hours")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(crate::engine::cooldown::DEFAULT_HEALTH_CHECK_WINDOW_HOURS)
+        .unwrap_or(cooldown::DEFAULT_HEALTH_CHECK_WINDOW_HOURS)
 }
 
 /// Minimum number of rate-limit events within the health check window to
@@ -44,15 +53,15 @@ pub fn health_check_window_hours() -> u32 {
 ///
 /// Configurable via `dispatch.degraded_rate_limit_threshold` (default: 3).
 pub fn degraded_rate_limit_threshold() -> i64 {
-    crate::config::get("dispatch.degraded_rate_limit_threshold")
+    config::get("dispatch.degraded_rate_limit_threshold")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(crate::engine::cooldown::DEFAULT_DEGRADED_RATE_LIMIT_THRESHOLD)
+        .unwrap_or(cooldown::DEFAULT_DEGRADED_RATE_LIMIT_THRESHOLD)
 }
 
 /// Base delay in milliseconds for exponential backoff between fallback retries.
 pub fn retry_base_delay_ms() -> u64 {
-    crate::config::get("dispatch.retry_base_delay_ms")
+    config::get("dispatch.retry_base_delay_ms")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10_000)
@@ -60,7 +69,7 @@ pub fn retry_base_delay_ms() -> u64 {
 
 /// Maximum delay in milliseconds for exponential backoff between fallback retries.
 pub fn retry_max_delay_ms() -> u64 {
-    crate::config::get("dispatch.retry_max_delay_ms")
+    config::get("dispatch.retry_max_delay_ms")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(120_000)
@@ -86,10 +95,10 @@ pub const SKIP_LIMITED_THRESHOLD: f64 = 0.3;
 /// failing models.
 pub fn get_agent_backoff_base(agent: &str) -> i64 {
     let key = format!("router.backoff_base.{agent}");
-    crate::config::get(&key)
+    config::get(&key)
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(crate::engine::cooldown::BACKOFF_BASE_SECS)
+        .unwrap_or(cooldown::BACKOFF_BASE_SECS)
 }
 
 /// Maximum number of tasks to route per tick. Prevents blocking the tick loop
@@ -99,7 +108,7 @@ pub fn get_agent_backoff_base(agent: &str) -> i64 {
 ///
 /// Configurable via `router.max_tasks_per_tick` (default: 1).
 pub fn max_tasks_per_routing_tick() -> usize {
-    crate::config::get("router.max_tasks_per_tick")
+    config::get("router.max_tasks_per_tick")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1)
@@ -228,10 +237,7 @@ impl Default for RouterConfig {
             router_model: "haiku".to_string(),
             timeout_seconds: 45,
             fallback_executor: "codex".to_string(),
-            agents: DEFAULT_AGENTS
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect(),
+            agents: DEFAULT_AGENTS.iter().map(ToString::to_string).collect(),
             max_route_attempts: 3,
             pool: vec![],
             fallback: String::new(),
@@ -272,30 +278,30 @@ impl RouterConfig {
         let mut config = Self::default();
 
         // Try to load from config
-        if let Ok(mode) = crate::config::get("router.mode")
+        if let Ok(mode) = config::get("router.mode")
             && (mode == "round_robin" || mode == "llm" || mode == "local")
         {
             config.mode = mode;
         }
 
-        if let Ok(agent) = crate::config::get("router.agent")
+        if let Ok(agent) = config::get("router.agent")
             && !agent.is_empty()
         {
             config.router_agent = agent;
         }
 
-        if let Ok(model) = crate::config::get("router.model")
+        if let Ok(model) = config::get("router.model")
             && !model.is_empty()
         {
             config.router_model = RouterConfig::normalize_model_identifier(&model);
         }
 
-        if let Ok(timeout) = crate::config::get("router.timeout_seconds")
+        if let Ok(timeout) = config::get("router.timeout_seconds")
             && let Ok(secs) = timeout.parse::<u64>()
         {
             let clamped = secs.min(MAX_ROUTER_TIMEOUT_SECS);
             if clamped != secs {
-                static TIMEOUT_CLAMP_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                static TIMEOUT_CLAMP_WARNED: OnceLock<()> = OnceLock::new();
                 TIMEOUT_CLAMP_WARNED.get_or_init(|| {
                     tracing::warn!(
                         configured_secs = secs,
@@ -308,21 +314,21 @@ impl RouterConfig {
             config.timeout_seconds = clamped;
         }
 
-        if let Ok(fallback) = crate::config::get("router.fallback_executor")
+        if let Ok(fallback) = config::get("router.fallback_executor")
             && !fallback.is_empty()
         {
             config.fallback_executor = fallback;
         }
 
         // Parse agents list from top-level `agents:` config key
-        config.agents = crate::engine::configured_agents();
+        config.agents = engine::configured_agents();
 
         // Temporary operational toggle: allow disabling agents without editing
         // config files. Controlled by ORCH_EXCLUDE_AGENTS env var (comma-separated
         // list of agent names to exclude from routing). This keeps changes reversible
         // (unset the env var to restore behavior) and avoids editing user config files.
         // Example: ORCH_EXCLUDE_AGENTS=glm,some-other-agent
-        let exclude_agents = std::env::var("ORCH_EXCLUDE_AGENTS")
+        let exclude_agents = env::var("ORCH_EXCLUDE_AGENTS")
             .map(|v| {
                 v.split(',')
                     .map(|s| s.trim().to_string())
@@ -343,14 +349,14 @@ impl RouterConfig {
             }
         }
 
-        if let Ok(max_attempts) = crate::config::get("router.max_route_attempts")
+        if let Ok(max_attempts) = config::get("router.max_route_attempts")
             && let Ok(n) = max_attempts.parse::<u32>()
         {
             config.max_route_attempts = n;
         }
 
         // Parse allowed_tools as comma-separated or YAML array
-        if let Ok(tools_str) = crate::config::get("router.allowed_tools")
+        if let Ok(tools_str) = config::get("router.allowed_tools")
             && !tools_str.is_empty()
             && tools_str != "[]"
         {
@@ -368,12 +374,12 @@ impl RouterConfig {
         }
 
         // Parse weighted_round_robin
-        if let Ok(val) = crate::config::get("router.weighted_round_robin") {
+        if let Ok(val) = config::get("router.weighted_round_robin") {
             config.weighted_round_robin = val == "true" || val == "1";
         }
 
         // Parse self_routing_penalty
-        if let Ok(val) = crate::config::get("router.self_routing_penalty")
+        if let Ok(val) = config::get("router.self_routing_penalty")
             && let Ok(penalty) = val.parse::<f64>()
         {
             config.self_routing_penalty = penalty.clamp(0.0, 1.0);
@@ -382,7 +388,7 @@ impl RouterConfig {
         // Parse per-agent weights from router.weights.<agent>
         for agent in &config.agents {
             let key = format!("router.weights.{agent}");
-            if let Ok(val) = crate::config::get(&key)
+            if let Ok(val) = config::get(&key)
                 && let Ok(w) = val.parse::<f64>()
             {
                 config.weights.insert(agent.clone(), w.max(0.0));
@@ -392,7 +398,7 @@ impl RouterConfig {
         // Parse per-agent backoff base seconds from router.backoff_base.<agent>
         for agent in &config.agents {
             let key = format!("router.backoff_base.{agent}");
-            if let Ok(val) = crate::config::get(&key)
+            if let Ok(val) = config::get(&key)
                 && let Ok(secs) = val.parse::<i64>()
             {
                 config.agent_backoff_bases.insert(agent.clone(), secs);
@@ -400,7 +406,7 @@ impl RouterConfig {
         }
 
         // Parse max_tasks_per_tick
-        if let Ok(val) = crate::config::get("router.max_tasks_per_tick")
+        if let Ok(val) = config::get("router.max_tasks_per_tick")
             && let Ok(n) = val.parse::<usize>()
             && n > 0
         {
@@ -410,13 +416,13 @@ impl RouterConfig {
         // Parse pool: list of "agent:model" entries.
         // `config::get_list()` returns Ok(vec![]) when the key is missing, so we
         // can't rely on `is_ok()` to indicate presence.
-        match crate::config::get_list("router.pool") {
+        match config::get_list("router.pool") {
             Ok(pool_list) if !pool_list.is_empty() => {
                 config.pool = pool_list;
             }
             _ => {
                 // Accept comma-separated string lists: "a,b,c"
-                if let Ok(pool_raw) = crate::config::get("router.pool") {
+                if let Ok(pool_raw) = config::get("router.pool") {
                     let parsed = pool_raw
                         .split(',')
                         .map(|s| s.trim().to_string())
@@ -430,7 +436,7 @@ impl RouterConfig {
         }
 
         // Parse fallback: single "agent:model" entry
-        if let Ok(fallback) = crate::config::get("router.fallback")
+        if let Ok(fallback) = config::get("router.fallback")
             && !fallback.is_empty()
         {
             config.fallback = fallback;
@@ -441,7 +447,7 @@ impl RouterConfig {
         // These candidates apply to every complexity tier by default. More
         // specific model_map.{complexity}.{agent} entries below override the
         // shorthand for that one tier.
-        let known_agents = crate::engine::configured_agents();
+        let known_agents = engine::configured_agents();
         let known_complexities = ["simple", "medium", "complex", "review"];
         for agent in &known_agents {
             let key = format!("models.{agent}");
@@ -481,13 +487,12 @@ impl RouterConfig {
         // Reading the catalog costs an `opencode models` run, so only configs that can
         // reach opencode pay for it
         let discovered_opencode = if config.uses_opencode() {
-            crate::engine::runner::agents::opencode::discover_opencode_models()
+            opencode::discover_opencode_models()
         } else {
             Vec::new()
         };
         if !discovered_opencode.is_empty() {
-            let discovered: std::collections::HashSet<String> =
-                discovered_opencode.into_iter().collect();
+            let discovered: HashSet<String> = discovered_opencode.into_iter().collect();
             for complexity in known_complexities {
                 if let Some(agent_models) = config.model_map.get(complexity)
                     && let Some(models) = agent_models.get("opencode")
@@ -514,7 +519,7 @@ impl RouterConfig {
         }
 
         // Parse default_skills
-        if let Ok(skills_str) = crate::config::get("router.default_skills")
+        if let Ok(skills_str) = config::get("router.default_skills")
             && !skills_str.is_empty()
             && skills_str != "[]"
         {
@@ -530,17 +535,17 @@ impl RouterConfig {
         }
 
         // Parse Ollama-specific config for local routing mode
-        if let Ok(url) = crate::config::get("router.ollama_url")
+        if let Ok(url) = config::get("router.ollama_url")
             && !url.is_empty()
         {
             config.ollama_url = url;
         }
-        if let Ok(model) = crate::config::get("router.ollama_model")
+        if let Ok(model) = config::get("router.ollama_model")
             && !model.is_empty()
         {
             config.ollama_model = model;
         }
-        if let Ok(timeout) = crate::config::get("router.ollama_timeout_seconds")
+        if let Ok(timeout) = config::get("router.ollama_timeout_seconds")
             && let Ok(secs) = timeout.parse::<u64>()
             && secs > 0
         {
@@ -601,7 +606,7 @@ impl RouterConfig {
     }
 
     fn read_model_pool_from_config(key: &str) -> Option<Vec<String>> {
-        match crate::config::get_list(key) {
+        match config::get_list(key) {
             Ok(list) => {
                 if !list.is_empty() {
                     return Some(
@@ -612,7 +617,7 @@ impl RouterConfig {
                 }
             }
             _ => {
-                if let Ok(val) = crate::config::get(key)
+                if let Ok(val) = config::get(key)
                     && !val.is_empty()
                 {
                     return Some(vec![RouterConfig::normalize_model_identifier(&val)]);
@@ -645,8 +650,7 @@ impl RouterConfig {
         }
 
         if has_free {
-            expanded_pool
-                .extend(crate::engine::runner::agents::opencode::discover_free_opencode_models());
+            expanded_pool.extend(opencode::discover_free_opencode_models());
         }
 
         // Also filter out invalid discovered free models (should be valid but just in case)
@@ -655,10 +659,9 @@ impl RouterConfig {
         // For opencode, filter configured entries against the provider model catalog
         // when available. This proactively avoids dispatching non-existent model IDs.
         if agent == "opencode" {
-            let discovered = crate::engine::runner::agents::opencode::discover_opencode_models();
+            let discovered = opencode::discover_opencode_models();
             if !discovered.is_empty() {
-                let discovered_set: std::collections::HashSet<String> =
-                    discovered.into_iter().collect();
+                let discovered_set: HashSet<String> = discovered.into_iter().collect();
                 expanded_pool.retain(|m| discovered_set.contains(m));
             }
         }
@@ -679,7 +682,7 @@ impl RouterConfig {
             None => false,
             Some(pool) => pool
                 .iter()
-                .any(|model| !crate::engine::cooldown::is_model_in_cooldown(agent, model)),
+                .any(|model| !cooldown::is_model_in_cooldown(agent, model)),
         }
     }
 
@@ -701,8 +704,7 @@ impl RouterConfig {
             return None;
         }
         // Random starting index — varies per task_id to distribute across the pool
-        let start =
-            crate::engine::router::selection::simple_hash_index_for(expanded_pool.len(), task_id);
+        let start = selection::simple_hash_index_for(expanded_pool.len(), task_id);
         // Walk the pool from start, skipping cooled and invalid models
         for i in 0..expanded_pool.len() {
             let model = &expanded_pool[(start + i) % expanded_pool.len()];
@@ -715,7 +717,7 @@ impl RouterConfig {
                 );
                 continue;
             }
-            if !crate::engine::cooldown::is_model_in_cooldown(agent, model) {
+            if !cooldown::is_model_in_cooldown(agent, model) {
                 // Normalize the model identifier to handle edge cases like trailing slashes
                 return Some(Self::normalize_model_identifier(model));
             }
@@ -751,7 +753,7 @@ impl RouterConfig {
     /// Returns the total number of model entries removed across all complexity tiers.
     fn prune_unavailable_opencode_models(
         model_map: &mut HashMap<String, HashMap<String, Vec<String>>>,
-        discovered: &std::collections::HashSet<String>,
+        discovered: &HashSet<String>,
     ) -> usize {
         let mut pruned = 0;
         for agent_models in model_map.values_mut() {
@@ -768,24 +770,31 @@ impl RouterConfig {
 #[cfg(test)]
 mod tests {
     use super::{MAX_ROUTER_TIMEOUT_SECS, RouterConfig};
+    use crate::engine::cooldown;
     use serial_test::serial;
+    use std::collections::HashMap;
+    use std::collections::HashSet;
+    use std::env;
+    use std::fs;
+    use std::path::Path;
+    use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
 
     struct CurrentDirGuard {
-        original: std::path::PathBuf,
+        original: PathBuf,
     }
 
     impl CurrentDirGuard {
-        fn set(path: &std::path::Path) -> Self {
-            let original = std::env::current_dir().unwrap();
-            std::env::set_current_dir(path).unwrap();
+        fn set(path: &Path) -> Self {
+            let original = env::current_dir().unwrap();
+            env::set_current_dir(path).unwrap();
             Self { original }
         }
     }
 
     impl Drop for CurrentDirGuard {
         fn drop(&mut self) {
-            std::env::set_current_dir(&self.original).unwrap();
+            env::set_current_dir(&self.original).unwrap();
         }
     }
 
@@ -797,7 +806,7 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn model_for_complexity_returns_none_when_all_models_cooled() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let mut config = RouterConfig::default();
         // Inject a two-model pool for a unique agent name to avoid cross-test pollution
         config
@@ -813,10 +822,8 @@ mod tests {
             );
 
         // Put both models into cooldown
-        crate::engine::cooldown::record_model_failure("testagent_allcooled", "cooldown-model-a")
-            .await;
-        crate::engine::cooldown::record_model_failure("testagent_allcooled", "cooldown-model-b")
-            .await;
+        cooldown::record_model_failure("testagent_allcooled", "cooldown-model-a").await;
+        cooldown::record_model_failure("testagent_allcooled", "cooldown-model-b").await;
 
         let result = config.model_for_complexity("testagent_allcooled", "complex", "task-0");
         assert!(
@@ -828,7 +835,7 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn model_for_complexity_returns_none_when_single_model_cooled() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let mut config = RouterConfig::default();
         config
             .model_map
@@ -839,11 +846,7 @@ mod tests {
                 vec!["single-cooled-model".to_string()],
             );
 
-        crate::engine::cooldown::record_model_failure(
-            "testagent_singlecooled",
-            "single-cooled-model",
-        )
-        .await;
+        cooldown::record_model_failure("testagent_singlecooled", "single-cooled-model").await;
 
         let result = config.model_for_complexity("testagent_singlecooled", "complex", "task-0");
         assert!(
@@ -925,7 +928,7 @@ mod tests {
     fn from_config_reads_self_routing_penalty() {
         let _lock = cwd_mutex().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
+        fs::write(
             dir.path().join(".orch.yml"),
             "router:\n  self_routing_penalty: 0.5\n",
         )
@@ -955,7 +958,7 @@ mod tests {
     fn from_config_reads_router_pool_yaml_array() {
         let _lock = cwd_mutex().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
+        fs::write(
             dir.path().join(".orch.yml"),
             "router:\n  pool:\n    - opencode:free\n    - opencode:github-copilot/gpt-5-mini\n    - kimi:k2p5\n    - claude:haiku\n",
         )
@@ -980,7 +983,7 @@ mod tests {
     fn from_config_clamps_router_timeout_to_max() {
         let _lock = cwd_mutex().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
+        fs::write(
             dir.path().join(".orch.yml"),
             "router:\n  timeout_seconds: 90\n",
         )
@@ -1052,7 +1055,7 @@ mod tests {
         let _lock = cwd_mutex().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         // Simulate a config with a custom agent (olm) in both agents and model_map
-        std::fs::write(
+        fs::write(
             dir.path().join(".orch.yml"),
             r"
 agents:
@@ -1098,7 +1101,7 @@ model_map:
     fn from_config_loads_models_shorthand_for_all_complexities() {
         let _lock = cwd_mutex().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
+        fs::write(
             dir.path().join(".orch.yml"),
             r"
 agents:
@@ -1128,7 +1131,7 @@ models:
     fn from_config_loads_single_model_shorthand_for_all_complexities() {
         let _lock = cwd_mutex().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
+        fs::write(
             dir.path().join(".orch.yml"),
             r"
 agents:
@@ -1156,7 +1159,7 @@ models:
     fn from_config_model_map_overrides_models_shorthand_per_tier() {
         let _lock = cwd_mutex().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
+        fs::write(
             dir.path().join(".orch.yml"),
             r"
 agents:
@@ -1236,8 +1239,6 @@ model_map:
     #[serial(cooldown_state)]
     #[test]
     fn prune_unavailable_opencode_models_removes_missing_models() {
-        use std::collections::{HashMap, HashSet};
-
         let mut model_map: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
         model_map.entry("complex".to_string()).or_default().insert(
             "opencode".to_string(),
@@ -1274,8 +1275,6 @@ model_map:
     #[serial(cooldown_state)]
     #[test]
     fn prune_unavailable_opencode_models_noop_when_all_available() {
-        use std::collections::{HashMap, HashSet};
-
         let mut model_map: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
         model_map.entry("simple".to_string()).or_default().insert(
             "opencode".to_string(),
@@ -1284,7 +1283,7 @@ model_map:
 
         let discovered: HashSet<String> = ["model-a", "model-b"]
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(ToString::to_string)
             .collect();
 
         let pruned = RouterConfig::prune_unavailable_opencode_models(&mut model_map, &discovered);
@@ -1300,8 +1299,6 @@ model_map:
     #[serial(cooldown_state)]
     #[test]
     fn prune_unavailable_opencode_models_preserves_non_opencode_agents() {
-        use std::collections::{HashMap, HashSet};
-
         let mut model_map: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
         model_map
             .entry("complex".to_string())
@@ -1371,8 +1368,6 @@ model_map:
     #[serial(cooldown_state)]
     #[test]
     fn prune_unavailable_opencode_models_covers_all_complexity_tiers() {
-        use std::collections::{HashMap, HashSet};
-
         let mut model_map: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
         for tier in ["simple", "medium", "complex", "review"] {
             model_map

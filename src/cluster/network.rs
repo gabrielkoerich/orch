@@ -1,6 +1,8 @@
 //! Raft RPCs and forwarded writes between nodes, JSON over HTTP like `../agents-coordination`.
 //! Every request carries the cluster secret, so reaching the port is not enough to join
 
+use std::error;
+use std::fmt::Write as _;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -9,7 +11,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use hmac::Hmac;
+use hmac::Mac;
 use openraft::BasicNode;
+use openraft::error::ClientWriteError;
 use openraft::error::{
     InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Unreachable,
 };
@@ -18,6 +23,7 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
+use reqwest::header::HeaderValue;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use subtle::ConstantTimeEq;
@@ -61,9 +67,6 @@ pub struct Hello {
 
 /// HMAC-SHA256 under the cluster secret, in hex. Proves the secret without sending it
 fn mac(secret: &str, parts: &[&str]) -> String {
-    use hmac::{Hmac, Mac};
-    use std::fmt::Write as _;
-
     let mut m =
         Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key");
     for part in parts {
@@ -89,7 +92,7 @@ pub struct Join {
 fn authorized(app: &App, headers: &HeaderMap) -> bool {
     let given = headers
         .get(SECRET_HEADER)
-        .map(reqwest::header::HeaderValue::as_bytes)
+        .map(HeaderValue::as_bytes)
         .unwrap_or_default();
     given.ct_eq(app.secret.as_bytes()).into()
 }
@@ -148,15 +151,13 @@ async fn join(State(a): State<App>, headers: HeaderMap, Json(req): Json<Join>) -
     let node = BasicNode::new(&req.addr);
     match a.raft.add_learner(req.id, node, false).await {
         Ok(_) => StatusCode::OK.into_response(),
-        Err(RaftError::APIError(openraft::error::ClientWriteError::ForwardToLeader(f))) => {
-            match f.leader_node {
-                Some(leader) => match send_join(&leader.addr, &a.secret, &req).await {
-                    Ok(()) => StatusCode::OK.into_response(),
-                    Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
-                },
-                None => (StatusCode::SERVICE_UNAVAILABLE, "no leader yet").into_response(),
-            }
-        }
+        Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => match f.leader_node {
+            Some(leader) => match send_join(&leader.addr, &a.secret, &req).await {
+                Ok(()) => StatusCode::OK.into_response(),
+                Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+            },
+            None => (StatusCode::SERVICE_UNAVAILABLE, "no leader yet").into_response(),
+        },
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
     }
 }
@@ -249,7 +250,7 @@ async fn write(State(a): State<App>, headers: HeaderMap, Json(req): Json<Request
     match a.raft.client_write(req).await {
         Ok(r) => Json(r.data).into_response(),
         // Refused before anything was proposed, so the sender may safely try another node
-        Err(e @ RaftError::APIError(openraft::error::ClientWriteError::ForwardToLeader(_))) => {
+        Err(e @ RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => {
             (StatusCode::MISDIRECTED_REQUEST, e.to_string()).into_response()
         }
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
@@ -314,7 +315,7 @@ impl RaftNetworkFactory<TypeConfig> for HttpNetwork {
         Peer {
             target,
             addr: node.addr.clone(),
-            secret: std::sync::Arc::clone(&self.secret),
+            secret: Arc::clone(&self.secret),
         }
     }
 }
@@ -335,7 +336,7 @@ impl Peer {
     where
         Req: Serialize,
         Resp: DeserializeOwned,
-        E: std::error::Error + DeserializeOwned,
+        E: error::Error + DeserializeOwned,
     {
         let res = CLIENT
             .post(format!("http://{}/raft/{path}", self.addr))

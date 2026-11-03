@@ -1,13 +1,19 @@
 //! `orch plan import` creates and updates issues from a roadmap file.
 
 use std::collections::{HashMap, HashSet};
+use std::env;
+use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 use anyhow::Context;
 
+use crate::backends::BlockedByFetch;
 use crate::config;
 use crate::github::http::GhHttp;
 use crate::github::types::GitHubIssue;
+use crate::plan;
+use crate::plan::ChangeKind;
 use crate::plan::{
     Binding, DepRef, ExistingIssue, HUMAN_LABEL, LinkEdit, NO_AGENT_LABEL, PLAN_LABEL, PlanDiff,
     Task, UnmetExternal, diff_import, diff_links, issue_body_with, issue_title, labels_for,
@@ -21,14 +27,14 @@ pub async fn import(
     skip_unmet: bool,
 ) -> anyhow::Result<()> {
     let path = Path::new(file);
-    let markdown = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    let (roadmap, warnings) = crate::plan::parse_roadmap_for(&markdown, milestone)?;
+    let markdown =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let (roadmap, warnings) = plan::parse_roadmap_for(&markdown, milestone)?;
     for warning in warnings {
         eprintln!("warning: {warning}");
     }
     if let Some(id) = milestone {
-        crate::plan::select(&roadmap, Some(id))?;
+        plan::select(&roadmap, Some(id))?;
     }
     let repo = config::get_current_repo()
         .context("'repo' not set — run `orch init` or set gh.repo in .orch.yml")?;
@@ -45,7 +51,7 @@ pub async fn import(
     let branch = http.get_default_branch(&repo).await?;
     let existing = load_existing(&http, &repo).await?;
     let known: HashSet<String> = existing.iter().map(|issue| issue.task_id.clone()).collect();
-    let selected_all: Vec<Task> = crate::plan::select(&roadmap, milestone)?
+    let selected_all: Vec<Task> = plan::select(&roadmap, milestone)?
         .into_iter()
         .cloned()
         .collect();
@@ -60,7 +66,7 @@ pub async fn import(
         let skip = skip_unmet_ids(&selected_all, &unmet);
         let mut skipped = Vec::new();
         diff.tasks.retain(|plan| {
-            if plan.kind == crate::plan::ChangeKind::Create && skip.contains(&plan.task.id) {
+            if plan.kind == ChangeKind::Create && skip.contains(&plan.task.id) {
                 skipped.push(plan.task.id.clone());
                 false
             } else {
@@ -183,11 +189,11 @@ async fn load_blocked_by(
             continue;
         }
         let blocked = match http.list_blocked_by(repo, number).await? {
-            crate::backends::BlockedByFetch::Native(items) => items,
-            crate::backends::BlockedByFetch::Unavailable => {
+            BlockedByFetch::Native(items) => items,
+            BlockedByFetch::Unavailable => {
                 anyhow::bail!("blocked-by API unavailable for #{number}");
             }
-            crate::backends::BlockedByFetch::Failed(err) => {
+            BlockedByFetch::Failed(err) => {
                 anyhow::bail!("blocked-by API failed for #{number}: {err}");
             }
         };
@@ -230,8 +236,8 @@ async fn apply(
 
     for plan in &diff.tasks {
         match plan.kind {
-            crate::plan::ChangeKind::Unchanged => {}
-            crate::plan::ChangeKind::Create => {
+            ChangeKind::Unchanged => {}
+            ChangeKind::Create => {
                 let title = issue_title(&plan.task);
                 let extra = blocked_external
                     .get(&plan.task.id)
@@ -247,7 +253,7 @@ async fn apply(
                 }
                 numbers.insert(plan.task.id.clone(), (issue.number, issue.id));
             }
-            crate::plan::ChangeKind::Update => {
+            ChangeKind::Update => {
                 let number = plan.number.context("update is missing an issue number")?;
                 let title = issue_title(&plan.task);
                 let extra = blocked_external
@@ -308,7 +314,7 @@ async fn apply(
 }
 
 fn repo_relative(path: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .ok()?;
@@ -320,7 +326,7 @@ fn repo_relative(path: &Path) -> Option<String> {
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir().ok()?.join(path)
+        env::current_dir().ok()?.join(path)
     };
     let abs = abs.canonicalize().unwrap_or(abs);
     let top = top.canonicalize().unwrap_or(top);

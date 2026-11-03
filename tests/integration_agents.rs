@@ -23,7 +23,10 @@
 //! cargo test --test integration_agents router -- --ignored --nocapture
 //! ```
 
+use std::fs;
+use std::io::Write;
 use std::process::Command;
+use std::process::Stdio;
 
 /// Simple prompt that should produce a parseable JSON response.
 const SIMPLE_PROMPT: &str = r#"Reply with ONLY this JSON, no markdown, no explanation:
@@ -187,12 +190,11 @@ fn claude_stdin_pipe_mode() {
     // Test -p with stdin redirect — matches real task agent invocation
     let output = agent_cmd("claude")
         .args(["-p", "--model", "haiku", "--output-format", "json"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .and_then(|mut child| {
-            use std::io::Write;
             if let Some(ref mut stdin) = child.stdin {
                 stdin.write_all(SIMPLE_PROMPT.as_bytes()).ok();
             }
@@ -300,12 +302,11 @@ fn codex_stdin_pipe_mode() {
     // Test piped stdin — matches real task invocation: cat msg | codex ... exec --json -
     let output = agent_cmd("codex")
         .args(["--full-auto", "exec", "--json", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .and_then(|mut child| {
-            use std::io::Write;
             if let Some(ref mut stdin) = child.stdin {
                 stdin.write_all(SIMPLE_PROMPT.as_bytes()).ok();
             }
@@ -408,8 +409,8 @@ fn opencode_with_permission_config_succeeds() {
     // Create a temp workdir with .opencode/config.json (same as build_command generates)
     let workdir = tempfile::tempdir().expect("failed to create tempdir");
     let config_dir = workdir.path().join(".opencode");
-    std::fs::create_dir_all(&config_dir).expect("failed to create .opencode dir");
-    std::fs::write(
+    fs::create_dir_all(&config_dir).expect("failed to create .opencode dir");
+    fs::write(
         config_dir.join("config.json"),
         r#"{"permission":{"read":"allow","edit":"allow","glob":"allow","grep":"allow","bash":"allow","task":"allow","skill":"allow","webfetch":"allow","websearch":"allow","list":"allow","todowrite":"allow","todoread":"allow","question":"allow","codesearch":"allow"}}"#,
     )

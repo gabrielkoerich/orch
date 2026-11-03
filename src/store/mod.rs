@@ -23,11 +23,6 @@
 //! `CONTROL_MESSAGE_COLS`, `JOB_STATE_COLS`, etc. See `tasks.rs` and `control.rs`
 //! for examples. CI will fail if `SELECT *` is detected in store files.
 
-use anyhow::Context;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
-use std::path::Path;
-use std::sync::{Arc, OnceLock};
-
 pub(crate) mod control;
 pub(crate) mod dependencies;
 mod helpers;
@@ -37,6 +32,18 @@ mod metrics;
 mod pricing;
 pub(crate) mod replica;
 pub(crate) mod tasks;
+#[cfg(test)]
+mod tests;
+
+use anyhow::Context;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
+use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 pub use control::{ChatCostSummary, ControlMessage, MemoryEntry, parse_since_duration};
 pub use dependencies::{
@@ -58,14 +65,25 @@ pub use metrics::{
     InsertTaskMetric, MetricsSummary, SlowTaskInfo,
 };
 pub use pricing::{CostEstimate, ModelPricing, TokenUsage, pricing_for_model};
+use sqlx::error::DatabaseError;
 pub use tasks::{
     CliTaskRef, CliTaskSpec, CompleteRun, NewTask, RunTokenUsage, StartRun, StoreRoute, Task,
     TaskActivity, TaskRun, TaskStatus, UpsertExternal, parse_cli_task_spec,
 };
+use tokio::time;
+
+use crate::cluster;
+use crate::cluster::Command;
+use crate::cluster::Node;
+use crate::cluster::Reply;
+use crate::cluster::Request;
+use crate::cluster::local;
+use crate::cluster::local::Endpoint;
+use crate::home;
 
 /// Default database path: `~/.orch/orch.db`
-pub async fn default_db_path() -> anyhow::Result<std::path::PathBuf> {
-    crate::home::db_path().await
+pub async fn default_db_path() -> anyhow::Result<PathBuf> {
+    home::db_path().await
 }
 
 /// The unified task store backed by SQLite (via sqlx).
@@ -73,13 +91,13 @@ pub async fn default_db_path() -> anyhow::Result<std::path::PathBuf> {
 pub struct TaskStore {
     pool: SqlitePool,
     /// Set once on the daemon. Without it, replicated writes apply directly, as in tests and the CLI
-    raft: Arc<OnceLock<crate::cluster::Node>>,
+    raft: Arc<OnceLock<Node>>,
     /// Set on the CLI when a daemon runs, so its writes go through the daemon's log
-    daemon: Arc<OnceLock<crate::cluster::local::Endpoint>>,
+    daemon: Arc<OnceLock<Endpoint>>,
 }
 
-impl std::fmt::Debug for TaskStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for TaskStore {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("TaskStore").finish_non_exhaustive()
     }
 }
@@ -93,7 +111,7 @@ impl TaskStore {
             .filename(db_path)
             .journal_mode(SqliteJournalMode::Wal)
             .create_if_missing(true)
-            .busy_timeout(std::time::Duration::from_secs(5))
+            .busy_timeout(Duration::from_secs(5))
             .pragma("foreign_keys", "ON");
 
         let pool = SqlitePoolOptions::new()
@@ -121,7 +139,7 @@ impl TaskStore {
             .filename(db_path)
             .journal_mode(SqliteJournalMode::Wal)
             .create_if_missing(true)
-            .busy_timeout(std::time::Duration::from_secs(5))
+            .busy_timeout(Duration::from_secs(5))
             .pragma("foreign_keys", "ON");
 
         let pool = SqlitePoolOptions::new()
@@ -168,7 +186,7 @@ impl TaskStore {
         Ok(())
     }
 
-    pub fn attach_node(&self, node: crate::cluster::Node) {
+    pub fn attach_node(&self, node: Node) {
         if self.raft.set(node).is_err() {
             tracing::warn!("raft already attached to the task store");
         }
@@ -185,22 +203,19 @@ impl TaskStore {
         self.raft.get().is_some() || self.daemon.get().is_some()
     }
 
-    pub fn node(&self) -> Option<&crate::cluster::Node> {
+    pub fn node(&self) -> Option<&Node> {
         self.raft.get()
     }
 
-    pub fn attach_daemon(&self, endpoint: crate::cluster::local::Endpoint) {
+    pub fn attach_daemon(&self, endpoint: Endpoint) {
         let _ = self.daemon.set(endpoint);
     }
 
     /// Propose a replicated write through Raft, or apply it directly when no Raft is attached
-    pub(crate) async fn write(
-        &self,
-        cmd: crate::cluster::Command,
-    ) -> anyhow::Result<crate::cluster::Reply> {
+    pub(crate) async fn write(&self, cmd: Command) -> anyhow::Result<Reply> {
         let Some(node) = self.raft.get() else {
             if let Some(endpoint) = self.daemon.get() {
-                match crate::cluster::local::send(endpoint, &cmd).await {
+                match local::send(endpoint, &cmd).await {
                     Ok(reply) => return reply_result(reply),
                     // Nothing was sent, so applying here cannot apply the command twice
                     Err(e) if e.is_connect() => {
@@ -212,32 +227,29 @@ impl TaskStore {
 
             return self.apply_direct(cmd).await;
         };
-        let req = crate::cluster::Request {
-            now: crate::cluster::now_stamp(),
+        let req = Request {
+            now: cluster::now_stamp(),
             cmd,
         };
         reply_result(node.write(req).await?)
     }
 
-    pub(crate) async fn write_int(&self, cmd: crate::cluster::Command) -> anyhow::Result<i64> {
+    pub(crate) async fn write_int(&self, cmd: Command) -> anyhow::Result<i64> {
         match self.write(cmd).await? {
-            crate::cluster::Reply::Int(n) => Ok(n),
+            Reply::Int(n) => Ok(n),
             other => anyhow::bail!("expected an integer reply, got {other:?}"),
         }
     }
 
-    pub(crate) async fn write_bool(&self, cmd: crate::cluster::Command) -> anyhow::Result<bool> {
+    pub(crate) async fn write_bool(&self, cmd: Command) -> anyhow::Result<bool> {
         match self.write(cmd).await? {
-            crate::cluster::Reply::Bool(b) => Ok(b),
+            Reply::Bool(b) => Ok(b),
             other => anyhow::bail!("expected a boolean reply, got {other:?}"),
         }
     }
 
     /// The same SQL apply runs, in one transaction on this node only
-    pub(crate) async fn apply_direct(
-        &self,
-        cmd: crate::cluster::Command,
-    ) -> anyhow::Result<crate::cluster::Reply> {
+    pub(crate) async fn apply_direct(&self, cmd: Command) -> anyhow::Result<Reply> {
         let mut attempt = 0;
         loop {
             match self.apply_once(cmd.clone()).await {
@@ -245,22 +257,16 @@ impl TaskStore {
                 Err(e) if attempt < WRITE_LOCK_RETRIES && is_write_lock_error(&e) => {
                     attempt += 1;
                     tracing::warn!(attempt, err = %e, "database is locked, retrying the write");
-                    tokio::time::sleep(std::time::Duration::from_millis(100 << (attempt - 1)))
-                        .await;
+                    time::sleep(Duration::from_millis(100 << (attempt - 1))).await;
                 }
                 result => return result,
             }
         }
     }
 
-    async fn apply_once(
-        &self,
-        cmd: crate::cluster::Command,
-    ) -> anyhow::Result<crate::cluster::Reply> {
+    async fn apply_once(&self, cmd: Command) -> anyhow::Result<Reply> {
         let mut tx = self.begin_write().await?;
-        let reply = cmd
-            .apply(&mut tx, &crate::cluster::now_stamp(), false)
-            .await?;
+        let reply = cmd.apply(&mut tx, &cluster::now_stamp(), false).await?;
         tx.commit().await?;
         Ok(reply)
     }
@@ -291,17 +297,14 @@ fn is_write_lock_error(err: &anyhow::Error) -> bool {
         cause
             .downcast_ref::<sqlx::Error>()
             .and_then(|e| e.as_database_error())
-            .and_then(sqlx::error::DatabaseError::code)
+            .and_then(DatabaseError::code)
             .is_some_and(|code| code == "5" || code == "517")
     })
 }
 
-fn reply_result(reply: crate::cluster::Reply) -> anyhow::Result<crate::cluster::Reply> {
+fn reply_result(reply: Reply) -> anyhow::Result<Reply> {
     match reply {
-        crate::cluster::Reply::Err(e) => Err(anyhow::anyhow!(e)),
+        Reply::Err(e) => Err(anyhow::anyhow!(e)),
         other => Ok(other),
     }
 }
-
-#[cfg(test)]
-mod tests;

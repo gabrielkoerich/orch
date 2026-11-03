@@ -12,8 +12,30 @@
 
 use async_trait::async_trait;
 use orch::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
+use orch::engine::ProjectEngine;
+use orch::engine::cooldown;
+use orch::engine::router;
+use orch::engine::router::Router;
+use orch::engine::router::config::RouterConfig;
+use orch::engine::router::config::retry_base_delay_ms;
+use orch::engine::router::config::retry_max_delay_ms;
+use orch::engine::router::config::*;
+use orch::engine::runner::TaskRunner;
+use orch::engine::tasks::TaskManager;
+use orch::store::NewTask;
+use orch::store::StoreRoute;
+use orch::store::TaskActivity;
+use orch::store::TaskStatus;
 use orch::store::TaskStore;
+use orch::store::UpsertExternal;
+use std::env;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 /// Minimal mock backend that passes health checks and returns empty lists.
 struct MockBackend;
@@ -81,9 +103,9 @@ async fn store_opens_and_migrates() {
     let tmp = temp_db("open");
     let store = TaskStore::open(&tmp).await;
     assert!(store.is_ok(), "TaskStore::open failed: {:?}", store.err());
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
-    let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+    let _ = fs::remove_file(&tmp);
+    let _ = fs::remove_file(tmp.with_extension("db-shm"));
+    let _ = fs::remove_file(tmp.with_extension("db-wal"));
 }
 
 /// Verify that TaskStore migrations are idempotent (open twice).
@@ -107,9 +129,9 @@ async fn store_migrations_idempotent() {
         );
     }
 
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
-    let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+    let _ = fs::remove_file(&tmp);
+    let _ = fs::remove_file(tmp.with_extension("db-shm"));
+    let _ = fs::remove_file(tmp.with_extension("db-wal"));
 }
 
 /// Verify that tasks table exists and is queryable after migrations.
@@ -125,9 +147,9 @@ async fn store_tasks_table_exists() {
         .expect("query tasks table");
     assert_eq!(count, 0);
 
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
-    let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+    let _ = fs::remove_file(&tmp);
+    let _ = fs::remove_file(tmp.with_extension("db-shm"));
+    let _ = fs::remove_file(tmp.with_extension("db-wal"));
 }
 
 /// Verify that the router config parses without panicking.
@@ -137,7 +159,7 @@ fn router_config_parses() {
     // The repository's project config may be visible in test context, so assert
     // that parsing succeeds and yields a supported mode rather than assuming
     // hardcoded defaults.
-    let config = orch::engine::router::config::RouterConfig::from_config();
+    let config = RouterConfig::from_config();
     assert!(!config.agents.is_empty(), "should have default agents");
     assert!(
         matches!(config.mode.as_str(), "llm" | "local" | "round_robin"),
@@ -158,10 +180,10 @@ async fn mock_backend_health_check() {
 async fn cooldown_init_with_store() {
     let tmp = temp_db("cooldown");
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
-    orch::engine::cooldown::init_cooldown_store(store).await;
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
-    let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+    cooldown::init_cooldown_store(store).await;
+    let _ = fs::remove_file(&tmp);
+    let _ = fs::remove_file(tmp.with_extension("db-shm"));
+    let _ = fs::remove_file(tmp.with_extension("db-wal"));
     // Should not panic — that's the test
 }
 
@@ -173,18 +195,17 @@ async fn cooldown_init_with_store() {
 /// Helper: create a temp DB path with a unique suffix and return it.
 /// The caller is responsible for cleanup. Uses an atomic counter to
 /// guarantee uniqueness even when tests run in parallel threads.
-fn temp_db(label: &str) -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
+fn temp_db(label: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("orch-integ-{label}-{}-{n}.db", std::process::id()))
+    env::temp_dir().join(format!("orch-integ-{label}-{}-{n}.db", process::id()))
 }
 
 /// Helper: remove a temp DB and its WAL/SHM files.
-fn cleanup_db(path: &std::path::Path) {
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(path.with_extension("db-shm"));
-    let _ = std::fs::remove_file(path.with_extension("db-wal"));
+fn cleanup_db(path: &Path) {
+    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(path.with_extension("db-shm"));
+    let _ = fs::remove_file(path.with_extension("db-wal"));
 }
 
 /// Verify that a ProjectEngine can be fully constructed from mock components.
@@ -194,31 +215,25 @@ fn cleanup_db(path: &std::path::Path) {
 /// If any struct field changes or a constructor signature drifts, this fails.
 #[tokio::test]
 async fn project_engine_constructs() {
-    use orch::engine::ProjectEngine;
-    use orch::engine::runner::TaskRunner;
-    use orch::engine::tasks::TaskManager;
-
     let tmp = temp_db("pe-construct");
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
     let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
 
     let task_manager = Arc::new(TaskManager::with_store(
-        std::sync::Arc::clone(&backend),
-        std::sync::Arc::clone(&store),
+        Arc::clone(&backend),
+        Arc::clone(&store),
         "test/repo".to_string(),
     ));
 
-    let runner = Arc::new(
-        TaskRunner::new("test/repo".to_string()).with_store(std::sync::Arc::clone(&store)),
-    );
+    let runner = Arc::new(TaskRunner::new("test/repo".to_string()).with_store(Arc::clone(&store)));
 
     let engine = ProjectEngine {
         repo: "test/repo".to_string(),
-        project_dir: std::path::PathBuf::from("/tmp/test-project"),
+        project_dir: PathBuf::from("/tmp/test-project"),
         backend,
         task_manager,
         runner,
-        store: std::sync::Arc::clone(&store),
+        store: Arc::clone(&store),
     };
 
     assert_eq!(engine.repo, "test/repo");
@@ -229,18 +244,11 @@ async fn project_engine_constructs() {
 /// in the store with status `New`.
 #[tokio::test]
 async fn task_manager_creates_internal_task() {
-    use orch::engine::tasks::TaskManager;
-    use orch::store::TaskStatus;
-
     let tmp = temp_db("tm-create");
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
     let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
 
-    let tm = TaskManager::with_store(
-        backend,
-        std::sync::Arc::clone(&store),
-        "test/repo".to_string(),
-    );
+    let tm = TaskManager::with_store(backend, Arc::clone(&store), "test/repo".to_string());
 
     // Create an internal task via the store directly (TaskManager.create_task
     // requires more setup; the store method is what the engine uses internally).
@@ -284,8 +292,6 @@ async fn task_manager_creates_internal_task() {
 /// retrieved by external ID.
 #[tokio::test]
 async fn create_external_task_and_retrieve() {
-    use orch::store::{NewTask, TaskStatus};
-
     let tmp = temp_db("create-ext");
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
@@ -330,8 +336,6 @@ async fn create_external_task_and_retrieve() {
 /// TaskStatus enum serialization.
 #[tokio::test]
 async fn task_status_lifecycle() {
-    use orch::store::TaskStatus;
-
     let tmp = temp_db("status-lifecycle");
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
@@ -384,8 +388,6 @@ async fn task_status_lifecycle() {
 /// an LLM call or tmux session.
 #[tokio::test]
 async fn store_route_result_persists() {
-    use orch::store::{StoreRoute, TaskStatus};
-
     let tmp = temp_db("route-persist");
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
@@ -433,10 +435,6 @@ async fn store_route_result_persists() {
 /// an integration test, since tick_route_tasks is pub(crate).
 #[tokio::test]
 async fn router_round_robin_routes_task() {
-    use orch::engine::router::Router;
-    use orch::engine::router::config::RouterConfig;
-    use orch::store::UpsertExternal;
-
     let tmp = temp_db("rr-route");
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
@@ -521,7 +519,7 @@ async fn router_round_robin_routes_task() {
         .await
         .expect("store route result");
 
-    let stored = orch::engine::router::get_route_result(&store, "test/repo", "99")
+    let stored = router::get_route_result(&store, "test/repo", "99")
         .await
         .expect("get route result");
     assert_eq!(stored.agent, route.agent);
@@ -536,8 +534,6 @@ async fn router_round_robin_routes_task() {
 /// store wiring should not panic.
 #[tokio::test]
 async fn task_runner_constructs_with_store() {
-    use orch::engine::runner::TaskRunner;
-
     let tmp = temp_db("runner-construct");
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
@@ -563,11 +559,11 @@ async fn task_activity_tracking() {
 
     // Status updates automatically append activity entries
     store
-        .update_status(id, orch::store::TaskStatus::Routed)
+        .update_status(id, TaskStatus::Routed)
         .await
         .expect("route");
     store
-        .update_status(id, orch::store::TaskStatus::InProgress)
+        .update_status(id, TaskStatus::InProgress)
         .await
         .expect("dispatch");
 
@@ -591,8 +587,6 @@ async fn task_activity_tracking() {
 /// 4. Verify task is no longer in the routable list
 #[tokio::test]
 async fn engine_tick_simulation() {
-    use orch::store::{StoreRoute, TaskStatus, UpsertExternal};
-
     let tmp = temp_db("tick-sim");
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
@@ -692,8 +686,6 @@ async fn engine_tick_simulation() {
 /// Verify that blocked status works and block_reason is stored.
 #[tokio::test]
 async fn task_blocked_with_reason() {
-    use orch::store::TaskStatus;
-
     let tmp = temp_db("blocked");
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
@@ -741,8 +733,6 @@ async fn task_blocked_with_reason() {
 /// different repos must not leak into each other's routable lists.
 #[tokio::test]
 async fn multi_repo_task_isolation() {
-    use orch::store::TaskStatus;
-
     let tmp = temp_db("multi-repo");
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
@@ -791,8 +781,6 @@ async fn multi_repo_task_isolation() {
 /// Verify graceful degradation config defaults.
 #[test]
 fn graceful_degradation_config_defaults() {
-    use orch::engine::router::config::*;
-
     // Test default threshold
     let threshold = min_healthy_agents_threshold();
     assert_eq!(threshold, 2, "default threshold should be 2");
@@ -814,7 +802,6 @@ fn graceful_degradation_config_defaults() {
 #[test]
 fn exponential_backoff_calculation() {
     // Test config values directly (these are public)
-    use orch::engine::router::config::{retry_base_delay_ms, retry_max_delay_ms};
 
     let base = retry_base_delay_ms();
     let max = retry_max_delay_ms();
@@ -842,8 +829,6 @@ fn exponential_backoff_calculation() {
 /// Verify router healthy agent count.
 #[tokio::test]
 async fn router_healthy_agent_count() {
-    use orch::engine::router::{Router, RouterConfig};
-
     // Create router with default config
     let config = RouterConfig::default();
     let router = Router::new(config);
@@ -888,8 +873,6 @@ async fn router_healthy_agent_count() {
 /// values silently — it must read them and pass them through.
 #[tokio::test]
 async fn update_status_and_fields_records_pre_update_values_in_activity() {
-    use orch::store::{TaskActivity, TaskStatus};
-
     let tmp = temp_db("update-activity");
     let store = TaskStore::open_single(&tmp).await.expect("open store");
 
@@ -925,9 +908,9 @@ async fn update_status_and_fields_records_pre_update_values_in_activity() {
     assert_eq!(entry.agent, None, "agent should be None, not a default");
     assert_eq!(entry.model, None, "model should be None, not a default");
 
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
-    let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+    let _ = fs::remove_file(&tmp);
+    let _ = fs::remove_file(tmp.with_extension("db-shm"));
+    let _ = fs::remove_file(tmp.with_extension("db-wal"));
 }
 
 /// Verify that update_status_and_fields propagates errors instead of silently
@@ -935,8 +918,6 @@ async fn update_status_and_fields_records_pre_update_values_in_activity() {
 /// the function must return Err rather than proceeding with defaulted values.
 #[tokio::test]
 async fn update_status_and_fields_propagates_fetch_error_on_missing_row() {
-    use orch::store::TaskStatus;
-
     let tmp = temp_db("update-norow");
     let store = TaskStore::open_single(&tmp).await.expect("open store");
 
@@ -951,9 +932,9 @@ async fn update_status_and_fields_propagates_fetch_error_on_missing_row() {
         "update_status_and_fields must return Err when the row does not exist"
     );
 
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
-    let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+    let _ = fs::remove_file(&tmp);
+    let _ = fs::remove_file(tmp.with_extension("db-shm"));
+    let _ = fs::remove_file(tmp.with_extension("db-wal"));
 }
 
 /// Verify that update_status_and_fields propagates column decode errors instead
@@ -966,8 +947,6 @@ async fn update_status_and_fields_propagates_fetch_error_on_missing_row() {
 /// an activity row with defaulted pre-update fields, and return Ok.
 #[tokio::test]
 async fn update_status_and_fields_propagates_column_decode_error() {
-    use orch::store::{TaskActivity, TaskStatus};
-
     let tmp = temp_db("update-decode");
     let store = TaskStore::open_single(&tmp).await.expect("open store");
 
@@ -1016,12 +995,12 @@ async fn update_status_and_fields_propagates_column_decode_error() {
     // After the failed update, status should still be the original value.
     // We inject X'FFFF' (2 bytes) — check it's not "routed" (6 bytes ASCII).
     assert_ne!(
-        std::str::from_utf8(&status_row.0).ok(),
+        str::from_utf8(&status_row.0).ok(),
         Some("routed"),
         "task status must remain unchanged when decode fails"
     );
 
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
-    let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+    let _ = fs::remove_file(&tmp);
+    let _ = fs::remove_file(tmp.with_extension("db-shm"));
+    let _ = fs::remove_file(tmp.with_extension("db-wal"));
 }

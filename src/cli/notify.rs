@@ -12,6 +12,7 @@
 
 use crate::channels::telegram::TelegramChannel;
 use crate::channels::{Channel, OutgoingMessage};
+use crate::config;
 
 /// Send a Telegram notification message.
 ///
@@ -21,7 +22,7 @@ use crate::channels::{Channel, OutgoingMessage};
 /// * `target`  — optional chat_id override; falls back to `channels.telegram.chat_id`
 pub async fn send(message: &str, target: Option<&str>) -> anyhow::Result<()> {
     // Resolve bot token
-    let token = crate::config::get("channels.telegram.bot_token").map_err(|_| {
+    let token = config::get("channels.telegram.bot_token").map_err(|_| {
         anyhow::anyhow!(
             "Telegram bot token not configured.\n\
              Set `channels.telegram.bot_token` in ~/.orch/config.yml"
@@ -30,8 +31,8 @@ pub async fn send(message: &str, target: Option<&str>) -> anyhow::Result<()> {
 
     // Resolve chat_id: --target arg → config default
     let chat_id: Option<String> = target
-        .map(std::string::ToString::to_string)
-        .or_else(|| crate::config::get("channels.telegram.chat_id").ok());
+        .map(ToString::to_string)
+        .or_else(|| config::get("channels.telegram.chat_id").ok());
 
     if chat_id.is_none() {
         anyhow::bail!(

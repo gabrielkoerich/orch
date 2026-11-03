@@ -9,7 +9,17 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::fmt::Write as _;
+use std::mem;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::Receiver;
+use tokio::time;
 
 const TELEGRAM_LONG_POLL_TIMEOUT_SECS: u64 = 30;
 const TELEGRAM_HTTP_TIMEOUT_SECS: u64 = TELEGRAM_LONG_POLL_TIMEOUT_SECS + 15;
@@ -35,7 +45,7 @@ fn split_for_telegram(text: &str, max: usize) -> Vec<String> {
     let mut current = String::new();
     for line in text.split_inclusive('\n') {
         if !current.is_empty() && size(&current) + size(line) > max {
-            parts.push(std::mem::take(&mut current));
+            parts.push(mem::take(&mut current));
         }
         if size(line) <= max {
             current.push_str(line);
@@ -46,7 +56,7 @@ fn split_for_telegram(text: &str, max: usize) -> Vec<String> {
             let mut buf = [0u8; 4];
             let c = c.encode_utf8(&mut buf);
             if size(&current) + size(c) > max {
-                parts.push(std::mem::take(&mut current));
+                parts.push(mem::take(&mut current));
             }
             current.push_str(c);
         }
@@ -68,11 +78,11 @@ pub struct TelegramChannel {
     pub token: String,
     pub client: Client,
     pub chat_id: Option<String>,
-    pub offset: std::sync::Arc<tokio::sync::Mutex<i64>>,
+    pub offset: Arc<Mutex<i64>>,
 }
 
-impl std::fmt::Debug for TelegramChannel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for TelegramChannel {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("TelegramChannel")
             .field("chat_id", &self.chat_id)
             .finish_non_exhaustive()
@@ -135,7 +145,7 @@ impl TelegramChannel {
             token,
             client,
             chat_id,
-            offset: std::sync::Arc::new(tokio::sync::Mutex::new(0)),
+            offset: Arc::new(Mutex::new(0)),
         })
     }
 
@@ -157,7 +167,7 @@ impl TelegramChannel {
                 Ok(r) => r,
                 Err(e) => {
                     if attempt + 1 < TELEGRAM_MAX_RETRIES {
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        time::sleep(Duration::from_secs(2)).await;
                         continue;
                     }
                     anyhow::bail!(
@@ -288,14 +298,12 @@ impl Channel for TelegramChannel {
         "telegram"
     }
 
-    async fn start(&self) -> anyhow::Result<tokio::sync::mpsc::Receiver<IncomingMessage>> {
-        use std::fmt::Write as _;
-
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
+    async fn start(&self) -> anyhow::Result<Receiver<IncomingMessage>> {
+        let (tx, rx) = mpsc::channel(64);
         let token = self.token.clone();
         let client = self.client.clone();
         let chat_id = self.chat_id.clone();
-        let offset = std::sync::Arc::clone(&self.offset);
+        let offset = Arc::clone(&self.offset);
 
         let token_fingerprint = {
             let mut hasher = Sha256::new();
@@ -315,7 +323,7 @@ impl Channel for TelegramChannel {
             token,
             client,
             chat_id,
-            offset: std::sync::Arc::clone(&offset),
+            offset: Arc::clone(&offset),
         };
 
         tokio::spawn(async move {
@@ -337,7 +345,7 @@ impl Channel for TelegramChannel {
                             backoff_secs = backoff.as_secs(),
                             "failed to get telegram updates"
                         );
-                        tokio::time::sleep(backoff).await;
+                        time::sleep(backoff).await;
                         backoff = (backoff * 2).min(POLL_BACKOFF_CAP);
                         continue;
                     }
@@ -438,7 +446,7 @@ impl Channel for TelegramChannel {
 
                 // If no updates, sleep briefly to avoid busy looping
                 if !has_updates {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    time::sleep(Duration::from_secs(1)).await;
                 }
             }
         });
@@ -516,7 +524,9 @@ impl Channel for TelegramChannel {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn a_short_message_is_one_part() {
@@ -526,8 +536,6 @@ mod tests {
 
     #[test]
     fn a_long_message_splits_at_line_ends_and_loses_nothing() {
-        use std::fmt::Write as _;
-
         let text = (0..400).fold(String::new(), |mut text, i| {
             let _ = writeln!(text, "line {i} with some text");
             text
@@ -560,7 +568,6 @@ mod tests {
         assert_eq!(parts.len(), 3);
         assert_eq!(parts.concat(), text);
     }
-    use serde_json::json;
 
     #[test]
     fn html_escape_escapes_telegram_html_entities() {

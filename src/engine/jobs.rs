@@ -17,13 +17,24 @@ use crate::backends::{ExternalBackend, ExternalId};
 use crate::channels::notification::TaskNotification;
 use crate::channels::transport::Transport;
 use crate::cmd::CommandErrorContext;
+use crate::config;
+use crate::cron as crate_cron;
+use crate::home;
+use crate::store::TaskStore;
 use crate::store::{JobState, TaskStatus};
 use anyhow::Context;
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::result;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::process::Command;
+use tokio::task;
+use tokio::time;
 
 // Note: self-review analysis is now performed by scheduled tasks configured
 // in `.orch.yml` and executed as regular `task` jobs. Hardcoded self-review
@@ -93,7 +104,7 @@ pub fn resolve_template_body(template: &TaskTemplate, base_dir: &Path) -> anyhow
             } else {
                 base_dir.join(path)
             };
-            std::fs::read_to_string(&full)
+            fs::read_to_string(&full)
                 .with_context(|| format!("reading prompt file {}", full.display()))
         }
         None => Ok(template.body.clone()),
@@ -136,7 +147,7 @@ pub fn resolve_jobs_path() -> PathBuf {
     }
 
     // 2. Check registered project directories (handles brew service running from /)
-    if let Ok(paths) = crate::config::get_project_paths() {
+    if let Ok(paths) = config::get_project_paths() {
         for path_str in &paths {
             let candidate = PathBuf::from(path_str).join(".orch.yml");
             if candidate.exists() {
@@ -146,7 +157,7 @@ pub fn resolve_jobs_path() -> PathBuf {
     }
 
     // 3. Fall back to global config
-    crate::home::config_path().unwrap_or_else(|_| PathBuf::from(".orch/config.yml"))
+    home::config_path().unwrap_or_else(|_| PathBuf::from(".orch/config.yml"))
 }
 
 /// Load jobs from the orch config file plus any markdown prompt files
@@ -160,7 +171,7 @@ pub fn load_jobs(path: &PathBuf) -> anyhow::Result<Vec<Job>> {
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let mut jobs: Vec<Job> = if path.exists() {
         let content =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let file: ConfigFile = serde_norway::from_str(&content)
             .with_context(|| format!("parsing {}", path.display()))?;
         file.jobs
@@ -169,7 +180,7 @@ pub fn load_jobs(path: &PathBuf) -> anyhow::Result<Vec<Job>> {
     };
 
     let scanned = scan_prompt_jobs(&base_dir)?;
-    let mut seen: std::collections::HashSet<String> = jobs.iter().map(|j| j.id.clone()).collect();
+    let mut seen: HashSet<String> = jobs.iter().map(|j| j.id.clone()).collect();
     for job in scanned {
         if !seen.insert(job.id.clone()) {
             anyhow::bail!(
@@ -188,9 +199,9 @@ pub fn load_jobs(path: &PathBuf) -> anyhow::Result<Vec<Job>> {
 }
 
 fn validate_job(job: &Job, base_dir: &Path) -> anyhow::Result<()> {
-    let expanded = crate::cron::expand_alias(&job.schedule)
+    let expanded = crate_cron::expand_alias(&job.schedule)
         .with_context(|| format!("job '{}': invalid cron schedule '{}'", job.id, job.schedule))?;
-    let normalized = crate::cron::normalize_dow(&expanded);
+    let normalized = crate_cron::normalize_dow(&expanded);
     let full_expr = format!("0 {normalized} *");
     Schedule::from_str(&full_expr)
         .with_context(|| format!("job '{}': invalid cron schedule '{}'", job.id, job.schedule))?;
@@ -268,9 +279,9 @@ pub fn scan_prompt_jobs(base_dir: &Path) -> anyhow::Result<Vec<Job>> {
     if !dir.is_dir() {
         return Ok(vec![]);
     }
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
+    let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
         .with_context(|| format!("reading {}", dir.display()))?
-        .filter_map(std::result::Result::ok)
+        .filter_map(result::Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("md"))
         .collect();
@@ -278,8 +289,8 @@ pub fn scan_prompt_jobs(base_dir: &Path) -> anyhow::Result<Vec<Job>> {
 
     let mut jobs = Vec::with_capacity(entries.len());
     for path in entries {
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let content =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         let Some((fm, body)) = split_frontmatter(&content) else {
             continue; // No frontmatter → treat as a plain prompt referenced from .orch.yml
         };
@@ -313,7 +324,7 @@ pub fn save_jobs(path: &PathBuf, jobs: &[Job]) -> anyhow::Result<()> {
     // Read the existing file to preserve non-jobs keys
     let mut file: ConfigFile = if path.exists() {
         let content =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         serde_norway::from_str(&content).with_context(|| format!("parsing {}", path.display()))?
     } else {
         ConfigFile {
@@ -332,7 +343,7 @@ pub fn save_jobs(path: &PathBuf, jobs: &[Job]) -> anyhow::Result<()> {
         .cloned()
         .collect();
     let content = serde_norway::to_string(&file)?;
-    std::fs::write(path, content).with_context(|| format!("writing {}", path.display()))?;
+    fs::write(path, content).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -343,7 +354,7 @@ pub fn save_jobs(path: &PathBuf, jobs: &[Job]) -> anyhow::Result<()> {
 /// fence.  If the field is absent it is inserted before the closing `---`.
 pub fn set_frontmatter_enabled(path: &Path, enabled: bool) -> anyhow::Result<()> {
     let original =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
     let value = if enabled { "true" } else { "false" };
 
@@ -351,7 +362,7 @@ pub fn set_frontmatter_enabled(path: &Path, enabled: bool) -> anyhow::Result<()>
     // We only touch the first YAML block (between the opening and first closing
     // `---` fences) to avoid accidentally rewriting the body.
     let rewritten = rewrite_frontmatter_enabled(&original, value);
-    std::fs::write(path, rewritten).with_context(|| format!("writing {}", path.display()))?;
+    fs::write(path, rewritten).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -422,12 +433,12 @@ fn is_not_found_error(e: &anyhow::Error) -> bool {
 pub async fn tick(
     jobs_path: &Path,
     backend: &Arc<dyn ExternalBackend>,
-    store: Option<&Arc<crate::store::TaskStore>>,
+    store: Option<&Arc<TaskStore>>,
     repo: &str,
     transport: Option<&Arc<Transport>>,
 ) -> anyhow::Result<()> {
     let jobs_path_clone = jobs_path.to_path_buf();
-    let jobs = match tokio::task::spawn_blocking(move || load_jobs(&jobs_path_clone))
+    let jobs = match task::spawn_blocking(move || load_jobs(&jobs_path_clone))
         .await
         .map_err(|e| anyhow::anyhow!("load_jobs panicked: {e}"))
         .and_then(|r| r)
@@ -466,7 +477,7 @@ pub async fn tick(
 
         // Check if schedule matches
         let is_due = match &state.last_run {
-            Some(last) => match crate::cron::check(&job.schedule, Some(last)) {
+            Some(last) => match crate_cron::check(&job.schedule, Some(last)) {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::error!(
@@ -478,7 +489,7 @@ pub async fn tick(
                     continue;
                 }
             },
-            None => match crate::cron::check(&job.schedule, None) {
+            None => match crate_cron::check(&job.schedule, None) {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::error!(
@@ -513,7 +524,7 @@ pub async fn tick(
                 match backend.get_task(&ExternalId(task_id_clone.clone())).await {
                     Ok(task) => {
                         let status = task.labels.iter().find(|l| l.starts_with("status:"));
-                        match status.map(std::string::String::as_str) {
+                        match status.map(String::as_str) {
                             Some(
                                 "status:in_progress"
                                 | "status:routed"
@@ -654,7 +665,7 @@ pub async fn execute_job(
     job: &Job,
     state: &mut JobState,
     backend: &Arc<dyn ExternalBackend>,
-    store: Option<&Arc<crate::store::TaskStore>>,
+    store: Option<&Arc<TaskStore>>,
     repo: &str,
     transport: Option<&Arc<Transport>>,
     base_dir: &Path,
@@ -730,15 +741,15 @@ pub async fn execute_job(
                 // Configurable timeout with 5-minute default. A bash job that hangs
                 // (network operation, blocking subprocess) would otherwise park a Tokio
                 // worker for its entire duration, blocking the inline tick loop.
-                let timeout_secs: u64 = crate::config::get("jobs.bash_timeout_seconds")
+                let timeout_secs: u64 = config::get("jobs.bash_timeout_seconds")
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(300);
-                let timeout = std::time::Duration::from_secs(timeout_secs);
+                let timeout = Duration::from_secs(timeout_secs);
 
-                let output = tokio::time::timeout(
+                let output = time::timeout(
                     timeout,
-                    tokio::process::Command::new("bash")
+                    Command::new("bash")
                         .arg("-c")
                         .arg(cmd)
                         .current_dir(dir)
@@ -805,7 +816,7 @@ pub async fn execute_job(
         let target = job
             .notify_target
             .clone()
-            .or_else(|| crate::config::get("channels.telegram.chat_id").ok());
+            .or_else(|| config::get("channels.telegram.chat_id").ok());
         let notification = TaskNotification {
             task_id: job.id.clone(),
             title: format!("Job: {}", job.id),

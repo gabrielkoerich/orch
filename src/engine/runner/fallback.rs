@@ -6,9 +6,14 @@
 
 use crate::store;
 use crate::store::TaskStore;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::{agents, response};
+use crate::cmd_cache;
+use crate::engine;
+use crate::engine::cooldown;
+use crate::engine::cooldown::CreditExhaustionReason;
 
 /// Summarizes a rate limit error by extracting key information from Claude's API retry JSON.
 ///
@@ -113,7 +118,7 @@ fn extract_json_field(json: &str, field: &str) -> Option<String> {
             let num_str = &value_str[..end];
             num_str
                 .strip_suffix(',')
-                .map(std::string::ToString::to_string)
+                .map(ToString::to_string)
                 .or_else(|| Some(num_str.to_string()))
         }
     })
@@ -170,13 +175,12 @@ async fn try_free_model_reroute(
         .await
         .map(|t| t.model_reroute_chain)
         .unwrap_or_default();
-    let tried_set: std::collections::HashSet<&str> =
-        tried_models.split(',').filter(|s| !s.is_empty()).collect();
+    let tried_set: HashSet<&str> = tried_models.split(',').filter(|s| !s.is_empty()).collect();
     let next_free = free.iter().find(|m| {
         !exclude_models.contains(&m.as_str())
             && !tried_set.contains(m.as_str())
             && (!check_cooldowns
-                || (!crate::engine::cooldown::is_agent_in_cooldown(agent_name)
+                || (!cooldown::is_agent_in_cooldown(agent_name)
                     && !response::is_model_in_cooldown(agent_name, m)))
     })?;
     tracing::info!(task_id, model = %next_free, "{}", reason_prefix);
@@ -215,17 +219,16 @@ async fn apply_vendor_reset_date(
     model_name: Option<&str>,
     message: &str,
 ) -> bool {
-    use crate::engine::cooldown::CreditExhaustionReason;
     let Some(model) = model_name else {
         return false;
     };
-    match crate::engine::cooldown::detect_credit_exhaustion(message) {
+    match cooldown::detect_credit_exhaustion(message) {
         None | Some(CreditExhaustionReason::BillingCycleExhausted) => {}
         Some(_) => return false,
     }
-    match crate::engine::cooldown::parse_retry_at(message) {
+    match cooldown::parse_retry_at(message) {
         Some(until) if until > chrono::Utc::now().timestamp() => {
-            crate::engine::cooldown::set_model_cooldown_until(agent_name, model, until).await;
+            cooldown::set_model_cooldown_until(agent_name, model, until).await;
             true
         }
         _ => false,
@@ -289,34 +292,30 @@ pub async fn handle_error(
             let mut billing_cycle_model_scoped = false;
 
             if apply_vendor_reset_date(agent_name, model_name, message).await {
-                let reason = crate::engine::cooldown::detect_credit_exhaustion(message);
+                let reason = cooldown::detect_credit_exhaustion(message);
                 credit_recorded = reason.is_some();
-                billing_cycle_model_scoped = reason
-                    == Some(crate::engine::cooldown::CreditExhaustionReason::BillingCycleExhausted);
-            } else if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message)
-            {
+                billing_cycle_model_scoped =
+                    reason == Some(CreditExhaustionReason::BillingCycleExhausted);
+            } else if let Some(reason) = cooldown::detect_credit_exhaustion(message) {
                 credit_recorded = true;
                 // For billing cycle exhaustion where we know the specific model, apply
                 // model-level persistent cooldown only. The quota is scoped to that
                 // provider sub-model (e.g. github-copilot/gpt-5-mini), not the entire
                 // agent account, so an agent-wide cooldown would incorrectly block
                 // unrelated models on the same agent.
-                if reason == crate::engine::cooldown::CreditExhaustionReason::BillingCycleExhausted
-                {
+                if reason == CreditExhaustionReason::BillingCycleExhausted {
                     if let Some(model) = model_name {
-                        crate::engine::cooldown::record_persistent_model_failure(agent_name, model)
-                            .await;
+                        cooldown::record_persistent_model_failure(agent_name, model).await;
                         billing_cycle_model_scoped = true;
                     } else {
-                        crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await;
+                        cooldown::record_credit_exhaustion(agent_name, reason).await;
                     }
                 } else {
-                    crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await;
+                    cooldown::record_credit_exhaustion(agent_name, reason).await;
                 }
-            } else if let (Some(model), Some(window_secs)) = (
-                model_name,
-                crate::engine::cooldown::parse_relative_usage_window(message),
-            ) {
+            } else if let (Some(model), Some(window_secs)) =
+                (model_name, cooldown::parse_relative_usage_window(message))
+            {
                 // Vendor-advertised relative usage window (e.g. "weekly (7-day)
                 // usage limit") is authoritative — apply a model-specific cooldown
                 // for that exact duration instead of the generic exponential
@@ -324,7 +323,7 @@ pub async fn handle_error(
                 // call site (cooldown::record_rate_limit()) already applies; this
                 // in-task failover path bypassed it entirely, undoing the
                 // #3572/#3574 fix for the most common rate-limit path (issue #3580).
-                crate::engine::cooldown::set_model_cooldown(
+                cooldown::set_model_cooldown(
                     agent_name,
                     model,
                     window_secs,
@@ -339,13 +338,11 @@ pub async fn handle_error(
                     "relative usage window detected: applying model-specific cooldown"
                 );
             } else {
-                crate::engine::cooldown::record_agent_failure_with_message(agent_name, message)
-                    .await;
+                cooldown::record_agent_failure_with_message(agent_name, message).await;
                 // Also record the model-specific cooldown so model_for_complexity skips it.
                 if let Some(model) = model_name {
                     if is_provider_returned_error {
-                        crate::engine::cooldown::record_transient_model_failure(agent_name, model)
-                            .await;
+                        cooldown::record_transient_model_failure(agent_name, model).await;
                     } else {
                         response::record_model_failure(agent_name, model).await;
                     }
@@ -375,30 +372,26 @@ pub async fn handle_error(
             let mut billing_cycle_model_scoped = false;
 
             if apply_vendor_reset_date(agent_name, model_name, message).await {
-                let reason = crate::engine::cooldown::detect_credit_exhaustion(message);
+                let reason = cooldown::detect_credit_exhaustion(message);
                 credit_recorded = reason.is_some();
-                billing_cycle_model_scoped = reason
-                    == Some(crate::engine::cooldown::CreditExhaustionReason::BillingCycleExhausted);
-            } else if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message)
-            {
+                billing_cycle_model_scoped =
+                    reason == Some(CreditExhaustionReason::BillingCycleExhausted);
+            } else if let Some(reason) = cooldown::detect_credit_exhaustion(message) {
                 credit_recorded = true;
                 // Billing cycle exhaustion scoped to a known model gets model-level
                 // persistent cooldown only — agent-wide cooldown would block unrelated models.
-                if reason == crate::engine::cooldown::CreditExhaustionReason::BillingCycleExhausted
-                {
+                if reason == CreditExhaustionReason::BillingCycleExhausted {
                     if let Some(model) = model_name {
-                        crate::engine::cooldown::record_persistent_model_failure(agent_name, model)
-                            .await;
+                        cooldown::record_persistent_model_failure(agent_name, model).await;
                         billing_cycle_model_scoped = true;
                     } else {
-                        crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await;
+                        cooldown::record_credit_exhaustion(agent_name, reason).await;
                     }
                 } else {
-                    crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await;
+                    cooldown::record_credit_exhaustion(agent_name, reason).await;
                 }
             } else {
-                crate::engine::cooldown::record_agent_failure_with_message(agent_name, message)
-                    .await;
+                cooldown::record_agent_failure_with_message(agent_name, message).await;
                 if let Some(model) = model_name {
                     response::record_model_failure(agent_name, model).await;
                 }
@@ -429,11 +422,11 @@ pub async fn handle_error(
             format!("missing tool: {tool}"),
         ),
         agents::AgentError::ModelUnavailable { model, message } => {
-            crate::engine::cooldown::record_model_unavailable(agent_name, model, message).await;
+            cooldown::record_model_unavailable(agent_name, model, message).await;
 
             // Try next model before switching agent, unless the agent is cooled
             // (an agent-wide cooldown must not be defeated by model substitution)
-            let agent_cooled = crate::engine::cooldown::is_agent_in_cooldown(agent_name);
+            let agent_cooled = cooldown::is_agent_in_cooldown(agent_name);
             let models = agent_runner.available_models();
             let current_model = model_name.unwrap_or("");
             let next_model = if agent_cooled {
@@ -555,24 +548,19 @@ pub async fn handle_error(
             // tracking, exhaustion checks, and fallback pacing.
             // Credit-shaped errors that escaped the Auth/RateLimit classifiers still
             // need the credit cooldown and counter, not the generic 5 min backoff.
-            if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
+            if let Some(reason) = cooldown::detect_credit_exhaustion(message) {
                 credit_recorded = true;
                 match model_name {
-                    Some(model)
-                        if reason
-                            == crate::engine::cooldown::CreditExhaustionReason::BillingCycleExhausted =>
-                    {
-                        crate::engine::cooldown::record_persistent_model_failure(agent_name, model)
-                            .await;
+                    Some(model) if reason == CreditExhaustionReason::BillingCycleExhausted => {
+                        cooldown::record_persistent_model_failure(agent_name, model).await;
                     }
-                    _ => crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await,
+                    _ => cooldown::record_credit_exhaustion(agent_name, reason).await,
                 }
             } else {
                 if let Some(model) = model_name {
                     response::record_model_failure(agent_name, model).await;
                 }
-                crate::engine::cooldown::record_agent_failure_with_message(agent_name, message)
-                    .await;
+                cooldown::record_agent_failure_with_message(agent_name, message).await;
             }
             (
                 response::RetryableError::Failed,
@@ -672,7 +660,7 @@ pub async fn handle_error(
             {
                 if let Some(m) = model_name {
                     // A stopped session also exits 0 with no output, so the backoff stays short
-                    crate::engine::cooldown::record_transient_model_failure(agent_name, m).await;
+                    cooldown::record_transient_model_failure(agent_name, m).await;
                 }
                 // Before falling through to handle_failover() (which tries claude/codex),
                 // check whether this agent has any free models that haven't been tried yet.
@@ -751,14 +739,14 @@ pub async fn handle_error(
 
     // Try free models as last resort before giving up
     let chain = response::get_reroute_chain(task_id, store, repo).await;
-    let available: Vec<String> = crate::engine::configured_agents()
+    let available: Vec<String> = engine::configured_agents()
         .into_iter()
-        .filter(|a| crate::cmd_cache::command_exists(a))
+        .filter(|a| cmd_cache::command_exists(a))
         .collect();
 
     let all_agents_tried = {
-        let chain_set: std::collections::HashSet<&str> = if chain.is_empty() {
-            std::collections::HashSet::new()
+        let chain_set: HashSet<&str> = if chain.is_empty() {
+            HashSet::new()
         } else {
             chain.split(',').collect()
         };
@@ -824,10 +812,15 @@ pub async fn handle_error(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::engine::runner::agents::StreamEvent;
     use crate::engine::runner::agents::{AgentError, AgentRunner, ParsedResponse, PermissionRules};
     use crate::parser::AgentResponse;
+    use chrono::Datelike;
     use serial_test::serial;
+    use tokio::process::Command;
 
     struct MockRunner {
         free: Vec<String>,
@@ -838,10 +831,7 @@ mod tests {
     }
 
     impl AgentRunner for MockRunnerWithModels {
-        fn stream_events(
-            &self,
-            _event: &serde_json::Value,
-        ) -> Vec<crate::engine::runner::agents::StreamEvent> {
+        fn stream_events(&self, _event: &serde_json::Value) -> Vec<StreamEvent> {
             vec![]
         }
 
@@ -891,20 +881,13 @@ mod tests {
             self.models.clone()
         }
 
-        fn router_command(
-            &self,
-            _prompt: &str,
-            _model: Option<&str>,
-        ) -> anyhow::Result<tokio::process::Command> {
+        fn router_command(&self, _prompt: &str, _model: Option<&str>) -> anyhow::Result<Command> {
             anyhow::bail!("not implemented")
         }
     }
 
     impl AgentRunner for MockRunner {
-        fn stream_events(
-            &self,
-            _event: &serde_json::Value,
-        ) -> Vec<crate::engine::runner::agents::StreamEvent> {
+        fn stream_events(&self, _event: &serde_json::Value) -> Vec<StreamEvent> {
             vec![]
         }
 
@@ -954,11 +937,7 @@ mod tests {
             self.free.clone()
         }
 
-        fn router_command(
-            &self,
-            _prompt: &str,
-            _model: Option<&str>,
-        ) -> anyhow::Result<tokio::process::Command> {
+        fn router_command(&self, _prompt: &str, _model: Option<&str>) -> anyhow::Result<Command> {
             anyhow::bail!("not implemented")
         }
     }
@@ -971,13 +950,13 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn rate_limit_sets_agent_cooldown_immediately() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "test-agent-1371-early-cooldown";
 
         // Confirm no cooldown before the error.
         assert!(
-            !crate::engine::cooldown::is_agent_in_cooldown(agent),
+            !cooldown::is_agent_in_cooldown(agent),
             "agent should not be in cooldown before handle_error"
         );
 
@@ -1002,7 +981,7 @@ mod tests {
 
         // Cooldown must be set immediately after handle_error returns, not deferred.
         assert!(
-            crate::engine::cooldown::is_agent_in_cooldown(agent),
+            cooldown::is_agent_in_cooldown(agent),
             "agent should be in cooldown immediately after handle_error for RateLimit"
         );
     }
@@ -1016,18 +995,18 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn rate_limit_sets_both_agent_and_model_cooldowns() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "test-agent-2153-model-cooldown";
         let model = "opencode/github-copilot/qwen3.6-plus-free";
 
         // Confirm no cooldowns before the error.
         assert!(
-            !crate::engine::cooldown::is_agent_in_cooldown(agent),
+            !cooldown::is_agent_in_cooldown(agent),
             "agent should not be in cooldown before handle_error"
         );
         assert!(
-            !crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            !cooldown::is_model_in_cooldown(agent, model),
             "model should not be in cooldown before handle_error"
         );
 
@@ -1051,13 +1030,13 @@ mod tests {
 
         // Agent-level cooldown must be set immediately.
         assert!(
-            crate::engine::cooldown::is_agent_in_cooldown(agent),
+            cooldown::is_agent_in_cooldown(agent),
             "agent should be in agent-level cooldown after RateLimit"
         );
         // Model-level cooldown must ALSO be set immediately — this is the fix for issue #2153.
         // Without this, model_for_complexity would still pick the same model.
         assert!(
-            crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            cooldown::is_model_in_cooldown(agent, model),
             "model should be in model-level cooldown after RateLimit (fixes issue #2153)"
         );
     }
@@ -1066,7 +1045,7 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn rate_limit_cooldown_is_model_specific() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "test-agent-2153-model-specific";
         let cooled_model = "opencode/github-copilot/qwen3.6-plus-free";
@@ -1092,12 +1071,12 @@ mod tests {
 
         // The specific model that hit the rate limit should be cooled.
         assert!(
-            crate::engine::cooldown::is_model_in_cooldown(agent, cooled_model),
+            cooldown::is_model_in_cooldown(agent, cooled_model),
             "rate-limited model should be in cooldown"
         );
         // Other models of the same agent should NOT be cooled.
         assert!(
-            !crate::engine::cooldown::is_model_in_cooldown(agent, other_model),
+            !cooldown::is_model_in_cooldown(agent, other_model),
             "other models should not be cooled by a single model's rate limit"
         );
     }
@@ -1115,13 +1094,9 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn credit_exhaustion_does_not_bump_generic_failure_count() {
-        crate::engine::cooldown::reset_global_state().await;
-        let store = std::sync::Arc::new(
-            crate::store::TaskStore::open_memory()
-                .await
-                .expect("in-memory store"),
-        );
-        crate::engine::cooldown::init_cooldown_store(std::sync::Arc::clone(&store)).await;
+        cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.expect("in-memory store"));
+        cooldown::init_cooldown_store(Arc::clone(&store)).await;
 
         let runner = MockRunner { free: vec![] };
         let agent = "test-agent-3652-credit-no-bump";
@@ -1138,7 +1113,7 @@ mod tests {
             None,
             Some("simple"),
             1,
-            &Some(std::sync::Arc::clone(&store)),
+            &Some(Arc::clone(&store)),
             "owner/repo",
         )
         .await
@@ -1167,20 +1142,16 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn two_timeouts_leave_model_routable() {
-        crate::engine::cooldown::reset_global_state().await;
-        let store = std::sync::Arc::new(
-            crate::store::TaskStore::open_memory()
-                .await
-                .expect("in-memory store"),
-        );
-        crate::engine::cooldown::init_cooldown_store(std::sync::Arc::clone(&store)).await;
+        cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.expect("in-memory store"));
+        cooldown::init_cooldown_store(Arc::clone(&store)).await;
 
         let runner = MockRunner { free: vec![] };
         let agent = "opencode";
         let model = "opencode/nemotron-3-ultra-free";
 
         let err = AgentError::Timeout {
-            elapsed: std::time::Duration::from_mins(30),
+            elapsed: Duration::from_mins(30),
         };
 
         for i in 1..=2 {
@@ -1192,7 +1163,7 @@ mod tests {
                 Some(model),
                 Some("simple"),
                 i,
-                &Some(std::sync::Arc::clone(&store)),
+                &Some(Arc::clone(&store)),
                 "owner/repo",
             )
             .await
@@ -1200,11 +1171,11 @@ mod tests {
         }
 
         assert!(
-            !crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            !cooldown::is_model_in_cooldown(agent, model),
             "timeouts must not cool the model"
         );
         assert!(
-            !crate::engine::cooldown::is_agent_in_cooldown(agent),
+            !cooldown::is_agent_in_cooldown(agent),
             "timeouts must not cool the agent"
         );
         let counts = store.recent_rate_limit_counts(6).await.unwrap();
@@ -1220,13 +1191,9 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn interrupted_run_does_not_write_rate_limit() {
-        crate::engine::cooldown::reset_global_state().await;
-        let store = std::sync::Arc::new(
-            crate::store::TaskStore::open_memory()
-                .await
-                .expect("in-memory store"),
-        );
-        crate::engine::cooldown::init_cooldown_store(std::sync::Arc::clone(&store)).await;
+        cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.expect("in-memory store"));
+        cooldown::init_cooldown_store(Arc::clone(&store)).await;
 
         let runner = MockRunner { free: vec![] };
         let agent = "claude";
@@ -1243,14 +1210,14 @@ mod tests {
             Some(model),
             Some("medium"),
             1,
-            &Some(std::sync::Arc::clone(&store)),
+            &Some(Arc::clone(&store)),
             "owner/repo",
         )
         .await
         .unwrap();
 
         assert!(
-            !crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            !cooldown::is_model_in_cooldown(agent, model),
             "interrupted runs must not cool the model"
         );
         let counts = store.recent_rate_limit_counts(6).await.unwrap();
@@ -1276,7 +1243,7 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn rate_limit_with_relative_window_sets_window_length_model_cooldown() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "test-agent-3580-kimi";
         let model = "opus";
@@ -1301,7 +1268,7 @@ mod tests {
         .unwrap();
 
         let now = chrono::Utc::now().timestamp();
-        let until = crate::engine::cooldown::cooldown_until(&key)
+        let until = cooldown::cooldown_until(&key)
             .expect("relative usage window should set model cooldown");
         let remaining = until.saturating_sub(now);
 
@@ -1310,7 +1277,7 @@ mod tests {
             "expected ~7-day model cooldown from the parsed window, got {remaining}s"
         );
         assert_eq!(
-            crate::engine::cooldown::cooldown_reason(&key).as_deref(),
+            cooldown::cooldown_reason(&key).as_deref(),
             Some("rate_limit_usage_window"),
             "relative usage-window cooldown must be labeled as a rate limit, not silence"
         );
@@ -1319,7 +1286,7 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn provider_returned_error_sets_short_model_cooldown() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "opencode";
         let model = "opencode/nemotron-3-super-free";
@@ -1344,12 +1311,12 @@ mod tests {
         .unwrap();
 
         let now = chrono::Utc::now().timestamp();
-        let until = crate::engine::cooldown::cooldown_until(&key)
-            .expect("provider error should set model cooldown");
+        let until =
+            cooldown::cooldown_until(&key).expect("provider error should set model cooldown");
         let remaining = until.saturating_sub(now);
 
         assert!(
-            remaining <= crate::engine::cooldown::TRANSIENT_MODEL_BACKOFF_BASE_SECS,
+            remaining <= cooldown::TRANSIENT_MODEL_BACKOFF_BASE_SECS,
             "expected a 5 minute model cooldown, got {remaining}s"
         );
     }
@@ -1357,13 +1324,13 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn model_unavailable_sets_persistent_model_cooldown_for_codex_style() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "codex";
         let model = "gpt-5.3-codex";
 
         // Simulate Codex provider JSON error: message contains "model is not supported"
-        let err = crate::engine::runner::agents::AgentError::ModelUnavailable {
+        let err = AgentError::ModelUnavailable {
             model: model.to_string(),
             message: "{\"detail\":\"The 'gpt-5.3-codex' model is not supported\"}".to_string(),
         };
@@ -1385,20 +1352,19 @@ mod tests {
         // The persistent backoff base is ~4h; ensure cooldown exists and is at least that long minus a margin
         let key = format!("{agent}:{model}");
         let now = chrono::Utc::now().timestamp();
-        let until =
-            crate::engine::cooldown::cooldown_until(&key).expect("model cooldown should be set");
+        let until = cooldown::cooldown_until(&key).expect("model cooldown should be set");
         let remaining = until.saturating_sub(now);
 
         assert!(
-            remaining >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
+            remaining >= cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
             "expected persistent model cooldown (~4h) for codex model-unavailable, got {remaining}s"
         );
     }
 
     async fn vendor_reset_remaining(agent: &str, model: &str, message: &str) -> i64 {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
-        let err = crate::engine::runner::agents::AgentError::RateLimit {
+        let err = AgentError::RateLimit {
             message: message.to_string(),
         };
         let _ = handle_error(
@@ -1414,7 +1380,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let until = crate::engine::cooldown::cooldown_until(&format!("{agent}:{model}"))
+        let until = cooldown::cooldown_until(&format!("{agent}:{model}"))
             .expect("model cooldown should be set");
         until - chrono::Utc::now().timestamp()
     }
@@ -1422,7 +1388,6 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn vendor_reset_date_overrides_weekly_window() {
-        use chrono::Datelike;
         let t = chrono::Local::now() + chrono::Duration::days(2);
         let msg = format!(
             "You've hit your weekly limit · resets {} {} at 1am (America/Sao_Paulo)",
@@ -1454,13 +1419,13 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn agent_failed_insufficient_balance_sets_credit_cooldown() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "test-agent-3642-insufficient-balance";
 
         // Confirm no cooldown before the error.
         assert!(
-            !crate::engine::cooldown::is_agent_in_cooldown(agent),
+            !cooldown::is_agent_in_cooldown(agent),
             "agent should not be in cooldown before handle_error"
         );
 
@@ -1488,15 +1453,14 @@ mod tests {
         // Without #3642, the AgentFailed arm would have gone to the else branch
         // and called record_agent_failure_with_message, setting a 5-min cooldown.
         assert!(
-            crate::engine::cooldown::is_agent_in_cooldown(agent),
+            cooldown::is_agent_in_cooldown(agent),
             "agent should be in cooldown after handle_error for AgentFailed with insufficient balance"
         );
 
-        let until = crate::engine::cooldown::cooldown_until(agent)
-            .expect("agent cooldown should be active");
+        let until = cooldown::cooldown_until(agent).expect("agent cooldown should be active");
         let remaining = until - chrono::Utc::now().timestamp();
         assert!(
-            remaining >= crate::engine::cooldown::CREDIT_BACKOFF_BASE_SECS - 30,
+            remaining >= cooldown::CREDIT_BACKOFF_BASE_SECS - 30,
             "credit cooldown should be at least the 1h base, got {remaining}s"
         );
     }
@@ -1504,7 +1468,7 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn silent_exit0_retries_free_model_for_simple_complexity() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner {
             free: vec!["opencode/mimo-v2-omni-free".to_string()],
         };
@@ -1537,7 +1501,7 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn silent_exit0_retries_free_model_when_complexity_unknown() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner {
             free: vec!["opencode/mimo-v2-omni-free".to_string()],
         };
@@ -1570,7 +1534,7 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn silent_exit0_retries_free_model_for_medium_complexity() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner {
             free: vec!["opencode/mimo-v2-omni-free".to_string()],
         };
@@ -1603,7 +1567,7 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn silent_exit0_retries_free_model_for_complex_complexity() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner {
             free: vec!["opencode/mimo-v2-omni-free".to_string()],
         };
@@ -1638,7 +1602,7 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn context_overflow_escalates_to_needs_review_immediately() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let err = AgentError::ContextOverflow {
             message: "prompt is too long: 250000 tokens, max 200000".to_string(),
@@ -1669,7 +1633,7 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn free_model_reroute_succeeds_without_store() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner {
             free: vec!["opencode/mimo-v2-omni-free".to_string()],
         };
@@ -1702,7 +1666,7 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn silent_exit0_falls_through_when_no_free_models() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let err = AgentError::Unknown {
             exit_code: 0,
@@ -1737,14 +1701,14 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn invalid_response_sets_model_cooldown() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "opencode";
         let model = "opencode/nemotron-3-super-free";
 
         // Confirm no model cooldown before the error.
         assert!(
-            !crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            !cooldown::is_model_in_cooldown(agent, model),
             "model should not be in cooldown before handle_error"
         );
 
@@ -1768,7 +1732,7 @@ mod tests {
 
         // Model-level cooldown must be set after InvalidResponse.
         assert!(
-            crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            cooldown::is_model_in_cooldown(agent, model),
             "model should be in cooldown after InvalidResponse (fixes issue #2750)"
         );
     }
@@ -1782,7 +1746,7 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn billing_cycle_exhausted_with_known_model_sets_only_model_cooldown() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "codex-3382-billing-cycle";
         let model = "gpt-5.5";
@@ -1807,17 +1771,17 @@ mod tests {
 
         // Agent-level credit cooldown must NOT be set — the quota is model-scoped.
         assert!(
-            !crate::engine::cooldown::is_agent_in_cooldown(agent),
+            !cooldown::is_agent_in_cooldown(agent),
             "agent must NOT be in agent-level cooldown when BillingCycleExhausted has a known model (issue #3382)"
         );
         // Model-level cooldown MUST be set.
         assert!(
-            crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            cooldown::is_model_in_cooldown(agent, model),
             "model must be in cooldown after BillingCycleExhausted (issue #3382)"
         );
         // Other models on the same agent must NOT be cooled.
         assert!(
-            !crate::engine::cooldown::is_model_in_cooldown(agent, "gpt-5.4"),
+            !cooldown::is_model_in_cooldown(agent, "gpt-5.4"),
             "other models on the same agent must not be cooled by a single model's billing exhaustion"
         );
     }
@@ -1825,7 +1789,7 @@ mod tests {
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn summarize_rate_limit_error_extracts_api_retry_info() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let raw_output = r#"some log lines
 {"type":"system","subtype":"api_retry","attempt":6,"max_retries":10,"retry_delay_ms":17266.789,"error_status":429,"error":"rate_limit","session_id":"331c099b-..."}
 {"type":"system","subtype":"api_retry","attempt":7,"max_retries":10,"retry_delay_ms":35162.66,"error_status":429,"error":"rate_limit","session_id":"331c099b-..."}
@@ -1838,7 +1802,7 @@ more logs"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn summarize_rate_limit_error_returns_original_when_no_api_retry() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let raw_output = "some regular error message without api_retry JSON";
 
         let summarized = super::summarize_rate_limit_error(raw_output);
@@ -1848,7 +1812,7 @@ more logs"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn summarize_rate_limit_error_handles_malformed_json_gracefully() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let raw_output = r#"some logs
 {"type":"system","subtype":"api_retry","attempt":"not_a_number","retry_delay_ms":invalid,"error_status":429}
 more logs"#;
@@ -1864,7 +1828,7 @@ more logs"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn summarize_rate_limit_error_works_with_single_line() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let raw_output = r#"{"type":"system","subtype":"api_retry","attempt":3,"max_retries":10,"retry_delay_ms":5000,"error_status":429,"error":"rate_limit"}"#;
 
         let summarized = super::summarize_rate_limit_error(raw_output);
@@ -1877,7 +1841,7 @@ more logs"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn extract_json_field_handles_quoted_strings() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let json = r#"{"error_status":429,"attempt":7,"retry_delay_ms":35162.66,"error":"rate_limit","session_id":"331c099b-..."}"#;
 
         assert_eq!(
@@ -1910,7 +1874,7 @@ more logs"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn summarize_rate_limit_error_handles_truncated_fragment_with_subtype() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         // Real-world truncated fragment from GLM runs (no "type":"system" prefix)
         let raw_output = r#"some log context
 ,"subtype":"api_retry","attempt":5,"retry_delay_ms":20000,"error_status":429,"error":"rate_limit"
@@ -1938,7 +1902,7 @@ more context"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn summarize_rate_limit_error_handles_fragment_with_extractable_fields() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let raw_output = r#"log output
 ,"subtype":"api_retry","attempt":5,"retry_delay_ms":20000,"error_status":429,"error":"rate_limit","session_id":"abc123","max_retries":10}
 rest of output"#;
@@ -1951,7 +1915,7 @@ rest of output"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn summarize_rate_limit_error_complete_json_still_works() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let raw_output = r#"some log lines
 {"type":"system","subtype":"api_retry","attempt":6,"max_retries":10,"retry_delay_ms":17266.789,"error_status":429,"error":"rate_limit","session_id":"331c099b-..."}
 {"type":"system","subtype":"api_retry","attempt":7,"max_retries":10,"retry_delay_ms":35162.66,"error_status":429,"error":"rate_limit","session_id":"331c099b-..."}
@@ -1965,7 +1929,7 @@ more logs"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn summarize_rate_limit_error_no_api_retry_no_raw_passthrough() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let raw_output = "some regular error message without api_retry JSON that is quite long and should be truncated";
 
         let summarized = super::summarize_rate_limit_error(raw_output);
@@ -1980,7 +1944,7 @@ more logs"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn summarize_rate_limit_error_no_api_retry_short() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let raw_output = "rate limit exceeded";
 
         let summarized = super::summarize_rate_limit_error(raw_output);
@@ -1995,7 +1959,7 @@ more logs"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn model_not_found_applies_persistent_cooldown() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "opencode-2941-not-found";
         let model = "github-copilot/claude-opus-4.6";
@@ -2021,14 +1985,14 @@ more logs"#;
         .unwrap();
 
         let now = chrono::Utc::now().timestamp();
-        let until = crate::engine::cooldown::cooldown_until(&key)
-            .expect("model not found should set model cooldown");
+        let until =
+            cooldown::cooldown_until(&key).expect("model not found should set model cooldown");
         let remaining = until.saturating_sub(now);
 
         // Persistent cooldown starts at 4h; transient starts at 5min.
         // Verify we applied the persistent (4h base) path, not the short one.
         assert!(
-            remaining >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
+            remaining >= cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
             "expected ~4h (persistent) cooldown for 'Model not found', got {remaining}s — \
              may have applied transient 5min cooldown instead"
         );
@@ -2043,7 +2007,7 @@ more logs"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn model_not_supported_applies_persistent_cooldown() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "codex-3215-not-supported";
         let model = "gpt-5.2-codex";
@@ -2069,12 +2033,12 @@ more logs"#;
         .unwrap();
 
         let now = chrono::Utc::now().timestamp();
-        let until = crate::engine::cooldown::cooldown_until(&key)
-            .expect("model not supported should set model cooldown");
+        let until =
+            cooldown::cooldown_until(&key).expect("model not supported should set model cooldown");
         let remaining = until.saturating_sub(now);
 
         assert!(
-            remaining >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
+            remaining >= cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
             "expected ~4h (persistent) cooldown for 'not supported', got {remaining}s — \
              may have applied transient 5min cooldown instead (issue #3215)"
         );
@@ -2083,7 +2047,7 @@ more logs"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn model_not_available_in_country_applies_persistent_cooldown() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "opencode-3650-country";
         let model = "some-region-locked-model";
@@ -2094,7 +2058,7 @@ more logs"#;
             "This model is not available in your country.",
             "This model is not available in your region.",
         ] {
-            crate::engine::cooldown::reset_global_state().await;
+            cooldown::reset_global_state().await;
             let err = AgentError::ModelUnavailable {
                 model: model.to_string(),
                 message: message.to_string(),
@@ -2115,12 +2079,12 @@ more logs"#;
             .unwrap();
 
             let now = chrono::Utc::now().timestamp();
-            let until = crate::engine::cooldown::cooldown_until(&key)
-                .expect("region block should set model cooldown");
+            let until =
+                cooldown::cooldown_until(&key).expect("region block should set model cooldown");
             let remaining = until.saturating_sub(now);
 
             assert!(
-                remaining >= crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
+                remaining >= cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS - 30,
                 "expected ~4h (persistent) cooldown for '{message}', got {remaining}s — \
                  may have applied transient 5min cooldown instead (issue #3650)"
             );
@@ -2135,17 +2099,17 @@ more logs"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn thinking_block_conflict_does_not_set_cooldown() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "claude-3204-thinking-block";
         let model = "opus";
 
         assert!(
-            !crate::engine::cooldown::is_agent_in_cooldown(agent),
+            !cooldown::is_agent_in_cooldown(agent),
             "agent must not be in cooldown before handle_error"
         );
         assert!(
-            !crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            !cooldown::is_model_in_cooldown(agent, model),
             "model must not be in cooldown before handle_error"
         );
 
@@ -2168,11 +2132,11 @@ more logs"#;
         .unwrap();
 
         assert!(
-            !crate::engine::cooldown::is_agent_in_cooldown(agent),
+            !cooldown::is_agent_in_cooldown(agent),
             "agent must NOT be in cooldown after ThinkingBlockConflict (fixes issue #3204)"
         );
         assert!(
-            !crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            !cooldown::is_model_in_cooldown(agent, model),
             "model must NOT be in cooldown after ThinkingBlockConflict (fixes issue #3204)"
         );
     }
@@ -2181,7 +2145,7 @@ more logs"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn model_unavailable_transient_applies_short_cooldown() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let runner = MockRunner { free: vec![] };
         let agent = "opencode-2941-transient";
         let model = "github-copilot/gpt-4o";
@@ -2207,14 +2171,14 @@ more logs"#;
         .unwrap();
 
         let now = chrono::Utc::now().timestamp();
-        let until = crate::engine::cooldown::cooldown_until(&key)
+        let until = cooldown::cooldown_until(&key)
             .expect("transient model unavailability should set model cooldown");
         let remaining = until.saturating_sub(now);
 
         // Standard (transient) backoff base is 5min. Persistent base is 4h.
         // Confirm we did NOT apply the long 4h cooldown for a transient error.
         assert!(
-            remaining < crate::engine::cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS,
+            remaining < cooldown::PERSISTENT_MODEL_BACKOFF_BASE_SECS,
             "transient unavailability should use short cooldown (<4h), got {remaining}s"
         );
     }
@@ -2222,7 +2186,7 @@ more logs"#;
     #[serial(cooldown_state)]
     #[tokio::test]
     async fn model_unavailable_does_not_reuse_same_agent_when_agent_cooled() {
-        crate::engine::cooldown::reset_global_state().await;
+        cooldown::reset_global_state().await;
         let agent = "codex-3620";
         let failing_model = "gpt-5.4";
         let other_model = "gpt-5.5";
@@ -2230,7 +2194,7 @@ more logs"#;
             models: vec![failing_model.to_string(), other_model.to_string()],
         };
 
-        crate::engine::cooldown::set_agent_cooldown(agent, 3600).await;
+        cooldown::set_agent_cooldown(agent, 3600).await;
 
         let err = AgentError::ModelUnavailable {
             model: failing_model.to_string(),

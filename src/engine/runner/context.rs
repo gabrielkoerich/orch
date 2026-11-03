@@ -9,13 +9,19 @@
 //! - Git diff (for retries)
 //! - Issue comments
 
+use crate::backends::Mention;
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask};
 use crate::cmd::CommandErrorContext;
+use crate::home;
 use crate::store;
+use crate::store::MemoryEntry;
 use crate::store::TaskStore;
 use futures::future::join_all;
+use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
+use tokio::fs;
 use tokio::process::Command;
 
 /// All assembled context for a task execution.
@@ -38,15 +44,15 @@ pub struct TaskContext {
     /// PR review context (for re-dispatching after review changes requested)
     pub pr_review_context: String,
     /// Memory from previous attempts (capped at last 3)
-    pub memory: Vec<crate::store::MemoryEntry>,
+    pub memory: Vec<MemoryEntry>,
 }
 
 /// Load task-specific context from context file.
 pub async fn load_task_context(task_id: &str) -> String {
-    let contexts_dir = crate::home::contexts_dir().unwrap_or_default();
+    let contexts_dir = home::contexts_dir().unwrap_or_default();
 
     let path = contexts_dir.join(format!("task-{task_id}.md"));
-    tokio::fs::read_to_string(&path).await.unwrap_or_default()
+    fs::read_to_string(&path).await.unwrap_or_default()
 }
 
 /// Build parent task context for subtasks.
@@ -56,8 +62,6 @@ pub async fn build_parent_context(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
 ) -> String {
-    use std::fmt::Write as _;
-
     // Check if task has a parent via store
     let parent_id = match store::opt_store_get_task(store, repo, &task.id.0)
         .await
@@ -126,15 +130,13 @@ pub async fn build_parent_context(
 
 /// Build project instructions from CLAUDE.md, AGENTS.md, README.md.
 pub async fn build_project_instructions(project_dir: &Path) -> String {
-    use std::fmt::Write as _;
-
     let mut instructions = String::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
 
     for filename in &["CLAUDE.md", "AGENTS.md", "README.md"] {
         let path = project_dir.join(filename);
         // CLAUDE.md is often a symlink to AGENTS.md, reading both put the same file in every prompt twice
-        let Ok(real) = tokio::fs::canonicalize(&path).await else {
+        let Ok(real) = fs::canonicalize(&path).await else {
             continue;
         };
 
@@ -142,7 +144,7 @@ pub async fn build_project_instructions(project_dir: &Path) -> String {
             continue;
         }
 
-        if let Ok(content) = tokio::fs::read_to_string(&path).await
+        if let Ok(content) = fs::read_to_string(&path).await
             && !content.is_empty()
         {
             let _ = writeln!(instructions, "## {filename}\n\n{content}\n");
@@ -154,8 +156,6 @@ pub async fn build_project_instructions(project_dir: &Path) -> String {
 
 /// Build skills documentation for selected skills.
 pub async fn build_skills_docs(selected_skills: &[String]) -> String {
-    use std::fmt::Write as _;
-
     if selected_skills.is_empty() {
         return String::new();
     }
@@ -166,13 +166,13 @@ pub async fn build_skills_docs(selected_skills: &[String]) -> String {
             .unwrap_or_default()
             .join(".claude")
             .join("skills"),
-        crate::home::skills_dir().unwrap_or_default(),
+        home::skills_dir().unwrap_or_default(),
     ];
 
     for skill in selected_skills {
         for dir in &skills_dirs {
             let skill_file = dir.join(skill).join("SKILL.md");
-            if let Ok(content) = tokio::fs::read_to_string(&skill_file).await {
+            if let Ok(content) = fs::read_to_string(&skill_file).await {
                 let _ = writeln!(docs, "## Skill: {skill}\n\n{content}\n");
                 break;
             }
@@ -269,7 +269,7 @@ pub async fn build_git_log(project_dir: &Path, default_branch: &str) -> String {
 }
 
 /// Returns true if the comment is from an automated bot and should be skipped.
-fn is_bot_comment(mention: &crate::backends::Mention) -> bool {
+fn is_bot_comment(mention: &Mention) -> bool {
     // Skip GitHub Actions bots and other automated accounts
     if mention.author.ends_with("[bot]") {
         return true;
@@ -290,9 +290,7 @@ pub async fn fetch_issue_comments(
     task_id: &str,
     limit: usize,
 ) -> String {
-    use std::fmt::Write as _;
-
-    let id = crate::backends::ExternalId(task_id.to_string());
+    let id = ExternalId(task_id.to_string());
     let all_comments = match backend.list_issue_comments(&id).await {
         Ok(c) => c,
         Err(e) => {
@@ -326,9 +324,7 @@ pub async fn build_memory_context(
     task_id: &str,
     store: &Option<Arc<TaskStore>>,
     repo: &str,
-) -> (String, Vec<crate::store::MemoryEntry>) {
-    use std::fmt::Write as _;
-
+) -> (String, Vec<MemoryEntry>) {
     const MAX_MEMORY_ENTRIES: usize = 3;
 
     let memory = match store::get_recent_memory_result(store, repo, task_id, MAX_MEMORY_ENTRIES)
@@ -473,6 +469,12 @@ pub async fn build_full_context(
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    #[cfg(unix)]
+    use std::fs as std_fs;
+    #[cfg(unix)]
+    use std::os::unix::fs as unix_fs;
+
     use super::*;
 
     #[tokio::test]
@@ -484,7 +486,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_project_instructions_empty_dir() {
-        let dir = std::env::temp_dir().join("orch_test_nonexistent");
+        let dir = env::temp_dir().join("orch_test_nonexistent");
         let instructions = build_project_instructions(&dir).await;
         assert_eq!(instructions, "");
     }
@@ -493,9 +495,9 @@ mod tests {
     #[tokio::test]
     async fn project_instructions_read_a_symlinked_file_once() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("AGENTS.md"), "agent rules").unwrap();
-        std::os::unix::fs::symlink("AGENTS.md", dir.path().join("CLAUDE.md")).unwrap();
-        std::fs::write(dir.path().join("README.md"), "readme").unwrap();
+        std_fs::write(dir.path().join("AGENTS.md"), "agent rules").unwrap();
+        unix_fs::symlink("AGENTS.md", dir.path().join("CLAUDE.md")).unwrap();
+        std_fs::write(dir.path().join("README.md"), "readme").unwrap();
 
         let instructions = build_project_instructions(dir.path()).await;
         assert_eq!(instructions.matches("agent rules").count(), 1);

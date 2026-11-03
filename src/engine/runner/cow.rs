@@ -1,10 +1,14 @@
 //! Copy-on-write task worktrees cloned from a per-project template by the git-cow crate, see docs/content/cow-worktrees.md
 
 use super::worktree::resolve_branch_start_point;
+use crate::home;
+use std::env;
 use std::path::{Path, PathBuf};
 
+use tokio::task;
+
 fn template_dir(project: &str) -> anyhow::Result<PathBuf> {
-    Ok(crate::home::state_dir()?.join("templates").join(project))
+    Ok(home::state_dir()?.join("templates").join(project))
 }
 
 // Called after a task PR merges and before its worktree is removed.
@@ -14,7 +18,7 @@ pub async fn warm_from_merged(repo_root: &Path, project: &str, wt_dir: &Path) {
     let Ok(template) = template_dir(project) else {
         return;
     };
-    let res = tokio::task::spawn_blocking(move || {
+    let res = task::spawn_blocking(move || {
         let bare =
             git_cow::git(&repo, &["rev-parse", "--is-bare-repository"]).is_ok_and(|v| v == "true");
         let wt_parent = wt.parent().unwrap_or(&wt);
@@ -39,7 +43,7 @@ pub async fn create_worktree(
     branch: &str,
     default_branch: &str,
 ) -> anyhow::Result<()> {
-    if std::env::var("ORCH_COW_WORKTREES").is_ok_and(|v| v == "0") {
+    if env::var("ORCH_COW_WORKTREES").is_ok_and(|v| v == "0") {
         anyhow::bail!("disabled by ORCH_COW_WORKTREES=0");
     }
     let template = template_dir(project)?;
@@ -51,19 +55,20 @@ pub async fn create_worktree(
         wt_dir.to_path_buf(),
         branch.to_string(),
     );
-    tokio::task::spawn_blocking(move || {
-        git_cow::add(&repo, &template, &start, &wt, None, Some(&branch))
-    })
-    .await??;
+    task::spawn_blocking(move || git_cow::add(&repo, &template, &start, &wt, None, Some(&branch)))
+        .await??;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::process::Command;
+
     use super::*;
 
     fn sh(dir: &Path, args: &[&str]) {
-        let mut cmd = std::process::Command::new("git");
+        let mut cmd = Command::new("git");
         cmd.current_dir(dir);
         // Global commit.gpgsign calls the operator's signer (1Password)
         if args.first() == Some(&"commit") {
@@ -75,7 +80,7 @@ mod tests {
 
     // CI jobs on a clone-capable volume set this so a failed probe fails the test
     fn expect_clone() -> bool {
-        std::env::var("ORCH_COW_EXPECT_CLONE").is_ok_and(|v| v == "1")
+        env::var("ORCH_COW_EXPECT_CLONE").is_ok_and(|v| v == "1")
     }
 
     fn repo_with_origin() -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) {
@@ -88,8 +93,8 @@ mod tests {
         );
         sh(project.path(), &["config", "user.email", "t@t.com"]);
         sh(project.path(), &["config", "user.name", "T"]);
-        std::fs::write(project.path().join("a.txt"), "a\n").unwrap();
-        std::fs::write(project.path().join("d.txt"), "d\n").unwrap();
+        fs::write(project.path().join("a.txt"), "a\n").unwrap();
+        fs::write(project.path().join("d.txt"), "d\n").unwrap();
         sh(project.path(), &["add", "."]);
         sh(project.path(), &["commit", "-m", "init"]);
         sh(project.path(), &["push", "origin", "HEAD:main"]);
@@ -103,11 +108,11 @@ mod tests {
     async fn clone_gives_clean_worktree_or_falls_back() {
         let (_remote, project, home) = repo_with_origin();
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("ORCH_HOME", home.path()) };
+        unsafe { env::set_var("ORCH_HOME", home.path()) };
         let templates = home.path().join("state/templates");
-        std::fs::create_dir_all(&templates).unwrap();
+        fs::create_dir_all(&templates).unwrap();
         let wt_dir = home.path().join("worktrees/p/task-1");
-        std::fs::create_dir_all(wt_dir.parent().unwrap()).unwrap();
+        fs::create_dir_all(wt_dir.parent().unwrap()).unwrap();
         sh(project.path(), &["branch", "task-1", "origin/main"]);
 
         // Volumes without clone support (ext4, HFS+) take the else branch
@@ -121,11 +126,8 @@ mod tests {
         let res = create_worktree(project.path(), "p", &wt_dir, "task-1", "main").await;
         if supported {
             res.expect("clone path should succeed");
-            assert_eq!(
-                std::fs::read_to_string(wt_dir.join("a.txt")).unwrap(),
-                "a\n"
-            );
-            let status = std::process::Command::new("git")
+            assert_eq!(fs::read_to_string(wt_dir.join("a.txt")).unwrap(), "a\n");
+            let status = Command::new("git")
                 .args(["status", "--porcelain"])
                 .current_dir(&wt_dir)
                 .output()
@@ -137,7 +139,7 @@ mod tests {
             assert!(!wt_dir.exists(), "failed clone must leave no directory");
         }
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::remove_var("ORCH_HOME") };
+        unsafe { env::remove_var("ORCH_HOME") };
     }
 
     #[tokio::test]
@@ -145,20 +147,20 @@ mod tests {
     async fn branch_differing_from_template_gets_its_own_files() {
         let (_remote, project, home) = repo_with_origin();
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("ORCH_HOME", home.path()) };
+        unsafe { env::set_var("ORCH_HOME", home.path()) };
         let templates = home.path().join("state/templates");
-        std::fs::create_dir_all(&templates).unwrap();
+        fs::create_dir_all(&templates).unwrap();
         let wt_dir = home.path().join("worktrees/p/task-3");
-        std::fs::create_dir_all(wt_dir.parent().unwrap()).unwrap();
+        fs::create_dir_all(wt_dir.parent().unwrap()).unwrap();
 
         // Task branch: a.txt changed, b.txt added, d.txt deleted
         sh(
             project.path(),
             &["checkout", "-q", "-b", "task-3", "origin/main"],
         );
-        std::fs::write(project.path().join("a.txt"), "changed\n").unwrap();
-        std::fs::write(project.path().join("b.txt"), "b\n").unwrap();
-        std::fs::remove_file(project.path().join("d.txt")).unwrap();
+        fs::write(project.path().join("a.txt"), "changed\n").unwrap();
+        fs::write(project.path().join("b.txt"), "b\n").unwrap();
+        fs::remove_file(project.path().join("d.txt")).unwrap();
         sh(project.path(), &["add", "-A"]);
         sh(project.path(), &["commit", "-m", "task"]);
         sh(project.path(), &["checkout", "-q", "--detach"]);
@@ -175,15 +177,12 @@ mod tests {
                 .await
                 .expect("clone path should succeed");
             assert_eq!(
-                std::fs::read_to_string(wt_dir.join("a.txt")).unwrap(),
+                fs::read_to_string(wt_dir.join("a.txt")).unwrap(),
                 "changed\n"
             );
-            assert_eq!(
-                std::fs::read_to_string(wt_dir.join("b.txt")).unwrap(),
-                "b\n"
-            );
+            assert_eq!(fs::read_to_string(wt_dir.join("b.txt")).unwrap(), "b\n");
             assert!(!wt_dir.join("d.txt").exists());
-            let status = std::process::Command::new("git")
+            let status = Command::new("git")
                 .args(["status", "--porcelain"])
                 .current_dir(&wt_dir)
                 .output()
@@ -191,14 +190,14 @@ mod tests {
             assert!(status.stdout.is_empty(), "clone must have a clean index");
         }
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::remove_var("ORCH_HOME") };
+        unsafe { env::remove_var("ORCH_HOME") };
     }
 
     #[tokio::test]
     #[serial_test::serial(orch_home)]
     async fn checkout_ignored_dirs_reach_template_and_clone() {
         let (_remote, project, home) = repo_with_origin();
-        std::fs::write(
+        fs::write(
             project.path().join(".gitignore"),
             "out/\n.env\n.local/\nnode/\n",
         )
@@ -207,23 +206,23 @@ mod tests {
         sh(project.path(), &["commit", "-m", "ignore"]);
         sh(project.path(), &["push", "origin", "HEAD:main"]);
         sh(project.path(), &["fetch", "origin"]);
-        std::fs::create_dir_all(project.path().join("out/sub")).unwrap();
-        std::fs::write(project.path().join("out/sub/dep.bin"), "dep\n").unwrap();
-        std::fs::create_dir_all(project.path().join(".local")).unwrap();
-        std::fs::write(project.path().join(".local/settings"), "x\n").unwrap();
-        std::fs::create_dir_all(project.path().join("pkg/a/node")).unwrap();
-        std::fs::write(project.path().join("pkg/a/node/dep.bin"), "nested\n").unwrap();
-        std::fs::create_dir_all(project.path().join("pkg/a/.hidden/node")).unwrap();
-        std::fs::write(project.path().join("pkg/a/.hidden/node/x"), "x\n").unwrap();
-        std::fs::write(project.path().join("pkg/a/keep.txt"), "k\n").unwrap();
-        std::fs::write(project.path().join(".env"), "secret\n").unwrap();
+        fs::create_dir_all(project.path().join("out/sub")).unwrap();
+        fs::write(project.path().join("out/sub/dep.bin"), "dep\n").unwrap();
+        fs::create_dir_all(project.path().join(".local")).unwrap();
+        fs::write(project.path().join(".local/settings"), "x\n").unwrap();
+        fs::create_dir_all(project.path().join("pkg/a/node")).unwrap();
+        fs::write(project.path().join("pkg/a/node/dep.bin"), "nested\n").unwrap();
+        fs::create_dir_all(project.path().join("pkg/a/.hidden/node")).unwrap();
+        fs::write(project.path().join("pkg/a/.hidden/node/x"), "x\n").unwrap();
+        fs::write(project.path().join("pkg/a/keep.txt"), "k\n").unwrap();
+        fs::write(project.path().join(".env"), "secret\n").unwrap();
 
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("ORCH_HOME", home.path()) };
+        unsafe { env::set_var("ORCH_HOME", home.path()) };
         let templates = home.path().join("state/templates");
-        std::fs::create_dir_all(&templates).unwrap();
+        fs::create_dir_all(&templates).unwrap();
         let wt_dir = home.path().join("worktrees/p/task-4");
-        std::fs::create_dir_all(wt_dir.parent().unwrap()).unwrap();
+        fs::create_dir_all(wt_dir.parent().unwrap()).unwrap();
         sh(project.path(), &["branch", "task-4", "origin/main"]);
 
         let supported = git_cow::can_clone(&templates, wt_dir.parent().unwrap());
@@ -240,7 +239,7 @@ mod tests {
             let tpl = templates.join("p");
             for root in [&tpl, &wt_dir] {
                 assert_eq!(
-                    std::fs::read_to_string(root.join("out/sub/dep.bin")).unwrap(),
+                    fs::read_to_string(root.join("out/sub/dep.bin")).unwrap(),
                     "dep\n"
                 );
                 assert!(!root.join(".env").exists(), "loose ignored file was copied");
@@ -250,20 +249,20 @@ mod tests {
                     "nested hidden dir was copied"
                 );
                 assert_eq!(
-                    std::fs::read_to_string(root.join("pkg/a/node/dep.bin")).unwrap(),
+                    fs::read_to_string(root.join("pkg/a/node/dep.bin")).unwrap(),
                     "nested\n"
                 );
             }
             // The worktree keeps its own gitdir
             assert!(wt_dir.join(".git").is_file());
             assert_ne!(
-                std::fs::read_to_string(wt_dir.join(".git")).unwrap(),
-                std::fs::read_to_string(tpl.join(".git")).unwrap()
+                fs::read_to_string(wt_dir.join(".git")).unwrap(),
+                fs::read_to_string(tpl.join(".git")).unwrap()
             );
             // git-cow warms the template from the checkout at most once an hour, so a second task
             // right after the first keeps the build output the template already has
-            std::fs::remove_file(project.path().join("out/sub/dep.bin")).unwrap();
-            std::fs::write(project.path().join("out/new.bin"), "new\n").unwrap();
+            fs::remove_file(project.path().join("out/sub/dep.bin")).unwrap();
+            fs::write(project.path().join("out/new.bin"), "new\n").unwrap();
             let wt2 = home.path().join("worktrees/p/task-5");
             sh(project.path(), &["branch", "task-5", "origin/main"]);
             create_worktree(project.path(), "p", &wt2, "task-5", "main")
@@ -273,14 +272,14 @@ mod tests {
             assert!(!wt2.join("out/new.bin").exists());
         }
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::remove_var("ORCH_HOME") };
+        unsafe { env::remove_var("ORCH_HOME") };
     }
 
     #[tokio::test]
     #[serial_test::serial(orch_home)]
     async fn merged_task_ignored_dirs_reach_template_of_bare_project() {
         let (remote, project, home) = repo_with_origin();
-        std::fs::write(project.path().join(".gitignore"), "out/\n").unwrap();
+        fs::write(project.path().join(".gitignore"), "out/\n").unwrap();
         sh(project.path(), &["add", "."]);
         sh(project.path(), &["commit", "-m", "ignore"]);
         sh(project.path(), &["push", "origin", "HEAD:main"]);
@@ -297,11 +296,11 @@ mod tests {
         sh(&bare, &["branch", "task-6", "main"]);
 
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("ORCH_HOME", home.path()) };
+        unsafe { env::set_var("ORCH_HOME", home.path()) };
         let templates = home.path().join("state/templates");
-        std::fs::create_dir_all(&templates).unwrap();
+        fs::create_dir_all(&templates).unwrap();
         let wt_dir = home.path().join("worktrees/pb/task-6");
-        std::fs::create_dir_all(wt_dir.parent().unwrap()).unwrap();
+        fs::create_dir_all(wt_dir.parent().unwrap()).unwrap();
 
         let supported = git_cow::can_clone(&templates, wt_dir.parent().unwrap());
         if expect_clone() {
@@ -317,9 +316,9 @@ mod tests {
             let tpl = templates.join("pb");
             assert!(!tpl.join("out").exists());
 
-            std::fs::create_dir_all(wt_dir.join("out")).unwrap();
-            std::fs::write(wt_dir.join("out/dep.bin"), "dep\n").unwrap();
-            std::fs::write(wt_dir.join("loose.log"), "x\n").unwrap();
+            fs::create_dir_all(wt_dir.join("out")).unwrap();
+            fs::write(wt_dir.join("out/dep.bin"), "dep\n").unwrap();
+            fs::write(wt_dir.join("loose.log"), "x\n").unwrap();
 
             // A project with a working checkout is not warmed from tasks
             warm_from_merged(project.path(), "pb", &wt_dir).await;
@@ -327,14 +326,14 @@ mod tests {
 
             warm_from_merged(&bare, "pb", &wt_dir).await;
             assert_eq!(
-                std::fs::read_to_string(tpl.join("out/dep.bin")).unwrap(),
+                fs::read_to_string(tpl.join("out/dep.bin")).unwrap(),
                 "dep\n"
             );
             assert!(!tpl.join("loose.log").exists());
             assert!(tpl.join(".git").is_file());
         }
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::remove_var("ORCH_HOME") };
+        unsafe { env::remove_var("ORCH_HOME") };
     }
 
     #[tokio::test]
@@ -342,15 +341,15 @@ mod tests {
     async fn env_switch_disables_clone_path() {
         let (_remote, project, home) = repo_with_origin();
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("ORCH_HOME", home.path()) };
+        unsafe { env::set_var("ORCH_HOME", home.path()) };
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("ORCH_COW_WORKTREES", "0") };
+        unsafe { env::set_var("ORCH_COW_WORKTREES", "0") };
         let wt_dir = home.path().join("worktrees/p/task-2");
         let res = create_worktree(project.path(), "p", &wt_dir, "task-2", "main").await;
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::remove_var("ORCH_COW_WORKTREES") };
+        unsafe { env::remove_var("ORCH_COW_WORKTREES") };
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::remove_var("ORCH_HOME") };
+        unsafe { env::remove_var("ORCH_HOME") };
         assert!(res.is_err());
         assert!(!wt_dir.exists());
     }

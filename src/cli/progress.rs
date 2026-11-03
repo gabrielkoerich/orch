@@ -1,10 +1,17 @@
 use std::path::Path;
 
+use tokio::process::Command;
+
+use std::env;
+use std::process::Output;
+
+use crate::cluster;
 use crate::cluster::{local, progress};
+use crate::engine::runner::commit::When;
 use crate::engine::runner::git_ops;
 
-async fn git(dir: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> {
-    Ok(tokio::process::Command::new("git")
+async fn git(dir: &Path, args: &[&str]) -> anyhow::Result<Output> {
+    Ok(Command::new("git")
         .args(args)
         .current_dir(dir)
         .output()
@@ -14,7 +21,7 @@ async fn git(dir: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> 
 /// Commit in the worktree, then hand the report to the service, which commits what is left,
 /// pushes, and records it for every node
 pub async fn run(done: &str, left: &str, state: &str) -> anyhow::Result<()> {
-    let cwd = std::env::current_dir()?;
+    let cwd = env::current_dir()?;
     let top = git(&cwd, &["rev-parse", "--show-toplevel"]).await?;
     anyhow::ensure!(
         top.status.success(),
@@ -23,21 +30,13 @@ pub async fn run(done: &str, left: &str, state: &str) -> anyhow::Result<()> {
     let worktree = String::from_utf8_lossy(&top.stdout).trim().to_string();
     let dir = Path::new(&worktree);
 
-    let task_id = std::env::var("TASK_ID").unwrap_or_default();
-    let agent = std::env::var("ORCH_AGENT").unwrap_or_else(|_| "agent".to_string());
-    let (cli_committed, cli_error) = match git_ops::auto_commit(
-        dir,
-        &task_id,
-        done,
-        &agent,
-        0,
-        crate::engine::runner::commit::When::Tested,
-    )
-    .await
-    {
-        Ok(committed) => (committed, None),
-        Err(e) => (false, Some(format!("{e:#}"))),
-    };
+    let task_id = env::var("TASK_ID").unwrap_or_default();
+    let agent = env::var("ORCH_AGENT").unwrap_or_else(|_| "agent".to_string());
+    let (cli_committed, cli_error) =
+        match git_ops::auto_commit(dir, &task_id, done, &agent, 0, When::Tested).await {
+            Ok(committed) => (committed, None),
+            Err(e) => (false, Some(format!("{e:#}"))),
+        };
 
     let report = progress::Report {
         worktree,
@@ -47,7 +46,7 @@ pub async fn run(done: &str, left: &str, state: &str) -> anyhow::Result<()> {
         cli_committed,
         cli_error,
     };
-    if !crate::cluster::enabled() {
+    if !cluster::enabled() {
         eprintln!("committed locally. Recording progress needs a cluster section in the config");
         return Ok(());
     }

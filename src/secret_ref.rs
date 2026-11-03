@@ -2,6 +2,16 @@
 //! `passbox:<name>` is read once through passbox, `${NAME}` reads an environment variable, any
 //! other value is used as written. A reference is the whole value, never part of a longer one
 
+use crate::config;
+use std::collections::HashMap;
+use std::env;
+use std::process::Command;
+use std::process::Stdio;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::PoisonError;
+use tokio::task;
+
 /// Blocking, it waits on passbox's Touch ID prompt, so call it from `spawn_blocking`
 pub fn resolve(value: &str) -> anyhow::Result<String> {
     resolve_with("passbox", value)
@@ -10,27 +20,26 @@ pub fn resolve(value: &str) -> anyhow::Result<String> {
 /// A config value resolved with [`resolve`], read once per daemon start: a passbox read waits on
 /// Touch ID, so a secret read in two places must not prompt twice
 pub async fn config_secret(key: &str) -> anyhow::Result<String> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
-        std::sync::OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
 
     // The global config only: a project file must never point a secret at its own endpoint
-    let value = crate::config::get_global(key)?;
+    let value = config::get_global(key)?;
     if let Some(secret) = cache
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(PoisonError::into_inner)
         .get(&value)
     {
         return Ok(secret.clone());
     }
 
     let raw = value.clone();
-    let secret = tokio::task::spawn_blocking(move || resolve(&raw))
+    let secret = task::spawn_blocking(move || resolve(&raw))
         .await?
         .inspect_err(|e| tracing::warn!(key, err = %e, "config secret unavailable"))?;
     cache
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(PoisonError::into_inner)
         .insert(value, secret.clone());
     Ok(secret)
 }
@@ -39,7 +48,7 @@ fn expand_env(value: &str) -> anyhow::Result<String> {
     let Some(name) = env_name(value) else {
         return Ok(value.to_string());
     };
-    match std::env::var(name) {
+    match env::var(name) {
         Ok(v) if !v.is_empty() => Ok(v),
         _ => anyhow::bail!("environment variable {name} is unset or empty"),
     }
@@ -59,9 +68,9 @@ fn resolve_with(passbox: &str, value: &str) -> anyhow::Result<String> {
 
     // `exec --stdin` hands the value to a child, so it works without a terminal and does not
     // depend on a flag of `get` that passbox versions differ on
-    let out = std::process::Command::new(passbox)
+    let out = Command::new(passbox)
         .args(["exec", "--stdin", name, "--", "/bin/cat"])
-        .stdin(std::process::Stdio::null())
+        .stdin(Stdio::null())
         .output()?;
 
     if !out.status.success() {
@@ -79,13 +88,17 @@ fn resolve_with(passbox: &str, value: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
     use super::*;
 
-    fn stub(dir: &std::path::Path, script: &str) -> String {
-        use std::os::unix::fs::PermissionsExt;
+    fn stub(dir: &Path, script: &str) -> String {
         let path = dir.join("passbox");
-        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        fs::set_permissions(&path, Permissions::from_mode(0o755)).unwrap();
         path.to_string_lossy().into_owned()
     }
 
@@ -99,7 +112,7 @@ mod tests {
     fn an_env_reference_reads_the_variable() {
         // A name no other test sets, so parallel tests cannot race on it
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("ORCH_SECRET_REF_TEST_SET", "from-env") };
+        unsafe { env::set_var("ORCH_SECRET_REF_TEST_SET", "from-env") };
         assert_eq!(
             resolve_with("/nonexistent", "${ORCH_SECRET_REF_TEST_SET}").unwrap(),
             "from-env"

@@ -4,18 +4,20 @@
 //! The `list` command opens the store, hydrates the in-memory map, then
 //! prints all active entries — accurate even when the service is not running.
 
+use crate::cli;
 use crate::engine::cooldown;
+use crate::engine::router::Router;
 use std::sync::Arc;
 
 /// List all active agent and model cooldowns.
 pub async fn list() -> anyhow::Result<()> {
-    let store = Arc::new(crate::cli::init_store().await?);
+    let store = Arc::new(cli::init_store().await?);
     // Hydrate in-memory map from persisted KV so we see the full state.
-    cooldown::init_cooldown_store(std::sync::Arc::clone(&store)).await;
+    cooldown::init_cooldown_store(Arc::clone(&store)).await;
 
     // Recompute degraded agents so the CLI shows the same skip reasons as the
     // service, including agents held only by the rate-limit threshold
-    let router = crate::engine::router::Router::from_config();
+    let router = Router::from_config();
     router.refresh_health(&store).await;
 
     let entries = cooldown::list_all_cooldowns();
@@ -44,12 +46,12 @@ pub async fn list() -> anyhow::Result<()> {
 
 /// Clear a specific cooldown by key, or all cooldowns with `--all`.
 pub async fn clear(key: Option<String>, all: bool) -> anyhow::Result<()> {
-    let store = Arc::new(crate::cli::init_store().await?);
+    let store = Arc::new(cli::init_store().await?);
     // Hydrate first so clear operates on the current state.
-    cooldown::init_cooldown_store(std::sync::Arc::clone(&store)).await;
+    cooldown::init_cooldown_store(Arc::clone(&store)).await;
 
     if all {
-        let agents = crate::engine::router::Router::from_config().available_agents;
+        let agents = Router::from_config().available_agents;
         cooldown::clear_cooldown("*", &store).await;
         cooldown::mark_rate_limits_cleared(&store, &agents).await;
         println!("Cleared all cooldowns.");

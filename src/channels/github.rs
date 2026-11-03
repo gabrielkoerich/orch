@@ -3,8 +3,12 @@
 //! Provides `start_webhook_server` and `check_webhook_health` for the engine.
 
 use super::IncomingMessage;
+use crate::config;
+use crate::home;
 use chrono::{DateTime, Utc};
 
+use axum::body::Bytes;
+use axum::http::HeaderMap;
 use axum::{
     Router,
     extract::State,
@@ -15,11 +19,25 @@ use axum::{
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::fs;
+use std::fs::File;
+use std::io;
+use std::io::ErrorKind;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time as std_time;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
+use tokio::net::TcpListener;
+use tokio::sync::Mutex;
+use tokio::sync::mpsc::Sender;
+use tokio::task;
+use tokio::time;
 
 #[derive(serde::Deserialize, serde::Serialize)]
 struct GhUser {
@@ -67,7 +85,7 @@ struct DedupInner {
 ///   restart within the dedup window).
 #[derive(Clone)]
 pub struct DedupStore {
-    inner: Arc<tokio::sync::Mutex<DedupInner>>,
+    inner: Arc<Mutex<DedupInner>>,
     /// `Some(path)` enables file-backed persistence.
     file_path: Option<PathBuf>,
     window_secs: u64,
@@ -75,8 +93,8 @@ pub struct DedupStore {
     metrics_enabled: bool,
 }
 
-impl std::fmt::Debug for DedupStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for DedupStore {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("DedupStore")
             .field("file_path", &self.file_path)
             .field("window_secs", &self.window_secs)
@@ -100,7 +118,7 @@ impl DedupStore {
         metrics_enabled: bool,
     ) -> Self {
         Self {
-            inner: Arc::new(tokio::sync::Mutex::new(DedupInner {
+            inner: Arc::new(Mutex::new(DedupInner {
                 entries: HashMap::new(),
                 duplicate_count: 0,
                 inserted_count: 0,
@@ -137,7 +155,7 @@ impl DedupStore {
             "loaded webhook dedup state from file"
         );
         Self {
-            inner: Arc::new(tokio::sync::Mutex::new(DedupInner {
+            inner: Arc::new(Mutex::new(DedupInner {
                 entries,
                 duplicate_count: 0,
                 inserted_count: 0,
@@ -212,21 +230,19 @@ impl DedupStore {
                 attempt += 1;
                 let path_clone = path.clone();
                 let entries_clone = Arc::clone(&entries);
-                match tokio::task::spawn_blocking(move || {
-                    flush_dedup_file(&path_clone, &entries_clone)
-                })
-                .await
+                match task::spawn_blocking(move || flush_dedup_file(&path_clone, &entries_clone))
+                    .await
                 {
                     Ok(Ok(())) => break,
                     Ok(Err(e)) if attempt < MAX_FLUSH_ATTEMPTS => {
-                        let delay = std::time::Duration::from_millis(100u64 << (attempt - 1));
+                        let delay = Duration::from_millis(100u64 << (attempt - 1));
                         tracing::warn!(
                             ?e,
                             attempt,
                             path = %path_for_log.display(),
                             "failed to flush webhook dedup state, retrying"
                         );
-                        tokio::time::sleep(delay).await;
+                        time::sleep(delay).await;
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(
@@ -305,9 +321,9 @@ fn load_dedup_file(path: &Path, window_secs: u64) -> HashMap<String, u64> {
         entries: HashMap<String, u64>,
     }
 
-    let content = match std::fs::read_to_string(path) {
+    let content = match fs::read_to_string(path) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(e) if e.kind() == ErrorKind::NotFound => return HashMap::new(),
         Err(e) => {
             tracing::warn!(?e, path = %path.display(), "failed to read webhook dedup file, starting fresh");
             return HashMap::new();
@@ -335,29 +351,29 @@ fn load_dedup_file(path: &Path, window_secs: u64) -> HashMap<String, u64> {
 }
 
 /// Persist the dedup entries to a JSON file.
-fn flush_dedup_file(path: &Path, entries: &HashMap<String, u64>) -> std::io::Result<()> {
+fn flush_dedup_file(path: &Path, entries: &HashMap<String, u64>) -> io::Result<()> {
     #[derive(serde::Serialize)]
     struct FileFormat<'a> {
         entries: &'a HashMap<String, u64>,
     }
 
     let content = serde_json::to_string(&FileFormat { entries })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
     atomic_write(path, &content)
 }
 
-fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+fn atomic_write(path: &Path, content: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)?;
     }
 
     let tmp_path = path.with_extension(format!("db.tmp.{}", uuid::Uuid::new_v4()));
-    let mut file = std::fs::File::create(&tmp_path)?;
+    let mut file = File::create(&tmp_path)?;
     file.write_all(content.as_bytes())?;
     file.sync_all()?;
-    std::fs::rename(&tmp_path, path)?;
+    fs::rename(&tmp_path, path)?;
     if let Some(parent) = path.parent()
-        && let Ok(dir) = std::fs::File::open(parent)
+        && let Ok(dir) = File::open(parent)
         && let Err(e) = dir.sync_all()
     {
         tracing::warn!(?e, path = %parent.display(), "failed to sync parent directory after dedup file rename");
@@ -373,7 +389,7 @@ fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
 struct WebhookState {
     secret: String,
     repo: String,
-    tx: tokio::sync::mpsc::Sender<IncomingMessage>,
+    tx: Sender<IncomingMessage>,
     dedup_store: DedupStore,
 }
 
@@ -544,8 +560,8 @@ fn parse_github_event(
 
 async fn handle_webhook(
     State(state): State<WebhookState>,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> impl IntoResponse {
     let signature = headers
         .get("x-hub-signature-256")
@@ -626,7 +642,7 @@ async fn webhook_health(State(state): State<WebhookState>) -> impl IntoResponse 
 /// Logs dedup store metrics (seen_count, duplicate_count) at `debug` level for observability.
 pub async fn check_webhook_health(port: u16) -> (bool, Option<String>) {
     let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(Duration::from_secs(5))
         .build()
     {
         Ok(c) => c,
@@ -668,10 +684,10 @@ pub async fn check_webhook_health(port: u16) -> (bool, Option<String>) {
 /// already in use) that is worth retrying.
 pub fn is_transient_bind_error(e: &anyhow::Error) -> bool {
     for cause in e.chain() {
-        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+        if let Some(io_err) = cause.downcast_ref::<io::Error>() {
             return matches!(
                 io_err.kind(),
-                std::io::ErrorKind::AddrInUse | std::io::ErrorKind::AddrNotAvailable
+                ErrorKind::AddrInUse | ErrorKind::AddrNotAvailable
             );
         }
     }
@@ -682,18 +698,18 @@ pub fn is_transient_bind_error(e: &anyhow::Error) -> bool {
 ///
 /// Uses subsecond wall-clock bits as a cheap jitter source — no `rand` crate
 /// needed.  Delay is capped at 30 s.
-pub fn webhook_backoff_delay(attempt: u32) -> std::time::Duration {
+pub fn webhook_backoff_delay(attempt: u32) -> Duration {
     let base_ms: u64 = 500;
     let max_ms: u64 = 30_000;
     let exp_ms = base_ms.saturating_mul(1u64 << (attempt.saturating_sub(1)).min(6));
     let bounded_ms = exp_ms.min(max_ms);
     let jitter_ms = u64::from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        SystemTime::now()
+            .duration_since(std_time::UNIX_EPOCH)
             .unwrap_or_default()
             .subsec_millis(),
     ) % 500;
-    std::time::Duration::from_millis(bounded_ms + jitter_ms)
+    Duration::from_millis(bounded_ms + jitter_ms)
 }
 
 /// Start the webhook HTTP server.
@@ -709,29 +725,28 @@ pub async fn start_webhook_server(
     port: u16,
     secret: String,
     repo: String,
-    tx: tokio::sync::mpsc::Sender<IncomingMessage>,
+    tx: Sender<IncomingMessage>,
 ) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
+    let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
 
-    let window_secs = crate::config::get("webhook.dedup_window_seconds")
+    let window_secs = config::get("webhook.dedup_window_seconds")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(DEFAULT_DEDUP_WINDOW_SECS);
 
-    let max_size = crate::config::get("webhook.max_seen_deliveries")
+    let max_size = config::get("webhook.max_seen_deliveries")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_MAX_SEEN_DELIVERIES);
 
-    let store_type =
-        crate::config::get("webhook.dedup_store").unwrap_or_else(|_| "memory".to_string());
+    let store_type = config::get("webhook.dedup_store").unwrap_or_else(|_| "memory".to_string());
 
-    let metrics_enabled = crate::config::get("webhook.dedup_metrics").map_or(true, |v| v == "true");
+    let metrics_enabled = config::get("webhook.dedup_metrics").map_or(true, |v| v == "true");
 
     let dedup_store = if store_type == "file" {
-        let path = crate::config::get("webhook.dedup_path").ok().map_or_else(
+        let path = config::get("webhook.dedup_path").ok().map_or_else(
             || {
-                crate::home::orch_home()
+                home::orch_home()
                     .unwrap_or_else(|_| PathBuf::from("/tmp"))
                     .join("webhook_dedup.db")
             },
@@ -742,7 +757,7 @@ pub async fn start_webhook_server(
         // dedup file). Run the constructor on a blocking thread so we don't
         // block the Tokio async worker thread that is running
         // start_webhook_server.
-        match tokio::task::spawn_blocking(move || {
+        match task::spawn_blocking(move || {
             DedupStore::new_filebacked_with_metrics(path, window_secs, max_size, metrics_enabled)
         })
         .await
@@ -786,6 +801,12 @@ pub async fn start_webhook_server(
 
 #[cfg(test)]
 mod tests {
+    use axum::body;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tokio::sync::mpsc;
+    use tower::ServiceExt;
+
     use super::*;
 
     #[test]
@@ -1179,7 +1200,7 @@ mod tests {
 
         // Write a file with an entry that is already expired (timestamp = 0).
         let content = r#"{"entries":{"old-delivery":0}}"#;
-        std::fs::write(&path, content).unwrap();
+        fs::write(&path, content).unwrap();
 
         // Load with a 1-second window; the entry (ts=0) is long expired.
         let store = DedupStore::new_filebacked(path, 1, 50_000);
@@ -1232,11 +1253,9 @@ mod tests {
     /// the IncomingMessage arrives on the mpsc channel.
     #[tokio::test]
     async fn test_webhook_handler_issues_opened() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::util::ServiceExt; // for oneshot()
+        // for oneshot()
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(16);
+        let (tx, mut rx) = mpsc::channel::<IncomingMessage>(16);
 
         let state = WebhookState {
             secret: String::new(), // empty secret = skip verification
@@ -1286,11 +1305,7 @@ mod tests {
     /// Integration test: verify that issue_comment events include the correct thread_id.
     #[tokio::test]
     async fn test_webhook_handler_issue_comment() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(16);
+        let (tx, mut rx) = mpsc::channel::<IncomingMessage>(16);
 
         let state = WebhookState {
             secret: String::new(),
@@ -1338,11 +1353,7 @@ mod tests {
     /// Integration test: verify pull_request_review.submitted events are handled.
     #[tokio::test]
     async fn test_webhook_handler_pr_review_submitted() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(16);
+        let (tx, mut rx) = mpsc::channel::<IncomingMessage>(16);
 
         let state = WebhookState {
             secret: String::new(),
@@ -1392,11 +1403,7 @@ mod tests {
     /// Integration test: verify that invalid signatures are rejected.
     #[tokio::test]
     async fn test_webhook_handler_rejects_invalid_signature() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(16);
+        let (tx, mut rx) = mpsc::channel::<IncomingMessage>(16);
 
         let state = WebhookState {
             secret: "real-secret".to_string(),
@@ -1441,11 +1448,7 @@ mod tests {
     /// processed by the engine. Also verifies metrics are recorded correctly.
     #[tokio::test]
     async fn test_webhook_deduplication_same_delivery_id() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(16);
+        let (tx, mut rx) = mpsc::channel::<IncomingMessage>(16);
 
         // Shared dedup store — both requests use the same state.
         let dedup_store = DedupStore::new_in_memory(7200, 50_000);
@@ -1563,11 +1566,7 @@ mod tests {
     /// Health endpoint test: verify it returns JSON with dedup status.
     #[tokio::test]
     async fn test_health_endpoint_returns_json_metrics() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let (tx, _rx) = tokio::sync::mpsc::channel::<IncomingMessage>(16);
+        let (tx, _rx) = mpsc::channel::<IncomingMessage>(16);
         let dedup_store = DedupStore::new_in_memory(7200, 50_000);
 
         // Pre-populate with one entry and one duplicate for metrics.
@@ -1594,7 +1593,7 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        let body_bytes = body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
@@ -1607,7 +1606,7 @@ mod tests {
     /// Verify that `is_transient_bind_error` correctly classifies EADDRINUSE.
     #[test]
     fn test_is_transient_bind_error_addr_in_use() {
-        let io_err = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        let io_err = io::Error::from(ErrorKind::AddrInUse);
         let err = anyhow::anyhow!(io_err);
         assert!(is_transient_bind_error(&err));
     }
@@ -1615,7 +1614,7 @@ mod tests {
     /// Verify that non-bind errors are not classified as transient.
     #[test]
     fn test_is_transient_bind_error_other_error() {
-        let io_err = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        let io_err = io::Error::from(ErrorKind::ConnectionRefused);
         let err = anyhow::anyhow!(io_err);
         assert!(!is_transient_bind_error(&err));
     }
@@ -1645,11 +1644,11 @@ mod tests {
     #[tokio::test]
     async fn test_start_webhook_server_port_in_use() {
         // Hold a listener on 0.0.0.0 (the same bind address used by start_webhook_server).
-        let holder = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let holder = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let port = holder.local_addr().unwrap().port();
 
         // A second bind on the same address+port must fail.
-        let result = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await;
+        let result = TcpListener::bind(format!("0.0.0.0:{port}")).await;
         drop(holder);
 
         let io_err = result.expect_err("expected EADDRINUSE on duplicate bind");

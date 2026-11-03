@@ -9,6 +9,9 @@
 //! ```
 
 use std::collections::HashMap;
+use std::env;
+use std::fmt::Write as _;
+use std::fs;
 use std::path::PathBuf;
 
 /// Secret patterns that should NOT appear in artifacts.
@@ -62,8 +65,6 @@ fn assert_no_secrets_in_files(files: &[(PathBuf, String)]) {
     }
 
     if !all_violations.is_empty() {
-        use std::fmt::Write as _;
-
         let mut msg = String::from("Secret leakage detected in task artifacts:\n\n");
         for (path, line, pattern, snippet) in all_violations {
             let _ = write!(
@@ -83,12 +84,13 @@ fn assert_no_secrets_in_files(files: &[(PathBuf, String)]) {
 fn setup_temp_home() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().expect("failed to create temp dir");
     let home = temp.path().join("home");
-    std::fs::create_dir_all(&home).expect("failed to create home dir");
+    fs::create_dir_all(&home).expect("failed to create home dir");
     // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-    unsafe { std::env::set_var("HOME", &home) };
+    unsafe { env::set_var("HOME", &home) };
     (temp, home)
 }
 
+#[cfg(test)]
 mod unit_tests {
     use super::*;
 
@@ -163,13 +165,13 @@ Tokens are accepted without validation.";
 
         // Create temp files to test
         let attempt_dir = home.join(".orch/state/owner/repo/tasks/123/attempts/1");
-        std::fs::create_dir_all(&attempt_dir).unwrap();
+        fs::create_dir_all(&attempt_dir).unwrap();
 
         let sys_file = attempt_dir.join("prompt-sys.md");
         let msg_file = attempt_dir.join("prompt-msg.md");
 
-        std::fs::write(&sys_file, sys_prompt).unwrap();
-        std::fs::write(&msg_file, msg_prompt).unwrap();
+        fs::write(&sys_file, sys_prompt).unwrap();
+        fs::write(&msg_file, msg_prompt).unwrap();
 
         // Verify no secrets in files
         let files = vec![
@@ -211,6 +213,7 @@ claude -p --system prompt-sys.md < prompt-msg.md
     }
 }
 
+#[cfg(test)]
 mod integration_tests {
     use super::*;
 
@@ -231,11 +234,11 @@ mod integration_tests {
         // Set GH_TOKEN in environment (simulating real deployment)
         let test_token = "ghp_test1234567890abcdefghijklmnopqrstuvwxyz12";
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("GH_TOKEN", test_token) };
+        unsafe { env::set_var("GH_TOKEN", test_token) };
 
         // Create a minimal agent invocation
         let attempt_dir = home.join(".orch/state/owner/repo/tasks/456/attempts/1");
-        std::fs::create_dir_all(&attempt_dir).unwrap();
+        fs::create_dir_all(&attempt_dir).unwrap();
 
         let sys_file = attempt_dir.join("prompt-sys.md");
         let msg_file = attempt_dir.join("prompt-msg.md");
@@ -244,8 +247,8 @@ mod integration_tests {
         let sys_prompt = "System prompt without secrets".to_string();
         let msg_prompt = "Message prompt without secrets".to_string();
 
-        std::fs::write(&sys_file, &sys_prompt).unwrap();
-        std::fs::write(&msg_file, &msg_prompt).unwrap();
+        fs::write(&sys_file, &sys_prompt).unwrap();
+        fs::write(&msg_file, &msg_prompt).unwrap();
 
         // Simulate what build_runner_script does: write the token export line
         let runner_script = format!(
@@ -259,7 +262,7 @@ export GIT_AUTHOR_EMAIL="test@example.com"
         );
 
         let runner_file = attempt_dir.join("runner.sh");
-        std::fs::write(&runner_file, &runner_script).unwrap();
+        fs::write(&runner_file, &runner_script).unwrap();
 
         // Verify prompt files have no secrets
         let prompt_files = vec![(sys_file, sys_prompt), (msg_file, msg_prompt)];
@@ -267,7 +270,7 @@ export GIT_AUTHOR_EMAIL="test@example.com"
 
         // Clean up env var
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::remove_var("GH_TOKEN") };
+        unsafe { env::remove_var("GH_TOKEN") };
     }
 
     /// Test that when no GH_TOKEN is in environment, the runner script
@@ -278,12 +281,12 @@ export GIT_AUTHOR_EMAIL="test@example.com"
 
         // Ensure no GH_TOKEN in environment
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::remove_var("GH_TOKEN") };
+        unsafe { env::remove_var("GH_TOKEN") };
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::remove_var("GITHUB_TOKEN") };
+        unsafe { env::remove_var("GITHUB_TOKEN") };
 
         let attempt_dir = home.join(".orch/state/owner/repo/tasks/789/attempts/1");
-        std::fs::create_dir_all(&attempt_dir).unwrap();
+        fs::create_dir_all(&attempt_dir).unwrap();
 
         // Simulate a runner script generated when no token is available
         let runner_script = r#"#!/usr/bin/env bash
@@ -298,7 +301,7 @@ export GIT_AUTHOR_EMAIL="test@example.com"
 "#;
 
         let runner_file = attempt_dir.join("runner.sh");
-        std::fs::write(&runner_file, runner_script).unwrap();
+        fs::write(&runner_file, runner_script).unwrap();
 
         // Verify the script has no hardcoded tokens
         let files = vec![(runner_file, runner_script.to_string())];
@@ -312,7 +315,7 @@ export GIT_AUTHOR_EMAIL="test@example.com"
         let (_temp, home) = setup_temp_home();
 
         let attempt_dir = home.join(".orch/state/owner/repo/tasks/999/attempts/1");
-        std::fs::create_dir_all(&attempt_dir).unwrap();
+        fs::create_dir_all(&attempt_dir).unwrap();
 
         // Create all the files that would be in an attempt directory
         let files = vec![
@@ -362,7 +365,7 @@ exit $CMD_STATUS
         let mut file_contents = Vec::new();
         for (filename, content) in &files {
             let path = attempt_dir.join(filename);
-            std::fs::write(&path, content).unwrap();
+            fs::write(&path, content).unwrap();
             file_contents.push((path, (*content).to_string()));
         }
 

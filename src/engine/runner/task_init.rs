@@ -9,10 +9,16 @@ use crate::engine::router::{RouteResultError, get_route_result};
 use crate::store;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
+use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{agent, context, git_ops, worktree};
+use crate::engine::RunTimeouts;
+use crate::engine::cleanup;
+use crate::home;
 
 /// Result of task preparation: everything needed to run an agent session.
 pub struct TaskInitResult {
@@ -26,8 +32,8 @@ pub struct TaskInitResult {
     pub new_attempts: u32,
 }
 
-impl std::fmt::Debug for TaskInitResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for TaskInitResult {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("TaskInitResult")
             .field("agent_name", &self.agent_name)
             .field("model_name", &self.model_name)
@@ -209,7 +215,7 @@ pub async fn prepare_task(
                 // Attempt to clean up the worktree we created to avoid leaving
                 // partial artifacts behind.
                 if let Some(s) = store {
-                    let _ = crate::engine::cleanup::cleanup_task_worktree(task_id, repo, s).await;
+                    let _ = cleanup::cleanup_task_worktree(task_id, repo, s).await;
                 }
                 return Err(anyhow::anyhow!(err_msg));
             }
@@ -255,8 +261,7 @@ pub async fn prepare_task(
 
     let sandboxed = super::sandbox::enabled(&wt.main_project_dir);
     let shipcheck = agent::Shipcheck::detect(&wt.work_dir).await;
-    agent::install_shipcheck_hooks(&wt.work_dir, shipcheck, std::path::Path::new("shipcheck"))
-        .await;
+    agent::install_shipcheck_hooks(&wt.work_dir, shipcheck, Path::new("shipcheck")).await;
 
     // Build prompts
     let system_prompt = agent::build_system_prompt(
@@ -275,11 +280,11 @@ pub async fn prepare_task(
 
     // Output file in per-task attempt directory (attempt = attempts + 1, set below)
     let next_attempt = attempts + 1;
-    let attempt_dir = match crate::home::task_attempt_dir_async(repo, task_id, next_attempt).await {
+    let attempt_dir = match home::task_attempt_dir_async(repo, task_id, next_attempt).await {
         Ok(dir) => dir,
         Err(e) => {
             if let Some(s) = store {
-                let _ = crate::engine::cleanup::cleanup_task_worktree(task_id, repo, s).await;
+                let _ = cleanup::cleanup_task_worktree(task_id, repo, s).await;
             }
             return Err(e);
         }
@@ -308,7 +313,7 @@ pub async fn prepare_task(
         ]);
     }
 
-    if let Ok(orch_home) = crate::home::orch_home() {
+    if let Ok(orch_home) = home::orch_home() {
         for path in [
             orch_home.join("config.yml"),
             orch_home.join("config.example.yml"),
@@ -333,8 +338,7 @@ pub async fn prepare_task(
     }
 
     // Stuck recovery reads the same limits, so a live session is never taken before this runs out
-    let timeout_seconds =
-        crate::engine::RunTimeouts::from_config().for_complexity(complexity.as_deref());
+    let timeout_seconds = RunTimeouts::from_config().for_complexity(complexity.as_deref());
 
     // Build agent invocation
     let invocation = agent::AgentInvocation {
@@ -366,7 +370,7 @@ pub async fn prepare_task(
     .await
     {
         if let Some(s) = store {
-            let _ = crate::engine::cleanup::cleanup_task_worktree(task_id, repo, s).await;
+            let _ = cleanup::cleanup_task_worktree(task_id, repo, s).await;
         }
         return Err(anyhow::anyhow!("failed to persist attempts counter: {e}"));
     }
@@ -418,7 +422,7 @@ mod tests {
             .set_fields(store_id, &[("attempts", serde_json::json!(1000))])
             .await
             .unwrap();
-        let store = Some(std::sync::Arc::clone(&task_store));
+        let store = Some(Arc::clone(&task_store));
 
         let outcome = check_guards(&format!("internal:{store_id}"), "owner/repo", &store)
             .await

@@ -35,13 +35,16 @@ cargo test -- test_name        # specific test (fallback)
 
 ## Required checks before committing
 
-CI enforces all three — run them locally before pushing:
+CI enforces all four, run them locally before pushing:
 
 ```bash
 cargo fmt -- --check                       # formatting
 cargo clippy --all-targets -- -D warnings  # lints (warnings are errors, incl. test code)
 cargo nextest run                          # tests
+DYLINT_RUSTFLAGS="-D warnings" cargo dylint --all -- --all-targets  # use_in_fn lint
 ```
+
+The import rules and the dylint setup are in [docs/content/development.md](docs/content/development.md#import-rules).
 
 Or all at once:
 

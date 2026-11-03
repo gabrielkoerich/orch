@@ -1,10 +1,13 @@
 //! Finds the other orch nodes on the tailnet from `tailscale status --json`
 
 use std::collections::HashMap;
+use std::iter;
 use std::time::Duration;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use tokio::process::Command;
+use tokio::time;
 
 use super::NodeId;
 
@@ -49,7 +52,7 @@ impl Tailnet {
 
     /// Every machine with this node name, this one included
     pub fn all_named(&self, name: &str) -> Vec<&Host> {
-        std::iter::once(&self.me)
+        iter::once(&self.me)
             .chain(&self.peers)
             .filter(|h| h.name == name)
             .collect()
@@ -100,9 +103,9 @@ pub fn parse(json: &str) -> anyhow::Result<Tailnet> {
 }
 
 pub async fn status() -> anyhow::Result<Tailnet> {
-    let out = tokio::time::timeout(
+    let out = time::timeout(
         Duration::from_secs(5),
-        tokio::process::Command::new("tailscale")
+        Command::new("tailscale")
             .args(["status", "--json"])
             .kill_on_drop(true)
             .output(),

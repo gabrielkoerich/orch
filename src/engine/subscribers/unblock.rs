@@ -3,6 +3,7 @@
 use crate::backends::ExternalBackend;
 use crate::engine::events::TaskEvent;
 use crate::engine::tasks::TaskManager;
+use crate::engine::tick;
 use crate::store::TaskStore;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -27,13 +28,8 @@ pub fn spawn(
                         task_id = event.task_id,
                         "event-driven parent unblock triggered"
                     );
-                    if let Err(e) = crate::engine::tick::tick_unblock_parents(
-                        &backend,
-                        &task_manager,
-                        &store,
-                        &repo,
-                    )
-                    .await
+                    if let Err(e) =
+                        tick::tick_unblock_parents(&backend, &task_manager, &store, &repo).await
                     {
                         tracing::warn!(?e, "event-driven unblock failed (tick will retry)");
                     }

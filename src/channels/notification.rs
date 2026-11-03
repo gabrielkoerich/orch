@@ -8,6 +8,7 @@
 //! events are broadcast. Configured via `notifications.level` in config.
 
 use super::html_escape;
+use crate::config;
 use serde::{Deserialize, Serialize};
 
 /// Notification level — controls which task events are broadcast.
@@ -29,7 +30,7 @@ pub enum NotificationLevel {
 impl NotificationLevel {
     /// Load from config key `notifications.level`, defaulting to `all`.
     pub fn from_config() -> Self {
-        match crate::config::get("notifications.level") {
+        match config::get("notifications.level") {
             Ok(val) => match val.as_str() {
                 "verbose" => Self::Verbose,
                 "errors_only" => Self::ErrorsOnly,

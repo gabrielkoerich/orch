@@ -1,4 +1,8 @@
+use crate::cli;
 use crate::engine::cleanup::cleanup_orphaned_worktree;
+use crate::home;
+use std::collections::HashSet;
+use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -9,13 +13,13 @@ use std::sync::Arc;
 /// specified and does not prompt for confirmation. Orphaned worktrees are
 /// unreferenced by definition and safe to remove automatically.
 pub async fn run(dry_run: bool) -> anyhow::Result<()> {
-    let store = Arc::new(crate::cli::init_store().await?);
+    let store = Arc::new(cli::init_store().await?);
     let all_tasks = store.list_all_global().await?;
 
-    let worktrees_dir = crate::home::worktrees_dir()?;
+    let worktrees_dir = home::worktrees_dir()?;
 
     // Build a set of owned worktree paths for O(1) lookup.
-    let owned: std::collections::HashSet<String> = all_tasks
+    let owned: HashSet<String> = all_tasks
         .iter()
         .filter(|t| !t.worktree.is_empty())
         .map(|t| t.worktree.clone())
@@ -24,7 +28,7 @@ pub async fn run(dry_run: bool) -> anyhow::Result<()> {
     let mut removed = 0usize;
     let mut failed = 0usize;
 
-    let project_dirs = match std::fs::read_dir(&worktrees_dir) {
+    let project_dirs = match fs::read_dir(&worktrees_dir) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("cannot read worktrees directory: {e}");
@@ -43,7 +47,7 @@ pub async fn run(dry_run: bool) -> anyhow::Result<()> {
         if !project_entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
-        let Ok(branch_dirs) = std::fs::read_dir(project_entry.path()) else {
+        let Ok(branch_dirs) = fs::read_dir(project_entry.path()) else {
             continue;
         };
         for branch_entry in branch_dirs {

@@ -15,6 +15,7 @@
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::time::{Duration, Instant};
 
 /// Wall-clock-minus-monotonic gap large enough to be a host suspend rather than
@@ -67,7 +68,7 @@ pub fn checkpoint() -> Option<ChronoDuration> {
     let prev = {
         let mut guard = LAST_CHECKPOINT
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         guard.replace(Checkpoint {
             instant: now_instant,
             wall: now_wall,
@@ -76,9 +77,7 @@ pub fn checkpoint() -> Option<ChronoDuration> {
     let prev = prev?;
     let gap = gap_since(&prev, now_instant, now_wall)?;
 
-    let mut log = GAP_LOG
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut log = GAP_LOG.lock().unwrap_or_else(PoisonError::into_inner);
     log.push(GapRecord {
         detected_at: now_wall,
         gap,
@@ -130,9 +129,7 @@ impl Default for SuspendDetector {
 /// Total suspend time detected since `since`. Subtract this from a wall-clock age
 /// computation to avoid mistaking suspend time for hung agent/tick runtime.
 pub fn suspended_duration_since(since: DateTime<Utc>) -> ChronoDuration {
-    let log = GAP_LOG
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let log = GAP_LOG.lock().unwrap_or_else(PoisonError::into_inner);
     log.iter()
         .filter(|r| r.detected_at > since)
         .fold(ChronoDuration::zero(), |acc, r| acc + r.gap)
@@ -144,9 +141,7 @@ pub fn suspended_duration_since(since: DateTime<Utc>) -> ChronoDuration {
 pub fn gap_detected_within(window: Duration) -> Option<ChronoDuration> {
     let window = ChronoDuration::from_std(window).unwrap_or_else(|_| ChronoDuration::zero());
     let cutoff = Utc::now() - window;
-    let log = GAP_LOG
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let log = GAP_LOG.lock().unwrap_or_else(PoisonError::into_inner);
     log.iter()
         .rev()
         .find(|r| r.detected_at >= cutoff)
@@ -158,9 +153,7 @@ pub fn gap_detected_within(window: Duration) -> Option<ChronoDuration> {
 /// deterministically in tests.
 #[cfg(test)]
 pub(crate) fn inject_gap_for_test(detected_at: DateTime<Utc>, gap: ChronoDuration) {
-    let mut log = GAP_LOG
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut log = GAP_LOG.lock().unwrap_or_else(PoisonError::into_inner);
     log.push(GapRecord { detected_at, gap });
 }
 
@@ -168,14 +161,14 @@ pub(crate) fn inject_gap_for_test(detected_at: DateTime<Utc>, gap: ChronoDuratio
 /// `#[serial(suspend_state)]` since `GAP_LOG` is a process-wide static.
 #[cfg(test)]
 pub(crate) fn clear_for_test() {
-    let mut log = GAP_LOG
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut log = GAP_LOG.lock().unwrap_or_else(PoisonError::into_inner);
     log.clear();
 }
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use super::*;
     use serial_test::serial;
 
@@ -213,7 +206,7 @@ mod tests {
     fn suspend_detector_reports_no_gap_for_normal_elapsed_time() {
         let mut detector = SuspendDetector::new();
         detector.check();
-        std::thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(10));
         assert_eq!(detector.check(), None);
     }
 

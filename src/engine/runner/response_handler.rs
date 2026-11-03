@@ -8,10 +8,19 @@ use crate::config;
 use crate::parser::AgentResponse;
 use crate::store;
 use crate::store::TaskStore;
+use std::io;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
 
+use tokio::fs;
+
 use super::{agents, git_ops, response, worktree};
+use crate::engine::cooldown;
+use crate::engine::review;
+use crate::github::http::GhHttp;
+use crate::status_heuristics;
+use crate::store::Task;
 
 /// Write a structured `result.json` to the attempt directory for debugging.
 #[expect(
@@ -67,7 +76,7 @@ pub async fn write_result_json(
         }
     };
 
-    if let Err(e) = tokio::fs::write(
+    if let Err(e) = fs::write(
         attempt_dir.join("result.json"),
         serde_json::to_string_pretty(&result_json).unwrap_or_default(),
     )
@@ -211,8 +220,7 @@ fn classify_final_status(input: &DecisionInput<'_>) -> String {
         "done".to_string()
     } else if input.agent_status == "blocked" && input.is_retryable_blocked {
         "new".to_string()
-    } else if crate::status_heuristics::status_looks_like_descriptive_completion(input.agent_status)
-    {
+    } else if status_heuristics::status_looks_like_descriptive_completion(input.agent_status) {
         "done".to_string()
     } else {
         input.agent_status.to_string()
@@ -240,7 +248,7 @@ impl StoreCtx<'_> {
     }
 
     /// Load the full task record.
-    async fn get_task(&self) -> Option<crate::store::Task> {
+    async fn get_task(&self) -> Option<Task> {
         if let Some(store_id) = self.store_id_opt {
             store::opt_store_get_task_by_id(self.store, store_id).await
         } else {
@@ -400,8 +408,8 @@ enum PushResult {
 fn is_missing_path_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|ioe| ioe.kind() == std::io::ErrorKind::NotFound)
+            .downcast_ref::<io::Error>()
+            .is_some_and(|ioe| ioe.kind() == ErrorKind::NotFound)
     }) || err
         .to_string()
         .to_ascii_lowercase()
@@ -744,7 +752,7 @@ async fn create_pr_with_log(
             // Save pr_number to the store so the review gate can find it
             // immediately without racing GitHub's list-API cache (~300 ms lag).
             // This is set for both newly-created and pre-existing PRs.
-            match crate::engine::review::parse_pr_number_from_url(url) {
+            match review::parse_pr_number_from_url(url) {
                 Ok(pr_num) => {
                     if let Err(e) = store::store_set_result(
                         ctx.store,
@@ -999,7 +1007,7 @@ async fn close_superseded_pr(ctx: &StoreCtx<'_>, pr_number: u64) {
     if ctx.repo.is_empty() {
         return;
     }
-    match crate::github::http::GhHttp::new() {
+    match GhHttp::new() {
         Ok(gh) => {
             let note = "Closing as superseded: the change is already on the default branch, so this branch has no commits ahead of it.";
             if let Err(e) = gh.add_comment(ctx.repo, &pr_number.to_string(), note).await {
@@ -1144,7 +1152,7 @@ async fn detect_no_code_reroutes(
 ///
 /// Priority: explicit `error` field → `summary` → fallback.
 /// Appends `remaining` items if present so operators know what was left to do.
-fn agent_blocked_reason(resp: &crate::parser::AgentResponse) -> String {
+fn agent_blocked_reason(resp: &AgentResponse) -> String {
     let summary_opt = if resp.summary.is_empty() {
         None
     } else {
@@ -1164,7 +1172,7 @@ fn agent_blocked_reason(resp: &crate::parser::AgentResponse) -> String {
 }
 
 /// True when a blocked response names a denied `git push` and nothing else as the blocker.
-fn is_denied_push_block(resp: &crate::parser::AgentResponse) -> bool {
+fn is_denied_push_block(resp: &AgentResponse) -> bool {
     let r = agent_blocked_reason(resp).to_lowercase();
     r.contains("push")
         && [
@@ -1646,9 +1654,9 @@ pub async fn handle_success(
         if final_status == "new" {
             // Retryable external block: cooldown failed agent/model, clear selection,
             // and reroute after backoff instead of permanently blocking.
-            crate::engine::cooldown::record_agent_failure_with_message(agent_name, &reason).await;
+            cooldown::record_agent_failure_with_message(agent_name, &reason).await;
             if let Some(m) = model_name {
-                crate::engine::cooldown::record_model_failure(agent_name, m).await;
+                cooldown::record_model_failure(agent_name, m).await;
             }
             ctx.set(&[
                 (
@@ -1714,7 +1722,11 @@ pub async fn handle_success(
 /// Labels that indicate a task is non-code and can be marked done without a PR.
 #[cfg(test)]
 mod tests {
+    use std::fs as std_fs;
+    use std::process::Command;
+
     use super::*;
+    use crate::store::NewTask;
 
     #[test]
     fn local_rate_limit_skip_is_detected() {
@@ -1728,7 +1740,7 @@ mod tests {
 
     /// Helper: run git in `dir`, panicking on failure
     fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+        let out = Command::new("git")
             .current_dir(dir)
             .args(args)
             .output()
@@ -1762,12 +1774,12 @@ mod tests {
         // orch's worktree: main, then a feature branch with the task's commit
         let work = tempfile::tempdir().unwrap();
         init_clone(remote.path(), work.path());
-        std::fs::write(work.path().join("README.md"), "base").unwrap();
+        std_fs::write(work.path().join("README.md"), "base").unwrap();
         git(work.path(), &["add", "."]);
         git(work.path(), &["commit", "-m", "init"]);
         git(work.path(), &["push", "origin", "HEAD:main"]);
         git(work.path(), &["checkout", "-b", "feat"]);
-        std::fs::write(work.path().join("fix.txt"), "the fix").unwrap();
+        std_fs::write(work.path().join("fix.txt"), "the fix").unwrap();
         git(work.path(), &["add", "."]);
         git(work.path(), &["commit", "-m", "apply the fix"]);
         git(work.path(), &["push", "-u", "origin", "feat"]);
@@ -1783,7 +1795,7 @@ mod tests {
         git(other.path(), &["push", "--force", "origin", "feat"]);
 
         // orch now has an unpushed commit of its own on top of the stale branch
-        std::fs::write(work.path().join("more.txt"), "follow-up").unwrap();
+        std_fs::write(work.path().join("more.txt"), "follow-up").unwrap();
         git(work.path(), &["add", "."]);
         git(work.path(), &["commit", "-m", "follow-up"]);
 
@@ -1819,7 +1831,7 @@ mod tests {
 
         // push_branch recovers the stale lease itself, so the log below is the proof: the
         // follow-up commit is on the remote, on top of the rebased history
-        let log = std::process::Command::new("git")
+        let log = Command::new("git")
             .current_dir(work.path())
             .args(["log", "--oneline", "origin/feat"])
             .output()
@@ -1841,8 +1853,8 @@ mod tests {
 
     #[test]
     fn missing_path_error_detects_io_not_found() {
-        let err = anyhow::Error::from(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
+        let err = anyhow::Error::from(io::Error::new(
+            ErrorKind::NotFound,
             "simulated missing path",
         ));
         assert!(is_missing_path_error(&err));
@@ -1871,8 +1883,8 @@ mod tests {
     /// instead of blocking it as a same-agent no-code loop (#3780).
     #[tokio::test]
     async fn conflict_reroute_with_no_commits_closes_pr_and_marks_done() {
-        fn git(dir: &std::path::Path, args: &[&str]) {
-            let ok = std::process::Command::new("git")
+        fn git(dir: &Path, args: &[&str]) {
+            let ok = Command::new("git")
                 .args(args)
                 .current_dir(dir)
                 .env("GIT_AUTHOR_NAME", "t")
@@ -1890,16 +1902,16 @@ mod tests {
         // the agent leaves behind when the fix already landed on the base.
         let dir = tempfile::tempdir().unwrap();
         let origin = dir.path().join("origin.git");
-        std::fs::create_dir(&origin).unwrap();
+        std_fs::create_dir(&origin).unwrap();
         git(&origin, &["init", "--bare", "-b", "main"]);
         let work_dir = dir.path().join("work");
-        std::fs::create_dir(&work_dir).unwrap();
+        std_fs::create_dir(&work_dir).unwrap();
         git(&work_dir, &["init", "-b", "main"]);
         git(
             &work_dir,
             &["remote", "add", "origin", &origin.display().to_string()],
         );
-        std::fs::write(work_dir.join("a.txt"), "a").unwrap();
+        std_fs::write(work_dir.join("a.txt"), "a").unwrap();
         git(&work_dir, &["add", "-A"]);
         git(&work_dir, &["commit", "-m", "init"]);
         git(&work_dir, &["push", "-u", "origin", "main"]);
@@ -1914,7 +1926,7 @@ mod tests {
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let store_id = store
-            .create(&crate::store::NewTask {
+            .create(&NewTask {
                 external_id: Some("3772".to_string()),
                 repo: "owner/repo".to_string(),
                 origin: "github".to_string(),
@@ -2044,7 +2056,7 @@ mod tests {
 
     #[test]
     fn denied_push_block_detected() {
-        let resp = |s: &str| crate::parser::AgentResponse {
+        let resp = |s: &str| AgentResponse {
             status: "blocked".to_string(),
             summary: s.to_string(),
             ..Default::default()
@@ -2396,7 +2408,7 @@ mod tests {
     /// Agent explicitly returned blocked with an error field — use error as reason.
     #[test]
     fn agent_blocked_reason_prefers_error_field() {
-        let resp = crate::parser::AgentResponse {
+        let resp = AgentResponse {
             status: "blocked".to_string(),
             error: Some("CDP endpoint not reachable".to_string()),
             summary: "Could not complete research".to_string(),
@@ -2415,7 +2427,7 @@ mod tests {
     /// No error field — falls back to summary.
     #[test]
     fn agent_blocked_reason_falls_back_to_summary() {
-        let resp = crate::parser::AgentResponse {
+        let resp = AgentResponse {
             status: "blocked".to_string(),
             error: None,
             summary: "Could not access required data sources in sandboxed environment".to_string(),
@@ -2432,7 +2444,7 @@ mod tests {
     /// No error or summary — returns generic fallback.
     #[test]
     fn agent_blocked_reason_generic_fallback() {
-        let resp = crate::parser::AgentResponse {
+        let resp = AgentResponse {
             status: "blocked".to_string(),
             ..Default::default()
         };

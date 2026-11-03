@@ -7,7 +7,17 @@ use crate::engine::runner::agents::{
     AgentError, PermissionRules, get_runner, shell_single_quote, supports_session,
 };
 use anyhow::Result;
+use std::error;
+use std::fmt;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::fmt::Write as _;
+use std::process::Output;
+use std::result;
 use std::time::Duration;
+use tokio::fs;
+use tokio::process::Command;
+use tokio::time;
 
 /// Result of a one-shot agent invocation.
 #[derive(Debug, Clone)]
@@ -37,8 +47,8 @@ pub enum DirectCommandError {
     },
 }
 
-impl std::fmt::Display for DirectCommandError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for DirectCommandError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Timeout { secs } => write!(f, "agent timed out after {secs}s"),
             Self::Spawn { message } => write!(f, "spawning agent: {message}"),
@@ -52,7 +62,7 @@ impl std::fmt::Display for DirectCommandError {
     }
 }
 
-impl std::error::Error for DirectCommandError {}
+impl error::Error for DirectCommandError {}
 
 /// Run an agent one-shot without tmux.
 ///
@@ -105,8 +115,8 @@ pub async fn run_direct_with_session(
     let sys_file = format!("{work_dir}/system.md");
     let msg_file = format!("{work_dir}/message.txt");
 
-    tokio::fs::write(&sys_file, system_prompt).await?;
-    tokio::fs::write(&msg_file, message).await?;
+    fs::write(&sys_file, system_prompt).await?;
+    fs::write(&msg_file, message).await?;
 
     let runner = get_runner(agent);
     let permissions = PermissionRules::deny_read_only();
@@ -132,7 +142,6 @@ fn insert_session_flag(
     mut shell_cmd: String,
     session: SessionContinuation<'_>,
 ) -> String {
-    use std::fmt::Write as _;
     if !supports_session(agent) {
         return shell_cmd;
     }
@@ -164,11 +173,11 @@ fn insert_session_flag(
 /// Returns `Err(DirectCommandError::NonZeroExit { stdout, .. })` so callers can
 /// inspect stdout for rate-limit messages even on failure.
 pub async fn run_direct_command_raw(
-    cmd: &mut tokio::process::Command,
+    cmd: &mut Command,
     timeout: Duration,
-) -> std::result::Result<String, DirectCommandError> {
+) -> result::Result<String, DirectCommandError> {
     cmd.kill_on_drop(true);
-    let output = tokio::time::timeout(timeout + Duration::from_secs(5), cmd.output())
+    let output = time::timeout(timeout + Duration::from_secs(5), cmd.output())
         .await
         .map_err(|_| DirectCommandError::Timeout {
             secs: timeout.as_secs(),
@@ -195,7 +204,7 @@ pub async fn run_direct_command_raw(
 }
 
 /// Shared output-handling logic: parse stdout, classify errors.
-fn finish_output(output: &std::process::Output, agent: &str) -> Result<DirectResult> {
+fn finish_output(output: &Output, agent: &str) -> Result<DirectResult> {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let exit_code = output.status.code().unwrap_or(-1);
@@ -238,12 +247,12 @@ async fn run_shell_command(
     timeout: Duration,
     agent: &str,
 ) -> Result<DirectResult> {
-    let mut cmd = tokio::process::Command::new("bash");
+    let mut cmd = Command::new("bash");
     cmd.arg("-c")
         .arg(shell_cmd)
         .current_dir(work_dir)
         .kill_on_drop(true);
-    let output = tokio::time::timeout(timeout + Duration::from_secs(5), cmd.output())
+    let output = time::timeout(timeout + Duration::from_secs(5), cmd.output())
         .await
         .map_err(|_| anyhow::anyhow!("agent timed out after {}s", timeout.as_secs()))?
         .map_err(|e| anyhow::anyhow!("spawning agent: {e}"))?;

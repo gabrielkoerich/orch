@@ -21,8 +21,13 @@ pub mod telegram;
 pub mod tmux;
 pub mod transport;
 
+use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::Receiver;
 
 /// Escape `&`, `<` and `>` for Telegram's HTML parse_mode, which rejects bare ones
 pub(crate) fn html_escape(s: &str) -> String {
@@ -116,7 +121,7 @@ pub trait Channel: Send + Sync {
 
     /// Start listening for incoming messages.
     /// Returns a receiver that the engine polls.
-    async fn start(&self) -> anyhow::Result<tokio::sync::mpsc::Receiver<IncomingMessage>>;
+    async fn start(&self) -> anyhow::Result<Receiver<IncomingMessage>>;
 
     /// Send a message to a thread/conversation.
     async fn send(&self, msg: &OutgoingMessage) -> anyhow::Result<()>;
@@ -139,8 +144,8 @@ pub struct ChannelRegistry {
     channels: Vec<Box<dyn Channel>>,
 }
 
-impl std::fmt::Debug for ChannelRegistry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for ChannelRegistry {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_list()
             .entries(self.channels.iter().map(|c| c.name()))
             .finish()
@@ -160,6 +165,6 @@ impl ChannelRegistry {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &dyn Channel> {
-        self.channels.iter().map(std::convert::AsRef::as_ref)
+        self.channels.iter().map(AsRef::as_ref)
     }
 }

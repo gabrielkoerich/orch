@@ -16,6 +16,7 @@ use crate::backends::ExternalTask;
 use super::RouteResult;
 use super::config::RouterConfig;
 use super::weights::AgentWeights;
+use crate::engine::cooldown;
 
 /// Extract an explicit `agent:*` label from the task, if present and valid.
 ///
@@ -97,7 +98,7 @@ pub(super) fn route_via_round_robin_stateful(
     for offset in 0..agents.len() {
         let idx = (agent_idx + offset) % agents.len();
         let candidate = &agents[idx];
-        if crate::engine::cooldown::is_agent_in_cooldown(candidate) {
+        if cooldown::is_agent_in_cooldown(candidate) {
             continue;
         }
         // Also skip last-used agent when possible
@@ -156,7 +157,7 @@ pub(super) fn route_via_weighted_round_robin(
     // Filter out cooled agents (e.g. from silence detection short cooldown)
     let uncooled: Vec<String> = agents
         .iter()
-        .filter(|a| !crate::engine::cooldown::is_agent_in_cooldown(a))
+        .filter(|a| !cooldown::is_agent_in_cooldown(a))
         .cloned()
         .collect();
     let candidates = if uncooled.is_empty() {

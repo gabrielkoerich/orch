@@ -5,17 +5,29 @@
 //! run side by side without conflicts.
 
 use anyhow::Context;
+use std::env;
+use std::fs as std_fs;
+use std::path;
 use std::path::{Path, PathBuf};
+use std::process;
+use std::process::Command;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
+use tokio::fs;
+use tokio::runtime::Handle;
+use tokio::runtime::RuntimeFlavor;
+use tokio::task;
 
 /// The home directory name.
 const HOME_DIR: &str = ".orch";
 
 fn ensure_dir(path: &Path) -> anyhow::Result<()> {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(|| std::fs::create_dir_all(path))?;
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            task::block_in_place(|| std_fs::create_dir_all(path))?;
         }
-        _ => std::fs::create_dir_all(path)?,
+        _ => std_fs::create_dir_all(path)?,
     }
 
     Ok(())
@@ -26,7 +38,7 @@ fn ensure_dir(path: &Path) -> anyhow::Result<()> {
 /// Can be overridden via the `ORCH_HOME` environment variable. This is useful
 /// in tests and CI environments to avoid reading/writing the real state directory.
 pub fn orch_home() -> anyhow::Result<PathBuf> {
-    if let Ok(dir) = std::env::var("ORCH_HOME") {
+    if let Ok(dir) = env::var("ORCH_HOME") {
         let path = PathBuf::from(dir);
         ensure_dir(&path)?;
         return Ok(path);
@@ -100,15 +112,13 @@ pub async fn db_path() -> anyhow::Result<PathBuf> {
     let new_path = home.join("orch.db");
     let old_path = home.join("orchestrator.db");
     if old_path.exists() && !new_path.exists() {
-        tokio::fs::rename(&old_path, &new_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "migrating database from {} to {}",
-                    old_path.display(),
-                    new_path.display()
-                )
-            })?;
+        fs::rename(&old_path, &new_path).await.with_context(|| {
+            format!(
+                "migrating database from {} to {}",
+                old_path.display(),
+                new_path.display()
+            )
+        })?;
         tracing::info!("migrated database: legacy orchestrator.db -> orch.db");
     }
     Ok(new_path)
@@ -119,7 +129,7 @@ pub async fn db_path() -> anyhow::Result<PathBuf> {
 /// Written by the engine at startup, deleted on graceful shutdown.
 /// Format: "{pid}\t{version}" — the PID lets readers verify the owning process is alive.
 /// Used by service status and diagnostics to detect CLI/service drift.
-pub fn service_version_path() -> anyhow::Result<std::path::PathBuf> {
+pub fn service_version_path() -> anyhow::Result<PathBuf> {
     Ok(state_dir()?.join("service.version"))
 }
 
@@ -132,12 +142,9 @@ pub fn pid_is_orch_serve(pid: u32) -> bool {
 
 /// Find all PIDs of running `orch serve` processes.
 pub fn find_orch_serve_pids(exclude_self: bool) -> Vec<u32> {
-    let output = std::process::Command::new("pgrep")
-        .args(["-x", "orch"])
-        .output()
-        .ok();
+    let output = Command::new("pgrep").args(["-x", "orch"]).output().ok();
 
-    let self_pid = std::process::id();
+    let self_pid = process::id();
     match output {
         Some(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
             .lines()
@@ -150,7 +157,7 @@ pub fn find_orch_serve_pids(exclude_self: bool) -> Vec<u32> {
 }
 
 /// Send SIGTERM to other running `orch serve` processes, then SIGKILL stragglers.
-pub fn kill_other_orch_serve_processes(timeout: std::time::Duration) -> u32 {
+pub fn kill_other_orch_serve_processes(timeout: Duration) -> u32 {
     let others = find_orch_serve_pids(true);
     if others.is_empty() {
         return 0;
@@ -167,7 +174,7 @@ pub fn kill_other_orch_serve_processes(timeout: std::time::Duration) -> u32 {
         send_signal(*pid, "KILL");
     }
 
-    remaining = wait_for_orch_serve_exit(remaining, std::time::Duration::from_secs(1));
+    remaining = wait_for_orch_serve_exit(remaining, Duration::from_secs(1));
     for pid in &remaining {
         tracing::error!(pid, "stale orch serve survived SIGKILL");
     }
@@ -176,7 +183,7 @@ pub fn kill_other_orch_serve_processes(timeout: std::time::Duration) -> u32 {
 }
 
 fn process_args(pid: u32) -> Option<String> {
-    let output = std::process::Command::new("ps")
+    let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "args="])
         .output()
         .ok()?;
@@ -200,15 +207,15 @@ fn command_line_is_orch_serve(cmdline: &str) -> bool {
 }
 
 fn send_signal(pid: u32, signal: &str) {
-    let _ = std::process::Command::new("kill")
+    let _ = Command::new("kill")
         .args([format!("-{signal}"), pid.to_string()])
         .output();
 }
 
-fn wait_for_orch_serve_exit(mut pids: Vec<u32>, timeout: std::time::Duration) -> Vec<u32> {
-    let start = std::time::Instant::now();
+fn wait_for_orch_serve_exit(mut pids: Vec<u32>, timeout: Duration) -> Vec<u32> {
+    let start = Instant::now();
     while start.elapsed() < timeout && !pids.is_empty() {
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(200));
         pids.retain(|pid| pid_is_orch_serve(*pid));
     }
     pids
@@ -247,7 +254,7 @@ pub fn skills_dir() -> anyhow::Result<PathBuf> {
 /// Falls back to the flat `~/.orch/state/` if no repo is configured.
 pub fn repo_state_dir(repo: &str) -> anyhow::Result<PathBuf> {
     let state = state_dir()?;
-    let dir = state.join(repo.replace('/', std::path::MAIN_SEPARATOR_STR));
+    let dir = state.join(repo.replace('/', path::MAIN_SEPARATOR_STR));
     ensure_dir(&dir)?;
     Ok(dir)
 }
@@ -266,10 +273,10 @@ pub fn task_dir(repo: &str, task_id: &str) -> anyhow::Result<PathBuf> {
 pub async fn task_dir_async(repo: &str, task_id: &str) -> anyhow::Result<PathBuf> {
     let state = state_dir()?;
     let dir = state
-        .join(repo.replace('/', std::path::MAIN_SEPARATOR_STR))
+        .join(repo.replace('/', path::MAIN_SEPARATOR_STR))
         .join("tasks")
         .join(task_id);
-    tokio::fs::create_dir_all(&dir).await?;
+    fs::create_dir_all(&dir).await?;
     Ok(dir)
 }
 
@@ -293,12 +300,12 @@ pub async fn task_attempt_dir_async(
 ) -> anyhow::Result<PathBuf> {
     let state = state_dir()?;
     let dir = state
-        .join(repo.replace('/', std::path::MAIN_SEPARATOR_STR))
+        .join(repo.replace('/', path::MAIN_SEPARATOR_STR))
         .join("tasks")
         .join(task_id)
         .join("attempts")
         .join(attempt.to_string());
-    tokio::fs::create_dir_all(&dir).await?;
+    fs::create_dir_all(&dir).await?;
     Ok(dir)
 }
 
@@ -310,12 +317,12 @@ pub async fn task_attempt_dir_async(
 /// fast no-ops (a single `stat` syscall on an existing path).
 pub async fn init_dirs() -> anyhow::Result<()> {
     let home = orch_home()?;
-    tokio::fs::create_dir_all(&home).await?;
-    tokio::fs::create_dir_all(home.join("state")).await?;
-    tokio::fs::create_dir_all(home.join("worktrees")).await?;
-    tokio::fs::create_dir_all(home.join("contexts")).await?;
-    tokio::fs::create_dir_all(home.join("projects")).await?;
-    tokio::fs::create_dir_all(home.join("skills")).await?;
+    fs::create_dir_all(&home).await?;
+    fs::create_dir_all(home.join("state")).await?;
+    fs::create_dir_all(home.join("worktrees")).await?;
+    fs::create_dir_all(home.join("contexts")).await?;
+    fs::create_dir_all(home.join("projects")).await?;
+    fs::create_dir_all(home.join("skills")).await?;
     Ok(())
 }
 
@@ -331,19 +338,19 @@ mod tests {
     fn with_temp_orch_home() -> (TempDir, Option<String>) {
         let temp = TempDir::new().unwrap();
         let orch_home = temp.path().join(".orch");
-        std::fs::create_dir_all(&orch_home).unwrap();
-        let prev = std::env::var("ORCH_HOME").ok();
+        std_fs::create_dir_all(&orch_home).unwrap();
+        let prev = env::var("ORCH_HOME").ok();
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("ORCH_HOME", &orch_home) };
+        unsafe { env::set_var("ORCH_HOME", &orch_home) };
         (temp, prev)
     }
 
     fn restore_orch_home(prev: Option<String>) {
         match prev {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            Some(v) => unsafe { std::env::set_var("ORCH_HOME", v) },
+            Some(v) => unsafe { env::set_var("ORCH_HOME", v) },
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            None => unsafe { std::env::remove_var("ORCH_HOME") },
+            None => unsafe { env::remove_var("ORCH_HOME") },
         }
     }
 
@@ -351,9 +358,9 @@ mod tests {
     fn test_orch_home_env_override() {
         let temp = TempDir::new().unwrap();
         let custom_dir = temp.path().join(".orch-custom");
-        let prev = std::env::var("ORCH_HOME").ok();
+        let prev = env::var("ORCH_HOME").ok();
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("ORCH_HOME", &custom_dir) };
+        unsafe { env::set_var("ORCH_HOME", &custom_dir) };
 
         let result = orch_home().unwrap();
         assert_eq!(result, custom_dir);
@@ -421,7 +428,7 @@ mod tests {
 
     #[test]
     fn find_orch_serve_pids_excludes_self() {
-        let self_pid = std::process::id();
+        let self_pid = process::id();
         let pids = find_orch_serve_pids(true);
         assert!(!pids.contains(&self_pid));
     }

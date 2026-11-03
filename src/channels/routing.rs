@@ -91,7 +91,7 @@ impl ChannelRouter {
     pub fn resolve_project(&self, channel: &str, topic_or_channel_id: &str) -> Option<&str> {
         self.target_to_repo
             .get(&(channel.to_string(), topic_or_channel_id.to_string()))
-            .map(std::string::String::as_str)
+            .map(String::as_str)
     }
 
     /// Check if a target is the General channel.
@@ -113,7 +113,7 @@ impl ChannelRouter {
         self.repo_to_targets
             .get(repo)
             .and_then(|targets| targets.get(channel))
-            .map(std::string::String::as_str)
+            .map(String::as_str)
     }
 
     /// List all configured project repos.

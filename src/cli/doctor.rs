@@ -1,16 +1,28 @@
+use crate::backends::Status;
 use crate::backends::github::GitHubBackend;
 use crate::backends::{ExternalBackend, ExternalId};
+use crate::cli;
 use crate::config;
 use crate::engine::cleanup::{
     cleanup_orphaned_worktree, remove_worktree_and_branch, resolve_repo_root,
 };
+use crate::engine::runner::git_ops;
 use crate::github::http::GhHttp;
+use crate::home;
 use crate::store::{Task, TaskStatus, TaskStore};
 use crate::tmux::TmuxManager;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use tokio::process::Command;
+use tokio::time;
+
+use std::collections::HashMap;
+use std::fs;
+use std::io;
+use std::time::Duration;
 
 /// What kind of automatic repair can be applied to a finding.
 ///
@@ -67,7 +79,7 @@ impl Severity {
 /// When called outside a project directory (no `.orch.yml`), runs across all
 /// repos found in the store. When called inside a project, scopes to that repo.
 pub async fn run(full: bool, fix: bool, dry_run: bool) -> anyhow::Result<()> {
-    let store = Arc::new(crate::cli::init_store().await?);
+    let store = Arc::new(cli::init_store().await?);
     let gh = GhHttp::new()?;
     let tmux = TmuxManager::new();
 
@@ -85,7 +97,7 @@ pub async fn run(full: bool, fix: bool, dry_run: bool) -> anyhow::Result<()> {
 
     // Spinner: show progress on stderr while checks run (erase with \r on done).
     let spinner_running = Arc::new(AtomicBool::new(true));
-    let spinner_flag = std::sync::Arc::clone(&spinner_running);
+    let spinner_flag = Arc::clone(&spinner_running);
     let spinner_task = tokio::spawn(async move {
         let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let mut i = 0usize;
@@ -94,12 +106,12 @@ pub async fn run(full: bool, fix: bool, dry_run: bool) -> anyhow::Result<()> {
                 "\r{} Running orch service doctor…",
                 frames[i % frames.len()]
             );
-            let _ = std::io::stderr().flush();
-            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            let _ = io::stderr().flush();
+            time::sleep(Duration::from_millis(80)).await;
             i += 1;
         }
         eprint!("\r");
-        let _ = std::io::stderr().flush();
+        let _ = io::stderr().flush();
     });
 
     let result = run_checks(full, fix, dry_run, &repos, &store, &gh, &tmux).await;
@@ -238,10 +250,8 @@ async fn run_checks(
                 gh.list_open_pulls(repo).await.unwrap_or_default();
 
             // Build lookup maps: pr_number -> pr, head_ref -> pr
-            let mut pr_by_number: std::collections::HashMap<u64, serde_json::Value> =
-                std::collections::HashMap::new();
-            let mut pr_by_head: std::collections::HashMap<String, serde_json::Value> =
-                std::collections::HashMap::new();
+            let mut pr_by_number: HashMap<u64, serde_json::Value> = HashMap::new();
+            let mut pr_by_head: HashMap<String, serde_json::Value> = HashMap::new();
             for pr in &open_prs {
                 if let Some(n) = pr.get("number").and_then(serde_json::Value::as_u64) {
                     pr_by_number.insert(n, pr.clone());
@@ -334,7 +344,7 @@ async fn run_checks(
                 let head = pr
                     .pointer("/head/ref")
                     .and_then(|v| v.as_str())
-                    .map(std::string::ToString::to_string);
+                    .map(ToString::to_string);
                 let mut owned = false;
                 if let Some(n) = pr_num {
                     for t in &active_tasks {
@@ -430,7 +440,7 @@ async fn run_checks(
 async fn check_done_no_merged_pr(
     task: &Task,
     gh: &GhHttp,
-    pr_states: &std::collections::HashMap<u64, (bool, String)>,
+    pr_states: &HashMap<u64, (bool, String)>,
     findings: &mut Vec<Finding>,
     repo: &str,
 ) {
@@ -547,7 +557,7 @@ async fn describe_unrecovered_work(task: &Task) -> String {
     }
 
     // Check for dirty files
-    let has_dirty = tokio::process::Command::new("git")
+    let has_dirty = Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(wt)
         .output()
@@ -559,7 +569,7 @@ async fn describe_unrecovered_work(task: &Task) -> String {
     }
 
     // Check for unpushed commits
-    let has_unpushed = tokio::process::Command::new("git")
+    let has_unpushed = Command::new("git")
         .args(["log", &format!("origin/{}..HEAD", task.branch), "--oneline"])
         .current_dir(wt)
         .output()
@@ -571,7 +581,7 @@ async fn describe_unrecovered_work(task: &Task) -> String {
     }
 
     // Branch pushed, no PR
-    let branch_on_remote = crate::engine::runner::git_ops::git()
+    let branch_on_remote = git_ops::git()
         .await
         .args(["ls-remote", "--heads", "origin", &task.branch])
         .current_dir(wt)
@@ -595,7 +605,7 @@ async fn check_dirty_worktree(task: &Task, findings: &mut Vec<Finding>) {
     if !wt.exists() || !wt.join(".git").exists() {
         return;
     }
-    let output = tokio::process::Command::new("git")
+    let output = Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(wt)
         .output()
@@ -624,7 +634,7 @@ async fn check_unpushed_commits(task: &Task, findings: &mut Vec<Finding>) {
     if !wt.exists() || !wt.join(".git").exists() {
         return;
     }
-    let output = tokio::process::Command::new("git")
+    let output = Command::new("git")
         .args(["log", &format!("origin/{}..HEAD", task.branch), "--oneline"])
         .current_dir(wt)
         .output()
@@ -652,7 +662,7 @@ async fn check_unpushed_commits(task: &Task, findings: &mut Vec<Finding>) {
 /// Check 4: Closed GitHub issue with non-done SQLite status (and vice versa).
 fn check_issue_status_mismatch(
     task: &Task,
-    issue_states: &std::collections::HashMap<String, (String, Vec<String>)>,
+    issue_states: &HashMap<String, (String, Vec<String>)>,
     findings: &mut Vec<Finding>,
 ) {
     let ext_id = match &task.external_id {
@@ -691,7 +701,7 @@ fn check_issue_status_mismatch(
 /// Check 5: Label/status mismatch.
 fn check_label_mismatch(
     task: &Task,
-    issue_states: &std::collections::HashMap<String, (String, Vec<String>)>,
+    issue_states: &HashMap<String, (String, Vec<String>)>,
     findings: &mut Vec<Finding>,
 ) {
     let ext_id = match &task.external_id {
@@ -754,7 +764,7 @@ async fn check_stale_in_progress(
 
 /// Check 7: Orphaned worktrees.
 async fn check_orphaned_worktrees(all_tasks: &[Task], findings: &mut Vec<Finding>) {
-    let Ok(worktrees_dir) = crate::home::worktrees_dir() else {
+    let Ok(worktrees_dir) = home::worktrees_dir() else {
         return;
     };
     check_orphaned_worktrees_in(&worktrees_dir, all_tasks, findings).await;
@@ -765,12 +775,12 @@ async fn check_orphaned_worktrees_in(
     all_tasks: &[Task],
     findings: &mut Vec<Finding>,
 ) {
-    let Ok(project_dirs) = std::fs::read_dir(worktrees_dir) else {
+    let Ok(project_dirs) = fs::read_dir(worktrees_dir) else {
         return;
     };
 
     // Build a HashMap for O(1) worktree-path → task lookups instead of O(T) linear scan.
-    let task_by_worktree: std::collections::HashMap<&str, &Task> = all_tasks
+    let task_by_worktree: HashMap<&str, &Task> = all_tasks
         .iter()
         .filter(|t| !t.worktree.is_empty())
         .map(|t| (t.worktree.as_str(), t))
@@ -787,7 +797,7 @@ async fn check_orphaned_worktrees_in(
         if !project_entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
-        let Ok(branch_dirs) = std::fs::read_dir(project_entry.path()) else {
+        let Ok(branch_dirs) = fs::read_dir(project_entry.path()) else {
             continue;
         };
         for branch_entry in branch_dirs {
@@ -846,7 +856,7 @@ async fn check_orphaned_worktrees_in(
 /// Check 8: PR merged but task not done (uses pre-fetched pr_states cache).
 fn check_pr_merged_not_done(
     task: &Task,
-    pr_states: &std::collections::HashMap<u64, (bool, String)>,
+    pr_states: &HashMap<u64, (bool, String)>,
     findings: &mut Vec<Finding>,
 ) {
     let Some(pr_num) = task.pr_number.and_then(|n| u64::try_from(n).ok()) else {
@@ -897,7 +907,7 @@ async fn worktree_has_work(wt: &Path, branch: &str) -> bool {
     if !wt.join(".git").exists() {
         return false;
     }
-    let has_dirty = tokio::process::Command::new("git")
+    let has_dirty = Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(wt)
         .output()
@@ -907,7 +917,7 @@ async fn worktree_has_work(wt: &Path, branch: &str) -> bool {
         return true;
     }
     if !branch.is_empty() {
-        let has_unpushed = tokio::process::Command::new("git")
+        let has_unpushed = Command::new("git")
             .args(["log", &format!("origin/{branch}..HEAD"), "--oneline"])
             .current_dir(wt)
             .output()
@@ -995,7 +1005,7 @@ async fn apply_fixes(
                 }
 
                 if let Some(ref ext_id) = task.external_id {
-                    let status = crate::backends::Status::Done;
+                    let status = Status::Done;
                     if let Err(e) = backend
                         .update_status(&ExternalId(ext_id.clone()), status)
                         .await
@@ -1060,7 +1070,7 @@ async fn apply_fixes(
                 let task = store.get(*store_id).await?;
                 if let Some(ref ext_id) = task.external_id {
                     let _ = backend
-                        .update_status(&ExternalId(ext_id.clone()), crate::backends::Status::Routed)
+                        .update_status(&ExternalId(ext_id.clone()), Status::Routed)
                         .await;
                 }
                 println!("  fixed #{}: reset to routed", f.task_id);
@@ -1163,7 +1173,7 @@ async fn apply_fixes(
                 // Close GitHub issue + sync labels
                 if let Some(ref ext_id) = task.external_id {
                     let _ = backend
-                        .update_status(&ExternalId(ext_id.clone()), crate::backends::Status::Done)
+                        .update_status(&ExternalId(ext_id.clone()), Status::Done)
                         .await;
                 }
 
@@ -1217,10 +1227,7 @@ async fn apply_fixes(
                 let task = store.get(*store_id).await?;
                 if let Some(ref ext_id) = task.external_id {
                     let _ = backend
-                        .update_status(
-                            &ExternalId(ext_id.clone()),
-                            crate::backends::Status::NeedsReview,
-                        )
+                        .update_status(&ExternalId(ext_id.clone()), Status::NeedsReview)
                         .await;
                 }
                 println!(
@@ -1249,17 +1256,17 @@ fn task_label(task: &Task) -> String {
     }
 }
 
-fn task_status_to_backend_status(status: TaskStatus) -> crate::backends::Status {
+fn task_status_to_backend_status(status: TaskStatus) -> Status {
     match status {
-        TaskStatus::New => crate::backends::Status::New,
-        TaskStatus::Routed => crate::backends::Status::Routed,
-        TaskStatus::InProgress => crate::backends::Status::InProgress,
-        TaskStatus::Done => crate::backends::Status::Done,
-        TaskStatus::Blocked => crate::backends::Status::Blocked,
-        TaskStatus::InReview => crate::backends::Status::InReview,
-        TaskStatus::Approved => crate::backends::Status::Approved,
-        TaskStatus::NeedsReview => crate::backends::Status::NeedsReview,
-        TaskStatus::Waiting => crate::backends::Status::Waiting,
+        TaskStatus::New => Status::New,
+        TaskStatus::Routed => Status::Routed,
+        TaskStatus::InProgress => Status::InProgress,
+        TaskStatus::Done => Status::Done,
+        TaskStatus::Blocked => Status::Blocked,
+        TaskStatus::InReview => Status::InReview,
+        TaskStatus::Approved => Status::Approved,
+        TaskStatus::NeedsReview => Status::NeedsReview,
+        TaskStatus::Waiting => Status::Waiting,
     }
 }
 
@@ -1306,6 +1313,8 @@ fn collect_valid_external_issue_numbers<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::collect_valid_external_issue_numbers;
     use crate::store::{Task, TaskStatus};
 
@@ -1379,7 +1388,7 @@ mod tests {
     async fn done_task_worktree_is_not_reported_as_orphaned() {
         let base = tempfile::tempdir().unwrap();
         let wt = base.path().join("proj").join("branch-1");
-        std::fs::create_dir_all(&wt).unwrap();
+        fs::create_dir_all(&wt).unwrap();
 
         let mut done = task(1, Some("1"), "github");
         done.status = TaskStatus::Done;
@@ -1418,12 +1427,14 @@ mod tests {
 
 #[cfg(test)]
 mod done_is_terminal_tests {
+    use std::process;
+
     use super::*;
     use crate::backends::test_helpers::NoopBackend;
     use crate::store::{NewTask, TaskStore};
 
     fn git(dir: &Path, args: &[&str]) {
-        let ok = std::process::Command::new("git")
+        let ok = process::Command::new("git")
             .args(args)
             .current_dir(dir)
             .env("GIT_AUTHOR_NAME", "t")
@@ -1444,11 +1455,11 @@ mod done_is_terminal_tests {
         let dir = tempfile::tempdir().unwrap();
         let wt = dir.path();
         git(wt, &["init", "-b", "main"]);
-        std::fs::write(wt.join("a.txt"), "a").unwrap();
+        fs::write(wt.join("a.txt"), "a").unwrap();
         git(wt, &["add", "-A"]);
         git(wt, &["commit", "-m", "init"]);
         // Uncommitted change — the state that used to trigger commit + push + needs_review.
-        std::fs::write(wt.join("b.txt"), "b").unwrap();
+        fs::write(wt.join("b.txt"), "b").unwrap();
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let store_id = store

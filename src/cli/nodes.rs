@@ -1,8 +1,11 @@
+use std::iter;
+
+use crate::cluster;
 use crate::cluster::{discovery, local};
 
 /// The cluster's members as this machine's service sees them
 pub async fn run() -> anyhow::Result<()> {
-    if !crate::cluster::enabled() {
+    if !cluster::enabled() {
         println!("orch runs on this machine only: the config has no cluster section");
         return Ok(());
     }
@@ -17,7 +20,7 @@ pub async fn run() -> anyhow::Result<()> {
         tailnet
             .as_ref()
             .and_then(|t| {
-                std::iter::once(&t.me)
+                iter::once(&t.me)
                     .chain(&t.peers)
                     .find(|h| h.ip == ip)
                     .map(|h| (h.name.clone(), h.online))

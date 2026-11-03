@@ -1,11 +1,17 @@
+use std::fs;
+use std::path::PathBuf;
+
+use crate::cli;
 use crate::config;
+use crate::store::CostSummary;
+use crate::store::MetricsSummary;
 
 /// Show task metrics and statistics, per-project by default.
 ///
 /// `since_hours` controls the time window (default 24; pass 168 for 7 days, etc.).
 pub async fn stats(all: bool, since_hours: u32) -> anyhow::Result<()> {
-    let store = crate::cli::init_store().await?;
-    let window_label = crate::cli::hours_to_label(since_hours);
+    let store = cli::init_store().await?;
+    let window_label = cli::hours_to_label(since_hours);
 
     if all {
         let summary = store.get_metrics_summary(since_hours).await?;
@@ -36,8 +42,8 @@ pub async fn stats(all: bool, since_hours: u32) -> anyhow::Result<()> {
 fn print_summary_table(
     title: &str,
     window_label: &str,
-    summary: &crate::store::MetricsSummary,
-    cost: Option<&crate::store::CostSummary>,
+    summary: &MetricsSummary,
+    cost: Option<&CostSummary>,
 ) {
     println!("── {title} ──────────────────────────────────");
 
@@ -118,9 +124,9 @@ fn get_configured_repos() -> Vec<String> {
     // Try projects from global config
     if let Ok(paths) = config::get_project_paths() {
         for path_str in &paths {
-            let candidate = std::path::PathBuf::from(path_str).join(".orch.yml");
+            let candidate = PathBuf::from(path_str).join(".orch.yml");
             if candidate.exists()
-                && let Ok(content) = std::fs::read_to_string(&candidate)
+                && let Ok(content) = fs::read_to_string(&candidate)
                 && let Ok(val) = serde_norway::from_str::<serde_norway::Value>(&content)
                 && let Some(repo) = val
                     .get("gh")

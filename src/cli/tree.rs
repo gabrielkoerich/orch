@@ -2,7 +2,9 @@
 
 use crate::backends::ExternalTask;
 use crate::engine::tasks::Task;
+use crate::store;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 /// A node in the task tree.
 #[derive(Debug, Clone)]
@@ -39,7 +41,7 @@ impl TreeNode {
     }
 
     /// Create a tree node for an internal task (from store).
-    pub fn from_internal(task: &crate::store::Task) -> Self {
+    pub fn from_internal(task: &store::Task) -> Self {
         Self {
             id: task
                 .external_id
@@ -169,8 +171,6 @@ pub fn render_tree(root: &TreeNode) -> String {
 
 /// Render a tree node and its children recursively.
 fn render_node(node: &TreeNode, output: &mut String, prefix: &str, is_last: bool, is_root: bool) {
-    use std::fmt::Write as _;
-
     if is_root {
         // Root node format: #30 [blocked] Implement auth system
         let _ = writeln!(
@@ -259,10 +259,7 @@ mod tests {
             title: title.to_string(),
             body: String::new(),
             state: "open".to_string(),
-            labels: labels
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect(),
+            labels: labels.iter().map(ToString::to_string).collect(),
             author: "test".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),

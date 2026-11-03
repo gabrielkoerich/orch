@@ -1,10 +1,22 @@
 //! Task event bus — broadcast channel for status transitions.
 
+use std::borrow::Cow;
+use std::env;
+use std::fs as std_fs;
+use std::net;
+use std::path::PathBuf;
+use std::process;
+
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::handshake::server::Request;
+
+use crate::home;
+
+use tokio::fs;
+use tokio_tungstenite::tungstenite::Message;
 
 /// Parsed query-parameter filters for a websocket connection.
 #[derive(Clone, Debug, Default)]
@@ -28,7 +40,7 @@ impl EventFilter {
             let Some((key, value)) = pair.split_once('=') else {
                 continue;
             };
-            let decoded = urlencoding::decode(value).unwrap_or(std::borrow::Cow::Borrowed(value));
+            let decoded = urlencoding::decode(value).unwrap_or(Cow::Borrowed(value));
             match key {
                 "task_id" => task_id = Some(decoded.into_owned()),
                 "repo" => repo = Some(decoded.into_owned()),
@@ -129,19 +141,19 @@ impl EventBus {
         // Write port file without blocking the runtime thread.
         let port_path = ws_port_path()?;
         if let Some(parent) = port_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            fs::create_dir_all(parent).await?;
         }
-        tokio::fs::write(&port_path, port.to_string()).await?;
+        fs::write(&port_path, port.to_string()).await?;
 
         // Write service version file so service status can detect CLI/service drift.
         // Format: "{pid}\t{version}" so readers can verify the owning process is alive.
-        if let Ok(path) = crate::home::service_version_path() {
+        if let Ok(path) = home::service_version_path() {
             if let Some(parent) = path.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
+                let _ = fs::create_dir_all(parent).await;
             }
-            let pid = std::process::id();
+            let pid = process::id();
             let content = format!("{}\t{}", pid, env!("ORCH_VERSION"));
-            let _ = tokio::fs::write(path, content).await;
+            let _ = fs::write(path, content).await;
         }
 
         let tx = self.tx.clone();
@@ -177,7 +189,7 @@ impl EventBus {
                                                 }
                                                 let json = serde_json::to_string(&e)
                                                     .unwrap_or_default();
-                                                let msg = tokio_tungstenite::tungstenite::Message::Text(json);
+                                                let msg = Message::Text(json);
                                                 if write.send(msg).await.is_err() {
                                                     break;
                                                 }
@@ -195,7 +207,7 @@ impl EventBus {
                                                     missed: n,
                                                 };
                                                 if let Ok(json) = serde_json::to_string(&ctrl) {
-                                                    let msg = tokio_tungstenite::tungstenite::Message::Text(json);
+                                                    let msg = Message::Text(json);
                                                     if write.send(msg).await.is_err() {
                                                         break;
                                                     }
@@ -229,8 +241,8 @@ impl EventBus {
 /// Find an available port in the ephemeral range (49152-65535).
 /// Starts from a deterministic offset based on hostname hash, then increments.
 /// This gives stable first-attempt ports across restarts on the same machine.
-pub fn select_available_listener() -> anyhow::Result<(std::net::TcpListener, u16)> {
-    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "orch".to_string());
+pub fn select_available_listener() -> anyhow::Result<(net::TcpListener, u16)> {
+    let hostname = env::var("HOSTNAME").unwrap_or_else(|_| "orch".to_string());
     let hash = hostname
         .bytes()
         .fold(0u32, |acc, b| acc.wrapping_add(u32::from(b)));
@@ -242,7 +254,7 @@ pub fn select_available_listener() -> anyhow::Result<(std::net::TcpListener, u16
         if port < 49152 {
             continue;
         }
-        if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+        if let Ok(listener) = net::TcpListener::bind(("127.0.0.1", port)) {
             return Ok((listener, port));
         }
     }
@@ -252,33 +264,37 @@ pub fn select_available_listener() -> anyhow::Result<(std::net::TcpListener, u16
 /// Remove the ws.port file on shutdown.
 pub async fn cleanup_port_file() {
     if let Ok(path) = ws_port_path() {
-        let _ = tokio::fs::remove_file(path).await;
+        let _ = fs::remove_file(path).await;
     }
 }
 
 /// Remove the service.version file on shutdown — only if this process owns it.
 pub fn cleanup_version_file() {
-    if let Ok(path) = crate::home::service_version_path() {
-        let owned = std::fs::read_to_string(&path)
+    if let Ok(path) = home::service_version_path() {
+        let owned = std_fs::read_to_string(&path)
             .ok()
             .and_then(|s| s.split('\t').next()?.parse::<u32>().ok())
-            .is_none_or(|pid| pid == std::process::id()); // legacy plain-version files: assume ownership
+            .is_none_or(|pid| pid == process::id()); // legacy plain-version files: assume ownership
         if owned {
-            let _ = std::fs::remove_file(path);
+            let _ = std_fs::remove_file(path);
         }
     }
 }
 
-fn ws_port_path() -> anyhow::Result<std::path::PathBuf> {
+fn ws_port_path() -> anyhow::Result<PathBuf> {
     if cfg!(test) {
-        Ok(std::env::temp_dir().join("orch-test-state").join("ws.port"))
+        Ok(env::temp_dir().join("orch-test-state").join("ws.port"))
     } else {
-        Ok(crate::home::state_dir()?.join("ws.port"))
+        Ok(home::state_dir()?.join("ws.port"))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use tokio::time;
+
     use super::*;
 
     #[test]
@@ -360,7 +376,7 @@ mod tests {
         let (listener, port) = select_available_listener().unwrap();
         assert!(port >= 49152);
         // Verify the port is reserved while the listener is alive.
-        let second_bind = std::net::TcpListener::bind(("127.0.0.1", port));
+        let second_bind = net::TcpListener::bind(("127.0.0.1", port));
         assert!(second_bind.is_err());
         drop(listener);
     }
@@ -444,7 +460,7 @@ mod tests {
         let (_write, mut read) = ws.split();
 
         // Give the server a moment to register the client
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        time::sleep(Duration::from_millis(50)).await;
 
         // Publish an event
         let mut event_with_agent = make_event("test-1", "owner/repo");
@@ -452,16 +468,13 @@ mod tests {
         bus.publish(event_with_agent);
 
         // Read from websocket
-        let msg = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            StreamExt::next(&mut read),
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+        let msg = time::timeout(Duration::from_secs(2), StreamExt::next(&mut read))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
 
-        if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+        if let Message::Text(text) = msg {
             let received: TaskEvent = serde_json::from_str(&text).unwrap();
             assert_eq!(received.task_id, "test-1");
             assert_eq!(received.new_status, "routed");
@@ -484,23 +497,20 @@ mod tests {
         let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         let (_write, mut read) = ws.split();
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        time::sleep(Duration::from_millis(50)).await;
 
         // Publish event for task 42 (should arrive)
         bus.publish(make_event("42", "owner/repo"));
         // Publish event for task 99 (should be filtered out)
         bus.publish(make_event("99", "owner/repo"));
 
-        let msg = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            StreamExt::next(&mut read),
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+        let msg = time::timeout(Duration::from_secs(2), StreamExt::next(&mut read))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
 
-        if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+        if let Message::Text(text) = msg {
             let received: TaskEvent = serde_json::from_str(&text).unwrap();
             assert_eq!(received.task_id, "42");
         } else {
@@ -508,11 +518,7 @@ mod tests {
         }
 
         // No more messages should arrive — timeout confirms the filter works
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(300),
-            StreamExt::next(&mut read),
-        )
-        .await;
+        let result = time::timeout(Duration::from_millis(300), StreamExt::next(&mut read)).await;
         assert!(result.is_err(), "expected no more messages (filtered)");
 
         cleanup_port_file().await;
@@ -531,23 +537,20 @@ mod tests {
         let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         let (_write, mut read) = ws.split();
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        time::sleep(Duration::from_millis(50)).await;
 
         // Matching event
         bus.publish(make_event("1", "gabrielkoerich/orch"));
         // Non-matching event
         bus.publish(make_event("2", "other/repo"));
 
-        let msg = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            StreamExt::next(&mut read),
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+        let msg = time::timeout(Duration::from_secs(2), StreamExt::next(&mut read))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
 
-        if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+        if let Message::Text(text) = msg {
             let received: TaskEvent = serde_json::from_str(&text).unwrap();
             assert_eq!(received.task_id, "1");
             assert_eq!(received.repo, "gabrielkoerich/orch");
@@ -556,11 +559,7 @@ mod tests {
         }
 
         // No more messages — non-matching event was filtered server-side
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(300),
-            StreamExt::next(&mut read),
-        )
-        .await;
+        let result = time::timeout(Duration::from_millis(300), StreamExt::next(&mut read)).await;
         assert!(result.is_err(), "expected no more messages (filtered)");
 
         cleanup_port_file().await;
@@ -576,7 +575,7 @@ mod tests {
         let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         let (_write, mut read) = ws.split();
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        time::sleep(Duration::from_millis(50)).await;
 
         bus.publish(make_event("1", "a/b"));
         bus.publish(make_event("2", "c/d"));
@@ -584,16 +583,13 @@ mod tests {
 
         let mut received_ids = Vec::new();
         for _ in 0..3 {
-            let msg = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                StreamExt::next(&mut read),
-            )
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            let msg = time::timeout(Duration::from_secs(2), StreamExt::next(&mut read))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
 
-            if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+            if let Message::Text(text) = msg {
                 let event: TaskEvent = serde_json::from_str(&text).unwrap();
                 received_ids.push(event.task_id);
             }
@@ -622,7 +618,7 @@ mod tests {
         let (_write, mut read) = ws.split();
 
         // Give the server a moment to register the client.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        time::sleep(Duration::from_millis(50)).await;
 
         // Flood the bus — many more events than the channel capacity (1).
         // This guarantees the server-side rx will lag before the client reads.
@@ -633,15 +629,11 @@ mod tests {
         // Drain messages until we find a ControlMessage with kind=="lagged".
         let mut got_lag = false;
         for _ in 0..30 {
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                StreamExt::next(&mut read),
-            )
-            .await;
+            let result = time::timeout(Duration::from_secs(2), StreamExt::next(&mut read)).await;
 
             let Ok(Some(Ok(msg))) = result else { break };
 
-            if let tokio_tungstenite::tungstenite::Message::Text(text) = msg
+            if let Message::Text(text) = msg
                 && let Ok(ctrl) = serde_json::from_str::<ControlMessage>(&text)
                 && ctrl.kind == "lagged"
             {

@@ -2,6 +2,7 @@ use super::{Context, TaskStore};
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use sqlx::sqlite::SqliteRow;
 
 /// Explicit column list for `SELECT` queries on the `control_messages` table.
 ///
@@ -226,10 +227,7 @@ impl TaskStore {
             .map_err(Into::into)
     }
 
-    fn row_to_control_message(
-        row: &sqlx::sqlite::SqliteRow,
-    ) -> Result<ControlMessage, sqlx::Error> {
-        use sqlx::Row;
+    fn row_to_control_message(row: &SqliteRow) -> Result<ControlMessage, sqlx::Error> {
         Ok(ControlMessage {
             id: row.try_get("id")?,
             session_id: row.try_get("session_id")?,

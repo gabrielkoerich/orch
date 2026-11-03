@@ -216,8 +216,13 @@ fn parse_timestamp(s: &str) -> anyhow::Result<DateTime<Utc>> {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
+    use chrono::Datelike;
+    use chrono::TimeZone;
     use chrono::Timelike;
+    use cron::Schedule;
 
     #[test]
     fn every_minute_matches_now() {
@@ -360,10 +365,6 @@ mod tests {
 
     #[test]
     fn dow_range_zero_to_five_fires_on_sunday() {
-        use chrono::{Datelike, TimeZone};
-        use cron::Schedule;
-        use std::str::FromStr;
-
         // Normalize and build a 7-field expression, then check that a known Sunday
         // appears in the schedule's upcoming occurrences.
         let normalized = normalize_dow("0 9 * * 0-5");

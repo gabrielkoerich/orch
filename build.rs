@@ -1,9 +1,12 @@
+use std::env;
+use std::process::Command;
+
 fn main() {
     // Version priority:
     // 1. ORCH_BUILD_VERSION env var (set by CI to the computed release version, e.g. "v0.5.7")
     // 2. git describe --tags --abbrev=0 (last tag, for local dev builds when tags exist)
     // 3. CARGO_PKG_VERSION from Cargo.toml (hardcoded fallback)
-    let version = std::env::var("ORCH_BUILD_VERSION")
+    let version = env::var("ORCH_BUILD_VERSION")
         .map(|v| v.trim_start_matches('v').to_string())
         .ok()
         .filter(|s| !s.is_empty())
@@ -15,7 +18,7 @@ fn main() {
 }
 
 fn git_tag_version() -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = Command::new("git")
         .args(["describe", "--tags", "--abbrev=0"])
         .output()
         .ok()?;

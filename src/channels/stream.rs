@@ -13,6 +13,8 @@ use crate::channels::transport::{Transport, parse_conversation_key};
 use crate::channels::{ChannelRegistry, OutgoingMessage, html_escape, split_utf8};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::broadcast::error::RecvError;
+use tokio::time;
 use tokio::time::{Duration, Instant};
 
 const TELEGRAM_MAX_BYTES: usize = 4096;
@@ -187,14 +189,14 @@ pub async fn fanout_output(
                     break;
                 }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+            Err(RecvError::Lagged(n)) => {
                 tracing::warn!(
                     task_id,
                     missed = n,
                     "fanout: output receiver lagged, some output dropped"
                 );
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+            Err(RecvError::Closed) => {
                 tracing::debug!(task_id, "fanout: output broadcast closed");
                 break;
             }
@@ -232,7 +234,7 @@ pub async fn fanout_output(
                 } else {
                     Duration::from_millis(50)
                 };
-                tokio::time::sleep(sleep_dur).await;
+                time::sleep(sleep_dur).await;
 
                 // After waiting, attempt to flush any buffers whose rate limit expired
                 if let Some(_binding) = transport.get_binding(&repo, &task_id).await {
@@ -277,7 +279,17 @@ pub async fn fanout_output(
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::mpsc;
+    use tokio::sync::mpsc::Receiver;
+    use tokio::sync::mpsc::Sender;
+
+    use std::time as std_time;
+
     use super::*;
+    use crate::channels::Channel;
+    use crate::channels::IncomingMessage;
+    use crate::channels::OutputChunk;
+    use crate::channels::transport::Transport;
 
     #[test]
     fn split_short_content_unchanged() {
@@ -335,7 +347,7 @@ mod tests {
         assert_eq!(parts.join(""), content);
         for p in &parts {
             // Each part must be valid UTF-8 (Rust strings always are, but slice must be sound)
-            assert!(std::str::from_utf8(p.as_bytes()).is_ok());
+            assert!(str::from_utf8(p.as_bytes()).is_ok());
         }
     }
 
@@ -349,7 +361,7 @@ mod tests {
         let parts = split_for_platform(&content, "discord");
         assert_eq!(parts.join(""), content);
         for p in &parts {
-            assert!(std::str::from_utf8(p.as_bytes()).is_ok());
+            assert!(str::from_utf8(p.as_bytes()).is_ok());
         }
     }
 
@@ -446,24 +458,22 @@ mod tests {
     // fanout_output sends OutgoingMessage bodies to registered channels.
     struct TestChannel {
         name: String,
-        tx: tokio::sync::mpsc::Sender<crate::channels::OutgoingMessage>,
+        tx: Sender<OutgoingMessage>,
     }
 
     #[async_trait::async_trait]
-    impl crate::channels::Channel for TestChannel {
+    impl Channel for TestChannel {
         fn name(&self) -> &str {
             &self.name
         }
 
-        async fn start(
-            &self,
-        ) -> anyhow::Result<tokio::sync::mpsc::Receiver<crate::channels::IncomingMessage>> {
+        async fn start(&self) -> anyhow::Result<Receiver<IncomingMessage>> {
             // Not used in this test — return a dummy receiver.
-            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            let (_tx, rx) = mpsc::channel(1);
             Ok(rx)
         }
 
-        async fn send(&self, msg: &crate::channels::OutgoingMessage) -> anyhow::Result<()> {
+        async fn send(&self, msg: &OutgoingMessage) -> anyhow::Result<()> {
             // Forward the message to the test harness channel so assertions can observe it.
             let _ = self.tx.send(msg.clone()).await;
             Ok(())
@@ -476,21 +486,19 @@ mod tests {
 
     #[tokio::test]
     async fn fanout_sends_to_registered_channel() {
-        use crate::channels::transport::Transport;
-
-        let transport = std::sync::Arc::new(Transport::new());
+        let transport = Arc::new(Transport::new());
 
         // Prepare a test channel that will collect OutgoingMessage values
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::channels::OutgoingMessage>(16);
+        let (tx, mut rx) = mpsc::channel::<OutgoingMessage>(16);
         let test_ch = TestChannel {
             name: "telegram".to_string(),
             tx,
         };
 
         // Register channel in a ChannelRegistry
-        let mut registry = crate::channels::ChannelRegistry::new();
+        let mut registry = ChannelRegistry::new();
         registry.register(Box::new(test_ch));
-        let registry = std::sync::Arc::new(registry);
+        let registry = Arc::new(registry);
 
         // Bind a task to the channel:thread so fanout knows where to send
         let task_id = "fanout-test-task";
@@ -507,8 +515,8 @@ mod tests {
             .await;
 
         // Spawn the fanout_output task
-        let transport_clone = std::sync::Arc::clone(&transport);
-        let registry_clone = std::sync::Arc::clone(&registry);
+        let transport_clone = Arc::clone(&transport);
+        let registry_clone = Arc::clone(&registry);
         let task_id_str = task_id.to_string();
         let repo_str = repo.to_string();
         tokio::spawn(async move {
@@ -516,14 +524,14 @@ mod tests {
         });
 
         // Give fanout time to subscribe to the broadcast
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        time::sleep(std_time::Duration::from_millis(50)).await;
 
         // Push some output into the transport; the fanout should forward it
         transport
             .push_output(
                 repo,
                 task_id,
-                crate::channels::OutputChunk {
+                OutputChunk {
                     content: "hello from agent".to_string(),
                     is_final: false,
                 },
@@ -535,7 +543,7 @@ mod tests {
             .push_output(
                 repo,
                 task_id,
-                crate::channels::OutputChunk {
+                OutputChunk {
                     content: String::new(),
                     is_final: true,
                 },
@@ -545,11 +553,10 @@ mod tests {
         // Expect at least one outgoing message to be sent to the test channel
         let mut got = false;
         for _ in 0..10 {
-            if let Ok(Some(msg)) =
-                tokio::time::timeout(std::time::Duration::from_millis(200), async {
-                    rx.recv().await
-                })
-                .await
+            if let Ok(Some(msg)) = time::timeout(std_time::Duration::from_millis(200), async {
+                rx.recv().await
+            })
+            .await
                 && msg.body.contains("hello from agent")
             {
                 got = true;
@@ -568,17 +575,17 @@ mod tests {
     /// delivers the reply to the correct forum topic / thread.
     #[tokio::test]
     async fn fanout_forwards_topic_id() {
-        let transport = std::sync::Arc::new(Transport::new());
+        let transport = Arc::new(Transport::new());
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::channels::OutgoingMessage>(16);
+        let (tx, mut rx) = mpsc::channel::<OutgoingMessage>(16);
         let test_ch = TestChannel {
             name: "telegram".to_string(),
             tx,
         };
 
-        let mut registry = crate::channels::ChannelRegistry::new();
+        let mut registry = ChannelRegistry::new();
         registry.register(Box::new(test_ch));
-        let registry = std::sync::Arc::new(registry);
+        let registry = Arc::new(registry);
 
         let task_id = "topic-forward-task";
         let repo = "owner/test-repo";
@@ -594,21 +601,21 @@ mod tests {
             )
             .await;
 
-        let transport_clone = std::sync::Arc::clone(&transport);
-        let registry_clone = std::sync::Arc::clone(&registry);
+        let transport_clone = Arc::clone(&transport);
+        let registry_clone = Arc::clone(&registry);
         let task_id_str = task_id.to_string();
         let repo_str = repo.to_string();
         tokio::spawn(async move {
             fanout_output(repo_str, task_id_str, transport_clone, registry_clone).await;
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        time::sleep(std_time::Duration::from_millis(50)).await;
 
         transport
             .push_output(
                 repo,
                 task_id,
-                crate::channels::OutputChunk {
+                OutputChunk {
                     content: "topic reply".to_string(),
                     is_final: true,
                 },
@@ -617,11 +624,10 @@ mod tests {
 
         let mut got_topic = false;
         for _ in 0..10 {
-            if let Ok(Some(msg)) =
-                tokio::time::timeout(std::time::Duration::from_millis(200), async {
-                    rx.recv().await
-                })
-                .await
+            if let Ok(Some(msg)) = time::timeout(std_time::Duration::from_millis(200), async {
+                rx.recv().await
+            })
+            .await
                 && msg.body.contains("topic reply")
             {
                 assert_eq!(

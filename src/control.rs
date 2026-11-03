@@ -23,16 +23,31 @@
 //! - opencode supports `opencode models` for listing available models
 
 use std::collections::HashMap;
+use std::process;
+use std::sync::PoisonError;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time;
 
+use crate::cmd_cache;
+use crate::engine;
+use crate::engine::router::RouterConfig;
+use crate::engine::runner::agents;
+use crate::engine::runner::agents::opencode;
+use crate::engine::runner::direct;
+use crate::home;
+use crate::store;
+use crate::store::TaskStore;
+use crate::store::TokenUsage;
 use anyhow::{Context, Result};
 use regex::Regex;
+use tokio::fs;
+use tokio::process::Command;
+use tokio::sync;
+use tokio::time as tokio_time;
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
 const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(10);
-
-use crate::store::TaskStore;
 
 /// Per-session invocation locks — ensures only one agent invocation runs at a time per session.
 ///
@@ -43,14 +58,14 @@ use crate::store::TaskStore;
 /// there are no other waiters. We therefore test for `Arc::strong_count() == 2` when
 /// deciding to evict the map entry (map entry + local clone). If other waiters exist the
 /// count will be > 2 and we leave the entry in place.
-static SESSION_LOCKS: std::sync::LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static SESSION_LOCKS: LazyLock<Mutex<HashMap<String, Arc<sync::Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// System prompt template, loaded at compile time.
 const SYSTEM_TEMPLATE: &str = include_str!("../prompts/control_system.md");
 
 /// Timeout for agent invocations (2 minutes).
-const AGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const AGENT_TIMEOUT: time::Duration = time::Duration::from_secs(120);
 
 /// Maximum bytes for a single control-session turn payload.
 /// When the combined state + user message exceeds this limit, the payload is split
@@ -121,12 +136,12 @@ pub fn parse_model_spec(spec: &str) -> ModelSpec {
     if let Some((agent, model)) = spec.split_once(':') {
         ModelSpec {
             agent: agent.to_string(),
-            model: crate::engine::router::RouterConfig::normalize_model_identifier(model),
+            model: RouterConfig::normalize_model_identifier(model),
         }
     } else {
         ModelSpec {
             agent: infer_agent(spec).to_string(),
-            model: crate::engine::router::RouterConfig::normalize_model_identifier(spec),
+            model: RouterConfig::normalize_model_identifier(spec),
         }
     }
 }
@@ -156,7 +171,7 @@ fn infer_agent(model: &str) -> &'static str {
 /// Performs lightweight checks (known agent + binary in PATH) without
 /// a test invocation. Used by `/agent` before persisting.
 pub fn validate_agent(agent: &str) -> Result<()> {
-    let agents = crate::engine::configured_agents();
+    let agents = engine::configured_agents();
     if !agents.iter().any(|a| a == agent) {
         anyhow::bail!(
             "unknown agent '{}'. Available: {}",
@@ -164,7 +179,7 @@ pub fn validate_agent(agent: &str) -> Result<()> {
             agents.join(", ")
         );
     }
-    if !crate::cmd_cache::command_exists(agent) {
+    if !cmd_cache::command_exists(agent) {
         anyhow::bail!("agent '{agent}' not found in PATH. Is it installed?");
     }
     Ok(())
@@ -217,11 +232,7 @@ pub async fn validate_model(spec: &ModelSpec) -> Result<()> {
 
 /// List available opencode models via `opencode models`.
 async fn list_opencode_models() -> Result<Vec<String>> {
-    match crate::engine::runner::agents::opencode::run_opencode_models_cli(
-        std::time::Duration::from_secs(10),
-    )
-    .await
-    {
+    match opencode::run_opencode_models_cli(time::Duration::from_secs(10)).await {
         (models, "ok" | "empty_output") => Ok(models),
         (_, reason) => anyhow::bail!("opencode models failed: {reason}"),
     }
@@ -291,7 +302,7 @@ pub async fn assemble_context(store: &TaskStore, session_id: &str) -> Result<Cha
     // 3-5. Run independent subprocess calls in parallel (best-effort, 10s timeout each)
     let (service_status, task_list, job_list) = tokio::join!(
         async {
-            let mut cmd = tokio::process::Command::new("brew");
+            let mut cmd = Command::new("brew");
             cmd.args(["services", "info", "orch"]).kill_on_drop(true);
             match timeout(SUBPROCESS_TIMEOUT, cmd.output()).await {
                 Ok(Ok(output)) if output.status.success() => {
@@ -301,7 +312,7 @@ pub async fn assemble_context(store: &TaskStore, session_id: &str) -> Result<Cha
             }
         },
         async {
-            let mut cmd = tokio::process::Command::new("orch");
+            let mut cmd = Command::new("orch");
             cmd.args(["task", "list"]).kill_on_drop(true);
             match timeout(SUBPROCESS_TIMEOUT, cmd.output()).await {
                 Ok(Ok(output)) if output.status.success() => {
@@ -311,7 +322,7 @@ pub async fn assemble_context(store: &TaskStore, session_id: &str) -> Result<Cha
             }
         },
         async {
-            let mut cmd = tokio::process::Command::new("orch");
+            let mut cmd = Command::new("orch");
             cmd.args(["job", "list"]).kill_on_drop(true);
             match timeout(SUBPROCESS_TIMEOUT, cmd.output()).await {
                 Ok(Ok(output)) if output.status.success() => {
@@ -444,12 +455,9 @@ async fn handle_control_command(
             }
             // Delay the SIGTERM slightly so the acknowledgment reply is delivered first.
             tokio::spawn(async {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                let pid = std::process::id().to_string();
-                let _ = tokio::process::Command::new("kill")
-                    .args(["-TERM", &pid])
-                    .status()
-                    .await;
+                tokio_time::sleep(Duration::from_secs(2)).await;
+                let pid = process::id().to_string();
+                let _ = Command::new("kill").args(["-TERM", &pid]).status().await;
             });
             Ok("Restarting orch service\u{2026} I'll confirm here when back online.".to_string())
         }
@@ -567,9 +575,9 @@ fn total_tokens_u64_to_i64_saturating(
 ///
 /// Uses `~/.orch/state/control/{pid}/` for isolation between concurrent processes.
 async fn prepare_temp_dir() -> Result<String> {
-    let home = crate::home::orch_home()?;
-    let dir = format!("{}/state/control/{}", home.display(), std::process::id());
-    tokio::fs::create_dir_all(&dir).await?;
+    let home = home::orch_home()?;
+    let dir = format!("{}/state/control/{}", home.display(), process::id());
+    fs::create_dir_all(&dir).await?;
     Ok(dir)
 }
 
@@ -587,15 +595,8 @@ pub async fn invoke_agent(
 ) -> Result<InvokeResult> {
     let dir = prepare_temp_dir().await?;
 
-    let result = crate::engine::runner::direct::run_direct(
-        agent,
-        Some(model),
-        context,
-        message,
-        AGENT_TIMEOUT,
-        &dir,
-    )
-    .await?;
+    let result =
+        direct::run_direct(agent, Some(model), context, message, AGENT_TIMEOUT, &dir).await?;
 
     Ok(InvokeResult {
         text: result.text,
@@ -673,7 +674,7 @@ pub async fn invoke_agent_with_session(
         resume,
     });
 
-    let result = crate::engine::runner::direct::run_direct_with_session(
+    let result = direct::run_direct_with_session(
         agent,
         Some(model),
         context,
@@ -712,12 +713,10 @@ pub async fn send_message(
     // Acquire per-session lock — serializes concurrent invocations for the same session.
     // Messages that arrive while an invocation is running will queue here and execute in order.
     let session_lock = {
-        let mut map = SESSION_LOCKS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = SESSION_LOCKS.lock().unwrap_or_else(PoisonError::into_inner);
         Arc::clone(
             map.entry(session_id.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+                .or_insert_with(|| Arc::new(sync::Mutex::new(()))),
         )
     };
     let guard = session_lock.lock().await;
@@ -759,7 +758,7 @@ pub async fn send_message(
     // and persist ALL intermediate assistant responses so local transcript matches provider.
     // For other agents (codex, opencode), split into chunks and send each as independent
     // invocation (no --resume), each getting its own persisted assistant response.
-    let agent_has_sessions = crate::engine::runner::agents::supports_session(&agent);
+    let agent_has_sessions = agents::supports_session(&agent);
     let (chunks, delivery_mode) = if full_message.len() > MAX_CONTROL_MESSAGE_BYTES {
         tracing::info!(
             bytes = full_message.len(),
@@ -867,8 +866,8 @@ pub async fn send_message(
                 let output_tokens = opt_token_u64_to_i64_saturating(chunk_result.output_tokens);
                 let cost_usd = match (chunk_result.input_tokens, chunk_result.output_tokens) {
                     (Some(input), Some(output)) => {
-                        let pricing = crate::store::pricing_for_model(&model);
-                        let usage = crate::store::TokenUsage {
+                        let pricing = store::pricing_for_model(&model);
+                        let usage = TokenUsage {
                             input_tokens: input,
                             output_tokens: output,
                         };
@@ -919,8 +918,8 @@ pub async fn send_message(
                 let output_tokens = opt_token_u64_to_i64_saturating(chunk_result.output_tokens);
                 let cost_usd = match (chunk_result.input_tokens, chunk_result.output_tokens) {
                     (Some(input), Some(output)) => {
-                        let pricing = crate::store::pricing_for_model(&model);
-                        let usage = crate::store::TokenUsage {
+                        let pricing = store::pricing_for_model(&model);
+                        let usage = TokenUsage {
                             input_tokens: input,
                             output_tokens: output,
                         };
@@ -1012,8 +1011,8 @@ pub async fn send_message(
             let output_tokens = opt_token_u64_to_i64_saturating(chunk_result.output_tokens);
             let cost_usd = match (chunk_result.input_tokens, chunk_result.output_tokens) {
                 (Some(input), Some(output)) => {
-                    let pricing = crate::store::pricing_for_model(&model);
-                    let usage = crate::store::TokenUsage {
+                    let pricing = store::pricing_for_model(&model);
+                    let usage = TokenUsage {
                         input_tokens: input,
                         output_tokens: output,
                     };
@@ -1054,9 +1053,7 @@ pub async fn send_message(
     // concurrently the count will be > 2 and we should not evict. Only remove the
     // map entry when the strong_count == 2.
     if Arc::strong_count(&session_lock) == 2 {
-        let mut map = SESSION_LOCKS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = SESSION_LOCKS.lock().unwrap_or_else(PoisonError::into_inner);
         // Re-check under the map lock: a concurrent caller may have cloned the Arc
         // between our strong_count check above and acquiring the map lock.
         if map
@@ -1156,8 +1153,14 @@ fn build_control_chunks(state: &str, message: &str, agent_has_sessions: bool) ->
 
 #[cfg(test)]
 mod tests {
+    use tokio::runtime::Runtime;
+
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::store::TaskStore;
+    use crate::store::TokenUsage;
+    use crate::store::pricing_for_model;
 
     #[test]
     fn parse_spec_agent_model() {
@@ -1382,12 +1385,12 @@ mod tests {
             .unwrap()
             .captures_iter(SYSTEM_TEMPLATE)
             .map(|caps| caps[1].to_string())
-            .collect::<std::collections::BTreeSet<_>>();
+            .collect::<BTreeSet<_>>();
 
         let expected = ["agent", "model", "restart"]
             .into_iter()
             .map(str::to_string)
-            .collect::<std::collections::BTreeSet<_>>();
+            .collect::<BTreeSet<_>>();
 
         assert_eq!(documented, expected);
     }
@@ -1421,7 +1424,7 @@ mod tests {
             agent: "nonexistent".to_string(),
             model: "test".to_string(),
         };
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = Runtime::new().unwrap();
         let result = rt.block_on(validate_model(&spec));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unknown agent"));
@@ -1460,8 +1463,6 @@ mod tests {
 
     #[test]
     fn cost_usd_computed_from_token_counts() {
-        use crate::store::{TokenUsage, pricing_for_model};
-
         let model = "sonnet";
         let input_tokens: u64 = 1_000_000;
         let output_tokens: u64 = 1_000_000;
@@ -1503,9 +1504,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_control_message_stores_cost_usd() {
-        use crate::store::{TokenUsage, pricing_for_model};
-
-        let store = crate::store::TaskStore::open_memory().await.unwrap();
+        let store = TaskStore::open_memory().await.unwrap();
 
         let input_tokens: u64 = 500_000;
         let output_tokens: u64 = 100_000;
@@ -1635,7 +1634,7 @@ mod tests {
         assert_eq!(reassembled, content);
         for c in &chunks {
             assert!(
-                std::str::from_utf8(c.as_bytes()).is_ok(),
+                str::from_utf8(c.as_bytes()).is_ok(),
                 "chunk is not valid UTF-8"
             );
         }

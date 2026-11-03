@@ -1,4 +1,5 @@
 use crate::backends::Status;
+use crate::cli;
 use crate::cli::init_task_manager;
 use crate::config;
 use crate::store;
@@ -88,7 +89,7 @@ pub async fn dashboard(global: bool, project: Option<String>) -> anyhow::Result<
         }
     }
 
-    let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
+    let store: Option<Arc<TaskStore>> = cli::init_store().await.ok().map(Arc::new);
     let repo = config::get_current_repo().unwrap_or_default();
 
     println!("\nActive Sessions");
@@ -127,7 +128,7 @@ pub async fn dashboard(global: bool, project: Option<String>) -> anyhow::Result<
 
 /// Dashboard using the global store — works from any directory, across all projects.
 async fn dashboard_from_global_store(project: Option<&str>) -> anyhow::Result<()> {
-    let store = if let Ok(s) = crate::cli::init_store().await {
+    let store = if let Ok(s) = cli::init_store().await {
         Arc::new(s)
     } else {
         println!("Tasks (0 total)\n\nActive Sessions\n\nRecent (last 24h)");

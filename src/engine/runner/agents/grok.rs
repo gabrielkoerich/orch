@@ -19,6 +19,8 @@
 //! `--sandbox off`. Orch still isolates the agent in the worktree and denies
 //! `rm` and `git push`. Control sessions (`deny_read_only`) use `read-only`.
 
+use tokio::process::Command;
+
 use super::claude::{self, ClaudeRunner};
 use super::{
     AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent, shell_single_quote,
@@ -105,14 +107,10 @@ impl AgentRunner for GrokRunner {
         Self::parser().classify_error(exit_code, stdout, &stderr)
     }
 
-    fn router_command(
-        &self,
-        prompt: &str,
-        model: Option<&str>,
-    ) -> anyhow::Result<tokio::process::Command> {
+    fn router_command(&self, prompt: &str, model: Option<&str>) -> anyhow::Result<Command> {
         // Classification only needs a JSON answer. Strip the tools so the
         // call cannot edit the repo or browse the network while routing.
-        let mut cmd = tokio::process::Command::new("grok");
+        let mut cmd = Command::new("grok");
         cmd.arg("--no-plan")
             .arg("--no-subagents")
             .arg("--disable-web-search")
@@ -301,6 +299,8 @@ fn classify_grok_message(message: &str) -> Option<AgentError> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::engine::runner::agents::SandboxLevel;
 
@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn build_command_allowlist_keeps_destructive_denies() {
         let mut rules = perms(true, &["Bash(rm *)"], &["Edit", "Write", "Bash", "git"]);
-        rules.allowed_edit_paths = vec![std::path::PathBuf::from("/work/tree")];
+        rules.allowed_edit_paths = vec![PathBuf::from("/work/tree")];
         let cmd = runner().build_command(None, "", "/tmp/sys.txt", "/tmp/msg.txt", &rules);
         assert!(
             cmd.contains("--tools 'search_replace,write,run_terminal_cmd'"),

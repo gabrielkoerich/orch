@@ -9,7 +9,16 @@
 use crate::cmd::CommandErrorContext;
 use anyhow::Context;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::process;
+#[cfg(test)]
+use std::time as std_time;
+use std::time::Duration;
+use std::time::Instant;
+#[cfg(test)]
+use std::time::SystemTime;
 use tokio::process::Command;
+use tokio::time;
 
 /// Info about an active orch tmux session.
 #[derive(Debug, Clone)]
@@ -252,7 +261,7 @@ impl TmuxManager {
     pub async fn session_blocks_dispatch_from_map(
         &self,
         session: &str,
-        session_map: &std::collections::HashMap<String, bool>,
+        session_map: &HashMap<String, bool>,
     ) -> bool {
         match session_map.get(session).copied() {
             None => false,      // session does not exist → no block
@@ -449,11 +458,11 @@ impl TmuxManager {
     pub async fn wait_for_sessions_dead(
         &self,
         sessions: &[String],
-        poll_interval: std::time::Duration,
-        timeout: std::time::Duration,
+        poll_interval: Duration,
+        timeout: Duration,
     ) -> usize {
-        let start = std::time::Instant::now();
-        let mut remaining: std::collections::HashSet<String> = sessions.iter().cloned().collect();
+        let start = Instant::now();
+        let mut remaining: HashSet<String> = sessions.iter().cloned().collect();
 
         while !remaining.is_empty() && start.elapsed() < timeout {
             let mut to_remove = Vec::new();
@@ -466,7 +475,7 @@ impl TmuxManager {
                 remaining.remove(&session);
             }
             if !remaining.is_empty() {
-                tokio::time::sleep(poll_interval).await;
+                time::sleep(poll_interval).await;
             }
         }
 
@@ -486,7 +495,7 @@ impl TmuxManager {
     pub async fn wait_for_completion(
         &self,
         session: &str,
-        poll_interval: std::time::Duration,
+        poll_interval: Duration,
     ) -> anyhow::Result<String> {
         loop {
             if !self.session_exists(session).await {
@@ -506,7 +515,7 @@ impl TmuxManager {
                 }
             }
 
-            tokio::time::sleep(poll_interval).await;
+            time::sleep(poll_interval).await;
         }
     }
 
@@ -585,14 +594,14 @@ impl TmuxManager {
 pub(crate) fn test_session_name() -> String {
     format!(
         "orch-test-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        SystemTime::now()
+            .duration_since(std_time::UNIX_EPOCH)
             .map_or_else(|_| 0, |d| d.as_millis())
     )
 }
 
 fn isolated_socket_name() -> String {
-    format!("orch-test-{}", std::process::id())
+    format!("orch-test-{}", process::id())
 }
 
 /// RAII guard that kills a tmux session on drop, even if the test panics.
@@ -602,7 +611,7 @@ pub(crate) struct SessionGuard(pub(crate) String);
 #[cfg(test)]
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        let _ = std::process::Command::new("tmux")
+        let _ = process::Command::new("tmux")
             .args(["-L", &isolated_socket_name(), "kill-session", "-t", &self.0])
             .output();
     }
@@ -830,7 +839,7 @@ mod tests {
 
         // Poll until pane is dead (up to 2s), fixed sleep is unreliable under load
         for _ in 0..20 {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            time::sleep(Duration::from_millis(100)).await;
             if !tmux.session_is_running(&session).await {
                 break;
             }
@@ -871,10 +880,7 @@ mod tests {
         let tmux = TmuxManager::new();
         // Call wait_for_completion on a session that never existed — should return Ok(""), not an error.
         let result = tmux
-            .wait_for_completion(
-                "orch-nonexistent-session-99999",
-                std::time::Duration::from_millis(50),
-            )
+            .wait_for_completion("orch-nonexistent-session-99999", Duration::from_millis(50))
             .await;
         assert!(
             result.is_ok(),
@@ -906,7 +912,7 @@ mod tests {
             "session must exist on the isolated test server"
         );
 
-        let on_default = tokio::process::Command::new("tmux")
+        let on_default = Command::new("tmux")
             .args(["has-session", "-t", &name])
             .output()
             .await

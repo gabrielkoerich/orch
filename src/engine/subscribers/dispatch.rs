@@ -6,27 +6,31 @@ use crate::engine::events::TaskEvent;
 use crate::engine::router::Router;
 use crate::engine::runner::{TaskRunner, WeightSignal};
 use crate::engine::tasks::TaskManager;
+use crate::engine::tick;
+use crate::engine::tick::DispatchMode;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use dashmap::DashMap;
+use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::sync::{RwLock, Semaphore, mpsc};
 
-type SessionMap = std::collections::HashMap<String, bool>;
+type SessionMap = HashMap<String, bool>;
 
 async fn prepare_dispatch_context<F>(
     router_arc: &Arc<RwLock<Router>>,
     session_map_fut: F,
-) -> (crate::engine::tick::DispatchMode, SessionMap)
+) -> (DispatchMode, SessionMap)
 where
-    F: std::future::Future<Output = SessionMap>,
+    F: Future<Output = SessionMap>,
 {
     // Keep lock scope minimal: snapshot router state, then drop the guard
     // before awaiting session/dispatch work.
     let dispatch_mode = {
         let router_guard = router_arc.read().await;
-        crate::engine::tick::dispatch_mode_from_router(&router_guard)
+        tick::dispatch_mode_from_router(&router_guard)
     };
     let session_map = session_map_fut.await;
     (dispatch_mode, session_map)
@@ -65,7 +69,7 @@ pub fn spawn(
                     // prevents double-dispatch if the tick loop also picks this up.
                     let (dispatch_mode, session_map) =
                         prepare_dispatch_context(&router_arc, tmux.batch_session_active()).await;
-                    if let Err(e) = crate::engine::tick::tick_dispatch_tasks(
+                    if let Err(e) = tick::tick_dispatch_tasks(
                         &backend,
                         &tmux,
                         &repo,
@@ -100,6 +104,7 @@ mod tests {
     use crate::engine::router::{Router, RouterConfig};
     use std::time::Duration;
     use tokio::sync::{Notify, oneshot};
+    use tokio::time;
 
     #[tokio::test]
     async fn prepare_dispatch_context_drops_read_lock_before_awaiting_session_map() {
@@ -121,7 +126,7 @@ mod tests {
         waiting.notified().await;
 
         // If the read guard leaked across the await above, this write lock would block.
-        let write_guard = tokio::time::timeout(Duration::from_secs(2), router_arc.write())
+        let write_guard = time::timeout(Duration::from_secs(2), router_arc.write())
             .await
             .expect("router write lock blocked while dispatch subscriber awaited session map");
         drop(write_guard);

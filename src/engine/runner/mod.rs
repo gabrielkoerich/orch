@@ -33,16 +33,40 @@ pub mod worktree;
 
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
+use crate::engine;
+use crate::engine::cleanup;
+use crate::engine::cooldown;
 use crate::engine::router::RouteResult;
+use crate::engine::tasks;
 use crate::engine::tasks::is_internal_id;
+#[cfg(not(test))]
+use crate::github::http;
+use crate::github::http::GhHttp;
+use crate::home;
+use crate::parser;
+use crate::parser::AgentResponse;
+use crate::parser::Delegation;
+use crate::status_heuristics;
 use crate::store;
 use crate::store::InsertTaskMetric;
+use crate::store::RunTokenUsage;
+use crate::store::TaskStatus;
+use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use anyhow::Context;
 use chrono::Utc;
 pub use response::WeightSignal;
+use serde_json::Value;
+use std::collections::HashSet;
+use std::env;
+use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
 use std::path::PathBuf;
+use std::slice;
 use std::sync::Arc;
+use tokio::fs;
+use tokio::task;
 
 /// Fully materialized task-run audit data.
 #[derive(Debug, Clone)]
@@ -101,11 +125,10 @@ fn classify_run_outcome(
         // otherwise Kimi-style "usage limit for this billing cycle" errors are
         // stored as a plain "rate_limit" outcome (issue #3529).
         Err(agents::AgentError::RateLimit { message }) => {
-            crate::engine::cooldown::detect_credit_exhaustion_outcome(message)
-                .unwrap_or("rate_limit")
+            cooldown::detect_credit_exhaustion_outcome(message).unwrap_or("rate_limit")
         }
         Err(agents::AgentError::Auth { message }) => {
-            crate::engine::cooldown::detect_credit_exhaustion_outcome(message).unwrap_or("failed")
+            cooldown::detect_credit_exhaustion_outcome(message).unwrap_or("failed")
         }
         Err(agents::AgentError::InvalidResponse { .. }) => "parse_error",
         Ok(_)
@@ -119,9 +142,7 @@ fn classify_run_outcome(
         Ok(_) if status == "blocked" => "blocked",
         // Non-canonical status that clearly reads as completion — success, not
         // "unrecognized status" (#3627).
-        Ok(_) if crate::status_heuristics::status_looks_like_descriptive_completion(status) => {
-            "success"
-        }
+        Ok(_) if status_heuristics::status_looks_like_descriptive_completion(status) => "success",
         Err(_) | Ok(_) => "failed",
     }
 }
@@ -221,7 +242,7 @@ fn parse_success_output(
         // Try to recover a structured response from assistant messages first
         let assistant_text = agents::collect_assistant_messages_text(agent_name, raw_stdout);
         if !assistant_text.is_empty() {
-            if let Ok(response) = crate::parser::parse(&assistant_text) {
+            if let Ok(response) = parser::parse(&assistant_text) {
                 tracing::debug!(
                     task_id,
                     agent = agent_name,
@@ -281,7 +302,7 @@ fn parse_success_output(
         }
 
         // Try to parse the inner result text as standard JSON
-        if let Ok(response) = crate::parser::parse(&agent_result.result_text) {
+        if let Ok(response) = parser::parse(&agent_result.result_text) {
             return Ok(agents::ParsedResponse {
                 response,
                 input_tokens: agent_result.input_tokens,
@@ -296,7 +317,7 @@ fn parse_success_output(
         // narrative while a prior assistant turn contains the JSON.
         let assistant_text = agents::collect_assistant_messages_text(agent_name, raw_stdout);
         if !assistant_text.is_empty()
-            && let Ok(response) = crate::parser::parse(&assistant_text)
+            && let Ok(response) = parser::parse(&assistant_text)
         {
             tracing::debug!(
                 task_id,
@@ -351,7 +372,7 @@ fn parse_success_output(
                  schema — synthesizing done response"
             );
             return Ok(agents::ParsedResponse {
-                response: crate::parser::AgentResponse {
+                response: AgentResponse {
                     status: "done".to_string(),
                     summary,
                     ..Default::default()
@@ -418,7 +439,6 @@ fn result_envelope_completed(raw_stdout: &str) -> bool {
 // A timeout kill has no result envelope. Salvage only the wrap-up shape: a successful
 // `git commit`, then only shell calls that all returned ok. Returns the last assistant text
 fn salvage_wrapup(raw: &str) -> Option<String> {
-    use serde_json::Value;
     // (tool name, command, finished ok) in call order
     let mut calls: Vec<(String, String, Option<bool>)> = Vec::new();
     let mut last_text = String::new();
@@ -496,7 +516,7 @@ pub fn parse_session_output(
                         "timed out after commit during wrap-up, salvaging as done"
                     );
                     return Ok(agents::ParsedResponse {
-                        response: crate::parser::AgentResponse {
+                        response: AgentResponse {
                             status: "done".to_string(),
                             summary,
                             ..Default::default()
@@ -582,11 +602,11 @@ pub struct TaskRunner {
     /// Path to the orch home directory
     orch_home: PathBuf,
     /// Unified task store for run audit trail
-    store: Option<Arc<crate::store::TaskStore>>,
+    store: Option<Arc<TaskStore>>,
 }
 
-impl std::fmt::Debug for TaskRunner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for TaskRunner {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("TaskRunner")
             .field("repo", &self.repo)
             .field("orch_home", &self.orch_home)
@@ -596,7 +616,7 @@ impl std::fmt::Debug for TaskRunner {
 
 impl TaskRunner {
     pub fn new(repo: String) -> Self {
-        let orch_home = crate::home::orch_home().unwrap_or_else(|e| {
+        let orch_home = home::orch_home().unwrap_or_else(|e| {
             tracing::warn!(error = %e, "orch_home() failed — falling back to /tmp/.orch");
             PathBuf::from("/tmp").join(".orch")
         });
@@ -610,7 +630,7 @@ impl TaskRunner {
 
     /// Set the unified task store for run audit trail.
     #[must_use]
-    pub fn with_store(mut self, store: Arc<crate::store::TaskStore>) -> Self {
+    pub fn with_store(mut self, store: Arc<TaskStore>) -> Self {
         self.store = Some(store);
         self
     }
@@ -798,7 +818,7 @@ impl TaskRunner {
                         .unwrap_or_default();
                     if route_reason.starts_with("label agent:") {
                         let agent_label = route_reason.trim_start_matches("label ");
-                        let gh = crate::github::http::GhHttp::new()?;
+                        let gh = GhHttp::new()?;
                         match gh.remove_label(&self.repo, task_id, agent_label).await {
                             Err(e) => {
                                 tracing::warn!(task_id, label = agent_label, err = %e, "failed to remove agent label after max attempts");
@@ -853,7 +873,7 @@ impl TaskRunner {
         if init.invocation.sandbox
             && let Err(e) = sandbox::argv(
                 &init.invocation,
-                &std::env::temp_dir().join("orch-sandbox-preflight"),
+                &env::temp_dir().join("orch-sandbox-preflight"),
             )
             .await
         {
@@ -891,9 +911,7 @@ impl TaskRunner {
         if let Some(stored) = store::opt_store_get_task(&self.store, &self.repo, task_id).await {
             let silence_reset = matches!(
                 stored.status,
-                crate::store::TaskStatus::New
-                    | crate::store::TaskStatus::Routed
-                    | crate::store::TaskStatus::NeedsReview
+                TaskStatus::New | TaskStatus::Routed | TaskStatus::NeedsReview
             );
             if silence_reset {
                 let status_str = stored.status.as_str();
@@ -1064,8 +1082,7 @@ impl TaskRunner {
         // dead so the tmux guard won't block removal.
         if final_status.as_str() == "done"
             && let Some(ref st) = self.store
-            && let Err(e) =
-                crate::engine::cleanup::cleanup_task_worktree(task_id, &self.repo, st).await
+            && let Err(e) = cleanup::cleanup_task_worktree(task_id, &self.repo, st).await
         {
             tracing::warn!(task_id, error = ?e, "worktree cleanup failed after no-op done");
         }
@@ -1278,7 +1295,7 @@ impl TaskRunner {
                             parsed: "",
                             outcome: "failed",
                             error: &e.to_string(),
-                            tokens: crate::store::RunTokenUsage::default(),
+                            tokens: RunTokenUsage::default(),
                         })
                         .await
                 {
@@ -1308,7 +1325,7 @@ impl TaskRunner {
                         parsed: "",
                         outcome: "aborted",
                         error: "run skipped by guard",
-                        tokens: crate::store::RunTokenUsage::default(),
+                        tokens: RunTokenUsage::default(),
                     })
                     .await
             {
@@ -1329,7 +1346,7 @@ impl TaskRunner {
             .await
             .unwrap_or_default();
         if !delegations_raw.is_empty() {
-            match serde_json::from_str::<Vec<crate::parser::Delegation>>(&delegations_raw) {
+            match serde_json::from_str::<Vec<Delegation>>(&delegations_raw) {
                 Ok(delegations) if !delegations.is_empty() => {
                     self.process_delegations(task, &delegations, backend)
                         .await?;
@@ -1393,7 +1410,7 @@ impl TaskRunner {
             // and we can safely clear agent/model for normal reroute.
             let silence_already_reset = store::opt_store_get_task(&self.store, &self.repo, task_id)
                 .await
-                .is_some_and(|t| !matches!(t.status, crate::store::TaskStatus::InProgress));
+                .is_some_and(|t| !matches!(t.status, TaskStatus::InProgress));
 
             if silence_already_reset {
                 tracing::debug!(
@@ -1456,22 +1473,21 @@ impl TaskRunner {
                 // Also record via the cooldown system so model_for_complexity() skips
                 // this model.  Use the stored last_error text as the message since
                 // classify_run_error_type() already confirmed it contains "rate limit".
-                crate::engine::cooldown::record_rate_limit(&agent_name, model, &last_error).await;
+                cooldown::record_rate_limit(&agent_name, model, &last_error).await;
                 WeightSignal::RateLimited {
                     agent: agent_name.clone(),
                 }
             } else {
                 // Non-rate-limit "needs_review" (e.g. agent successfully completed but
                 // review agent is needed) — reset backoff so the next failure starts fresh.
-                crate::engine::cooldown::record_agent_success(&agent_name, model.unwrap_or(""))
-                    .await;
+                cooldown::record_agent_success(&agent_name, model.unwrap_or("")).await;
                 WeightSignal::Success {
                     agent: agent_name.clone(),
                 }
             }
         } else if status == "done" || status == "in_progress" || status == "in_review" {
             // Reset exponential backoff counters so the next failure starts fresh.
-            crate::engine::cooldown::record_agent_success(&agent_name, model.unwrap_or("")).await;
+            cooldown::record_agent_success(&agent_name, model.unwrap_or("")).await;
             WeightSignal::Success {
                 agent: agent_name.clone(),
             }
@@ -1517,7 +1533,7 @@ impl TaskRunner {
                     parsed: &run_audit.parsed_response,
                     outcome: &run_audit.outcome,
                     error: &run_audit.error,
-                    tokens: crate::store::RunTokenUsage {
+                    tokens: RunTokenUsage {
                         input_tokens: run_audit.input_tokens,
                         output_tokens: run_audit.output_tokens,
                         total_cost_usd: run_audit.total_cost_usd,
@@ -1570,10 +1586,7 @@ impl TaskRunner {
             && let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &task.id.0).await
         {
             store
-                .update_status(
-                    store_id,
-                    crate::engine::tasks::status_to_task_status(new_status),
-                )
+                .update_status(store_id, tasks::status_to_task_status(new_status))
                 .await
                 .context("store-first status update failed in runner")?;
         }
@@ -1596,7 +1609,7 @@ impl TaskRunner {
         };
 
         // Append visible attribution footer (matches PR body style)
-        let footer = crate::engine::attribution_footer("Created", &agent_name, model);
+        let footer = engine::attribution_footer("Created", &agent_name, model);
         comment.push_str(&footer);
 
         backend.post_comment(&task.id, &comment).await?;
@@ -1612,21 +1625,20 @@ impl TaskRunner {
     async fn process_delegations(
         &self,
         parent_task: &ExternalTask,
-        delegations: &[crate::parser::Delegation],
+        delegations: &[Delegation],
         backend: &Arc<dyn ExternalBackend>,
     ) -> anyhow::Result<()> {
         let parent_id = &parent_task.id;
 
         // Fetch existing open tasks once for dedup — prevents creating duplicate
         // GitHub issues when the same delegations are produced on repeated runs.
-        let existing_titles: std::collections::HashSet<String> =
-            match backend.list_all_tasks().await {
-                Ok(tasks) => tasks.into_iter().map(|t| t.title).collect(),
-                Err(e) => {
-                    tracing::warn!(err = %e, "failed to fetch tasks for dedup — will create all");
-                    std::collections::HashSet::new()
-                }
-            };
+        let existing_titles: HashSet<String> = match backend.list_all_tasks().await {
+            Ok(tasks) => tasks.into_iter().map(|t| t.title).collect(),
+            Err(e) => {
+                tracing::warn!(err = %e, "failed to fetch tasks for dedup — will create all");
+                HashSet::new()
+            }
+        };
 
         for delegation in delegations {
             // Skip if an issue with the same title already exists
@@ -1648,7 +1660,7 @@ impl TaskRunner {
                 "{}\n\n---\n_Delegated from #{}_{}",
                 delegation.body,
                 parent_id.0,
-                crate::engine::orch_footer()
+                engine::orch_footer()
             );
 
             match backend
@@ -1679,7 +1691,7 @@ impl TaskRunner {
             && let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &parent_id.0).await
         {
             store
-                .update_status(store_id, crate::store::TaskStatus::Blocked)
+                .update_status(store_id, TaskStatus::Blocked)
                 .await
                 .context("store-first: failed to block parent in store")?;
         }
@@ -1706,7 +1718,7 @@ impl TaskRunner {
                     "Delegated {} subtask(s):\n\n{}\n\nParent task is blocked until all subtasks complete.{}",
                     delegations.len(),
                     summary,
-                    crate::engine::orch_footer()
+                    engine::orch_footer()
                 ),
             )
             .await?;
@@ -1717,7 +1729,7 @@ impl TaskRunner {
     /// Resolve the project directory for this repo.
     async fn resolve_project_dir(&self) -> anyhow::Result<PathBuf> {
         // Explicit env var always wins
-        if let Ok(dir) = std::env::var("PROJECT_DIR")
+        if let Ok(dir) = env::var("PROJECT_DIR")
             && !dir.is_empty()
         {
             return Ok(PathBuf::from(dir));
@@ -1731,7 +1743,7 @@ impl TaskRunner {
                 if let Ok(repo) = config::get_repo_for_project(&path) {
                     // Use tokio::fs::metadata for async-safe existence check
                     let path_for_check = path.clone();
-                    if repo == self.repo && tokio::fs::metadata(&path_for_check).await.is_ok() {
+                    if repo == self.repo && fs::metadata(&path_for_check).await.is_ok() {
                         return Ok(path);
                     }
                 }
@@ -1744,7 +1756,7 @@ impl TaskRunner {
         {
             let path = PathBuf::from(&dir);
             let path_for_check = path.clone();
-            if tokio::fs::metadata(&path_for_check).await.is_ok() {
+            if fs::metadata(&path_for_check).await.is_ok() {
                 return Ok(path);
             }
         }
@@ -1758,7 +1770,7 @@ impl TaskRunner {
                 .join(parts[0])
                 .join(format!("{}.git", parts[1]));
             let bare_for_check = bare.clone();
-            if tokio::task::spawn_blocking(move || bare_for_check.exists())
+            if task::spawn_blocking(move || bare_for_check.exists())
                 .await
                 .unwrap_or(false)
             {
@@ -1816,13 +1828,13 @@ async fn update_agent_label_after_reroute(
     // Skipped under #[cfg(test)] to avoid real GitHub API calls.
     #[cfg(not(test))]
     {
-        match crate::github::http::GhHttp::new() {
+        match GhHttp::new() {
             Ok(gh) => {
                 if gh
                     .ensure_label(
                         repo,
                         &new_label,
-                        crate::github::http::status_label_color(&new_label),
+                        http::status_label_color(&new_label),
                         &format!("Agent: {new_agent}"),
                     )
                     .await
@@ -1846,7 +1858,7 @@ async fn update_agent_label_after_reroute(
     }
 
     if let Err(e) = backend
-        .set_labels(&task.id, std::slice::from_ref(&new_label))
+        .set_labels(&task.id, slice::from_ref(&new_label))
         .await
     {
         tracing::warn!(
@@ -1871,6 +1883,7 @@ mod tests {
     use chrono::Utc;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+    use tokio::process::Command;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1923,7 +1936,7 @@ mod tests {
             "tail must be a valid suffix of the original"
         );
         assert!(
-            std::str::from_utf8(tail.as_bytes()).is_ok(),
+            str::from_utf8(tail.as_bytes()).is_ok(),
             "tail must be valid UTF-8"
         );
     }
@@ -1934,7 +1947,7 @@ mod tests {
         for max_bytes in [1, 3, 5, 7, 11, 13, 20, 100] {
             let tail = safe_utf8_tail(s, max_bytes);
             assert!(
-                std::str::from_utf8(tail.as_bytes()).is_ok(),
+                str::from_utf8(tail.as_bytes()).is_ok(),
                 "max_bytes={max_bytes}: tail must be valid UTF-8"
             );
             assert!(
@@ -2477,10 +2490,10 @@ mod tests {
         // thread-safe in general, but the subsequent call is synchronous and
         // isolated to the temp dir created above.
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("PROJECT_DIR", &dir_str) };
+        unsafe { env::set_var("PROJECT_DIR", &dir_str) };
         let result = runner.resolve_project_dir().await;
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::remove_var("PROJECT_DIR") };
+        unsafe { env::remove_var("PROJECT_DIR") };
 
         assert!(
             result.is_ok(),
@@ -2494,10 +2507,10 @@ mod tests {
         // An empty PROJECT_DIR should be ignored and fall through to other logic.
         let runner = TaskRunner::new("owner/testrepo-nonexistent".to_string());
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("PROJECT_DIR", "") };
+        unsafe { env::set_var("PROJECT_DIR", "") };
         let result = runner.resolve_project_dir().await;
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::remove_var("PROJECT_DIR") };
+        unsafe { env::remove_var("PROJECT_DIR") };
 
         // No active config entry, no legacy project_dir, no bare clone for this
         // repo: should return an explicit error rather than falling back to the
@@ -2532,7 +2545,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl crate::backends::ExternalBackend for TrackingBackend {
+    impl ExternalBackend for TrackingBackend {
         fn name(&self) -> &'static str {
             "tracking"
         }
@@ -2644,24 +2657,23 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let temp_home = TempDir::new().unwrap();
         let orch_home = temp_home.path().join(".orch");
-        tokio::fs::create_dir_all(&orch_home).await.unwrap();
-        let old_orch_home = std::env::var("ORCH_HOME").ok();
+        fs::create_dir_all(&orch_home).await.unwrap();
+        let old_orch_home = env::var("ORCH_HOME").ok();
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("ORCH_HOME", &orch_home) };
+        unsafe { env::set_var("ORCH_HOME", &orch_home) };
 
         let runner = TaskRunner::new("owner/repo".to_string());
         let parent = make_task("99");
         let backend = Arc::new(TrackingBackend::new());
-        let backend_dyn: Arc<dyn crate::backends::ExternalBackend> =
-            Arc::<TrackingBackend>::clone(&backend);
+        let backend_dyn: Arc<dyn ExternalBackend> = Arc::<TrackingBackend>::clone(&backend);
 
         let delegations = vec![
-            crate::parser::Delegation {
+            Delegation {
                 title: "Subtask A".to_string(),
                 body: "Do A".to_string(),
                 labels: vec!["enhancement".to_string()],
             },
-            crate::parser::Delegation {
+            Delegation {
                 title: "Subtask B".to_string(),
                 body: "Do B".to_string(),
                 labels: vec![],
@@ -2715,10 +2727,10 @@ mod tests {
 
         if let Some(old) = old_orch_home {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            unsafe { std::env::set_var("ORCH_HOME", old) };
+            unsafe { env::set_var("ORCH_HOME", old) };
         } else {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            unsafe { std::env::remove_var("ORCH_HOME") };
+            unsafe { env::remove_var("ORCH_HOME") };
         }
     }
 
@@ -2731,18 +2743,17 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let temp_home = TempDir::new().unwrap();
         let orch_home = temp_home.path().join(".orch");
-        tokio::fs::create_dir_all(&orch_home).await.unwrap();
-        let old_orch_home = std::env::var("ORCH_HOME").ok();
+        fs::create_dir_all(&orch_home).await.unwrap();
+        let old_orch_home = env::var("ORCH_HOME").ok();
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("ORCH_HOME", &orch_home) };
+        unsafe { env::set_var("ORCH_HOME", &orch_home) };
 
         let runner = TaskRunner::new("owner/repo".to_string());
         let parent = make_task("101");
         let backend = Arc::new(TrackingBackend::new());
-        let backend_dyn: Arc<dyn crate::backends::ExternalBackend> =
-            Arc::<TrackingBackend>::clone(&backend);
+        let backend_dyn: Arc<dyn ExternalBackend> = Arc::<TrackingBackend>::clone(&backend);
 
-        let delegations = vec![crate::parser::Delegation {
+        let delegations = vec![Delegation {
             title: "Only Child".to_string(),
             body: "Do only child".to_string(),
             labels: vec!["feature".to_string()],
@@ -2776,10 +2787,10 @@ mod tests {
 
         if let Some(old) = old_orch_home {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            unsafe { std::env::set_var("ORCH_HOME", old) };
+            unsafe { env::set_var("ORCH_HOME", old) };
         } else {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            unsafe { std::env::remove_var("ORCH_HOME") };
+            unsafe { env::remove_var("ORCH_HOME") };
         }
     }
 
@@ -2946,11 +2957,7 @@ mod tests {
             }
         }
 
-        fn router_command(
-            &self,
-            _prompt: &str,
-            _model: Option<&str>,
-        ) -> anyhow::Result<tokio::process::Command> {
+        fn router_command(&self, _prompt: &str, _model: Option<&str>) -> anyhow::Result<Command> {
             anyhow::bail!("not implemented for mock")
         }
     }
@@ -3101,7 +3108,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl crate::backends::ExternalBackend for LabelFailingBackend {
+    impl ExternalBackend for LabelFailingBackend {
         fn name(&self) -> &'static str {
             "label_failing"
         }
@@ -3182,7 +3189,7 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             url: String::new(),
         };
-        let backend: Arc<dyn crate::backends::ExternalBackend> =
+        let backend: Arc<dyn ExternalBackend> =
             Arc::new(LabelFailingBackend::new().with_set_labels_err("network error"));
 
         let result =
@@ -3210,8 +3217,7 @@ mod tests {
             url: String::new(),
         };
         // LabelFailingBackend with no injected error delegates to TrackingBackend (always Ok).
-        let backend: Arc<dyn crate::backends::ExternalBackend> =
-            Arc::new(LabelFailingBackend::new());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(LabelFailingBackend::new());
 
         let result =
             update_agent_label_after_reroute("owner/repo", &task, &backend, "claude", "codex")

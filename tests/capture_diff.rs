@@ -18,12 +18,6 @@ mod channels {
         }
     }
 
-    #[derive(Debug, Clone)]
-    pub(crate) struct OutputChunk {
-        pub content: String,
-        pub is_final: bool,
-    }
-
     pub(crate) mod transport {
         use crate::channels::OutputChunk;
 
@@ -58,18 +52,25 @@ mod channels {
             pub(crate) async fn unbind(&self, _repo: &str, _task_id: &str) {}
         }
     }
+
+    #[derive(Debug, Clone)]
+    pub(crate) struct OutputChunk {
+        pub content: String,
+        pub is_final: bool,
+    }
 }
 
 mod engine {
     pub(crate) mod suspend {
         use chrono::{DateTime, Duration, Utc};
         use std::sync::Mutex;
+        use std::sync::PoisonError;
 
         static GAPS: Mutex<Vec<(DateTime<Utc>, Duration)>> = Mutex::new(Vec::new());
 
         pub(crate) fn suspended_duration_since(since: DateTime<Utc>) -> Duration {
             GAPS.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(PoisonError::into_inner)
                 .iter()
                 .filter(|(detected_at, _)| *detected_at > since)
                 .fold(Duration::zero(), |acc, (_, gap)| acc + *gap)
@@ -77,14 +78,12 @@ mod engine {
 
         pub(crate) fn inject_gap_for_test(detected_at: DateTime<Utc>, gap: Duration) {
             GAPS.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(PoisonError::into_inner)
                 .push((detected_at, gap));
         }
 
         pub(crate) fn clear_for_test() {
-            GAPS.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear();
+            GAPS.lock().unwrap_or_else(PoisonError::into_inner).clear();
         }
     }
 }
@@ -100,6 +99,7 @@ mod capture;
 use capture::{CaptureService, MAX_OUTPUT_BUFFER_BYTES, OutputBuffer};
 use channels::transport::Transport;
 use std::sync::Arc;
+use std::time::Duration;
 
 fn buffer() -> OutputBuffer {
     OutputBuffer {
@@ -174,7 +174,7 @@ async fn seen_alive_with_live_session_not_silenced() {
     )
     .await;
 
-    let grace = std::time::Duration::from_secs(120);
+    let grace = Duration::from_secs(120);
     let silent = svc.get_silent_sessions_for_repo(repo, grace).await;
     assert!(
         silent.is_empty(),
@@ -217,7 +217,7 @@ async fn silent_detection_discounts_host_suspend_gap() {
     )
     .await;
 
-    let grace = std::time::Duration::from_secs(120);
+    let grace = Duration::from_secs(120);
     let silent = svc.get_silent_sessions_for_repo(repo, grace).await;
     assert!(
         silent.is_empty(),

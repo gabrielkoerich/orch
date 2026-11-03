@@ -10,6 +10,12 @@ pub mod progress;
 mod storage;
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::error;
+use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::io;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
@@ -24,10 +30,15 @@ use openraft::raft::{
 use openraft::storage::Adaptor;
 use openraft::{BasicNode, SnapshotPolicy};
 
+use crate::config as crate_config;
 use crate::store::TaskStore;
 
 pub use command::{Command, Reply, Request};
 pub use storage::RaftStore;
+use tokio::net::TcpListener;
+use tokio::sync::Notify;
+use tokio::time;
+use tokio::time::Instant;
 
 pub type NodeId = u64;
 
@@ -41,7 +52,7 @@ pub type Raft = openraft::Raft<TypeConfig>;
 
 /// A `cluster:` section turns the cluster on. Without one, orch writes straight to SQLite as it always has
 pub fn enabled() -> bool {
-    crate::config::get("cluster.secret").is_ok_and(|s| !s.is_empty())
+    crate_config::get("cluster.secret").is_ok_and(|s| !s.is_empty())
 }
 
 /// Start this machine's node from the `cluster:` section and the tailnet. A learner keeps asking
@@ -115,7 +126,7 @@ async fn join_loop(node: Node, plan: config::Plan, cfg: config::ClusterConfig) {
             }
         }
 
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        time::sleep(Duration::from_secs(30)).await;
     }
 }
 
@@ -132,7 +143,7 @@ pub struct Member {
 pub fn members(node: &Node) -> Vec<Member> {
     let m = node.raft.metrics().borrow().clone();
     let membership = m.membership_config.membership();
-    let voters: std::collections::BTreeSet<NodeId> = membership.voter_ids().collect();
+    let voters: BTreeSet<NodeId> = membership.voter_ids().collect();
     membership
         .nodes()
         .map(|(id, n)| Member {
@@ -171,11 +182,11 @@ pub struct Node {
     pub raft: Raft,
     /// None on a single node, which has no peers to forward to
     secret: Option<Arc<str>>,
-    server: Option<Arc<tokio::sync::Notify>>,
+    server: Option<Arc<Notify>>,
 }
 
-impl std::fmt::Debug for Node {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for Node {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Node")
             .field("server", &self.server.is_some())
             .finish_non_exhaustive()
@@ -187,7 +198,7 @@ impl Node {
     /// the leader can be unknown or stale, so it waits and tries again, but only a write that was
     /// certainly not applied is sent again
     pub async fn write(&self, req: Request) -> anyhow::Result<Reply> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let err = match self.raft.client_write(req.clone()).await {
                 Ok(r) => return Ok(r.data),
@@ -207,11 +218,11 @@ impl Node {
                 },
                 None => "no leader known".to_string(),
             };
-            if tokio::time::Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 anyhow::bail!("no leader took the write: {reason}");
             }
 
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            time::sleep(Duration::from_millis(200)).await;
         }
     }
 
@@ -241,8 +252,8 @@ pub struct NodeConfig {
     pub elect: bool,
 }
 
-impl std::fmt::Debug for NodeConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for NodeConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("NodeConfig")
             .field("name", &self.name)
             .field("id", &self.id)
@@ -284,7 +295,7 @@ pub async fn start_node(
     raft_db: &Path,
     cfg: NodeConfig,
 ) -> anyhow::Result<Node> {
-    let listener = tokio::net::TcpListener::bind(&cfg.addr).await?;
+    let listener = TcpListener::bind(&cfg.addr).await?;
     start_node_on(store, raft_db, cfg, listener).await
 }
 
@@ -293,7 +304,7 @@ pub async fn start_node_on(
     store: &TaskStore,
     raft_db: &Path,
     cfg: NodeConfig,
-    listener: tokio::net::TcpListener,
+    listener: TcpListener,
 ) -> anyhow::Result<Node> {
     let secret: Arc<str> = Arc::from(cfg.secret);
     let raft_store = RaftStore::open(raft_db, store.clone()).await?;
@@ -304,7 +315,7 @@ pub async fn start_node_on(
     }
     .validate()?;
     let network = network::HttpNetwork {
-        secret: std::sync::Arc::clone(&secret),
+        secret: Arc::clone(&secret),
     };
     let raft = Raft::new(cfg.id, Arc::new(config), network, log, sm).await?;
     let me = network::Hello {
@@ -315,14 +326,9 @@ pub async fn start_node_on(
         term: 0,
         proof: String::new(),
     };
-    let app = network::router(
-        raft.clone(),
-        std::sync::Arc::clone(&secret),
-        me,
-        cfg.addr.clone(),
-    );
-    let stop = Arc::new(tokio::sync::Notify::new());
-    let stopped = std::sync::Arc::clone(&stop);
+    let app = network::router(raft.clone(), Arc::clone(&secret), me, cfg.addr.clone());
+    let stop = Arc::new(Notify::new());
+    let stopped = Arc::clone(&stop);
     tokio::spawn(async move {
         // Graceful shutdown also closes kept-alive connections, which would keep answering for a stopped node
         let served = axum::serve(listener, app)
@@ -364,8 +370,8 @@ impl RaftNetworkFactory<TypeConfig> for NoNetwork {
     }
 }
 
-fn unreachable<E: std::error::Error>() -> RPCError<NodeId, BasicNode, E> {
-    RPCError::Unreachable(Unreachable::new(&std::io::Error::other(
+fn unreachable<E: error::Error>() -> RPCError<NodeId, BasicNode, E> {
+    RPCError::Unreachable(Unreachable::new(&io::Error::other(
         "no network on a single node",
     )))
 }

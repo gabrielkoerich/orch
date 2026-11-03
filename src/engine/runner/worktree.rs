@@ -4,11 +4,18 @@
 //! Worktrees are stored at `~/.orch/worktrees/<project>/<branch>/`.
 
 use crate::cmd::CommandErrorContext;
+use crate::engine::runner::git_ops;
+use crate::engine::runner::git_ops::RebaseOutcome;
+use crate::engine::runner::git_ops::StashRebaseOpts;
+use crate::github::http::GhHttp;
+use crate::home;
 use crate::store;
 use crate::store::TaskStore;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::fs;
 use tokio::process::Command;
+use tokio::task;
 
 /// Result of worktree setup.
 #[derive(Debug)]
@@ -37,7 +44,7 @@ pub fn project_name(project_dir: &Path) -> String {
 
 /// Base worktrees directory for a project.
 pub fn project_worktrees_dir(project_dir: &Path) -> PathBuf {
-    crate::home::worktrees_dir()
+    home::worktrees_dir()
         .unwrap_or_default()
         .join(project_name(project_dir))
 }
@@ -47,11 +54,11 @@ pub async fn list_project_worktrees(project_dir: &Path) -> anyhow::Result<Vec<Pa
     let base = project_worktrees_dir(project_dir);
     let mut worktrees = Vec::new();
 
-    if tokio::fs::metadata(&base).await.is_err() {
+    if fs::metadata(&base).await.is_err() {
         return Ok(worktrees);
     }
 
-    let mut entries = tokio::fs::read_dir(&base).await?;
+    let mut entries = fs::read_dir(&base).await?;
     while let Some(entry) = entries.next_entry().await? {
         if entry.metadata().await.is_ok_and(|m| m.is_dir()) {
             worktrees.push(entry.path());
@@ -102,16 +109,11 @@ pub async fn rebase_worktree_on_origin_main(
 ) -> anyhow::Result<()> {
     let origin_branch = format!("origin/{default_branch}");
 
-    match crate::engine::runner::git_ops::stash_rebase_restore(
-        worktree_dir,
-        &origin_branch,
-        crate::engine::runner::git_ops::StashRebaseOpts::default(),
-    )
-    .await?
+    match git_ops::stash_rebase_restore(worktree_dir, &origin_branch, StashRebaseOpts::default())
+        .await?
     {
-        crate::engine::runner::git_ops::RebaseOutcome::Succeeded
-        | crate::engine::runner::git_ops::RebaseOutcome::Skipped(_) => Ok(()),
-        crate::engine::runner::git_ops::RebaseOutcome::Failed(e) => {
+        RebaseOutcome::Succeeded | RebaseOutcome::Skipped(_) => Ok(()),
+        RebaseOutcome::Failed(e) => {
             anyhow::bail!("git rebase {origin_branch} failed: {e}")
         }
     }
@@ -337,18 +339,15 @@ pub(super) async fn resolve_branch_start_point(
 pub async fn validate_worktree_gitdir(worktree_dir: &Path) -> bool {
     let git_file = worktree_dir.join(".git");
     // Use tokio::fs::metadata for async-safe existence check
-    if tokio::fs::metadata(&git_file).await.is_err() {
+    if fs::metadata(&git_file).await.is_err() {
         return false;
     }
     // In a linked worktree .git is a file; in the main repo it's a directory (always valid).
-    if tokio::fs::metadata(&git_file)
-        .await
-        .is_ok_and(|m| m.is_dir())
-    {
+    if fs::metadata(&git_file).await.is_ok_and(|m| m.is_dir()) {
         return true;
     }
 
-    let Ok(content) = tokio::fs::read_to_string(&git_file).await else {
+    let Ok(content) = fs::read_to_string(&git_file).await else {
         return false;
     };
     // Expected format: "gitdir: /absolute/path/to/.git/worktrees/<name>\n"
@@ -359,7 +358,7 @@ pub async fn validate_worktree_gitdir(worktree_dir: &Path) -> bool {
         .and_then(|l| l.strip_prefix("gitdir: "))
     {
         // Use async metadata for the gitdir check too.
-        return tokio::fs::metadata(gitdir_path.trim())
+        return fs::metadata(gitdir_path.trim())
             .await
             .is_ok_and(|m| m.is_dir());
     }
@@ -389,7 +388,7 @@ async fn resolve_parent_branch(
         worktrees_base.join(&parent.branch)
     } else {
         // Use async metadata to avoid blocking the reactor thread.
-        let exists = tokio::fs::metadata(&parent.worktree)
+        let exists = fs::metadata(&parent.worktree)
             .await
             .is_ok_and(|m| m.is_dir());
         if exists {
@@ -422,7 +421,7 @@ pub async fn setup_worktree(
     let default_branch = detect_default_branch(&main_dir).await;
 
     let worktrees_base = project_worktrees_dir(&main_dir);
-    tokio::fs::create_dir_all(&worktrees_base).await?;
+    fs::create_dir_all(&worktrees_base).await?;
 
     // Check if we have a saved branch/worktree in store
     let task_record = store::opt_store_get_task(store, repo, task_id).await;
@@ -437,7 +436,7 @@ pub async fn setup_worktree(
 
     let mut force_fresh = false;
     if let (Some(store), Some(record)) = (store.as_ref(), task_record.as_ref()) {
-        let key = crate::store::worktree_refresh_key(record.id);
+        let key = store::worktree_refresh_key(record.id);
         if matches!(store.kv_get(&key).await, Ok(Some(_))) {
             let _ = store.kv_delete(&key).await;
             force_fresh = true;
@@ -454,7 +453,7 @@ pub async fn setup_worktree(
         }
         if let Some(saved) = saved_worktree.as_ref().filter(|path| !path.is_empty()) {
             let saved_path = PathBuf::from(saved);
-            if tokio::fs::metadata(&saved_path).await.is_ok() {
+            if fs::metadata(&saved_path).await.is_ok() {
                 discard_worktree(&main_dir, &saved_path).await;
             }
         }
@@ -466,7 +465,7 @@ pub async fn setup_worktree(
             let wt = match &saved_worktree {
                 Some(wt) if !wt.is_empty() => {
                     let wt_str = wt.clone();
-                    let exists = tokio::task::spawn_blocking(move || Path::new(&wt_str).exists())
+                    let exists = task::spawn_blocking(move || Path::new(&wt_str).exists())
                         .await
                         .unwrap_or(false);
                     if exists {
@@ -527,11 +526,11 @@ pub async fn setup_worktree(
     // A task with a recorded merge conflict keeps its rebase, auto_merge left it on purpose and
     // told the agent to continue it.
     // Use tokio::fs for async-safe existence check
-    if tokio::fs::metadata(&worktree_dir).await.is_ok() {
+    if fs::metadata(&worktree_dir).await.is_ok() {
         let keep_rebase = task_record
             .as_ref()
             .is_some_and(|t| t.merge_conflict_retries > 0)
-            && crate::engine::runner::git_ops::rebase_in_progress(&worktree_dir).await;
+            && git_ops::rebase_in_progress(&worktree_dir).await;
         if keep_rebase {
             tracing::info!(
                 task_id,
@@ -585,8 +584,8 @@ pub async fn setup_worktree(
                 .await;
             // If the directory still exists (e.g. worktree remove failed), remove it
             // manually so the worktree-creation block below re-creates it cleanly.
-            if tokio::fs::metadata(&worktree_dir).await.is_ok() {
-                let _ = tokio::fs::remove_dir_all(&worktree_dir).await;
+            if fs::metadata(&worktree_dir).await.is_ok() {
+                let _ = fs::remove_dir_all(&worktree_dir).await;
             }
             // Prune stale worktree metadata so git won't complain on re-add.
             let _ = Command::new("git")
@@ -597,7 +596,7 @@ pub async fn setup_worktree(
     }
 
     // Create worktree if it doesn't exist
-    if tokio::fs::metadata(&worktree_dir).await.is_err() {
+    if fs::metadata(&worktree_dir).await.is_err() {
         tracing::info!(task_id, worktree = %worktree_dir.display(), "creating worktree");
 
         // Fetch latest so `origin/<default_branch>` (and any pre-existing
@@ -605,7 +604,7 @@ pub async fn setup_worktree(
         // the operator's checkout: branching from `origin/<default_branch>`
         // means unpushed local commits or in-progress work on `main` never
         // leak into the new worktree.
-        let _ = crate::engine::runner::git_ops::git()
+        let _ = git_ops::git()
             .await
             .args([
                 "-C",
@@ -640,7 +639,7 @@ pub async fn setup_worktree(
 
         // Create worktree
         if let Some(parent) = worktree_dir.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            fs::create_dir_all(parent).await?;
         }
 
         let cloned = match super::cow::create_worktree(
@@ -675,7 +674,7 @@ pub async fn setup_worktree(
                 .output_with_context()
                 .await?;
 
-            if !output.status.success() && tokio::fs::metadata(&worktree_dir).await.is_err() {
+            if !output.status.success() && fs::metadata(&worktree_dir).await.is_err() {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
                 // Retry: prune and recreate
@@ -749,7 +748,7 @@ pub async fn setup_worktree(
                     }
                 }
 
-                if tokio::fs::metadata(&worktree_dir).await.is_err() {
+                if fs::metadata(&worktree_dir).await.is_err() {
                     anyhow::bail!(
                         "failed to create worktree at {} for task {} (stdout: {}, stderr: {}, retry stdout: {}, retry stderr: {}, retry error: {})",
                         worktree_dir.display(),
@@ -770,7 +769,7 @@ pub async fn setup_worktree(
     // for branches that don't yet exist on GitHub.
     if !task_id.starts_with("internal:")
         && let Ok(issue_num) = task_id.parse::<u64>()
-        && let Ok(gh) = crate::github::http::GhHttp::new()
+        && let Ok(gh) = GhHttp::new()
     {
         match gh
             .link_issue_to_branch(repo, issue_num, &branch_name_str)
@@ -831,8 +830,8 @@ async fn discard_worktree(main_dir: &Path, worktree_dir: &Path) {
         ])
         .output_with_context()
         .await;
-    if tokio::fs::metadata(worktree_dir).await.is_ok() {
-        let _ = tokio::fs::remove_dir_all(worktree_dir).await;
+    if fs::metadata(worktree_dir).await.is_ok() {
+        let _ = fs::remove_dir_all(worktree_dir).await;
     }
     let _ = Command::new("git")
         .args(["-C", &main_dir.to_string_lossy(), "worktree", "prune"])
@@ -857,7 +856,7 @@ async fn find_existing_worktree(worktrees_base: &Path, task_id: &str) -> Option<
         )
     };
 
-    let mut entries = match tokio::fs::read_dir(worktrees_base).await {
+    let mut entries = match fs::read_dir(worktrees_base).await {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(
@@ -902,11 +901,19 @@ async fn find_existing_worktree(worktrees_base: &Path, task_id: &str) -> Option<
 
 #[cfg(test)]
 mod tests {
+    use futures::future;
+    use tokio::time;
+
+    use std::env;
+    use std::fs as std_fs;
+    use std::process;
+    use std::time::Duration;
+
     use super::*;
 
     /// Helper: run a git command in `dir`, panicking on failure.
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let mut cmd = std::process::Command::new("git");
+    fn git(dir: &Path, args: &[&str]) {
+        let mut cmd = process::Command::new("git");
         cmd.current_dir(dir);
         // Global commit.gpgsign calls the operator's signer (1Password)
         if args.first() == Some(&"commit") {
@@ -943,7 +950,7 @@ mod tests {
         git(setup.path(), &["config", "user.name", "T"]);
 
         // Initial commit on main.
-        std::fs::write(setup.path().join("README.md"), "main").unwrap();
+        std_fs::write(setup.path().join("README.md"), "main").unwrap();
         git(setup.path(), &["add", "."]);
         git(setup.path(), &["commit", "-m", "init"]);
         git(setup.path(), &["push", "origin", "HEAD:main"]);
@@ -953,7 +960,7 @@ mod tests {
             setup.path(),
             &["checkout", "-b", "gh-issue-42-fix-login-bug"],
         );
-        std::fs::write(setup.path().join("feature.txt"), "work").unwrap();
+        std_fs::write(setup.path().join("feature.txt"), "work").unwrap();
         git(setup.path(), &["add", "."]);
         git(setup.path(), &["commit", "-m", "feature work"]);
         git(
@@ -972,7 +979,7 @@ mod tests {
         git(local.path(), &["config", "user.name", "T"]);
         git(local.path(), &["fetch", "--all"]);
         // Confirm the local branch does NOT exist; only the remote tracking ref.
-        let has_local = std::process::Command::new("git")
+        let has_local = process::Command::new("git")
             .args([
                 "-C",
                 local.path().to_str().unwrap(),
@@ -1014,7 +1021,7 @@ mod tests {
         git(local.path(), &["config", "user.name", "T"]);
 
         // Commit something so origin/main exists.
-        std::fs::write(local.path().join("README.md"), "main").unwrap();
+        std_fs::write(local.path().join("README.md"), "main").unwrap();
         git(local.path(), &["add", "."]);
         git(local.path(), &["commit", "-m", "init"]);
         git(local.path(), &["push", "origin", "HEAD:main"]);
@@ -1031,8 +1038,8 @@ mod tests {
     }
 
     /// Capture stdout of a git command in `dir`.
-    fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
+    fn git_stdout(dir: &Path, args: &[&str]) -> String {
+        let out = process::Command::new("git")
             .args(args)
             .current_dir(dir)
             .output()
@@ -1056,9 +1063,9 @@ mod tests {
     async fn setup_worktree_anchors_on_origin_not_local_main() {
         // Isolate ORCH_HOME so the worktree lands in a temp dir.
         let orch_home_dir = tempfile::tempdir().unwrap();
-        let prev_orch_home = std::env::var("ORCH_HOME").ok();
+        let prev_orch_home = env::var("ORCH_HOME").ok();
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("ORCH_HOME", orch_home_dir.path()) };
+        unsafe { env::set_var("ORCH_HOME", orch_home_dir.path()) };
 
         // Bare "remote".
         let remote = tempfile::tempdir().unwrap();
@@ -1074,7 +1081,7 @@ mod tests {
         git(project.path(), &["config", "user.name", "T"]);
 
         // Pushed baseline on main.
-        std::fs::write(project.path().join("README.md"), "pushed\n").unwrap();
+        std_fs::write(project.path().join("README.md"), "pushed\n").unwrap();
         git(project.path(), &["add", "."]);
         git(project.path(), &["commit", "-m", "pushed baseline"]);
         git(project.path(), &["push", "origin", "HEAD:main"]);
@@ -1084,7 +1091,7 @@ mod tests {
         git(project.path(), &["remote", "set-head", "origin", "main"]);
 
         // Operator's WIP: an unpushed local commit on top of main.
-        std::fs::write(project.path().join("LOCAL_ONLY.md"), "unpushed\n").unwrap();
+        std_fs::write(project.path().join("LOCAL_ONLY.md"), "unpushed\n").unwrap();
         git(project.path(), &["add", "."]);
         git(project.path(), &["commit", "-m", "local unpushed commit"]);
         let local_sha = git_stdout(project.path(), &["rev-parse", "HEAD"]);
@@ -1122,9 +1129,9 @@ mod tests {
         // Restore ORCH_HOME.
         match prev_orch_home {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            Some(v) => unsafe { std::env::set_var("ORCH_HOME", v) },
+            Some(v) => unsafe { env::set_var("ORCH_HOME", v) },
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            None => unsafe { std::env::remove_var("ORCH_HOME") },
+            None => unsafe { env::remove_var("ORCH_HOME") },
         }
     }
 
@@ -1133,9 +1140,9 @@ mod tests {
     #[serial_test::serial(orch_home)]
     async fn setup_worktree_keeps_the_conflicted_rebase_for_a_conflict_task() {
         let orch_home_dir = tempfile::tempdir().unwrap();
-        let prev_orch_home = std::env::var("ORCH_HOME").ok();
+        let prev_orch_home = env::var("ORCH_HOME").ok();
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-        unsafe { std::env::set_var("ORCH_HOME", orch_home_dir.path()) };
+        unsafe { env::set_var("ORCH_HOME", orch_home_dir.path()) };
 
         let remote = tempfile::tempdir().unwrap();
         git(remote.path(), &["init", "--bare"]);
@@ -1146,7 +1153,7 @@ mod tests {
         );
         git(project.path(), &["config", "user.email", "t@t.com"]);
         git(project.path(), &["config", "user.name", "T"]);
-        std::fs::write(project.path().join("f.txt"), "base\n").unwrap();
+        std_fs::write(project.path().join("f.txt"), "base\n").unwrap();
         git(project.path(), &["add", "."]);
         git(project.path(), &["commit", "-m", "base"]);
         git(project.path(), &["push", "origin", "HEAD:main"]);
@@ -1166,39 +1173,39 @@ mod tests {
         let wt = setup.work_dir.clone();
         git(&wt, &["config", "user.email", "t@t.com"]);
         git(&wt, &["config", "user.name", "T"]);
-        std::fs::write(wt.join("f.txt"), "agent\n").unwrap();
+        std_fs::write(wt.join("f.txt"), "agent\n").unwrap();
         git(&wt, &["commit", "-am", "agent change"]);
         git(&wt, &["push", "origin", "HEAD"]);
 
         // main moves on with a conflicting change, then the rebase stops on it
-        std::fs::write(project.path().join("f.txt"), "main\n").unwrap();
+        std_fs::write(project.path().join("f.txt"), "main\n").unwrap();
         git(project.path(), &["commit", "-am", "main change"]);
         git(project.path(), &["push", "origin", "HEAD:main"]);
         git(&wt, &["fetch", "origin"]);
-        let rebase = std::process::Command::new("git")
+        let rebase = process::Command::new("git")
             .args(["rebase", "origin/main"])
             .current_dir(&wt)
             .output()
             .unwrap();
         assert!(!rebase.status.success(), "precondition: rebase conflicts");
-        assert!(crate::engine::runner::git_ops::rebase_in_progress(&wt).await);
+        assert!(git_ops::rebase_in_progress(&wt).await);
 
         store.increment(id, "merge_conflict_retries").await.unwrap();
 
         setup_worktree(&task_id, "conflict", project.path(), &opt, "test/repo")
             .await
             .unwrap();
-        crate::engine::runner::git_ops::rebase_on_default(&wt, "main").await;
+        git_ops::rebase_on_default(&wt, "main").await;
         assert!(
-            crate::engine::runner::git_ops::rebase_in_progress(&wt).await,
+            git_ops::rebase_in_progress(&wt).await,
             "the rebase auto_merge left must survive dispatch"
         );
 
         match prev_orch_home {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            Some(v) => unsafe { std::env::set_var("ORCH_HOME", v) },
+            Some(v) => unsafe { env::set_var("ORCH_HOME", v) },
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
-            None => unsafe { std::env::remove_var("ORCH_HOME") },
+            None => unsafe { env::remove_var("ORCH_HOME") },
         }
     }
 
@@ -1211,7 +1218,7 @@ mod tests {
         git(local.path(), &["config", "user.email", "t@t.com"]);
         git(local.path(), &["config", "user.name", "T"]);
         git(local.path(), &["checkout", "-b", "main"]);
-        std::fs::write(local.path().join("README.md"), "main").unwrap();
+        std_fs::write(local.path().join("README.md"), "main").unwrap();
         git(local.path(), &["add", "."]);
         git(local.path(), &["commit", "-m", "init"]);
 
@@ -1344,7 +1351,7 @@ mod tests {
     async fn find_existing_worktree_matches_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let wt_dir = dir.path().join("gh-issue-42-fix-login-bug");
-        tokio::fs::create_dir(&wt_dir).await.unwrap();
+        fs::create_dir(&wt_dir).await.unwrap();
 
         let result = find_existing_worktree(dir.path(), "42").await;
         assert_eq!(result, Some(wt_dir));
@@ -1354,7 +1361,7 @@ mod tests {
     async fn find_existing_worktree_matches_internal_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let wt_dir = dir.path().join("internal-8-fix");
-        tokio::fs::create_dir(&wt_dir).await.unwrap();
+        fs::create_dir(&wt_dir).await.unwrap();
 
         let result = find_existing_worktree(dir.path(), "internal:8").await;
         assert_eq!(result, Some(wt_dir));
@@ -1365,7 +1372,7 @@ mod tests {
         // Old worktrees created before the rename should still be found
         let dir = tempfile::tempdir().unwrap();
         let wt_dir = dir.path().join("gh-task-internal-8-fix");
-        tokio::fs::create_dir(&wt_dir).await.unwrap();
+        fs::create_dir(&wt_dir).await.unwrap();
 
         let result = find_existing_worktree(dir.path(), "internal:8").await;
         assert_eq!(result, Some(wt_dir));
@@ -1376,7 +1383,7 @@ mod tests {
         // Old external worktrees with gh-task- prefix should still be found
         let dir = tempfile::tempdir().unwrap();
         let wt_dir = dir.path().join("gh-task-42-fix-login-bug");
-        tokio::fs::create_dir(&wt_dir).await.unwrap();
+        fs::create_dir(&wt_dir).await.unwrap();
 
         let result = find_existing_worktree(dir.path(), "42").await;
         assert_eq!(result, Some(wt_dir));
@@ -1385,7 +1392,7 @@ mod tests {
     #[tokio::test]
     async fn find_existing_worktree_ignores_other_tasks() {
         let dir = tempfile::tempdir().unwrap();
-        tokio::fs::create_dir(dir.path().join("gh-issue-43-other-task"))
+        fs::create_dir(dir.path().join("gh-issue-43-other-task"))
             .await
             .unwrap();
 
@@ -1415,11 +1422,7 @@ mod tests {
     async fn resolve_parent_branch_empty_parent_branch_returns_none() {
         let db_dir = tempfile::tempdir().unwrap();
         let db_path = db_dir.path().join("test.db");
-        let store = Arc::new(
-            crate::store::TaskStore::open_single(&db_path)
-                .await
-                .unwrap(),
-        );
+        let store = Arc::new(TaskStore::open_single(&db_path).await.unwrap());
 
         // Create parent task — branch defaults to empty string
         let parent_id = store
@@ -1438,11 +1441,7 @@ mod tests {
     async fn resolve_parent_branch_returns_parent_branch_and_worktree() {
         let db_dir = tempfile::tempdir().unwrap();
         let db_path = db_dir.path().join("test.db");
-        let store = Arc::new(
-            crate::store::TaskStore::open_single(&db_path)
-                .await
-                .unwrap(),
-        );
+        let store = Arc::new(TaskStore::open_single(&db_path).await.unwrap());
 
         // Create parent task and set its branch
         let parent_id = store
@@ -1472,16 +1471,12 @@ mod tests {
     async fn resolve_parent_branch_prefers_existing_worktree_path() {
         let db_dir = tempfile::tempdir().unwrap();
         let db_path = db_dir.path().join("test.db");
-        let store = Arc::new(
-            crate::store::TaskStore::open_single(&db_path)
-                .await
-                .unwrap(),
-        );
+        let store = Arc::new(TaskStore::open_single(&db_path).await.unwrap());
 
         let worktrees_base = tempfile::tempdir().unwrap();
         // Create the parent worktree directory
         let parent_wt_dir = worktrees_base.path().join("custom-worktree-path");
-        tokio::fs::create_dir_all(&parent_wt_dir).await.unwrap();
+        fs::create_dir_all(&parent_wt_dir).await.unwrap();
 
         let parent_id = store
             .create_internal("owner/repo", "parent task", "", "issue", "99", None)
@@ -1518,20 +1513,20 @@ mod tests {
     async fn concurrent_worktree_checks_no_starvation() {
         let temp_dir = tempfile::tempdir().unwrap();
         let worktrees_base = temp_dir.path().join("worktrees");
-        tokio::fs::create_dir_all(&worktrees_base).await.unwrap();
+        fs::create_dir_all(&worktrees_base).await.unwrap();
 
         // Create a fake worktree with valid gitdir
         let wt_dir = worktrees_base.join("gh-issue-123-test");
-        tokio::fs::create_dir_all(&wt_dir).await.unwrap();
+        fs::create_dir_all(&wt_dir).await.unwrap();
         // Create .git as a file pointing to a real directory (worktree link)
         let gitdir_target = temp_dir
             .path()
             .join(".git")
             .join("worktrees")
             .join("gh-issue-123-test");
-        tokio::fs::create_dir_all(&gitdir_target).await.unwrap();
+        fs::create_dir_all(&gitdir_target).await.unwrap();
         let git_file = wt_dir.join(".git");
-        tokio::fs::write(&git_file, format!("gitdir: {}\n", gitdir_target.display()))
+        fs::write(&git_file, format!("gitdir: {}\n", gitdir_target.display()))
             .await
             .unwrap();
 
@@ -1552,8 +1547,8 @@ mod tests {
             .collect();
 
         // Wait with timeout to detect starvation
-        let results = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            futures::future::join_all(handles).await
+        let results = time::timeout(Duration::from_secs(10), async {
+            future::join_all(handles).await
         })
         .await;
 

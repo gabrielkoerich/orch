@@ -13,9 +13,22 @@
 
 use super::{AgentProfile, RouteResult, RouterConfig};
 use crate::backends::ExternalTask;
+use crate::engine::cooldown;
 use crate::engine::runner::agents::{self, AgentError, claude, opencode};
+use crate::engine::runner::direct::DirectCommandError;
+use crate::engine::runner::direct::run_direct_command_raw;
+use crate::engine::runner::response;
+use crate::home;
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::fs as tokio_fs;
+use tokio::sync::Mutex;
+use tokio::task;
 
 /// Prefix used to identify router LLM timeout errors in error messages.
 /// This lets callers (route_with_llm in mod.rs) distinguish timeouts from
@@ -23,7 +36,6 @@ use std::time::Duration;
 /// Format: "router LLM timed out after {secs}s" — this prefix makes it easy
 /// to detect by string prefix without full pattern matching.
 pub(super) const TIMEOUT_PREFIX: &str = "router LLM timed out after ";
-use serde::Deserialize;
 
 /// Response from the LLM router.
 #[derive(Debug, Deserialize)]
@@ -457,7 +469,7 @@ pub(super) fn apply_self_routing_penalty(
 /// `Router` holds a `LlmRouter` and delegates `route_with_llm` to it.
 pub(super) struct LlmRouter {
     /// Cached skills catalog loaded once to avoid repeated blocking I/O.
-    skills_catalog: tokio::sync::Mutex<Option<String>>,
+    skills_catalog: Mutex<Option<String>>,
 }
 
 /// Scan a skills directory for skill subdirectories containing SKILL.md files.
@@ -466,13 +478,13 @@ pub(super) struct LlmRouter {
 ///
 /// This function is synchronous and should only be called from within a
 /// `tokio::task::spawn_blocking` context to avoid blocking the async reactor.
-fn scan_skills_directory(skills_dir: &std::path::Path) -> Option<String> {
+fn scan_skills_directory(skills_dir: &Path) -> Option<String> {
     if !skills_dir.exists() {
         return None;
     }
 
     let mut skills = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(skills_dir) {
+    if let Ok(entries) = fs::read_dir(skills_dir) {
         for entry in entries {
             let entry = match entry {
                 Ok(e) => e,
@@ -494,7 +506,7 @@ fn scan_skills_directory(skills_dir: &std::path::Path) -> Option<String> {
                 continue;
             }
 
-            let content = std::fs::read_to_string(&skill_file).unwrap_or_default();
+            let content = fs::read_to_string(&skill_file).unwrap_or_default();
             let name = content
                 .lines()
                 .next()
@@ -516,7 +528,7 @@ fn scan_skills_directory(skills_dir: &std::path::Path) -> Option<String> {
 impl LlmRouter {
     pub(super) fn new() -> Self {
         Self {
-            skills_catalog: tokio::sync::Mutex::new(None),
+            skills_catalog: Mutex::new(None),
         }
     }
 
@@ -551,14 +563,14 @@ impl LlmRouter {
             .await?;
 
         // Save prompt and response to per-task routing dir for debugging
-        let routing_dir = crate::home::task_dir_async(repo, &task.id.0)
+        let routing_dir = home::task_dir_async(repo, &task.id.0)
             .await
-            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/orch-routing"))
+            .unwrap_or_else(|_| PathBuf::from("/tmp/orch-routing"))
             .join("routing");
-        let _ = tokio::fs::create_dir_all(&routing_dir).await;
+        let _ = tokio_fs::create_dir_all(&routing_dir).await;
 
         let prompt_path = routing_dir.join("prompt.txt");
-        let _ = tokio::fs::write(&prompt_path, &prompt).await;
+        let _ = tokio_fs::write(&prompt_path, &prompt).await;
 
         // Call the LLM router with the specified agent+model
         let timeout = Duration::from_secs(config.timeout_seconds);
@@ -638,7 +650,7 @@ impl LlmRouter {
 
         // Save raw response for debugging
         let response_path = routing_dir.join("response.txt");
-        let _ = tokio::fs::write(&response_path, &response).await;
+        let _ = tokio_fs::write(&response_path, &response).await;
 
         // Log a concise routing summary at info level (after sanity checks complete)
         let warning = Self::check_routing_sanity(task, &agent, &profile);
@@ -711,7 +723,7 @@ impl LlmRouter {
         task: &ExternalTask,
         available_agents: &[String],
         router_agent: &str,
-        configured_weights: &std::collections::HashMap<String, f64>,
+        configured_weights: &HashMap<String, f64>,
     ) -> anyhow::Result<String> {
         let template = include_str!("../../../prompts/route.md");
 
@@ -781,14 +793,14 @@ impl LlmRouter {
 
         // Cache miss — offload loading to blocking thread pool.
         // Capture only what we need to avoid holding any locks across the await.
-        let skills_dir_opt: Option<PathBuf> = match std::env::var("ORCH_HOME") {
+        let skills_dir_opt: Option<PathBuf> = match env::var("ORCH_HOME") {
             Ok(orch_home) => Some(PathBuf::from(orch_home).join("skills")),
             Err(_) => None,
         };
 
-        let catalog = tokio::task::spawn_blocking(move || -> String {
+        let catalog = task::spawn_blocking(move || -> String {
             // Try skills.yml in current directory
-            if let Ok(content) = std::fs::read_to_string("skills.yml")
+            if let Ok(content) = fs::read_to_string("skills.yml")
                 && let Ok(yaml) = serde_norway::from_str::<serde_norway::Value>(&content)
                 && let Some(skills) = yaml.get("skills")
                 && let Ok(json) = serde_json::to_string(skills)
@@ -804,7 +816,7 @@ impl LlmRouter {
             }
 
             // Try ~/.orch/skills
-            if let Ok(skills_dir) = crate::home::skills_dir()
+            if let Ok(skills_dir) = home::skills_dir()
                 && let Some(catalog) = scan_skills_directory(&skills_dir)
             {
                 return catalog;
@@ -833,35 +845,31 @@ impl LlmRouter {
         model: Option<&str>,
         timeout: Duration,
     ) -> anyhow::Result<String> {
-        use crate::engine::runner::direct::{DirectCommandError, run_direct_command_raw};
-
         // Skip immediately if the agent itself is on cooldown (agent-level)
-        if crate::engine::cooldown::is_agent_in_cooldown(agent) {
+        if cooldown::is_agent_in_cooldown(agent) {
             anyhow::bail!("router LLM {agent} (agent) is on cooldown");
         }
 
         // Skip immediately if this specific agent+model is on cooldown (model-level)
         let model_str = model.unwrap_or("");
-        if crate::engine::runner::response::is_model_in_cooldown(agent, model_str) {
+        if response::is_model_in_cooldown(agent, model_str) {
             anyhow::bail!("router LLM {agent}:{model_str} is on cooldown");
         }
 
-        let mut cmd =
-            crate::engine::runner::agents::get_runner(agent).router_command(prompt, model)?;
+        let mut cmd = agents::get_runner(agent).router_command(prompt, model)?;
 
         match run_direct_command_raw(&mut cmd, timeout).await {
             Ok(stdout) => Ok(stdout),
             Err(DirectCommandError::NonZeroExit { stdout, stderr, .. }) => {
                 // Detect rate limit from stdout (agent exits non-zero on API errors)
-                use crate::engine::runner::agents::AgentError;
-                let runner = crate::engine::runner::agents::get_runner(agent);
+                let runner = agents::get_runner(agent);
                 if let Err(AgentError::RateLimit { .. }) = runner.parse_response(&stdout) {
                     tracing::warn!(
                         agent,
                         model = model.unwrap_or("default"),
                         "router LLM rate limited — adding to cooldown"
                     );
-                    crate::engine::runner::response::record_model_failure(agent, model_str).await;
+                    response::record_model_failure(agent, model_str).await;
                     anyhow::bail!("router LLM rate limited: {agent}:{model_str}");
                 }
 
@@ -1056,7 +1064,7 @@ impl LlmRouter {
                         depth -= 1;
                         if depth == 0 {
                             // candidate from i..=j
-                            if let Ok(candidate) = std::str::from_utf8(&bytes[i..=j])
+                            if let Ok(candidate) = str::from_utf8(&bytes[i..=j])
                                 && let Ok(val) =
                                     serde_json::from_str::<serde_json::Value>(candidate)
                             {
@@ -1252,10 +1260,7 @@ mod tests {
             title: "Test task".to_string(),
             body: "Test body".to_string(),
             state: "open".to_string(),
-            labels: labels
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect(),
+            labels: labels.iter().map(ToString::to_string).collect(),
             author: "testuser".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -1266,10 +1271,7 @@ mod tests {
     fn make_profile(skills: &[&str]) -> AgentProfile {
         AgentProfile {
             role: "developer".to_string(),
-            skills: skills
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect(),
+            skills: skills.iter().map(ToString::to_string).collect(),
             tools: vec!["git".to_string()],
             constraints: vec![],
         }

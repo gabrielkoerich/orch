@@ -10,18 +10,38 @@
 
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
+use crate::engine;
 use crate::engine::cleanup::cleanup_task_worktree;
+use crate::engine::review;
+use crate::engine::review_poll;
+use crate::engine::router::config::RouterConfig;
+use crate::engine::runner::response::ReviewIssue;
 use crate::engine::runner::{git_ops, worktree};
 use crate::engine::tasks::TaskManager;
+use crate::github::app;
 use crate::github::http::GhHttp;
+use crate::github::types::GitHubComment;
 use crate::github::types::{GitHubCheckRun, GitHubPullRequest, GitHubReview, RequiredStatusCheck};
+use crate::store;
+use crate::store::Task;
+use crate::store::TaskStatus;
 use crate::store::TaskStore;
 use crate::store::{
     opt_store_get_task, store_increment, store_reset_failure_counters, store_set_result,
 };
+use crate::tmux::TmuxManager;
+use std::cmp;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::fmt::Write as _;
+use std::io;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::Semaphore;
+use tokio::time;
 
 /// Minimum interval between CI status checks for the same task.
 ///
@@ -84,7 +104,7 @@ async fn is_ci_check_in_cooldown(
 ///
 /// Returns true if the task is already blocked due to a billing failure or other
 /// unrecoverable CI failure. In such cases, there's no point polling CI status.
-fn should_skip_ci_check(stored: &crate::store::Task) -> bool {
+fn should_skip_ci_check(stored: &Task) -> bool {
     let block_reason = stored.block_reason.as_deref().unwrap_or("");
     block_reason.contains("billing")
         || block_reason.contains("payment")
@@ -121,16 +141,13 @@ async fn worktree_matching_pr(
         .await
         .map(|t| t.worktree)
         .filter(|wt| !wt.is_empty())?;
-    let path = std::path::Path::new(&wt);
+    let path = Path::new(&wt);
     let same_repo = pr
         .head
         .repo
         .as_ref()
         .is_some_and(|r| r.full_name.eq_ignore_ascii_case(repo));
-    let on_head = crate::engine::review::worktree_head_sha(path)
-        .await
-        .as_deref()
-        == Some(pr.head.sha.as_str());
+    let on_head = review::worktree_head_sha(path).await.as_deref() == Some(pr.head.sha.as_str());
     let on_branch = git_ops::get_current_branch(path).await == pr.head.ref_;
     let same_base = worktree::detect_default_branch(path).await == pr.base.ref_;
     if same_repo && on_head && on_branch && same_base {
@@ -163,10 +180,7 @@ async fn bring_branch_up_to_date(
 
     match attempt_worktree_rebase_and_force_push(task_id, worktree.clone()).await {
         WorktreeRebaseOutcome::RebasedAndPushed => {
-            crate::engine::review::carry_approval_after_rebase(
-                store, gh, repo, task_id, pr, pr_number,
-            )
-            .await;
+            review::carry_approval_after_rebase(store, gh, repo, task_id, pr, pr_number).await;
             tracing::info!(
                 task_id,
                 pr_number,
@@ -205,7 +219,7 @@ pub(crate) async fn prepare_branch_for_review(
         gh,
         repo,
         pr_number,
-        std::time::Duration::from_secs(10),
+        Duration::from_secs(10),
     )
     .await
     {
@@ -345,7 +359,7 @@ async fn attempt_worktree_rebase_and_force_push(
         return WorktreeRebaseOutcome::Unavailable("no worktree available".to_string());
     };
 
-    let wt_path = std::path::PathBuf::from(&wt);
+    let wt_path = PathBuf::from(&wt);
     if !wt_path.exists() {
         return WorktreeRebaseOutcome::Unavailable(format!("worktree missing: {wt}"));
     }
@@ -356,11 +370,11 @@ async fn attempt_worktree_rebase_and_force_push(
     let branch = git_ops::get_current_branch(&wt_path).await;
     // Lease the feature-branch tip before fetch moves the tracking ref
     git_ops::record_push_lease(&wt_path, &branch, &default_branch).await;
-    let git_timeout = std::time::Duration::from_secs(120);
+    let git_timeout = Duration::from_secs(120);
     // Over HTTPS with the gh token, an SSH remote would ask the owner's SSH agent
-    let fetch_result = tokio::time::timeout(
+    let fetch_result = time::timeout(
         git_timeout,
-        crate::engine::runner::git_ops::git()
+        git_ops::git()
             .await
             .args(["fetch", "origin"])
             .current_dir(&wt_path)
@@ -374,7 +388,7 @@ async fn attempt_worktree_rebase_and_force_push(
             "git fetch timed out in rebase recovery after {}s",
             git_timeout.as_secs()
         );
-        Err(std::io::Error::other("git fetch timed out"))
+        Err(io::Error::other("git fetch timed out"))
     });
 
     let rebase_result = match fetch_result {
@@ -406,7 +420,7 @@ async fn attempt_worktree_rebase_and_force_push(
 
     match rebase_result {
         Ok(git_ops::RebaseOutcome::Succeeded) => {
-            let push_result = tokio::time::timeout(
+            let push_result = time::timeout(
                 git_timeout,
                 git_ops::force_push_leased(&wt_path, &branch, &default_branch),
             )
@@ -526,8 +540,7 @@ pub(crate) async fn sweep_ci_timer_keys(
     repo: &str,
     finished_task_ids: &[String],
 ) -> anyhow::Result<()> {
-    let finished: std::collections::HashSet<&str> =
-        finished_task_ids.iter().map(String::as_str).collect();
+    let finished: HashSet<&str> = finished_task_ids.iter().map(String::as_str).collect();
     let repo_marker = format!("{repo}#");
     for prefix in ["ci_check_ts:", "ci_pending_since:", "review_ci_wait_since:"] {
         for (key, _) in store.kv_list_prefix(prefix).await? {
@@ -601,8 +614,7 @@ async fn handle_pr_rebase_recovery(
             retries,
             merge_error.unwrap_or("merge conflict")
         );
-        let footer =
-            crate::engine::attribution_footer("Commented", review_agent, Some(review_model));
+        let footer = engine::attribution_footer("Commented", review_agent, Some(review_model));
         if let Err(e) = gh
             .add_comment(repo, &pr_number.to_string(), &format!("{comment}{footer}"))
             .await
@@ -724,8 +736,7 @@ async fn handle_pr_rebase_recovery(
                 tracing::error!(task_id = task.id.0, err = %e, "failed to write SSH-fetch block_reason and set Blocked");
                 return Ok(());
             }
-            let footer =
-                crate::engine::attribution_footer("Commented", review_agent, Some(review_model));
+            let footer = engine::attribution_footer("Commented", review_agent, Some(review_model));
             let comment = format!(
                 "Auto-merge could not rebase because `git fetch origin` failed with an SSH agent error: {}",
                 stderr.trim()
@@ -756,8 +767,7 @@ async fn handle_pr_rebase_recovery(
                 tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason and set Blocked");
                 return Ok(());
             }
-            let footer =
-                crate::engine::attribution_footer("Commented", review_agent, Some(review_model));
+            let footer = engine::attribution_footer("Commented", review_agent, Some(review_model));
             if let Err(e) = gh
                 .add_comment(repo, &pr_number.to_string(), &format!("{comment}{footer}"))
                 .await
@@ -841,22 +851,22 @@ async fn poll_mergeable_until(
     gh: &GhHttp,
     repo: &str,
     pr_number: u64,
-    max_wait: std::time::Duration,
+    max_wait: Duration,
 ) -> anyhow::Result<(GitHubPullRequest, bool)> {
-    let interval = std::time::Duration::from_secs(2);
-    let deadline = std::time::Instant::now() + max_wait;
+    let interval = Duration::from_secs(2);
+    let deadline = Instant::now() + max_wait;
     loop {
         let pr = gh.get_pr(repo, pr_number).await?;
         match pr.mergeable {
             Some(false) => return Ok((pr, true)),
             Some(true) => return Ok((pr, false)),
             None => {
-                if std::time::Instant::now() >= deadline {
+                if Instant::now() >= deadline {
                     anyhow::bail!("PR mergeability not yet computed — retry");
                 }
-                let remaining = deadline - std::time::Instant::now();
-                let sleep_for = std::cmp::min(remaining, interval);
-                tokio::time::sleep(sleep_for).await;
+                let remaining = deadline - Instant::now();
+                let sleep_for = cmp::min(remaining, interval);
+                time::sleep(sleep_for).await;
             }
         }
     }
@@ -1124,7 +1134,7 @@ pub(crate) async fn auto_merge_pr(
     // unrecoverable failures (billing, CI failure limit, etc.). No point
     // polling CI for a task that will never be unblocked.
     if let Some(stored_task) = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0).await
-        && stored_task.status == crate::store::TaskStatus::Blocked
+        && stored_task.status == TaskStatus::Blocked
         && should_skip_ci_check(&stored_task)
     {
         tracing::debug!(
@@ -1200,19 +1210,12 @@ pub(crate) async fn auto_merge_pr(
                 // Validate the PR's head ref matches our branch before treating as closed
                 match gh.get_pr(repo, closed_pr_number).await {
                     Ok(pr) if pr.head.ref_ == branch => {
-                        let approved = crate::store::opt_store_get_task(
-                            &Some(std::sync::Arc::clone(store)),
-                            repo,
-                            &task.id.0,
-                        )
-                        .await
-                        .is_some_and(|t| t.status == crate::store::TaskStatus::Approved);
+                        let approved =
+                            store::opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
+                                .await
+                                .is_some_and(|t| t.status == TaskStatus::Approved);
                         if approved {
-                            crate::engine::review_poll::block_closed_approved_pr(
-                                task_manager,
-                                &task.id,
-                            )
-                            .await;
+                            review_poll::block_closed_approved_pr(task_manager, &task.id).await;
                             return Ok(());
                         }
 
@@ -1331,7 +1334,7 @@ pub(crate) async fn auto_merge_pr(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(15);
-    let max_wait = std::time::Duration::from_secs(max_wait_secs);
+    let max_wait = Duration::from_secs(max_wait_secs);
     let mut poll_count: u32 = 0;
 
     // Poll for mergeability to avoid deferring to the next sync tick (~10-45s)
@@ -1348,7 +1351,7 @@ pub(crate) async fn auto_merge_pr(
         &gh,
         repo,
         pr_number,
-        std::time::Duration::from_secs(mergeability_poll_secs),
+        Duration::from_secs(mergeability_poll_secs),
     )
     .await?;
     if has_conflict {
@@ -1368,10 +1371,7 @@ pub(crate) async fn auto_merge_pr(
     }
     let head_sha = pr.head.sha.clone();
     let base_branch = pr.base.ref_.clone();
-    crate::engine::review::carry_approval_across_base_update(
-        store, &gh, repo, &task.id.0, &pr, pr_number,
-    )
-    .await;
+    review::carry_approval_across_base_update(store, &gh, repo, &task.id.0, &pr, pr_number).await;
     let required_contexts = gh
         .get_required_status_check_contexts(repo, &base_branch)
         .await?;
@@ -1409,9 +1409,7 @@ pub(crate) async fn auto_merge_pr(
         // that is_billing_failure can reuse them without a redundant API call.
         let mut prefetched_check_runs: Option<Vec<GitHubCheckRun>> = None;
         let (state, total, passing, failing, pending) = {
-            let _permit = std::sync::Arc::clone(ci_poll_semaphore())
-                .acquire_owned()
-                .await;
+            let _permit = Arc::clone(ci_poll_semaphore()).acquire_owned().await;
             if required_contexts.is_empty() {
                 gh.get_combined_status(
                     repo,
@@ -1592,7 +1590,7 @@ pub(crate) async fn auto_merge_pr(
                                     tracing::error!(task_id = task.id.0, err = %e, "failed to write SSH-fetch block_reason and set Blocked after behind-branch CI failure");
                                     return Ok(());
                                 }
-                                let footer = crate::engine::attribution_footer(
+                                let footer = engine::attribution_footer(
                                     "Commented",
                                     review_agent,
                                     Some(review_model),
@@ -1637,7 +1635,7 @@ pub(crate) async fn auto_merge_pr(
                                     tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason and set Blocked after behind-branch rebase push failure");
                                     return Ok(());
                                 }
-                                let footer = crate::engine::attribution_footer(
+                                let footer = engine::attribution_footer(
                                     "Commented",
                                     review_agent,
                                     Some(review_model),
@@ -1883,14 +1881,14 @@ pub(crate) async fn auto_merge_pr(
         poll_count += 1;
         let multiplier = (2_u64).pow(poll_count.saturating_sub(1)).min(4);
         let sleep_secs = base_interval_secs.saturating_mul(multiplier);
-        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+        time::sleep(Duration::from_secs(sleep_secs)).await;
     }
 
     // 5. Re-verify no reviewer has requested changes since the CI wait started.
-    let post_ci_reviews = crate::github::app::reviews_for_gate(
+    let post_ci_reviews = app::reviews_for_gate(
         &gh.get_pr_reviews(repo, pr_number).await?,
         &head_sha,
-        crate::github::app::bot_login().await.as_deref(),
+        app::bot_login().await.as_deref(),
     );
     if any_changes_requested_in_reviews(&post_ci_reviews) {
         tracing::warn!(
@@ -2033,8 +2031,7 @@ pub(crate) async fn auto_merge_pr(
             return Ok(());
         }
         let comment = format!("Auto-merge failed: {e}");
-        let footer =
-            crate::engine::attribution_footer("Commented", review_agent, Some(review_model));
+        let footer = engine::attribution_footer("Commented", review_agent, Some(review_model));
         if let Err(e) = gh
             .add_comment(repo, &pr_number.to_string(), &format!("{comment}{footer}"))
             .await
@@ -2070,7 +2067,7 @@ pub(crate) async fn auto_merge_pr(
     }
 
     // Kill any orphaned review session that might be racing us
-    let tmux = crate::tmux::TmuxManager::new();
+    let tmux = TmuxManager::new();
     let stale_session = tmux.session_name(repo, &format!("{}-review", task.id.0));
     if let Err(e) = tmux.kill_session(&stale_session).await {
         tracing::debug!(task_id = task.id.0, error = %e, "failed to kill stale review session after auto-merge");
@@ -2078,7 +2075,7 @@ pub(crate) async fn auto_merge_pr(
 
     // 8. Post final comment on the PR
     let comment = "✅ PR reviewed, approved, and merged.";
-    let footer = crate::engine::attribution_footer("Reviewed", review_agent, Some(review_model));
+    let footer = engine::attribution_footer("Reviewed", review_agent, Some(review_model));
     if let Err(e) = gh
         .add_comment(repo, &pr_number.to_string(), &format!("{comment}{footer}"))
         .await
@@ -2140,7 +2137,7 @@ async fn branch_newer_than_last_review(
 
     // Defensive: find the latest automated review comment by created_at rather
     // than relying on the iteration order returned by the API.
-    let mut latest: Option<&crate::github::types::GitHubComment> = None;
+    let mut latest: Option<&GitHubComment> = None;
     for c in &comments {
         if !c.body.starts_with("## Automated Review") {
             continue;
@@ -2247,7 +2244,7 @@ async fn required_ci_checks_pass(gh: &GhHttp, repo: &str, pr_number: u64) -> Opt
 pub(crate) async fn handle_review_changes(
     task: &ExternalTask,
     notes: &str,
-    issues: &[crate::engine::runner::response::ReviewIssue],
+    issues: &[ReviewIssue],
     _backend: &Arc<dyn ExternalBackend>,
     repo: &str,
     pr_number: u64,
@@ -2255,10 +2252,8 @@ pub(crate) async fn handle_review_changes(
     review_model: &str,
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
-    router_config: &crate::engine::router::config::RouterConfig,
+    router_config: &RouterConfig,
 ) -> anyhow::Result<()> {
-    use std::fmt::Write as _;
-
     // 1. Check review cycle count (max 2 review rounds)
     let task_store_record = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0).await;
     let review_cycles: u32 = task_store_record
@@ -2364,7 +2359,7 @@ pub(crate) async fn handle_review_changes(
                             "🔄 Auto-recovery: required CI checks pass. \
                         The review agent may have been blocked by a non-required check failure. \
                         Resetting review cycles and re-triggering review.{}",
-                            crate::engine::attribution_footer(
+                            engine::attribution_footer(
                                 "Commented",
                                 review_agent,
                                 Some(review_model)
@@ -2437,8 +2432,7 @@ pub(crate) async fn handle_review_changes(
         let escalation = format!(
             "🔍 Review agent requested changes after {review_cycles} cycles. Escalating to human.\n\n**Review Notes:**\n{notes}"
         );
-        let footer =
-            crate::engine::attribution_footer("Commented", review_agent, Some(review_model));
+        let footer = engine::attribution_footer("Commented", review_agent, Some(review_model));
         if let Err(e) = gh
             .add_comment(repo, &pr_num_str, &format!("{escalation}{footer}"))
             .await
@@ -2497,7 +2491,7 @@ pub(crate) async fn handle_review_changes(
     let previous_agent = task_store_record
         .as_ref()
         .and_then(|t| t.agent.as_ref())
-        .map_or("", std::string::String::as_str);
+        .map_or("", String::as_str);
     let complexity = task_store_record.as_ref().map_or_else(
         || "medium".to_string(),
         |t| {
@@ -2631,7 +2625,14 @@ mod tests {
     use super::*;
     use crate::backends::test_helpers::NoopBackend;
     use crate::backends::{ExternalId, ExternalTask};
+    use crate::engine::router;
+    use crate::engine::tasks::TaskManager;
+    use crate::github::types::GitHubApp;
+    use crate::github::types::GitHubBranchRef;
     use crate::github::types::{GitHubReview, GitHubUser};
+    use crate::store::NewTask;
+    use crate::store::TaskStatus;
+    use crate::store::TaskStore;
 
     #[test]
     fn mergeable_state_ready_accepts_only_clean_states() {
@@ -2751,7 +2752,7 @@ mod tests {
             name: name.to_string(),
             status: status.to_string(),
             conclusion: conclusion.map(str::to_string),
-            app: app_id.map(|id| crate::github::types::GitHubApp { id }),
+            app: app_id.map(|id| GitHubApp { id }),
         }
     }
 
@@ -2917,14 +2918,11 @@ mod tests {
     /// reuses existing routing context instead of forcing full LLM re-routing.
     #[tokio::test]
     async fn handle_review_changes_sets_routed_with_valid_model() {
-        use crate::engine::tasks::TaskManager;
-        use crate::store::{TaskStatus, TaskStore};
-
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let repo = "owner/repo";
 
         let task_id_num = store
-            .create(&crate::store::NewTask {
+            .create(&NewTask {
                 external_id: None,
                 repo: repo.to_string(),
                 origin: "internal".to_string(),
@@ -2940,12 +2938,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .update_status(task_id_num, crate::store::TaskStatus::InReview)
+            .update_status(task_id_num, TaskStatus::InReview)
             .await
             .unwrap();
 
         let task_id_str = format!("internal:{task_id_num}");
-        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(NoopBackend);
+        let backend: Arc<dyn ExternalBackend> = Arc::new(NoopBackend);
         let task_manager = Arc::new(TaskManager::with_store(
             Arc::clone(&backend),
             Arc::clone(&store),
@@ -2975,7 +2973,7 @@ mod tests {
             "sonnet",
             &task_manager,
             &store,
-            &crate::engine::router::RouterConfig::default(),
+            &router::RouterConfig::default(),
         )
         .await;
 
@@ -3027,14 +3025,11 @@ mod tests {
     /// When all models are cooled, it falls back to New for full re-route (#1723).
     #[tokio::test]
     async fn handle_review_changes_resolves_valid_model_or_falls_back() {
-        use crate::engine::tasks::TaskManager;
-        use crate::store::{TaskStatus, TaskStore};
-
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let repo = "owner/repo";
 
         let task_id_num = store
-            .create(&crate::store::NewTask {
+            .create(&NewTask {
                 external_id: None,
                 repo: repo.to_string(),
                 origin: "internal".to_string(),
@@ -3050,7 +3045,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .update_status(task_id_num, crate::store::TaskStatus::InReview)
+            .update_status(task_id_num, TaskStatus::InReview)
             .await
             .unwrap();
 
@@ -3074,7 +3069,7 @@ mod tests {
             .unwrap();
 
         let task_id_str = format!("internal:{task_id_num}");
-        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(NoopBackend);
+        let backend: Arc<dyn ExternalBackend> = Arc::new(NoopBackend);
         let task_manager = Arc::new(TaskManager::with_store(
             Arc::clone(&backend),
             Arc::clone(&store),
@@ -3104,7 +3099,7 @@ mod tests {
             "opus",
             &task_manager,
             &store,
-            &crate::engine::router::RouterConfig::default(),
+            &router::RouterConfig::default(),
         )
         .await;
 
@@ -3163,14 +3158,11 @@ mod tests {
     /// `None` and `update_task_status` returns `Err` for that internal task.
     #[tokio::test]
     async fn handle_review_changes_transition_failure_returns_ok() {
-        use crate::engine::tasks::TaskManager;
-        use crate::store::{TaskStatus, TaskStore};
-
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let task_repo = "owner/repo";
 
         let task_id_num = store
-            .create(&crate::store::NewTask {
+            .create(&NewTask {
                 external_id: None,
                 repo: task_repo.to_string(),
                 origin: "internal".to_string(),
@@ -3186,12 +3178,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .update_status(task_id_num, crate::store::TaskStatus::InReview)
+            .update_status(task_id_num, TaskStatus::InReview)
             .await
             .unwrap();
 
         let task_id_str = format!("internal:{task_id_num}");
-        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(NoopBackend);
+        let backend: Arc<dyn ExternalBackend> = Arc::new(NoopBackend);
 
         // Intentionally wrong repo — causes resolve_task_id to return None,
         // which makes update_task_status return Err for the internal task.
@@ -3227,7 +3219,7 @@ mod tests {
             "sonnet",
             &task_manager,
             &store,
-            &crate::engine::router::RouterConfig::default(),
+            &router::RouterConfig::default(),
         )
         .await;
 
@@ -3292,12 +3284,12 @@ mod tests {
             title: "Test PR".to_string(),
             body: None,
             state: "open".to_string(),
-            head: crate::github::types::GitHubBranchRef {
+            head: GitHubBranchRef {
                 ref_: "feature/test".to_string(),
                 sha: "abc123".to_string(),
                 repo: None,
             },
-            base: crate::github::types::GitHubBranchRef {
+            base: GitHubBranchRef {
                 ref_: "main".to_string(),
                 sha: "def456".to_string(),
                 repo: None,
@@ -3356,14 +3348,11 @@ mod tests {
     /// through to the normal Blocked path.
     #[tokio::test]
     async fn handle_review_changes_escalates_when_stale_check_fails() {
-        use crate::engine::tasks::TaskManager;
-        use crate::store::{TaskStatus, TaskStore};
-
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let repo = "owner/repo";
 
         let task_id_num = store
-            .create(&crate::store::NewTask {
+            .create(&NewTask {
                 external_id: None,
                 repo: repo.to_string(),
                 origin: "internal".to_string(),
@@ -3390,7 +3379,7 @@ mod tests {
             .unwrap();
 
         let task_id_str = format!("internal:{task_id_num}");
-        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(NoopBackend);
+        let backend: Arc<dyn ExternalBackend> = Arc::new(NoopBackend);
         let task_manager = Arc::new(TaskManager::with_store(
             Arc::clone(&backend),
             Arc::clone(&store),
@@ -3422,7 +3411,7 @@ mod tests {
             "minimax-m2",
             &task_manager,
             &store,
-            &crate::engine::router::RouterConfig::default(),
+            &router::RouterConfig::default(),
         )
         .await;
 
@@ -3445,8 +3434,6 @@ mod tests {
     /// not reset to zero each time like a function-local `Instant` would.
     #[tokio::test]
     async fn ci_pending_elapsed_persists_across_calls() {
-        use crate::store::TaskStore;
-
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let task_id = "internal:1";
 
@@ -3504,8 +3491,6 @@ mod tests {
     /// continuously well past `max_wait`.
     #[tokio::test]
     async fn ci_pending_elapsed_atomic_insert_survives_concurrent_racers() {
-        use crate::store::TaskStore;
-
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let task_id = "internal:2";
 
@@ -3535,8 +3520,6 @@ mod tests {
 
     #[tokio::test]
     async fn ci_pending_window_is_per_repo_and_per_head() {
-        use crate::store::TaskStore;
-
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backdated = chrono::Utc::now() - chrono::Duration::days(3);
         store
@@ -3584,8 +3567,6 @@ mod tests {
 
     #[tokio::test]
     async fn ci_check_cooldown_is_per_repo() {
-        use crate::store::TaskStore;
-
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         record_ci_check(&store, "a/x", "5").await.unwrap();
         assert!(is_ci_check_in_cooldown(&store, "a/x", "5").await.unwrap());
@@ -3594,8 +3575,6 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_removes_finished_task_and_legacy_keys() {
-        use crate::store::TaskStore;
-
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         record_ci_check(&store, REPO, "7").await.unwrap();
         record_ci_check(&store, REPO, "8").await.unwrap();

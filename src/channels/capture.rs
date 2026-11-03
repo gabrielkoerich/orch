@@ -12,11 +12,18 @@
 use crate::channels::OutputChunk;
 use crate::channels::tmux;
 use crate::channels::transport::{Transport, session_key};
+use crate::engine::suspend;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio::time;
 
 pub(crate) const MAX_OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
 
@@ -64,11 +71,11 @@ pub struct CaptureService {
     /// Transport layer for broadcasting output
     transport: Arc<Transport>,
     /// Polling interval
-    interval: std::time::Duration,
+    interval: Duration,
 }
 
-impl std::fmt::Debug for CaptureService {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for CaptureService {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("CaptureService")
             .field("interval", &self.interval)
             .finish_non_exhaustive()
@@ -81,7 +88,7 @@ impl CaptureService {
         Self {
             buffers: Arc::new(RwLock::new(HashMap::new())),
             transport,
-            interval: std::time::Duration::from_secs(2),
+            interval: Duration::from_secs(2),
         }
     }
 
@@ -143,7 +150,7 @@ impl CaptureService {
             interval_secs = self.interval.as_secs(),
             "capture service started"
         );
-        let mut interval = tokio::time::interval(self.interval);
+        let mut interval = time::interval(self.interval);
 
         loop {
             interval.tick().await;
@@ -156,7 +163,7 @@ impl CaptureService {
     /// This returns when no more sessions are registered, making it suitable
     /// for CLI streaming where the capture should stop when the session ends.
     pub async fn run(&self) {
-        let mut interval = tokio::time::interval(self.interval);
+        let mut interval = time::interval(self.interval);
 
         loop {
             interval.tick().await;
@@ -190,7 +197,7 @@ impl CaptureService {
     pub async fn get_silent_sessions_for_repo(
         &self,
         repo: &str,
-        grace_period: std::time::Duration,
+        grace_period: Duration,
     ) -> Vec<(String, String, i64)> {
         let now = Utc::now();
         let buffers = self.buffers.read().await;
@@ -245,7 +252,7 @@ impl CaptureService {
             // of a hung agent. Discount any detected suspend/resume gaps that occurred
             // since the session was registered, mirroring the watchdog fix in
             // engine::tick (`stuck_task_timing_from_map`).
-            let suspended = crate::engine::suspend::suspended_duration_since(buf.registered_at);
+            let suspended = suspend::suspended_duration_since(buf.registered_at);
             let age = (raw_age - suspended).max(chrono::Duration::zero());
             if age.num_seconds() > i64::try_from(grace_period.as_secs()).unwrap_or(i64::MAX) {
                 silent.push((buf.task_id.clone(), buf.session.clone(), age.num_seconds()));
@@ -364,8 +371,8 @@ impl OutputBuffer {
         let new_content = match self.last_len.cmp(&current_len) {
             // Content shrank (terminal cleared) — no incremental diff available.
             // Emitting full current_content would duplicate already-broadcast output.
-            std::cmp::Ordering::Greater => String::new(),
-            std::cmp::Ordering::Equal => {
+            Ordering::Greater => String::new(),
+            Ordering::Equal => {
                 // Same-length overwrite (e.g. spinner/progress refresh).
                 // Find the longest common prefix and return only the changed suffix.
                 let common_prefix = self
@@ -381,7 +388,7 @@ impl OutputBuffer {
                 }
                 current_content[start..].to_string()
             }
-            std::cmp::Ordering::Less => {
+            Ordering::Less => {
                 let mut offset = self.last_len;
                 while offset < current_len && !current_content.is_char_boundary(offset) {
                     offset += 1;
@@ -434,7 +441,7 @@ impl CaptureService {
         has_output: bool,
         registered_at: chrono::DateTime<Utc>,
     ) {
-        let skey = crate::channels::transport::session_key(repo, task_id);
+        let skey = session_key(repo, task_id);
         let mut buffers = self.buffers.write().await;
         let buf = buffers
             .get_mut(&skey)
@@ -447,6 +454,8 @@ impl CaptureService {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use crate::channels::transport::Transport;
 
@@ -611,7 +620,7 @@ mod tests {
         svc.register_session(repo, "new-task", "orch-test-new")
             .await;
 
-        let grace = std::time::Duration::from_secs(120);
+        let grace = Duration::from_secs(120);
         let silent = svc.get_silent_sessions_for_repo(repo, grace).await;
         assert_eq!(silent.len(), 1);
         assert_eq!(silent[0].0, "silent-task");
@@ -667,7 +676,7 @@ mod tests {
         )
         .await;
 
-        let grace = std::time::Duration::from_secs(120);
+        let grace = Duration::from_secs(120);
         let silent = svc.get_silent_sessions_for_repo(repo, grace).await;
         // Both sessions should be returned: "never-seen-task" was never alive, and
         // "seen-but-dead-task" was alive but the tmux session is now dead with no output.
@@ -676,8 +685,7 @@ mod tests {
             2,
             "both never-alive and dead-with-no-output sessions must be silenced"
         );
-        let ids: std::collections::HashSet<&str> =
-            silent.iter().map(|(id, _, _)| id.as_str()).collect();
+        let ids: HashSet<&str> = silent.iter().map(|(id, _, _)| id.as_str()).collect();
         assert!(ids.contains("never-seen-task"));
         assert!(ids.contains("seen-but-dead-task"));
     }
@@ -708,7 +716,7 @@ mod tests {
         )
         .await;
 
-        let grace = std::time::Duration::from_secs(120);
+        let grace = Duration::from_secs(120);
         let silent_a = svc
             .get_silent_sessions_for_repo("owner/repo-a", grace)
             .await;
@@ -804,7 +812,7 @@ mod tests {
         svc.register_session(repo, "task-42", "orch-new-session")
             .await;
 
-        let grace = std::time::Duration::from_secs(120);
+        let grace = Duration::from_secs(120);
         let silent = svc.get_silent_sessions_for_repo(repo, grace).await;
 
         // The stale old-generation entry must be skipped.
