@@ -33,6 +33,11 @@ enum CiState {
     Red(Vec<String>),
 }
 
+/// Prefix shared by the no-checks wait timers of every head of one task
+fn review_ci_wait_since_prefix(repo: &str, task_id: &str) -> String {
+    format!("review_ci_wait_since:{repo}#{task_id}#")
+}
+
 /// Decide whether the review of `pr_number` may start
 pub(crate) async fn review_ci_gate(
     gh: &GhHttp,
@@ -55,7 +60,8 @@ pub(crate) async fn review_ci_gate(
 
     let runs = gh.get_check_runs(repo, &sha).await?;
     let statuses = gh.get_commit_status_contexts(repo, &sha).await?;
-    let wait_key = format!("review_ci_wait_since:{repo}#{task_id}#{sha}");
+    let wait_prefix = review_ci_wait_since_prefix(repo, task_id);
+    let wait_key = format!("{wait_prefix}{sha}");
     let state = match ci_state(&required, &runs, &statuses) {
         CiState::Red(failed) => {
             // A check that never started for an Actions billing limit did not run, it did not fail
@@ -78,12 +84,7 @@ pub(crate) async fn review_ci_gate(
         CiState::Red(failed) => CiGate::Red(failed),
         CiState::NotStarted => {
             let now = chrono::Utc::now().timestamp();
-            let since = if let Some(v) = store.kv_get(&wait_key).await? {
-                v.parse().unwrap_or(now)
-            } else {
-                store.kv_set(&wait_key, &now.to_string()).await?;
-                now
-            };
+            let since = wait_since(store, &wait_prefix, &wait_key, now).await?;
             CiGate::NotStarted {
                 waited_out: now - since >= NO_CHECKS_WAIT_SECS,
             }
@@ -97,6 +98,24 @@ pub(crate) async fn review_ci_gate(
     }
 
     Ok(gate)
+}
+
+/// When the wait on this head began. A head with no timer yet starts one and drops the timers
+/// of earlier heads of the task
+async fn wait_since(
+    store: &Arc<TaskStore>,
+    prefix: &str,
+    key: &str,
+    now: i64,
+) -> anyhow::Result<i64> {
+    if let Some(v) = store.kv_get(key).await? {
+        return Ok(v.parse().unwrap_or(now));
+    }
+    for (old_key, _) in store.kv_list_prefix(prefix).await? {
+        store.kv_delete(&old_key).await?;
+    }
+    store.kv_set(key, &now.to_string()).await?;
+    Ok(now)
 }
 
 /// The check runs whose name is one of the failed checks. A failed commit status has no run
@@ -170,6 +189,57 @@ mod tests {
             conclusion: conclusion.map(String::from),
             app: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_head_change_leaves_one_wait_key() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let prefix = review_ci_wait_since_prefix("a/x", "7");
+        let other = review_ci_wait_since_prefix("a/x", "8");
+        store.kv_set(&format!("{other}old"), "1").await.unwrap();
+
+        let first = wait_since(&store, &prefix, &format!("{prefix}aaa"), 100)
+            .await
+            .unwrap();
+        let again = wait_since(&store, &prefix, &format!("{prefix}aaa"), 200)
+            .await
+            .unwrap();
+        wait_since(&store, &prefix, &format!("{prefix}bbb"), 300)
+            .await
+            .unwrap();
+
+        assert_eq!((first, again), (100, 100));
+        let keys: Vec<String> = store
+            .kv_list_prefix(&prefix)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, [format!("{prefix}bbb")]);
+        assert!(
+            store
+                .kv_get(&format!("{other}old"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sweep_removes_the_wait_key_of_a_finished_task() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let done = format!("{}aaa", review_ci_wait_since_prefix("a/x", "7"));
+        let live = format!("{}aaa", review_ci_wait_since_prefix("a/x", "8"));
+        store.kv_set(&done, "1").await.unwrap();
+        store.kv_set(&live, "1").await.unwrap();
+
+        crate::engine::auto_merge::sweep_ci_timer_keys(&store, "a/x", &["7".to_string()])
+            .await
+            .unwrap();
+
+        assert!(store.kv_get(&done).await.unwrap().is_none());
+        assert!(store.kv_get(&live).await.unwrap().is_some());
     }
 
     fn required(name: &str) -> RequiredStatusCheck {
