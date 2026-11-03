@@ -360,12 +360,16 @@ pub async fn prepare_task(
         branch: wt.branch.clone(),
     };
 
-    // Increment attempts counter — must succeed so max_attempts guard cannot be bypassed
+    // Increment attempts counter — must succeed so max_attempts guard cannot be bypassed.
+    // Also clears last_error, so a failover's error never reads as this run's outcome
     if let Err(e) = store::store_set_result(
         store,
         repo,
         task_id,
-        &[("attempts", serde_json::json!(next_attempt))],
+        &[
+            ("attempts", serde_json::json!(next_attempt)),
+            ("last_error", serde_json::json!("")),
+        ],
     )
     .await
     {

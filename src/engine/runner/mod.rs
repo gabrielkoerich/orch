@@ -1869,8 +1869,8 @@ async fn update_agent_label_after_reroute(
     true
 }
 
-/// Weight signal for a run that ended in `needs_review`. A completed run clears `last_error`,
-/// so a non-empty value means `handle_error` ended the run (timeout, no fallback, exhausted agents)
+/// Weight signal for a run that ended in `needs_review`. `prepare_task` clears `last_error` at run
+/// start, so a non-empty value means `handle_error` ended this run
 fn needs_review_signal(last_error: &str, agent: &str) -> WeightSignal {
     let agent = agent.to_string();
     if classify_run_error_type(last_error) == "rate_limit" {
