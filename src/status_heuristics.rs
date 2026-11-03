@@ -34,17 +34,7 @@ pub fn status_looks_like_descriptive_completion(status: &str) -> bool {
         "already implemented",
     ]
     .iter()
-    .any(|cue| normalized.contains(cue))
-        || normalized.ends_with("_addressed")
-        || normalized.ends_with("_skipped")
-        || normalized.ends_with("_done")
-        || normalized.ends_with("_fixed")
-        || normalized.ends_with("_complete")
-        || normalized.ends_with("_completed")
-        || normalized.ends_with("_resolved")
-        || normalized.ends_with("_handled")
-        || normalized.ends_with("_applied")
-        || normalized.ends_with("_patched");
+    .any(|cue| normalized.contains(cue));
 
     if !has_success_cue {
         return false;
@@ -122,5 +112,101 @@ mod tests {
             "waiting_on_dependency"
         ));
         assert!(!status_looks_like_descriptive_completion(""));
+    }
+
+    #[test]
+    fn every_success_cue_is_completion() {
+        for cue in [
+            "complete",
+            "completed",
+            "done",
+            "finished",
+            "success",
+            "succeeded",
+            "resolved",
+            "applied",
+            "patched",
+            "handled",
+            "closed",
+            "acknowledged",
+            "fixed",
+            "verified",
+            "skipped",
+            "merged",
+            "implemented",
+            "addressed",
+            "nothing to do",
+            "nothing to trade",
+            "no changes needed",
+            "already implemented",
+        ] {
+            assert!(status_looks_like_descriptive_completion(cue), "{cue}");
+        }
+    }
+
+    #[test]
+    fn underscore_suffixes_are_completion() {
+        for suffix in [
+            "addressed",
+            "skipped",
+            "done",
+            "fixed",
+            "complete",
+            "completed",
+            "resolved",
+            "handled",
+            "applied",
+            "patched",
+        ] {
+            let status = format!("issue_{suffix}");
+            assert!(
+                status_looks_like_descriptive_completion(&status),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_failure_cue_wins_over_success() {
+        for cue in [
+            "error",
+            "failed",
+            "failure",
+            "blocked",
+            "cannot",
+            "can't",
+            "unable",
+            "retry",
+            "rate limit",
+            "timed out",
+            "incomplete",
+            "unresolved",
+            "unsuccessful",
+            "unaddressed",
+            "unhandled",
+            "unverified",
+            "unapplied",
+            "unpatched",
+            "not fixed",
+            "not_fixed",
+            "not done",
+            "not_done",
+            "overdue",
+        ] {
+            let status = format!("done {cue}");
+            assert!(
+                !status_looks_like_descriptive_completion(&status),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_is_trimmed_and_case_insensitive() {
+        assert!(status_looks_like_descriptive_completion("  DONE \n"));
+        assert!(!status_looks_like_descriptive_completion(
+            "  Done But FAILED "
+        ));
+        assert!(!status_looks_like_descriptive_completion("   "));
     }
 }
