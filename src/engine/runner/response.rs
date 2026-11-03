@@ -1056,6 +1056,8 @@ pub async fn store_failure_memory(
 #[cfg(test)]
 mod tests {
     use std::env;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::process;
 
     use super::*;
@@ -2195,8 +2197,6 @@ That's all."#;
     /// runs in its own process, so the environment is not restored
     #[cfg(unix)]
     fn failover_env() -> tempfile::TempDir {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
         fs::create_dir(&bin).unwrap();
