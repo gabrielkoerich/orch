@@ -689,6 +689,14 @@ impl RouterConfig {
         }
     }
 
+    /// True when `complexity` or any adjacent tier has a model out of cooldown, the same search
+    /// `model_for_complexity_or_adjacent` runs
+    pub fn has_available_model_in_any_tier(&self, agent: &str, complexity: &str) -> bool {
+        Self::tier_search_order(complexity)
+            .into_iter()
+            .any(|tier| self.has_available_model_for_complexity(agent, tier))
+    }
+
     /// Get the model for a given agent and complexity level.
     ///
     /// When the complexity tier has a pool of models, selects randomly using

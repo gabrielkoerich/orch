@@ -565,7 +565,7 @@ impl Router {
         }
         if !self
             .config
-            .has_available_model_for_complexity(agent, complexity)
+            .has_available_model_in_any_tier(agent, complexity)
         {
             tracing::debug!(agent, complexity, "agent skipped: no available model");
             return false;
@@ -2774,6 +2774,39 @@ Hope that helps!"#;
         let result = router.route(&task, &store, "test/repo").await.unwrap();
         assert_eq!(result.agent, "codex");
         assert!(result.reason.contains("label"));
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn route_takes_the_adjacent_tier_model_when_the_own_tier_is_cooled() {
+        cooldown::reset_global_state().await;
+        let agent = "tierroute_agent";
+        let mut config = RouterConfig {
+            agents: vec![agent.to_string()],
+            ..Default::default()
+        };
+        config.model_map.clear();
+        for (tier, model) in [("medium", "tr-m"), ("complex", "tr-c")] {
+            config
+                .model_map
+                .entry(tier.to_string())
+                .or_default()
+                .insert(agent.to_string(), vec![model.to_string()]);
+        }
+        cooldown::record_model_failure(agent, "tr-m").await;
+        let mut router = Router::new_for_test(config, vec![agent.to_string()]);
+
+        let task = create_test_task(
+            "1",
+            "Test task",
+            vec![format!("agent:{agent}"), "complexity:medium".to_string()],
+        );
+        let store = test_store().await;
+        let result = router.route(&task, &store, "test/repo").await.unwrap();
+        assert_eq!(result.agent, agent);
+        assert_eq!(result.model.as_deref(), Some("tr-c"));
+        assert_eq!(result.complexity, "medium");
+        assert!(result.warning.unwrap().contains("complex tier"));
     }
 
     #[serial(cooldown_state)]
