@@ -1493,17 +1493,25 @@ async fn dependency_tree(focus: Option<i64>) -> anyhow::Result<()> {
                 &edge.depends_on_repo,
                 edge.depends_on_number,
             );
-            let done = store
+            let snap = store
                 .blocker_snapshot(&edge.depends_on_repo, edge.depends_on_number)
                 .await
                 .ok()
-                .flatten()
-                .is_some_and(|snap| snap.is_satisfied());
-            let state = if done { "done" } else { "open" };
+                .flatten();
+            let state = blocker_state_label(snap.as_ref());
             println!("  blocked by {label} [{state}]");
         }
     }
     Ok(())
+}
+
+fn blocker_state_label(snap: Option<&crate::store::BlockerSnapshot>) -> String {
+    match snap {
+        Some(snap) => snap
+            .unsatisfied_reason()
+            .unwrap_or_else(|| "done".to_string()),
+        None => "open".to_string(),
+    }
 }
 
 /// List what a task waits on, and what waits on it.
@@ -1523,11 +1531,10 @@ pub async fn deps(id: &str) -> anyhow::Result<()> {
     }
     for dep in dependencies {
         let label = dep_label(&task.repo, &dep.depends_on_repo, dep.depends_on_number);
-        let done = store
+        let snap = store
             .blocker_snapshot(&dep.depends_on_repo, dep.depends_on_number)
-            .await?
-            .is_some_and(|snap| snap.is_satisfied());
-        let state = if done { "done" } else { "open" };
+            .await?;
+        let state = blocker_state_label(snap.as_ref());
         let local = dep.blocker_status.as_deref().unwrap_or("untracked");
         println!("  {label}  {state}  local:{local}  source:{}", dep.source);
     }

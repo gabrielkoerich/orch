@@ -184,6 +184,35 @@ impl BlockerSnapshot {
         }
         self.issue_state == "closed" && (reason.is_empty() || reason == "completed")
     }
+
+    /// Why the blocker is not done, for the CLI. `None` when it is satisfied
+    pub fn unsatisfied_reason(&self) -> Option<String> {
+        if self.is_satisfied() {
+            return None;
+        }
+        let reason = self.state_reason.as_deref().unwrap_or("");
+        if self.issue_state != "closed" {
+            return Some(if self.has_pr {
+                "open, PR not merged".to_string()
+            } else {
+                "open".to_string()
+            });
+        }
+        if reason == "not_planned" || reason == "duplicate" {
+            return Some(format!("closed as {reason}"));
+        }
+        if self.pr_closed {
+            return Some("closed, PR closed unmerged".to_string());
+        }
+        if self.has_pr {
+            return Some(if self.pr_merged {
+                "closed, PR merged outside the default branch".to_string()
+            } else {
+                "closed, PR not merged".to_string()
+            });
+        }
+        Some("closed".to_string())
+    }
 }
 
 /// Map a GitHub issue `state` and `state_reason` onto the values stored in KV.
@@ -763,6 +792,12 @@ mod tests {
             }),
         );
         assert!(!closed_unmerged.is_satisfied());
+        assert_eq!(
+            closed_unmerged.unsatisfied_reason().as_deref(),
+            Some("closed, PR closed unmerged")
+        );
+        assert_eq!(open.unsatisfied_reason().as_deref(), Some("open"));
+        assert_eq!(approved_merge(true).unsatisfied_reason(), None);
 
         let merged_unapproved = BlockerSnapshot::observe(
             "closed",
