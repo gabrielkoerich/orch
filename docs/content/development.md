@@ -42,7 +42,7 @@ Every import is a `use` at the top of its module. Lint rules enforce it, because
 | No crate-rooted path of more than two segments in code (`crate::db::Store`, `std::fs::read`) | `clippy::absolute_paths` with `absolute-paths-max-segments = 2` |
 | `mod` declarations, then `use`, then all other items | `clippy::arbitrary_source_item_ordering`, module groups in `clippy.toml`, no alphabetical order inside a group |
 | No `use` after a statement | `clippy::items_after_statements` (pedantic) |
-| No `use` inside a function, method or closure body | `use_in_fn`, a [dylint](https://github.com/trailofbits/dylint) library in `lints/use_in_fn` |
+| No `use` inside a function, method or closure body | `use_in_fn`, a [dylint](https://github.com/trailofbits/dylint) library loaded from [dylint-lints](https://github.com/gabrielkoerich/dylint-lints) at a tag, set in `dylint.toml` |
 
 No Clippy or rustc lint catches a `use` at the start of a body, so `use_in_fn` fills that gap. It is an early lint pass over the expanded AST, so it also flags a `use` that a local `macro_rules!` expands into a body. It skips macros from other crates. A test that greps the source was rejected: it is not a lint, and it misses macro output.
 
@@ -50,7 +50,7 @@ No Clippy or rustc lint catches a `use` at the start of a body, so `use_in_fn` f
 
 Costs:
 
-- The lint library builds with the nightly that `dylint_linting` 6.3 needs, pinned in `lints/use_in_fn/rust-toolchain.toml`. A `dylint_linting` upgrade moves that pin, and rustc's internal API can break the lint on the way.
+- The lint library builds with the nightly that `dylint_linting` 6.3 needs, pinned in `rust-toolchain.toml` of the dylint-lints repository and in `release.yml`. A nightly bump is one release there and a new tag here, and rustc's internal API can break the lint on the way.
 - Each CI run of `check` installs that nightly with `rustc-dev`, builds the dylint driver and the lint library, and runs one more `cargo check` of orch on the nightly. A rustc warning that only the nightly knows also fails that step.
 
 Or all at once:

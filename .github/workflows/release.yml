@@ -72,10 +72,15 @@ jobs:
         with:
           tool: cargo-dylint@6.3.2,dylint-link@6.3.2
 
-      # The lint library builds with the nightly its rust-toolchain.toml pins
+      # The nightly that rust-toolchain.toml in the dylint-lints repository pins for the lint
       - name: Install the dylint nightly
-        working-directory: lints/use_in_fn
-        run: rustup toolchain install
+        run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustc-dev --component llvm-tools-preview
+
+      - name: Cache the dylint drivers
+        uses: actions/cache@v4
+        with:
+          path: ~/.dylint_drivers
+          key: dylint-drivers-${{ runner.os }}-nightly-2026-08-20-6.3.2
 
       - name: Dylint
         env:

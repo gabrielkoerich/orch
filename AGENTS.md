@@ -224,7 +224,7 @@ Or all at once:
 cargo fmt && cargo clippy --all-targets -- -D warnings && cargo nextest run
 ```
 
-**Installing dylint locally:** `cargo +stable install cargo-dylint dylint-link --version 6.3.2 --locked`. The `+stable` matters, the pinned 1.94.1 is too old to build cargo-dylint. The first run installs the nightly from `lints/use_in_fn/rust-toolchain.toml`.
+**Installing dylint locally:** `cargo +stable install cargo-dylint dylint-link --version 6.3.2 --locked`. The `+stable` matters, the pinned 1.94.1 is too old to build cargo-dylint. The first run installs the nightly that the lint pins in its [repository](https://github.com/gabrielkoerich/dylint-lints).
 
 **Installing nextest locally:** CI uses prebuilt binaries via `taiki-e/install-action`. For local use, install with `cargo binstall cargo-nextest` (requires [cargo-binstall](https://github.com/cargo-bins/cargo-binstall)), or fall back to `cargo test` if nextest is unavailable.
 
@@ -237,7 +237,7 @@ Every import is a `use` at the top of its module, after the `mod` declarations. 
 | No path with more than two segments that starts at a crate (`crate::db::Store`, `std::fs::read`, `tokio::time::sleep`) in code. Import the item or its parent module | `clippy::absolute_paths`, `absolute-paths-max-segments = 2` in `clippy.toml` |
 | `mod` declarations, then `use`, then everything else. A `#[cfg(test)]` module may stay at the bottom | `clippy::arbitrary_source_item_ordering`, groups in `clippy.toml` |
 | No `use` after a statement in a block | `clippy::items_after_statements` |
-| No `use` inside a function, method or closure body | `use_in_fn` in `lints/use_in_fn`, run with `cargo dylint` |
+| No `use` inside a function, method or closure body | `use_in_fn` from [dylint-lints](https://github.com/gabrielkoerich/dylint-lints), run with `cargo dylint` |
 
 When two imports want the same name, import the parent module (`fmt::Result`, `io::Error`) or rename one (`use std::time as std_time`). Import an item used only under a `cfg` with the same `cfg`, or the other target warns that the import is unused.
 
