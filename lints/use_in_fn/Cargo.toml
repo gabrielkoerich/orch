@@ -1,0 +1,21 @@
+[package]
+name = "use_in_fn"
+version = "0.1.0"
+description = "Flags a use item inside a function, method or closure body"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dylint_linting = "6.3"
+
+[dev-dependencies]
+dylint_testing = "6.3"
+
+# Built on its own nightly, outside the orch package
+[workspace]
+
+[package.metadata.rust-analyzer]
+rustc_private = true

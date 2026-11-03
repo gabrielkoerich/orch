@@ -67,6 +67,21 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Install dylint
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-dylint@6.3.2,dylint-link@6.3.2
+
+      # The lint library builds with the nightly its rust-toolchain.toml pins
+      - name: Install the dylint nightly
+        working-directory: lints/use_in_fn
+        run: rustup toolchain install
+
+      - name: Dylint
+        env:
+          DYLINT_RUSTFLAGS: "-D warnings"
+        run: cargo dylint --all -- --all-targets
+
   # Run Rust test suite with code coverage.
   # Produces an lcov artifact and posts a coverage report on PRs.
   # Uses cargo-llvm-cov for line/branch coverage — cheaper than tarpaulin.

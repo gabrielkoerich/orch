@@ -1,0 +1,47 @@
+warning: `use` inside a function body
+  --> $DIR/main.rs:22:9
+   |
+LL |         use std::io::Read;
+   |         ^^^^^^^^^^^^^^^^^^
+   |
+   = help: move it to the top of the module
+   = note: `#[warn(use_in_fn)]` on by default
+
+warning: `use` inside a function body
+  --> $DIR/main.rs:30:5
+   |
+LL |     use std::path::Path;
+   |     ^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: move it to the top of the module
+
+warning: `use` inside a function body
+  --> $DIR/main.rs:33:9
+   |
+LL |         use std::time::Duration;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: move it to the top of the module
+
+warning: `use` inside a function body
+  --> $DIR/main.rs:38:9
+   |
+LL |         use std::cmp::max;
+   |         ^^^^^^^^^^^^^^^^^^
+   |
+   = help: move it to the top of the module
+
+warning: `use` inside a function body
+  --> $DIR/main.rs:5:9
+   |
+LL |         use std::env;
+   |         ^^^^^^^^^^^^^
+...
+LL |     let _ = read_env!();
+   |             ----------- in this macro invocation
+   |
+   = help: move it to the top of the module
+   = note: this warning originates in the macro `read_env` (in Nightly b$DIRlds, run with -Z macro-backtrace for more info)
+
+warning: 5 warnings emitted
+
