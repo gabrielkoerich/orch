@@ -1477,6 +1477,12 @@ impl TaskRunner {
                 WeightSignal::RateLimited {
                     agent: agent_name.clone(),
                 }
+            } else if !last_error.is_empty() {
+                // `handle_error` ends in needs_review with the error in last_error (timeout,
+                // no fallback, exhausted agents). A completed run clears it, so this is a failure
+                WeightSignal::Failed {
+                    agent: agent_name.clone(),
+                }
             } else {
                 // Non-rate-limit "needs_review" (e.g. agent successfully completed but
                 // review agent is needed) — reset backoff so the next failure starts fresh.
@@ -2809,6 +2815,10 @@ mod tests {
             } else {
                 WeightSignal::Rerouted
             }
+        } else if status == "needs_review" && error_type == "timeout" {
+            WeightSignal::Failed {
+                agent: agent.to_string(),
+            }
         } else if status == "done"
             || status == "needs_review"
             || status == "in_progress"
@@ -2833,6 +2843,12 @@ mod tests {
             matches!(signal, WeightSignal::Success { agent } if agent == "claude"),
             "needs_review should produce WeightSignal::Success"
         );
+    }
+
+    #[test]
+    fn weight_signal_failed_for_needs_review_after_timeout() {
+        let signal = weight_signal_for("needs_review", "timeout", "claude");
+        assert!(matches!(signal, WeightSignal::Failed { agent } if agent == "claude"));
     }
 
     #[test]

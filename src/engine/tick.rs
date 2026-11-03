@@ -2376,8 +2376,13 @@ async fn dispatch_tasks_for_repo(
                         // Route to needs_review only when the review agent is enabled;
                         // otherwise mark done so the task is not permanently stuck.
                         WeightSignal::None if enable_review => "needs_review",
+                        // A failed run stays in needs_review with its issue open. The review
+                        // path re-routes a task with no PR and no commits
+                        WeightSignal::Failed { .. } => "needs_review",
                         WeightSignal::Success { .. } | WeightSignal::None => "done",
                     };
+
+                    tracing::info!(task_id, display_status, "task run finished, applying status");
 
                     // Send weight signal back to the router
                     let _ = weight_tx.send(signal).await;
