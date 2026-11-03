@@ -7457,6 +7457,10 @@ async fn move_repo_keeps_tasks_and_dependencies() {
         ("dep_cycle_comment:a/x#1:sig", "dep_cycle_comment:b/x#1:sig"),
         ("review_approved_sha:a/x#2#9", "review_approved_sha:b/x#2#9"),
         ("issues_last_ingested:a/x", "issues_last_ingested:b/x"),
+        (
+            "review_ci_wait_since:a/x#1#abc",
+            "review_ci_wait_since:b/x#1#abc",
+        ),
     ];
     // a repo whose name starts with the moved one must keep its keys
     let untouched = ["dep_blocker:a/x2#1", "issues_last_ingested:a/x2"];

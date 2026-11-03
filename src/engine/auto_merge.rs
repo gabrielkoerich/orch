@@ -529,7 +529,7 @@ pub(crate) async fn sweep_ci_timer_keys(
     let finished: std::collections::HashSet<&str> =
         finished_task_ids.iter().map(String::as_str).collect();
     let repo_marker = format!("{repo}#");
-    for prefix in ["ci_check_ts:", "ci_pending_since:"] {
+    for prefix in ["ci_check_ts:", "ci_pending_since:", "review_ci_wait_since:"] {
         for (key, _) in store.kv_list_prefix(prefix).await? {
             let rest = &key[prefix.len()..];
             let stale = match rest.strip_prefix(repo_marker.as_str()) {

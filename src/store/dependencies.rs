@@ -1138,6 +1138,10 @@ pub(crate) mod apply {
                 format!("ci_pending_since:{old}#"),
                 format!("ci_pending_since:{new}#"),
             ),
+            (
+                format!("review_ci_wait_since:{old}#"),
+                format!("review_ci_wait_since:{new}#"),
+            ),
         ] {
             sqlx::query(
                 "UPDATE OR REPLACE kv SET key = ? || substr(key, ?) WHERE substr(key, 1, ?) = ?",
