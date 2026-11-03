@@ -999,24 +999,30 @@ async fn close_superseded_pr(ctx: &StoreCtx<'_>, pr_number: u64) {
     if ctx.repo.is_empty() {
         return;
     }
-    let gh = match crate::github::http::GhHttp::new() {
-        Ok(gh) => gh,
+    match crate::github::http::GhHttp::new() {
+        Ok(gh) => {
+            let note = "Closing as superseded: the change is already on the default branch, so this branch has no commits ahead of it.";
+            if let Err(e) = gh.add_comment(ctx.repo, &pr_number.to_string(), note).await {
+                tracing::warn!(task_id = ctx.task_id, pr_number, err = %e, "failed to comment on superseded PR");
+            }
+            if let Err(e) = gh.close_pr(ctx.repo, pr_number).await {
+                tracing::warn!(task_id = ctx.task_id, pr_number, err = %e, "failed to close superseded PR");
+            }
+        }
         Err(e) => {
             tracing::warn!(task_id = ctx.task_id, err = %e, "cannot close superseded PR");
-            return;
         }
-    };
-    let note = "Closing as superseded: the change is already on the default branch, so this branch has no commits ahead of it.";
-    if let Err(e) = gh.add_comment(ctx.repo, &pr_number.to_string(), note).await {
-        tracing::warn!(task_id = ctx.task_id, pr_number, err = %e, "failed to comment on superseded PR");
     }
-    if let Err(e) = gh.close_pr(ctx.repo, pr_number).await {
-        tracing::warn!(task_id = ctx.task_id, pr_number, err = %e, "failed to close superseded PR");
-    }
-    ctx.set(&[(
-        "last_error",
-        serde_json::json!("PR closed as superseded: the fix already landed on the default branch"),
-    )])
+    // Dropping the PR lets the blocker refresh read the closed, completed issue with no PR
+    ctx.set(&[
+        (
+            "last_error",
+            serde_json::json!(
+                "PR closed as superseded: the fix already landed on the default branch"
+            ),
+        ),
+        ("pr_number", serde_json::json!(null)),
+    ])
     .await;
 }
 
@@ -1973,6 +1979,10 @@ mod tests {
             task.last_error.contains("superseded"),
             "the close attempt must be recorded on the task: {}",
             task.last_error
+        );
+        assert_eq!(
+            task.pr_number, None,
+            "a superseded PR must not stay on the task, the blocker refresh would read it as closed unmerged"
         );
     }
 

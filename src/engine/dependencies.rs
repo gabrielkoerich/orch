@@ -1763,6 +1763,57 @@ See #4 in the notes
     }
 
     #[tokio::test]
+    async fn superseded_blocker_releases_the_waiter_but_a_human_close_does_not() {
+        use crate::backends::PullRequestCompletion;
+
+        let store = TaskStore::open_memory().await.unwrap();
+        let a = insert(&store, "owner/repo", "1", "A", "").await;
+        let b = insert(&store, "owner/repo", "2", "B", "").await;
+        store
+            .set_fields(a, &[("pr_number", serde_json::json!(10))])
+            .await
+            .unwrap();
+        store
+            .replace_dependencies(
+                b,
+                &[NewDependency {
+                    repo: "owner/repo".into(),
+                    number: 1,
+                    source: DepSource::Github,
+                }],
+            )
+            .await
+            .unwrap();
+        let backend = ScriptedBackend::new(HashMap::new());
+        backend
+            .close_state
+            .lock()
+            .unwrap()
+            .insert(1, ("closed".into(), Some("completed".into())));
+        backend.pulls.lock().unwrap().insert(
+            10,
+            Some(PullRequestCompletion {
+                merged: false,
+                base_ref: "main".into(),
+                default_branch: "main".into(),
+                approved: true,
+                closed: true,
+            }),
+        );
+        // A person closed the PR unmerged, so the PR stays on the task
+        refresh_blocker_snapshots(&backend, &store).await.unwrap();
+        assert!(store.block_claim_if_waiting(b).await.unwrap().is_some());
+
+        // The superseded path clears the PR from the task
+        store
+            .set_fields(a, &[("pr_number", serde_json::json!(null))])
+            .await
+            .unwrap();
+        refresh_uncached(&backend, &store).await;
+        assert_eq!(store.block_claim_if_waiting(b).await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn merged_unapproved_pr_releases_the_waiter() {
         use crate::backends::PullRequestCompletion;
 
