@@ -33,7 +33,6 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process;
-use std::str as std_str;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -996,7 +995,7 @@ async fn update_status_and_fields_propagates_column_decode_error() {
     // After the failed update, status should still be the original value.
     // We inject X'FFFF' (2 bytes) — check it's not "routed" (6 bytes ASCII).
     assert_ne!(
-        std_str::from_utf8(&status_row.0).ok(),
+        str::from_utf8(&status_row.0).ok(),
         Some("routed"),
         "task status must remain unchanged when decode fails"
     );

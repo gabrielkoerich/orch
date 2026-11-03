@@ -1107,7 +1107,6 @@ mod tests {
     use std::collections::HashMap;
     use std::io;
     use std::io::Write;
-    use std::str as std_str;
     use std::sync::{Arc, Mutex};
     use tokio::runtime::Builder;
     use tracing::Level;
@@ -2379,6 +2378,6 @@ mod tests {
         assert!(review_context.len() <= MAX_REVIEW_CONTEXT_BYTES + 40); // suffix is short
         assert!(review_context.ends_with("... (review context truncated)"));
         // Must be valid UTF-8 after truncation (no split multi-byte chars).
-        assert!(std_str::from_utf8(review_context.as_bytes()).is_ok());
+        assert!(str::from_utf8(review_context.as_bytes()).is_ok());
     }
 }

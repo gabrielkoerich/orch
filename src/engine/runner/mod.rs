@@ -1881,7 +1881,6 @@ mod tests {
     use crate::store::{NewTask, TaskStore};
     use async_trait::async_trait;
     use chrono::Utc;
-    use std::str as std_str;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
     use tokio::process::Command;
@@ -1937,7 +1936,7 @@ mod tests {
             "tail must be a valid suffix of the original"
         );
         assert!(
-            std_str::from_utf8(tail.as_bytes()).is_ok(),
+            str::from_utf8(tail.as_bytes()).is_ok(),
             "tail must be valid UTF-8"
         );
     }
@@ -1948,7 +1947,7 @@ mod tests {
         for max_bytes in [1, 3, 5, 7, 11, 13, 20, 100] {
             let tail = safe_utf8_tail(s, max_bytes);
             assert!(
-                std_str::from_utf8(tail.as_bytes()).is_ok(),
+                str::from_utf8(tail.as_bytes()).is_ok(),
                 "max_bytes={max_bytes}: tail must be valid UTF-8"
             );
             assert!(

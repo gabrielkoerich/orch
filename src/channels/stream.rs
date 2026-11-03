@@ -283,7 +283,6 @@ mod tests {
     use tokio::sync::mpsc::Receiver;
     use tokio::sync::mpsc::Sender;
 
-    use std::str as std_str;
     use std::time as std_time;
 
     use super::*;
@@ -348,7 +347,7 @@ mod tests {
         assert_eq!(parts.join(""), content);
         for p in &parts {
             // Each part must be valid UTF-8 (Rust strings always are, but slice must be sound)
-            assert!(std_str::from_utf8(p.as_bytes()).is_ok());
+            assert!(str::from_utf8(p.as_bytes()).is_ok());
         }
     }
 
@@ -362,7 +361,7 @@ mod tests {
         let parts = split_for_platform(&content, "discord");
         assert_eq!(parts.join(""), content);
         for p in &parts {
-            assert!(std_str::from_utf8(p.as_bytes()).is_ok());
+            assert!(str::from_utf8(p.as_bytes()).is_ok());
         }
     }
 

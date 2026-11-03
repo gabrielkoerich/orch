@@ -25,7 +25,6 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
-use std::str as std_str;
 use std::time::Duration;
 use tokio::fs as tokio_fs;
 use tokio::sync::Mutex;
@@ -1065,7 +1064,7 @@ impl LlmRouter {
                         depth -= 1;
                         if depth == 0 {
                             // candidate from i..=j
-                            if let Ok(candidate) = std_str::from_utf8(&bytes[i..=j])
+                            if let Ok(candidate) = str::from_utf8(&bytes[i..=j])
                                 && let Ok(val) =
                                     serde_json::from_str::<serde_json::Value>(candidate)
                             {

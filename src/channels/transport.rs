@@ -296,7 +296,6 @@ pub enum MessageRoute {
 mod tests {
     use tokio::time;
 
-    use std::str as std_str;
     use std::time::Duration;
 
     use super::*;
@@ -359,7 +358,7 @@ mod tests {
         let chunks = split_utf8(&content, 100);
         assert_eq!(chunks.join(""), content);
         for c in &chunks {
-            assert!(std_str::from_utf8(c.as_bytes()).is_ok());
+            assert!(str::from_utf8(c.as_bytes()).is_ok());
         }
     }
 
@@ -370,7 +369,7 @@ mod tests {
         let chunks = split_utf8(&content, 10); // 10 bytes per chunk, emoji is 4 bytes
         assert_eq!(chunks.join(""), content);
         for c in &chunks {
-            assert!(std_str::from_utf8(c.as_bytes()).is_ok());
+            assert!(str::from_utf8(c.as_bytes()).is_ok());
         }
     }
 

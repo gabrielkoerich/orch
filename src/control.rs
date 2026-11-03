@@ -1156,7 +1156,6 @@ mod tests {
     use tokio::runtime::Runtime;
 
     use std::collections::BTreeSet;
-    use std::str as std_str;
 
     use super::*;
     use crate::store::TaskStore;
@@ -1635,7 +1634,7 @@ mod tests {
         assert_eq!(reassembled, content);
         for c in &chunks {
             assert!(
-                std_str::from_utf8(c.as_bytes()).is_ok(),
+                str::from_utf8(c.as_bytes()).is_ok(),
                 "chunk is not valid UTF-8"
             );
         }
