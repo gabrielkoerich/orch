@@ -2334,50 +2334,35 @@ async fn dispatch_tasks_for_repo(
                     // no PR and no commits should not enter the review cycle).
                     let enable_review = config::get("workflow.enable_review_agent")
                         .map_or(true, |v| v != "false");
-                    let display_status = match &signal {
-                        WeightSignal::Success { .. } if enable_review => {
-                            // Check if response handler already set done (no-op task).
-                            // The task_manager.update_task_status() was already called
-                            // by response_handler, so read the actual status from store.
-                            let has_pr = match store_for_spawn
-                                .resolve_task_id(&repo_owned, &task_id)
-                                .await
-                            {
-                                Ok(Some(store_id)) => match store_for_spawn
-                                    .get(store_id)
-                                    .await
-                                {
-                                    Ok(t) => t.pr_number.is_some(),
-                                    Err(e) => {
-                                        tracing::warn!(task_id, err = %e, "store.get() failed — defaulting to needs_review");
-                                        true
-                                    }
-                                },
-                                Ok(None) => false,
+                    // Only a successful run can reach the no-PR shortcut, so only then read the PR.
+                    let has_pr = if enable_review && matches!(signal, WeightSignal::Success { .. })
+                    {
+                        match store_for_spawn.resolve_task_id(&repo_owned, &task_id).await {
+                            Ok(Some(store_id)) => match store_for_spawn.get(store_id).await {
+                                Ok(t) => t.pr_number.is_some(),
                                 Err(e) => {
-                                    tracing::warn!(task_id, err = %e, "failed to check PR status — defaulting to needs_review");
+                                    tracing::warn!(task_id, err = %e, "store.get() failed — defaulting to needs_review");
                                     true
                                 }
-                            };
-                            if has_pr {
-                                "needs_review"
-                            } else {
-                                "done"
+                            },
+                            Ok(None) => false,
+                            Err(e) => {
+                                tracing::warn!(task_id, err = %e, "failed to check PR status — defaulting to needs_review");
+                                true
                             }
                         }
-                        // Rerouted: silence detection or other non-rate-limit reset already
-                        // moved the task to "new". Stay in "new" — never convert to
-                        // needs_review, which would trigger the no-code shortcut and falsely
-                        // close the task as done without a successful agent run.
-                        WeightSignal::RateLimited { .. } | WeightSignal::Rerouted => "new",
-                        WeightSignal::Blocked => "blocked",
-                        // None means the runner guard skipped the task (e.g. tmux session
-                        // already exists) or the task completed with an unrecognised status.
-                        // Route to needs_review only when the review agent is enabled;
-                        // otherwise mark done so the task is not permanently stuck.
-                        WeightSignal::None if enable_review => "needs_review",
-                        WeightSignal::Success { .. } | WeightSignal::None => "done",
+                    } else {
+                        false
                     };
+                    let display_status = display_status_for(&signal, enable_review, has_pr);
+
+                    if display_status == "done" {
+                        tracing::info!(
+                            task_id,
+                            "marking done: the run succeeded with no PR to review"
+                        );
+                    }
+                    tracing::info!(task_id, display_status, "task run finished, applying status");
 
                     // Send weight signal back to the router
                     let _ = weight_tx.send(signal).await;
@@ -3122,6 +3107,29 @@ pub(crate) async fn tick_all(
     }
 }
 
+/// Status a finished run moves to. Only a successful run with no PR (or with the review agent
+/// off) becomes `done`. A failed run stays in `needs_review` with its issue open
+fn display_status_for(signal: &WeightSignal, enable_review: bool, has_pr: bool) -> &'static str {
+    match signal {
+        WeightSignal::Success { .. } if enable_review => {
+            if has_pr {
+                "needs_review"
+            } else {
+                "done"
+            }
+        }
+        // Silence detection or another non-rate-limit reset already moved the task to "new".
+        // Converting it to needs_review would trigger the no-code shortcut and falsely close it
+        WeightSignal::RateLimited { .. } | WeightSignal::Rerouted => "new",
+        WeightSignal::Blocked => "blocked",
+        // The review path re-routes a task with no PR and no commits
+        WeightSignal::Failed { .. } => "needs_review",
+        // None means the runner guard skipped the task or the status was unrecognised
+        WeightSignal::None if enable_review => "needs_review",
+        WeightSignal::Success { .. } | WeightSignal::None => "done",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3150,6 +3158,31 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::task;
 
+    #[test]
+    fn timed_out_run_without_pr_never_becomes_done() {
+        let failed = WeightSignal::Failed {
+            agent: "claude".to_string(),
+        };
+        assert_eq!(display_status_for(&failed, true, false), "needs_review");
+        assert_eq!(display_status_for(&failed, false, false), "needs_review");
+    }
+
+    #[test]
+    fn done_needs_a_successful_run_with_no_pr() {
+        let ok = WeightSignal::Success {
+            agent: "claude".to_string(),
+        };
+        assert_eq!(display_status_for(&ok, true, true), "needs_review");
+        assert_eq!(display_status_for(&ok, true, false), "done");
+        assert_eq!(
+            display_status_for(&WeightSignal::Rerouted, true, false),
+            "new"
+        );
+        assert_eq!(
+            display_status_for(&WeightSignal::None, true, false),
+            "needs_review"
+        );
+    }
     #[test]
     fn skips_agent_for_human_and_no_agent_labels() {
         assert!(skips_agent(&["owner:human".to_string()]));

@@ -1460,31 +1460,28 @@ impl TaskRunner {
             // limit for this billing cycle") also contain "usage limit"/"rate limit", so
             // a bare substring check would record a rate-limit event into the router's
             // health signal for a condition that isn't a genuine rate limit (issue #3529).
-            let has_rate_limit_error = classify_run_error_type(&last_error) == "rate_limit";
-            if has_rate_limit_error {
-                // Record in the metrics store so the router's health check detects it.
-                if let Some(ref store) = self.store
-                    && let Err(e) = store
-                        .record_rate_limit(&agent_name, "rate", Some(task_id))
-                        .await
-                {
-                    tracing::warn!(task_id, agent = %agent_name, err = %e, "failed to persist rate_limit event — router health check may miss this signal");
+            let signal = needs_review_signal(&last_error, &agent_name);
+            match &signal {
+                WeightSignal::RateLimited { .. } => {
+                    // Record in the metrics store so the router's health check detects it.
+                    if let Some(ref store) = self.store
+                        && let Err(e) = store
+                            .record_rate_limit(&agent_name, "rate", Some(task_id))
+                            .await
+                    {
+                        tracing::warn!(task_id, agent = %agent_name, err = %e, "failed to persist rate_limit event — router health check may miss this signal");
+                    }
+                    // Also record via the cooldown system so model_for_complexity() skips
+                    // this model.
+                    cooldown::record_rate_limit(&agent_name, model, &last_error).await;
                 }
-                // Also record via the cooldown system so model_for_complexity() skips
-                // this model.  Use the stored last_error text as the message since
-                // classify_run_error_type() already confirmed it contains "rate limit".
-                cooldown::record_rate_limit(&agent_name, model, &last_error).await;
-                WeightSignal::RateLimited {
-                    agent: agent_name.clone(),
+                WeightSignal::Success { .. } => {
+                    // Reset backoff so the next failure starts fresh.
+                    cooldown::record_agent_success(&agent_name, model.unwrap_or("")).await;
                 }
-            } else {
-                // Non-rate-limit "needs_review" (e.g. agent successfully completed but
-                // review agent is needed) — reset backoff so the next failure starts fresh.
-                cooldown::record_agent_success(&agent_name, model.unwrap_or("")).await;
-                WeightSignal::Success {
-                    agent: agent_name.clone(),
-                }
+                _ => {}
             }
+            signal
         } else if status == "done" || status == "in_progress" || status == "in_review" {
             // Reset exponential backoff counters so the next failure starts fresh.
             cooldown::record_agent_success(&agent_name, model.unwrap_or("")).await;
@@ -1870,6 +1867,19 @@ async fn update_agent_label_after_reroute(
         return false;
     }
     true
+}
+
+/// Weight signal for a run that ended in `needs_review`. A completed run clears `last_error`,
+/// so a non-empty value means `handle_error` ended the run (timeout, no fallback, exhausted agents)
+fn needs_review_signal(last_error: &str, agent: &str) -> WeightSignal {
+    let agent = agent.to_string();
+    if classify_run_error_type(last_error) == "rate_limit" {
+        WeightSignal::RateLimited { agent }
+    } else if !last_error.is_empty() {
+        WeightSignal::Failed { agent }
+    } else {
+        WeightSignal::Success { agent }
+    }
 }
 
 #[cfg(test)]
@@ -2833,6 +2843,25 @@ mod tests {
             matches!(signal, WeightSignal::Success { agent } if agent == "claude"),
             "needs_review should produce WeightSignal::Success"
         );
+    }
+
+    #[test]
+    fn needs_review_signal_success_for_empty_error() {
+        let signal = needs_review_signal("", "claude");
+        assert!(matches!(signal, WeightSignal::Success { agent } if agent == "claude"));
+    }
+
+    #[test]
+    fn needs_review_signal_failed_after_timeout_with_no_fallback() {
+        let signal =
+            needs_review_signal("claude timed out after 1804s, no fallback agents", "claude");
+        assert!(matches!(signal, WeightSignal::Failed { agent } if agent == "claude"));
+    }
+
+    #[test]
+    fn needs_review_signal_rate_limited_for_rate_limit() {
+        let signal = needs_review_signal("rate limit exceeded, try again later", "claude");
+        assert!(matches!(signal, WeightSignal::RateLimited { agent } if agent == "claude"));
     }
 
     #[test]

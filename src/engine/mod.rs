@@ -2668,7 +2668,10 @@ pub async fn serve() -> anyhow::Result<()> {
                         WeightSignal::Success { ref agent } => {
                             rw.record_success(agent);
                         }
-                        WeightSignal::Rerouted | WeightSignal::Blocked | WeightSignal::None => {}
+                        WeightSignal::Failed { .. }
+                        | WeightSignal::Rerouted
+                        | WeightSignal::Blocked
+                        | WeightSignal::None => {}
                     }
                 }
 
@@ -2814,7 +2817,10 @@ pub async fn serve() -> anyhow::Result<()> {
                         WeightSignal::Success { ref agent } => {
                             rw.record_success(agent);
                         }
-                        WeightSignal::Rerouted | WeightSignal::Blocked | WeightSignal::None => {}
+                        WeightSignal::Failed { .. }
+                        | WeightSignal::Rerouted
+                        | WeightSignal::Blocked
+                        | WeightSignal::None => {}
                     }
                 }
 

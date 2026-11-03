@@ -173,6 +173,9 @@ pub enum WeightSignal {
     Success { agent: String },
     /// Agent hit a rate limit / usage limit.
     RateLimited { agent: String },
+    /// The run failed (timeout, no fallback, exhausted agents) and ended in `needs_review`.
+    /// Never read as a completed run, so the no-PR shortcut cannot mark the task done.
+    Failed { agent: String },
     /// Task is blocked on child tasks (delegations). Do not trigger review agent.
     Blocked,
     /// Task was rerouted (silence detection, timeout, parse error) — reset to new for re-routing.
