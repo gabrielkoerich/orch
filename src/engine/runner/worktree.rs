@@ -1158,7 +1158,7 @@ mod tests {
             .await
             .unwrap();
         let task_id = format!("internal:{id}");
-        let opt = Some(store.clone());
+        let opt = Some(Arc::clone(&store));
 
         let setup = setup_worktree(&task_id, "conflict", project.path(), &opt, "test/repo")
             .await
