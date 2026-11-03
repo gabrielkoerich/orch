@@ -569,7 +569,7 @@ pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
     }
 }
 
-async fn rebase_in_progress(dir: &Path) -> bool {
+pub(crate) async fn rebase_in_progress(dir: &Path) -> bool {
     for name in ["rebase-merge", "rebase-apply"] {
         let out = Command::new("git")
             .args(["rev-parse", "--git-path", name])

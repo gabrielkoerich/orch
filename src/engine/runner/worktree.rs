@@ -524,13 +524,26 @@ pub async fn setup_worktree(
     // inherit that broken state, causing all subsequent git operations to
     // fail.  Aborting here is safe: if no rebase is in progress git exits
     // with a non-zero code which we silently ignore.
+    // A task with a recorded merge conflict keeps its rebase, auto_merge left it on purpose and
+    // told the agent to continue it.
     // Use tokio::fs for async-safe existence check
     if tokio::fs::metadata(&worktree_dir).await.is_ok() {
-        let _ = Command::new("git")
-            .args(["rebase", "--abort"])
-            .current_dir(&worktree_dir)
-            .output_with_context()
-            .await;
+        let keep_rebase = task_record
+            .as_ref()
+            .is_some_and(|t| t.merge_conflict_retries > 0)
+            && crate::engine::runner::git_ops::rebase_in_progress(&worktree_dir).await;
+        if keep_rebase {
+            tracing::info!(
+                task_id,
+                "keeping the conflicted rebase auto_merge left for the agent"
+            );
+        } else {
+            let _ = Command::new("git")
+                .args(["rebase", "--abort"])
+                .current_dir(&worktree_dir)
+                .output_with_context()
+                .await;
+        }
 
         // Check for a corrupted git index (e.g. "error: could not write index").
         // `git status` reads the index; a non-zero exit with index-related stderr
@@ -1107,6 +1120,80 @@ mod tests {
         );
 
         // Restore ORCH_HOME.
+        match prev_orch_home {
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            Some(v) => unsafe { std::env::set_var("ORCH_HOME", v) },
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            None => unsafe { std::env::remove_var("ORCH_HOME") },
+        }
+    }
+
+    /// auto_merge leaves a conflicted rebase for the agent, dispatch must not abort it.
+    #[tokio::test]
+    #[serial_test::serial(orch_home)]
+    async fn setup_worktree_keeps_the_conflicted_rebase_for_a_conflict_task() {
+        let orch_home_dir = tempfile::tempdir().unwrap();
+        let prev_orch_home = std::env::var("ORCH_HOME").ok();
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { std::env::set_var("ORCH_HOME", orch_home_dir.path()) };
+
+        let remote = tempfile::tempdir().unwrap();
+        git(remote.path(), &["init", "--bare"]);
+        let project = tempfile::tempdir().unwrap();
+        git(
+            project.path(),
+            &["clone", remote.path().to_str().unwrap(), "."],
+        );
+        git(project.path(), &["config", "user.email", "t@t.com"]);
+        git(project.path(), &["config", "user.name", "T"]);
+        std::fs::write(project.path().join("f.txt"), "base\n").unwrap();
+        git(project.path(), &["add", "."]);
+        git(project.path(), &["commit", "-m", "base"]);
+        git(project.path(), &["push", "origin", "HEAD:main"]);
+        git(project.path(), &["remote", "set-head", "origin", "main"]);
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let id = store
+            .create_internal("test/repo", "conflict", "", "test", "1", None)
+            .await
+            .unwrap();
+        let task_id = format!("internal:{id}");
+        let opt = Some(store.clone());
+
+        let setup = setup_worktree(&task_id, "conflict", project.path(), &opt, "test/repo")
+            .await
+            .unwrap();
+        let wt = setup.work_dir.clone();
+        git(&wt, &["config", "user.email", "t@t.com"]);
+        git(&wt, &["config", "user.name", "T"]);
+        std::fs::write(wt.join("f.txt"), "agent\n").unwrap();
+        git(&wt, &["commit", "-am", "agent change"]);
+        git(&wt, &["push", "origin", "HEAD"]);
+
+        // main moves on with a conflicting change, then the rebase stops on it
+        std::fs::write(project.path().join("f.txt"), "main\n").unwrap();
+        git(project.path(), &["commit", "-am", "main change"]);
+        git(project.path(), &["push", "origin", "HEAD:main"]);
+        git(&wt, &["fetch", "origin"]);
+        let rebase = std::process::Command::new("git")
+            .args(["rebase", "origin/main"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert!(!rebase.status.success(), "precondition: rebase conflicts");
+        assert!(crate::engine::runner::git_ops::rebase_in_progress(&wt).await);
+
+        store.increment(id, "merge_conflict_retries").await.unwrap();
+
+        setup_worktree(&task_id, "conflict", project.path(), &opt, "test/repo")
+            .await
+            .unwrap();
+        crate::engine::runner::git_ops::rebase_on_default(&wt, "main").await;
+        assert!(
+            crate::engine::runner::git_ops::rebase_in_progress(&wt).await,
+            "the rebase auto_merge left must survive dispatch"
+        );
+
         match prev_orch_home {
             // SAFETY: nextest runs each test in its own process, so no other test touches the environment
             Some(v) => unsafe { std::env::set_var("ORCH_HOME", v) },
