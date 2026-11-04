@@ -922,6 +922,16 @@ pub(crate) async fn rescue_unpushed_work(
                 .next()
                 .map(str::to_string)
         });
+    // A tip someone else pushed may be missing locally, and rev-list fails on an unknown object
+    let remote_tip = match remote_tip {
+        Some(tip) => {
+            let known = git_in(repo_root, &["cat-file", "-e", &format!("{tip}^{{commit}}")])
+                .await
+                .is_some_and(|o| o.status.success());
+            known.then_some(tip)
+        }
+        None => None,
+    };
     let mut args = vec!["rev-list", "--oneline", &local_ref, "--not", "--remotes"];
     if let Some(tip) = remote_tip.as_deref() {
         args.push(tip);
@@ -1027,7 +1037,21 @@ pub(crate) async fn remove_worktree_and_branch(
     repo_root: &Path,
     keep_remote_branch: bool,
 ) -> bool {
-    if let Some(br) = branch.filter(|b| !b.is_empty())
+    remove_worktree_and_branch_for(task_id, wt, branch, repo_root, keep_remote_branch, false).await
+}
+
+/// Same as `remove_worktree_and_branch`, but a merged PR skips the rescue. A squash leaves the
+/// branch commits on no ref, so the rescue would push a branch for work that already landed
+pub(crate) async fn remove_worktree_and_branch_for(
+    task_id: &str,
+    wt: &Path,
+    branch: Option<&str>,
+    repo_root: &Path,
+    keep_remote_branch: bool,
+    pr_merged: bool,
+) -> bool {
+    if !pr_merged
+        && let Some(br) = branch.filter(|b| !b.is_empty())
         && rescue_unpushed_work(task_id, Some(wt), br, repo_root).await == Rescue::Failed
     {
         return false;
@@ -2715,6 +2739,50 @@ mod tests {
 
         assert_eq!(rescue, Rescue::Clean);
         assert!(!remote_has(&clone, "rescue/feat"));
+    }
+
+    #[tokio::test]
+    async fn merged_pr_cleanup_pushes_no_rescue_branch() {
+        let (tmp, clone) = origin_and_clone_with_feat();
+        let wt = add_worktree(&clone, tmp.path(), "feat");
+
+        let removed =
+            remove_worktree_and_branch_for("1", &wt, Some("feat"), &clone, false, true).await;
+
+        assert!(removed);
+        assert!(!wt.exists());
+        assert!(!remote_has(&clone, "rescue/feat"));
+    }
+
+    #[tokio::test]
+    async fn unmerged_cleanup_still_pushes_a_rescue_branch() {
+        let (tmp, clone) = origin_and_clone_with_feat();
+        let wt = add_worktree(&clone, tmp.path(), "feat");
+
+        let removed =
+            remove_worktree_and_branch_for("1", &wt, Some("feat"), &clone, false, false).await;
+
+        assert!(removed);
+        assert!(remote_has(&clone, "rescue/feat"));
+    }
+
+    #[tokio::test]
+    async fn rescue_ignores_a_remote_tip_missing_locally() {
+        let (tmp, clone) = origin_and_clone_with_feat();
+        git_ok(&clone, &["push", "origin", "feat"]);
+        let other = tmp.path().join("other");
+        git_ok(
+            tmp.path(),
+            &["clone", "-b", "feat", "origin.git", other.to_str().unwrap()],
+        );
+        std_fs::write(other.join("extra.txt"), "extra").unwrap();
+        git_ok(&other, &["add", "."]);
+        git_ok(&other, &["commit", "-m", "extra"]);
+        git_ok(&other, &["push", "origin", "feat"]);
+
+        let rescue = rescue_unpushed_work("1", None, "feat", &clone).await;
+
+        assert_ne!(rescue, Rescue::Failed);
     }
 
     #[tokio::test]

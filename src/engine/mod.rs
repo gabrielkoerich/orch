@@ -52,7 +52,7 @@ use crate::channels::transport::Transport;
 use crate::channels::{Channel, ChannelRegistry, IncomingMessage, OutgoingMessage};
 use crate::cmd::CommandErrorContext;
 use crate::config;
-use crate::engine::cleanup::remove_worktree_and_branch;
+use crate::engine::cleanup::{remove_worktree_and_branch, remove_worktree_and_branch_for};
 use crate::engine::router::{Router, RouterConfig};
 use crate::engine::runner::worktree::{
     abort_worktree_rebase, list_project_worktrees, rebase_worktree_on_origin_main,
@@ -1169,12 +1169,13 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
                 }
                 TaskStatus::Done => {
                     tracing::info!(repo = %engine.repo, task_id = %task_id, worktree = %worktree_dir.display(), status = ?task.status, "terminal task worktree, removing");
-                    remove_worktree_and_branch(
+                    remove_worktree_and_branch_for(
                         &task_id,
                         &worktree_dir,
                         Some(branch_name),
                         &repo_root_path,
                         false,
+                        task.pr_number.is_some(),
                     )
                     .await;
                     cleaned += 1;

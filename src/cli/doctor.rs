@@ -4,7 +4,7 @@ use crate::backends::{ExternalBackend, ExternalId};
 use crate::cli;
 use crate::config;
 use crate::engine::cleanup::{
-    cleanup_orphaned_worktree, remove_worktree_and_branch, resolve_repo_root,
+    cleanup_orphaned_worktree, remove_worktree_and_branch_for, resolve_repo_root,
 };
 use crate::engine::runner::git_ops;
 use crate::github::http::GhHttp;
@@ -1097,12 +1097,13 @@ async fn apply_fixes(
                             } else {
                                 Some(task.branch.as_str())
                             };
-                            let removed = remove_worktree_and_branch(
+                            let removed = remove_worktree_and_branch_for(
                                 &f.task_id,
                                 wt,
                                 branch,
                                 Path::new(&root),
                                 task.pr_number.is_some(), // keep remote branch if PR exists
+                                task.status == TaskStatus::Done && task.pr_number.is_some(),
                             )
                             .await;
                             if removed {
@@ -1187,12 +1188,13 @@ async fn apply_fixes(
                             } else {
                                 Some(task.branch.as_str())
                             };
-                            let removed = remove_worktree_and_branch(
+                            let removed = remove_worktree_and_branch_for(
                                 &f.task_id,
                                 wt,
                                 branch,
                                 Path::new(&root),
                                 true, // keep remote — PR is merged
+                                task.pr_number.is_some(),
                             )
                             .await;
                             if removed {
