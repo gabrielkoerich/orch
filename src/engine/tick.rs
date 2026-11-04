@@ -59,6 +59,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::{Instant, SystemTime};
 use tokio::sync::RwLock;
@@ -376,6 +377,15 @@ fn run_tier(router: &RouterConfig, task: &Task) -> String {
     }
 }
 
+/// The router config for this tick, loaded on first use. A full load re-reads the config and
+/// repeats its startup warnings, so one tick shares one load across every live run
+fn tick_router(
+    cell: &OnceLock<RouterConfig>,
+    load: impl FnOnce() -> RouterConfig,
+) -> &RouterConfig {
+    cell.get_or_init(load)
+}
+
 /// Start time and config for the stuck check of an in_progress task. A live session ages from
 /// the status entry, since other writes refresh `updated_at` mid-run, and is not stuck before
 /// its own run timeout ends. A dead session keeps `updated_at`, which the runner touches when it
@@ -387,6 +397,7 @@ async fn in_progress_stuck_clock(
     updated_at: &str,
     has_session: bool,
     config: &EngineConfig,
+    router: &OnceLock<RouterConfig>,
 ) -> (String, EngineConfig) {
     if !has_session {
         return (updated_at.to_string(), config.clone());
@@ -415,7 +426,7 @@ async fn in_progress_stuck_clock(
             updated_at.to_string()
         }
     };
-    let tier = run_tier(&RouterConfig::from_config(), &task);
+    let tier = run_tier(tick_router(router, RouterConfig::from_config), &task);
     let task_config = EngineConfig {
         stuck_timeout: config.live_session_stuck_limit(Some(&tier)),
         ..config.clone()
@@ -774,6 +785,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
     dispatching: &Arc<DashMap<String, String>>,
 ) -> anyhow::Result<()> {
     let _span = tracing::info_span!("engine.tick.phase2.stuck_tasks").entered();
+    let tick_router_cell = OnceLock::new();
 
     let in_progress = match task_manager
         .list_external_by_status(Status::InProgress)
@@ -793,6 +805,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
             &task.updated_at,
             session_alive(tmux, repo, &task.id.0, session_map),
             config,
+            &tick_router_cell,
         )
         .await;
         let Some(timing) = stuck_task_timing_from_map(
@@ -1125,6 +1138,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
             &task.updated_at,
             session_alive(tmux, repo, &task_id, session_map),
             config,
+            &tick_router_cell,
         )
         .await;
         let Some(timing) = stuck_task_timing_from_map(
@@ -3167,6 +3181,7 @@ mod tests {
     use crate::tmux::{SessionGuard, TmuxManager};
     use async_trait::async_trait;
     use dashmap::mapref::entry::Entry;
+    use std::cell::Cell;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -5230,6 +5245,19 @@ mod tests {
             },
             ..EngineConfig::default()
         }
+    }
+
+    #[test]
+    fn tick_router_loads_the_config_once_for_many_live_runs() {
+        let cell = OnceLock::new();
+        let loads = Cell::new(0);
+        for _ in 0..4 {
+            tick_router(&cell, || {
+                loads.set(loads.get() + 1);
+                RouterConfig::default()
+            });
+        }
+        assert_eq!(loads.get(), 1);
     }
 
     #[tokio::test]
