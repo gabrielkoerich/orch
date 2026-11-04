@@ -193,7 +193,7 @@ async fn load_blocked_by(
             BlockedByFetch::Unavailable => {
                 anyhow::bail!("blocked-by API unavailable for #{number}");
             }
-            BlockedByFetch::Failed(err) => {
+            BlockedByFetch::Failed(err) | BlockedByFetch::Unreachable(err) => {
                 anyhow::bail!("blocked-by API failed for #{number}: {err}");
             }
         };
