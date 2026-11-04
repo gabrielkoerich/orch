@@ -114,11 +114,8 @@ fn parse_output(content: &str) -> ParsedOutput {
         match event_type {
             // ── Claude ────────────────────────────────────────────────────
             "assistant" => {
-                if let Some(text) = extract_claude_text(&v)
-                    && text.len() > 40
-                    && key_messages.len() < 10
-                {
-                    key_messages.push(first_sentence(&text, 160));
+                if let Some(text) = extract_claude_text(&v) {
+                    push_key_message(&mut key_messages, &text);
                 }
             }
 
@@ -146,9 +143,7 @@ fn parse_output(content: &str) -> ParsedOutput {
                     .and_then(|t| t.as_str())
                     .or_else(|| v.get("text").and_then(|t| t.as_str()))
                     .unwrap_or("");
-                if text.len() > 40 && key_messages.len() < 10 {
-                    key_messages.push(first_sentence(text, 160));
-                }
+                push_key_message(&mut key_messages, text);
             }
 
             "tool_use" if v.get("part").is_some() => {
@@ -174,9 +169,7 @@ fn parse_output(content: &str) -> ParsedOutput {
                     match item_type {
                         "agent_message" => {
                             let text = item.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                            if text.len() > 40 && key_messages.len() < 10 {
-                                key_messages.push(first_sentence(text, 160));
-                            }
+                            push_key_message(&mut key_messages, text);
                         }
                         "command_execution" => {
                             let cmd = item.get("command").and_then(|c| c.as_str()).unwrap_or("");
@@ -208,6 +201,13 @@ fn parse_output(content: &str) -> ParsedOutput {
         tool_counts,
         git_commands,
         key_messages,
+    }
+}
+
+/// Keep an assistant message longer than 40 chars as a key message, up to 10.
+fn push_key_message(key_messages: &mut Vec<String>, text: &str) {
+    if text.len() > 40 && key_messages.len() < 10 {
+        key_messages.push(first_sentence(text, 160));
     }
 }
 
@@ -594,6 +594,38 @@ mod tests {
         // Short message (<= 40 chars) should be filtered out
         assert_eq!(p.key_messages.len(), 1);
         assert!(p.key_messages[0].contains("authentication"));
+    }
+
+    #[test]
+    fn parse_key_messages_from_opencode_and_codex() {
+        let long = "x".repeat(41);
+        let content = format!(
+            r#"{{"type":"text","part":{{"text":"{long}"}}}}
+{{"type":"text","text":"{long}"}}
+{{"type":"text","part":{{"text":"short"}}}}
+{{"type":"item.completed","item":{{"type":"agent_message","text":"{long}"}}}}
+{{"type":"item.completed","item":{{"type":"agent_message","text":"short"}}}}
+"#
+        );
+        let p = parse_output(&content);
+        assert_eq!(p.key_messages.len(), 3);
+    }
+
+    #[test]
+    fn parse_key_messages_capped_at_ten() {
+        let line = format!(r#"{{"type":"text","text":"{}"}}"#, "y".repeat(50));
+        let content = vec![line; 15].join("\n");
+        let p = parse_output(&content);
+        assert_eq!(p.key_messages.len(), 10);
+    }
+
+    #[test]
+    fn parse_codex_git_commands_capped_at_twenty() {
+        let line = r#"{"type":"item.completed","item":{"type":"command_execution","command":"git status"}}"#;
+        let content = vec![line; 25].join("\n");
+        let p = parse_output(&content);
+        assert_eq!(p.git_commands.len(), 20);
+        assert_eq!(p.tool_counts["bash"], 25);
     }
 
     #[test]
