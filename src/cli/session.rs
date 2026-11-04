@@ -597,6 +597,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_key_messages_from_opencode_and_codex() {
+        let long = "x".repeat(41);
+        let content = format!(
+            r#"{{"type":"text","part":{{"text":"{long}"}}}}
+{{"type":"text","text":"{long}"}}
+{{"type":"text","part":{{"text":"short"}}}}
+{{"type":"item.completed","item":{{"type":"agent_message","text":"{long}"}}}}
+{{"type":"item.completed","item":{{"type":"agent_message","text":"short"}}}}
+"#
+        );
+        let p = parse_output(&content);
+        assert_eq!(p.key_messages.len(), 3);
+    }
+
+    #[test]
+    fn parse_key_messages_capped_at_ten() {
+        let line = format!(r#"{{"type":"text","text":"{}"}}"#, "y".repeat(50));
+        let content = vec![line; 15].join("\n");
+        let p = parse_output(&content);
+        assert_eq!(p.key_messages.len(), 10);
+    }
+
+    #[test]
+    fn parse_codex_git_commands_capped_at_twenty() {
+        let line = r#"{"type":"item.completed","item":{"type":"command_execution","command":"git status"}}"#;
+        let content = vec![line; 25].join("\n");
+        let p = parse_output(&content);
+        assert_eq!(p.git_commands.len(), 20);
+        assert_eq!(p.tool_counts["bash"], 25);
+    }
+
+    #[test]
     fn parse_empty_content() {
         let p = parse_output("");
         assert!(p.is_empty());
