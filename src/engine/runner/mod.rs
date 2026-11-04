@@ -926,7 +926,7 @@ impl TaskRunner {
                 tracing::info!(
                     task_id,
                     status = status_str,
-                    "task already reset by silence detection — skipping fallback processing"
+                    "task already reset by the engine — skipping fallback processing"
                 );
                 session::cleanup_session(task_id, &tmux, &tmux_session).await;
                 let silence_err = agents::patterns::classify_from_text(0, "silence detected");
@@ -940,7 +940,7 @@ impl TaskRunner {
                         raw_stdout: &session_output.raw_stdout,
                         raw_stderr: &session_output.raw_stderr,
                         started_at,
-                        error_override: Some(format!("silence detection set task to {status_str}")),
+                        error_override: Some(format!("task was reset by the engine while the session ran (status {status_str})")),
                         elapsed_secs: session_output.elapsed_secs,
                         push_failed: false,
                     })

@@ -2879,6 +2879,63 @@ async fn complete_run_records_all_fields() {
 }
 
 #[tokio::test]
+async fn complete_run_keeps_the_outcome_of_a_run_closed_by_recovery() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let task_id = store
+        .create(&NewTask {
+            repo: "owner/repo".to_string(),
+            origin: "internal".to_string(),
+            title: "Test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let run_id = store
+        .start_run(&StartRun {
+            task_id,
+            attempt: 1,
+            run_type: "agent",
+            agent: "claude",
+            model: "opus",
+            command: "claude",
+            prompt: "p",
+        })
+        .await
+        .unwrap();
+    store
+        .finalize_incomplete_runs(
+            task_id,
+            "aborted",
+            "stuck-task recovery: active session killed",
+        )
+        .await
+        .unwrap();
+
+    store
+        .complete_run(&CompleteRun {
+            run_id,
+            exit_code: Some(0),
+            stdout: "",
+            stderr: "",
+            parsed: "",
+            outcome: "failed",
+            error: "task was reset by the engine while the session ran (status new)",
+            tokens: RunTokenUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                total_cost_usd: 0.0,
+                duration_secs: 0.0,
+            },
+        })
+        .await
+        .unwrap();
+
+    let run = store.get_last_run(task_id, "agent").await.unwrap().unwrap();
+    assert_eq!(run.outcome, "aborted");
+    assert_eq!(run.error, "stuck-task recovery: active session killed");
+}
+
+#[tokio::test]
 async fn complete_run_derives_duration_from_started_at_when_unreported() {
     let store = TaskStore::open_memory().await.unwrap();
 

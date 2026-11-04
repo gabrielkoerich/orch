@@ -1815,7 +1815,7 @@ impl TaskStore {
                 .bind(run.run_id)
                 .fetch_optional(&self.pool)
                 .await?;
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE task_runs SET
             exit_code = ?, stdout = ?, stderr = ?, parsed_response = ?,
             outcome = ?, error = NULLIF(?, ''),
@@ -1823,7 +1823,7 @@ impl TaskStore {
             duration_secs = CASE WHEN ? > 0 THEN ?
                 ELSE MAX(0, (julianday('now') - julianday(started_at)) * 86400.0) END,
             completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-         WHERE id = ?",
+         WHERE id = ? AND outcome IS NULL",
         )
         .bind(run.exit_code)
         .bind(run.stdout)
@@ -1851,6 +1851,14 @@ impl TaskStore {
         .bind(run.run_id)
         .execute(&self.pool)
         .await?;
+        if updated.rows_affected() == 0 && run_ctx.is_some() {
+            // The first writer knows the cause, so a closed run keeps its outcome and error
+            tracing::debug!(
+                run_id = run.run_id,
+                "run already closed, keeping its outcome"
+            );
+            return Ok(());
+        }
         if let Some(run_ctx) = run_ctx {
             let task_id: i64 = run_ctx.try_get("task_id").map_err(|e| {
                 anyhow::anyhow!("failed to decode task_id from run_id {}: {e}", run.run_id)
