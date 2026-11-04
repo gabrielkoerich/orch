@@ -114,11 +114,8 @@ fn parse_output(content: &str) -> ParsedOutput {
         match event_type {
             // ── Claude ────────────────────────────────────────────────────
             "assistant" => {
-                if let Some(text) = extract_claude_text(&v)
-                    && text.len() > 40
-                    && key_messages.len() < 10
-                {
-                    key_messages.push(first_sentence(&text, 160));
+                if let Some(text) = extract_claude_text(&v) {
+                    push_key_message(&mut key_messages, &text);
                 }
             }
 
@@ -146,9 +143,7 @@ fn parse_output(content: &str) -> ParsedOutput {
                     .and_then(|t| t.as_str())
                     .or_else(|| v.get("text").and_then(|t| t.as_str()))
                     .unwrap_or("");
-                if text.len() > 40 && key_messages.len() < 10 {
-                    key_messages.push(first_sentence(text, 160));
-                }
+                push_key_message(&mut key_messages, text);
             }
 
             "tool_use" if v.get("part").is_some() => {
@@ -174,9 +169,7 @@ fn parse_output(content: &str) -> ParsedOutput {
                     match item_type {
                         "agent_message" => {
                             let text = item.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                            if text.len() > 40 && key_messages.len() < 10 {
-                                key_messages.push(first_sentence(text, 160));
-                            }
+                            push_key_message(&mut key_messages, text);
                         }
                         "command_execution" => {
                             let cmd = item.get("command").and_then(|c| c.as_str()).unwrap_or("");
@@ -208,6 +201,13 @@ fn parse_output(content: &str) -> ParsedOutput {
         tool_counts,
         git_commands,
         key_messages,
+    }
+}
+
+/// Keep an assistant message longer than 40 chars as a key message, up to 10.
+fn push_key_message(key_messages: &mut Vec<String>, text: &str) {
+    if text.len() > 40 && key_messages.len() < 10 {
+        key_messages.push(first_sentence(text, 160));
     }
 }
 
