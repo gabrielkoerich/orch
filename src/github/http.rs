@@ -1348,7 +1348,14 @@ impl GhHttp {
                 .await
             {
                 Ok(resp) => resp,
-                Err(err) => return Ok(BlockedByFetch::Failed(err.to_string())),
+                Err(err) => {
+                    let message = err.to_string();
+                    // `send_with_retries` words a send failure with this marker
+                    if message.contains("(transport error)") {
+                        return Ok(BlockedByFetch::Unreachable(message));
+                    }
+                    return Ok(BlockedByFetch::Failed(message));
+                }
             };
             let status = resp.status();
             if status == StatusCode::NOT_FOUND || status == StatusCode::FORBIDDEN {

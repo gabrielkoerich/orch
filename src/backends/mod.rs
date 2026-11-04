@@ -124,12 +124,14 @@ pub struct PullRequestCompletion {
 ///
 /// `Native` is the GitHub blocked-by list, including when it is empty.
 /// `Unavailable` means the API is missing or forbidden, so the native list is empty.
-/// `Failed` means the read did not succeed, so stored rows stay as they are
+/// `Failed` means the read did not succeed, so stored rows stay as they are.
+/// `Unreachable` is a `Failed` caused by a transport error, so every other read in the pass would fail too
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockedByFetch {
     Native(Vec<BlockedByIssue>),
     Unavailable,
     Failed(String),
+    Unreachable(String),
 }
 
 /// The core trait for external task backends.

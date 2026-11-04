@@ -64,6 +64,8 @@ pub struct DepRef {
 #[derive(Debug, Clone)]
 pub struct SyncOutcome {
     pub cache: bool,
+    /// The read failed on a transport error, so GitHub cannot be reached for any task
+    pub unreachable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,7 +219,10 @@ pub async fn sync_issue_dependencies(
     body: &str,
 ) -> anyhow::Result<SyncOutcome> {
     let Some(issue_number) = issue_number.filter(|number| *number > 0) else {
-        return Ok(SyncOutcome { cache: false });
+        return Ok(SyncOutcome {
+            cache: false,
+            unreachable: false,
+        });
     };
     let fetch = match backend.blocked_by(repo, issue_number).await {
         Ok(fetch) => fetch,
@@ -234,7 +239,23 @@ pub async fn sync_issue_dependencies(
                 error = %message,
                 "dependency read failed, keeping stored rows"
             );
-            return Ok(SyncOutcome { cache: false });
+            return Ok(SyncOutcome {
+                cache: false,
+                unreachable: false,
+            });
+        }
+        BlockedByFetch::Unreachable(message) => {
+            tracing::warn!(
+                task_id,
+                repo,
+                issue_number,
+                error = %message,
+                "GitHub unreachable, keeping stored rows"
+            );
+            return Ok(SyncOutcome {
+                cache: false,
+                unreachable: true,
+            });
         }
     };
     // An issue naming itself would wait forever, so it never becomes a row
@@ -298,7 +319,18 @@ pub async fn sync_issue_dependencies(
     }
     store.replace_dependencies(task_id, &rows).await?;
     store.link_known_task(task_id, repo, issue_number).await?;
-    Ok(SyncOutcome { cache: true })
+    // Ingest and the tick share this stamp, so one read per issue covers both within the TTL
+    let now = chrono::Utc::now().timestamp();
+    if let Err(err) = store
+        .kv_set(&format!("dep_synced_at:{task_id}"), &now.to_string())
+        .await
+    {
+        tracing::warn!(task_id, err = %err, "failed to cache dependency sync time");
+    }
+    Ok(SyncOutcome {
+        cache: true,
+        unreachable: false,
+    })
 }
 
 /// Move `new` and `routed` tasks with open dependencies to `waiting`, and release
@@ -313,9 +345,8 @@ pub async fn apply_claim_gates(store: &TaskStore) -> anyhow::Result<()> {
 
 /// Refresh blocked-by links for schedulable tasks, then hold or release them.
 ///
-/// A successful read is cached for 45 seconds so a 10 second tick does not
-/// fetch every task every time. Sync from ingest calls `sync_issue_dependencies`
-/// directly and does not use this cache
+/// A read from here or from ingest is cached for 45 seconds. The pass ends at
+/// the first transport error
 pub async fn reconcile_dependencies(
     backend: &dyn ExternalBackend,
     store: &TaskStore,
@@ -349,10 +380,9 @@ pub async fn reconcile_dependencies(
         )
         .await
         {
-            Ok(outcome) if outcome.cache => {
-                if let Err(err) = store.kv_set(&key, &now.to_string()).await {
-                    tracing::warn!(task_id = task.id, err = %err, "failed to cache dependency sync time");
-                }
+            Ok(outcome) if outcome.unreachable => {
+                tracing::warn!("GitHub unreachable, ending the dependency pass");
+                break;
             }
             Ok(_) => {}
             Err(err) => {
@@ -892,6 +922,8 @@ See #4 in the notes
         reviewer: Mutex<Option<String>>,
         /// Counts the blocker reads that cost a GitHub call.
         reads: AtomicUsize,
+        /// Counts the blocked-by reads.
+        blocked_reads: AtomicUsize,
     }
 
     impl ScriptedBackend {
@@ -903,6 +935,7 @@ See #4 in the notes
                 pulls: Mutex::new(HashMap::new()),
                 review_comments: Mutex::new(HashMap::new()),
                 reads: AtomicUsize::new(0),
+                blocked_reads: AtomicUsize::new(0),
                 reviewer: Mutex::new(None),
             }
         }
@@ -970,6 +1003,7 @@ See #4 in the notes
             _repo: &str,
             issue_number: i64,
         ) -> anyhow::Result<BlockedByFetch> {
+            self.blocked_reads.fetch_add(1, Ordering::Relaxed);
             Ok(self
                 .blocked
                 .lock()
@@ -1053,6 +1087,38 @@ See #4 in the notes
             state: state.to_string(),
             state_reason: reason.map(str::to_string),
         }
+    }
+
+    #[tokio::test]
+    async fn ingest_then_tick_reads_each_issue_once() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let a = insert(&store, "owner/repo", "1", "A", "").await;
+        let b = insert(&store, "owner/repo", "2", "B", "").await;
+        let backend = ScriptedBackend::new(HashMap::new());
+        for (id, number) in [(a, 1), (b, 2)] {
+            sync_issue_dependencies(&backend, &store, id, "owner/repo", Some(number), "")
+                .await
+                .unwrap();
+        }
+        reconcile_dependencies(&backend, &store, None)
+            .await
+            .unwrap();
+        assert_eq!(backend.blocked_reads.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_ends_the_pass() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let mut blocked = HashMap::new();
+        for number in 1..=3 {
+            insert(&store, "owner/repo", &number.to_string(), "T", "").await;
+            blocked.insert(number, BlockedByFetch::Unreachable("down".into()));
+        }
+        let backend = ScriptedBackend::new(blocked);
+        reconcile_dependencies(&backend, &store, None)
+            .await
+            .unwrap();
+        assert_eq!(backend.blocked_reads.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
