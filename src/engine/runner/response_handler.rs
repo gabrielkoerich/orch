@@ -247,6 +247,15 @@ impl StoreCtx<'_> {
         }
     }
 
+    /// A successful run ends the streak of network errors and timeouts
+    async fn reset_retry_streaks(&self) {
+        self.set(&[
+            ("network_retries", serde_json::json!(0)),
+            ("timeout_retries", serde_json::json!(0)),
+        ])
+        .await;
+    }
+
     /// Load the full task record.
     async fn get_task(&self) -> Option<Task> {
         if let Some(store_id) = self.store_id_opt {
@@ -1486,7 +1495,7 @@ pub async fn handle_success(
         task_id,
     };
 
-    ctx.set(&[("network_retries", serde_json::json!(0))]).await;
+    ctx.reset_retry_streaks().await;
 
     // Auto-commit, push, create PR
     let git = if resp.status == "done"
@@ -1728,6 +1737,36 @@ mod tests {
 
     use super::*;
     use crate::store::NewTask;
+
+    /// A successful run between timeouts restarts the count, so only timeouts in a row block a task
+    #[tokio::test]
+    async fn successful_run_resets_timeout_retries() {
+        let store = Some(Arc::new(TaskStore::open_memory().await.unwrap()));
+        let id = store
+            .as_ref()
+            .unwrap()
+            .create_internal("owner/repo", "t", "b", "test", "", None)
+            .await
+            .unwrap();
+        let task_id = format!("internal:{id}");
+        let ctx = StoreCtx {
+            store: &store,
+            store_id_opt: None,
+            repo: "owner/repo",
+            task_id: &task_id,
+        };
+
+        ctx.increment("timeout_retries").await.unwrap();
+        ctx.increment("network_retries").await.unwrap();
+        ctx.reset_retry_streaks().await;
+        ctx.increment("timeout_retries").await.unwrap();
+        ctx.increment("timeout_retries").await.unwrap();
+
+        let task = ctx.get_task().await.unwrap();
+        assert_eq!(task.timeout_retries, 2);
+        assert_eq!(task.network_retries, 0);
+        assert_ne!(task.status.as_str(), "blocked");
+    }
 
     #[test]
     fn local_rate_limit_skip_is_detected() {
