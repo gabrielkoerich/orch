@@ -665,6 +665,7 @@ async fn handle_dispatch(
                     .json(&serde_json::json!({ "type": 6 }))
                     .send()
                     .await
+                    .map_err(reqwest::Error::without_url)
                 {
                     tracing::warn!(interaction_id, error = %e, "failed to acknowledge Discord interaction");
                 }

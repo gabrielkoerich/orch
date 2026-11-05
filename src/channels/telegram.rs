@@ -163,7 +163,14 @@ impl TelegramChannel {
         });
 
         for attempt in 0..TELEGRAM_MAX_RETRIES {
-            let response = match self.client.post(&url).json(&params).send().await {
+            let response = match self
+                .client
+                .post(&url)
+                .json(&params)
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)
+            {
                 Ok(r) => r,
                 Err(e) => {
                     if attempt + 1 < TELEGRAM_MAX_RETRIES {
@@ -181,7 +188,8 @@ impl TelegramChannel {
                 anyhow::bail!("telegram API error: {body}");
             }
 
-            let updates: GetUpdatesResponse = response.json().await?;
+            let updates: GetUpdatesResponse =
+                response.json().await.map_err(reqwest::Error::without_url)?;
 
             if !updates.ok {
                 anyhow::bail!("telegram API returned ok=false");
@@ -226,7 +234,13 @@ impl TelegramChannel {
             params["message_thread_id"] = serde_json::json!(tid);
         }
 
-        let response = self.client.post(&url).json(&params).send().await?;
+        let response = self
+            .client
+            .post(&url)
+            .json(&params)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -263,12 +277,19 @@ impl TelegramChannel {
         }
 
         let url = self.api_url("sendMessage");
-        let response = self.client.post(&url).json(&params).send().await?;
+        let response = self
+            .client
+            .post(&url)
+            .json(&params)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?;
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
             anyhow::bail!("telegram API error: {body}");
         }
-        let result: serde_json::Value = response.json().await?;
+        let result: serde_json::Value =
+            response.json().await.map_err(reqwest::Error::without_url)?;
         let message_id = result["result"]["message_id"].as_i64().unwrap_or(0);
         Ok(message_id)
     }
@@ -283,7 +304,13 @@ impl TelegramChannel {
             "callback_query_id": callback_query_id,
             "text": text
         });
-        let response = self.client.post(&url).json(&params).send().await?;
+        let response = self
+            .client
+            .post(&url)
+            .json(&params)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?;
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
             anyhow::bail!("telegram API error: {body}");
@@ -510,7 +537,12 @@ impl Channel for TelegramChannel {
     async fn health_check(&self) -> anyhow::Result<()> {
         let url = self.api_url("getMe");
 
-        let response = self.client.get(&url).send().await?;
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -527,6 +559,22 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn request_errors_do_not_contain_the_token_url() {
+        let token = "123456:FAKE-TOKEN";
+        let url = format!("http://127.0.0.1:1/bot{token}/getUpdates");
+        let err = Client::new()
+            .post(&url)
+            .send()
+            .await
+            .expect_err("port 1 refuses connections");
+        assert!(err.to_string().contains(token));
+
+        let err = reqwest::Error::without_url(err);
+        assert!(!err.to_string().contains(token));
+        assert!(!format!("{err:?}").contains(token));
+    }
 
     #[test]
     fn a_short_message_is_one_part() {
