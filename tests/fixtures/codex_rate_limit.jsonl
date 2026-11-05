@@ -1,2 +1,10 @@
-{"type":"error","message":"You've hit your usage limit for this billing period. Please upgrade your plan or wait until your limit resets."}
-{"type":"turn.failed","error":{"message":"You've hit your usage limit"}}
+# agent: codex
+# cli: unknown, archived before versions were recorded
+# date: 2026-09-23
+# scenario: rate_limit
+# source: archived orch run, trimmed to lines matching thread.started|turn.started|"type":"error"|turn.failed
+# exit: 1
+{"type":"thread.started","thread_id":"00000000-0000-4000-8000-000000000001"}
+{"type":"turn.started"}
+{"type":"error","message":"You’ve hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at Oct 13th, 2026 10:43 PM."}
+{"type":"turn.failed","error":{"message":"You’ve hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at Oct 13th, 2026 10:43 PM."}}

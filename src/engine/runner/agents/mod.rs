@@ -7,6 +7,8 @@
 
 #[macro_use]
 mod delegate;
+#[cfg(test)]
+pub(crate) mod fixture;
 /// Shared error pattern detection utilities used by multiple agent runners.
 pub(crate) mod patterns;
 

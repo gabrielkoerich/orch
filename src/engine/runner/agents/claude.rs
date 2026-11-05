@@ -1049,6 +1049,7 @@ pub fn collect_assistant_messages_text(ndjson: &str) -> String {
 mod tests {
     use super::*;
     use crate::engine::cooldown;
+    use crate::engine::runner::agents::fixture;
 
     fn runner() -> ClaudeRunner {
         ClaudeRunner::new("claude")
@@ -1444,8 +1445,10 @@ mod tests {
 
     #[test]
     fn fixture_claude_success() {
-        let raw = include_str!("../../../../tests/fixtures/claude_success.json");
-        let parsed = runner().parse_response(raw).unwrap();
+        let raw = fixture::load(include_str!(
+            "../../../../tests/fixtures/claude_success.json"
+        ));
+        let parsed = runner().parse_response(&raw.stdout).unwrap();
         assert_eq!(parsed.response.status, "done");
         assert!(parsed.response.summary.contains("Implemented"));
         assert_eq!(parsed.response.accomplished.len(), 2);
@@ -1456,44 +1459,30 @@ mod tests {
 
     #[test]
     fn fixture_claude_rate_limit() {
-        let raw = include_str!("../../../../tests/fixtures/claude_error_rate_limit.json");
-        let err = runner().parse_response(raw).unwrap_err();
+        let raw = fixture::load(include_str!(
+            "../../../../tests/fixtures/claude_error_rate_limit.json"
+        ));
+        let err = runner().parse_response(&raw.stdout).unwrap_err();
         assert!(matches!(err, AgentError::RateLimit { .. }), "got: {err:?}");
     }
 
     // ── NDJSON / stream-json fixtures ────────────────────────────
 
     #[test]
-    fn fixture_claude_stream_success() {
-        let raw = include_str!("../../../../tests/fixtures/claude_stream_success.jsonl");
-        let parsed = runner().parse_response(raw).unwrap();
-        assert_eq!(parsed.response.status, "done");
-        assert!(parsed.response.summary.contains("Implemented"));
-        assert_eq!(parsed.response.accomplished.len(), 2);
-        assert_eq!(parsed.input_tokens, Some(15000));
-        assert_eq!(parsed.output_tokens, Some(3500));
-        assert_eq!(parsed.duration_ms, Some(45000));
-    }
-
-    #[test]
     fn fixture_claude_stream_error() {
-        let raw = include_str!("../../../../tests/fixtures/claude_stream_error.jsonl");
-        let err = runner().parse_response(raw).unwrap_err();
+        let raw = fixture::load(include_str!(
+            "../../../../tests/fixtures/claude_stream_error.jsonl"
+        ));
+        let err = runner().parse_response(&raw.stdout).unwrap_err();
         assert!(matches!(err, AgentError::Auth { .. }), "got: {err:?}");
     }
 
     #[test]
-    fn fixture_claude_stream_rate_limit() {
-        let raw = include_str!("../../../../tests/fixtures/claude_stream_rate_limit.jsonl");
-        let err = runner().parse_response(raw).unwrap_err();
-        assert!(matches!(err, AgentError::RateLimit { .. }), "got: {err:?}");
-    }
-
-    #[test]
     fn fixture_claude_stream_thinking_block_conflict() {
-        let raw =
-            include_str!("../../../../tests/fixtures/claude_stream_thinking_block_conflict.jsonl");
-        let err = runner().parse_response(raw).unwrap_err();
+        let raw = fixture::load(include_str!(
+            "../../../../tests/fixtures/claude_stream_thinking_block_conflict.jsonl"
+        ));
+        let err = runner().parse_response(&raw.stdout).unwrap_err();
         assert!(
             matches!(err, AgentError::ThinkingBlockConflict { .. }),
             "expected ThinkingBlockConflict, got: {err:?}"

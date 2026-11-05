@@ -1,1 +1,3 @@
+# agent: opencode
+# source: hand-written, a real CLI cannot produce this case on demand
 {"type":"error","timestamp":1772275793048,"sessionID":"ses_35c2183a3ffe70d2iGf4PT2Gdh","error":{"name":"UnknownError","data":{"message":"Provider returned error"}}}
