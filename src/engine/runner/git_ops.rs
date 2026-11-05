@@ -1339,6 +1339,10 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
     anyhow::bail!("push failed: {stderr}")
 }
 
+pub fn is_missing_remote_ref_error(err: &anyhow::Error) -> bool {
+    err.to_string().contains("couldn't find remote ref")
+}
+
 fn push_needs_rebase(stderr: &str) -> bool {
     let lower = stderr.to_ascii_lowercase();
     lower.contains("non-fast-forward")
@@ -1366,6 +1370,8 @@ fn is_transient_network_error(stderr: &str) -> bool {
         || lower.contains("no route to host")
         || lower.contains("temporary failure in name resolution")
         || lower.contains("eof")
+        || lower.contains("fatal error in commit_refs")
+        || (lower.contains("[remote rejected]") && lower.contains("(failure)"))
 }
 
 /// Strip credentials from push stderr before it is logged or returned:
@@ -2204,6 +2210,23 @@ mod tests {
         assert!(!is_transient_network_error(
             "remote: error: GH006: Protected branch update failed"
         ));
+    }
+
+    #[test]
+    fn is_transient_network_error_detects_github_remote_failure() {
+        assert!(is_transient_network_error(
+            "remote: fatal error in commit_refs\n ! [remote rejected] b -> b (failure)"
+        ));
+        assert!(is_transient_network_error(
+            "! [remote rejected] b -> b (failure)"
+        ));
+    }
+
+    #[test]
+    fn missing_remote_ref_error_is_detected() {
+        let err = anyhow::anyhow!("failed to fetch origin/b: fatal: couldn't find remote ref b");
+        assert!(is_missing_remote_ref_error(&err));
+        assert!(!is_missing_remote_ref_error(&anyhow::anyhow!("conflict")));
     }
 
     #[test]

@@ -601,12 +601,7 @@ async fn push_branch_with_log(
             }
 
             // Check if this is a non-fast-forward error that we can recover from.
-            let is_diverged = err_str.contains("non-fast-forward")
-                || err_str.contains("rejected")
-                || err_str.contains("fetch first")
-                || err_str.contains("behind");
-
-            if is_diverged {
+            if push_error_is_diverged(&err_str) {
                 tracing::info!(
                     task_id = ctx.task_id,
                     branch = branch,
@@ -670,6 +665,30 @@ async fn push_branch_with_log(
                         .await;
                         return PushResult::Success;
                     }
+                    Err(rebase_err) if git_ops::is_missing_remote_ref_error(&rebase_err) => {
+                        // The branch never reached the remote, so there is nothing to rebase onto.
+                        // Take the counted retry path instead of the rebase conflict block
+                        tracing::warn!(
+                            task_id = ctx.task_id,
+                            branch = branch,
+                            "remote branch does not exist, skipping rebase recovery"
+                        );
+                        ctx.append_activity(
+                            "push",
+                            Some(agent_name),
+                            model_name,
+                            Some(&serde_json::json!({
+                                "status": "error",
+                                "branch": branch,
+                                "default_branch": default_branch,
+                                "error": err_str,
+                            })),
+                        )
+                        .await;
+                        ctx.set(&[("last_error", serde_json::json!(format!("push failed: {e}")))])
+                            .await;
+                        return PushResult::Failed;
+                    }
                     Err(rebase_err) => {
                         // Rebase failed (likely conflicts) — block for human intervention.
                         tracing::error!(
@@ -719,6 +738,15 @@ async fn push_branch_with_log(
             PushResult::Failed
         }
     }
+}
+
+/// True when a push error means the remote branch moved. `[remote rejected]` is a server side
+/// failure, only `! [rejected]` marks a divergence
+fn push_error_is_diverged(err_str: &str) -> bool {
+    err_str.contains("non-fast-forward")
+        || err_str.contains("! [rejected]")
+        || err_str.contains("fetch first")
+        || err_str.contains("behind")
 }
 
 /// True when the GitHub client refused the call locally because its rate-limit window is active.
@@ -1798,6 +1826,16 @@ mod tests {
         git(dir, &["config", "user.email", "t@t.com"]);
         git(dir, &["config", "user.name", "T"]);
         git(dir, &["config", "commit.gpgsign", "false"]);
+    }
+
+    #[test]
+    fn remote_rejected_failure_is_not_diverged() {
+        let err = "remote: fatal error in commit_refs\n ! [remote rejected] b -> b (failure)";
+        assert!(!push_error_is_diverged(err));
+        assert!(push_error_is_diverged("! [rejected] b -> b (fetch first)"));
+        assert!(push_error_is_diverged(
+            "! [rejected] b -> b (non-fast-forward)"
+        ));
     }
 
     /**
