@@ -397,4 +397,104 @@ mod tests {
         assert_eq!(forest[0].id, "31");
         assert!(forest[0].children.is_empty());
     }
+
+    fn node(id: &str, status: &str, agent: Option<&str>, children: Vec<TreeNode>) -> TreeNode {
+        TreeNode {
+            id: id.to_string(),
+            title: format!("T{id}"),
+            status: status.to_string(),
+            agent: agent.map(ToString::to_string),
+            children,
+        }
+    }
+
+    #[test]
+    fn render_tree_exact_output_for_nested_tree() {
+        let root = node(
+            "1",
+            "blocked",
+            Some("claude"),
+            vec![
+                node(
+                    "2",
+                    "done",
+                    None,
+                    vec![
+                        node("4", "done", Some("codex"), vec![]),
+                        node("5", "new", None, vec![]),
+                    ],
+                ),
+                node("3", "new", None, vec![node("6", "new", None, vec![])]),
+            ],
+        );
+
+        let expected = [
+            "#1 [blocked] (claude) T1",
+            "├── #2 [done] T2",
+            "│   ├── #4 [done] (codex) T4",
+            "│   └── #5 [new] T5",
+            "└── #3 [new] T3",
+            "    └── #6 [new] T6",
+            "",
+        ]
+        .join("\n");
+        assert_eq!(render_tree(&root), expected);
+    }
+
+    #[test]
+    fn render_forest_separates_trees_with_one_blank_line() {
+        let roots = vec![
+            node("1", "new", None, vec![]),
+            node("2", "done", None, vec![]),
+        ];
+        assert_eq!(render_forest(&roots), "#1 [new] T1\n\n#2 [done] T2\n");
+    }
+
+    #[test]
+    fn render_forest_empty_says_no_tasks() {
+        assert_eq!(render_forest(&[]), "No tasks found.");
+    }
+
+    #[test]
+    fn render_single_tree_notes_missing_children_only_when_asked() {
+        let leaf = node("1", "new", None, vec![]);
+        assert_eq!(
+            render_single_tree(&leaf, true),
+            "#1 [new] T1\n    (no children)\n"
+        );
+        assert_eq!(render_single_tree(&leaf, false), "#1 [new] T1\n");
+
+        let parent = node("1", "new", None, vec![node("2", "new", None, vec![])]);
+        assert_eq!(
+            render_single_tree(&parent, true),
+            "#1 [new] T1\n└── #2 [new] T2\n"
+        );
+    }
+
+    #[test]
+    fn build_forest_sorts_numerically_and_non_numeric_ids_sort_first() {
+        let tasks = vec![
+            create_test_task("10", "ten", "open", &["status:new"]),
+            create_test_task("9", "nine", "open", &["status:new"]),
+            create_test_task("abc", "word", "open", &["status:new"]),
+            create_test_task("2", "child b", "open", &["parent:10"]),
+            create_test_task("11", "child a", "open", &["parent:10"]),
+        ];
+
+        let forest = build_forest(&tasks);
+        let root_ids: Vec<&str> = forest.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(root_ids, ["abc", "9", "10"]);
+        let child_ids: Vec<&str> = forest[2].children.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(child_ids, ["2", "11"]);
+    }
+
+    #[test]
+    fn from_external_without_labels_has_unknown_status_and_no_agent() {
+        let Task::External(ext) = create_test_task("7", "x", "open", &[]) else {
+            unreachable!()
+        };
+        let node = TreeNode::from_external(&ext);
+        assert_eq!(node.status, "unknown");
+        assert_eq!(node.agent, None);
+    }
 }
