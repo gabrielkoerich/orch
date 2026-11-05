@@ -865,10 +865,12 @@ pub async fn record_rate_limit_window(agent_name: &str, window: &RateLimitWindow
         tracing::warn!(agent = agent_name, err = %e, "failed to persist rate limit window");
     }
 
+    let now = chrono::Utc::now().timestamp();
     if window.status == "rejected"
-        && let Some(until) = window.resets_at
-        && until > chrono::Utc::now().timestamp()
+        && let Some(reset) = window.resets_at
+        && reset > now
     {
+        let until = reset.min(now + PERSISTENT_MODEL_BACKOFF_MAX_SECS);
         set_cooldown_async(agent_name, until, "rate_limit_window").await;
         tracing::info!(
             agent = agent_name,

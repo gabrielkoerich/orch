@@ -977,6 +977,14 @@ pub fn find_claude_result(ndjson: &str) -> Option<super::AgentResult> {
     })
 }
 
+/// Keep a vendor label printable: letters, digits, `_` and `-`, at most 32 characters
+fn sanitize_window_label(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        .take(32)
+        .collect()
+}
+
 /// Every `rate_limit_event` in the stream, oldest first. Lines without a status are skipped
 pub fn rate_limit_windows(ndjson: &str) -> Vec<RateLimitWindow> {
     ndjson
@@ -987,12 +995,12 @@ pub fn rate_limit_windows(ndjson: &str) -> Vec<RateLimitWindow> {
         .filter_map(|val| {
             let info = val.get("rate_limit_info")?;
             Some(RateLimitWindow {
-                status: info.get("status")?.as_str()?.to_string(),
-                window_type: info
-                    .get("rateLimitType")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string(),
+                status: sanitize_window_label(info.get("status")?.as_str()?),
+                window_type: sanitize_window_label(
+                    info.get("rateLimitType")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown"),
+                ),
                 utilization: info.get("utilization").and_then(serde_json::Value::as_f64),
                 resets_at: info.get("resetsAt").and_then(serde_json::Value::as_i64),
             })
