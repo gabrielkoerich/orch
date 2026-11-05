@@ -54,6 +54,7 @@ use super::{
     AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent, json_error_message,
     json_str,
 };
+use crate::engine::cooldown::RateLimitWindow;
 use crate::engine::runner::agents::opencode;
 use crate::parser;
 
@@ -974,6 +975,29 @@ pub fn find_claude_result(ndjson: &str) -> Option<super::AgentResult> {
         duration_ms: None,
         truncated_by_length: false,
     })
+}
+
+/// Every `rate_limit_event` in the stream, oldest first. Lines without a status are skipped
+pub fn rate_limit_windows(ndjson: &str) -> Vec<RateLimitWindow> {
+    ndjson
+        .lines()
+        .filter(|line| line.contains("rate_limit_event"))
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .filter(|val| val.get("type").and_then(|v| v.as_str()) == Some("rate_limit_event"))
+        .filter_map(|val| {
+            let info = val.get("rate_limit_info")?;
+            Some(RateLimitWindow {
+                status: info.get("status")?.as_str()?.to_string(),
+                window_type: info
+                    .get("rateLimitType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                utilization: info.get("utilization").and_then(serde_json::Value::as_f64),
+                resets_at: info.get("resetsAt").and_then(serde_json::Value::as_i64),
+            })
+        })
+        .collect()
 }
 
 /// Concatenate text content from all `type:assistant` NDJSON messages in
@@ -2322,6 +2346,24 @@ mod stream_tests {
             events(err),
             vec![StreamEvent::Error("too many turns".into())]
         );
+    }
+
+    #[test]
+    fn rate_limit_windows_parses_rejected_and_unknown_types() {
+        let ndjson = concat!(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","utilization":0.4,"resetsAt":1900000000}}"#,
+            "\n",
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"weekly_opus","resetsAt":1900003600}}"#,
+            "\n",
+            r#"{"type":"rate_limit_event","rate_limit_info":{}}"#,
+        );
+        let windows = rate_limit_windows(ndjson);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].status, "allowed");
+        assert_eq!(windows[0].utilization, Some(0.4));
+        assert_eq!(windows[1].status, "rejected");
+        assert_eq!(windows[1].window_type, "weekly_opus");
+        assert_eq!(windows[1].resets_at, Some(1_900_003_600));
     }
 
     #[test]

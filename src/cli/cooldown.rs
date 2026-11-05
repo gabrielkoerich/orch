@@ -22,12 +22,14 @@ pub async fn list() -> anyhow::Result<()> {
 
     let entries = cooldown::list_all_cooldowns();
     let degraded = cooldown::list_degraded_agents();
+    let windows = cooldown::list_rate_limit_windows(&store).await;
+    let now = chrono::Utc::now().timestamp();
     if entries.is_empty() && degraded.is_empty() {
         println!("No active cooldowns.");
+        print_windows(&windows, now);
         return Ok(());
     }
 
-    let now = chrono::Utc::now().timestamp();
     println!("{:<30} {:<12} REASON", "KEY", "REMAINING");
     println!("{}", "-".repeat(72_usize));
     for (key, until, reason) in &entries {
@@ -41,7 +43,31 @@ pub async fn list() -> anyhow::Result<()> {
         }
         println!("{:<30} {:<12} {}", agent, "degraded", reason);
     }
+    print_windows(&windows, now);
     Ok(())
+}
+
+fn print_windows(windows: &[(String, cooldown::RateLimitWindow)], now: i64) {
+    if windows.is_empty() {
+        return;
+    }
+    println!();
+    println!(
+        "{:<12} {:<12} {:<10} {:<12} RESETS IN",
+        "AGENT", "WINDOW", "STATUS", "UTILIZATION"
+    );
+    for (agent, w) in windows {
+        let used = w
+            .utilization
+            .map_or_else(|| "-".to_string(), |u| format!("{:.0}%", u * 100.0));
+        let resets = w
+            .resets_at
+            .map_or_else(|| "-".to_string(), |at| format_remaining(at - now));
+        println!(
+            "{agent:<12} {:<12} {:<10} {used:<12} {resets}",
+            w.window_type, w.status
+        );
+    }
 }
 
 /// Clear a specific cooldown by key, or all cooldowns with `--all`.

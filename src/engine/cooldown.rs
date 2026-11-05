@@ -841,6 +841,62 @@ pub async fn set_agent_cooldown(agent_name: &str, duration_secs: u64) {
     set_cooldown_async(agent_name, cooldown_until, "silence_agent_cooldown").await;
 }
 
+/// KV prefix for the latest quota window an agent reported: `rate_window:{agent}`
+pub const RATE_WINDOW_KV_PREFIX: &str = "rate_window:";
+
+/// One quota window from a vendor `rate_limit_event`, with the vendor window type kept as sent
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RateLimitWindow {
+    pub status: String,
+    pub window_type: String,
+    pub utilization: Option<f64>,
+    pub resets_at: Option<i64>,
+}
+
+/// Store the latest window for an agent. A rejected window cools the agent until its reset time
+pub async fn record_rate_limit_window(agent_name: &str, window: &RateLimitWindow) {
+    let store_opt = cooldown_store().lock().await.clone();
+    if let Some(store) = store_opt
+        && let Ok(value) = serde_json::to_string(window)
+        && let Err(e) = store
+            .kv_set(&format!("{RATE_WINDOW_KV_PREFIX}{agent_name}"), &value)
+            .await
+    {
+        tracing::warn!(agent = agent_name, err = %e, "failed to persist rate limit window");
+    }
+
+    if window.status == "rejected"
+        && let Some(until) = window.resets_at
+        && until > chrono::Utc::now().timestamp()
+    {
+        set_cooldown_async(agent_name, until, "rate_limit_window").await;
+        tracing::info!(
+            agent = agent_name,
+            window = %window.window_type,
+            cooldown_until = until,
+            "rate limit window rejected: cooling agent until vendor reset"
+        );
+    }
+}
+
+/// Latest stored quota window per agent, sorted by agent name
+pub async fn list_rate_limit_windows(store: &Arc<TaskStore>) -> Vec<(String, RateLimitWindow)> {
+    let rows = store
+        .kv_list_prefix(RATE_WINDOW_KV_PREFIX)
+        .await
+        .unwrap_or_default();
+    let mut windows: Vec<(String, RateLimitWindow)> = rows
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let agent = key.strip_prefix(RATE_WINDOW_KV_PREFIX)?.to_string();
+            let window = serde_json::from_str(&value).ok()?;
+            Some((agent, window))
+        })
+        .collect();
+    windows.sort_by(|a, b| a.0.cmp(&b.0));
+    windows
+}
+
 /// Record a silence detection for an agent+model and apply extended cooldowns
 /// when repeated silences exceed the threshold within the rolling window.
 pub async fn record_silence_detection(agent_name: &str, model: &str) -> Option<SilenceCountResult> {
@@ -3448,6 +3504,50 @@ mod tests {
             .unwrap()
             .expect("failure count should be stored");
         assert_eq!(stored, "1");
+    }
+
+    fn window(status: &str, resets_at: Option<i64>) -> RateLimitWindow {
+        RateLimitWindow {
+            status: status.to_string(),
+            window_type: "five_hour".to_string(),
+            utilization: Some(1.0),
+            resets_at,
+        }
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn rejected_window_cools_agent_until_reset() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
+
+        let agent = "test_window_rejected_agent";
+        let reset = chrono::Utc::now().timestamp() + 7200;
+        record_rate_limit_window(agent, &window("rejected", Some(reset))).await;
+
+        assert_eq!(cooldown_until(agent), Some(reset));
+        let stored = list_rate_limit_windows(&store).await;
+        assert_eq!(
+            stored,
+            vec![(agent.to_string(), window("rejected", Some(reset)))]
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn allowed_window_changes_no_cooldown() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
+
+        let agent = "test_window_allowed_agent";
+        let reset = chrono::Utc::now().timestamp() + 7200;
+        record_rate_limit_window(agent, &window("allowed", Some(reset))).await;
+        record_rate_limit_window(agent, &window("allowed_warning", Some(reset))).await;
+
+        assert_eq!(cooldown_until(agent), None);
+        assert_eq!(list_rate_limit_windows(&store).await.len(), 1);
     }
 
     #[serial(cooldown_state)]
