@@ -55,6 +55,11 @@ impl TreeNode {
     }
 }
 
+/// Order nodes by numeric ID, with non-numeric IDs counting as 0.
+fn sort_by_numeric_id(nodes: &mut [TreeNode]) {
+    nodes.sort_by_key(|n| n.id.parse::<i64>().unwrap_or(0));
+}
+
 /// Build a forest (collection of trees) from a list of tasks.
 ///
 /// Uses `parent:*` labels to determine hierarchy. Tasks without a parent label
@@ -77,11 +82,7 @@ pub fn build_forest(tasks: &[Task]) -> Vec<TreeNode> {
         }
 
         // Sort children by numeric ID for deterministic output
-        node.children.sort_by(|a, b| {
-            let a_num = a.id.parse::<i64>().unwrap_or(0);
-            let b_num = b.id.parse::<i64>().unwrap_or(0);
-            a_num.cmp(&b_num)
-        });
+        sort_by_numeric_id(&mut node.children);
 
         Some(node)
     }
@@ -153,11 +154,7 @@ pub fn build_forest(tasks: &[Task]) -> Vec<TreeNode> {
     }
 
     // Sort roots by ID numerically for consistent output
-    roots.sort_by(|a, b| {
-        let a_num = a.id.parse::<i64>().unwrap_or(0);
-        let b_num = b.id.parse::<i64>().unwrap_or(0);
-        a_num.cmp(&b_num)
-    });
+    sort_by_numeric_id(&mut roots);
 
     roots
 }
@@ -171,35 +168,19 @@ pub fn render_tree(root: &TreeNode) -> String {
 
 /// Render a tree node and its children recursively.
 fn render_node(node: &TreeNode, output: &mut String, prefix: &str, is_last: bool, is_root: bool) {
+    let agent = node
+        .agent
+        .as_ref()
+        .map(|a| format!("({a}) "))
+        .unwrap_or_default();
+    let label = format!("#{} [{}] {}{}", node.id, node.status, agent, node.title);
     if is_root {
         // Root node format: #30 [blocked] Implement auth system
-        let _ = writeln!(
-            output,
-            "#{} [{}] {}{}",
-            node.id,
-            node.status,
-            node.agent
-                .as_ref()
-                .map(|a| format!("({a}) "))
-                .unwrap_or_default(),
-            node.title
-        );
+        let _ = writeln!(output, "{label}");
     } else {
         // Child node format with tree branches
         let branch = if is_last { "└── " } else { "├── " };
-        let _ = writeln!(
-            output,
-            "{}{}#{} [{}] {}{}",
-            prefix,
-            branch,
-            node.id,
-            node.status,
-            node.agent
-                .as_ref()
-                .map(|a| format!("({a}) "))
-                .unwrap_or_default(),
-            node.title
-        );
+        let _ = writeln!(output, "{prefix}{branch}{label}");
     }
 
     // Render children
