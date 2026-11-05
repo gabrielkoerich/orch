@@ -1828,12 +1828,6 @@ mod tests {
         git(dir, &["config", "commit.gpgsign", "false"]);
     }
 
-    /**
-     * Someone rebased the PR branch from another clone and force-pushed it, so orch's
-     * push is rejected with a stale lease. Pushing is orch's own step: it must rebase
-     * onto the moved branch and push again, never hand finished work back to the agent
-     * as a fresh attempt (#3783)
-     **/
     #[test]
     fn remote_rejected_failure_is_not_diverged() {
         let err = "remote: fatal error in commit_refs\n ! [remote rejected] b -> b (failure)";
@@ -1844,6 +1838,12 @@ mod tests {
         ));
     }
 
+    /**
+     * Someone rebased the PR branch from another clone and force-pushed it, so orch's
+     * push is rejected with a stale lease. Pushing is orch's own step: it must rebase
+     * onto the moved branch and push again, never hand finished work back to the agent
+     * as a fresh attempt (#3783)
+     **/
     #[tokio::test]
     async fn push_rejected_after_remote_rebase_is_pushed_not_rerouted() {
         let remote = tempfile::tempdir().unwrap();
