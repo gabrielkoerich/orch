@@ -1,2 +1,8 @@
-{"type":"step_start","timestamp":1706300000,"part":{"type":"step-start","snapshot":"Starting task..."}}
-{"type":"error","timestamp":1706300001,"message":"rate limit exceeded: too many requests, please try again later"}
+# agent: opencode
+# cli: opencode v2.2.5
+# date: 2026-11-05
+# scenario: rate_limit
+# source: recorded with scripts/record-agent-fixture.py
+# exit: 1
+{"type":"error","timestamp":1793919837680,"sessionID":"ses_000000000000000000000001","error":{"type":"provider.free-limit","message":"Free usage limit reached. Connect a provider or subscribe to OpenCode Go to keep going, or switch models.","status":429,"response":{"body":"{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode.ai/go\"}}"},"retryAfterMs":6190000}}
+{"type":"step_start","timestamp":1793919837039,"sessionID":"ses_000000000000000000000001","part":{"id":"prt_000000000000000000000001_step-start","sessionID":"ses_000000000000000000000001","messageID":"msg_000000000000000000000001","type":"step-start"}}

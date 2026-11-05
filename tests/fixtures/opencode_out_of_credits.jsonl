@@ -1,0 +1,8 @@
+# agent: opencode
+# cli: opencode v2.2.5
+# date: 2026-11-05
+# scenario: out_of_credits
+# source: recorded with scripts/record-agent-fixture.py
+# exit: 1
+{"type":"error","timestamp":1793919837915,"sessionID":"ses_000000000000000000000001","error":{"type":"provider.quota","message":"insufficient balance (1008)","status":402,"response":{"body":"{\"type\":\"error\",\"error\":{\"type\":\"insufficient_balance_error\",\"message\":\"insufficient balance (1008)\"},\"request_id\":\"073c3e5ed8c9eb3287cfcb47401fc85d\"}"}}}
+{"type":"step_start","timestamp":1793919837019,"sessionID":"ses_000000000000000000000001","part":{"id":"prt_000000000000000000000001_step-start","sessionID":"ses_000000000000000000000001","messageID":"msg_000000000000000000000001","type":"step-start"}}

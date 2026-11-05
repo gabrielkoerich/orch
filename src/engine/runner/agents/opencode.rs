@@ -1270,6 +1270,7 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::engine::runner::agents::fixture;
 
     fn runner() -> OpenCodeRunner {
         OpenCodeRunner::new()
@@ -1807,38 +1808,18 @@ mod tests {
 
     // ── Fixture-based tests ─────────────────────────────────────
 
-    #[test]
-    fn fixture_opencode_success() {
-        let raw = include_str!("../../../../tests/fixtures/opencode_success.jsonl");
-        let parsed = runner().parse_response(raw).unwrap();
-        assert_eq!(parsed.response.status, "done");
-        assert!(parsed.response.summary.contains("Fixed"));
-        assert_eq!(parsed.response.accomplished.len(), 2);
-        assert_eq!(parsed.input_tokens, Some(17500));
-        assert_eq!(parsed.output_tokens, Some(500));
-    }
-
     /// Real failure: OpenCode rejects a tool permission in non-interactive mode.
     /// The error has `{"error":{"name":"PermissionError","data":{"message":"user rejected permission..."}}}`.
     /// Parser must extract the nested message and classify as PermissionDenied.
     #[test]
     fn fixture_opencode_permission_denied() {
-        let raw = include_str!("../../../../tests/fixtures/opencode_permission_denied.jsonl");
-        let err = runner().parse_response(raw).unwrap_err();
+        let raw = fixture::load(include_str!(
+            "../../../../tests/fixtures/opencode_permission_denied.jsonl"
+        ));
+        let err = runner().parse_response(&raw.stdout).unwrap_err();
         assert!(
             matches!(err, AgentError::PermissionDenied { .. }),
             "expected PermissionDenied, got: {err:?}"
-        );
-    }
-
-    /// Real failure: OpenCode rate limit via top-level message field.
-    #[test]
-    fn fixture_opencode_rate_limit() {
-        let raw = include_str!("../../../../tests/fixtures/opencode_rate_limit.jsonl");
-        let err = runner().parse_response(raw).unwrap_err();
-        assert!(
-            matches!(err, AgentError::RateLimit { .. }),
-            "expected RateLimit, got: {err:?}"
         );
     }
 
@@ -1847,8 +1828,10 @@ mod tests {
     /// Parser must extract the nested message and classify as ModelUnavailable.
     #[test]
     fn fixture_opencode_model_not_found() {
-        let raw = include_str!("../../../../tests/fixtures/opencode_model_not_found.jsonl");
-        let err = runner().parse_response(raw).unwrap_err();
+        let raw = fixture::load(include_str!(
+            "../../../../tests/fixtures/opencode_model_not_found.jsonl"
+        ));
+        let err = runner().parse_response(&raw.stdout).unwrap_err();
         assert!(
             matches!(err, AgentError::ModelUnavailable { .. }),
             "expected ModelUnavailable, got: {err:?}"
@@ -1862,8 +1845,10 @@ mod tests {
     /// provider failure. Classified as RateLimit so degraded/rate-limit tracking applies.
     #[test]
     fn fixture_opencode_provider_returned_error() {
-        let raw = include_str!("../../../../tests/fixtures/opencode_provider_returned_error.jsonl");
-        let err = runner().parse_response(raw).unwrap_err();
+        let raw = fixture::load(include_str!(
+            "../../../../tests/fixtures/opencode_provider_returned_error.jsonl"
+        ));
+        let err = runner().parse_response(&raw.stdout).unwrap_err();
         assert!(
             matches!(err, AgentError::RateLimit { .. }),
             "expected RateLimit, got: {err:?}"

@@ -1,3 +1,5 @@
+# agent: claude
+# source: hand-written, a real CLI cannot produce this case on demand
 {
   "type": "result",
   "subtype": "error",

@@ -1,6 +1,16 @@
-{"type":"thread.started","thread_id":"thread_abc123"}
+# agent: codex
+# cli: codex-cli 0.166.0
+# date: 2026-11-05
+# scenario: success
+# source: recorded with scripts/record-agent-fixture.py
+# exit: 0
+# stderr: 2026-11-05T23:10:12.373716Z ERROR codex_skills_extension::loader::host: skills scan reached its traversal limit (root: file:///home/user/.claude/skills)
+{"type":"thread.started","thread_id":"00000000-0000-4000-8000-000000000001"}
 {"type":"turn.started"}
-{"type":"item.completed","item":{"type":"agent_message","text":"I'll implement the requested changes."}}
-{"type":"item.completed","item":{"type":"command_execution","command":"echo 'hello world'"}}
-{"type":"item.completed","item":{"type":"agent_message","text":"{\"status\":\"done\",\"summary\":\"Implemented the requested feature\",\"accomplished\":[\"Created handler\",\"Added route\"],\"remaining\":[],\"files\":[\"src/handler.rs\"]}"}}
-{"type":"turn.completed"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’ll add `hello.txt` with the requested content, then verify the file."}}
+{"type":"item.started","item":{"id":"item_1","type":"file_change","changes":[{"path":"/work/hello.txt","kind":"add"}],"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"file_change","changes":[{"path":"/work/hello.txt","kind":"add"}],"status":"completed"}}
+{"type":"item.started","item":{"id":"item_2","type":"command_execution","command":"/bin/zsh -lc 'test \"$(tr -d '\"'\\\\n' < hello.txt)\\\" = hello && git status --short -- hello.txt\"","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_2","type":"command_execution","command":"/bin/zsh -lc 'test \"$(tr -d '\"'\\\\n' < hello.txt)\\\" = hello && git status --short -- hello.txt\"","aggregated_output":"?? hello.txt\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"{\"status\":\"done\",\"summary\":\"Created hello.txt containing hello.\",\"accomplished\":[\"Created and verified hello.txt.\"],\"remaining\":[],\"files_changed\":[\"hello.txt\"],\"blockers\":[],\"reason\":\"\",\"learnings\":[]}"}}
+{"type":"turn.completed","usage":{"input_tokens":39729,"cached_input_tokens":29312,"cache_write_input_tokens":0,"output_tokens":301,"reasoning_output_tokens":36}}

@@ -24,6 +24,8 @@ pub mod diff;
 pub mod direct;
 pub mod fallback;
 pub mod git_ops;
+#[cfg(test)]
+mod recorded_fixtures;
 pub mod response;
 pub mod response_handler;
 pub mod sandbox;
@@ -231,6 +233,22 @@ fn parse_success_output(
     agent_runner: &dyn agents::AgentRunner,
     raw_stdout: &str,
 ) -> Result<agents::ParsedResponse, agents::AgentError> {
+    // The last result envelope is the agent's final answer and carries the run's tokens and cost.
+    // Claude writes terminal_reason:completed on every run, so this goes before that shortcut
+    let agent_result = agents::find_agent_result(agent_name, raw_stdout);
+    if let Some(result) = &agent_result
+        && !result.is_error
+        && let Ok(response) = parser::parse(&result.result_text)
+    {
+        return Ok(agents::ParsedResponse {
+            response,
+            input_tokens: result.input_tokens,
+            output_tokens: result.output_tokens,
+            cost_usd: result.cost_usd,
+            duration_ms: result.duration_ms,
+        });
+    }
+
     // Quick NDJSON terminal_reason:completed shortcut: when the agent
     // emitted a session envelope that explicitly signals completion we
     // prefer to interpret that as a successful run (or at least a
@@ -281,7 +299,7 @@ fn parse_success_output(
     }
 
     // 1. Try to use the unified agent result extractor first
-    if let Some(agent_result) = agents::find_agent_result(agent_name, raw_stdout) {
+    if let Some(agent_result) = agent_result {
         // Treat is_error as authoritative for the success path
         if agent_result.is_error {
             // Classify the error from the agent's result text rather than
@@ -304,16 +322,6 @@ fn parse_success_output(
             });
         }
 
-        // Try to parse the inner result text as standard JSON
-        if let Ok(response) = parser::parse(&agent_result.result_text) {
-            return Ok(agents::ParsedResponse {
-                response,
-                input_tokens: agent_result.input_tokens,
-                output_tokens: agent_result.output_tokens,
-                cost_usd: agent_result.cost_usd,
-                duration_ms: agent_result.duration_ms,
-            });
-        }
         // Strategy 2: scan all earlier assistant messages in the NDJSON
         // stream for valid AgentResponse JSON. Agents often emit the
         // JSON in an intermediate turn and then summarise in prose as

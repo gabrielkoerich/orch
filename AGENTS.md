@@ -511,6 +511,10 @@ A test must not depend on `~/.orch/config.yml`. CI has no config, so a test that
 
 A test must not run an agent binary either. `skip_live_opencode_discovery()` in `src/engine/runner/agents/opencode.rs` makes opencode model discovery return nothing in test and debug builds, because the real `opencode models` leaves an `opencode serve --service` child behind, and a full run left 45 of them (#3895). Do not remove that gate to make a test see real models, and do not call a real agent from a test to find out what it supports. `building_a_router_never_runs_opencode` guards it.
 
+## Agent output fixtures
+
+`scripts/record-agent-fixture.py` records an agent CLI run with orch's command line (`record`) or imports an archived attempt from `~/.orch/state` (`import`) into `tests/fixtures/`, scrubbed and scanned with gitleaks. A maintainer runs it by hand, never CI or a test. Each fixture's `# source:` header says if it was recorded, archived or hand-written, and `src/engine/runner/recorded_fixtures.rs` drives the recorded ones through `parse_session_output`.
+
 ## Preferred tools
 
 - Use `rg` instead of `grep` — faster, installed as a brew dependency

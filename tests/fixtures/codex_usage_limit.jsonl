@@ -1,3 +1,5 @@
+# agent: codex
+# source: hand-written, a real CLI cannot produce this case on demand
 {"type":"thread.started","thread_id":"019ca16a-4f72-7990-9b72-fb0c45e1e2ce"}
 {"type":"turn.started"}
 {"type":"error","message":"Reconnecting... 2/5 (stream disconnected before completion: failed to send websocket request: Connection closed normally)"}

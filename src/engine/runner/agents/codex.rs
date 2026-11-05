@@ -448,6 +448,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::engine::runner::agents::fixture;
 
     fn runner() -> CodexRunner {
         CodexRunner
@@ -721,23 +722,6 @@ mod tests {
 
     // ── Fixture-based tests ─────────────────────────────────────
 
-    #[test]
-    fn fixture_codex_success() {
-        let raw = include_str!("../../../../tests/fixtures/codex_success.jsonl");
-        let parsed = runner().parse_response(raw).unwrap();
-        assert_eq!(parsed.response.status, "done");
-        assert!(parsed.response.summary.contains("Implemented"));
-        assert_eq!(parsed.response.accomplished.len(), 2);
-        assert_eq!(parsed.response.files, vec!["src/handler.rs"]);
-    }
-
-    #[test]
-    fn fixture_codex_rate_limit() {
-        let raw = include_str!("../../../../tests/fixtures/codex_rate_limit.jsonl");
-        let err = runner().parse_response(raw).unwrap_err();
-        assert!(matches!(err, AgentError::RateLimit { .. }), "got: {err:?}");
-    }
-
     // ── Connection / transient error tests ────────────────────────
 
     #[test]
@@ -830,8 +814,10 @@ mod tests {
     /// RateLimit must take priority over AgentFailed (reconnect errors).
     #[test]
     fn fixture_codex_usage_limit() {
-        let raw = include_str!("../../../../tests/fixtures/codex_usage_limit.jsonl");
-        let err = runner().parse_response(raw).unwrap_err();
+        let raw = fixture::load(include_str!(
+            "../../../../tests/fixtures/codex_usage_limit.jsonl"
+        ));
+        let err = runner().parse_response(&raw.stdout).unwrap_err();
         assert!(
             matches!(err, AgentError::RateLimit { .. }),
             "expected RateLimit (priority over reconnect errors), got: {err:?}"
@@ -841,8 +827,10 @@ mod tests {
     /// Real failure: unsupported model with ChatGPT account.
     #[test]
     fn fixture_codex_model_unsupported() {
-        let raw = include_str!("../../../../tests/fixtures/codex_model_unsupported.jsonl");
-        let err = runner().parse_response(raw).unwrap_err();
+        let raw = fixture::load(include_str!(
+            "../../../../tests/fixtures/codex_model_unsupported.jsonl"
+        ));
+        let err = runner().parse_response(&raw.stdout).unwrap_err();
         assert!(
             matches!(err, AgentError::ModelUnavailable { .. }),
             "expected ModelUnavailable, got: {err:?}"
