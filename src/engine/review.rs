@@ -1731,6 +1731,10 @@ async fn parse_review_output(
         return store_review_timeout(store, run.run_id, exit_code, &raw_output, &stderr).await;
     }
 
+    for window in runner::agents::claude::rate_limit_windows(&raw_output) {
+        cooldown::record_rate_limit_window(&ctx.review_agent, &window).await;
+    }
+
     if is_hard_failure {
         tracing::warn!(
             task_id = task.id.0,

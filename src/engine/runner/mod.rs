@@ -991,6 +991,9 @@ impl TaskRunner {
         // parsing succeeds treat as success regardless of exit code. Only fall
         // back to error classification when parsing fails and the process exit
         // code indicates an error.
+        for window in agents::claude::rate_limit_windows(&session_output.raw_stdout) {
+            cooldown::record_rate_limit_window(&init.agent_name, &window).await;
+        }
         let agent_runner = agents::get_runner(&init.agent_name);
         let parse_result =
             parse_session_output(task_id, &init.agent_name, &*agent_runner, &session_output);
