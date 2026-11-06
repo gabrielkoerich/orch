@@ -49,6 +49,10 @@ const RECONCILIATION_LIST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Run it on a slower cadence so repeated GitHub slowness does not consume 30 s every sync.
 const RECONCILIATION_INTERVAL: Duration = Duration::from_mins(15);
 
+const RUN_OUTPUT_RETENTION_DAYS: i32 = 30;
+const RUN_PRUNE_INTERVAL_SECS: i64 = 24 * 60 * 60;
+const RUN_PRUNE_KV_KEY: &str = "task_runs_pruned_at";
+
 /// Per-repo in-flight guard for closed-issue reconciliation/cleanup.
 /// Prevents overlapping cleanup runs from piling up across sync cycles.
 static CLEANUP_IN_FLIGHT: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
@@ -148,6 +152,26 @@ pub(crate) async fn cleanup_done_worktrees(
 ) -> anyhow::Result<()> {
     let opts = JanitorOptions::from_config();
     cleanup_done_worktrees_with_opts(backend, repo, task_manager, store, &opts).await
+}
+
+/// Clear the stored output of runs for tasks done longer than `RUN_OUTPUT_RETENTION_DAYS`, once a day
+pub(crate) async fn prune_old_run_output(store: &TaskStore) -> anyhow::Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    let last = store
+        .kv_get(RUN_PRUNE_KV_KEY)
+        .await?
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    if now - last < RUN_PRUNE_INTERVAL_SECS {
+        return Ok(());
+    }
+    store.kv_set(RUN_PRUNE_KV_KEY, &now.to_string()).await?;
+
+    let pruned = store.prune_old_runs(RUN_OUTPUT_RETENTION_DAYS).await?;
+    if pruned > 0 {
+        tracing::info!(pruned, "cleared the output of old task runs");
+    }
+    Ok(())
 }
 
 async fn reconcile_closed_tasks(

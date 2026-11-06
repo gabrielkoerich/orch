@@ -2115,20 +2115,32 @@ impl TaskStore {
         Ok(rows.into_iter().map(|(a,)| a).collect())
     }
 
-    /// Prune old runs for done/blocked tasks older than `days` days.
-    /// Test-only maintenance helper.
-    #[cfg(test)]
+    /// Clear the text columns of runs for tasks that entered `done` over `days` days ago
+    /// Metrics stay, and blocked tasks keep every run
     pub async fn prune_old_runs(&self, days: i32) -> anyhow::Result<u64> {
         let result = sqlx::query(
-            "DELETE FROM task_runs WHERE task_id IN (
-            SELECT id FROM tasks
-            WHERE status IN ('done', 'blocked')
-              AND updated_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ? || ' days')
-         )",
+            "UPDATE task_runs
+             SET stdout = '', stderr = '', prompt = '', parsed_response = ''
+             WHERE (stdout != '' OR stderr != '' OR prompt != '' OR parsed_response != '')
+               AND task_id IN (
+                 SELECT t.id FROM tasks t
+                 WHERE t.status = 'done'
+                   AND (SELECT MAX(a.timestamp) FROM task_activity a
+                        WHERE a.task_id = t.id
+                          AND a.event_type = 'status_change'
+                          AND a.to_status = 'done')
+                       < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ? || ' days')
+               )",
         )
         .bind(format!("-{days}"))
         .execute(&self.pool)
         .await?;
+
+        if result.rows_affected() > 0 {
+            sqlx::query("PRAGMA incremental_vacuum")
+                .execute(&self.pool)
+                .await?;
+        }
 
         Ok(result.rows_affected())
     }

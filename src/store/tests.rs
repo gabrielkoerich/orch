@@ -2713,7 +2713,91 @@ async fn prune_old_runs_deletes_runs_for_old_done_tasks() {
         .await
         .unwrap();
 
-    // Mark done and backdate updated_at
+    store.update_status(id, TaskStatus::Done).await.unwrap();
+    backdate_done_entry(&store, id).await;
+
+    let pruned = store.prune_old_runs(30).await.unwrap();
+    assert_eq!(pruned, 1, "should clear 1 run for old done task");
+
+    let runs = store.get_runs(id).await.unwrap();
+    assert_eq!(runs.len(), 1, "the row stays after prune");
+    let run = &runs[0];
+    assert_eq!(run.stdout, "");
+    assert_eq!(run.prompt, "");
+    assert_eq!(run.parsed_response, "");
+    assert_eq!(run.stderr, "");
+    assert_eq!(run.outcome, "success");
+    assert_eq!(run.input_tokens, 100);
+    assert_eq!(run.output_tokens, 50);
+    assert!((run.total_cost_usd - 0.001).abs() < 1e-9);
+    assert!((run.duration_secs - 5.0).abs() < 1e-9);
+}
+
+async fn backdate_done_entry(store: &TaskStore, id: i64) {
+    sqlx::query(
+        "UPDATE task_activity SET timestamp = '2020-01-01T00:00:00Z' \
+         WHERE task_id = ? AND event_type = 'status_change' AND to_status = 'done'",
+    )
+    .bind(id)
+    .execute(&store.pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn prune_old_runs_keeps_runs_for_blocked_tasks() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let id = store
+        .create_internal("owner/repo", "task", "body", "manual", "", None)
+        .await
+        .unwrap();
+    store
+        .start_run(&StartRun {
+            task_id: id,
+            attempt: 1,
+            run_type: "agent",
+            agent: "claude",
+            model: "sonnet",
+            command: "",
+            prompt: "do stuff",
+        })
+        .await
+        .unwrap();
+    store.update_status(id, TaskStatus::Blocked).await.unwrap();
+    sqlx::query("UPDATE task_activity SET timestamp = '2020-01-01T00:00:00Z' WHERE task_id = ?")
+        .bind(id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+        .bind(id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+    assert_eq!(store.prune_old_runs(30).await.unwrap(), 0);
+    assert_eq!(store.get_runs(id).await.unwrap()[0].prompt, "do stuff");
+}
+
+#[tokio::test]
+async fn prune_old_runs_ages_done_tasks_from_the_done_entry_not_updated_at() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let id = store
+        .create_internal("owner/repo", "task", "body", "manual", "", None)
+        .await
+        .unwrap();
+    store
+        .start_run(&StartRun {
+            task_id: id,
+            attempt: 1,
+            run_type: "agent",
+            agent: "claude",
+            model: "sonnet",
+            command: "",
+            prompt: "do stuff",
+        })
+        .await
+        .unwrap();
     store.update_status(id, TaskStatus::Done).await.unwrap();
     sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
         .bind(id)
@@ -2721,13 +2805,8 @@ async fn prune_old_runs_deletes_runs_for_old_done_tasks() {
         .await
         .unwrap();
 
-    // Prune runs older than 30 days
-    let pruned = store.prune_old_runs(30).await.unwrap();
-    assert_eq!(pruned, 1, "should prune 1 run for old done task");
-
-    // Verify runs are gone
-    let runs = store.get_runs(id).await.unwrap();
-    assert!(runs.is_empty(), "runs should be deleted after prune");
+    assert_eq!(store.prune_old_runs(30).await.unwrap(), 0);
+    assert_eq!(store.get_runs(id).await.unwrap()[0].prompt, "do stuff");
 }
 
 #[tokio::test]
@@ -2752,7 +2831,7 @@ async fn prune_old_runs_keeps_runs_for_active_tasks() {
             agent: "claude",
             model: "sonnet",
             command: "",
-            prompt: "",
+            prompt: "do stuff",
         })
         .await
         .unwrap();
@@ -3953,12 +4032,7 @@ async fn prune_old_runs_only_removes_old_terminal_tasks() {
         .await
         .unwrap();
 
-    // Backdate the updated_at to 60 days ago
-    sqlx::query("UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-60 days') WHERE id = ?")
-        .bind(done_id)
-        .execute(store.pool())
-        .await
-        .unwrap();
+    backdate_done_entry(&store, done_id).await;
 
     // Add a run to the old done task
     store
@@ -4008,13 +4082,11 @@ async fn prune_old_runs_only_removes_old_terminal_tasks() {
     let pruned = store.prune_old_runs(30).await.unwrap();
     assert_eq!(pruned, 1);
 
-    // Old done task's runs are gone
     let old_runs = store.get_runs(done_id).await.unwrap();
-    assert!(old_runs.is_empty());
+    assert_eq!(old_runs[0].prompt, "");
 
-    // Active task's runs are preserved
     let active_runs = store.get_runs(active_id).await.unwrap();
-    assert_eq!(active_runs.len(), 1);
+    assert_eq!(active_runs[0].prompt, "prompt");
 }
 
 #[tokio::test]
@@ -5661,12 +5733,7 @@ async fn prune_old_runs_removes_completed_task_runs() {
         .update_status(task_id, TaskStatus::Done)
         .await
         .unwrap();
-    // Backdate the task so it appears old
-    sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
-        .bind(task_id)
-        .execute(&store.pool)
-        .await
-        .unwrap();
+    backdate_done_entry(&store, task_id).await;
 
     let run = StartRun {
         task_id,
@@ -5675,13 +5742,13 @@ async fn prune_old_runs_removes_completed_task_runs() {
         agent: "claude",
         model: "sonnet",
         command: "",
-        prompt: "",
+        prompt: "do stuff",
     };
     store.start_run(&run).await.unwrap();
 
     let pruned = store.prune_old_runs(30).await.unwrap();
     assert_eq!(pruned, 1);
-    assert!(store.get_runs(task_id).await.unwrap().is_empty());
+    assert_eq!(store.get_runs(task_id).await.unwrap()[0].prompt, "");
 }
 
 #[tokio::test]
@@ -5704,13 +5771,13 @@ async fn prune_old_runs_keeps_recent_task_runs() {
         agent: "claude",
         model: "sonnet",
         command: "",
-        prompt: "",
+        prompt: "do stuff",
     };
     store.start_run(&run).await.unwrap();
 
     let pruned = store.prune_old_runs(30).await.unwrap();
     assert_eq!(pruned, 0);
-    assert_eq!(store.get_runs(task_id).await.unwrap().len(), 1);
+    assert_eq!(store.get_runs(task_id).await.unwrap()[0].prompt, "do stuff");
 }
 
 // ── increment named column alias ────────────────────────────────
