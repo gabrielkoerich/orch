@@ -7,6 +7,7 @@ use crate::engine::auto_merge;
 use crate::engine::cooldown::AGENT_COOLDOWN_SECS;
 use crate::engine::dispatch_guard::DispatchGuard;
 use crate::engine::events::TaskEvent;
+use crate::engine::push_retry::{self, PushRetry};
 use crate::engine::review;
 use crate::engine::review::{MAX_REVIEW_AGENT_FAILURES, ReviewDecision, review_and_merge};
 use crate::engine::review_gate;
@@ -673,6 +674,9 @@ async fn ci_allows_review(
     task: &ExternalTask,
 ) -> bool {
     let task_id = task.id.0.as_str();
+    if !push_allows_review(store, task_manager, repo, task).await {
+        return false;
+    }
     let stored = opt_store_get_task(&Some(Arc::clone(store)), repo, task_id).await;
     let Some(pr_number) = stored
         .as_ref()
@@ -731,6 +735,56 @@ async fn ci_allows_review(
     tracing::info!(task_id, pr_number, "{hold}");
     reset_refires(store, repo, task_id).await;
 
+    false
+}
+
+/// A finished task whose push failed on a GitHub or network error waits here, and the engine
+/// pushes again after a backoff (#4025). True when the review may start
+async fn push_allows_review(
+    store: &Arc<TaskStore>,
+    task_manager: &Arc<TaskManager>,
+    repo: &str,
+    task: &ExternalTask,
+) -> bool {
+    let task_id = task.id.0.as_str();
+    let (status, fields) = match push_retry::retry_pending_push(store, repo, task_id).await {
+        PushRetry::NotPending | PushRetry::Pushed => return true,
+        PushRetry::Wait | PushRetry::Failed => {
+            reset_refires(store, repo, task_id).await;
+            return false;
+        }
+        PushRetry::Exhausted(err) => {
+            tracing::error!(
+                task_id,
+                "push failed {} times, blocking for human intervention",
+                push_retry::MAX_PUSH_FAILURES
+            );
+            (
+                Status::Blocked,
+                vec![("block_reason", serde_json::json!(err))],
+            )
+        }
+        PushRetry::NeedsAgent(err) => {
+            tracing::warn!(
+                task_id,
+                err,
+                "push failed again, routing back to a task agent"
+            );
+            (
+                Status::New,
+                vec![
+                    ("agent", serde_json::json!(null)),
+                    ("model", serde_json::json!(null)),
+                ],
+            )
+        }
+    };
+    if let Err(e) = task_manager
+        .update_task_status_and_result(&task.id, status, &fields)
+        .await
+    {
+        tracing::error!(task_id, err = %e, "failed to move a task whose push kept failing");
+    }
     false
 }
 

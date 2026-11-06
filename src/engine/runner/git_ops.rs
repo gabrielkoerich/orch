@@ -1362,7 +1362,7 @@ fn is_stale_lease_error(stderr: &str) -> bool {
 /// timeout, i/o timeout, connection reset) rather than a ref rejection.
 /// A refused ref must not be retried, but a blipped endpoint deserves one
 /// immediate retry before the run is classified as `push_failed`.
-fn is_transient_network_error(stderr: &str) -> bool {
+pub fn is_transient_network_error(stderr: &str) -> bool {
     let lower = stderr.to_ascii_lowercase();
     lower.contains("i/o timeout")
         || lower.contains("dial tcp")
