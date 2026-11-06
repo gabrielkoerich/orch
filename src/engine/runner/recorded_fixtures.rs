@@ -53,9 +53,13 @@ fn claude_rate_limit_carries_the_reset_time() {
     let err = run("claude", raw).unwrap_err();
     assert!(matches!(err, AgentError::RateLimit { .. }), "got {err:?}");
     let windows = claude::rate_limit_windows(&fixture::load(raw).stdout);
-    assert_eq!(windows.len(), 1);
+    assert_eq!(windows.len(), 2);
     assert_eq!(windows[0].status, "rejected");
+    assert_eq!(windows[0].window_type, "seven_day");
+    assert_eq!(windows[0].utilization, Some(1.0));
     assert_eq!(windows[0].resets_at, Some(1_791_864_000));
+    assert_eq!(windows[1].window_type, "five_hour");
+    assert_eq!(windows[1].utilization, Some(0.06));
 }
 
 #[test]
