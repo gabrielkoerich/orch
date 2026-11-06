@@ -21,6 +21,7 @@ use crate::engine::router::Router;
 use crate::engine::router::get_route_result;
 use crate::engine::runner::TaskRunner;
 use crate::engine::runner::agents::patterns;
+use crate::engine::runner::agents::truncate_at_char_boundary;
 use crate::engine::tasks::store_task_to_external;
 use crate::engine::tasks::{CreateTaskRequest, Task, TaskFilter, TaskType, status_to_task_status};
 use crate::home;
@@ -93,10 +94,7 @@ fn review_attempt_line(activity: &store::TaskActivity) -> String {
 
 fn truncate_err(err: &str, max: usize) -> String {
     if err.len() > max {
-        let mut end = max;
-        while end > 0 && !err.is_char_boundary(end) {
-            end -= 1;
-        }
+        let end = truncate_at_char_boundary(err, max);
         format!("{}...", &err[..end])
     } else {
         err.to_string()
@@ -2250,6 +2248,13 @@ mod tests {
     fn truncate_err_under_limit() {
         let s = "short error";
         assert_eq!(truncate_err(s, 50), "short error");
+    }
+
+    #[test]
+    fn truncate_err_cuts_inside_char_down_to_boundary() {
+        assert_eq!(truncate_err("héllo", 2), "h...");
+        assert_eq!(truncate_err("é", 1), "...");
+        assert_eq!(truncate_err("abc", 0), "...");
     }
 
     #[test]
