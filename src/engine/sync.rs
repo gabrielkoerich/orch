@@ -10,7 +10,7 @@
 //! - Skill repository syncing
 
 use super::EngineConfig;
-use super::cleanup::{check_merged_prs, cleanup_done_worktrees};
+use super::cleanup::{check_merged_prs, cleanup_done_worktrees, prune_old_run_output};
 use super::commands::{CommandOutcome, CommandStoreOps, parse_command, validate_and_run_command};
 use super::review_poll::review_open_prs;
 use crate::backends::ExternalId;
@@ -1870,6 +1870,9 @@ pub(crate) async fn sync_tick(
         tokio::spawn(async move {
             if let Err(e) = cleanup_done_worktrees(&backend, &repo, &task_manager, &store).await {
                 tracing::warn!(err = %e, "worktree cleanup failed");
+            }
+            if let Err(e) = prune_old_run_output(&store).await {
+                tracing::warn!(err = %e, "task run pruning failed");
             }
         });
     }
