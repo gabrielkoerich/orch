@@ -61,6 +61,7 @@ pub use response::WeightSignal;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::env;
+use std::error;
 use std::fmt;
 use std::fmt::Debug;
 use std::fmt::Formatter;
@@ -612,6 +613,32 @@ pub fn parse_session_output(
         message: "empty-output-exit0: opencode returned exit 0 with empty stdout".to_string(),
     })
 }
+
+/// The repo has no project directory: not in the active config, no legacy
+/// `project_dir`, no bare clone. It fails before any agent starts
+#[derive(Debug)]
+pub(crate) struct NoProjectDir {
+    pub(crate) repo: String,
+    pub(crate) bare_clone: PathBuf,
+}
+
+impl NoProjectDir {
+    /// Block reason for a task of this repo
+    pub(crate) const BLOCK_REASON: &str = "project is not configured and has no bare clone";
+}
+
+impl fmt::Display for NoProjectDir {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "no resolvable project directory for repo {} — not in active config, no bare clone at {}, no legacy project_dir set",
+            self.repo,
+            self.bare_clone.display()
+        )
+    }
+}
+
+impl error::Error for NoProjectDir {}
 
 /// Task runner configuration.
 pub struct TaskRunner {
@@ -1725,7 +1752,7 @@ impl TaskRunner {
     }
 
     /// Resolve the project directory for this repo.
-    async fn resolve_project_dir(&self) -> anyhow::Result<PathBuf> {
+    pub(crate) async fn resolve_project_dir(&self) -> anyhow::Result<PathBuf> {
         // Explicit env var always wins
         if let Ok(dir) = env::var("PROJECT_DIR")
             && !dir.is_empty()
@@ -1780,18 +1807,18 @@ impl TaskRunner {
         // project_dir, no bare clone. Falling back to the service's own CWD
         // here would silently point worktree creation at an unrelated
         // directory (see issue #3416) — surface a clear error instead.
-        anyhow::bail!(
-            "no resolvable project directory for repo {} — not in active config, no bare clone at {}, no legacy project_dir set",
-            self.repo,
-            self.orch_home
+        Err(NoProjectDir {
+            repo: self.repo.clone(),
+            bare_clone: self
+                .orch_home
                 .join("projects")
                 .join(self.repo.split('/').next().unwrap_or_default())
                 .join(format!(
                     "{}.git",
                     self.repo.split('/').nth(1).unwrap_or_default()
-                ))
-                .display()
-        )
+                )),
+        }
+        .into())
     }
 }
 

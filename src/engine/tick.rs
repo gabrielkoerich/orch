@@ -37,7 +37,7 @@ use crate::engine::router::{
     AllAgentsCooledError, RouteResultError, Router, RouterConfig, get_route_result,
 };
 use crate::engine::runner::response;
-use crate::engine::runner::{TaskRunner, WeightSignal};
+use crate::engine::runner::{NoProjectDir, TaskRunner, WeightSignal};
 use crate::engine::sync;
 use crate::engine::tasks;
 use crate::engine::tasks::{TaskManager, is_internal_id};
@@ -1649,6 +1649,7 @@ pub(crate) async fn tick_global_sweeps(
     router: &Router,
     dispatching: &Arc<DashMap<String, String>>,
     auto_merge_in_flight: &Arc<DashSet<String>>,
+    active_repos: &HashSet<String>,
 ) {
     // Global sweep for CI-failure blocked tasks from inactive or removed projects.
     // auto_unblock_blocked_tasks runs inside sync_tick and is scoped to the active repo.
@@ -1671,6 +1672,7 @@ pub(crate) async fn tick_global_sweeps(
         store,
         router,
         dispatching,
+        active_repos,
     )
     .await
     {
@@ -1679,8 +1681,13 @@ pub(crate) async fn tick_global_sweeps(
 
     // Recover rebroadcast-blocked tasks once a review agent is routable, across
     // all repos
-    if let Err(e) =
-        sync::auto_recover_rebroadcast_blocked_tasks_global(router, task_manager, store).await
+    if let Err(e) = sync::auto_recover_rebroadcast_blocked_tasks_global(
+        router,
+        task_manager,
+        store,
+        active_repos,
+    )
+    .await
     {
         tracing::warn!(err = %e, "global rebroadcast-blocked recovery sweep failed");
     }
@@ -2432,7 +2439,16 @@ async fn dispatch_tasks_for_repo(
                 Err(e) => {
                     tracing::error!(task_id, ?e, "task runner failed");
                     let duration = dispatch_start.elapsed().as_secs_f64();
-                    if is_internal_id(&task_id) {
+                    if e.downcast_ref::<NoProjectDir>().is_some() {
+                        // The run failed before any agent started, so nothing exists to review
+                        block_task_without_project(
+                            &task_manager_for_spawn,
+                            &store_for_spawn,
+                            &repo_owned,
+                            &task_id,
+                        )
+                        .await;
+                    } else if is_internal_id(&task_id) {
                         // Internal tasks have no GitHub issue to comment on.
                         if let Err(ue) = task_manager_for_spawn
                             .update_task_status_with_duration(
@@ -2489,6 +2505,53 @@ async fn dispatch_tasks_for_repo(
         }));
     }
     Ok(())
+}
+
+/// Block a task whose repo has no project directory. Nothing exists to review, so
+/// `NeedsReview` would only feed the refire and rebroadcast loop (#4024)
+async fn block_task_without_project(
+    task_manager: &Arc<TaskManager>,
+    store: &Arc<TaskStore>,
+    repo: &str,
+    task_id: &str,
+) {
+    let store_id = match store.resolve_task_id(repo, task_id).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            tracing::error!(
+                task_id,
+                repo,
+                "cannot block task without project: not in the store"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::error!(task_id, repo, err = %e, "cannot block task without project: store lookup failed");
+            return;
+        }
+    };
+    let fields = [
+        (
+            "block_reason",
+            serde_json::json!(NoProjectDir::BLOCK_REASON),
+        ),
+        (
+            "last_error",
+            serde_json::json!(format!("no project directory for repo {repo}")),
+        ),
+    ];
+    if let Err(e) = task_manager
+        .update_task_status_and_result_by_store_id(
+            store_id,
+            repo,
+            &ExternalId(task_id.to_string()),
+            Status::Blocked,
+            &fields,
+        )
+        .await
+    {
+        tracing::error!(task_id, repo, err = %e, "failed to block task without project");
+    }
 }
 
 fn skips_agent(labels: &[String]) -> bool {
@@ -2577,6 +2640,23 @@ pub(crate) async fn dispatch_routed_tasks_global(
             repo.clone(),
         ));
         let runner = Arc::new(TaskRunner::new(repo.clone()).with_store(Arc::clone(store)));
+
+        // Without a project directory the runner bails before any agent starts, so
+        // block now instead of taking a dispatch slot first
+        if let Err(e) = runner.resolve_project_dir().await
+            && e.downcast_ref::<NoProjectDir>().is_some()
+        {
+            tracing::warn!(repo = %repo, count = tasks.len(), "global sweep: repo has no project directory, blocking its routed tasks");
+            for task in &tasks {
+                let ext = task
+                    .external_id
+                    .clone()
+                    .unwrap_or_else(|| format!("internal:{}", task.id));
+                block_task_without_project(&task_manager, store, &repo, &ext).await;
+            }
+            continue;
+        }
+
         let dispatchable: Vec<ExternalTask> =
             tasks.iter().map(tasks::store_task_to_external).collect();
 
@@ -3006,6 +3086,7 @@ pub(crate) async fn tick_all(
             &router_guard,
             dispatching,
             auto_merge_in_flight,
+            active_repos,
         )
         .await;
     }
@@ -6231,6 +6312,39 @@ mod tests {
                 .count(),
             1,
             "an exhausted shared quota must not reset within the same tick"
+        );
+    }
+
+    /// A task of a repo with no project directory ends `blocked` with a reason that names
+    /// the cause, never `needs_review` (#4024)
+    #[tokio::test]
+    async fn block_task_without_project_blocks_with_the_cause() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            Arc::clone(&store),
+            "removed/repo".to_string(),
+        ));
+        let id = store
+            .create_internal("removed/repo", "Orphan", "", "cron", "1", None)
+            .await
+            .unwrap();
+        store.update_status(id, TaskStatus::Routed).await.unwrap();
+
+        block_task_without_project(
+            &task_manager,
+            &store,
+            "removed/repo",
+            &format!("internal:{id}"),
+        )
+        .await;
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.status, TaskStatus::Blocked);
+        assert_eq!(
+            task.block_reason.as_deref(),
+            Some(NoProjectDir::BLOCK_REASON)
         );
     }
 
