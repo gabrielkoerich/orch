@@ -985,27 +985,61 @@ fn sanitize_window_label(raw: &str) -> String {
         .collect()
 }
 
-/// Every `rate_limit_event` in the stream, oldest first. Lines without a status are skipped
+/// Every window of every `rate_limit_event`, oldest first. The event status belongs to the headline
+/// window, the other `unifiedWindows` entries use their own status or `unknown`
 pub fn rate_limit_windows(ndjson: &str) -> Vec<RateLimitWindow> {
-    ndjson
+    let mut windows = Vec::new();
+    for line in ndjson
         .lines()
         .filter(|line| line.contains("rate_limit_event"))
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
-        .filter(|val| val.get("type").and_then(|v| v.as_str()) == Some("rate_limit_event"))
-        .filter_map(|val| {
-            let info = val.get("rate_limit_info")?;
-            Some(RateLimitWindow {
-                status: sanitize_window_label(info.get("status")?.as_str()?),
-                window_type: sanitize_window_label(
-                    info.get("rateLimitType")
+    {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        if val.get("type").and_then(|v| v.as_str()) != Some("rate_limit_event") {
+            continue;
+        }
+        let Some(info) = val.get("rate_limit_info") else {
+            continue;
+        };
+        let Some(status) = info.get("status").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let unified = info.get("unifiedWindows").and_then(|v| v.as_object());
+        let headline_raw = info
+            .get("rateLimitType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let headline = unified.and_then(|map| map.get(headline_raw));
+        windows.push(RateLimitWindow {
+            status: sanitize_window_label(status),
+            window_type: sanitize_window_label(headline_raw),
+            utilization: headline
+                .and_then(|w| w.get("utilization"))
+                .or_else(|| info.get("utilization"))
+                .and_then(serde_json::Value::as_f64),
+            resets_at: info
+                .get("resetsAt")
+                .or_else(|| headline.and_then(|w| w.get("resetsAt")))
+                .and_then(serde_json::Value::as_i64),
+        });
+        for (name, w) in unified.into_iter().flatten() {
+            if name == headline_raw {
+                continue;
+            }
+            windows.push(RateLimitWindow {
+                status: sanitize_window_label(
+                    w.get("status")
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown"),
                 ),
-                utilization: info.get("utilization").and_then(serde_json::Value::as_f64),
-                resets_at: info.get("resetsAt").and_then(serde_json::Value::as_i64),
-            })
-        })
-        .collect()
+                window_type: sanitize_window_label(name),
+                utilization: w.get("utilization").and_then(serde_json::Value::as_f64),
+                resets_at: w.get("resetsAt").and_then(serde_json::Value::as_i64),
+            });
+        }
+    }
+    windows
 }
 
 /// Concatenate text content from all `type:assistant` NDJSON messages in
@@ -2361,6 +2395,21 @@ mod stream_tests {
         assert_eq!(windows[1].status, "rejected");
         assert_eq!(windows[1].window_type, "weekly_opus");
         assert_eq!(windows[1].resets_at, Some(1_900_003_600));
+    }
+
+    #[test]
+    fn rate_limit_windows_reads_every_unified_window() {
+        let ndjson = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1791259200,"rateLimitType":"seven_day","overageStatus":"rejected","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.13,"resetsAt":1791250200},"seven_day":{"utilization":1,"resetsAt":1791259200}}}}"#;
+        let windows = rate_limit_windows(ndjson);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].status, "rejected");
+        assert_eq!(windows[0].window_type, "seven_day");
+        assert_eq!(windows[0].utilization, Some(1.0));
+        assert_eq!(windows[0].resets_at, Some(1_791_259_200));
+        assert_eq!(windows[1].status, "unknown");
+        assert_eq!(windows[1].window_type, "five_hour");
+        assert_eq!(windows[1].utilization, Some(0.13));
+        assert_eq!(windows[1].resets_at, Some(1_791_250_200));
     }
 
     #[test]

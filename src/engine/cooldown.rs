@@ -841,7 +841,7 @@ pub async fn set_agent_cooldown(agent_name: &str, duration_secs: u64) {
     set_cooldown_async(agent_name, cooldown_until, "silence_agent_cooldown").await;
 }
 
-/// KV prefix for the latest quota window an agent reported: `rate_window:{agent}`
+/// KV prefix for the latest quota window of each type an agent reported: `rate_window:{agent}:{type}`
 pub const RATE_WINDOW_KV_PREFIX: &str = "rate_window:";
 
 /// One quota window from a vendor `rate_limit_event`, with the vendor window type kept as sent
@@ -859,7 +859,10 @@ pub async fn record_rate_limit_window(agent_name: &str, window: &RateLimitWindow
     if let Some(store) = store_opt
         && let Ok(value) = serde_json::to_string(window)
         && let Err(e) = store
-            .kv_set(&format!("{RATE_WINDOW_KV_PREFIX}{agent_name}"), &value)
+            .kv_set(
+                &format!("{RATE_WINDOW_KV_PREFIX}{agent_name}:{}", window.window_type),
+                &value,
+            )
             .await
     {
         tracing::warn!(agent = agent_name, err = %e, "failed to persist rate limit window");
@@ -890,12 +893,12 @@ pub async fn list_rate_limit_windows(store: &Arc<TaskStore>) -> Vec<(String, Rat
     let mut windows: Vec<(String, RateLimitWindow)> = rows
         .into_iter()
         .filter_map(|(key, value)| {
-            let agent = key.strip_prefix(RATE_WINDOW_KV_PREFIX)?.to_string();
+            let (agent, _) = key.strip_prefix(RATE_WINDOW_KV_PREFIX)?.rsplit_once(':')?;
             let window = serde_json::from_str(&value).ok()?;
-            Some((agent, window))
+            Some((agent.to_string(), window))
         })
         .collect();
-    windows.sort_by(|a, b| a.0.cmp(&b.0));
+    windows.sort_by(|a, b| (&a.0, &a.1.window_type).cmp(&(&b.0, &b.1.window_type)));
     windows
 }
 
