@@ -929,6 +929,21 @@ mod tests {
     }
 
     #[test]
+    fn truncate_diff_keeps_input_at_exact_limit_and_cuts_inside_char() {
+        let (out, truncated) = super::truncate_diff("héllo", 6);
+        assert!(!truncated);
+        assert_eq!(out, "héllo");
+
+        let (out, truncated) = super::truncate_diff("héllo", 2);
+        assert!(truncated);
+        assert_eq!(out, "h");
+
+        let (out, truncated) = super::truncate_diff("é", 1);
+        assert!(truncated);
+        assert_eq!(out, "");
+    }
+
+    #[test]
     #[serial]
     fn diff_for_paths_includes_untracked_file_contents() {
         let dir = init_temp_repo();

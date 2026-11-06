@@ -2253,6 +2253,13 @@ mod tests {
     }
 
     #[test]
+    fn truncate_err_cuts_inside_char_down_to_boundary() {
+        assert_eq!(truncate_err("héllo", 2), "h...");
+        assert_eq!(truncate_err("é", 1), "...");
+        assert_eq!(truncate_err("abc", 0), "...");
+    }
+
+    #[test]
     fn truncate_err_exact_limit() {
         let s = "short error";
         assert_eq!(truncate_err(s, 11), "short error");
