@@ -1177,6 +1177,7 @@ pub(crate) async fn auto_recover_rebroadcast_blocked_tasks_global(
     router: &Router,
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
+    active_repos: &HashSet<String>,
 ) -> anyhow::Result<()> {
     const MIN_BLOCK_AGE_MINUTES: i64 = 5;
 
@@ -1193,6 +1194,10 @@ pub(crate) async fn auto_recover_rebroadcast_blocked_tasks_global(
         .into_iter()
         .filter(|t| {
             if t.block_reason.as_deref() != Some(REBROADCAST_BLOCK_REASON) {
+                return false;
+            }
+            // A repo outside the active set has no review subscriber, so a reset would loop
+            if !active_repos.contains(&t.repo) {
                 return false;
             }
             // Only recover tasks blocked long enough to rule out same-tick escalations.
@@ -1620,6 +1625,7 @@ pub(crate) async fn refire_and_escalate_stale_needs_review_global(
     store: &Arc<TaskStore>,
     router: &Router,
     dispatching: &Arc<DashMap<String, String>>,
+    active_repos: &HashSet<String>,
 ) -> anyhow::Result<()> {
     const MIN_STALE_NEEDS_REVIEW_MINUTES: i64 = 1;
     const MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS: u64 = 5;
@@ -1651,6 +1657,11 @@ pub(crate) async fn refire_and_escalate_stale_needs_review_global(
     }
 
     for stored in needs_review_tasks {
+        // No review subscriber listens for a repo outside the active set
+        if !active_repos.contains(&stored.repo) {
+            continue;
+        }
+
         let external = tasks::store_task_to_external(&stored);
         let ext_id = external.id.clone();
         let repo = stored.repo.clone();
@@ -3938,9 +3949,15 @@ mod tests {
         let t = store.get(id).await.unwrap();
         assert_eq!(t.needs_review_refires, 0);
 
-        refire_and_escalate_stale_needs_review_global(&task_manager, &store, &router, &dispatching)
-            .await
-            .unwrap();
+        refire_and_escalate_stale_needs_review_global(
+            &task_manager,
+            &store,
+            &router,
+            &dispatching,
+            &sweep_repos(),
+        )
+        .await
+        .unwrap();
 
         let t2 = store.get(id).await.unwrap();
         assert_eq!(t2.needs_review_refires, 1);
@@ -3998,9 +4015,15 @@ mod tests {
         let before = store.get(id).await.unwrap();
         assert_eq!(before.needs_review_refires, 1);
 
-        refire_and_escalate_stale_needs_review_global(&task_manager, &store, &router, &dispatching)
-            .await
-            .unwrap();
+        refire_and_escalate_stale_needs_review_global(
+            &task_manager,
+            &store,
+            &router,
+            &dispatching,
+            &sweep_repos(),
+        )
+        .await
+        .unwrap();
 
         let after = store.get(id).await.unwrap();
         // Counter must not increment on a backoff delay, only on an actual re-fire
@@ -4062,9 +4085,15 @@ mod tests {
             .await
             .unwrap();
 
-        refire_and_escalate_stale_needs_review_global(&task_manager, &store, &router, &dispatching)
-            .await
-            .unwrap();
+        refire_and_escalate_stale_needs_review_global(
+            &task_manager,
+            &store,
+            &router,
+            &dispatching,
+            &sweep_repos(),
+        )
+        .await
+        .unwrap();
 
         let after = store.get(id).await.unwrap();
         assert_eq!(after.status, TaskStatus::Blocked);
@@ -4116,14 +4145,93 @@ mod tests {
             .await
             .unwrap();
 
-        refire_and_escalate_stale_needs_review_global(&task_manager, &store, &router, &dispatching)
-            .await
-            .unwrap();
+        refire_and_escalate_stale_needs_review_global(
+            &task_manager,
+            &store,
+            &router,
+            &dispatching,
+            &sweep_repos(),
+        )
+        .await
+        .unwrap();
 
         let after = store.get(id).await.unwrap();
         assert_eq!(after.status, TaskStatus::NeedsReview);
         assert_eq!(after.needs_review_refires, 5);
         assert!(after.block_reason.is_none());
+    }
+
+    /// Every repo the sweep tests use, so each counts as active
+    fn sweep_repos() -> HashSet<String> {
+        ["owner/repo", "inactive/repo", "some/repo", "active/repo"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
+    /// A repo outside the active set has no review subscriber (#4024)
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn global_sweeps_leave_tasks_of_a_removed_repo_alone() {
+        cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            Arc::clone(&store),
+            "active/repo".to_string(),
+        ));
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+        let router = router_with_healthy_review_agent();
+        let active: HashSet<String> = ["active/repo".to_string()].into_iter().collect();
+
+        let review_id = store
+            .create_internal("removed/repo", "Needs review", "", "cron", "1", None)
+            .await
+            .unwrap();
+        store
+            .update_status(review_id, TaskStatus::NeedsReview)
+            .await
+            .unwrap();
+        let blocked_id = store
+            .create_internal("removed/repo", "Rebroadcast blocked", "", "cron", "2", None)
+            .await
+            .unwrap();
+        store
+            .update_status(blocked_id, TaskStatus::Blocked)
+            .await
+            .unwrap();
+        store
+            .set_block_reason(blocked_id, Some(REBROADCAST_BLOCK_REASON))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        refire_and_escalate_stale_needs_review_global(
+            &task_manager,
+            &store,
+            &router,
+            &dispatching,
+            &active,
+        )
+        .await
+        .unwrap();
+        auto_recover_rebroadcast_blocked_tasks_global(&router, &task_manager, &store, &active)
+            .await
+            .unwrap();
+
+        let review = store.get(review_id).await.unwrap();
+        assert_eq!(review.status, TaskStatus::NeedsReview);
+        assert_eq!(review.needs_review_refires, 0);
+        let blocked = store.get(blocked_id).await.unwrap();
+        assert_eq!(blocked.status, TaskStatus::Blocked);
+        assert_eq!(
+            blocked.block_reason.as_deref(),
+            Some(REBROADCAST_BLOCK_REASON)
+        );
     }
 
     // ── refire_and_escalate_stale_needs_review_global ──────────────────────
@@ -4182,9 +4290,15 @@ mod tests {
             .await
             .unwrap();
 
-        refire_and_escalate_stale_needs_review_global(&task_manager, &store, &router, &dispatching)
-            .await
-            .unwrap();
+        refire_and_escalate_stale_needs_review_global(
+            &task_manager,
+            &store,
+            &router,
+            &dispatching,
+            &sweep_repos(),
+        )
+        .await
+        .unwrap();
 
         let task = store.get(id).await.unwrap();
         assert_eq!(
@@ -4237,9 +4351,15 @@ mod tests {
             .await
             .unwrap();
 
-        refire_and_escalate_stale_needs_review_global(&task_manager, &store, &router, &dispatching)
-            .await
-            .unwrap();
+        refire_and_escalate_stale_needs_review_global(
+            &task_manager,
+            &store,
+            &router,
+            &dispatching,
+            &sweep_repos(),
+        )
+        .await
+        .unwrap();
 
         let task = store.get(id).await.unwrap();
         assert_eq!(task.status, TaskStatus::Blocked);
@@ -4292,9 +4412,15 @@ mod tests {
             .await
             .unwrap();
 
-        refire_and_escalate_stale_needs_review_global(&task_manager, &store, &router, &dispatching)
-            .await
-            .unwrap();
+        refire_and_escalate_stale_needs_review_global(
+            &task_manager,
+            &store,
+            &router,
+            &dispatching,
+            &sweep_repos(),
+        )
+        .await
+        .unwrap();
 
         let task = store.get(id).await.unwrap();
         assert_eq!(
@@ -4347,9 +4473,15 @@ mod tests {
             .await
             .unwrap();
 
-        refire_and_escalate_stale_needs_review_global(&task_manager, &store, &router, &dispatching)
-            .await
-            .unwrap();
+        refire_and_escalate_stale_needs_review_global(
+            &task_manager,
+            &store,
+            &router,
+            &dispatching,
+            &sweep_repos(),
+        )
+        .await
+        .unwrap();
 
         let task = store.get(id).await.unwrap();
         assert_eq!(task.status, TaskStatus::NeedsReview);
@@ -4409,9 +4541,14 @@ mod tests {
             .await
             .unwrap();
 
-        auto_recover_rebroadcast_blocked_tasks_global(&router, &task_manager, &store)
-            .await
-            .unwrap();
+        auto_recover_rebroadcast_blocked_tasks_global(
+            &router,
+            &task_manager,
+            &store,
+            &sweep_repos(),
+        )
+        .await
+        .unwrap();
 
         let task = store.get(id).await.unwrap();
         assert_eq!(
@@ -6201,9 +6338,14 @@ mod tests {
             "owner/repo".to_string(),
         ));
         let router = router_with_healthy_review_agent();
-        auto_recover_rebroadcast_blocked_tasks_global(&router, &task_manager, &store)
-            .await
-            .unwrap();
+        auto_recover_rebroadcast_blocked_tasks_global(
+            &router,
+            &task_manager,
+            &store,
+            &sweep_repos(),
+        )
+        .await
+        .unwrap();
     }
 
     #[serial(cooldown_state)]
@@ -6246,9 +6388,14 @@ mod tests {
             .await
             .unwrap();
 
-        auto_recover_rebroadcast_blocked_tasks_global(&router, &task_manager, &store)
-            .await
-            .unwrap();
+        auto_recover_rebroadcast_blocked_tasks_global(
+            &router,
+            &task_manager,
+            &store,
+            &sweep_repos(),
+        )
+        .await
+        .unwrap();
 
         let task = store.get(id).await.unwrap();
         assert_eq!(task.status, TaskStatus::Blocked);
@@ -6295,9 +6442,14 @@ mod tests {
         // No backdating — escalated "just now" in this same tick, must not be
         // immediately un-blocked by the same pass.
 
-        auto_recover_rebroadcast_blocked_tasks_global(&router, &task_manager, &store)
-            .await
-            .unwrap();
+        auto_recover_rebroadcast_blocked_tasks_global(
+            &router,
+            &task_manager,
+            &store,
+            &sweep_repos(),
+        )
+        .await
+        .unwrap();
 
         let task = store.get(id).await.unwrap();
         assert_eq!(task.status, TaskStatus::Blocked);
@@ -6350,9 +6502,14 @@ mod tests {
             .await
             .unwrap();
 
-        auto_recover_rebroadcast_blocked_tasks_global(&router, &task_manager, &store)
-            .await
-            .unwrap();
+        auto_recover_rebroadcast_blocked_tasks_global(
+            &router,
+            &task_manager,
+            &store,
+            &sweep_repos(),
+        )
+        .await
+        .unwrap();
 
         let task = store.get(id).await.unwrap();
         assert_eq!(
@@ -6414,9 +6571,14 @@ mod tests {
             .await
             .unwrap();
 
-        auto_recover_rebroadcast_blocked_tasks_global(&router, &task_manager, &store)
-            .await
-            .unwrap();
+        auto_recover_rebroadcast_blocked_tasks_global(
+            &router,
+            &task_manager,
+            &store,
+            &sweep_repos(),
+        )
+        .await
+        .unwrap();
 
         let task = store.get(id).await.unwrap();
         assert_eq!(task.status, TaskStatus::Blocked);
