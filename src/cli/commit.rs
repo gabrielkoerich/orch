@@ -2,6 +2,7 @@ use crate::cli;
 use crate::cmd::SyncCommandErrorContext;
 use crate::config;
 use crate::control;
+use crate::engine::runner::agents::truncate_at_char_boundary;
 use crate::engine::runner::commit;
 use crate::engine::runner::diff::parse_unified_diff_hunks;
 use anyhow::Context;
@@ -217,10 +218,7 @@ fn truncate_diff(diff: &str, max_bytes: usize) -> (String, bool) {
     if diff.len() <= max_bytes {
         return (diff.to_string(), false);
     }
-    let mut cutoff = max_bytes;
-    while cutoff > 0 && !diff.is_char_boundary(cutoff) {
-        cutoff -= 1;
-    }
+    let cutoff = truncate_at_char_boundary(diff, max_bytes);
     (diff[..cutoff].to_string(), true)
 }
 
