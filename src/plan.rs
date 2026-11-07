@@ -677,6 +677,29 @@ fn render_unmet(unmet: &[UnmetExternal], skipped: &[String]) -> String {
     out
 }
 
+pub fn render_outline(roadmap: &Roadmap) -> String {
+    let mut out = String::new();
+    for milestone in &roadmap.milestones {
+        let _ = writeln!(out, "{} {}", milestone.id, milestone.title);
+        for task in roadmap
+            .tasks
+            .iter()
+            .filter(|task| task.milestone_id == milestone.id)
+        {
+            let human = if task.owner_human { " [human]" } else { "" };
+            let deps = if task.depends_on.is_empty() {
+                "none".to_string()
+            } else {
+                task.depends_on.join(", ")
+            };
+            let _ = writeln!(out, "  {} {}{human}", task.id, task.title);
+            let _ = writeln!(out, "    depends on: {deps}");
+        }
+        out.push('\n');
+    }
+    out
+}
+
 pub fn render_tasks(diff: &PlanDiff) -> String {
     let mut out = String::new();
     for plan in &diff.tasks {
@@ -1013,6 +1036,13 @@ fn is_milestone_id(token: &str) -> bool {
     saw_digit
 }
 
+pub(crate) fn is_milestone_heading(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix("## ")
+        .and_then(parse_milestone_heading)
+        .is_some()
+}
+
 fn parse_milestone_heading(rest: &str) -> Option<(String, String)> {
     let rest = rest.trim();
     let (first, title) = rest.split_once(char::is_whitespace)?;
@@ -1269,6 +1299,44 @@ mod tests {
         let (roadmap, warnings) = parse_roadmap_for(&broken, Some("M3")).unwrap();
         assert_eq!(select(&roadmap, Some("M3")).unwrap().len(), 1);
         assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn milestone_heading_needs_an_id_and_a_title() {
+        assert!(is_milestone_heading("## M1. Workspace"));
+        assert!(is_milestone_heading("  ## M2S. API"));
+        assert!(!is_milestone_heading("## Notes"));
+        assert!(!is_milestone_heading("### M1-01 Task"));
+        assert!(!is_milestone_heading("## M1"));
+    }
+
+    #[test]
+    fn outline_lists_milestones_tasks_and_dependencies() {
+        let outline = render_outline(&roadmap());
+        assert!(
+            outline.contains("M1 Content model and pack format"),
+            "{outline}"
+        );
+        assert!(
+            outline.contains("  M1-01 Set up the workspace\n    depends on: none"),
+            "{outline}"
+        );
+        assert!(
+            outline.contains("  M1-02 Content model types\n    depends on: M1-01"),
+            "{outline}"
+        );
+        assert!(
+            outline.contains("  M5-02 Privacy policy [human]\n    depends on: M1-05"),
+            "{outline}"
+        );
+        assert!(
+            outline.contains("M6 Full year and plan editor"),
+            "{outline}"
+        );
+        assert!(
+            outline.contains("  M6-01 Units 4 to 10\n    depends on: M1-05, M1-01"),
+            "{outline}"
+        );
     }
 
     #[test]

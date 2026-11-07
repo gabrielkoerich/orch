@@ -175,14 +175,18 @@ orch task priority <id> high  # high, normal or low: sets the priority label
 
 A `priority:high` label makes a routed task dispatch before normal ones, and it may take one slot beyond `engine.max_parallel`. A routed task with a linked PR dispatches before every other task, `priority:high` included, and may also take the extra slot. A `priority:low` task dispatches last. A label change on GitHub applies on the next sync.
 
-### Plan import
+### Plan
 
 ```bash
+orch plan docs/PLAN.md                       # Draft a roadmap, print it, import after yes
+orch plan docs/PLAN.md --yes                 # Skip the confirmation prompt
 orch plan import docs/ROADMAP.md --dry-run   # Print creates, updates and links
 orch plan import docs/ROADMAP.md             # Create or update one issue per task
 orch plan import docs/ROADMAP.md --milestone M1
 orch plan import docs/ROADMAP.md --milestone M4 --skip-unmet
 ```
+
+`orch plan` sends a free-form markdown plan to an agent and writes a roadmap next to it (`PLAN.roadmap.md`). It prints the milestones, tasks and dependencies, then asks before creating issues. `--yes` skips the question. A later run keeps the same task ids so import updates the same issues.
 
 `orch plan import` reads a roadmap and creates one GitHub issue per task. `Depends on` is stored as a blocked-by link. An open blocked-by link holds the dependent task as waiting. `Owner: human` adds the `owner:human` and `no-agent` labels, so orch skips that task. A second run edits an issue only when the title, body or labels changed. A task dropped from the file is listed and left open.
 

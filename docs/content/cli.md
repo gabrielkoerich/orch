@@ -12,7 +12,7 @@ orch task     list|add|get|status|route|run|retry|reroute|unblock|attach|live|ki
               events|session
 orch service  start|stop|restart|status|install|uninstall|doctor|prune
 orch job      list|add|remove|enable|disable|tick|run|cron
-orch plan     import
+orch plan     [file] | import
 orch project  list|add|remove|move|board
 orch stats    overview|metrics|cost|dashboard
 orch cooldown list|clear
@@ -151,11 +151,15 @@ Jobs can also be defined declaratively as markdown files under `prompts/jobs/*.m
 ## Plan
 
 ```bash
+orch plan docs/PLAN.md
+orch plan docs/PLAN.md --yes
 orch plan import docs/ROADMAP.md
 orch plan import docs/ROADMAP.md --dry-run
 orch plan import docs/ROADMAP.md --milestone M1
 orch plan import docs/ROADMAP.md --milestone M4 --skip-unmet
 ```
+
+`orch plan <file>` sends a free-form markdown plan to an agent, writes a roadmap next to the plan (`PLAN.roadmap.md`), prints the milestones, tasks and dependencies, and asks before creating issues. Nothing is created on GitHub until you say yes. `--yes` skips the question. A later run keeps the same task ids so import updates the same issues.
 
 `orch plan import` reads a roadmap file and creates one GitHub issue per task. The title is the task id and the task title. The body holds the goal, scope and acceptance, a link to the heading on the default branch, and a hidden marker (`<!-- orch-plan: M1-03 -->`). A later import edits an issue only when the title, body or labels changed.
 

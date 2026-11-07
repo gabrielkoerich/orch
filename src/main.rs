@@ -177,7 +177,9 @@ mod tests {
     use std::path::Path;
     use std::path::PathBuf;
 
-    use super::{Cli, Commands, MAX_SERVICE_LOG_BYTES, rotate_log_if_needed, rotated_log_path};
+    use super::{
+        Cli, Commands, MAX_SERVICE_LOG_BYTES, PlanAction, rotate_log_if_needed, rotated_log_path,
+    };
     use clap::{CommandFactory, Parser, error::ErrorKind};
 
     #[test]
@@ -294,7 +296,7 @@ mod tests {
         let help = String::from_utf8(output).unwrap();
 
         for command in [
-            "init", "log", "commit", "stream", "notify", "chat", "task", "job", "service",
+            "init", "log", "commit", "stream", "notify", "chat", "task", "job", "plan", "service",
             "project", "stats", "cooldown", "config",
         ] {
             assert!(help.contains(&format!("  {command}")), "{command} missing");
@@ -365,6 +367,41 @@ mod tests {
         assert!(Cli::try_parse_from(["orch", "task", "unblock", "owner/repo#58"]).is_ok());
         assert!(Cli::try_parse_from(["orch", "task", "retry", "internal:58"]).is_ok());
         assert!(Cli::try_parse_from(["orch", "task", "get", "owner/other#58"]).is_ok());
+        assert!(Cli::try_parse_from(["orch", "plan", "docs/PLAN.md"]).is_ok());
+        assert!(Cli::try_parse_from(["orch", "plan", "docs/PLAN.md", "--yes"]).is_ok());
+        assert!(Cli::try_parse_from(["orch", "plan", "import", "docs/ROADMAP.md"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["orch", "plan", "import", "docs/ROADMAP.md", "--dry-run"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn plan_file_takes_yes_and_import_stays_a_subcommand() {
+        match Cli::parse_from(["orch", "plan", "docs/PLAN.md", "-y"]).command {
+            Commands::Plan {
+                file: Some(file),
+                yes: true,
+                action: None,
+            } => assert_eq!(file, "docs/PLAN.md"),
+            _ => panic!("expected plan file"),
+        }
+        match Cli::parse_from(["orch", "plan", "import", "docs/ROADMAP.md", "--dry-run"]).command {
+            Commands::Plan {
+                file: None,
+                yes: false,
+                action:
+                    Some(PlanAction::Import {
+                        file,
+                        dry_run: true,
+                        ..
+                    }),
+            } => assert_eq!(file, "docs/ROADMAP.md"),
+            _ => panic!("expected plan import"),
+        }
+        assert!(Cli::try_parse_from(["orch", "plan"]).is_err());
+        assert!(
+            Cli::try_parse_from(["orch", "plan", "import", "docs/ROADMAP.md", "--yes"]).is_err()
+        );
     }
 }
 
@@ -501,10 +538,20 @@ enum Commands {
         #[command(subcommand)]
         action: JobAction,
     },
-    /// Create GitHub issues from a roadmap file
+    /// Turn a markdown plan into GitHub issues
+    #[command(
+        subcommand_precedence_over_arg = true,
+        args_conflicts_with_subcommands = true,
+        arg_required_else_help = true
+    )]
     Plan {
+        /// Path to a free-form markdown plan
+        file: Option<String>,
+        /// Import without asking
+        #[arg(long, short = 'y')]
+        yes: bool,
         #[command(subcommand)]
-        action: PlanAction,
+        action: Option<PlanAction>,
     },
     /// Service management
     Service {
@@ -1419,14 +1466,20 @@ async fn async_main() -> anyhow::Result<()> {
                 process::exit(i32::from(!matches));
             }
         },
-        Commands::Plan { action } => match action {
-            PlanAction::Import {
+        Commands::Plan { file, yes, action } => match action {
+            Some(PlanAction::Import {
                 file,
                 dry_run,
                 milestone,
                 skip_unmet,
-            } => {
+            }) => {
                 cli::plan::import(&file, dry_run, milestone.as_deref(), skip_unmet).await?;
+            }
+            None => {
+                let Some(file) = file else {
+                    anyhow::bail!("usage: orch plan <file>");
+                };
+                cli::plan::from_plan(&file, yes).await?;
             }
         },
         Commands::Service { action } => match action {
