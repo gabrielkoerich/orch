@@ -1848,6 +1848,7 @@ dependencies = [
  "rsa",
  "sandbox-jail",
  "scopeguard",
+ "secret-redact",
  "serde",
  "serde_json",
  "serde_norway",
@@ -2421,6 +2422,15 @@ name = "sdd"
 version = "3.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "490dcfcbfef26be6800d11870ff2df8774fa6e86d047e3e8c8a76b25655e41ca"
+
+[[package]]
+name = "secret-redact"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15bd21ae45554681a9ad1bf7dfbc5183b7fc56b5e56db0c97b8f620c27d9baaa"
+dependencies = [
+ "regex",
+]
 
 [[package]]
 name = "security-framework"

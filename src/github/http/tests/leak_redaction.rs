@@ -33,7 +33,7 @@ fn assert_token_redacted(raw: &str) {
     );
     let body = posted_json_body(raw);
     assert!(
-        body.contains("[REDACTED:github_token]"),
+        body.contains("[REDACTED:github-pat]"),
         "redacted marker missing from posted body: {body}"
     );
     assert!(
