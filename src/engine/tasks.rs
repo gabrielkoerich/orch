@@ -464,58 +464,8 @@ impl TaskManager {
     /// For `"internal:{n}"` IDs, updates the store. For all others, calls the backend.
     /// Store is always updated when available.
     pub async fn update_task_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
-        let task_status = status_to_task_status(status);
-        self.release_dependents_if_done(task_status, &self.repo, &id.0)
-            .await;
-
-        // Read pre-update snapshot from the store (old_status + context fields).
-        // This must happen BEFORE any store.update_status() call so we capture
-        // the previous state for the event.
-        let (pre_snapshot, snapshot_store_id) = self.read_task_snapshot(&id.0).await;
-
-        if is_internal_id(&id.0) {
-            // Internal tasks: store is the single source of truth
-            let store = self
-                .store
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("store required for internal task status update"))?;
-            let store_id = snapshot_store_id
-                .ok_or_else(|| anyhow::anyhow!("internal task {} not found in store", id.0))?;
-            if task_status != TaskStatus::Blocked {
-                store.set_block_reason(store_id, None).await?;
-            }
-            store.update_status(store_id, task_status).await?;
-            // Publish event to bus only after confirmed update
-            self.publish_event(id, status, &pre_snapshot, &self.repo, None);
-            return Ok(());
-        }
-
-        // External tasks: store-first, then mirror to backend.
-        // SQLite is the source of truth; backend sync is best-effort.
-        if let Some(ref store) = self.store
-            && let Some(store_id) = snapshot_store_id
-        {
-            if task_status != TaskStatus::Blocked {
-                store.set_block_reason(store_id, None).await?;
-            }
-            store.update_status(store_id, task_status).await?;
-        }
-
-        // Mirror to backend (GitHub labels). Log failure but don't fail the operation
-        // since the store already has the correct status.
-        if let Err(e) = self.backend.update_status(id, status).await {
-            tracing::warn!(
-                task_id = id.0,
-                ?status,
-                err = %e,
-                "failed to mirror status to backend — store is authoritative"
-            );
-        }
-
-        // Publish event to bus
-        self.publish_event(id, status, &pre_snapshot, &self.repo, None);
-
-        Ok(())
+        self.update_task_status_with_duration(id, status, None)
+            .await
     }
 
     pub async fn update_task_status_and_result(
@@ -2056,6 +2006,111 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "no event should be published on a no-op update"
+        );
+    }
+    async fn duration_fixture(
+        internal: bool,
+    ) -> (
+        TaskManager,
+        Arc<TaskStore>,
+        i64,
+        ExternalId,
+        broadcast::Receiver<TaskEvent>,
+    ) {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let (tx, rx) = broadcast::channel::<TaskEvent>(16);
+        let (store_id, id) = if internal {
+            let sid = store
+                .create_internal("owner/repo", "task", "body", "manual", "", None)
+                .await
+                .unwrap();
+            (sid, ExternalId(format!("internal:{sid}")))
+        } else {
+            let sid = store
+                .upsert_external(&crate::store::UpsertExternal {
+                    repo: "owner/repo",
+                    ext_id: "91",
+                    title: "t",
+                    body: "",
+                    author: "user",
+                    url: "",
+                    labels: &[],
+                    origin: "github",
+                })
+                .await
+                .unwrap();
+            (sid, ExternalId("91".to_string()))
+        };
+        store
+            .set_block_reason(store_id, Some("stale reason"))
+            .await
+            .unwrap();
+        let tm =
+            TaskManager::with_events(backend, Arc::clone(&store), "owner/repo".to_string(), tx);
+        (tm, store, store_id, id, rx)
+    }
+
+    #[tokio::test]
+    async fn status_update_clears_block_reason_and_publishes_event_for_both_kinds() {
+        for internal in [false, true] {
+            let (tm, store, store_id, id, mut rx) = duration_fixture(internal).await;
+            tm.update_task_status(&id, Status::Routed).await.unwrap();
+            let task = store.get(store_id).await.unwrap();
+            assert_eq!(task.status, TaskStatus::Routed);
+            assert_eq!(task.block_reason, None);
+            let event = rx.try_recv().unwrap();
+            assert_eq!(event.old_status, "new");
+            assert_eq!(event.new_status, "routed");
+            assert_eq!(event.duration_seconds, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn status_update_with_duration_clears_block_reason_and_carries_duration() {
+        for internal in [false, true] {
+            let (tm, store, store_id, id, mut rx) = duration_fixture(internal).await;
+            tm.update_task_status_with_duration(&id, Status::Routed, Some(12.5))
+                .await
+                .unwrap();
+            let task = store.get(store_id).await.unwrap();
+            assert_eq!(task.status, TaskStatus::Routed);
+            assert_eq!(task.block_reason, None);
+            let event = rx.try_recv().unwrap();
+            assert_eq!(event.old_status, "new");
+            assert_eq!(event.new_status, "routed");
+            assert_eq!(event.duration_seconds, Some(12.5));
+        }
+    }
+
+    #[tokio::test]
+    async fn status_update_to_blocked_keeps_block_reason() {
+        for internal in [false, true] {
+            let (tm, store, store_id, id, _rx) = duration_fixture(internal).await;
+            tm.update_task_status(&id, Status::Blocked).await.unwrap();
+            let task = store.get(store_id).await.unwrap();
+            assert_eq!(task.status, TaskStatus::Blocked);
+            assert_eq!(task.block_reason.as_deref(), Some("stale reason"));
+
+            let (tm, store, store_id, id, _rx) = duration_fixture(internal).await;
+            tm.update_task_status_with_duration(&id, Status::Blocked, None)
+                .await
+                .unwrap();
+            let task = store.get(store_id).await.unwrap();
+            assert_eq!(task.block_reason.as_deref(), Some("stale reason"));
+        }
+    }
+
+    #[tokio::test]
+    async fn status_update_internal_without_store_or_row_errors() {
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let tm = TaskManager::new(Arc::clone(&backend));
+        let id = ExternalId("internal:1".to_string());
+        assert!(tm.update_task_status(&id, Status::Routed).await.is_err());
+        assert!(
+            tm.update_task_status_with_duration(&id, Status::Routed, None)
+                .await
+                .is_err()
         );
     }
 }
