@@ -230,6 +230,8 @@ mod tests {
     use super::*;
     use crate::store::NewTask;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
     const FAILED_PUSH: &str = "push failed: remote: fatal error in commit_refs\n ! [remote rejected] feature -> feature (pre-receive hook declined)";
@@ -285,10 +287,7 @@ mod tests {
         )
         .unwrap();
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     async fn pending_task(store: &Arc<TaskStore>, fx: &Fixture, failures: i32) -> String {
