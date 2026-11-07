@@ -34,7 +34,7 @@ Set it in `~/.orch/config.yml` for every project, or in one project's `.orch.yml
 2. Orch detects an open PR on the task's branch → sets status to `needs_review`. The review starts, and the task moves to `in_review`, only once CI has run on the PR head (`src/engine/review_gate.rs`):
    - No CI configured, or every check passed → the review starts.
    - Checks still running → the task waits in `needs_review`.
-   - A check failed → the task goes back to `routed` with the failed checks in `last_error` and counts toward `ci_merge_failures`.
+   - A check failed → the task goes back to `routed` with the failed checks in `last_error` and counts toward `ci_merge_failures`, once per head SHA. Another look at that same red head leaves the task in `needs_review`.
    - No check started after 15 minutes → the review starts anyway. The merge still waits for green CI.
    - No check started and the repository uses shipcheck → orch runs `shipcheck run` in the task worktree once per head, and the task waits in `needs_review` until it ends (`src/engine/review_shipcheck.rs`). The reviewer's own `shipcheck run` then returns the stored result, so a suite that takes most of the review's time limit runs outside it. A sandboxed reviewer does not use shipcheck, so orch skips the run. A run that ends with no result, or takes over an hour, does not run again for that head.
    - `review-gate` and `orch/review` report the review itself and never hold it.

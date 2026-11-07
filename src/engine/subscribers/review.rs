@@ -709,8 +709,8 @@ async fn ci_allows_review(
             tracing::warn!(task_id, pr_number, err = %e, "CI gate lookup failed, starting the review");
             return true;
         }
-        Ok(CiGate::Red(failed)) => {
-            route_back_on_red_ci(store, task_manager, repo, task, pr_number, &failed).await;
+        Ok(CiGate::Red { failed, sha }) => {
+            route_back_on_red_ci(store, task_manager, repo, task, pr_number, &failed, &sha).await;
             return false;
         }
         Ok(CiGate::Wait) => "CI still running on the PR head, review waits",
@@ -818,23 +818,29 @@ async fn route_back_on_red_ci(
     task: &ExternalTask,
     pr_number: u64,
     failed: &[String],
+    head_sha: &str,
 ) {
     let task_id = task.id.0.as_str();
-    let failures = match store::store_increment(
-        &Some(Arc::clone(store)),
-        repo,
-        task_id,
-        "ci_merge_failures",
-    )
-    .await
+    let checks = failed.join(", ");
+    let failures = match auto_merge::count_ci_failure_for_head(store, repo, task_id, head_sha).await
     {
-        Ok(v) => v,
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            tracing::info!(
+                task_id,
+                pr_number,
+                sha = head_sha,
+                checks,
+                "CI still failed on the same head, review waits"
+            );
+            reset_refires(store, repo, task_id).await;
+            return;
+        }
         Err(e) => {
             tracing::warn!(task_id, err = %e, "failed to increment ci_merge_failures, review waits");
             return;
         }
     };
-    let checks = failed.join(", ");
     let max = auto_merge::MAX_CI_MERGE_FAILURES;
     let (status, fields) = if failures >= max {
         tracing::error!(
@@ -1308,6 +1314,7 @@ async fn post_review_failure_comment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::test_helpers::NoopBackend;
 
     /// An incomplete mid-thought review (no result envelope) must reset for
     /// retry without counting toward MAX_REVIEW_AGENT_FAILURES (issue #3734).
@@ -1688,5 +1695,99 @@ mod tests {
             ),
             "the recorded attempt must carry that attempt's error"
         );
+    }
+
+    async fn needs_review_task(
+        repo: &str,
+        source_id: &str,
+    ) -> (Arc<TaskStore>, Arc<TaskManager>, ExternalTask, i64) {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let store_id = store
+            .create_internal(repo, "CI red", "", "test", source_id, None)
+            .await
+            .unwrap();
+        store
+            .update_status(store_id, TaskStatus::NeedsReview)
+            .await
+            .unwrap();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(NoopBackend);
+        let task_manager = Arc::new(TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
+            repo.to_string(),
+        ));
+        let task = ExternalTask {
+            id: ExternalId(format!("internal:{store_id}")),
+            title: "CI red".into(),
+            body: String::new(),
+            state: "open".into(),
+            labels: vec![],
+            author: String::new(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            url: String::new(),
+        };
+        (store, task_manager, task, store_id)
+    }
+
+    #[tokio::test]
+    async fn route_back_on_red_ci_counts_one_failure_per_head() {
+        let repo = "owner/repo";
+        let (store, task_manager, task, store_id) = needs_review_task(repo, "same-sha").await;
+        let failed = ["check".to_string()];
+
+        route_back_on_red_ci(&store, &task_manager, repo, &task, 1, &failed, "aaa").await;
+        let after_first = store.get(store_id).await.unwrap();
+        assert_eq!(after_first.ci_merge_failures, 1);
+        assert_eq!(after_first.status, TaskStatus::Routed);
+
+        store
+            .update_status(store_id, TaskStatus::NeedsReview)
+            .await
+            .unwrap();
+        store
+            .set_fields(store_id, &[("needs_review_refires", serde_json::json!(5))])
+            .await
+            .unwrap();
+        route_back_on_red_ci(&store, &task_manager, repo, &task, 1, &failed, "aaa").await;
+        let after_same = store.get(store_id).await.unwrap();
+        assert_eq!(after_same.ci_merge_failures, 1);
+        assert_eq!(after_same.status, TaskStatus::NeedsReview);
+        assert_eq!(
+            after_same.needs_review_refires, 0,
+            "a repeated look at the same red head must not spend the rebroadcast quota"
+        );
+
+        route_back_on_red_ci(&store, &task_manager, repo, &task, 1, &failed, "bbb").await;
+        let after_new = store.get(store_id).await.unwrap();
+        assert_eq!(after_new.ci_merge_failures, 2);
+        assert_eq!(after_new.status, TaskStatus::Routed);
+    }
+
+    #[tokio::test]
+    async fn route_back_on_red_ci_blocks_after_max_distinct_heads() {
+        let repo = "owner/repo";
+        let (store, task_manager, task, store_id) = needs_review_task(repo, "max-sha").await;
+        let failed = ["check".to_string()];
+        let shas = ["aaa", "bbb", "ccc"];
+
+        for (i, sha) in shas.iter().enumerate() {
+            store
+                .update_status(store_id, TaskStatus::NeedsReview)
+                .await
+                .unwrap();
+            route_back_on_red_ci(&store, &task_manager, repo, &task, 1, &failed, sha).await;
+            let task = store.get(store_id).await.unwrap();
+            if i + 1 < shas.len() {
+                assert_eq!(task.status, TaskStatus::Routed);
+                assert_eq!(task.ci_merge_failures, i32::try_from(i + 1).unwrap());
+            } else {
+                assert_eq!(task.status, TaskStatus::Blocked);
+                assert_eq!(
+                    task.ci_merge_failures,
+                    i32::try_from(auto_merge::MAX_CI_MERGE_FAILURES).unwrap()
+                );
+            }
+        }
     }
 }
