@@ -1,24 +1,51 @@
-//! `orch plan import` creates and updates issues from a roadmap file.
+//! `orch plan` turns a free-form markdown plan into issues.
 
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Context;
 
 use crate::backends::BlockedByFetch;
+use crate::cli;
 use crate::config;
+use crate::control;
 use crate::github::http::GhHttp;
 use crate::github::types::GitHubIssue;
-use crate::plan;
-use crate::plan::ChangeKind;
 use crate::plan::{
-    Binding, DepRef, ExistingIssue, HUMAN_LABEL, LinkEdit, NO_AGENT_LABEL, PLAN_LABEL, PlanDiff,
-    Task, UnmetExternal, diff_import, diff_links, issue_body_with, issue_title, labels_for,
-    marker_id, render_report, skip_unmet_ids, unmet_externals,
+    self, Binding, ChangeKind, DepRef, ExistingIssue, HUMAN_LABEL, LinkEdit, NO_AGENT_LABEL,
+    PLAN_LABEL, PlanDiff, Roadmap, Task, UnmetExternal, diff_import, diff_links, issue_body_with,
+    issue_title, labels_for, marker_id, render_report, skip_unmet_ids, unmet_externals,
 };
+
+/// Draft a roadmap from a free-form plan, print it, and import after a yes.
+pub async fn from_plan(file: &str, yes: bool) -> anyhow::Result<()> {
+    let path = Path::new(file);
+    let markdown =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if markdown.trim().is_empty() {
+        anyhow::bail!("{} is empty", path.display());
+    }
+    let dest = roadmap_path(path);
+    let existing = fs::read_to_string(&dest).ok();
+    let (roadmap_md, roadmap) = draft_roadmap(&markdown, existing.as_deref()).await?;
+    let dest_str = dest
+        .to_str()
+        .with_context(|| format!("roadmap path {} is not utf-8", dest.display()))?;
+    // Save the draft before asking, a later run reuses the ids
+    fs::write(&dest, with_trailing_newline(&roadmap_md))
+        .with_context(|| format!("failed to write {dest_str}"))?;
+    print!("{}", plan::render_outline(&roadmap));
+    println!("Wrote {dest_str}");
+    if !yes && !prompt_import()? {
+        println!("aborted");
+        return Ok(());
+    }
+    import(dest_str, false, None, false).await
+}
 
 pub async fn import(
     file: &str,
@@ -339,6 +366,201 @@ fn repo_relative(path: &Path) -> Option<String> {
     )
 }
 
+async fn draft_roadmap(plan: &str, existing: Option<&str>) -> anyhow::Result<(String, Roadmap)> {
+    let store = cli::init_store().await?;
+    let agent = control::get_agent(&store).await?;
+    let model = control::get_model(&store).await?;
+    if model.is_empty() {
+        eprintln!("Drafting a roadmap with {agent}…");
+    } else {
+        eprintln!("Drafting a roadmap with {agent}:{model}…");
+    }
+    let prompt = build_prompt(plan, existing);
+    let result = control::invoke_agent(&agent, &model, "", &prompt).await?;
+    match accept_roadmap(&result.text) {
+        Ok(ok) => Ok(ok),
+        Err(first) => {
+            tracing::warn!(error = %first, "plan draft did not parse, retrying once");
+            let retry = retry_prompt(plan, existing, &result.text, &first);
+            let second = control::invoke_agent(&agent, &model, "", &retry).await?;
+            accept_roadmap(&second.text)
+        }
+    }
+}
+
+fn build_prompt(plan: &str, existing: Option<&str>) -> String {
+    let existing = match existing.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(text) => text.to_string(),
+        None => "(empty)".to_string(),
+    };
+    include_str!("../../prompts/plan_roadmap.md")
+        .replace("{{EXISTING}}", &existing)
+        .replace("{{PLAN}}", plan)
+}
+
+fn retry_prompt(
+    plan: &str,
+    existing: Option<&str>,
+    previous: &str,
+    error: &anyhow::Error,
+) -> String {
+    let mut prompt = build_prompt(plan, existing);
+    prompt.push_str("\n\nThe previous attempt was not a valid roadmap:\n\n");
+    prompt.push_str(&error.to_string());
+    prompt.push_str("\n\nPrevious output:\n\n");
+    prompt.push_str(previous.trim());
+    prompt.push_str("\n\nWrite a corrected roadmap. Output only the markdown.\n");
+    prompt
+}
+
+fn accept_roadmap(raw: &str) -> anyhow::Result<(String, Roadmap)> {
+    let mut last = anyhow::anyhow!("agent returned no roadmap");
+    for candidate in roadmap_candidates(raw) {
+        let slices = milestone_slices(&candidate);
+        let preferred: Vec<&str> = slices
+            .iter()
+            .copied()
+            .filter(|slice| starts_with_milestone(slice))
+            .collect();
+        let fallback = if preferred.is_empty() {
+            if slices.is_empty() {
+                vec![candidate.as_str()]
+            } else {
+                slices
+            }
+        } else {
+            preferred
+        };
+        for slice in fallback {
+            match try_parse(slice) {
+                Ok(ok) => return Ok(ok),
+                Err(err) => last = err,
+            }
+        }
+    }
+    Err(last)
+}
+
+fn starts_with_milestone(text: &str) -> bool {
+    text.lines()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(plan::is_milestone_heading)
+}
+
+fn milestone_slices(text: &str) -> Vec<&str> {
+    let mut slices = Vec::new();
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if line.trim_start().starts_with("## ") {
+            slices.push(text[offset..].trim());
+        }
+        offset += line.len();
+    }
+    slices
+}
+
+fn try_parse(markdown: &str) -> anyhow::Result<(String, Roadmap)> {
+    let markdown = markdown.trim();
+    let roadmap = plan::parse_roadmap(markdown)?;
+    if roadmap.tasks.is_empty() {
+        anyhow::bail!("roadmap has no tasks");
+    }
+    Ok((markdown.to_string(), roadmap))
+}
+
+fn roadmap_candidates(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for block in fenced_blocks(raw) {
+        push_unique(&mut out, &block);
+    }
+    let stripped = strip_outer_fence(raw);
+    push_unique(&mut out, &stripped);
+    out
+}
+
+fn push_unique(out: &mut Vec<String>, text: &str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || out.iter().any(|have| have == trimmed) {
+        return;
+    }
+    out.push(trimmed.to_string());
+}
+
+fn strip_outer_fence(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let without_open = if let Some(rest) = trimmed.strip_prefix("```") {
+        match rest.find('\n') {
+            Some(i) => &rest[i + 1..],
+            None => rest,
+        }
+    } else {
+        trimmed
+    };
+    without_open
+        .trim_end()
+        .strip_suffix("```")
+        .unwrap_or(without_open)
+        .trim()
+        .to_string()
+}
+
+fn fenced_blocks(raw: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut index = 0;
+    while let Some(rel) = raw[index..].find("```") {
+        let start = index + rel + 3;
+        let after_open = &raw[start..];
+        let content_start = match after_open.find('\n') {
+            Some(i) => start + i + 1,
+            None => break,
+        };
+        if let Some(rel_end) = raw[content_start..].find("```") {
+            let end = content_start + rel_end;
+            blocks.push(raw[content_start..end].trim().to_string());
+            index = end + 3;
+        } else {
+            blocks.push(raw[content_start..].trim().to_string());
+            break;
+        }
+    }
+    blocks
+}
+
+fn roadmap_path(plan: &Path) -> PathBuf {
+    let name = plan.file_name().map_or_else(
+        || "plan.md".to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let file_name = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem}.roadmap.{ext}"),
+        _ => format!("{name}.roadmap.md"),
+    };
+    match plan.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(file_name),
+        _ => PathBuf::from(file_name),
+    }
+}
+
+fn with_trailing_newline(text: &str) -> String {
+    if text.ends_with('\n') {
+        text.to_string()
+    } else {
+        format!("{text}\n")
+    }
+}
+
+fn prompt_import() -> anyhow::Result<bool> {
+    print!("\nImport these issues? [y/n] ");
+    io::stdout().flush().ok();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(is_yes(&input))
+}
+
+fn is_yes(input: &str) -> bool {
+    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,5 +609,161 @@ mod tests {
         .unwrap();
         let ids: Vec<&str> = found.iter().map(|item| item.task_id.as_str()).collect();
         assert_eq!(ids, ["M1-01", "M1-02"]);
+    }
+
+    const VALID_ROADMAP: &str = "\
+## M1. Workspace
+
+### M1-01 Create the crate
+
+- Goal: a crate that builds.
+- Scope: the library crate.
+- Acceptance:
+  - `cargo test` passes.
+- Depends on: none.
+
+### M1-02 Add a parser
+
+- Goal: parse the config file.
+- Acceptance:
+  - A sample file round-trips.
+- Depends on: M1-01.
+";
+
+    #[test]
+    fn accept_roadmap_reads_a_fenced_response_with_preamble() {
+        let raw = format!(
+            "Here is the roadmap:\n\n```markdown\n{VALID_ROADMAP}```\n\nLet me know if you want edits.\n"
+        );
+        let (markdown, roadmap) = accept_roadmap(&raw).unwrap();
+        assert_eq!(markdown, VALID_ROADMAP.trim());
+        assert_eq!(
+            roadmap
+                .tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            ["M1-01", "M1-02"]
+        );
+        assert_eq!(roadmap.tasks[1].depends_on, ["M1-01".to_string()]);
+    }
+
+    #[test]
+    fn accept_roadmap_reads_plain_markdown() {
+        let (markdown, roadmap) = accept_roadmap(VALID_ROADMAP).unwrap();
+        assert_eq!(markdown, VALID_ROADMAP.trim());
+        assert_eq!(roadmap.milestones[0].id, "M1");
+    }
+
+    #[test]
+    fn accept_roadmap_starts_at_the_first_milestone() {
+        let raw = format!("Notes from the meeting.\n\n{VALID_ROADMAP}");
+        let (markdown, roadmap) = accept_roadmap(&raw).unwrap();
+        assert!(markdown.starts_with("## M1. Workspace"), "{markdown}");
+        assert_eq!(roadmap.tasks.len(), 2);
+    }
+
+    #[test]
+    fn accept_roadmap_skips_a_leading_notes_heading() {
+        let raw = format!("## Notes\n\nFrom the meeting.\n\n{VALID_ROADMAP}");
+        let (markdown, roadmap) = accept_roadmap(&raw).unwrap();
+        assert!(markdown.starts_with("## M1. Workspace"), "{markdown}");
+        assert_eq!(roadmap.tasks.len(), 2);
+    }
+
+    #[test]
+    fn accept_roadmap_reads_an_unclosed_fence() {
+        let raw = format!("```markdown\n{VALID_ROADMAP}");
+        let (markdown, roadmap) = accept_roadmap(&raw).unwrap();
+        assert!(markdown.starts_with("## M1. Workspace"), "{markdown}");
+        assert_eq!(roadmap.tasks.len(), 2);
+    }
+
+    #[test]
+    fn accept_roadmap_rejects_a_plan_with_no_ids() {
+        let err = accept_roadmap("# Ship it\n\nBuild the app and write tests.\n").unwrap_err();
+        assert!(!err.to_string().is_empty(), "{err}");
+    }
+
+    #[test]
+    fn one_page_plan_without_ids_has_a_roadmap_import_accepts() {
+        let plan = "\
+# Notes app
+
+Build a local notes app.
+
+First, set up a Rust crate that builds and tests on a clean checkout.
+
+Then add a notes file format and a command that lists notes.
+
+A person has to create the GitHub repo.
+";
+        assert!(plan::parse_roadmap(plan).unwrap().tasks.is_empty());
+        assert!(accept_roadmap(plan).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let plan_file = dir.path().join("notes.md");
+        fs::write(&plan_file, plan).unwrap();
+        let dest = roadmap_path(&plan_file);
+        let (markdown, imported) = accept_roadmap(VALID_ROADMAP).unwrap();
+        fs::write(&dest, with_trailing_newline(&markdown)).unwrap();
+        let saved = fs::read_to_string(&dest).unwrap();
+        let (roadmap, warnings) = plan::parse_roadmap_for(&saved, None).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!imported.tasks.is_empty());
+        assert_eq!(roadmap.tasks.len(), imported.tasks.len());
+        assert!(roadmap.tasks.iter().all(|task| !task.id.is_empty()));
+        assert_eq!(dest.file_name().unwrap(), "notes.roadmap.md");
+    }
+
+    #[test]
+    fn retry_prompt_includes_the_error_and_previous_output() {
+        let prompt = retry_prompt(
+            "# Build it\n",
+            None,
+            "not a roadmap",
+            &anyhow::anyhow!("roadmap has no tasks"),
+        );
+        assert!(prompt.contains("# Build it"));
+        assert!(prompt.contains("not a roadmap"));
+        assert!(prompt.contains("roadmap has no tasks"));
+        assert!(prompt.contains("Write a corrected roadmap"));
+    }
+
+    #[test]
+    fn roadmap_path_sits_next_to_the_plan() {
+        assert_eq!(
+            roadmap_path(Path::new("docs/PLAN.md")),
+            PathBuf::from("docs/PLAN.roadmap.md")
+        );
+        assert_eq!(
+            roadmap_path(Path::new("plan.md")),
+            PathBuf::from("plan.roadmap.md")
+        );
+        assert_eq!(
+            roadmap_path(Path::new("/tmp/idea")),
+            PathBuf::from("/tmp/idea.roadmap.md")
+        );
+    }
+
+    #[test]
+    fn prompt_keeps_existing_ids_and_the_plan_body() {
+        let prompt = build_prompt("# Build it\n", Some(VALID_ROADMAP));
+        assert!(prompt.contains("# Build it"));
+        assert!(prompt.contains("### M1-01 Create the crate"));
+        assert!(prompt.contains("keep every task id"));
+    }
+
+    #[test]
+    fn yes_accepts_y_and_yes() {
+        assert!(is_yes("y\n"));
+        assert!(is_yes(" Yes "));
+        assert!(!is_yes("n"));
+        assert!(!is_yes(""));
+    }
+
+    #[test]
+    fn trailing_newline_is_added_once() {
+        assert_eq!(with_trailing_newline("a"), "a\n");
+        assert_eq!(with_trailing_newline("a\n"), "a\n");
     }
 }

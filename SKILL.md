@@ -105,8 +105,9 @@ These commands change a task's state. Use them after the cause is understood or 
 
 Do not kill or retry a running task to make it pick up a changed issue. It ends on its own and the next attempt reads the new text. Never use `orch task unblock all`.
 
-## Planning tasks with `orch plan import`
+## Planning tasks with `orch plan`
 
+- `orch plan <file>` turns a free-form markdown plan into a roadmap, prints the milestones and tasks, and asks before creating issues. `--yes` skips the question. The roadmap is saved next to the plan as `<name>.roadmap.md`.
 - `orch plan import <roadmap> --dry-run` shows what it would create, update and link. Run it first.
 - `--milestone <id>` imports one milestone, and `--skip-unmet` skips a task whose blocker outside the milestone has no issue yet.
 - Put human-only tasks (accounts, recordings, legal review, store setup) in their own milestone at the end. An agent task that depends on a human-only task waits until a person finishes it, and every task behind it waits too. Where an agent task needs something only a person can set up, give it a local stand-in instead, such as a local test configuration or a stubbed service.
