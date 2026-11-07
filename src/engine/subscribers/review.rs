@@ -1315,6 +1315,9 @@ async fn post_review_failure_comment(
 mod tests {
     use super::*;
     use crate::backends::test_helpers::NoopBackend;
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
 
     /// An incomplete mid-thought review (no result envelope) must reset for
     /// retry without counting toward MAX_REVIEW_AGENT_FAILURES (issue #3734).
@@ -1730,6 +1733,57 @@ mod tests {
         (store, task_manager, task, store_id)
     }
 
+    struct ReviewPushFixture {
+        _tmp: tempfile::TempDir,
+        clone: PathBuf,
+        remote: PathBuf,
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    fn review_push_fixture() -> ReviewPushFixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote.git");
+        let clone = tmp.path().join("clone");
+        fs::create_dir_all(&remote).unwrap();
+        git(&remote, &["init", "--bare", "-b", "main"]);
+        git(tmp.path(), &["clone", remote.to_str().unwrap(), "clone"]);
+        git(&clone, &["config", "user.email", "t@example.com"]);
+        git(&clone, &["config", "user.name", "t"]);
+        git(&clone, &["checkout", "-b", "main"]);
+        fs::write(clone.join("a.txt"), "a").unwrap();
+        git(&clone, &["add", "."]);
+        git(&clone, &["commit", "-m", "base"]);
+        git(&clone, &["push", "-u", "origin", "main"]);
+        git(&clone, &["checkout", "-b", "feature"]);
+        fs::write(clone.join("b.txt"), "b").unwrap();
+        git(&clone, &["add", "."]);
+        git(&clone, &["commit", "-m", "work"]);
+        ReviewPushFixture {
+            _tmp: tmp,
+            clone,
+            remote,
+        }
+    }
+
+    fn remote_feature_log(fx: &ReviewPushFixture) -> String {
+        let out = Command::new("git")
+            .args(["log", "feature", "--oneline"])
+            .current_dir(&fx.remote)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
     #[tokio::test]
     async fn route_back_on_red_ci_counts_one_failure_per_head() {
         let repo = "owner/repo";
@@ -1762,6 +1816,62 @@ mod tests {
         let after_new = store.get(store_id).await.unwrap();
         assert_eq!(after_new.ci_merge_failures, 2);
         assert_eq!(after_new.status, TaskStatus::Routed);
+    }
+
+    /// Review waits until the engine push lands, even when the task already has a PR (#4051)
+    #[tokio::test]
+    async fn push_allows_review_holds_until_an_engine_push_on_an_existing_pr() {
+        let repo = "owner/repo";
+        let (store, task_manager, task, store_id) = needs_review_task(repo, "push-retry-pr").await;
+        let fx = review_push_fixture();
+        git(&fx.clone, &["push", "-u", "origin", "feature"]);
+        fs::write(fx.clone.join("c.txt"), "c").unwrap();
+        git(&fx.clone, &["add", "."]);
+        git(&fx.clone, &["commit", "-m", "more"]);
+        store
+            .set_fields(
+                store_id,
+                &[
+                    ("worktree", serde_json::json!(fx.clone.to_str().unwrap())),
+                    ("branch", serde_json::json!("feature")),
+                    (
+                        "last_error",
+                        serde_json::json!(
+                            "push failed: remote: fatal error in commit_refs\n ! [remote rejected] feature -> feature (pre-receive hook declined)"
+                        ),
+                    ),
+                    ("push_failures", serde_json::json!(1)),
+                    ("pr_number", serde_json::json!(12)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !push_allows_review(&store, &task_manager, repo, &task).await,
+            "review must wait while the engine backoff is running"
+        );
+        assert!(
+            !remote_feature_log(&fx).contains("more"),
+            "the unpushed commit must not reach the remote before the retry"
+        );
+
+        store
+            .kv_set(&format!("push_retry_at:{repo}#{}", task.id.0), "0")
+            .await
+            .unwrap();
+        assert!(
+            push_allows_review(&store, &task_manager, repo, &task).await,
+            "review may start only after the engine push lands"
+        );
+        assert!(
+            remote_feature_log(&fx).contains("more"),
+            "the engine push must land the new commit before review starts"
+        );
+        let after = store.get(store_id).await.unwrap();
+        assert_eq!(after.pr_number, Some(12));
+        assert_eq!(after.push_failures, 0);
+        assert!(after.last_error.is_empty());
     }
 
     #[tokio::test]
