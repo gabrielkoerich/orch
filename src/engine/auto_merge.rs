@@ -12,7 +12,7 @@ use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
 use crate::engine;
 use crate::engine::ci_bootstrap;
-use crate::engine::cleanup::cleanup_task_worktree;
+use crate::engine::cleanup::{cleanup_merged_pr_worktree, cleanup_task_worktree};
 use crate::engine::review;
 use crate::engine::review_poll;
 use crate::engine::router::config::RouterConfig;
@@ -87,7 +87,7 @@ async fn finish_merged_pr(
             .update_task_status(&task.id, Status::Done)
             .await?;
     }
-    if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
+    if let Err(e) = cleanup_merged_pr_worktree(&task.id.0, repo, store).await {
         tracing::warn!(
             task_id = task.id.0,
             err = %e,
