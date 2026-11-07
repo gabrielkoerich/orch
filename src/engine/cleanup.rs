@@ -37,6 +37,7 @@ use crate::engine;
 use crate::engine::auto_merge;
 use crate::engine::runner::cow;
 use crate::engine::runner::git_ops;
+use crate::engine::runner::screenshots::SCREENSHOTS_BRANCH;
 use crate::engine::runner::worktree;
 use crate::github::http::GhHttp;
 use crate::home;
@@ -1345,6 +1346,9 @@ async fn delete_local_branch(task_id: &str, br: &str, repo_root: &Path) {
  * failure, closed-issue reconciliation, orphan sweeps) may hold unmerged work (#3781)
  **/
 pub(crate) async fn delete_branches(task_id: &str, br: &str, repo_root: &Path) {
+    if br == SCREENSHOTS_BRANCH {
+        return;
+    }
     let default_branch = worktree::detect_default_branch(repo_root).await;
     let _ = git_ops::git()
         .await
@@ -2709,6 +2713,20 @@ mod tests {
             !local_has(&clone, "feat"),
             "local copy is on origin, so it can go"
         );
+    }
+
+    #[tokio::test]
+    async fn delete_branches_leaves_the_screenshots_branch_alone() {
+        let (_tmp, clone) = origin_and_clone_with_feat();
+        git_ok(&clone, &["branch", SCREENSHOTS_BRANCH, "feat"]);
+        git_ok(&clone, &["push", "origin", SCREENSHOTS_BRANCH]);
+        git_ok(&clone, &["merge", "--ff-only", "feat"]);
+        git_ok(&clone, &["push", "origin", "main"]);
+
+        delete_branches("1", SCREENSHOTS_BRANCH, &clone).await;
+
+        assert!(remote_has(&clone, SCREENSHOTS_BRANCH));
+        assert!(local_has(&clone, SCREENSHOTS_BRANCH));
     }
 
     #[tokio::test]

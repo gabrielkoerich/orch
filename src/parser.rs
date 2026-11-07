@@ -45,6 +45,20 @@ pub struct AgentResponse {
     /// Subtask delegations — agent requests child tasks to be created.
     #[serde(default)]
     pub delegations: Vec<Delegation>,
+    /// Screenshots of a change a user sees, as image paths in the worktree.
+    #[serde(default)]
+    pub screenshots: Vec<Screenshot>,
+    /// Why no screenshot could be taken, or which tool was missing.
+    #[serde(default)]
+    pub screenshot_note: Option<String>,
+}
+
+/// A screenshot the agent took, with a short caption.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Screenshot {
+    pub path: String,
+    #[serde(default)]
+    pub caption: String,
 }
 
 /// A subtask delegation requested by an agent.
@@ -320,6 +334,7 @@ const AGENT_RESPONSE_FIELDS: &[&str] = &[
     "\"files\"",
     "\"learnings\"",
     "\"delegations\"",
+    "\"screenshots\"",
     "\"error\"",
 ];
 
@@ -621,6 +636,14 @@ fn map_generic_response(val: &serde_json::Value) -> anyhow::Result<AgentResponse
         Vec::new()
     };
 
+    let screenshots = extract_screenshots(obj.get("screenshots"));
+    let screenshot_note = obj
+        .get("screenshot_note")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(String::from);
+
     Ok(AgentResponse {
         status,
         summary,
@@ -632,7 +655,29 @@ fn map_generic_response(val: &serde_json::Value) -> anyhow::Result<AgentResponse
         output_tokens,
         learnings,
         delegations,
+        screenshots,
+        screenshot_note,
     })
+}
+
+/// Read the `screenshots` list. An entry is `{"path", "caption"}` or a bare path string.
+/// A malformed entry is skipped, since a bad screenshot must not lose the rest of the response.
+fn extract_screenshots(val: Option<&serde_json::Value>) -> Vec<Screenshot> {
+    let Some(serde_json::Value::Array(items)) = val else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| match item {
+            serde_json::Value::String(path) => Some(Screenshot {
+                path: path.clone(),
+                caption: String::new(),
+            }),
+            serde_json::Value::Object(_) => serde_json::from_value::<Screenshot>(item.clone()).ok(),
+            _ => None,
+        })
+        .filter(|s| !s.path.trim().is_empty())
+        .collect()
 }
 
 /// Extract a u64 from a JSON value.
@@ -853,6 +898,33 @@ Thanks"#;
         assert_eq!(resp.learnings.len(), 2);
         assert_eq!(resp.learnings[0], "Use std::sync::Arc for shared state");
         assert_eq!(resp.learnings[1], "Check imports before committing");
+    }
+
+    #[test]
+    fn parse_screenshots_with_captions() {
+        let input = r#"{"status":"done","summary":"x","screenshots":[{"path":"shots/home.png","caption":"Home, desktop"},"shots/phone.png",{"caption":"no path"},7],"screenshot_note":" skill missing "}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(
+            resp.screenshots,
+            vec![
+                Screenshot {
+                    path: "shots/home.png".into(),
+                    caption: "Home, desktop".into()
+                },
+                Screenshot {
+                    path: "shots/phone.png".into(),
+                    caption: String::new()
+                },
+            ]
+        );
+        assert_eq!(resp.screenshot_note.as_deref(), Some("skill missing"));
+    }
+
+    #[test]
+    fn parse_without_screenshots_yields_none() {
+        let resp = parse(r#"{"status":"done","summary":"x","accomplished":["a"]}"#).unwrap();
+        assert!(resp.screenshots.is_empty());
+        assert!(resp.screenshot_note.is_none());
     }
 
     #[test]
