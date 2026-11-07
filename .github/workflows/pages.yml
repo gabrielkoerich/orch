@@ -45,8 +45,9 @@ jobs:
       - name: Write the proof data
         env:
           GH_TOKEN: ${{ github.token }}
+          REF: ${{ steps.ref.outputs.ref }}
         run: |
-          gh release download "${{ steps.ref.outputs.ref }}" --repo "$GITHUB_REPOSITORY" \
+          gh release download "$REF" --repo "$GITHUB_REPOSITORY" \
             --pattern orch-x86_64-unknown-linux-gnu --dir "$RUNNER_TEMP"
           chmod +x "$RUNNER_TEMP/orch-x86_64-unknown-linux-gnu"
           "$RUNNER_TEMP/orch-x86_64-unknown-linux-gnu" stats export \
