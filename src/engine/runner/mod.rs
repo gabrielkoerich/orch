@@ -29,6 +29,7 @@ mod recorded_fixtures;
 pub mod response;
 pub mod response_handler;
 pub mod sandbox;
+pub mod screenshots;
 pub mod session;
 pub mod task_init;
 pub mod worktree;
@@ -1954,6 +1955,8 @@ mod tests {
                 output_tokens: None,
                 learnings: vec![],
                 delegations: vec![],
+                screenshots: vec![],
+                screenshot_note: None,
             },
             input_tokens: None,
             output_tokens: None,
@@ -2473,6 +2476,8 @@ mod tests {
                     output_tokens: None,
                     learnings: vec![],
                     delegations: vec![],
+                    screenshots: vec![],
+                    screenshot_note: None,
                 },
                 input_tokens: None,
                 output_tokens: None,
@@ -2594,6 +2599,8 @@ mod tests {
                 output_tokens: None,
                 learnings: vec![],
                 delegations: vec![],
+                screenshots: vec![],
+                screenshot_note: None,
             },
             input_tokens: None,
             output_tokens: None,

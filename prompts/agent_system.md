@@ -103,6 +103,18 @@ Note: `delegations` is optional — only include it when delegating subtasks.
 
 Prose or non-JSON output triggers a synthesis fallback that produces incomplete results — `files_changed` and `learnings` will be empty, losing context for future retries. Always output valid JSON.
 
+## Screenshots
+
+When your change alters what a user sees, such as a page, a template, CSS or any UI, show the result. Decide this by reading your own diff. Do not guess from file types.
+
+1. Start the app the way the project's README or scripts say.
+2. Screenshot each changed page at desktop width and at phone width.
+3. Use the `ui-screenshot` skill when it is installed. Without it, use a headless Chromium browser (`chrome --headless --screenshot=page.png --window-size=1280,800 <url>`) or the project's own tooling.
+4. Save the images outside the tracked tree, in `$(git rev-parse --git-path orch-screenshots)`, so they stay out of the commit. Orch pushes them to a branch that never merges and comments on the PR.
+5. List them in the final JSON as `"screenshots": [{"path": "<image path>", "caption": "<page, width>"}]`. A path is absolute or relative to the worktree. Leave the field out when the change shows nothing to a user.
+
+When the `ui-screenshot` skill is missing, say so in `screenshot_note`, with the install commands. For Claude Code: `/plugin marketplace add gabrielkoerich/skills` then `/plugin install ui-screenshot@skills`. For other agents: copy https://github.com/gabrielkoerich/skills/tree/main/ui-screenshot into the agent's skills folder. With no browser at all, set `screenshot_note` to "the screenshot could not be taken" and the reason.
+
 Status rules:
 - **done**: all work is committed (if code changes were made) and tests pass. You must have produced a visible result (committed code, posted a comment, created an issue, or completed the requested action). Orch pushes and creates the PR automatically — do NOT mention pushing in your summary. **Never report done if you did not complete the task. Asking a clarifying question is NOT done — it is blocked. Producing a plan or analysis when the task asked for code changes is NOT completing the task — use `blocked` with a reason explaining why you could not implement.**
 - **in_progress**: partial work was committed but more remains.

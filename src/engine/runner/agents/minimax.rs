@@ -223,6 +223,8 @@ impl AgentRunner for MiniMaxClaudeRunner {
             output_tokens,
             learnings: vec![],
             delegations: vec![],
+            screenshots: vec![],
+            screenshot_note: None,
         };
 
         Ok(ParsedResponse {

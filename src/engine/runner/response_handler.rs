@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use tokio::fs;
 
-use super::{agents, git_ops, response, worktree};
+use super::{agents, git_ops, response, screenshots, worktree};
 use crate::engine::cooldown;
 use crate::engine::push_retry;
 use crate::engine::review;
@@ -1051,6 +1051,50 @@ async fn run_git_ops(
 
 // ── Private status-computation helpers ───────────────────────────────────────
 
+/// Comment the agent's screenshots on the PR. Returns the note for the task summary and channels
+async fn post_screenshots(
+    ctx: &StoreCtx<'_>,
+    work_dir: &Path,
+    resp: &AgentResponse,
+) -> Option<String> {
+    let note = resp.screenshot_note.as_deref().map(str::trim);
+    let note = note.filter(|n| !n.is_empty());
+    if resp.screenshots.is_empty() && note.is_none() {
+        return None;
+    }
+    let pr_number = ctx.get_task().await.and_then(|t| t.pr_number);
+    let (Some(pr_number), false) = (pr_number, ctx.repo.is_empty()) else {
+        return note.map(String::from);
+    };
+    let Ok(pr) = u64::try_from(pr_number) else {
+        return note.map(String::from);
+    };
+
+    let roots = screenshots::allowed_roots(work_dir).await;
+    let (images, skipped) = screenshots::prepare(&resp.screenshots, work_dir, &roots, pr);
+    let commit = if images.is_empty() {
+        String::new()
+    } else {
+        match screenshots::publish(work_dir, &images, pr).await {
+            Ok(commit) => commit,
+            Err(e) => {
+                tracing::warn!(task_id = ctx.task_id, err = %e, "failed to push screenshots");
+                return note.map(String::from);
+            }
+        }
+    };
+    let body = screenshots::build_comment(ctx.repo, &commit, &images, note, &skipped);
+    match GhHttp::new() {
+        Ok(gh) => {
+            if let Err(e) = gh.add_comment(ctx.repo, &pr.to_string(), &body).await {
+                tracing::warn!(task_id = ctx.task_id, pr, err = %e, "failed to comment screenshots");
+            }
+        }
+        Err(e) => tracing::warn!(task_id = ctx.task_id, err = %e, "cannot comment screenshots"),
+    }
+    note.map(String::from)
+}
+
 /// Comment on and close a PR whose change already landed elsewhere.
 async fn close_superseded_pr(ctx: &StoreCtx<'_>, pr_number: u64) {
     if ctx.repo.is_empty() {
@@ -1582,6 +1626,12 @@ pub async fn handle_success(
         resp.status = "done".to_string();
     }
 
+    let screenshot_note = if git.has_pr {
+        post_screenshots(&ctx, &wt.work_dir, &resp).await
+    } else {
+        None
+    };
+
     // Store delegations in store if present (processed by run_with_context)
     if !resp.delegations.is_empty() {
         ctx.set(&[("delegations", serde_json::json!(resp.delegations))])
@@ -1753,8 +1803,12 @@ pub async fn handle_success(
         close_superseded_pr(&ctx, pr_number).await;
     }
 
-    ctx.set(&[("summary", serde_json::json!(resp.summary))])
-        .await;
+    // The summary reaches the channels, so a missing skill or browser goes with it
+    let summary = match &screenshot_note {
+        Some(note) => format!("{}\n\nScreenshots: {note}", resp.summary),
+        None => resp.summary.clone(),
+    };
+    ctx.set(&[("summary", serde_json::json!(summary))]).await;
 
     // Store token usage — prefer agent-parsed tokens, fall back to response
     store_token_usage(

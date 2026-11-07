@@ -767,6 +767,8 @@ pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
         output_tokens: None,
         learnings: vec![],
         delegations: vec![],
+        screenshots: vec![],
+        screenshot_note: None,
     })
 }
 
