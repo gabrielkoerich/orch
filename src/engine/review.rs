@@ -15,6 +15,7 @@ use crate::cmd::CommandErrorContext;
 use crate::config;
 use crate::engine::attribution_footer;
 use crate::engine::auto_merge::{auto_merge_pr, handle_review_changes};
+use crate::engine::ci_bootstrap;
 use crate::engine::cooldown;
 use crate::engine::cooldown::CreditExhaustionReason;
 use crate::engine::router::RouterConfig;
@@ -2916,8 +2917,14 @@ async fn ensure_pr_exists(
                 }
 
                 let task_ref = runner::git_ops::format_task_ref(&task.id.0);
+                // CI-01 must stay open after merge until the default-branch ruleset exists
+                let close_word = if ci_bootstrap::is_ci_bootstrap_task(&task.title, &task.body) {
+                    "Task"
+                } else {
+                    "Resolves"
+                };
                 let pr_body = format!(
-                    "Resolves {task_ref}\n\nAuto-created by orch review gate (agent forgot to open PR)"
+                    "{close_word} {task_ref}\n\nAuto-created by orch review gate (agent forgot to open PR)"
                 );
                 let gh = GhHttp::new()?;
                 match gh

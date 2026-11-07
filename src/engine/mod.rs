@@ -14,6 +14,7 @@
 
 pub mod auto_merge;
 pub mod channel_handler;
+pub mod ci_bootstrap;
 pub mod cleanup;
 pub mod commands;
 pub mod cooldown;

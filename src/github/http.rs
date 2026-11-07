@@ -33,6 +33,7 @@ use std::fmt;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::fmt::Write as _;
+use std::path::Path;
 use std::sync::LazyLock;
 use std::sync::{
     Arc, Mutex, OnceLock,
@@ -2074,7 +2075,7 @@ impl GhHttp {
     /// Used as a fallback when local git detection yields an invalid base
     /// branch for PR creation.
     pub async fn get_default_branch(&self, repo: &str) -> anyhow::Result<String> {
-        let url = format!("{GITHUB_API}/repos/{repo}");
+        let url = format!("{}/repos/{repo}", self.api_root());
         let resp: serde_json::Value = self.get_json(&url).await?;
         resp.get("default_branch")
             .and_then(|v| v.as_str())
@@ -2238,8 +2239,11 @@ impl GhHttp {
         branch: &str,
     ) -> anyhow::Result<Vec<RequiredStatusCheck>> {
         let branch = urlencoding::encode(branch);
-        let classic_url = format!("{GITHUB_API}/repos/{repo}/branches/{branch}/protection");
-        let rules_url = format!("{GITHUB_API}/repos/{repo}/rules/branches/{branch}");
+        let classic_url = format!(
+            "{}/repos/{repo}/branches/{branch}/protection",
+            self.api_root()
+        );
+        let rules_url = format!("{}/repos/{repo}/rules/branches/{branch}", self.api_root());
 
         let classic_fut = self.get_json::<serde_json::Value>(&classic_url);
         let rules_fut = self.get_all_pages::<serde_json::Value>(&rules_url, &[("per_page", "100")]);
@@ -2276,7 +2280,10 @@ impl GhHttp {
         repo: &str,
         sha: &str,
     ) -> anyhow::Result<Vec<(String, String)>> {
-        let url = format!("{GITHUB_API}/repos/{repo}/commits/{sha}/status?per_page=100");
+        let url = format!(
+            "{}/repos/{repo}/commits/{sha}/status?per_page=100",
+            self.api_root()
+        );
         // The /commits/{sha}/status endpoint returns a wrapper object:
         // { "state": "pending", "total_count": N, "statuses": [...] }
         // Use get_all_pages_from_wrapper to follow pagination and extract the
@@ -2342,6 +2349,94 @@ impl GhHttp {
         }
     }
 
+    /// True when `.github/workflows` on `branch` has at least one YAML file
+    pub async fn has_workflow_on_branch(&self, repo: &str, branch: &str) -> anyhow::Result<bool> {
+        let branch = urlencoding::encode(branch);
+        let url = format!(
+            "{}/repos/{repo}/contents/.github/workflows?ref={branch}",
+            self.api_root()
+        );
+        match self.get_json::<serde_json::Value>(&url).await {
+            Ok(value) => Ok(value.as_array().is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry
+                        .get("name")
+                        .and_then(|name| name.as_str())
+                        .is_some_and(|name| {
+                            Path::new(name)
+                                .extension()
+                                .and_then(|ext| ext.to_str())
+                                .is_some_and(|ext| {
+                                    ext.eq_ignore_ascii_case("yml")
+                                        || ext.eq_ignore_ascii_case("yaml")
+                                })
+                        })
+                })
+            })),
+            Err(e) => {
+                let err = e.to_string();
+                if err.contains("404") {
+                    Ok(false)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// True when `path` exists on `branch`
+    pub async fn has_file_on_branch(
+        &self,
+        repo: &str,
+        path: &str,
+        branch: &str,
+    ) -> anyhow::Result<bool> {
+        let path = path
+            .split('/')
+            .map(|segment| urlencoding::encode(segment).into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        let branch = urlencoding::encode(branch);
+        let url = format!(
+            "{}/repos/{repo}/contents/{path}?ref={branch}",
+            self.api_root()
+        );
+        match self.get_json::<serde_json::Value>(&url).await {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                let err = e.to_string();
+                if err.contains("404") {
+                    Ok(false)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// SHA of the head commit on `branch`
+    pub async fn get_branch_sha(&self, repo: &str, branch: &str) -> anyhow::Result<String> {
+        let encoded = urlencoding::encode(branch);
+        let url = format!("{}/repos/{repo}/branches/{encoded}", self.api_root());
+        let resp: serde_json::Value = self.get_json(&url).await?;
+        resp.pointer("/commit/sha")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("branch {branch} has no commit sha"))
+    }
+
+    /// Create a repository ruleset that requires `checks` on the default branch
+    pub async fn create_required_check_ruleset(
+        &self,
+        repo: &str,
+        checks: &[RequiredStatusCheck],
+    ) -> anyhow::Result<()> {
+        let url = format!("{}/repos/{repo}/rulesets", self.api_root());
+        let payload = required_check_ruleset_payload(checks);
+        self.post_json_raw(&url, &payload).await?;
+        Ok(())
+    }
+
     /// Get check runs for a PR head SHA.
     pub async fn get_check_runs(
         &self,
@@ -2359,7 +2454,8 @@ impl GhHttp {
         // cannot be used here because it calls `serde_json::from_str::<Vec<T>>`
         // which would fail on an object body.
         let url = format!(
-            "{GITHUB_API}/repos/{repo}/commits/{sha}/check-runs?filter=latest&per_page=100"
+            "{}/repos/{repo}/commits/{sha}/check-runs?filter=latest&per_page=100",
+            self.api_root()
         );
         self.get_all_pages_from_wrapper(&url, "check_runs").await
     }
@@ -2472,7 +2568,7 @@ impl GhHttp {
 
     /// Reopen a closed GitHub issue.
     pub async fn reopen_issue(&self, repo: &str, number: &str) -> anyhow::Result<()> {
-        let url = format!("{GITHUB_API}/repos/{repo}/issues/{number}");
+        let url = format!("{}/repos/{repo}/issues/{number}", self.api_root());
         let payload = serde_json::json!({ "state": "open" });
         self.patch_json_raw(&url, &payload).await?;
         Ok(())
@@ -3396,6 +3492,77 @@ fn is_no_branch_protection_error(err: &str) -> bool {
             && err.contains("Upgrade to GitHub Pro or make this repository public"))
 }
 
+pub(crate) const REQUIRED_CHECK_RULESET_NAME: &str = "orch required checks";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RulesetCreateKind {
+    CheckNeverRun,
+    NameTaken,
+    Refused,
+    Retryable,
+    Other,
+}
+
+pub(crate) fn required_check_ruleset_payload(checks: &[RequiredStatusCheck]) -> serde_json::Value {
+    let required: Vec<serde_json::Value> = checks
+        .iter()
+        .map(|check| {
+            if let Some(id) = check.integration_id {
+                serde_json::json!({ "context": check.context, "integration_id": id })
+            } else {
+                serde_json::json!({ "context": check.context })
+            }
+        })
+        .collect();
+    serde_json::json!({
+        "name": REQUIRED_CHECK_RULESET_NAME,
+        "target": "branch",
+        "enforcement": "active",
+        "conditions": {
+            "ref_name": {
+                "include": ["~DEFAULT_BRANCH"],
+                "exclude": []
+            }
+        },
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {
+                "strict_required_status_checks_policy": true,
+                "do_not_enforce_on_create": false,
+                "required_status_checks": required
+            }
+        }]
+    })
+}
+
+pub(crate) fn classify_ruleset_create_error(err: &str) -> RulesetCreateKind {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("already been taken") || lower.contains("name already exists") {
+        return RulesetCreateKind::NameTaken;
+    }
+    if lower.contains("not a valid check")
+        || lower.contains("required to be present is not found")
+        || (lower.contains("422") && lower.contains("status check") && lower.contains("not found"))
+    {
+        return RulesetCreateKind::CheckNeverRun;
+    }
+    if lower.contains("(500")
+        || lower.contains("(502")
+        || lower.contains("(503")
+        || lower.contains("(504")
+    {
+        return RulesetCreateKind::Retryable;
+    }
+    if lower.contains("403")
+        || lower.contains("401")
+        || lower.contains("upgrade to github pro")
+        || lower.contains("not accessible")
+    {
+        return RulesetCreateKind::Refused;
+    }
+    RulesetCreateKind::Other
+}
+
 /// Classic protection prefers `checks` (includes `app_id`) and falls back to `contexts`
 fn parse_classic_required_status_checks(value: &serde_json::Value) -> Vec<RequiredStatusCheck> {
     if let Some(checks) = value
@@ -3841,6 +4008,67 @@ mod tests {
         assert!(!is_no_branch_protection_error(
             "failed (403 Forbidden): {\"message\":\"Resource not accessible\"}"
         ));
+    }
+
+    #[test]
+    fn required_check_ruleset_payload_targets_the_default_branch() {
+        let payload = required_check_ruleset_payload(&[
+            RequiredStatusCheck {
+                context: "test".to_string(),
+                integration_id: Some(15368),
+            },
+            RequiredStatusCheck {
+                context: "lint".to_string(),
+                integration_id: None,
+            },
+        ]);
+        assert_eq!(payload["name"], REQUIRED_CHECK_RULESET_NAME);
+        assert_eq!(payload["target"], "branch");
+        assert_eq!(
+            payload["conditions"]["ref_name"]["include"],
+            serde_json::json!(["~DEFAULT_BRANCH"])
+        );
+        assert_eq!(
+            payload["rules"][0]["parameters"]["strict_required_status_checks_policy"],
+            true
+        );
+        assert_eq!(
+            payload["rules"][0]["parameters"]["required_status_checks"],
+            serde_json::json!([
+                { "context": "test", "integration_id": 15368 },
+                { "context": "lint" }
+            ])
+        );
+    }
+
+    #[test]
+    fn classify_ruleset_create_error_splits_retry_from_refuse() {
+        assert_eq!(
+            classify_ruleset_create_error(
+                "GitHub API POST https://api.github.com/repos/o/r/rulesets failed (422 Unprocessable Entity): {\"message\":\"Name has already been taken\"}"
+            ),
+            RulesetCreateKind::NameTaken
+        );
+        assert_eq!(
+            classify_ruleset_create_error(
+                "failed (422 Unprocessable Entity): Status check required to be present is not found"
+            ),
+            RulesetCreateKind::CheckNeverRun
+        );
+        assert_eq!(
+            classify_ruleset_create_error("failed (422): ci/test was not a valid check"),
+            RulesetCreateKind::CheckNeverRun
+        );
+        assert_eq!(
+            classify_ruleset_create_error(
+                "GitHub API POST /rulesets failed (403 Forbidden): {\"message\":\"Upgrade to GitHub Pro or make this repository public to enable this feature.\"}"
+            ),
+            RulesetCreateKind::Refused
+        );
+        assert_eq!(
+            classify_ruleset_create_error("failed (500 Internal Server Error): boom"),
+            RulesetCreateKind::Retryable
+        );
     }
 
     #[test]
@@ -5155,6 +5383,127 @@ mod tests {
                 2,
                 "must retry exactly once, not loop"
             );
+        }
+    }
+
+    #[cfg(test)]
+    mod contents_and_rulesets {
+        use super::super::*;
+        use std::env;
+        use std::ffi::OsString;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        struct EnvVarGuard {
+            key: &'static str,
+            previous: Option<OsString>,
+        }
+
+        impl EnvVarGuard {
+            fn set(key: &'static str, value: &str) -> Self {
+                let previous = env::var_os(key);
+                // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                unsafe { env::set_var(key, value) };
+                Self { key, previous }
+            }
+        }
+
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                match self.previous.take() {
+                    // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                    Some(value) => unsafe { env::set_var(self.key, value) },
+                    // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+                    None => unsafe { env::remove_var(self.key) },
+                }
+            }
+        }
+
+        fn client(server: &MockServer) -> (GhHttp, EnvVarGuard) {
+            let guard = EnvVarGuard::set("GH_TOKEN", "test_token");
+            (GhHttp::for_test(server.uri(), None), guard)
+        }
+
+        #[tokio::test]
+        async fn has_workflow_on_branch_is_false_when_the_directory_is_missing() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/contents/.github/workflows"))
+                .and(query_param("ref", "main"))
+                .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+                .mount(&server)
+                .await;
+            let (gh, _guard) = client(&server);
+            assert!(!gh.has_workflow_on_branch("o/r", "main").await.unwrap());
+        }
+
+        #[tokio::test]
+        async fn has_workflow_on_branch_is_true_when_a_yaml_file_exists() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/contents/.github/workflows"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    { "name": "ci.yml", "type": "file" }
+                ])))
+                .mount(&server)
+                .await;
+            let (gh, _guard) = client(&server);
+            assert!(gh.has_workflow_on_branch("o/r", "main").await.unwrap());
+        }
+
+        #[tokio::test]
+        async fn has_file_on_branch_is_false_on_404() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/contents/shipcheck.toml"))
+                .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+                .mount(&server)
+                .await;
+            let (gh, _guard) = client(&server);
+            assert!(
+                !gh.has_file_on_branch("o/r", "shipcheck.toml", "main")
+                    .await
+                    .unwrap()
+            );
+        }
+
+        #[tokio::test]
+        async fn create_required_check_ruleset_posts_the_payload() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/repos/o/r/rulesets"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "id": 1,
+                    "name": REQUIRED_CHECK_RULESET_NAME
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (gh, _guard) = client(&server);
+            gh.create_required_check_ruleset(
+                "o/r",
+                &[RequiredStatusCheck {
+                    context: "test".to_string(),
+                    integration_id: Some(15368),
+                }],
+            )
+            .await
+            .unwrap();
+        }
+
+        #[tokio::test]
+        async fn get_branch_sha_reads_commit_sha() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/branches/main"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "name": "main",
+                    "commit": { "sha": "abc123" }
+                })))
+                .mount(&server)
+                .await;
+            let (gh, _guard) = client(&server);
+            assert_eq!(gh.get_branch_sha("o/r", "main").await.unwrap(), "abc123");
         }
     }
 }

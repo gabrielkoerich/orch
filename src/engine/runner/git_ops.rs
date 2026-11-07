@@ -11,6 +11,7 @@ use crate::cmd::CommandErrorContext;
 use crate::github::http;
 use crate::github::http::GhHttp;
 use crate::github::token;
+use crate::plan;
 use crate::security;
 use regex::Regex;
 use std::fmt::Write as _;
@@ -1540,7 +1541,10 @@ fn build_pr_body(
         }
     }
 
-    if !task_id.starts_with("internal:")
+    // CI-01 must stay open after merge until the default-branch ruleset exists
+    let bootstrap = plan::is_ci_bootstrap_id(title.split_whitespace().next().unwrap_or(title));
+    if !bootstrap
+        && !task_id.starts_with("internal:")
         && let Ok(issue_num) = task_id.parse::<u64>()
     {
         let _ = write!(body, "\n\nCloses #{issue_num}");
@@ -2945,6 +2949,23 @@ mod tests {
         assert!(body.contains("### Remaining\n\n- Watch CI after merge\n"));
         assert!(body.contains("- `src/engine/runner/git_ops.rs`"));
         assert!(body.contains(" using `sonnet`"));
+        assert!(body.contains("Closes #16"));
+    }
+
+    #[test]
+    fn build_pr_body_keeps_a_ci_bootstrap_issue_open() {
+        let body = build_pr_body(
+            "CI-01 Set up CI and tests",
+            "Added the workflow.",
+            &[],
+            &[],
+            &[],
+            "16",
+            "claude",
+            None,
+        );
+        assert!(!body.contains("Closes #"));
+        assert!(!body.contains("Resolves #"));
     }
 
     fn sh_git(dir: &Path, args: &[&str]) {
