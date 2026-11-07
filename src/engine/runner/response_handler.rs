@@ -17,6 +17,7 @@ use tokio::fs;
 
 use super::{agents, git_ops, response, worktree};
 use crate::engine::cooldown;
+use crate::engine::push_retry;
 use crate::engine::review;
 use crate::github::http::GhHttp;
 use crate::status_heuristics;
@@ -110,6 +111,9 @@ struct DecisionInput<'a> {
     /// Persistent push-failure counter *after* this run's increment.
     /// Only meaningful when `push_failed` is `true`.
     push_failures: u64,
+    /// The push failed on a GitHub or network error. A new agent run cannot change that, so the
+    /// engine retries the push with a backoff instead (#4025).
+    is_transient_push_failure: bool,
     /// A PR already exists (or was just created) for this task.
     has_pr: bool,
     /// The agent created sub-task delegations.
@@ -153,7 +157,9 @@ fn classify_final_status(input: &DecisionInput<'_>) -> String {
     if input.is_workflow_scope_failure || input.is_rebase_conflict_failure {
         "blocked".to_string()
     } else if input.push_failed {
-        if input.push_failures >= 3 {
+        if input.is_transient_push_failure && input.push_failures < push_retry::MAX_PUSH_FAILURES {
+            "needs_review".to_string()
+        } else if input.push_failures >= 3 {
             "blocked".to_string()
         } else {
             "new".to_string()
@@ -331,10 +337,16 @@ struct GitOpsResult {
 }
 
 /// Push-failure detection result.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent kind of push failure"
+)]
 struct PushFailureState {
     push_failed: bool,
     is_workflow_scope_failure: bool,
     is_rebase_conflict_failure: bool,
+    /// GitHub or network error that the engine retries with a backoff, without an agent run.
+    is_transient_failure: bool,
     /// Post-increment failure counter (0 when no push was attempted or failed).
     push_failures: u64,
     /// Last error stored in the task record (used for workflow-scope detection).
@@ -1115,6 +1127,11 @@ async fn detect_push_failure_state(
     let is_rebase_conflict_failure =
         push_failed && stored_last_error.contains("push failed and rebase failed:");
 
+    let is_transient_failure = push_failed
+        && !is_workflow_scope_failure
+        && !is_rebase_conflict_failure
+        && git_ops::is_transient_network_error(&stored_last_error);
+
     // Track push failures — block after 3 consecutive failures.
     // Workflow-scope failures are non-retryable and blocked immediately; do not
     // increment this retry counter for them so that later normal push failures
@@ -1144,6 +1161,7 @@ async fn detect_push_failure_state(
         push_failed,
         is_workflow_scope_failure,
         is_rebase_conflict_failure,
+        is_transient_failure,
         push_failures,
         stored_last_error,
     }
@@ -1328,6 +1346,14 @@ async fn apply_post_decision_effects(
             ("model", serde_json::json!(null)),
         ])
         .await;
+    } else if push_state.push_failed && final_status == "needs_review" {
+        // The engine retries the push from the review gate. Keep agent and model, since the
+        // task never goes back to the router
+        tracing::warn!(
+            task_id = ctx.task_id,
+            push_failures = push_state.push_failures,
+            "agent done but push failed on a GitHub or network error — engine retries the push"
+        );
     } else if push_state.push_failed {
         // Clear agent and model so router picks a different one on reroute (#1604)
         ctx.set(&[
@@ -1649,6 +1675,7 @@ pub async fn handle_success(
         is_rebase_conflict_failure: push_state.is_rebase_conflict_failure,
         push_failed: push_state.push_failed,
         push_failures: push_state.push_failures,
+        is_transient_push_failure: push_state.is_transient_failure,
         has_pr: git.has_pr,
         has_delegations,
         has_pushed: git.has_pushed,
@@ -2159,6 +2186,31 @@ mod tests {
         let status = classify_final_status(&DecisionInput {
             push_failed: true,
             push_failures: 3, // >= 3
+            ..Default::default()
+        });
+        assert_eq!(status, "blocked");
+    }
+
+    /// A GitHub-side push failure never reaches the router, the engine retries the push (#4025).
+    #[test]
+    fn classify_transient_push_failure_waits_for_the_engine_retry() {
+        for push_failures in 1..push_retry::MAX_PUSH_FAILURES {
+            let status = classify_final_status(&DecisionInput {
+                push_failed: true,
+                is_transient_push_failure: true,
+                push_failures,
+                ..Default::default()
+            });
+            assert_eq!(status, "needs_review", "push_failures={push_failures}");
+        }
+    }
+
+    #[test]
+    fn classify_transient_push_failure_blocks_after_the_last_retry() {
+        let status = classify_final_status(&DecisionInput {
+            push_failed: true,
+            is_transient_push_failure: true,
+            push_failures: push_retry::MAX_PUSH_FAILURES,
             ..Default::default()
         });
         assert_eq!(status, "blocked");
