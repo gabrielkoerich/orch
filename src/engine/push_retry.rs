@@ -1,4 +1,4 @@
-//! Engine side retry of a push that failed on a GitHub or network error (#4025), with no agent run
+//! Engine side retry of a push that failed on a GitHub or network error (#4025, #4051), with no agent run
 
 use crate::engine::review;
 use crate::engine::runner::{git_ops, worktree};
@@ -43,10 +43,10 @@ pub(crate) fn backoff_secs(push_failures: i64) -> i64 {
     BACKOFF_SECS[idx]
 }
 
-/// A task with commits and no PR whose last push failed on a GitHub or network error
+/// A task whose last push failed on a GitHub or network error, including a later commit on an existing PR
 pub(crate) fn is_pending(task: &Task) -> bool {
-    task.pr_number.is_none()
-        && task.push_failures > 0
+    task.push_failures > 0
+        && u64::try_from(task.push_failures).is_ok_and(|n| n < MAX_PUSH_FAILURES)
         && !task.worktree.trim().is_empty()
         && !task.branch.trim().is_empty()
         && task.last_error.contains("push failed")
@@ -116,7 +116,9 @@ pub(crate) async fn retry_pending_push(
                 ],
             )
             .await;
-            open_pr(store, repo, task_id, &task, &worktree_path, &default_branch).await;
+            if task.pr_number.is_none() {
+                open_pr(store, repo, task_id, &task, &worktree_path, &default_branch).await;
+            }
             PushRetry::Pushed
         }
         Err(e) => {
@@ -313,6 +315,32 @@ mod tests {
         format!("internal:{id}")
     }
 
+    async fn set_pr_number(store: &Arc<TaskStore>, task_id: &str, pr_number: i32) {
+        let store_id = store.resolve_task_id("", task_id).await.unwrap().unwrap();
+        store
+            .set_fields(store_id, &[("pr_number", serde_json::json!(pr_number))])
+            .await
+            .unwrap();
+    }
+
+    /// The first feature commit is already on the remote, as it is for an open PR
+    fn extra_unpushed_commit(fx: &Fixture) {
+        git(&fx.clone, &["push", "-u", "origin", "feature"]);
+        fs::write(fx.clone.join("c.txt"), "c").unwrap();
+        git(&fx.clone, &["add", "."]);
+        git(&fx.clone, &["commit", "-m", "more"]);
+    }
+
+    fn remote_log(fx: &Fixture) -> String {
+        let out = Command::new("git")
+            .args(["log", "feature", "--oneline"])
+            .current_dir(&fx.remote)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
     async fn stored(store: &Arc<TaskStore>, task_id: &str) -> Task {
         opt_store_get_task(&Some(Arc::clone(store)), "", task_id)
             .await
@@ -419,5 +447,42 @@ mod tests {
             retry_pending_push(&store, "", &task_id).await,
             PushRetry::NotPending
         );
+    }
+
+    #[tokio::test]
+    async fn is_pending_when_the_task_already_has_a_pr() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let fx = fixture();
+        let task_id = pending_task(&store, &fx, 1).await;
+        set_pr_number(&store, &task_id, 12).await;
+        assert!(is_pending(&stored(&store, &task_id).await));
+    }
+
+    /// A later commit on a task that already has a PR still retries its push (#4051)
+    #[tokio::test]
+    async fn retries_an_unpushed_commit_when_the_task_already_has_a_pr() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let fx = fixture();
+        extra_unpushed_commit(&fx);
+        let task_id = pending_task(&store, &fx, 1).await;
+        set_pr_number(&store, &task_id, 12).await;
+        let key = retry_key("", &task_id);
+
+        assert_eq!(
+            retry_pending_push(&store, "", &task_id).await,
+            PushRetry::Wait
+        );
+        assert!(!remote_log(&fx).contains("more"));
+
+        store.kv_set(&key, "0").await.unwrap();
+        assert_eq!(
+            retry_pending_push(&store, "", &task_id).await,
+            PushRetry::Pushed
+        );
+        let task = stored(&store, &task_id).await;
+        assert_eq!(task.push_failures, 0);
+        assert!(task.last_error.is_empty());
+        assert_eq!(task.pr_number, Some(12));
+        assert!(remote_log(&fx).contains("more"));
     }
 }
