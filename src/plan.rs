@@ -16,6 +16,8 @@ use std::hash::BuildHasher;
 pub const PLAN_LABEL: &str = "orch-plan";
 pub const HUMAN_LABEL: &str = "owner:human";
 pub const NO_AGENT_LABEL: &str = "no-agent";
+pub const CI_BOOTSTRAP_ID: &str = "CI-01";
+pub const CI_BOOTSTRAP_MARKER: &str = "<!-- orch-ci-bootstrap -->";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanError {
@@ -320,7 +322,9 @@ pub fn select<'a>(
     Ok(roadmap
         .tasks
         .iter()
-        .filter(|task| task.milestone_id.eq_ignore_ascii_case(wanted))
+        .filter(|task| {
+            task.milestone_id.eq_ignore_ascii_case(wanted) || is_ci_bootstrap_id(&task.id)
+        })
         .collect())
 }
 
@@ -352,6 +356,10 @@ pub fn issue_body_with(
     blocked_external: &[String],
 ) -> String {
     let mut out = String::new();
+    if is_ci_bootstrap_id(&task.id) {
+        out.push_str(CI_BOOTSTRAP_MARKER);
+        out.push('\n');
+    }
     if !task.goal.is_empty() {
         out.push_str("## Goal\n\n");
         out.push_str(task.goal.trim());
@@ -381,13 +389,15 @@ pub fn issue_body_with(
         out.push_str(&blocked_external.join(", "));
         out.push_str(" (no issue yet)\n\n");
     }
-    let url = format!(
-        "https://github.com/{repo}/blob/{branch}/{path}#{anchor}",
-        branch = encode_git_path(branch),
-        path = encode_git_path(rel_path),
-        anchor = urlencoding::encode(&task_anchor(task)),
-    );
-    let _ = write!(out, "[{rel_path}]({url})\n\n");
+    if !is_ci_bootstrap_id(&task.id) {
+        let url = format!(
+            "https://github.com/{repo}/blob/{branch}/{path}#{anchor}",
+            branch = encode_git_path(branch),
+            path = encode_git_path(rel_path),
+            anchor = urlencoding::encode(&task_anchor(task)),
+        );
+        let _ = write!(out, "[{rel_path}]({url})\n\n");
+    }
     if !blocked_external.is_empty() {
         out.push_str("<!-- orch-blocked-external: ");
         out.push_str(&blocked_external.join(", "));
@@ -408,6 +418,86 @@ pub fn marker_id(body: &str) -> Option<String> {
     let end = rest.find("-->")?;
     let id = rest[..end].trim();
     is_task_id(id).then(|| id.to_string())
+}
+
+pub fn is_ci_bootstrap_id(id: &str) -> bool {
+    id.eq_ignore_ascii_case(CI_BOOTSTRAP_ID)
+}
+
+pub fn is_ci_bootstrap_body(body: &str) -> bool {
+    body.contains(CI_BOOTSTRAP_MARKER)
+}
+
+/// True when import should add CI-01, because the default branch has no workflow or CI-01 is still open
+pub fn needs_ci_bootstrap(has_workflow: bool, ci_issue_open: bool) -> bool {
+    !has_workflow || ci_issue_open
+}
+
+/// Prepend the CI bootstrap task and make every other task wait on it
+pub fn inject_ci_bootstrap(roadmap: &mut Roadmap, include_shipcheck: bool) {
+    if !roadmap
+        .tasks
+        .iter()
+        .any(|task| is_ci_bootstrap_id(&task.id))
+    {
+        if !roadmap
+            .milestones
+            .iter()
+            .any(|milestone| milestone.id.eq_ignore_ascii_case("CI"))
+        {
+            roadmap.milestones.insert(
+                0,
+                Milestone {
+                    id: "CI".to_string(),
+                    title: "CI bootstrap".to_string(),
+                    heading: "CI. CI bootstrap".to_string(),
+                },
+            );
+        }
+        roadmap
+            .tasks
+            .insert(0, ci_bootstrap_task(include_shipcheck));
+    }
+    for task in &mut roadmap.tasks {
+        if is_ci_bootstrap_id(&task.id) {
+            continue;
+        }
+        if !task.depends_on.iter().any(|dep| is_ci_bootstrap_id(dep)) {
+            task.depends_on.insert(0, CI_BOOTSTRAP_ID.to_string());
+        }
+    }
+}
+
+pub(crate) fn ci_bootstrap_task(include_shipcheck: bool) -> Task {
+    let mut scope = String::from(
+        "Add the smallest project layout that can run tests for this repository's language.\n\
+         Add at least one test that fails if that layout is broken.\n\
+         Add a GitHub Actions workflow under `.github/workflows/` that runs those tests on every push to the default branch.\n\
+         Do not add product features.",
+    );
+    let mut acceptance = vec![
+        "A workflow file exists on the default branch after merge.".to_string(),
+        "Pushing to the default branch runs the workflow.".to_string(),
+        "The workflow reports a passing check.".to_string(),
+        "Tests fail when the skeleton is broken.".to_string(),
+    ];
+    if include_shipcheck {
+        scope.push_str("\nAdd or keep `shipcheck.toml` so local checks match the workflow jobs.");
+        acceptance.push("`shipcheck.toml` lists the same checks the workflow runs.".to_string());
+    }
+    Task {
+        id: CI_BOOTSTRAP_ID.to_string(),
+        title: "Set up CI and tests".to_string(),
+        milestone_id: "CI".to_string(),
+        milestone_title: "CI bootstrap".to_string(),
+        milestone_heading: "CI. CI bootstrap".to_string(),
+        anchor_heading: "CI-01 Set up CI and tests".to_string(),
+        goal: "Give this repository a project skeleton, tests, and a GitHub Actions workflow that runs on every push to the default branch, so later tasks can rely on required checks.".to_string(),
+        scope,
+        acceptance,
+        depends_on: Vec::new(),
+        owner_human: false,
+    }
 }
 
 /// Labels for a plan issue. Human tasks also get `no-agent`, which the dispatcher already skips
@@ -483,7 +573,7 @@ pub fn diff_import(
 
     let mut removed = Vec::new();
     for issue in existing {
-        if selected_ids.contains(issue.task_id.as_str()) {
+        if selected_ids.contains(issue.task_id.as_str()) || is_ci_bootstrap_id(&issue.task_id) {
             continue;
         }
         if let Some(wanted) = milestone {
@@ -1008,6 +1098,9 @@ fn extract_ids(raw: &str) -> Vec<String> {
 }
 
 fn is_task_id(token: &str) -> bool {
+    if is_ci_bootstrap_id(token) {
+        return true;
+    }
     let Some((milestone, rest)) = token.split_once('-') else {
         return false;
     };
@@ -1891,6 +1984,98 @@ mod tests {
         let synced = current_links(&roadmap);
         let again = diff_links(&roadmap.tasks, &bindings, &synced).unwrap();
         assert!(again.is_empty(), "{again:?}");
+    }
+
+    #[test]
+    fn empty_repo_import_creates_ci_and_blocks_every_other_task() {
+        let mut roadmap = roadmap();
+        inject_ci_bootstrap(&mut roadmap, false);
+        assert_eq!(roadmap.tasks[0].id, CI_BOOTSTRAP_ID);
+        assert!(roadmap.tasks[0].depends_on.is_empty());
+        for task in &roadmap.tasks[1..] {
+            assert_eq!(task.depends_on[0], CI_BOOTSTRAP_ID, "{}", task.id);
+        }
+        let diff = diff_import(&roadmap, &[], None, |task| {
+            issue_body(task, "acme/app", "main", "docs/ROADMAP.md")
+        })
+        .unwrap();
+        assert_eq!(diff.tasks[0].task.id, CI_BOOTSTRAP_ID);
+        assert_eq!(diff.tasks[0].kind, ChangeKind::Create);
+        let selected: Vec<Task> = diff.tasks.iter().map(|plan| plan.task.clone()).collect();
+        let links = diff_links(&selected, &bindings_for(&diff), &HashMap::new()).unwrap();
+        for plan in &diff.tasks[1..] {
+            assert!(
+                links.iter().any(|edit| matches!(
+                    edit,
+                    LinkEdit::Add { task_id, blocking_task_id, .. }
+                        if task_id == &plan.task.id && blocking_task_id == CI_BOOTSTRAP_ID
+                )),
+                "{} should be blocked by {CI_BOOTSTRAP_ID}: {links:?}",
+                plan.task.id
+            );
+        }
+        let body = issue_body(&diff.tasks[0].task, "acme/app", "main", "docs/ROADMAP.md");
+        assert!(is_ci_bootstrap_body(&body));
+        assert_eq!(marker_id(&body).as_deref(), Some(CI_BOOTSTRAP_ID));
+        assert!(body.contains("GitHub Actions workflow"));
+        assert!(!body.contains("shipcheck.toml"));
+        assert!(!body.contains("https://github.com/acme/app/blob"));
+    }
+
+    #[test]
+    fn ci_bootstrap_includes_shipcheck_when_requested() {
+        let task = ci_bootstrap_task(true);
+        let body = issue_body(&task, "acme/app", "main", "docs/ROADMAP.md");
+        assert!(body.contains("shipcheck.toml"));
+    }
+
+    #[test]
+    fn inject_ci_bootstrap_is_idempotent_and_survives_a_milestone_filter() {
+        let mut roadmap = roadmap();
+        inject_ci_bootstrap(&mut roadmap, false);
+        inject_ci_bootstrap(&mut roadmap, false);
+        assert_eq!(
+            roadmap
+                .tasks
+                .iter()
+                .filter(|task| is_ci_bootstrap_id(&task.id))
+                .count(),
+            1
+        );
+        let selected = select(&roadmap, Some("M1")).unwrap();
+        assert_eq!(selected[0].id, CI_BOOTSTRAP_ID);
+        assert!(selected.iter().any(|task| task.id == "M1-01"));
+        let existing = vec![ExistingIssue {
+            task_id: CI_BOOTSTRAP_ID.to_string(),
+            number: 9,
+            database_id: 90,
+            title: issue_title(&roadmap.tasks[0]),
+            body: issue_body(&roadmap.tasks[0], "acme/app", "main", "docs/ROADMAP.md"),
+            labels: labels_for(&[], false),
+            state: "open".to_string(),
+        }];
+        let diff = diff_import(&roadmap, &existing, Some("M1"), |task| {
+            issue_body(task, "acme/app", "main", "docs/ROADMAP.md")
+        })
+        .unwrap();
+        assert!(
+            diff.removed.is_empty(),
+            "CI-01 must stay when importing another milestone: {:?}",
+            diff.removed
+        );
+        assert_eq!(diff.tasks[0].task.id, CI_BOOTSTRAP_ID);
+        assert_eq!(diff.tasks[0].kind, ChangeKind::Unchanged);
+    }
+
+    #[test]
+    fn ci_01_is_a_task_id() {
+        assert!(is_task_id(CI_BOOTSTRAP_ID));
+        assert!(is_ci_bootstrap_id("ci-01"));
+        assert!(!is_task_id("CI"));
+        assert!(needs_ci_bootstrap(false, false));
+        assert!(needs_ci_bootstrap(false, true));
+        assert!(needs_ci_bootstrap(true, true));
+        assert!(!needs_ci_bootstrap(true, false));
     }
 
     #[test]

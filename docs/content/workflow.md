@@ -19,7 +19,7 @@ Issue → Branch + Worktree → Agent works → Push → PR → Review Agent →
 5. **PR** — engine creates PR and links it to the issue
 6. **Review:** a different agent reviews the PR when one is available, the authoring agent reviews otherwise (approve / request changes)
 7. **Fix + Reply** — fix review findings, commit fixes (engine pushes)
-8. **Merge** — an approving review moves the task to `approved`. The engine waits for CI and merges the PR with no agent running
+8. **Merge** — an approving review moves the task to `approved`. The engine waits for CI and merges the PR with no agent running. A CI bootstrap task stays `approved` after merge until its checks pass on the default branch and orch creates a ruleset that requires them. If GitHub refuses the ruleset, orch comments and leaves the issue open so later tasks stay waiting until branch protection is on
 9. **Cleanup** — engine detects merged PR, removes worktree + local branch. Blocked tasks with an open PR keep their remote branch. Stale worktree metadata is auto-pruned during sync.
 
 ## Mention-Driven Tasks

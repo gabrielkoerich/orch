@@ -126,7 +126,7 @@ fn runs_named(runs: &[GitHubCheckRun], names: &[String]) -> Vec<GitHubCheckRun> 
         .collect()
 }
 
-fn is_own_check(name: &str) -> bool {
+pub(crate) fn is_own_check(name: &str) -> bool {
     REVIEW_OWN_CHECKS.contains(&name)
 }
 

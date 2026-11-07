@@ -10,6 +10,7 @@
 //! - Skill repository syncing
 
 use super::EngineConfig;
+use super::ci_bootstrap;
 use super::cleanup::{check_merged_prs, cleanup_done_worktrees, prune_old_run_output};
 use super::commands::{CommandOutcome, CommandStoreOps, parse_command, validate_and_run_command};
 use super::review_poll::review_open_prs;
@@ -1955,6 +1956,10 @@ pub(crate) async fn sync_tick(
 
         if let Err(e) = review_result {
             tracing::warn!(err = %e, "PR review failed");
+        }
+
+        if let Err(e) = ci_bootstrap::apply_pending(store, task_manager, repo).await {
+            tracing::warn!(err = %e, "CI bootstrap ruleset apply failed");
         }
 
         phases.push(("merge_comments_review", at.elapsed().as_millis()));

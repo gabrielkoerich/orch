@@ -6,7 +6,8 @@
 
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::cmd::CommandErrorContext;
-use crate::engine::tasks::TaskManager;
+use crate::engine::ci_bootstrap;
+use crate::engine::tasks::{TaskManager, store_task_to_external};
 use crate::store;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
@@ -178,14 +179,22 @@ async fn reconcile_closed_tasks(
     task_ids: &mut Vec<String>,
     all_tasks: &[ExternalTask],
     task_manager: &TaskManager,
+    store: &Arc<TaskStore>,
+    repo: &str,
 ) {
     const MAX_RECONCILE_PER_CYCLE: usize = 10;
 
     let done_set: HashSet<String> = task_ids.iter().cloned().collect();
-    let closed_not_in_store: Vec<_> = all_tasks
-        .iter()
-        .filter(|t| t.state == "closed" && !done_set.contains(&t.id.0))
-        .collect();
+    let mut closed_not_in_store = Vec::new();
+    for task in all_tasks {
+        if task.state != "closed" || done_set.contains(&task.id.0) {
+            continue;
+        }
+        if ci_bootstrap::hold_after_merge(task, store, repo).await {
+            continue;
+        }
+        closed_not_in_store.push(task);
+    }
 
     // Split: issues that already have status:done label just need worktree
     // cleanup (no API call needed), vs those needing label reconciliation.
@@ -295,7 +304,7 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
                     count = candidates.len(),
                     "reconciling closed issues from candidates"
                 );
-                reconcile_closed_tasks(&mut task_ids, &candidates, task_manager).await;
+                reconcile_closed_tasks(&mut task_ids, &candidates, task_manager, store, repo).await;
             }
             Ok(Ok(_)) => {
                 tracing::debug!("no reconciliation candidates found");
@@ -1730,6 +1739,22 @@ pub(crate) async fn check_merged_prs(
         }
 
         tracing::info!(task_id, branch = %branch, "PR merged, marking task complete");
+
+        let stored = store::opt_store_get_task(&Some(Arc::clone(store)), repo, &task_id).await;
+        if let Some(ref stored) = stored {
+            let external = store_task_to_external(stored);
+            if ci_bootstrap::hold_after_merge(&external, store, repo).await {
+                tracing::info!(
+                    task_id,
+                    branch = %branch,
+                    "CI bootstrap PR merged, holding done until the ruleset exists"
+                );
+                if let Err(e) = cleanup_task_worktree(&task_id, repo, store).await {
+                    tracing::warn!(task_id, err = %e, "worktree cleanup after merge failed");
+                }
+                continue;
+            }
+        }
 
         let id = ExternalId(task_id.clone());
         if let Err(e) = task_manager.update_task_status(&id, Status::Done).await {

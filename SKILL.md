@@ -112,6 +112,7 @@ Do not kill or retry a running task to make it pick up a changed issue. It ends 
 - `--milestone <id>` imports one milestone, and `--skip-unmet` skips a task whose blocker outside the milestone has no issue yet.
 - Put human-only tasks (accounts, recordings, legal review, store setup) in their own milestone at the end. An agent task that depends on a human-only task waits until a person finishes it, and every task behind it waits too. Where an agent task needs something only a person can set up, give it a local stand-in instead, such as a local test configuration or a stubbed service.
 - Each issue carries a plan marker. Two issues with the same marker make the import fail, so remove the marker from the duplicate.
+- When the default branch has no GitHub Actions workflow, import adds a first CI-01 task (project skeleton, tests, workflow, and `shipcheck.toml` when that file is already in the repo) and every other task is blocked by it. After that task merges and its checks pass on the default branch, orch creates a ruleset that requires those checks. If GitHub refuses the ruleset, orch leaves the CI issue open and comments so later tasks stay waiting until branch protection is on.
 
 ## Service
 

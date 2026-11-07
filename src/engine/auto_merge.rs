@@ -11,6 +11,7 @@
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
 use crate::engine;
+use crate::engine::ci_bootstrap;
 use crate::engine::cleanup::cleanup_task_worktree;
 use crate::engine::review;
 use crate::engine::review_poll;
@@ -68,6 +69,32 @@ static CI_POLL_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 fn ci_poll_semaphore() -> &'static Arc<Semaphore> {
     CI_POLL_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(3)))
+}
+
+async fn finish_merged_pr(
+    task: &ExternalTask,
+    task_manager: &Arc<TaskManager>,
+    store: &Arc<TaskStore>,
+    repo: &str,
+) -> anyhow::Result<()> {
+    if ci_bootstrap::hold_after_merge(task, store, repo).await {
+        tracing::info!(
+            task_id = task.id.0,
+            "CI bootstrap merged, holding done until required checks exist"
+        );
+    } else {
+        task_manager
+            .update_task_status(&task.id, Status::Done)
+            .await?;
+    }
+    if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
+        tracing::warn!(
+            task_id = task.id.0,
+            err = %e,
+            "post-merge cleanup failed"
+        );
+    }
+    Ok(())
 }
 
 /// Check if we should skip CI status checking for this task due to per-task cooldown.
@@ -1162,16 +1189,7 @@ pub(crate) async fn auto_merge_pr(
                             pr_number = closed_pr_number,
                             "PR already merged — marking task done (idempotent)"
                         );
-                        task_manager
-                            .update_task_status(&task.id, Status::Done)
-                            .await?;
-                        if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
-                            tracing::warn!(
-                                task_id = task.id.0,
-                                err = %e,
-                                "post-merge cleanup failed"
-                            );
-                        }
+                        finish_merged_pr(task, task_manager, store, repo).await?;
                         return Ok(());
                     }
                     Ok(_) => {
@@ -1192,16 +1210,7 @@ pub(crate) async fn auto_merge_pr(
                             "failed to verify PR details, assuming merged"
                         );
                         // Fall through to marking done since get_closed_pr_state said it was merged
-                        task_manager
-                            .update_task_status(&task.id, Status::Done)
-                            .await?;
-                        if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
-                            tracing::warn!(
-                                task_id = task.id.0,
-                                err = %e,
-                                "post-merge cleanup failed"
-                            );
-                        }
+                        finish_merged_pr(task, task_manager, store, repo).await?;
                         return Ok(());
                     }
                 }
@@ -2046,7 +2055,7 @@ pub(crate) async fn auto_merge_pr(
         return Ok(());
     }
 
-    // 6. Update status to done
+    // 6. Mark done, or hold a CI bootstrap task until the ruleset exists
     if let Err(e) = store_set_result(
         &Some(Arc::clone(store)),
         repo,
@@ -2057,14 +2066,7 @@ pub(crate) async fn auto_merge_pr(
     {
         tracing::warn!(task_id = task.id.0, err = %e, "store write failed");
     }
-    task_manager
-        .update_task_status(&task.id, Status::Done)
-        .await?;
-
-    // 7. Cleanup worktree + branches
-    if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
-        tracing::warn!(task_id = task.id.0, err = %e, "post-merge cleanup failed");
-    }
+    finish_merged_pr(task, task_manager, store, repo).await?;
 
     // Kill any orphaned review session that might be racing us
     let tmux = TmuxManager::new();

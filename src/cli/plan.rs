@@ -56,7 +56,7 @@ pub async fn import(
     let path = Path::new(file);
     let markdown =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let (roadmap, warnings) = plan::parse_roadmap_for(&markdown, milestone)?;
+    let (mut roadmap, warnings) = plan::parse_roadmap_for(&markdown, milestone)?;
     for warning in warnings {
         eprintln!("warning: {warning}");
     }
@@ -77,6 +77,16 @@ pub async fn import(
     let http = GhHttp::new()?;
     let branch = http.get_default_branch(&repo).await?;
     let existing = load_existing(&http, &repo).await?;
+    let has_workflow = http.has_workflow_on_branch(&repo, &branch).await?;
+    let ci_open = existing.iter().any(|issue| {
+        plan::is_ci_bootstrap_id(&issue.task_id) && issue.state.eq_ignore_ascii_case("open")
+    });
+    if plan::needs_ci_bootstrap(has_workflow, ci_open) {
+        let shipcheck = http
+            .has_file_on_branch(&repo, "shipcheck.toml", &branch)
+            .await?;
+        plan::inject_ci_bootstrap(&mut roadmap, shipcheck);
+    }
     let known: HashSet<String> = existing.iter().map(|issue| issue.task_id.clone()).collect();
     let selected_all: Vec<Task> = plan::select(&roadmap, milestone)?
         .into_iter()
