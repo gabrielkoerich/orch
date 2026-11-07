@@ -370,13 +370,40 @@ impl RetryableError {
     }
 }
 
+/// Next task status from [`handle_failover`], plus the fallback agent when one was stored
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailoverOutcome {
+    /// Task status to apply: `new`, `blocked`, or `needs_review`
+    pub status: String,
+    /// Fallback agent written to the task when failover switched
+    pub next_agent: Option<String>,
+}
+
+impl FailoverOutcome {
+    fn with_status(status: impl Into<String>) -> Self {
+        Self {
+            status: status.into(),
+            next_agent: None,
+        }
+    }
+
+    fn switched(next_agent: String) -> Self {
+        Self {
+            status: "new".to_string(),
+            next_agent: Some(next_agent),
+        }
+    }
+}
+
 /**
- * Handle failover for any retryable error type. Returns "new" on reroute (or
+ * Handle failover for any retryable error type. Status is "new" on reroute (or
  * retryable exhaustion), "blocked" on hard exhaustion, "needs_review" when no
- * fallback agents are available. `credit_recorded` means the caller already ran
- * `record_credit_exhaustion`; the generic `failure_count:` counter must not be
- * bumped here or the next ordinary failure starts at the extended backoff tier
- * (issue #3652). Rate-limit event DB recording is done by the caller (mod.rs)
+ * fallback agents are available. `next_agent` is set when a fallback was stored
+ * so the next route prefers it over an `agent:*` label. `credit_recorded` means
+ * the caller already ran `record_credit_exhaustion`; the generic `failure_count:`
+ * counter must not be bumped here or the next ordinary failure starts at the
+ * extended backoff tier (issue #3652). Rate-limit event DB recording is done by
+ * the caller (mod.rs)
  **/
 pub async fn handle_failover(
     task_id: &str,
@@ -386,7 +413,7 @@ pub async fn handle_failover(
     credit_recorded: bool,
     store: &Option<Arc<TaskStore>>,
     repo: &str,
-) -> String {
+) -> FailoverOutcome {
     // Get the reroute chain
     let chain = get_reroute_chain(task_id, store, repo).await;
     let chain = update_reroute_chain(task_id, agent_name, &chain, store, repo).await;
@@ -395,7 +422,7 @@ pub async fn handle_failover(
         && let Some(status) =
             block_after_repeated_timeouts(task_id, error_message, store, repo).await
     {
-        return status;
+        return FailoverOutcome::with_status(status);
     }
 
     // Get all available agents
@@ -480,7 +507,7 @@ pub async fn handle_failover(
         )
         .await;
 
-        return next_status.to_string();
+        return FailoverOutcome::with_status(next_status);
     }
 
     // Pick a fallback agent
@@ -514,20 +541,22 @@ pub async fn handle_failover(
             set_agent_cooldown(agent_name, 120).await;
         }
 
-        let msg = format!("{error_message}, clearing agent/model for re-route");
+        // Store the fallback agent so the next route prefers it over an agent:* label
+        // Clear the model so routing picks one that the fallback agent can run
+        let msg = format!("{error_message}, switching to {next} for re-route");
         if let Err(e) = store::store_set_result(
             store,
             repo,
             task_id,
             &[
-                ("agent", serde_json::json!("")),
+                ("agent", serde_json::json!(next)),
                 ("model", serde_json::json!("")),
                 ("last_error", serde_json::json!(msg)),
             ],
         )
         .await
         {
-            tracing::warn!(task_id, err = %e, "failed to write agent/model clear to store");
+            tracing::warn!(task_id, err = %e, "failed to write failover agent to store");
         }
 
         // Apply exponential backoff with jitter before retry.
@@ -558,7 +587,7 @@ pub async fn handle_failover(
         )
         .await;
 
-        return "new".to_string();
+        return FailoverOutcome::switched(next);
     }
 
     // No fallback available
@@ -625,7 +654,7 @@ pub async fn handle_failover(
         )
         .await;
 
-        return "new".to_string();
+        return FailoverOutcome::with_status("new");
     }
 
     let msg = format!("{error_message}, no fallback agents");
@@ -660,7 +689,7 @@ pub async fn handle_failover(
     )
     .await;
 
-    "needs_review".to_string()
+    FailoverOutcome::with_status("needs_review")
 }
 
 /// Count a timeout against the task. Returns "blocked" once the task has timed out
@@ -1059,9 +1088,13 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::process;
+    use std::sync::Arc;
 
+    use super::super::TaskRunner;
     use super::*;
+    use crate::backends::{ExternalId, ExternalTask};
     use crate::engine::cooldown;
+    use crate::engine::router::{Router, RouterConfig};
     use crate::engine::runner::agents::{AgentError, find_agent_result, patterns};
     use crate::store::TaskStatus;
     use serial_test::serial;
@@ -2241,7 +2274,7 @@ That's all."#;
         let (store, task_id) = failover_task().await;
         let store = Some(store);
 
-        let status = handle_failover(
+        let outcome = handle_failover(
             &task_id,
             "claude",
             RetryableError::Timeout,
@@ -2252,7 +2285,8 @@ That's all."#;
         )
         .await;
 
-        assert_eq!(status, "new");
+        assert_eq!(outcome.status, "new");
+        assert!(outcome.next_agent.is_none());
         let task = store::opt_store_get_task(&store, "owner/repo", &task_id)
             .await
             .unwrap();
@@ -2275,7 +2309,7 @@ That's all."#;
         let (store, task_id) = failover_task().await;
         let store = Some(store);
 
-        let status = handle_failover(
+        let outcome = handle_failover(
             &task_id,
             "claude",
             RetryableError::Timeout,
@@ -2286,12 +2320,99 @@ That's all."#;
         )
         .await;
 
-        assert_eq!(status, "new");
+        assert_eq!(outcome.status, "new");
+        assert_eq!(outcome.next_agent.as_deref(), Some("codex"));
         let task = store::opt_store_get_task(&store, "owner/repo", &task_id)
             .await
             .unwrap();
         assert_eq!(task.limit_reroute_chain, "claude");
-        assert!(task.last_error.contains("re-route"), "{}", task.last_error);
+        assert_eq!(task.agent.as_deref(), Some("codex"));
+        assert!(
+            task.model.as_deref().unwrap_or("").is_empty(),
+            "model must be cleared so routing picks one for the fallback, got {:?}",
+            task.model
+        );
+        assert!(
+            task.last_error.contains("switching to codex"),
+            "{}",
+            task.last_error
+        );
+    }
+
+    /// The run_with_context reroute clear must keep the fallback while status is still InProgress
+    #[cfg(unix)]
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn timeout_failover_keeps_fallback_after_reroute_clear() {
+        let _env = failover_env();
+        cooldown::reset_global_state().await;
+        let (store_arc, task_id) = failover_task().await;
+        let store_id = store_arc
+            .resolve_task_id("owner/repo", &task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        store_arc
+            .update_status(store_id, TaskStatus::InProgress)
+            .await
+            .unwrap();
+        store_arc
+            .set_fields(store_id, &[("agent", serde_json::json!("claude"))])
+            .await
+            .unwrap();
+
+        let store = Some(Arc::clone(&store_arc));
+        let outcome = handle_failover(
+            &task_id,
+            "claude",
+            RetryableError::Timeout,
+            "claude timed out after 1804s",
+            false,
+            &store,
+            "owner/repo",
+        )
+        .await;
+        assert_eq!(outcome.status, "new");
+        assert_eq!(outcome.next_agent.as_deref(), Some("codex"));
+
+        let runner = TaskRunner::new("owner/repo".to_string()).with_store(Arc::clone(&store_arc));
+        runner
+            .clear_agent_on_reroute_unless_fallback(&task_id, "claude")
+            .await;
+
+        let task = store::opt_store_get_task(&store, "owner/repo", &task_id)
+            .await
+            .unwrap();
+        assert_eq!(task.agent.as_deref(), Some("codex"));
+        assert_eq!(task.status, TaskStatus::InProgress);
+        assert!(
+            task.model.as_deref().unwrap_or("").is_empty(),
+            "model must stay empty so routing picks one for the fallback, got {:?}",
+            task.model
+        );
+
+        let mut config = RouterConfig::default();
+        let medium = config.model_map.entry("medium".to_string()).or_default();
+        medium.insert("claude".to_string(), vec!["haiku".to_string()]);
+        medium.insert("codex".to_string(), vec!["gpt-test".to_string()]);
+        let agents = vec!["claude".to_string(), "codex".to_string()];
+        let mut router = Router::new_for_test(config, agents);
+        let labeled = ExternalTask {
+            id: ExternalId(task_id.clone()),
+            title: "Test".to_string(),
+            body: "Test body".to_string(),
+            state: "open".to_string(),
+            labels: vec!["agent:claude".to_string()],
+            author: "test".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: format!("https://github.com/owner/repo/issues/{task_id}"),
+        };
+        let result = router
+            .route(&labeled, &store_arc, "owner/repo")
+            .await
+            .unwrap();
+        assert_eq!(result.agent, "codex");
     }
 
     /// A task that times out on every run blocks after `max_timeout_retries` and keeps its issue open
@@ -2317,7 +2438,8 @@ That's all."#;
                     &store,
                     "owner/repo",
                 )
-                .await,
+                .await
+                .status,
             );
         }
 

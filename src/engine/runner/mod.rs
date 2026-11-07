@@ -695,6 +695,47 @@ impl TaskRunner {
         }
     }
 
+    /// Keep a stored fallback on reroute, wipe agent/model when the run's agent is still stored
+    pub(crate) async fn clear_agent_on_reroute_unless_fallback(
+        &self,
+        task_id: &str,
+        ran_agent: &str,
+    ) {
+        let stored = store::opt_store_get_task(&self.store, &self.repo, task_id).await;
+        if Self::reroute_keeps_stored_agent(stored.as_ref(), ran_agent) {
+            tracing::debug!(
+                task_id,
+                "stored fallback agent present, skipping agent/model clear"
+            );
+            return;
+        }
+        if let Err(e) = store::store_set_result(
+            &self.store,
+            &self.repo,
+            task_id,
+            &[
+                ("agent", serde_json::json!("")),
+                ("model", serde_json::json!("")),
+            ],
+        )
+        .await
+        {
+            tracing::warn!(task_id, err = %e, "failed to clear agent/model for reroute in store");
+        }
+    }
+
+    /// True when a fallback is already stored and must survive this reroute
+    fn reroute_keeps_stored_agent(stored: Option<&store::Task>, ran_agent: &str) -> bool {
+        let Some(task) = stored else {
+            return false;
+        };
+        if !matches!(task.status, TaskStatus::InProgress) {
+            return true;
+        }
+        let stored_agent = task.agent.as_deref().unwrap_or("");
+        !stored_agent.is_empty() && stored_agent != ran_agent
+    }
+
     async fn build_run_audit(&self, input: RunAuditInput<'_>) -> RunAudit {
         // Filter empty strings so that a blank last_error does not shadow the
         // actual parse_result error.  Without this, `Option::or(Some(""))` would
@@ -1431,33 +1472,8 @@ impl TaskRunner {
         // normal dispatch, regardless of why it was rerouted.
         let is_rerouted = status == "new" || status == "routed";
         if is_rerouted {
-            // Check if silence detection (tick phase1b) already re-routed this task while
-            // the session was running. Silence detection sets status to Routed/New and
-            // stores the fallback agent — we must NOT overwrite those fields here.
-            // If the stored status is still InProgress, silence detection did not fire
-            // and we can safely clear agent/model for normal reroute.
-            let silence_already_reset = store::opt_store_get_task(&self.store, &self.repo, task_id)
-                .await
-                .is_some_and(|t| !matches!(t.status, TaskStatus::InProgress));
-
-            if silence_already_reset {
-                tracing::debug!(
-                    task_id,
-                    "silence detection already set fallback agent — skipping agent/model clear"
-                );
-            } else if let Err(e) = store::store_set_result(
-                &self.store,
-                &self.repo,
-                task_id,
-                &[
-                    ("agent", serde_json::json!("")),
-                    ("model", serde_json::json!("")),
-                ],
-            )
-            .await
-            {
-                tracing::warn!(task_id, err = %e, "failed to clear agent/model for reroute in store");
-            }
+            self.clear_agent_on_reroute_unless_fallback(task_id, &agent_name)
+                .await;
         }
         // Determine weight signal based on outcome.
         // Reroutes should only emit RateLimited when the underlying error is genuinely
@@ -1916,7 +1932,7 @@ mod tests {
     use crate::backends::{ExternalId, ExternalTask, Mention, Status};
     use crate::engine::runner::agents::patterns::safe_tail as safe_utf8_tail;
     use crate::parser::AgentResponse;
-    use crate::store::{NewTask, TaskStore};
+    use crate::store::{NewTask, TaskStatus, TaskStore};
     use async_trait::async_trait;
     use chrono::Utc;
     use std::sync::{Arc, Mutex};
@@ -2331,6 +2347,94 @@ mod tests {
 
         assert_eq!(audit.outcome, "success");
         assert_eq!(audit.error, "");
+    }
+
+    #[tokio::test]
+    async fn reroute_clear_wipes_agent_when_it_still_matches_the_run() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let store_id = store
+            .create(&NewTask {
+                external_id: Some("42".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(store_id, TaskStatus::InProgress)
+            .await
+            .unwrap();
+        store
+            .set_fields(
+                store_id,
+                &[
+                    ("agent", serde_json::json!("claude")),
+                    ("model", serde_json::json!("sonnet")),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let runner = TaskRunner::new("owner/repo".to_string()).with_store(Arc::clone(&store));
+        runner
+            .clear_agent_on_reroute_unless_fallback("42", "claude")
+            .await;
+
+        let task = store.get(store_id).await.unwrap();
+        assert!(
+            task.agent.as_deref().unwrap_or("").is_empty(),
+            "matching in-progress agent must be cleared for a normal reroute, got {:?}",
+            task.agent
+        );
+        assert!(
+            task.model.as_deref().unwrap_or("").is_empty(),
+            "model must be cleared with the agent, got {:?}",
+            task.model
+        );
+    }
+
+    #[tokio::test]
+    async fn reroute_clear_keeps_a_different_in_progress_fallback() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let store_id = store
+            .create(&NewTask {
+                external_id: Some("42".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(store_id, TaskStatus::InProgress)
+            .await
+            .unwrap();
+        store
+            .set_fields(
+                store_id,
+                &[
+                    ("agent", serde_json::json!("codex")),
+                    ("model", serde_json::json!("")),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let runner = TaskRunner::new("owner/repo".to_string()).with_store(Arc::clone(&store));
+        runner
+            .clear_agent_on_reroute_unless_fallback("42", "claude")
+            .await;
+
+        let task = store.get(store_id).await.unwrap();
+        assert_eq!(task.agent.as_deref(), Some("codex"));
+        assert!(
+            task.model.as_deref().unwrap_or("").is_empty(),
+            "model stays empty so routing picks one for the fallback, got {:?}",
+            task.model
+        );
     }
 
     #[tokio::test]
