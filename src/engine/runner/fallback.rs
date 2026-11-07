@@ -776,7 +776,7 @@ pub async fn handle_error(
         }
     }
 
-    let status = response::handle_failover(
+    let outcome = response::handle_failover(
         task_id,
         agent_name,
         retryable,
@@ -786,11 +786,19 @@ pub async fn handle_error(
         repo,
     )
     .await;
-    match status.as_str() {
-        "new" => tracing::warn!(task_id, "failover exhausted (retryable), task reset to new"),
-        "blocked" => tracing::warn!(task_id, "failover exhausted (hard failure), task blocked"),
+    match (outcome.status.as_str(), outcome.next_agent.as_deref()) {
+        ("new", Some(next)) => {
+            tracing::info!(task_id, to = next, "failover: re-routing to fallback agent");
+        }
+        ("new", None) => {
+            tracing::warn!(task_id, "failover exhausted (retryable), task reset to new");
+        }
+        ("blocked", _) => {
+            tracing::warn!(task_id, "failover exhausted (hard failure), task blocked");
+        }
         _ => {}
     }
+    let status = outcome.status;
 
     // Store failure memory for retry learning
     response::store_failure_memory(

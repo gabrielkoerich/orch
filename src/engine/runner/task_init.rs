@@ -410,7 +410,7 @@ mod tests {
     use crate::engine::tick::display_status_for;
     use crate::store::NewTask;
 
-    const FAILOVER_ERROR: &str = "claude timed out after 1804s, clearing agent/model for re-route";
+    const FAILOVER_ERROR: &str = "claude timed out after 1804s, switching to codex for re-route";
 
     /// Seeds a no-code task with `seed_error`, then runs `prepare_task` for its next run
     async fn prepare_run(seed_error: &str) -> (Arc<TaskStore>, i64) {

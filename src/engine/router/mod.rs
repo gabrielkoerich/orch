@@ -2317,6 +2317,38 @@ Hope that helps!"#;
     }
 
     #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn route_uses_stored_agent_over_label() {
+        cooldown::reset_global_state().await;
+        let mut config = RouterConfig::default();
+        let medium = config.model_map.entry("medium".to_string()).or_default();
+        medium.insert("claude".to_string(), vec!["haiku".to_string()]);
+        medium.insert("codex".to_string(), vec!["gpt-test".to_string()]);
+        let agents = vec!["claude".to_string(), "codex".to_string()];
+        let mut router = Router::new_for_test(config, agents);
+
+        let store = test_store().await;
+        let store_id = store
+            .create(&NewTask {
+                external_id: Some("1".to_string()),
+                repo: "test/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .set_fields(store_id, &[("agent", serde_json::json!("codex"))])
+            .await
+            .unwrap();
+
+        let task = create_test_task("1", "Test", vec!["agent:claude".to_string()]);
+        let result = router.route(&task, &store, "test/repo").await.unwrap();
+        assert_eq!(result.agent, "codex");
+    }
+
+    #[serial(cooldown_state)]
     #[test]
     fn check_routing_sanity_warnings() {
         // Backend task routed to claude should warn
