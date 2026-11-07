@@ -1088,9 +1088,13 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::process;
+    use std::sync::Arc;
 
+    use super::super::TaskRunner;
     use super::*;
+    use crate::backends::{ExternalId, ExternalTask};
     use crate::engine::cooldown;
+    use crate::engine::router::{Router, RouterConfig};
     use crate::engine::runner::agents::{AgentError, find_agent_result, patterns};
     use crate::store::TaskStatus;
     use serial_test::serial;
@@ -2333,6 +2337,82 @@ That's all."#;
             "{}",
             task.last_error
         );
+    }
+
+    /// The run_with_context reroute clear must keep the fallback while status is still InProgress
+    #[cfg(unix)]
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn timeout_failover_keeps_fallback_after_reroute_clear() {
+        let _env = failover_env();
+        cooldown::reset_global_state().await;
+        let (store_arc, task_id) = failover_task().await;
+        let store_id = store_arc
+            .resolve_task_id("owner/repo", &task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        store_arc
+            .update_status(store_id, TaskStatus::InProgress)
+            .await
+            .unwrap();
+        store_arc
+            .set_fields(store_id, &[("agent", serde_json::json!("claude"))])
+            .await
+            .unwrap();
+
+        let store = Some(Arc::clone(&store_arc));
+        let outcome = handle_failover(
+            &task_id,
+            "claude",
+            RetryableError::Timeout,
+            "claude timed out after 1804s",
+            false,
+            &store,
+            "owner/repo",
+        )
+        .await;
+        assert_eq!(outcome.status, "new");
+        assert_eq!(outcome.next_agent.as_deref(), Some("codex"));
+
+        let runner = TaskRunner::new("owner/repo".to_string()).with_store(Arc::clone(&store_arc));
+        runner
+            .clear_agent_on_reroute_unless_fallback(&task_id, "claude")
+            .await;
+
+        let task = store::opt_store_get_task(&store, "owner/repo", &task_id)
+            .await
+            .unwrap();
+        assert_eq!(task.agent.as_deref(), Some("codex"));
+        assert_eq!(task.status, TaskStatus::InProgress);
+        assert!(
+            task.model.as_deref().unwrap_or("").is_empty(),
+            "model must stay empty so routing picks one for the fallback, got {:?}",
+            task.model
+        );
+
+        let mut config = RouterConfig::default();
+        let medium = config.model_map.entry("medium".to_string()).or_default();
+        medium.insert("claude".to_string(), vec!["haiku".to_string()]);
+        medium.insert("codex".to_string(), vec!["gpt-test".to_string()]);
+        let agents = vec!["claude".to_string(), "codex".to_string()];
+        let mut router = Router::new_for_test(config, agents);
+        let labeled = ExternalTask {
+            id: ExternalId(task_id.clone()),
+            title: "Test".to_string(),
+            body: "Test body".to_string(),
+            state: "open".to_string(),
+            labels: vec!["agent:claude".to_string()],
+            author: "test".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: format!("https://github.com/owner/repo/issues/{task_id}"),
+        };
+        let result = router
+            .route(&labeled, &store_arc, "owner/repo")
+            .await
+            .unwrap();
+        assert_eq!(result.agent, "codex");
     }
 
     /// A task that times out on every run blocks after `max_timeout_retries` and keeps its issue open
