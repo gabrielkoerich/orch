@@ -613,6 +613,9 @@ pub(crate) async fn sweep_ci_timer_keys(
         "ci_pending_since:",
         "review_ci_wait_since:",
         "ci_failure_sha:",
+        "ci_bootstrap_wait_since:",
+        "ci_bootstrap_no_checks_comment:",
+        "ci_bootstrap_never_run_comment:",
     ] {
         for (key, _) in store.kv_list_prefix(prefix).await? {
             let rest = &key[prefix.len()..];
@@ -3650,6 +3653,14 @@ mod tests {
             .unwrap();
         store.kv_set("ci_check_ts:7", "t").await.unwrap();
         store.kv_set("ci_pending_since:7", "t").await.unwrap();
+        store
+            .kv_set(&format!("ci_bootstrap_wait_since:{REPO}#7#abc"), "t")
+            .await
+            .unwrap();
+        store
+            .kv_set(&format!("ci_bootstrap_wait_since:{REPO}#8#abc"), "t")
+            .await
+            .unwrap();
 
         sweep_ci_timer_keys(&store, REPO, &["7".to_string()])
             .await
@@ -3689,6 +3700,20 @@ mod tests {
         assert!(
             store
                 .kv_get(&ci_failure_sha_key(REPO, "8", SHA))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .kv_get(&format!("ci_bootstrap_wait_since:{REPO}#7#abc"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .kv_get(&format!("ci_bootstrap_wait_since:{REPO}#8#abc"))
                 .await
                 .unwrap()
                 .is_some()

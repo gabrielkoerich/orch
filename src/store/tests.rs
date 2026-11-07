@@ -7484,6 +7484,18 @@ async fn move_repo_keeps_tasks_and_dependencies() {
             "review_ci_wait_since:a/x#1#abc",
             "review_ci_wait_since:b/x#1#abc",
         ),
+        (
+            "ci_bootstrap_wait_since:a/x#1#abc",
+            "ci_bootstrap_wait_since:b/x#1#abc",
+        ),
+        (
+            "ci_bootstrap_no_checks_comment:a/x#1#abc",
+            "ci_bootstrap_no_checks_comment:b/x#1#abc",
+        ),
+        (
+            "ci_bootstrap_never_run_comment:a/x#1",
+            "ci_bootstrap_never_run_comment:b/x#1",
+        ),
     ];
     // a repo whose name starts with the moved one must keep its keys
     let untouched = ["dep_blocker:a/x2#1", "issues_last_ingested:a/x2"];

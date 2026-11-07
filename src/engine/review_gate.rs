@@ -10,7 +10,7 @@ use std::sync::Arc;
 const REVIEW_OWN_CHECKS: &[&str] = &["review-gate", "orch/review"];
 
 /// How long a PR head may show no started checks before the review starts anyway
-const NO_CHECKS_WAIT_SECS: i64 = 15 * 60;
+pub(crate) const NO_CHECKS_WAIT_SECS: i64 = 15 * 60;
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum CiGate {
@@ -102,7 +102,7 @@ pub(crate) async fn review_ci_gate(
 
 /// When the wait on this head began. A head with no timer yet starts one and drops the timers
 /// of earlier heads of the task
-async fn wait_since(
+pub(crate) async fn wait_since(
     store: &Arc<TaskStore>,
     prefix: &str,
     key: &str,
