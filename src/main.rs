@@ -1072,6 +1072,18 @@ enum StatsAction {
         #[arg(long, default_value = "24h")]
         since: String,
     },
+    /// Write the merged PRs per day, the agent of each and the time to merge, as JSON
+    Export {
+        /// Repository as owner/name (default: the current project)
+        #[arg(long)]
+        repo: Option<String>,
+        /// Time window to export (e.g. "30d", "720h")
+        #[arg(long, default_value = "30d")]
+        since: String,
+        /// Write to this file instead of stdout
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Show cost tracking and token usage
     Cost {
         /// Task ID to show cost for
@@ -1504,6 +1516,9 @@ async fn async_main() -> anyhow::Result<()> {
             Some(StatsAction::Metrics { details, since }) => {
                 let hours = parse_since_or_default(&since);
                 cli::metrics(details, hours).await?;
+            }
+            Some(StatsAction::Export { repo, since, out }) => {
+                cli::proof::export(repo, &since, out.as_deref())?;
             }
             Some(StatsAction::Cost {
                 task_id,

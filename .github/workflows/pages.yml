@@ -1,7 +1,9 @@
 name: Docs
 
-# Runs after each release, started by release.yml, or by hand after a theme change
+# Runs after each release, started by release.yml, daily to refresh the proof data, or by hand after a theme change
 on:
+  schedule:
+    - cron: "17 5 * * *"
   workflow_dispatch:
     inputs:
       ref:
@@ -10,6 +12,8 @@ on:
 
 permissions:
   contents: read
+  issues: read
+  pull-requests: read
   pages: write
   id-token: write
 
@@ -39,6 +43,17 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ steps.ref.outputs.ref }}
+
+      - name: Write the proof data
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ steps.ref.outputs.ref }}
+        run: |
+          gh release download "$REF" --repo "$GITHUB_REPOSITORY" \
+            --pattern orch-x86_64-unknown-linux-gnu --dir "$RUNNER_TEMP"
+          chmod +x "$RUNNER_TEMP/orch-x86_64-unknown-linux-gnu"
+          "$RUNNER_TEMP/orch-x86_64-unknown-linux-gnu" stats export \
+            --repo "$GITHUB_REPOSITORY" --since 90d --out docs/static/proof.json
 
       - id: deployment
         uses: gabrielkoerich/zola-docs-action@e1ec41316383ce777846abbdb0c9ba9ab6109b0a # v1

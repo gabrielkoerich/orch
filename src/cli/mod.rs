@@ -17,6 +17,7 @@ pub mod nodes;
 pub mod notify;
 pub mod plan;
 pub mod progress;
+pub mod proof;
 pub mod prune;
 pub mod service;
 pub mod session;
