@@ -78,6 +78,18 @@ async fn move_repo_kv(conn: &mut SqliteConnection, old: &str, new: &str) -> anyh
             format!("review_ci_wait_since:{old}#"),
             format!("review_ci_wait_since:{new}#"),
         ),
+        (
+            format!("ci_bootstrap_wait_since:{old}#"),
+            format!("ci_bootstrap_wait_since:{new}#"),
+        ),
+        (
+            format!("ci_bootstrap_no_checks_comment:{old}#"),
+            format!("ci_bootstrap_no_checks_comment:{new}#"),
+        ),
+        (
+            format!("ci_bootstrap_never_run_comment:{old}#"),
+            format!("ci_bootstrap_never_run_comment:{new}#"),
+        ),
     ] {
         sqlx::query(
             "UPDATE OR REPLACE kv SET key = ? || substr(key, ?) WHERE substr(key, 1, ?) = ?",

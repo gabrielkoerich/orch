@@ -2918,7 +2918,7 @@ async fn ensure_pr_exists(
 
                 let task_ref = runner::git_ops::format_task_ref(&task.id.0);
                 // CI-01 must stay open after merge until the default-branch ruleset exists
-                let close_word = if ci_bootstrap::is_ci_bootstrap_task(&task.title, &task.body) {
+                let close_word = if ci_bootstrap::is_ci_bootstrap_task(&task.body) {
                     "Task"
                 } else {
                     "Resolves"
