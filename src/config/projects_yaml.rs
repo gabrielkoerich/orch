@@ -361,7 +361,7 @@ fn parse_scalar(s: &str) -> String {
     s.to_string()
 }
 
-fn format_yaml_string(s: &str) -> String {
+pub(crate) fn format_yaml_string(s: &str) -> String {
     if needs_yaml_quotes(s) {
         format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
     } else {

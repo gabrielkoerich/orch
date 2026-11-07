@@ -11,6 +11,7 @@ pub mod cost;
 pub mod dashboard;
 pub mod doctor;
 pub mod events;
+mod init;
 pub mod job;
 pub mod ndjson;
 pub mod nodes;
@@ -54,82 +55,9 @@ use std::process;
 use std::process::Command;
 use std::sync::Arc;
 
-/// Initialize orch for a project.
+/// Detect agents, write a minimal config, and start the service
 pub fn init(repo: Option<String>) -> anyhow::Result<()> {
-    let orch_home = home::orch_home()?;
-    fs::create_dir_all(&orch_home)?;
-
-    let config_path = orch_home.join("config.yml");
-
-    let repo_value = if let Some(r) = repo {
-        // Normalize: accept SSH URLs, HTTPS URLs, or owner/repo slugs
-        if let Some((owner, name)) = parse_github_slug(&r) {
-            format!("{owner}/{name}")
-        } else {
-            r
-        }
-    } else {
-        // Try to detect from git remote (origin) by reading the remote URL
-        let git_remote = Command::new("git")
-            .args(["remote", "get-url", "origin"])
-            .output_with_context();
-
-        match git_remote {
-            Ok(o) if o.status.success() => {
-                let url = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if let Some((owner, repo)) = parse_github_slug(&url) {
-                    format!("{owner}/{repo}")
-                } else {
-                    eprintln!("Could not parse repository from git remote: {url}");
-                    eprintln!("Use --repo OWNER/REPO");
-                    process::exit(1);
-                }
-            }
-            _ => {
-                eprintln!("Could not detect repository. Use --repo OWNER/REPO");
-                process::exit(1);
-            }
-        }
-    };
-
-    // Ensure global config exists
-    if !config_path.exists() {
-        let content = "# Orch global configuration\n# See: https://github.com/gabrielkoerich/orch\n\nprojects: []\n\nrouter:\n  mode: llm\n  agent: claude\n";
-        fs::write(&config_path, content)?;
-    }
-
-    println!("Initialized orch for {repo_value}");
-    println!("Global config: {}", config_path.display());
-
-    // Create project-local .orch.yml if not exists
-    let local_config = Path::new(".orch.yml");
-    if !local_config.exists() {
-        fs::write(
-            local_config,
-            format!("# Project-specific orch config\ngh:\n  repo: \"{repo_value}\"\n"),
-        )?;
-        println!("Created .orch.yml");
-    }
-
-    // Register project in global config
-    let cwd = env::current_dir()?;
-    let cwd_str = cwd.to_string_lossy().to_string();
-
-    // Check if already registered
-    let paths = config::get_project_paths().unwrap_or_default();
-    if paths.iter().any(|p| p == &cwd_str) {
-        println!("Project already registered in global config");
-    } else {
-        project_add(".")?;
-    }
-
-    // Guidance for board setup
-    println!();
-    println!("Next steps:");
-    println!("  orch project board list      — find GitHub Projects V2 boards");
-    println!("  orch project board link <id> — link a board for status tracking");
-
-    Ok(())
+    init::run(repo)
 }
 
 /// Show orch logs.
@@ -507,7 +435,7 @@ pub(crate) async fn board_reconcile_with(
 /// - `https://github.com/owner/repo` — GitHub URL (with optional .git suffix)
 ///
 /// Returns `None` if the input looks like a local path.
-fn parse_github_slug(input: &str) -> Option<(String, String)> {
+pub(crate) fn parse_github_slug(input: &str) -> Option<(String, String)> {
     // SSH URL format: git@github.com:owner/repo.git
     if input.starts_with("git@github.com:") {
         let path = input
