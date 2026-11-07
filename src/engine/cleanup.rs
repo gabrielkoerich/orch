@@ -2515,11 +2515,13 @@ mod tests {
         let (tmp, clone) = origin_and_clone_with_feat();
         let wt = add_worktree(&clone, tmp.path(), "feat");
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        // hold_after_merge reads the plan marker in the body, not the title
         let id = store_approved_task(
             &store,
             "owner/repo",
             "task-12",
             "CI-01 Set up CI and tests",
+            "<!-- orch-plan: CI-01 -->",
             &wt,
         )
         .await;
@@ -2836,6 +2838,7 @@ mod tests {
         repo: &str,
         external_id: &str,
         title: &str,
+        body: &str,
         worktree: &Path,
     ) -> i64 {
         let id = store
@@ -2844,6 +2847,7 @@ mod tests {
                 repo: repo.to_string(),
                 origin: "github".to_string(),
                 title: title.to_string(),
+                body: body.to_string(),
                 ..Default::default()
             })
             .await
@@ -2944,7 +2948,7 @@ mod tests {
         let (tmp, clone) = origin_and_clone_with_feat();
         let wt = add_worktree(&clone, tmp.path(), "feat");
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        store_approved_task(&store, "owner/repo", "task-12", "CI-01 Set up CI", &wt).await;
+        store_approved_task(&store, "owner/repo", "task-12", "CI-01 Set up CI", "", &wt).await;
 
         cleanup_merged_pr_worktree("task-12", "owner/repo", &store)
             .await
@@ -2971,7 +2975,7 @@ mod tests {
         let (tmp, clone) = origin_and_clone_with_feat();
         let wt = add_worktree(&clone, tmp.path(), "feat");
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        store_approved_task(&store, "owner/repo", "task-12", "fix something", &wt).await;
+        store_approved_task(&store, "owner/repo", "task-12", "fix something", "", &wt).await;
 
         cleanup_task_worktree("task-12", "owner/repo", &store)
             .await
