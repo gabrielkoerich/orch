@@ -2,7 +2,8 @@
 //! to a branch that never merges and comments on the PR with links pinned to that commit
 
 use std::fmt::Write as _;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -94,7 +95,21 @@ fn check_image(path: &str, base: &Path, roots: &[PathBuf]) -> anyhow::Result<Pat
     if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_IMAGE_BYTES {
         bail!("empty or larger than {} MB", MAX_IMAGE_BYTES / 1024 / 1024);
     }
+    let mut head = [0u8; 12];
+    let read = File::open(&source)
+        .and_then(|mut f| f.read(&mut head))
+        .context("unreadable")?;
+    if !has_image_header(&head[..read]) {
+        bail!("not an image file");
+    }
     Ok(source)
+}
+
+fn has_image_header(head: &[u8]) -> bool {
+    head.starts_with(b"\x89PNG\r\n\x1a\n")
+        || head.starts_with(&[0xFF, 0xD8, 0xFF])
+        || head.starts_with(b"GIF8")
+        || (head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WEBP"))
 }
 
 fn one_line(text: &str) -> String {
@@ -242,6 +257,8 @@ mod tests {
 
     use super::*;
 
+    const PNG_HEADER: &[u8] = b"\x89PNG\r\n\x1a\n";
+
     fn shot(path: &str, caption: &str) -> Screenshot {
         Screenshot {
             path: path.into(),
@@ -310,14 +327,16 @@ mod tests {
     fn prepare_keeps_images_inside_the_roots_only() {
         let tmp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(tmp.path()).unwrap();
-        fs::write(root.join("a b.png"), b"png").unwrap();
+        fs::write(root.join("a b.png"), PNG_HEADER).unwrap();
         fs::write(root.join("notes.txt"), b"text").unwrap();
+        fs::write(root.join("fake.png"), b"not an image at all").unwrap();
         let outside = tempfile::tempdir().unwrap();
-        fs::write(outside.path().join("secret.png"), b"png").unwrap();
+        fs::write(outside.path().join("secret.png"), PNG_HEADER).unwrap();
 
         let shots = vec![
             shot("a b.png", "A"),
             shot("notes.txt", "B"),
+            shot("fake.png", "F"),
             shot("missing.png", "C"),
             shot(&outside.path().join("secret.png").to_string_lossy(), "D"),
             shot("../secret.png", "E"),
@@ -326,7 +345,7 @@ mod tests {
 
         assert_eq!(prepared.len(), 1);
         assert_eq!(prepared[0].branch_path, "pr-9/1-a-b.png");
-        assert_eq!(skipped.len(), 4);
+        assert_eq!(skipped.len(), 5);
     }
 
     #[tokio::test]
@@ -348,12 +367,12 @@ mod tests {
         let head_before = git_run(&clone, &["rev-parse", "HEAD"]);
 
         let shot_path = clone.join("home.png");
-        fs::write(&shot_path, b"first").unwrap();
+        fs::write(&shot_path, PNG_HEADER).unwrap();
         let roots = vec![fs::canonicalize(&clone).unwrap()];
         let (images, _) = prepare(&[shot("home.png", "Home")], &clone, &roots, 3);
         let first = publish(&clone, &images, 3).await.unwrap();
 
-        fs::write(&shot_path, b"second").unwrap();
+        fs::write(&shot_path, b"\x89PNG\r\n\x1a\nsecond").unwrap();
         let (images, _) = prepare(&[shot("home.png", "Home")], &clone, &roots, 4);
         let second = publish(&clone, &images, 4).await.unwrap();
 
