@@ -1,15 +1,7 @@
 /* Orch docs styles, the shared layout comes from the zola-docs theme */
-#intro {
-  margin: 2rem 0 3rem;
-
-  em {
-    color: var(--text-secondary);
-    font-style: italic;
-  }
-}
 
 pre {
-  background: var(--bg-secondary);
+  background: var(--code-bg, var(--bg-secondary));
   padding: 1.25rem 1.5rem;
   border-radius: 8px;
   border: 1px solid var(--border-color);
@@ -34,14 +26,6 @@ pre code {
   font-size: inherit;
   border: none;
 }
-
-// Syntax highlighting (landing page custom spans)
-pre .comment { color: #6e7681; font-style: italic; }
-pre .command { color: #d2a8ff; }
-pre .string { color: #a5d6ff; }
-pre .flag { color: #79c0ff; }
-pre .output { color: #7ee787; }
-pre .prompt { color: #8b949e; }
 
 table {
   width: 100%;
@@ -70,39 +54,193 @@ table {
   }
 }
 
-// Landing page feature grid
-.feature-grid {
-  list-style: none;
-  margin: 1.5rem 0;
-  padding: 0;
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 1rem;
+.landing-hero {
+  margin: 0 0 2.5rem;
 
-  @media (max-width: 768px) {
-    grid-template-columns: 1fr;
+  h1 {
+    font-size: 2.35rem;
+    letter-spacing: -0.03em;
+    line-height: 1.15;
+    margin: 0 0 1.5rem;
+  }
+
+  p {
+    max-width: 40rem;
+    margin: 0 0 1rem;
+    color: var(--body-color);
+    font-size: 1.05rem;
+    line-height: 1.65;
   }
 }
 
-.feature-item {
-  margin: 0;
-  padding: 1rem;
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  transition: border-color .2s;
+.pipeline {
+  list-style: none;
+  margin: 0 0 0.75rem;
+  padding: 0 0 0 1.15rem;
+  border-left: 2px solid var(--border-color);
 
-  &:hover { border-color: var(--accent-color); }
-
-  h3 {
-    font-size: 1rem;
-    margin: 0 0 .5rem;
-    color: var(--accent-color);
-  }
-  p {
-    font-size: .9rem;
-    color: var(--text-secondary);
+  li {
+    position: relative;
     margin: 0;
-    line-height: 1.5;
+    padding: 0 0 1.15rem 1.35rem;
+  }
+
+  li:last-child {
+    padding-bottom: 0;
+  }
+
+  li::before {
+    content: "";
+    position: absolute;
+    left: -1.35rem;
+    top: 0.55rem;
+    width: 0.7rem;
+    height: 0.7rem;
+    border-radius: 50%;
+    background: var(--accent-color);
+    box-shadow: 0 0 0 3px var(--bg-color);
+  }
+
+  code,
+  .pipeline-step {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 0.9rem;
+    color: var(--heading-color);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 3px;
+    padding: 0.1rem 0.45rem;
+    margin-right: 0.6rem;
+  }
+
+  span:last-child {
+    color: var(--text-secondary);
+    font-size: 0.95rem;
+  }
+}
+
+.pipeline-note {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  margin: 0 0 3rem 2.5rem;
+}
+
+.proof {
+  margin: 0 0 3rem;
+  padding: 1.25rem 0 0;
+  border-top: 1px solid var(--border-color);
+
+  h2 {
+    margin-top: 1.5rem;
+  }
+}
+
+.proof-lede {
+  max-width: 42rem;
+}
+
+.proof-lede strong {
+  color: var(--heading-color);
+  font-variant-numeric: tabular-nums;
+}
+
+.proof-bars {
+  list-style: none;
+  display: flex;
+  align-items: flex-end;
+  gap: 0.35rem;
+  height: 6.5rem;
+  margin: 1.5rem 0 2rem;
+  padding: 0 0 1.5rem;
+  border-bottom: 1px solid var(--border-color);
+
+  li {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    align-items: center;
+    height: 100%;
+    margin: 0;
+    min-width: 0;
+  }
+}
+
+.proof-bar {
+  display: block;
+  width: 100%;
+  max-width: 1.6rem;
+  min-height: 2px;
+  background: var(--accent-color);
+  border-radius: 2px 2px 0 0;
+}
+
+.proof-bars time {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  color: var(--text-secondary);
+  margin-top: 0.35rem;
+}
+
+.proof-caption {
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  margin: 1.75rem 0 0;
+}
+
+.landing-install pre {
+  margin-top: 0.75rem;
+}
+
+.docs-index {
+  list-style: none;
+  margin: 0.75rem 0 1.5rem;
+  padding: 0;
+
+  li {
+    margin: 0;
+    padding: 0.45rem 0;
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem 0.75rem;
+    align-items: baseline;
+  }
+
+  time,
+  .docs-index-desc {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+  }
+}
+
+@media (max-width: 600px) {
+  .landing-hero h1 {
+    font-size: 1.85rem;
+  }
+
+  .pipeline li {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.15rem;
+  }
+
+  .pipeline code,
+  .pipeline .pipeline-step {
+    margin-right: 0;
+  }
+
+  .pipeline-note {
+    margin-left: 1.15rem;
+  }
+
+  .proof-bars {
+    gap: 0.2rem;
+  }
+
+  .proof-bars time {
+    font-size: 0.55rem;
   }
 }
