@@ -951,8 +951,8 @@ async fn complete_run_redacts_sensitive_git_error_fields() {
     let stored_error: String = row.try_get("error").unwrap();
     assert!(!stored_stderr.contains("ghp_"));
     assert!(!stored_error.contains("ghp_"));
-    assert!(stored_stderr.contains("[REDACTED:github_token]"));
-    assert!(stored_error.contains("[REDACTED:github_token]"));
+    assert!(stored_stderr.contains("[REDACTED:github-pat]"));
+    assert!(stored_error.contains("[REDACTED:github-pat]"));
 
     let activity = sqlx::query_scalar::<_, String>(
         "SELECT details FROM task_activity WHERE task_id = ? AND event_type = 'error' ORDER BY id DESC LIMIT 1",
@@ -962,7 +962,7 @@ async fn complete_run_redacts_sensitive_git_error_fields() {
     .await
     .unwrap();
     assert!(!activity.contains("ghp_"));
-    assert!(activity.contains("[REDACTED:github_token]"));
+    assert!(activity.contains("[REDACTED:github-pat]"));
 }
 
 #[tokio::test]
@@ -1192,7 +1192,7 @@ async fn set_fields_redacts_last_error() {
 
     let task = store.get(id).await.unwrap();
     assert!(!task.last_error.contains("ghp_"));
-    assert!(task.last_error.contains("[REDACTED:github_token]"));
+    assert!(task.last_error.contains("[REDACTED:github-pat]"));
 }
 
 #[tokio::test]
@@ -1213,7 +1213,7 @@ async fn set_block_reason_redacts_sensitive_git_error() {
     let task = store.get(id).await.unwrap();
     let block_reason = task.block_reason.expect("block_reason should be set");
     assert!(!block_reason.contains("ghp_"));
-    assert!(block_reason.contains("[REDACTED:github_token]"));
+    assert!(block_reason.contains("[REDACTED:github-pat]"));
 }
 
 #[tokio::test]
@@ -7204,7 +7204,7 @@ async fn batch_set_fields_redacts_last_error() {
 
     let task = store.get(id).await.unwrap();
     assert!(!task.last_error.contains("ghp_"));
-    assert!(task.last_error.contains("[REDACTED:github_token]"));
+    assert!(task.last_error.contains("[REDACTED:github-pat]"));
 }
 
 #[tokio::test]
