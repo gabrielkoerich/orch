@@ -96,6 +96,7 @@ orch stats metrics [--details] # task metrics summary (slow tasks, error dist.)
 orch stats cost [--summary] # cost tracking and token usage
 orch stats [--all] [--since 7d] # task throughput / per-project rollups (default window 24h)
 orch stats overview [--all] # explicit overview subcommand
+orch stats export [--repo owner/name] [--since 30d] [--out proof.json] # merged PRs per day, agent of each, hours from issue to merge
 orch task events [--repo X] [--task ID] # tail task events live
 orch log [N]                # tail server logs (last N lines)
 orch log -f                 # follow service logs
