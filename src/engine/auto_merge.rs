@@ -495,6 +495,45 @@ fn ci_pending_since_key(repo: &str, task_id: &str, head_sha: &str) -> String {
     format!("{}{head_sha}", ci_pending_since_prefix(repo, task_id))
 }
 
+/// Prefix shared by the counted-failure keys of every head of one task
+fn ci_failure_sha_prefix(repo: &str, task_id: &str) -> String {
+    format!("ci_failure_sha:{repo}#{task_id}#")
+}
+
+fn ci_failure_sha_key(repo: &str, task_id: &str, head_sha: &str) -> String {
+    format!("{}{head_sha}", ci_failure_sha_prefix(repo, task_id))
+}
+
+/// Increment `ci_merge_failures` once per head SHA. `None` when this SHA was already counted
+pub(crate) async fn count_ci_failure_for_head(
+    store: &Arc<TaskStore>,
+    repo: &str,
+    task_id: &str,
+    head_sha: &str,
+) -> anyhow::Result<Option<u64>> {
+    let key = (!head_sha.is_empty()).then(|| ci_failure_sha_key(repo, task_id, head_sha));
+    if let Some(ref key) = key
+        && store.kv_increment(key).await? > 1
+    {
+        return Ok(None);
+    }
+    match store_increment(&Some(Arc::clone(store)), repo, task_id, "ci_merge_failures").await {
+        Ok(n) => Ok(Some(n)),
+        Err(e) => {
+            if let Some(ref key) = key
+                && let Err(del) = store.kv_delete(key).await
+            {
+                tracing::warn!(
+                    task_id,
+                    err = %del,
+                    "failed to roll back ci_failure_sha after increment error"
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
 /// Return how long CI has been continuously observed as `pending` for this
 /// task, persisting the first-seen timestamp in the KV store.
 ///
@@ -569,7 +608,12 @@ pub(crate) async fn sweep_ci_timer_keys(
 ) -> anyhow::Result<()> {
     let finished: HashSet<&str> = finished_task_ids.iter().map(String::as_str).collect();
     let repo_marker = format!("{repo}#");
-    for prefix in ["ci_check_ts:", "ci_pending_since:", "review_ci_wait_since:"] {
+    for prefix in [
+        "ci_check_ts:",
+        "ci_pending_since:",
+        "review_ci_wait_since:",
+        "ci_failure_sha:",
+    ] {
         for (key, _) in store.kv_list_prefix(prefix).await? {
             let rest = &key[prefix.len()..];
             let stale = match rest.strip_prefix(repo_marker.as_str()) {
@@ -1742,15 +1786,21 @@ pub(crate) async fn auto_merge_pr(
                     return Ok(());
                 }
 
-                let ci_failures = match store_increment(
-                    &Some(Arc::clone(store)),
-                    repo,
-                    &task.id.0,
-                    "ci_merge_failures",
+                let ci_failures = match count_ci_failure_for_head(
+                    store, repo, &task.id.0, &head_sha,
                 )
                 .await
                 {
-                    Ok(v) => v,
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
+                        tracing::info!(
+                            task_id = task.id.0,
+                            pr_number,
+                            sha = %head_sha,
+                            "CI still failed on the same head, waiting"
+                        );
+                        return Ok(());
+                    }
                     Err(e) => {
                         tracing::warn!(task_id = task.id.0, err = %e, "failed to increment ci_merge_failures — skipping CI-failure based block this tick");
                         // Skip escalation this tick and let the sync retry later
@@ -1828,15 +1878,21 @@ pub(crate) async fn auto_merge_pr(
                     {
                         tracing::warn!(task_id = task.id.0, err = %e, "failed to clear ci_pending_since before timeout escalation");
                     }
-                    let ci_failures = match store_increment(
-                        &Some(Arc::clone(store)),
-                        repo,
-                        &task.id.0,
-                        "ci_merge_failures",
+                    let ci_failures = match count_ci_failure_for_head(
+                        store, repo, &task.id.0, &head_sha,
                     )
                     .await
                     {
-                        Ok(v) => v,
+                        Ok(Some(v)) => v,
+                        Ok(None) => {
+                            tracing::info!(
+                                task_id = task.id.0,
+                                pr_number,
+                                sha = %head_sha,
+                                "CI still pending on the same head after timeout, waiting"
+                            );
+                            return Ok(());
+                        }
                         Err(e) => {
                             tracing::warn!(task_id = task.id.0, err = %e, "failed to increment ci_merge_failures — skipping CI-timeout based block this tick");
                             return Ok(());
@@ -3584,6 +3640,14 @@ mod tests {
             .kv_set(&ci_pending_since_key(REPO, "7", SHA), "t")
             .await
             .unwrap();
+        store
+            .kv_set(&ci_failure_sha_key(REPO, "7", SHA), "1")
+            .await
+            .unwrap();
+        store
+            .kv_set(&ci_failure_sha_key(REPO, "8", SHA), "1")
+            .await
+            .unwrap();
         store.kv_set("ci_check_ts:7", "t").await.unwrap();
         store.kv_set("ci_pending_since:7", "t").await.unwrap();
 
@@ -3615,5 +3679,110 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        assert!(
+            store
+                .kv_get(&ci_failure_sha_key(REPO, "7", SHA))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .kv_get(&ci_failure_sha_key(REPO, "8", SHA))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    async fn task_for_ci_failure(repo: &str, source_id: &str) -> (Arc<TaskStore>, String, i64) {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let store_id = store
+            .create_internal(repo, "CI failure", "", "test", source_id, None)
+            .await
+            .unwrap();
+        (store, format!("internal:{store_id}"), store_id)
+    }
+
+    #[tokio::test]
+    async fn count_ci_failure_for_head_counts_a_sha_once() {
+        let (store, task_id, store_id) = task_for_ci_failure(REPO, "once").await;
+
+        let first = count_ci_failure_for_head(&store, REPO, &task_id, SHA)
+            .await
+            .unwrap();
+        let again = count_ci_failure_for_head(&store, REPO, &task_id, SHA)
+            .await
+            .unwrap();
+        let next = count_ci_failure_for_head(&store, REPO, &task_id, "newsha")
+            .await
+            .unwrap();
+
+        assert_eq!(first, Some(1));
+        assert_eq!(again, None);
+        assert_eq!(next, Some(2));
+        assert_eq!(store.get(store_id).await.unwrap().ci_merge_failures, 2);
+    }
+
+    #[tokio::test]
+    async fn count_ci_failure_for_head_is_per_task() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let a = store
+            .create_internal(REPO, "a", "", "test", "a", None)
+            .await
+            .unwrap();
+        let b = store
+            .create_internal(REPO, "b", "", "test", "b", None)
+            .await
+            .unwrap();
+        let a_id = format!("internal:{a}");
+        let b_id = format!("internal:{b}");
+
+        assert_eq!(
+            count_ci_failure_for_head(&store, REPO, &a_id, SHA)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            count_ci_failure_for_head(&store, REPO, &b_id, SHA)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(store.get(a).await.unwrap().ci_merge_failures, 1);
+        assert_eq!(store.get(b).await.unwrap().ci_merge_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn count_ci_failure_for_head_empty_sha_always_counts() {
+        let (store, task_id, store_id) = task_for_ci_failure(REPO, "empty").await;
+
+        assert_eq!(
+            count_ci_failure_for_head(&store, REPO, &task_id, "")
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            count_ci_failure_for_head(&store, REPO, &task_id, "")
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(store.get(store_id).await.unwrap().ci_merge_failures, 2);
+    }
+
+    #[tokio::test]
+    async fn count_ci_failure_for_head_only_one_racer_counts() {
+        let (store, task_id, store_id) = task_for_ci_failure(REPO, "race").await;
+
+        let (a, b) = tokio::join!(
+            count_ci_failure_for_head(&store, REPO, &task_id, SHA),
+            count_ci_failure_for_head(&store, REPO, &task_id, SHA),
+        );
+        let counted = [a.unwrap(), b.unwrap()].into_iter().flatten().count();
+        assert_eq!(counted, 1);
+        assert_eq!(store.get(store_id).await.unwrap().ci_merge_failures, 1);
     }
 }

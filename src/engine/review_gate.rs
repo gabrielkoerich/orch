@@ -18,8 +18,8 @@ pub(crate) enum CiGate {
     Start,
     /// CI is still running on the PR head
     Wait,
-    /// CI failed on the PR head, these checks failed
-    Red(Vec<String>),
+    /// CI failed on this PR head, these checks failed
+    Red { failed: Vec<String>, sha: String },
     /// No check started on the PR head. `waited_out` once the head waited 15 minutes, or at once
     /// when the repository has no CI
     NotStarted { waited_out: bool },
@@ -81,7 +81,7 @@ pub(crate) async fn review_ci_gate(
     let gate = match state {
         CiState::Green => CiGate::Start,
         CiState::Running => CiGate::Wait,
-        CiState::Red(failed) => CiGate::Red(failed),
+        CiState::Red(failed) => CiGate::Red { failed, sha },
         CiState::NotStarted => {
             let now = chrono::Utc::now().timestamp();
             let since = wait_since(store, &wait_prefix, &wait_key, now).await?;
