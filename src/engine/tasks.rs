@@ -464,58 +464,8 @@ impl TaskManager {
     /// For `"internal:{n}"` IDs, updates the store. For all others, calls the backend.
     /// Store is always updated when available.
     pub async fn update_task_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
-        let task_status = status_to_task_status(status);
-        self.release_dependents_if_done(task_status, &self.repo, &id.0)
-            .await;
-
-        // Read pre-update snapshot from the store (old_status + context fields).
-        // This must happen BEFORE any store.update_status() call so we capture
-        // the previous state for the event.
-        let (pre_snapshot, snapshot_store_id) = self.read_task_snapshot(&id.0).await;
-
-        if is_internal_id(&id.0) {
-            // Internal tasks: store is the single source of truth
-            let store = self
-                .store
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("store required for internal task status update"))?;
-            let store_id = snapshot_store_id
-                .ok_or_else(|| anyhow::anyhow!("internal task {} not found in store", id.0))?;
-            if task_status != TaskStatus::Blocked {
-                store.set_block_reason(store_id, None).await?;
-            }
-            store.update_status(store_id, task_status).await?;
-            // Publish event to bus only after confirmed update
-            self.publish_event(id, status, &pre_snapshot, &self.repo, None);
-            return Ok(());
-        }
-
-        // External tasks: store-first, then mirror to backend.
-        // SQLite is the source of truth; backend sync is best-effort.
-        if let Some(ref store) = self.store
-            && let Some(store_id) = snapshot_store_id
-        {
-            if task_status != TaskStatus::Blocked {
-                store.set_block_reason(store_id, None).await?;
-            }
-            store.update_status(store_id, task_status).await?;
-        }
-
-        // Mirror to backend (GitHub labels). Log failure but don't fail the operation
-        // since the store already has the correct status.
-        if let Err(e) = self.backend.update_status(id, status).await {
-            tracing::warn!(
-                task_id = id.0,
-                ?status,
-                err = %e,
-                "failed to mirror status to backend — store is authoritative"
-            );
-        }
-
-        // Publish event to bus
-        self.publish_event(id, status, &pre_snapshot, &self.repo, None);
-
-        Ok(())
+        self.update_task_status_with_duration(id, status, None)
+            .await
     }
 
     pub async fn update_task_status_and_result(
