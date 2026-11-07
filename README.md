@@ -41,29 +41,16 @@ orch service install         # systemd user unit for `orch serve`
 
 ## Quick Start
 
-### 1. Initialize orch for your project
+Log in to `gh` and one agent CLI, then:
 
 ```bash
-cd /path/to/your/project
-orch init
+orch init                 # probe agents, write config, start the service
+orch plan PLAN.md         # turn a markdown plan into issues
 ```
 
-This creates:
-- `~/.orch/config.yml` — global configuration (shared defaults + project registry)
-- `.orch.yml` — project-specific configuration (in your project root)
+`orch init` asks for one repository and writes `~/.orch/config.yml` with only the values that differ from the defaults. `--repo OWNER/REPO` skips the question.
 
-### 2. Start the service
-
-```bash
-orch service start
-```
-
-Or use Homebrew services:
-```bash
-brew services start orch
-```
-
-### 3. Create a task
+### Create a task
 
 ```bash
 # Create an internal task (SQLite only, no GitHub issue)
@@ -73,7 +60,7 @@ orch task add "Fix authentication bug" --body "Users can't login with OAuth"
 orch task add "Update README" -l documentation -l good-first-issue
 ```
 
-### 4. Watch the magic
+### Watch the service
 
 The service automatically:
 1. Routes tasks to the best agent based on content
@@ -226,8 +213,8 @@ orch job run <id>             # Run a job now, ignoring its schedule
 ### Utility Commands
 
 ```bash
-orch init                     # Initialize orch for current project
-orch init --repo owner/repo   # Initialize with specific repo
+orch init                     # Probe agents, write config, start the service
+orch init --repo owner/repo   # Same, without asking for the repository
 orch config agents            # List installed agent CLIs
 orch stats dashboard          # Full dashboard view (tasks, sessions, activity)
 orch stats metrics            # Show task metrics summary

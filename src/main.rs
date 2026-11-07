@@ -385,7 +385,7 @@ enum Commands {
     /// Start the orch service
     #[command(hide = true)]
     Serve,
-    /// Initialize orch for a project
+    /// Detect agents, write a minimal config, and start the service
     Init {
         /// Repository in OWNER/REPO format
         #[arg(long)]

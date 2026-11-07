@@ -23,6 +23,15 @@ Visible top-level commands: `init`, `log`, `nodes`, `progress`, `commit`, `confi
 
 `orch serve` is hidden. It runs the engine in the foreground, and the launchd and systemd units run it. `orch progress --done "..." [--left "..."] [--state "..."]` records what a task step finished and commits it, and the service pushes. `orch nodes` lists the cluster's machines, see [Cluster](@/cluster.md).
 
+## Init
+
+```bash
+orch init
+orch init --repo owner/repo
+```
+
+`orch init` finds the agent CLIs on `PATH` and whether each is logged in, and checks `gh` auth. It asks for one repository, writes `~/.orch/config.yml` with only the values that differ from the defaults, and starts the service. It then prints `orch plan <file>`. `--repo OWNER/REPO` skips the question. From a git checkout, origin is the default.
+
 ## Task Commands
 
 Task commands that take an id accept a bare number, `owner/repo#N`, `repo#N`, `internal:N`, or `internal-N`. Inside a project directory a bare number is that project's GitHub issue. If the same number matches more than one task and you are not in a project directory, the command names both forms and stops.

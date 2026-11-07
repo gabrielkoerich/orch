@@ -37,24 +37,16 @@ The `grok` CLI must be on `PATH`. Orch discovers it by the binary name `grok`.
 
 ## Quick Start
 
-### Option A: Existing local repo
+Log in to `gh` and one agent CLI, then:
 
 ```bash
-cd ~/projects/my-app
-orch init               # configure project (optional GitHub setup)
-orch task add "title"   # add a task
-orch task run <id>      # run a specific task
-orch service start      # start background service
+orch init
+orch plan PLAN.md
 ```
 
-### Option B: Any GitHub repo
+`orch init` finds the agent CLIs on `PATH` and whether each is logged in, and checks `gh` auth. It asks for one repository, writes a config that lists only non-default values, and starts the service.
 
-```bash
-orch project add owner/repo          # bare clone + import issues
-cd ~/.orch/projects/owner/repo.git   # or any local checkout of that repo
-orch task add "title"                # add a task to the current project
-orch service start                   # service picks it up automatically
-```
+`--repo OWNER/REPO` skips the question. From a git checkout, origin is the default.
 
 `orch task add` always targets the current project (resolved from CWD). To create tasks for another project, `cd` into it first. Bare clones live at `~/.orch/projects/<owner>/<repo>.git`. Agents always work in worktrees — never in the main clone. Worktrees are under `~/.orch/worktrees/<project>/<branch>/`.
 
