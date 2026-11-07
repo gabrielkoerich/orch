@@ -529,11 +529,30 @@ pub(crate) async fn cleanup_task_worktree(
     repo: &str,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
+    cleanup_task_worktree_impl(task_id, repo, store, false).await
+}
+
+/// Cleanup after a merged pull request, including while `hold_after_merge` keeps the task approved
+pub(crate) async fn cleanup_merged_pr_worktree(
+    task_id: &str,
+    repo: &str,
+    store: &Arc<TaskStore>,
+) -> anyhow::Result<()> {
+    cleanup_task_worktree_impl(task_id, repo, store, true).await
+}
+
+async fn cleanup_task_worktree_impl(
+    task_id: &str,
+    repo: &str,
+    store: &Arc<TaskStore>,
+    known_pr_merged: bool,
+) -> anyhow::Result<()> {
     let opts = JanitorOptions {
         ttl_hours: 0,
         ..Default::default()
     };
-    let cleaned = cleanup_task_worktree_with_opts(task_id, repo, store, &opts).await?;
+    let cleaned =
+        cleanup_task_worktree_with_opts_impl(task_id, repo, store, &opts, known_pr_merged).await?;
 
     // Fetch origin once after inline cleanup (post-merge single-task path).
     // Only fetch if cleanup actually happened (not skipped due to active session).
@@ -581,6 +600,16 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
     store: &Arc<TaskStore>,
     opts: &JanitorOptions,
 ) -> anyhow::Result<bool> {
+    cleanup_task_worktree_with_opts_impl(task_id, repo, store, opts, false).await
+}
+
+async fn cleanup_task_worktree_with_opts_impl(
+    task_id: &str,
+    repo: &str,
+    store: &Arc<TaskStore>,
+    opts: &JanitorOptions,
+    known_pr_merged: bool,
+) -> anyhow::Result<bool> {
     let (worktree, branch, keep_remote_branch, merged, external_id, pr_merged) =
         store::opt_store_get_task(&Some(Arc::clone(store)), repo, task_id)
             .await
@@ -588,15 +617,15 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
                 // Blocked tasks with a PR should keep their remote branch so the
                 // PR stays open for human review.
                 let keep = t.status == TaskStatus::Blocked && t.pr_number.is_some();
-                let merged = t.status == TaskStatus::Done;
+                let merged = t.status == TaskStatus::Done || known_pr_merged;
                 (
                     Some(t.worktree),
                     Some(t.branch),
                     keep,
                     merged,
                     t.external_id,
-                    // Done means the PR merged, and a squash leaves the branch commits on no ref
-                    merged && t.pr_number.is_some(),
+                    // A squash leaves the branch commits on no ref, so skip rescue when the PR merged
+                    known_pr_merged || (t.status == TaskStatus::Done && t.pr_number.is_some()),
                 )
             });
 
@@ -1753,7 +1782,7 @@ pub(crate) async fn check_merged_prs(
                     branch = %branch,
                     "CI bootstrap PR merged, holding done until the ruleset exists"
                 );
-                if let Err(e) = cleanup_task_worktree(&task_id, repo, store).await {
+                if let Err(e) = cleanup_merged_pr_worktree(&task_id, repo, store).await {
                     tracing::warn!(task_id, err = %e, "worktree cleanup after merge failed");
                 }
                 continue;
@@ -1766,7 +1795,7 @@ pub(crate) async fn check_merged_prs(
             continue;
         }
 
-        if let Err(e) = cleanup_task_worktree(&task_id, repo, store).await {
+        if let Err(e) = cleanup_merged_pr_worktree(&task_id, repo, store).await {
             tracing::warn!(task_id, err = %e, "worktree cleanup after merge failed");
         }
 
@@ -2266,6 +2295,15 @@ mod tests {
                 single_checked_branches: Arc::new(Mutex::new(Vec::new())),
             }
         }
+
+        fn with_merged(branch: &str) -> Self {
+            Self {
+                batch_result: Mutex::new(Ok(HashMap::from([(branch.to_string(), true)]))),
+                single_results: HashMap::new(),
+                posted_comments: Arc::new(Mutex::new(Vec::new())),
+                single_checked_branches: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
     }
 
     #[async_trait]
@@ -2470,6 +2508,51 @@ mod tests {
         assert_eq!(comments.len(), 1);
         assert_eq!(comments[0].0, "101");
         assert!(comments[0].1.contains("PR merged, marking task complete"));
+    }
+
+    #[tokio::test]
+    async fn check_merged_prs_skips_rescue_while_ci_bootstrap_holds() {
+        let (tmp, clone) = origin_and_clone_with_feat();
+        let wt = add_worktree(&clone, tmp.path(), "feat");
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let id = store_approved_task(
+            &store,
+            "owner/repo",
+            "task-12",
+            "CI-01 Set up CI and tests",
+            &wt,
+        )
+        .await;
+        let stored = store.get(id).await.unwrap();
+
+        let backend = Arc::new(MergeCheckMockBackend::with_merged("feat"));
+        let backend_dyn: Arc<dyn ExternalBackend> = Arc::<MergeCheckMockBackend>::clone(&backend);
+        let task_manager = Arc::new(TaskManager::with_store(
+            Arc::clone(&backend_dyn),
+            Arc::clone(&store),
+            "owner/repo".to_string(),
+        ));
+
+        check_merged_prs(
+            &backend_dyn,
+            "owner/repo",
+            &store,
+            &task_manager,
+            &[ReviewTaskSnapshot {
+                external: tasks::store_task_to_external(&stored),
+                stored,
+            }],
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let after = store.get(id).await.unwrap();
+        assert_eq!(after.status, TaskStatus::Approved);
+        assert!(after.worktree_cleaned);
+        assert!(!wt.exists());
+        assert!(!remote_has(&clone, "rescue/feat"));
+        assert!(backend.posted_comments.lock().unwrap().is_empty());
     }
 
     struct ReconciliationMockBackend {
@@ -2748,6 +2831,41 @@ mod tests {
         wt
     }
 
+    async fn store_approved_task(
+        store: &TaskStore,
+        repo: &str,
+        external_id: &str,
+        title: &str,
+        worktree: &Path,
+    ) -> i64 {
+        let id = store
+            .create(&NewTask {
+                external_id: Some(external_id.to_string()),
+                repo: repo.to_string(),
+                origin: "github".to_string(),
+                title: title.to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store.update_status(id, TaskStatus::Approved).await.unwrap();
+        store
+            .set_fields(
+                id,
+                &[
+                    ("branch", serde_json::json!("feat")),
+                    (
+                        "worktree",
+                        serde_json::json!(worktree.to_string_lossy().as_ref()),
+                    ),
+                    ("pr_number", serde_json::json!(7)),
+                ],
+            )
+            .await
+            .unwrap();
+        id
+    }
+
     #[tokio::test]
     async fn cleanup_pushes_unpushed_commits_to_a_rescue_branch() {
         let (tmp, clone) = origin_and_clone_with_feat();
@@ -2819,6 +2937,47 @@ mod tests {
         assert!(removed);
         assert!(!wt.exists());
         assert!(!remote_has(&clone, "rescue/feat"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_skips_rescue_for_an_approved_merged_pr() {
+        let (tmp, clone) = origin_and_clone_with_feat();
+        let wt = add_worktree(&clone, tmp.path(), "feat");
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        store_approved_task(&store, "owner/repo", "task-12", "CI-01 Set up CI", &wt).await;
+
+        cleanup_merged_pr_worktree("task-12", "owner/repo", &store)
+            .await
+            .unwrap();
+
+        let task = store
+            .get(
+                store
+                    .resolve_task_id("owner/repo", "task-12")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Approved);
+        assert!(task.worktree_cleaned);
+        assert!(!wt.exists());
+        assert!(!remote_has(&clone, "rescue/feat"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_rescues_an_approved_task_when_the_pr_is_not_known_merged() {
+        let (tmp, clone) = origin_and_clone_with_feat();
+        let wt = add_worktree(&clone, tmp.path(), "feat");
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        store_approved_task(&store, "owner/repo", "task-12", "fix something", &wt).await;
+
+        cleanup_task_worktree("task-12", "owner/repo", &store)
+            .await
+            .unwrap();
+
+        assert!(remote_has(&clone, "rescue/feat"));
     }
 
     #[tokio::test]
