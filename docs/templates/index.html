@@ -1,27 +1,114 @@
 {% extends "base.html" %}
 
 {% block content %}
-<div id="intro">
-    <em>{{config.description}}</em>
-</div>
+<section class="landing-hero">
+    <h1>Write the plan. orch builds it.</h1>
+    <p>Coding agents can write the code, and a person still runs the loop around them: split the plan, start each session, paste the CI failure back, answer the review, rebase, merge, start the next one. The agents work while you sit there, and the quota you pay for resets whether you used it or not.</p>
+    <p>You write a markdown plan. orch turns it into GitHub issues and builds them in order, on your machine, with the agent CLIs on your PATH. Each task gets its own worktree, a second agent reviews the PR, your CI tests it, and it merges under your branch protection. Then the tasks that waited on it start.</p>
+</section>
 
-<h2>Documentation</h2>
-<ul>
+<ol class="pipeline" aria-label="From plan to merged PR">
+    <li>
+        <code>plan.md</code>
+        <span>a markdown file you write</span>
+    </li>
+    <li>
+        <code>orch plan</code>
+        <span>GitHub issues with blocked-by links</span>
+    </li>
+    <li>
+        <span class="pipeline-step">agent</span>
+        <span>own worktree, routed by quota</span>
+    </li>
+    <li>
+        <span class="pipeline-step">review</span>
+        <span>a second agent, changes go back to the author</span>
+    </li>
+    <li>
+        <span class="pipeline-step">CI</span>
+        <span>GitHub Actions or shipcheck</span>
+    </li>
+    <li>
+        <span class="pipeline-step">merge</span>
+        <span>your branch protection</span>
+    </li>
+    <li>
+        <span class="pipeline-step">next</span>
+        <span>waiting tasks start</span>
+    </li>
+</ol>
+<p class="pipeline-note">A task labelled <code>owner:human</code> waits for you.</p>
+
+{% set proof = load_data(path="static/proof.json", required=false) %}
+<section class="proof" id="proof">
+    <h2>On this repository</h2>
+    {% if proof and proof.days %}
+        {% set_global orch_merged = 0 %}
+        {% set_global all_merged = 0 %}
+        {% set_global hours_sum = 0.0 %}
+        {% for day in proof.days %}
+            {% set_global orch_merged = orch_merged + day.merged_by_orch %}
+            {% set_global all_merged = all_merged + day.merged %}
+            {% for pr in day.prs %}
+                {% set_global hours_sum = hours_sum + pr.hours_to_merge %}
+            {% endfor %}
+        {% endfor %}
+        {% set first_day = proof.days | first %}
+        {% set last_day = proof.days | last %}
+        <p class="proof-lede">
+            Since {{ first_day.date }}, orch merged <strong>{{ orch_merged }}</strong> of <strong>{{ all_merged }}</strong> pull requests on <a href="https://github.com/{{ proof.repo }}/pulls?q=is%3Apr+is%3Amerged">{{ proof.repo }}</a>{% if orch_merged > 0 %}, in {{ (hours_sum / orch_merged) | round(precision=1) }} hours from issue to merge on average{% endif %}.
+            Source: <a href="{{ get_url(path='proof.json') }}">proof.json</a>.
+        </p>
+        {% set recent = proof.days | reverse | slice(end=14) | reverse %}
+        {% set_global peak = 1 %}
+        {% for day in recent %}
+            {% if day.merged_by_orch > peak %}
+                {% set_global peak = day.merged_by_orch %}
+            {% endif %}
+        {% endfor %}
+        {% set recent_first = recent | first %}
+        {% set recent_last = recent | last %}
+        <ol class="proof-bars" aria-label="Pull requests orch merged per day, last {{ recent | length }} days">
+            {% for day in recent %}
+            <li title="{{ day.date }}: {{ day.merged_by_orch }} of {{ day.merged }} by orch">
+                <span class="proof-bar" style="height: {{ day.merged_by_orch * 100 / peak }}%"></span>
+                <time datetime="{{ day.date }}">{{ day.date | split(pat="-") | last }}</time>
+            </li>
+            {% endfor %}
+        </ol>
+        <p class="proof-caption">Pull requests orch merged per day, {{ recent_first.date }} to {{ recent_last.date }}.</p>
+    {% else %}
+        <p class="proof-lede">The docs include counts of PRs orch merged, by day and by agent, as <a href="{{ get_url(path='proof.json') }}">proof.json</a>.</p>
+    {% endif %}
+</section>
+
+<section class="landing-install" id="install">
+    <h2>Install</h2>
+    <pre><code>brew tap gabrielkoerich/homebrew-tap
+brew install orch
+orch init
+orch plan PLAN.md</code></pre>
+    <p>On Linux: <code>cargo binstall orch-cli</code>, then <code>orch service install</code>. Log in to <code>gh</code> and one agent CLI first. The full walkthrough is in <a href="{{ get_url(path='@/getting-started.md') }}">Getting started</a>.</p>
+</section>
+
+<h2 id="docs">Documentation</h2>
+<ul class="docs-index">
     {% for page in section.pages %}
-    <li><a href="{{page.permalink | safe}}">{{page.title}}</a>{% if page.description %} — <span style="color: var(--text-secondary);">{{page.description}}</span>{% endif %}</li>
+    <li><a href="{{page.permalink | safe}}">{{page.title}}</a>{% if page.description %} <span class="docs-index-desc">{{page.description}}</span>{% endif %}</li>
     {% endfor %}
 </ul>
 
 {% set posts = get_section(path="posts/_index.md") %}
 {% if posts.pages | length > 0 %}
-<h2>Recent Updates</h2>
-<ul>
-    {% for page in posts.pages %}
+<h2>Recent updates</h2>
+<ul class="docs-index">
+    {% for page in posts.pages | slice(end=8) %}
     <li>
         <a href="{{page.permalink | safe}}">{{page.title}}</a>
-        {% if page.date %}<span style="color: var(--text-secondary); font-size: .85rem; font-family: var(--font-mono);"> — {{page.date | date(format="%Y-%m-%d")}}</span>{% endif %}
+        {% if page.date %}<time datetime="{{ page.date }}">{{page.date | date(format="%Y-%m-%d")}}</time>{% endif %}
     </li>
     {% endfor %}
 </ul>
+<p><a href="{{ get_url(path='@/posts/_index.md') }}">All updates</a></p>
 {% endif %}
 {% endblock %}
