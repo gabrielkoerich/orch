@@ -9,10 +9,8 @@ use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, bail};
-use tokio::process::Command;
 
 use super::git_ops;
-use crate::cmd::CommandErrorContext;
 use crate::parser::Screenshot;
 
 /// Branch that holds the images, used as no PR base or head, and cleanup deletes task branches only
@@ -176,7 +174,7 @@ pub fn build_unpublished_comment(note: Option<&str>, skipped: &[String]) -> Stri
 }
 
 async fn git_out(dir: &Path, index: Option<&Path>, args: &[&str]) -> anyhow::Result<String> {
-    let mut cmd: Command = git_ops::git().await;
+    let mut cmd = git_ops::git().await;
     cmd.arg("-C").arg(dir).args(args);
     if let Some(index) = index {
         cmd.env("GIT_INDEX_FILE", index);
@@ -185,7 +183,7 @@ async fn git_out(dir: &Path, index: Option<&Path>, args: &[&str]) -> anyhow::Res
         .env("GIT_AUTHOR_EMAIL", "orch@localhost")
         .env("GIT_COMMITTER_NAME", "orch")
         .env("GIT_COMMITTER_EMAIL", "orch@localhost");
-    let out = cmd.output_with_context().await?;
+    let out = git_ops::sanitize_git_output(cmd.output_with_context().await?);
     if !out.status.success() {
         bail!(
             "git {} failed: {}",
@@ -346,6 +344,14 @@ mod tests {
             .unwrap();
         assert!(out.status.success(), "git {args:?}: {out:?}");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn git_error_strips_url_credentials() {
+        let raw = "error: failed to push some refs to 'https://x-access-token:test-secret-1234567890abcdef@github.com/o/r.git'";
+        let msg = format!("git push failed: {}", git_ops::sanitize_push_error(raw));
+        assert!(!msg.contains("test-secret-1234567890abcdef"));
+        assert!(msg.contains("://***@github.com"));
     }
 
     #[test]
