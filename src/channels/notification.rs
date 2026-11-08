@@ -96,98 +96,99 @@ fn github_link(repo: Option<&str>, task_id: &str, pr_number: Option<&str>) -> Op
     None
 }
 
+/// Channel-specific wrappers around the shared notification layout
+struct ChannelBody<'a> {
+    title: &'a str,
+    status: &'a str,
+    agent: &'a str,
+    task_id: &'a str,
+    summary: &'a str,
+    link_suffix: &'a str,
+}
+
 impl TaskNotification {
+    fn github_link_suffix(&self, wrap: impl FnOnce(&str) -> String) -> String {
+        match github_link(
+            self.repo.as_deref(),
+            &self.task_id,
+            self.pr_number.as_deref(),
+        ) {
+            Some(url) => format!("\n\n{}", wrap(&url)),
+            None => String::new(),
+        }
+    }
+
+    fn render(&self, body: &ChannelBody<'_>) -> String {
+        let emoji = status_emoji(&self.status);
+        let duration = format_duration(self.duration_seconds);
+        format!(
+            "{emoji} {title}\n\
+             {status} · {agent} · {duration} · #{task_id}\n\
+             \n\
+             {summary}{link_suffix}",
+            title = body.title,
+            status = body.status,
+            agent = body.agent,
+            task_id = body.task_id,
+            summary = body.summary,
+            link_suffix = body.link_suffix,
+        )
+    }
+
     /// Format for Telegram (HTML).
     ///
     /// Use HTML parse mode to avoid fragile Markdown escaping issues. Values are
     /// escaped for HTML entities (e.g. <, >, &) and simple tags are used for
     /// bold/monospace formatting.
     pub fn format_telegram(&self) -> String {
-        let emoji = status_emoji(&self.status);
-        let duration = format_duration(self.duration_seconds);
-        let link_suffix = match github_link(
-            self.repo.as_deref(),
-            &self.task_id,
-            self.pr_number.as_deref(),
-        ) {
-            Some(url) => format!("\n\n<a href=\"{}\">View on GitHub</a>", html_escape(&url)),
-            None => String::new(),
-        };
-
-        format!(
-            "{emoji} <b>{title}</b>\n\
-             {status} · <code>{agent}</code> · {duration} · #{task_id}\n\
-             \n\
-             {summary}{link_suffix}",
-            emoji = emoji,
-            title = html_escape(&self.title),
-            status = html_escape(&self.status),
-            agent = html_escape(&self.agent),
-            duration = duration,
-            task_id = html_escape(&self.task_id),
-            summary = html_escape(&self.summary),
-            link_suffix = link_suffix,
-        )
+        let title = format!("<b>{}</b>", html_escape(&self.title));
+        let status = html_escape(&self.status);
+        let agent = format!("<code>{}</code>", html_escape(&self.agent));
+        let task_id = html_escape(&self.task_id);
+        let summary = html_escape(&self.summary);
+        let link_suffix = self.github_link_suffix(|url| {
+            format!("<a href=\"{}\">View on GitHub</a>", html_escape(url))
+        });
+        self.render(&ChannelBody {
+            title: &title,
+            status: &status,
+            agent: &agent,
+            task_id: &task_id,
+            summary: &summary,
+            link_suffix: &link_suffix,
+        })
     }
 
     /// Format for Slack (mrkdwn).
     ///
     /// Slack uses its own "mrkdwn" dialect: *bold*, _italic_, `code`.
     pub fn format_slack(&self) -> String {
-        let emoji = status_emoji(&self.status);
-        let duration = format_duration(self.duration_seconds);
-        let link_suffix = match github_link(
-            self.repo.as_deref(),
-            &self.task_id,
-            self.pr_number.as_deref(),
-        ) {
-            Some(url) => format!("\n\n<{url}|View on GitHub>"),
-            None => String::new(),
-        };
-
-        format!(
-            "{emoji} *{title}*\n\
-             {status} · `{agent}` · {duration} · #{task_id}\n\
-             \n\
-             {summary}{link_suffix}",
-            emoji = emoji,
-            title = self.title,
-            status = self.status,
-            agent = self.agent,
-            duration = duration,
-            task_id = self.task_id,
-            summary = self.summary,
-            link_suffix = link_suffix,
-        )
+        let title = format!("*{}*", self.title);
+        let agent = format!("`{}`", self.agent);
+        let link_suffix = self.github_link_suffix(|url| format!("<{url}|View on GitHub>"));
+        self.render(&ChannelBody {
+            title: &title,
+            status: &self.status,
+            agent: &agent,
+            task_id: &self.task_id,
+            summary: &self.summary,
+            link_suffix: &link_suffix,
+        })
     }
 
     /// Format for Discord (Markdown with bold instead of Telegram-style).
     pub fn format_discord(&self) -> String {
-        let emoji = status_emoji(&self.status);
-        let duration = format_duration(self.duration_seconds);
-        let link_suffix = match github_link(
-            self.repo.as_deref(),
-            &self.task_id,
-            self.pr_number.as_deref(),
-        ) {
-            Some(url) => format!("\n\n[View on GitHub]({url})"),
-            None => String::new(),
-        };
-
-        format!(
-            "{emoji} **{title}**\n\
-             {status} · `{agent}` · {duration} · #{task_id}\n\
-             \n\
-             {summary}{link_suffix}",
-            emoji = emoji,
-            title = self.title,
-            status = self.status,
-            agent = self.agent,
-            duration = duration,
-            task_id = self.task_id,
-            summary = self.summary,
-            link_suffix = link_suffix,
-        )
+        let title = format!("**{}**", self.title);
+        let agent = format!("`{}`", self.agent);
+        let link_suffix = self.github_link_suffix(|url| format!("[View on GitHub]({url})"));
+        self.render(&ChannelBody {
+            title: &title,
+            status: &self.status,
+            agent: &agent,
+            task_id: &self.task_id,
+            summary: &self.summary,
+            link_suffix: &link_suffix,
+        })
     }
 
     /// Format with project prefix (for General/subscribed channels).

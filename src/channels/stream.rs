@@ -85,6 +85,24 @@ async fn send_to_thread(
     );
 }
 
+/// Escape Telegram HTML before splitting so chunk sizes match the API payload
+async fn send_buffered(
+    channels: &Arc<ChannelRegistry>,
+    channel_name: &str,
+    thread_id: &str,
+    topic_id: Option<&str>,
+    buffered: String,
+) {
+    let to_send = if channel_name == "telegram" {
+        html_escape(&buffered)
+    } else {
+        buffered
+    };
+    for part in split_for_platform(&to_send, channel_name) {
+        send_to_thread(channels, channel_name, thread_id, topic_id, part).await;
+    }
+}
+
 /// Fan out output chunks from a task to all bound channel threads.
 ///
 /// Subscribes to the task's output broadcast in `transport`, accumulates
@@ -142,18 +160,8 @@ pub async fn fanout_output(
                                 .is_none_or(|t| now.duration_since(*t) >= rate);
 
                             if can_send && let Some(buffered) = buffers.remove(thread_key) {
-                                // Escape HTML for Telegram before splitting so chunk
-                                // boundaries are computed on the actual API payload size.
-                                let to_send = if ch_name == "telegram" {
-                                    html_escape(&buffered)
-                                } else {
-                                    buffered
-                                };
-                                let parts = split_for_platform(&to_send, ch_name);
-                                for part in parts {
-                                    send_to_thread(&channels, ch_name, thread_id, topic_id, part)
-                                        .await;
-                                }
+                                send_buffered(&channels, ch_name, thread_id, topic_id, buffered)
+                                    .await;
                                 last_send.insert(ch_name.to_string(), now);
                             }
                         }
@@ -173,16 +181,7 @@ pub async fn fanout_output(
                             else {
                                 continue;
                             };
-                            // Escape HTML for Telegram before splitting (same as above).
-                            let to_send = if ch_name == "telegram" {
-                                html_escape(&buffered)
-                            } else {
-                                buffered
-                            };
-                            let parts = split_for_platform(&to_send, ch_name);
-                            for part in parts {
-                                send_to_thread(&channels, ch_name, thread_id, topic_id, part).await;
-                            }
+                            send_buffered(&channels, ch_name, thread_id, topic_id, buffered).await;
                         }
                     }
                     tracing::debug!(task_id, "fanout: final chunk received, stream complete");
@@ -253,17 +252,8 @@ pub async fn fanout_output(
                                 .get(ch_name)
                                 .is_none_or(|t| now.duration_since(*t) >= rate);
                             if can_send {
-                                // Escape HTML for Telegram before splitting (same as above).
-                                let to_send = if ch_name == "telegram" {
-                                    html_escape(&buffered)
-                                } else {
-                                    buffered
-                                };
-                                let parts = split_for_platform(&to_send, ch_name);
-                                for part in parts {
-                                    send_to_thread(&channels, ch_name, thread_id, topic_id, part)
-                                        .await;
-                                }
+                                send_buffered(&channels, ch_name, thread_id, topic_id, buffered)
+                                    .await;
                                 last_send.insert(ch_name.to_string(), now);
                             } else {
                                 // Put it back for next round
