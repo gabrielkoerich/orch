@@ -5,7 +5,9 @@ use crate::engine;
 use crate::engine::auto_merge;
 use crate::engine::review_gate;
 use crate::engine::tasks::TaskManager;
-use crate::github::http::{GhHttp, RulesetCreateKind, classify_ruleset_create_error};
+use crate::github::http::{
+    GhHttp, REQUIRED_CHECK_RULESET_NAME, RulesetCreateKind, classify_ruleset_create_error,
+};
 use crate::github::types::{GitHubCheckRun, RequiredStatusCheck};
 use crate::plan;
 use crate::store;
@@ -174,6 +176,29 @@ pub(crate) fn checks_ready_for_ruleset(
     }
 }
 
+fn required_contexts_cover(
+    required: &[RequiredStatusCheck],
+    needed: &[RequiredStatusCheck],
+) -> bool {
+    needed.iter().all(|check| {
+        required
+            .iter()
+            .any(|existing| existing.context == check.context)
+    })
+}
+
+fn merge_missing_checks(
+    mut existing: Vec<RequiredStatusCheck>,
+    needed: &[RequiredStatusCheck],
+) -> Vec<RequiredStatusCheck> {
+    for check in needed {
+        if !existing.iter().any(|e| e.context == check.context) {
+            existing.push(check.clone());
+        }
+    }
+    existing
+}
+
 async fn apply_one(
     gh: &GhHttp,
     store: &Arc<TaskStore>,
@@ -191,17 +216,6 @@ async fn apply_one(
 
     let branch = gh.get_default_branch(repo).await?;
     let required = gh.get_required_status_check_contexts(repo, &branch).await?;
-    if !required.is_empty() {
-        return finish_applied(store, task_manager, task_id, repo).await;
-    }
-
-    // GitHub may have closed the issue via Closes on the PR, keep it open until the ruleset exists
-    reopen_if_closed(gh, repo, task_id).await;
-
-    if state == KV_REFUSED {
-        return Ok(());
-    }
-
     let sha = gh.get_branch_sha(repo, &branch).await?;
     let runs = gh.get_check_runs(repo, &sha).await?;
     let statuses = gh.get_commit_status_contexts(repo, &sha).await?;
@@ -212,13 +226,16 @@ async fn apply_one(
                 sha = %sha,
                 "CI bootstrap waiting for default-branch checks"
             );
+            reopen_if_closed(gh, repo, task_id).await;
             clear_wait(store, repo, task_id).await;
             return Ok(());
         }
         ChecksReady::Empty => {
+            reopen_if_closed(gh, repo, task_id).await;
             return wait_for_checks(gh, store, repo, task_id, &sha).await;
         }
         ChecksReady::Failed(failed) => {
+            reopen_if_closed(gh, repo, task_id).await;
             clear_wait(store, repo, task_id).await;
             return handle_failed_checks(gh, store, task_manager, repo, task_id, &sha, &failed)
                 .await;
@@ -229,37 +246,100 @@ async fn apply_one(
         }
     };
 
+    if required_contexts_cover(&required, &checks) {
+        return finish_applied(store, task_manager, task_id, repo).await;
+    }
+
+    // GitHub may have closed the issue via Closes on the PR, keep it open until the ruleset exists
+    reopen_if_closed(gh, repo, task_id).await;
+    if state == KV_REFUSED {
+        return Ok(());
+    }
+
     match gh.create_required_check_ruleset(repo, &checks).await {
         Ok(()) => finish_applied(store, task_manager, task_id, repo).await,
         Err(e) => {
             let err = e.to_string();
             match classify_ruleset_create_error(&err) {
                 RulesetCreateKind::NameTaken => {
-                    finish_applied(store, task_manager, task_id, repo).await
+                    apply_existing_orch_ruleset(gh, store, task_manager, repo, task_id, &checks)
+                        .await
                 }
-                RulesetCreateKind::Retryable => {
-                    tracing::info!(
-                        task_id,
-                        err = %err,
-                        "CI bootstrap ruleset create retrying"
-                    );
-                    Ok(())
-                }
-                RulesetCreateKind::CheckNeverRun => {
-                    tracing::info!(
-                        task_id,
-                        err = %err,
-                        "CI bootstrap ruleset create waiting, check has not run"
-                    );
-                    comment_never_run_once(gh, store, repo, task_id, &err).await;
-                    Ok(())
-                }
-                RulesetCreateKind::Refused | RulesetCreateKind::Other => {
-                    comment_refused(gh, repo, task_id, &err).await;
-                    store.kv_set(&kv_key(repo, task_id), KV_REFUSED).await?;
-                    Ok(())
-                }
+                kind => handle_ruleset_write_error(gh, store, repo, task_id, &err, kind).await,
             }
+        }
+    }
+}
+
+async fn apply_existing_orch_ruleset(
+    gh: &GhHttp,
+    store: &Arc<TaskStore>,
+    task_manager: &Arc<TaskManager>,
+    repo: &str,
+    task_id: &str,
+    needed: &[RequiredStatusCheck],
+) -> anyhow::Result<()> {
+    let Some((id, existing)) = gh
+        .get_named_ruleset_required_checks(repo, REQUIRED_CHECK_RULESET_NAME)
+        .await?
+    else {
+        tracing::info!(
+            task_id,
+            "CI bootstrap ruleset name taken, existing ruleset not found"
+        );
+        return Ok(());
+    };
+    if required_contexts_cover(&existing, needed) {
+        return finish_applied(store, task_manager, task_id, repo).await;
+    }
+    let merged = merge_missing_checks(existing, needed);
+    match gh.update_required_check_ruleset(repo, id, &merged).await {
+        Ok(()) => finish_applied(store, task_manager, task_id, repo).await,
+        Err(e) => {
+            let err = e.to_string();
+            handle_ruleset_write_error(
+                gh,
+                store,
+                repo,
+                task_id,
+                &err,
+                classify_ruleset_create_error(&err),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_ruleset_write_error(
+    gh: &GhHttp,
+    store: &Arc<TaskStore>,
+    repo: &str,
+    task_id: &str,
+    err: &str,
+    kind: RulesetCreateKind,
+) -> anyhow::Result<()> {
+    match kind {
+        RulesetCreateKind::NameTaken | RulesetCreateKind::Retryable => {
+            tracing::info!(
+                task_id,
+                err = %err,
+                "CI bootstrap ruleset create retrying"
+            );
+            Ok(())
+        }
+        RulesetCreateKind::CheckNeverRun => {
+            tracing::info!(
+                task_id,
+                err = %err,
+                "CI bootstrap ruleset create waiting, check has not run"
+            );
+            comment_never_run_once(gh, store, repo, task_id, err).await;
+            Ok(())
+        }
+        RulesetCreateKind::Refused | RulesetCreateKind::Other => {
+            comment_refused(gh, repo, task_id, err).await;
+            store.kv_set(&kv_key(repo, task_id), KV_REFUSED).await?;
+            Ok(())
         }
     }
 }
@@ -548,7 +628,7 @@ mod tests {
     use crate::store::UpsertExternal;
     use std::env;
     use std::ffi::OsString;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     struct EnvVarGuard {
@@ -654,6 +734,69 @@ mod tests {
             .and(path("/repos/o/r/branches/main"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "commit": { "sha": sha }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn mock_classic_required(server: &MockServer, context: &str, sha: &str) {
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "default_branch": "main"
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/branches/main/protection"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "required_status_checks": {
+                    "checks": [{ "context": context, "app_id": 15368 }]
+                }
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/rules/branches/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/branches/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "commit": { "sha": sha }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn mock_name_taken_ruleset(server: &MockServer, ruleset_checks: serde_json::Value) {
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/rulesets"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({
+                "message": "Name has already been taken"
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/rulesets"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "id": 9, "name": REQUIRED_CHECK_RULESET_NAME }
+            ])))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/rulesets/9"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 9,
+                "name": REQUIRED_CHECK_RULESET_NAME,
+                "rules": [{
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "required_status_checks": ruleset_checks
+                    }
+                }]
             })))
             .mount(server)
             .await;
@@ -773,6 +916,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn required_contexts_cover_matches_by_context_name() {
+        let required = vec![RequiredStatusCheck {
+            context: "cla/check".to_string(),
+            integration_id: None,
+        }];
+        let needed = vec![RequiredStatusCheck {
+            context: "test".to_string(),
+            integration_id: Some(15368),
+        }];
+        assert!(!required_contexts_cover(&required, &needed));
+        let required = vec![
+            RequiredStatusCheck {
+                context: "cla/check".to_string(),
+                integration_id: None,
+            },
+            RequiredStatusCheck {
+                context: "test".to_string(),
+                integration_id: None,
+            },
+        ];
+        assert!(required_contexts_cover(&required, &needed));
+    }
+
+    #[test]
+    fn merge_missing_checks_appends_contexts_the_ruleset_lacks() {
+        let existing = vec![RequiredStatusCheck {
+            context: "cla/check".to_string(),
+            integration_id: None,
+        }];
+        let needed = vec![
+            RequiredStatusCheck {
+                context: "cla/check".to_string(),
+                integration_id: Some(1),
+            },
+            RequiredStatusCheck {
+                context: "test".to_string(),
+                integration_id: Some(15368),
+            },
+        ];
+        assert_eq!(
+            merge_missing_checks(existing, &needed),
+            vec![
+                RequiredStatusCheck {
+                    context: "cla/check".to_string(),
+                    integration_id: None,
+                },
+                RequiredStatusCheck {
+                    context: "test".to_string(),
+                    integration_id: Some(15368),
+                },
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn hold_after_merge_records_pending_for_a_bootstrap_task() {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
@@ -818,57 +1016,212 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_pending_dones_when_required_checks_already_exist() {
+    async fn apply_pending_dones_when_required_checks_already_cover_default_branch_checks() {
         let _token = EnvVarGuard::set("GH_TOKEN", "test_token");
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/repos/o/r"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "default_branch": "main"
+        mock_classic_required(&server, "test", "deadbeef").await;
+        mock_runs_and_empty_status(
+            &server,
+            "deadbeef",
+            serde_json::json!([{
+                "id": 1,
+                "name": "test",
+                "status": "completed",
+                "conclusion": "success",
+                "app": { "id": 15368 }
+            }]),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/rulesets"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": 9
             })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/repos/o/r/branches/main/protection"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "required_status_checks": {
-                    "checks": [{ "context": "test", "app_id": 15368 }]
-                }
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/repos/o/r/rules/branches/main"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(0)
             .mount(&server)
             .await;
 
-        let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        let backend: Arc<dyn ExternalBackend> = Arc::new(NoopBackend);
-        let task_manager = Arc::new(TaskManager::with_store(
-            backend,
-            Arc::clone(&store),
-            "o/r".to_string(),
-        ));
-        let id = store
-            .upsert_external(&UpsertExternal {
-                repo: "o/r",
-                ext_id: "12",
-                title: "CI-01 Set up CI and tests",
-                body: &bootstrap_body(),
-                author: "u",
-                url: "",
-                labels: &[],
-                origin: "github",
-            })
-            .await
-            .unwrap();
-        store.update_status(id, TaskStatus::Approved).await.unwrap();
-        store
-            .kv_set(&kv_key("o/r", "12"), KV_PENDING)
+        let (store, task_manager, id) = pending_store().await;
+        let gh = GhHttp::for_test(server.uri(), None);
+        apply_pending_with(&gh, &store, &task_manager, "o/r")
             .await
             .unwrap();
 
+        let stored = store.get(id).await.unwrap();
+        assert_eq!(stored.status, TaskStatus::Done);
+        assert_eq!(
+            store.kv_get(&kv_key("o/r", "12")).await.unwrap().as_deref(),
+            Some(KV_APPLIED)
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_pending_creates_a_ruleset_when_an_unrelated_required_check_exists() {
+        let _token = EnvVarGuard::set("GH_TOKEN", "test_token");
+        let server = MockServer::start().await;
+        mock_classic_required(&server, "cla/check", "deadbeef").await;
+        mock_runs_and_empty_status(
+            &server,
+            "deadbeef",
+            serde_json::json!([{
+                "id": 1,
+                "name": "test",
+                "status": "completed",
+                "conclusion": "success",
+                "app": { "id": 15368 }
+            }]),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/rulesets"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": 9,
+                "name": REQUIRED_CHECK_RULESET_NAME
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (store, task_manager, id) = pending_store().await;
+        let gh = GhHttp::for_test(server.uri(), None);
+        apply_pending_with(&gh, &store, &task_manager, "o/r")
+            .await
+            .unwrap();
+
+        let stored = store.get(id).await.unwrap();
+        assert_eq!(stored.status, TaskStatus::Done);
+        assert_eq!(
+            store.kv_get(&kv_key("o/r", "12")).await.unwrap().as_deref(),
+            Some(KV_APPLIED)
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_pending_holds_when_an_unrelated_required_check_exists_and_checks_are_pending() {
+        let _token = EnvVarGuard::set("GH_TOKEN", "test_token");
+        let server = MockServer::start().await;
+        mock_classic_required(&server, "cla/check", "deadbeef").await;
+        mock_runs_and_empty_status(
+            &server,
+            "deadbeef",
+            serde_json::json!([{
+                "id": 1,
+                "name": "test",
+                "status": "in_progress",
+                "conclusion": null,
+                "app": { "id": 15368 }
+            }]),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/rulesets"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": 9
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let (store, task_manager, id) = pending_store().await;
+        let gh = GhHttp::for_test(server.uri(), None);
+        apply_pending_with(&gh, &store, &task_manager, "o/r")
+            .await
+            .unwrap();
+
+        let stored = store.get(id).await.unwrap();
+        assert_eq!(stored.status, TaskStatus::Approved);
+        assert_eq!(
+            store.kv_get(&kv_key("o/r", "12")).await.unwrap().as_deref(),
+            Some(KV_PENDING)
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_pending_dones_when_name_taken_and_orch_ruleset_lists_the_checks() {
+        let _token = EnvVarGuard::set("GH_TOKEN", "test_token");
+        let server = MockServer::start().await;
+        mock_unprotected_main(&server, "deadbeef").await;
+        mock_runs_and_empty_status(
+            &server,
+            "deadbeef",
+            serde_json::json!([{
+                "id": 1,
+                "name": "test",
+                "status": "completed",
+                "conclusion": "success",
+                "app": { "id": 15368 }
+            }]),
+        )
+        .await;
+        mock_name_taken_ruleset(
+            &server,
+            serde_json::json!([{ "context": "test", "integration_id": 15368 }]),
+        )
+        .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/o/r/rulesets/9"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 9
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let (store, task_manager, id) = pending_store().await;
+        let gh = GhHttp::for_test(server.uri(), None);
+        apply_pending_with(&gh, &store, &task_manager, "o/r")
+            .await
+            .unwrap();
+
+        let stored = store.get(id).await.unwrap();
+        assert_eq!(stored.status, TaskStatus::Done);
+        assert_eq!(
+            store.kv_get(&kv_key("o/r", "12")).await.unwrap().as_deref(),
+            Some(KV_APPLIED)
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_pending_updates_the_orch_ruleset_when_name_taken_and_checks_are_missing() {
+        let _token = EnvVarGuard::set("GH_TOKEN", "test_token");
+        let server = MockServer::start().await;
+        mock_unprotected_main(&server, "deadbeef").await;
+        mock_runs_and_empty_status(
+            &server,
+            "deadbeef",
+            serde_json::json!([{
+                "id": 1,
+                "name": "test",
+                "status": "completed",
+                "conclusion": "success",
+                "app": { "id": 15368 }
+            }]),
+        )
+        .await;
+        mock_name_taken_ruleset(&server, serde_json::json!([{ "context": "cla/check" }])).await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/o/r/rulesets/9"))
+            .and(body_partial_json(serde_json::json!({
+                "name": REQUIRED_CHECK_RULESET_NAME,
+                "rules": [{
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "required_status_checks": [
+                            { "context": "cla/check" },
+                            { "context": "test", "integration_id": 15368 }
+                        ]
+                    }
+                }]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 9,
+                "name": REQUIRED_CHECK_RULESET_NAME
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (store, task_manager, id) = pending_store().await;
         let gh = GhHttp::for_test(server.uri(), None);
         apply_pending_with(&gh, &store, &task_manager, "o/r")
             .await

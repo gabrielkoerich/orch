@@ -927,6 +927,31 @@ impl GhHttp {
         Ok(text)
     }
 
+    /// PUT with JSON body, returns raw response.
+    async fn put_json_raw(&self, url: &str, body: &serde_json::Value) -> anyhow::Result<String> {
+        Self::check_backoff(url)?;
+        let auth = self.auth_header(url).await?;
+        let make_req = || {
+            Ok(self
+                .client
+                .put(url)
+                .json(body)
+                .header(header::AUTHORIZATION, auth.clone())
+                .header(header::ACCEPT, "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28"))
+        };
+        let resp = self.send_with_retries(make_req, false).await?;
+        let status = resp.status();
+        let text_res = resp.text().await;
+        if !status.is_success() {
+            let text = text_res.unwrap_or_default();
+            Self::maybe_record_rate_limit_from_body(status, &text);
+            anyhow::bail!("GitHub API PUT {url} failed ({status}): {text}");
+        }
+        let text = text_res?;
+        Ok(text)
+    }
+
     /// DELETE request.
     async fn delete(&self, url: &str) -> anyhow::Result<StatusCode> {
         Self::check_backoff(url)?;
@@ -2434,6 +2459,46 @@ impl GhHttp {
         let url = format!("{}/repos/{repo}/rulesets", self.api_root());
         let payload = required_check_ruleset_payload(checks);
         self.post_json_raw(&url, &payload).await?;
+        Ok(())
+    }
+
+    /// Id and required checks of the repository ruleset named `name`, if it exists
+    pub async fn get_named_ruleset_required_checks(
+        &self,
+        repo: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<(i64, Vec<RequiredStatusCheck>)>> {
+        let url = format!("{}/repos/{repo}/rulesets", self.api_root());
+        let rulesets: Vec<serde_json::Value> =
+            self.get_all_pages(&url, &[("per_page", "100")]).await?;
+        let Some(id) = rulesets.iter().find_map(|ruleset| {
+            if ruleset.get("name").and_then(|n| n.as_str()) != Some(name) {
+                return None;
+            }
+            ruleset.get("id").and_then(serde_json::Value::as_i64)
+        }) else {
+            return Ok(None);
+        };
+        let url = format!("{}/repos/{repo}/rulesets/{id}", self.api_root());
+        let value: serde_json::Value = self.get_json(&url).await?;
+        let rules = value
+            .get("rules")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(Some((id, parse_ruleset_required_status_checks(&rules))))
+    }
+
+    /// Replace the required checks on an existing repository ruleset
+    pub async fn update_required_check_ruleset(
+        &self,
+        repo: &str,
+        ruleset_id: i64,
+        checks: &[RequiredStatusCheck],
+    ) -> anyhow::Result<()> {
+        let url = format!("{}/repos/{repo}/rulesets/{ruleset_id}", self.api_root());
+        let payload = required_check_ruleset_payload(checks);
+        self.put_json_raw(&url, &payload).await?;
         Ok(())
     }
 
@@ -5482,6 +5547,93 @@ mod tests {
             let (gh, _guard) = client(&server);
             gh.create_required_check_ruleset(
                 "o/r",
+                &[RequiredStatusCheck {
+                    context: "test".to_string(),
+                    integration_id: Some(15368),
+                }],
+            )
+            .await
+            .unwrap();
+        }
+
+        #[tokio::test]
+        async fn get_named_ruleset_required_checks_reads_the_named_ruleset() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/rulesets"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    { "id": 8, "name": "other" },
+                    { "id": 9, "name": REQUIRED_CHECK_RULESET_NAME }
+                ])))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/rulesets/9"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": 9,
+                    "name": REQUIRED_CHECK_RULESET_NAME,
+                    "rules": [{
+                        "type": "required_status_checks",
+                        "parameters": {
+                            "required_status_checks": [
+                                { "context": "test", "integration_id": 15368 }
+                            ]
+                        }
+                    }]
+                })))
+                .mount(&server)
+                .await;
+            let (gh, _guard) = client(&server);
+            let (id, checks) = gh
+                .get_named_ruleset_required_checks("o/r", REQUIRED_CHECK_RULESET_NAME)
+                .await
+                .unwrap()
+                .expect("ruleset");
+            assert_eq!(id, 9);
+            assert_eq!(
+                checks,
+                vec![RequiredStatusCheck {
+                    context: "test".to_string(),
+                    integration_id: Some(15368),
+                }]
+            );
+        }
+
+        #[tokio::test]
+        async fn get_named_ruleset_required_checks_is_none_when_missing() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/rulesets"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    { "id": 8, "name": "other" }
+                ])))
+                .mount(&server)
+                .await;
+            let (gh, _guard) = client(&server);
+            assert!(
+                gh.get_named_ruleset_required_checks("o/r", REQUIRED_CHECK_RULESET_NAME)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn update_required_check_ruleset_puts_the_payload() {
+            let server = MockServer::start().await;
+            Mock::given(method("PUT"))
+                .and(path("/repos/o/r/rulesets/9"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": 9,
+                    "name": REQUIRED_CHECK_RULESET_NAME
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (gh, _guard) = client(&server);
+            gh.update_required_check_ruleset(
+                "o/r",
+                9,
                 &[RequiredStatusCheck {
                     context: "test".to_string(),
                     integration_id: Some(15368),
