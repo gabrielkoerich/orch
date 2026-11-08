@@ -6,6 +6,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, bail};
 use tokio::process::Command;
@@ -21,6 +22,8 @@ const MAX_IMAGES: usize = 12;
 const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
 const LOCAL_REF: &str = "refs/orch/screenshots";
+const PUSH_ATTEMPTS: u32 = 5;
+static INDEX_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// An image checked and placed at its path on the screenshots branch
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +160,21 @@ pub fn build_comment(
     body
 }
 
+/// PR comment when the images never landed on the screenshots branch
+pub fn build_unpublished_comment(note: Option<&str>, skipped: &[String]) -> String {
+    let mut body = String::from("## Screenshots\n\nThe screenshots could not be published.\n");
+    if !skipped.is_empty() {
+        body.push_str("\nSkipped:\n");
+        for reason in skipped {
+            let _ = writeln!(body, "- {}", one_line(reason));
+        }
+    }
+    if let Some(note) = note.map(str::trim).filter(|n| !n.is_empty()) {
+        let _ = write!(body, "\n> {}\n", one_line(note));
+    }
+    body
+}
+
 async fn git_out(dir: &Path, index: Option<&Path>, args: &[&str]) -> anyhow::Result<String> {
     let mut cmd: Command = git_ops::git().await;
     cmd.arg("-C").arg(dir).args(args);
@@ -203,7 +221,11 @@ pub async fn publish(
         bail!("no images to publish");
     }
     let git_dir = git_out(worktree, None, &["rev-parse", "--absolute-git-dir"]).await?;
-    let index = PathBuf::from(git_dir).join(format!("orch-screenshots-index-{}", process::id()));
+    let index = PathBuf::from(git_dir).join(format!(
+        "orch-screenshots-index-{}-{}-{pr_number}",
+        process::id(),
+        INDEX_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let result = push_images(worktree, &index, images, pr_number).await;
     let _ = fs::remove_file(&index);
     result
@@ -215,21 +237,69 @@ async fn push_images(
     images: &[Prepared],
     pr_number: u64,
 ) -> anyhow::Result<String> {
-    let fetch_spec = format!("+refs/heads/{SCREENSHOTS_BRANCH}:{LOCAL_REF}");
-    let parent = match git_out(worktree, None, &["fetch", "origin", &fetch_spec]).await {
-        Ok(_) => git_out(worktree, None, &["rev-parse", "--verify", LOCAL_REF])
-            .await
-            .ok(),
-        Err(_) => None,
-    };
-
-    if let Some(parent) = &parent {
-        git_out(worktree, Some(index), &["read-tree", parent]).await?;
-    }
+    let mut blobs = Vec::with_capacity(images.len());
     for image in images {
         let source = image.source.to_string_lossy();
         let blob = git_out(worktree, None, &["hash-object", "-w", "--", &source]).await?;
-        let entry = format!("100644,{blob},{}", image.branch_path);
+        blobs.push((blob, image.branch_path.clone()));
+    }
+
+    let mut last_nff = None;
+    for attempt in 1..=PUSH_ATTEMPTS {
+        match push_once(worktree, index, &blobs, pr_number).await {
+            Ok(commit) => return Ok(commit),
+            Err(e) if push_lost_the_remote_tip(&e) => {
+                tracing::warn!(
+                    attempt,
+                    err = %e,
+                    "screenshot push was not a fast-forward, fetching again"
+                );
+                last_nff = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_nff.unwrap_or_else(|| anyhow::anyhow!("screenshot push failed")))
+}
+
+async fn fetch_parent(worktree: &Path) -> anyhow::Result<Option<String>> {
+    let fetch_spec = format!("+refs/heads/{SCREENSHOTS_BRANCH}:{LOCAL_REF}");
+    match git_out(worktree, None, &["fetch", "origin", &fetch_spec]).await {
+        Ok(_) => Ok(Some(
+            git_out(worktree, None, &["rev-parse", "--verify", LOCAL_REF])
+                .await
+                .context("screenshots branch ref missing after a successful fetch")?,
+        )),
+        Err(e) if git_ops::is_missing_remote_ref_error(&e) => Ok(None),
+        // A fetch error other than a missing branch must not become a root commit
+        Err(e) => Err(e),
+    }
+}
+
+fn push_lost_the_remote_tip(err: &anyhow::Error) -> bool {
+    let s = err.to_string();
+    let lower = s.to_ascii_lowercase();
+    lower.contains("non-fast-forward")
+        || s.contains("! [rejected]")
+        || lower.contains("fetch first")
+        || lower.contains("reference already exists")
+        || lower.contains("cannot lock ref")
+}
+
+async fn push_once(
+    worktree: &Path,
+    index: &Path,
+    blobs: &[(String, String)],
+    pr_number: u64,
+) -> anyhow::Result<String> {
+    let parent = fetch_parent(worktree).await?;
+    if let Some(parent) = &parent {
+        git_out(worktree, Some(index), &["read-tree", parent]).await?;
+    } else {
+        git_out(worktree, Some(index), &["read-tree", "--empty"]).await?;
+    }
+    for (blob, path) in blobs {
+        let entry = format!("100644,{blob},{path}");
         git_out(
             worktree,
             Some(index),
@@ -239,12 +309,11 @@ async fn push_images(
     }
     let tree = git_out(worktree, Some(index), &["write-tree"]).await?;
     let message = format!("Screenshots for PR #{pr_number}");
-    let mut args = vec!["commit-tree", &tree, "-m", &message];
+    let mut args = vec!["commit-tree", tree.as_str(), "-m", message.as_str()];
     if let Some(parent) = &parent {
-        args.extend(["-p", parent]);
+        args.extend(["-p", parent.as_str()]);
     }
     let commit = git_out(worktree, None, &args).await?;
-
     let refspec = format!("{commit}:refs/heads/{SCREENSHOTS_BRANCH}");
     git_out(worktree, None, &["push", "origin", &refspec]).await?;
     Ok(commit)
@@ -255,6 +324,7 @@ mod tests {
     use std::process::Command as StdCommand;
     use std::slice;
 
+    use super::git_ops;
     use super::*;
 
     const PNG_HEADER: &[u8] = b"\x89PNG\r\n\x1a\n";
@@ -321,6 +391,35 @@ mod tests {
         );
         assert!(!body.contains("!["));
         assert!(body.contains("> no browser"));
+    }
+
+    #[test]
+    fn unpublished_comment_says_the_images_never_landed() {
+        let body = build_unpublished_comment(
+            Some("ui-screenshot skill missing"),
+            &["shot.png: empty or larger than 10 MB".into()],
+        );
+        assert!(body.starts_with("## Screenshots"));
+        assert!(body.contains("The screenshots could not be published."));
+        assert!(!body.contains("!["));
+        assert!(body.contains("Skipped:"));
+        assert!(body.contains("shot.png: empty or larger than 10 MB"));
+        assert!(body.contains("> ui-screenshot skill missing"));
+    }
+
+    #[test]
+    fn push_lost_the_remote_tip_detects_a_diverged_or_raced_create() {
+        let nff = anyhow::anyhow!("git push failed: ! [rejected] a -> a (non-fast-forward)");
+        assert!(push_lost_the_remote_tip(&nff));
+        assert!(push_lost_the_remote_tip(&anyhow::anyhow!(
+            "git push failed: ! [rejected] a -> a (fetch first)"
+        )));
+        assert!(push_lost_the_remote_tip(&anyhow::anyhow!(
+            "git push failed: remote: error: cannot lock ref 'refs/heads/orch/screenshots': reference already exists\n ! [remote rejected] a -> orch/screenshots (reference already exists)"
+        )));
+        assert!(!push_lost_the_remote_tip(&anyhow::anyhow!(
+            "git push failed: remote: fatal error in commit_refs\n ! [remote rejected] a -> a (pre-receive hook declined)"
+        )));
     }
 
     #[test]
@@ -391,5 +490,156 @@ mod tests {
             git_run(&clone, &["branch", "--list", SCREENSHOTS_BRANCH]),
             ""
         );
+    }
+
+    fn init_origin_and_clone(tmp: &Path) -> (PathBuf, PathBuf) {
+        let origin = tmp.join("origin.git");
+        let clone = tmp.join("clone");
+        git_run(tmp, &["init", "--bare", "-q", "origin.git"]);
+        git_run(tmp, &["init", "-q", "-b", "main", "clone"]);
+        git_run(&clone, &["config", "user.email", "t@t"]);
+        git_run(&clone, &["config", "user.name", "t"]);
+        git_run(
+            &clone,
+            &["remote", "add", "origin", &origin.to_string_lossy()],
+        );
+        fs::write(clone.join("f"), "x").unwrap();
+        git_run(&clone, &["add", "f"]);
+        git_run(&clone, &["commit", "-qm", "init"]);
+        (origin, clone)
+    }
+
+    fn write_hook(origin: &Path, body: &str) {
+        let hook = origin.join("hooks/pre-receive");
+        fs::write(&hook, body).unwrap();
+        let status = StdCommand::new("chmod")
+            .arg("+x")
+            .arg(&hook)
+            .status()
+            .unwrap();
+        assert!(status.success(), "chmod +x {hook:?}");
+    }
+
+    fn screenshots_tip(origin: &Path) -> String {
+        git_run(
+            origin,
+            &["rev-parse", &format!("refs/heads/{SCREENSHOTS_BRANCH}")],
+        )
+    }
+
+    fn screenshots_files(origin: &Path, commit: &str) -> String {
+        git_run(origin, &["ls-tree", "-r", "--name-only", commit])
+    }
+
+    fn screenshots_branch_exists(origin: &Path) -> bool {
+        StdCommand::new("git")
+            .arg("-C")
+            .arg(origin)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{SCREENSHOTS_BRANCH}"),
+            ])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    #[tokio::test]
+    async fn publish_retries_when_two_worktrees_push_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (origin, clone) = init_origin_and_clone(tmp.path());
+        let other = tmp.path().join("other");
+        git_run(
+            &clone,
+            &["worktree", "add", "-q", &other.to_string_lossy(), "HEAD"],
+        );
+        write_hook(&origin, "#!/bin/sh\nsleep 0.2\n");
+
+        fs::write(clone.join("a.png"), PNG_HEADER).unwrap();
+        fs::write(other.join("b.png"), PNG_HEADER).unwrap();
+        let roots_a = allowed_roots(&clone).await;
+        let roots_b = allowed_roots(&other).await;
+        let (images_a, _) = prepare(&[shot("a.png", "A")], &clone, &roots_a, 3);
+        let (images_b, _) = prepare(&[shot("b.png", "B")], &other, &roots_b, 4);
+
+        let (first, second) =
+            tokio::join!(publish(&clone, &images_a, 3), publish(&other, &images_b, 4),);
+        let first = first.expect("first worktree publish");
+        let second = second.expect("second worktree publish");
+        assert_ne!(first, second);
+
+        let tip = screenshots_tip(&origin);
+        let files = screenshots_files(&origin, &tip);
+        assert!(files.contains("pr-3/1-a.png"), "{files}");
+        assert!(files.contains("pr-4/1-b.png"), "{files}");
+        let log = git_run(
+            &origin,
+            &[
+                "log",
+                "--format=%H",
+                &format!("refs/heads/{SCREENSHOTS_BRANCH}"),
+            ],
+        );
+        assert!(log.contains(&first), "{log}");
+        assert!(log.contains(&second), "{log}");
+    }
+
+    #[tokio::test]
+    async fn publish_skips_a_root_commit_when_fetch_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (origin, clone) = init_origin_and_clone(tmp.path());
+        let missing = tmp.path().join("missing.git");
+        git_run(
+            &clone,
+            &["remote", "set-url", "origin", &missing.to_string_lossy()],
+        );
+        git_run(
+            &clone,
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                &origin.to_string_lossy(),
+            ],
+        );
+
+        fs::write(clone.join("home.png"), PNG_HEADER).unwrap();
+        let roots = vec![fs::canonicalize(&clone).unwrap()];
+        let (images, _) = prepare(&[shot("home.png", "Home")], &clone, &roots, 3);
+        let err = publish(&clone, &images, 3).await.unwrap_err();
+        assert!(
+            !git_ops::is_missing_remote_ref_error(&err),
+            "fetch failed for a reason other than a missing branch: {err}"
+        );
+        assert!(
+            !screenshots_branch_exists(&origin),
+            "a root commit must not be pushed when fetch failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_stops_after_non_fast_forward_retries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (origin, clone) = init_origin_and_clone(tmp.path());
+        write_hook(
+            &origin,
+            "#!/bin/sh\necho 'error: non-fast-forward' >&2\nexit 1\n",
+        );
+
+        fs::write(clone.join("home.png"), PNG_HEADER).unwrap();
+        let roots = vec![fs::canonicalize(&clone).unwrap()];
+        let (images, _) = prepare(&[shot("home.png", "Home")], &clone, &roots, 3);
+        let err = publish(&clone, &images, 3).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .to_ascii_lowercase()
+                .contains("non-fast-forward"),
+            "{err}"
+        );
+        assert!(!screenshots_branch_exists(&origin));
     }
 }
