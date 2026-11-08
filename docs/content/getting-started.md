@@ -97,8 +97,6 @@ All runtime state lives in `~/.orch/` (`ORCH_HOME`):
 |------|-------------|
 | `config.yml` | Global runtime configuration |
 | `orch.db` | SQLite task database (internal tasks, metrics, KV store) |
-| `skills.yml` | Approved skill repositories and catalog |
-| `skills/` | Cloned skill repositories (refreshed automatically on the engine's sync tick) |
 | `projects/` | Bare clones added via `orch project add` |
 | `worktrees/` | Agent worktrees (`<project>/<branch>/`) |
 | `state/` | Runtime state (logs, prompts, per-task artifacts) |
@@ -118,7 +116,7 @@ Source files:
 ## How It Works
 
 1. **Add a task** via `orch task add` (or via a GitHub issue / scheduled job).
-2. **Route the task:** the router picks an agent and the agent's model for the task's complexity. `router.mode` is `round_robin` by default. In `llm` mode the router also builds a profile and selects skills.
+2. **Route the task:** the router picks an agent and the agent's model for the task's complexity. `router.mode` is `round_robin` by default. In `llm` mode the router also builds a profile.
 3. **Run the task** — the chosen executor runs in agentic mode inside a tmux session in the task worktree (`PROJECT_DIR`) with controlled tool access.
 4. **Output** — the agent writes results to `~/.orch/state/{repo}/tasks/{id}/attempts/{n}/output.json`; task metadata is updated in the SQLite store (`~/.orch/orch.db`).
 5. **Review:** a different agent reviews the PR when one is available (the authoring agent reviews otherwise) and posts an `## Automated Review` comment, or an App review in `review.mode: app`. An approved task waits in `approved` until CI passes and orch merges the PR.

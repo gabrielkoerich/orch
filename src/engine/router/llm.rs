@@ -5,11 +5,10 @@
 //! strategies (round-robin, weighted, label-based) in `mod.rs`.
 //!
 //! # Responsibilities
-//! - Building the routing prompt from a task and the skills catalog
+//! - Building the routing prompt from a task
 //! - Calling the configured LLM agent (`claude`, `codex`, or `opencode`)
 //! - Parsing the JSON response with multiple fallback strategies
 //! - Sanity-checking the routing decision
-//! - Loading and caching the skills catalog from disk
 
 use super::{AgentProfile, RouteResult, RouterConfig};
 use crate::backends::ExternalTask;
@@ -21,14 +20,9 @@ use crate::engine::runner::response;
 use crate::home;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::env;
-use std::fs;
-use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::fs as tokio_fs;
-use tokio::sync::Mutex;
-use tokio::task;
 
 /// Prefix used to identify router LLM timeout errors in error messages.
 /// This lets callers (route_with_llm in mod.rs) distinguish timeouts from
@@ -52,16 +46,12 @@ pub(crate) struct LlmRouteResponse {
     pub(crate) reason: String,
     #[serde(default)]
     pub(crate) profile: LlmAgentProfile,
-    #[serde(default)]
-    pub(crate) selected_skills: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct LlmAgentProfile {
     #[serde(default)]
     pub(crate) role: String,
-    #[serde(default)]
-    pub(crate) skills: Vec<String>,
     #[serde(default)]
     pub(crate) tools: Vec<String>,
     #[serde(default)]
@@ -227,7 +217,7 @@ fn detect_error_envelope(value: &serde_json::Value) -> Option<String> {
     // error-bearing fields. Collect candidate strings from common keys
     // such as `message`, `error`, `result`, `detail`, `reason`, and
     // numeric `status` values. This avoids false positives when tool
-    // names or skill ids contain words like "authentication".
+    // names contain words like "authentication".
     let mut candidates = Vec::new();
 
     collect_error_candidates(value, &mut candidates);
@@ -461,75 +451,12 @@ pub(super) fn apply_self_routing_penalty(
 
 /// Handles LLM-based task routing.
 ///
-/// `LlmRouter` is a self-contained unit: it builds a prompt from the task and
-/// the skills catalog, calls the configured LLM agent, parses the JSON
-/// response, and applies sanity checks. It holds only the skills catalog
-/// cache as mutable state.
-///
-/// `Router` holds a `LlmRouter` and delegates `route_with_llm` to it.
-pub(super) struct LlmRouter {
-    /// Cached skills catalog loaded once to avoid repeated blocking I/O.
-    skills_catalog: Mutex<Option<String>>,
-}
-
-/// Scan a skills directory for skill subdirectories containing SKILL.md files.
-/// Returns a JSON array of skills with id and name, or None if the directory
-/// is not accessible or contains no valid skills.
-///
-/// This function is synchronous and should only be called from within a
-/// `tokio::task::spawn_blocking` context to avoid blocking the async reactor.
-fn scan_skills_directory(skills_dir: &Path) -> Option<String> {
-    if !skills_dir.exists() {
-        return None;
-    }
-
-    let mut skills = Vec::new();
-    if let Ok(entries) = fs::read_dir(skills_dir) {
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!(path = %skills_dir.display(), err = %e, "error reading skills directory entry");
-                    continue;
-                }
-            };
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-
-            let file_name = path.file_name().unwrap_or_default();
-            let skill_id = file_name.to_string_lossy().into_owned();
-
-            let skill_file = path.join("SKILL.md");
-            if !skill_file.exists() {
-                continue;
-            }
-
-            let content = fs::read_to_string(&skill_file).unwrap_or_default();
-            let name = content
-                .lines()
-                .next()
-                .unwrap_or("")
-                .trim_start_matches("# ")
-                .to_string();
-
-            skills.push(serde_json::json!({"id": skill_id, "name": name}));
-        }
-    }
-
-    if skills.is_empty() {
-        return None;
-    }
-
-    serde_json::to_string(&skills).ok()
-}
+/// `Router` holds one and delegates `route_with_llm` to it.
+pub(super) struct LlmRouter;
 
 impl LlmRouter {
     pub(super) fn new() -> Self {
-        Self {
-            skills_catalog: Mutex::new(None),
-        }
+        Self
     }
 
     /// Route using LLM classification with an explicit router agent and model.
@@ -557,10 +484,8 @@ impl LlmRouter {
             anyhow::bail!("no agent CLIs found in PATH");
         }
 
-        // Build the routing prompt (async; offload blocking work inside)
-        let prompt = self
-            .build_routing_prompt(task, available_agents, router_agent, &config.weights)
-            .await?;
+        let prompt =
+            Self::build_routing_prompt(task, available_agents, router_agent, &config.weights);
 
         // Save prompt and response to per-task routing dir for debugging
         let routing_dir = home::task_dir_async(repo, &task.id.0)
@@ -614,7 +539,6 @@ impl LlmRouter {
         // Build the profile
         let mut profile = AgentProfile {
             role: llm_response.profile.role,
-            skills: llm_response.profile.skills,
             tools: if llm_response.profile.tools.is_empty() {
                 config.allowed_tools.clone()
             } else {
@@ -640,14 +564,6 @@ impl LlmRouter {
         // Get model for complexity
         let (model, tier_warning) =
             RouteResult::resolve_model(config, &agent, &complexity, &task.id.0);
-
-        // Build selected skills list
-        let mut selected_skills = llm_response.selected_skills;
-        for skill in &config.default_skills {
-            if !selected_skills.contains(skill) {
-                selected_skills.push(skill.clone());
-            }
-        }
 
         // Save raw response for debugging
         let response_path = routing_dir.join("response.txt");
@@ -713,25 +629,21 @@ impl LlmRouter {
             estimate,
             reason: llm_response.reason,
             profile,
-            selected_skills,
             warning,
         })
     }
 
     /// Build the routing prompt from the template.
-    async fn build_routing_prompt(
-        &self,
+    fn build_routing_prompt(
         task: &ExternalTask,
         available_agents: &[String],
         router_agent: &str,
         configured_weights: &HashMap<String, f64>,
-    ) -> anyhow::Result<String> {
+    ) -> String {
         let template = include_str!("../../../prompts/route.md");
 
-        // Build available agents string
         let available_agents_str = available_agents.join(", ");
 
-        // Build weights string for the prompt
         let weights_str = if configured_weights.is_empty() {
             "No weights configured — distribute evenly.".to_string()
         } else {
@@ -747,92 +659,16 @@ impl LlmRouter {
                 .join(", ")
         };
 
-        // Build labels string
         let labels = task.labels.join(", ");
 
-        // Load skills catalog if available — perform blocking FS work off the async reactor.
-        let skills_catalog = match self.load_skills_catalog().await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to load skills catalog, routing without skills");
-                "[]".to_string()
-            }
-        };
-
-        // Simple template substitution
-        let prompt = template
+        template
             .replace("{{ROUTER_AGENT}}", router_agent)
             .replace("{{AVAILABLE_AGENTS}}", &available_agents_str)
             .replace("{{AGENT_WEIGHTS}}", &weights_str)
-            .replace("{{SKILLS_CATALOG}}", &skills_catalog)
             .replace("{{TASK_ID}}", &task.id.0)
             .replace("{{TASK_TITLE}}", &task.title)
             .replace("{{TASK_LABELS}}", &labels)
-            .replace("{{TASK_BODY}}", &task.body);
-
-        Ok(prompt)
-    }
-
-    /// Invalidate the skills catalog cache so the next routing call reloads from disk.
-    ///
-    /// Called after `skills_sync()` updates skill files on disk.
-    pub(super) async fn invalidate_skills_catalog(&self) {
-        let mut cache = self.skills_catalog.lock().await;
-        *cache = None;
-    }
-
-    /// Load skills catalog from skills.yml or skills directory.
-    /// Cached after first load to avoid blocking I/O in async context.
-    async fn load_skills_catalog(&self) -> anyhow::Result<String> {
-        // First, check the cache with a short-lived lock
-        {
-            let cache = self.skills_catalog.lock().await;
-            if let Some(ref catalog) = *cache {
-                return Ok(catalog.clone());
-            }
-        } // Lock is dropped here
-
-        // Cache miss — offload loading to blocking thread pool.
-        // Capture only what we need to avoid holding any locks across the await.
-        let skills_dir_opt: Option<PathBuf> = match env::var("ORCH_HOME") {
-            Ok(orch_home) => Some(PathBuf::from(orch_home).join("skills")),
-            Err(_) => None,
-        };
-
-        let catalog = task::spawn_blocking(move || -> String {
-            // Try skills.yml in current directory
-            if let Ok(content) = fs::read_to_string("skills.yml")
-                && let Ok(yaml) = serde_norway::from_str::<serde_norway::Value>(&content)
-                && let Some(skills) = yaml.get("skills")
-                && let Ok(json) = serde_json::to_string(skills)
-            {
-                return json;
-            }
-
-            // Try ORCH_HOME/skills directory
-            if let Some(skills_dir) = skills_dir_opt.as_ref()
-                && let Some(catalog) = scan_skills_directory(skills_dir)
-            {
-                return catalog;
-            }
-
-            // Try ~/.orch/skills
-            if let Ok(skills_dir) = home::skills_dir()
-                && let Some(catalog) = scan_skills_directory(&skills_dir)
-            {
-                return catalog;
-            }
-
-            "[]".to_string()
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?;
-
-        // Update the cache with a second short-lived lock
-        let mut cache = self.skills_catalog.lock().await;
-        *cache = Some(catalog.clone());
-
-        Ok(catalog)
+            .replace("{{TASK_BODY}}", &task.body)
     }
 
     /// Call the specified router LLM to classify the task.
@@ -1269,10 +1105,9 @@ mod tests {
         }
     }
 
-    fn make_profile(skills: &[&str]) -> AgentProfile {
+    fn make_profile() -> AgentProfile {
         AgentProfile {
             role: "developer".to_string(),
-            skills: skills.iter().map(ToString::to_string).collect(),
             tools: vec!["git".to_string()],
             constraints: vec![],
         }
@@ -1453,8 +1288,8 @@ mod tests {
         assert_eq!(resp.executor, "opencode");
         assert_eq!(resp.complexity, "complex");
         assert_eq!(resp.profile.role, "architect");
-        assert_eq!(resp.profile.skills, vec!["rust", "design"]);
-        assert_eq!(resp.selected_skills, vec!["gh"]);
+        assert_eq!(resp.profile.tools, vec!["git", "rg"]);
+        assert_eq!(resp.profile.constraints, vec!["no unsafe"]);
     }
 
     #[test]
@@ -1623,11 +1458,7 @@ mod tests {
         assert_eq!(resp.executor, "claude");
         assert_eq!(resp.complexity, "");
         assert_eq!(resp.reason, "");
-        assert!(
-            resp.selected_skills.is_empty(),
-            "{:?}",
-            resp.selected_skills
-        );
+        assert_eq!(resp.profile.role, "");
     }
 
     #[test]
@@ -1740,7 +1571,7 @@ mod tests {
     #[test]
     fn sanity_warns_backend_task_routed_to_claude() {
         let task = make_task(&["backend", "priority:high"]);
-        let profile = make_profile(&["rust"]);
+        let profile = make_profile();
         let warning = LlmRouter::check_routing_sanity(&task, "claude", &profile);
         assert!(
             warning.is_some(),
@@ -1752,7 +1583,7 @@ mod tests {
     #[test]
     fn sanity_warns_api_label_routed_to_claude() {
         let task = make_task(&["api", "feature"]);
-        let profile = make_profile(&["rest"]);
+        let profile = make_profile();
         let warning = LlmRouter::check_routing_sanity(&task, "claude", &profile);
         assert!(warning.is_some());
     }
@@ -1760,7 +1591,7 @@ mod tests {
     #[test]
     fn sanity_warns_docs_task_routed_to_codex() {
         let task = make_task(&["documentation"]);
-        let profile = make_profile(&["writing"]);
+        let profile = make_profile();
         let warning = LlmRouter::check_routing_sanity(&task, "codex", &profile);
         assert!(
             warning.is_some(),
@@ -1772,7 +1603,7 @@ mod tests {
     #[test]
     fn sanity_warns_writing_label_routed_to_codex() {
         let task = make_task(&["writing"]);
-        let profile = make_profile(&["markdown"]);
+        let profile = make_profile();
         let warning = LlmRouter::check_routing_sanity(&task, "codex", &profile);
         assert!(warning.is_some());
     }
@@ -1780,7 +1611,7 @@ mod tests {
     #[test]
     fn sanity_no_warning_for_clean_routing() {
         let task = make_task(&["feature", "rust"]);
-        let profile = make_profile(&["rust", "async"]);
+        let profile = make_profile();
         let warning = LlmRouter::check_routing_sanity(&task, "claude", &profile);
         assert!(warning.is_none(), "no warning expected for clean routing");
     }
@@ -1789,7 +1620,7 @@ mod tests {
     fn sanity_no_warning_backend_to_codex() {
         // Backend label to codex is fine — only backend→claude warns
         let task = make_task(&["backend"]);
-        let profile = make_profile(&["node"]);
+        let profile = make_profile();
         let warning = LlmRouter::check_routing_sanity(&task, "codex", &profile);
         assert!(warning.is_none());
     }
@@ -1797,7 +1628,7 @@ mod tests {
     #[test]
     fn sanity_case_insensitive_label_matching() {
         let task = make_task(&["Backend", "API"]); // mixed case
-        let profile = make_profile(&["rust"]);
+        let profile = make_profile();
         let warning = LlmRouter::check_routing_sanity(&task, "claude", &profile);
         assert!(
             warning.is_some(),

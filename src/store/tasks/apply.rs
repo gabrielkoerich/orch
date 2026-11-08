@@ -399,7 +399,7 @@ pub(crate) async fn store_route(
     sqlx::query(
         "UPDATE tasks SET
         agent = ?, model = ?, complexity = ?, estimate = ?, route_reason = ?,
-        agent_profile = ?, selected_skills = ?,
+        agent_profile = ?,
         updated_at = ?
      WHERE id = ?",
     )
@@ -409,7 +409,6 @@ pub(crate) async fn store_route(
     .bind(i64::from(route.estimate))
     .bind(&route.reason)
     .bind(&route.profile)
-    .bind(&route.skills)
     .bind(now)
     .bind(route.id)
     .execute(&mut *conn)
@@ -418,7 +417,6 @@ pub(crate) async fn store_route(
         "complexity": route.complexity,
         "estimate": route.estimate,
         "reason": route.reason,
-        "skills": route.skills,
     });
     activity(
         conn,

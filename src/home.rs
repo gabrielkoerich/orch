@@ -242,13 +242,6 @@ pub fn projects_dir() -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Get the path to the skills directory (~/.orch/skills/).
-pub fn skills_dir() -> anyhow::Result<PathBuf> {
-    let dir = orch_home()?.join("skills");
-    ensure_dir(&dir)?;
-    Ok(dir)
-}
-
 /// Get the per-repo state directory: `~/.orch/state/{owner}/{repo}/`.
 ///
 /// Falls back to the flat `~/.orch/state/` if no repo is configured.
@@ -322,7 +315,6 @@ pub async fn init_dirs() -> anyhow::Result<()> {
     fs::create_dir_all(home.join("worktrees")).await?;
     fs::create_dir_all(home.join("contexts")).await?;
     fs::create_dir_all(home.join("projects")).await?;
-    fs::create_dir_all(home.join("skills")).await?;
     Ok(())
 }
 

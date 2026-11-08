@@ -4,7 +4,6 @@
 //! - Task-specific context files
 //! - Parent task context (for subtasks)
 //! - Project instructions (CLAUDE.md, AGENTS.md, README.md)
-//! - Skills documentation
 //! - Repository file tree
 //! - Git diff (for retries)
 //! - Issue comments
@@ -33,8 +32,6 @@ pub struct TaskContext {
     pub parent_context: String,
     /// Project instructions (CLAUDE.md + AGENTS.md + README.md)
     pub project_instructions: String,
-    /// Skills documentation for selected skills
-    pub skills_docs: String,
     /// Repository file tree (git ls-files, capped at 200 lines)
     pub repo_tree: String,
     /// Git diff from base branch (only for retries)
@@ -152,34 +149,6 @@ pub async fn build_project_instructions(project_dir: &Path) -> String {
     }
 
     instructions
-}
-
-/// Build skills documentation for selected skills.
-pub async fn build_skills_docs(selected_skills: &[String]) -> String {
-    if selected_skills.is_empty() {
-        return String::new();
-    }
-
-    let mut docs = String::new();
-    let skills_dirs = [
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".claude")
-            .join("skills"),
-        home::skills_dir().unwrap_or_default(),
-    ];
-
-    for skill in selected_skills {
-        for dir in &skills_dirs {
-            let skill_file = dir.join(skill).join("SKILL.md");
-            if let Ok(content) = fs::read_to_string(&skill_file).await {
-                let _ = writeln!(docs, "## Skill: {skill}\n\n{content}\n");
-                break;
-            }
-        }
-    }
-
-    docs
 }
 
 /// Build repository file tree (git ls-files, capped at 200 lines).
@@ -400,17 +369,12 @@ pub async fn load_pr_review_context(
 }
 
 /// Build the full task context.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is a separate context source"
-)]
 pub async fn build_full_context(
     task: &ExternalTask,
     backend: Option<&dyn ExternalBackend>,
     project_dir: &Path,
     default_branch: &str,
     attempts: u32,
-    selected_skills: &[String],
     store: &Option<Arc<TaskStore>>,
     repo: &str,
 ) -> TaskContext {
@@ -418,7 +382,6 @@ pub async fn build_full_context(
         task_context,
         parent_context,
         project_instructions,
-        skills_docs,
         repo_tree,
         git_diff,
         issue_comments,
@@ -434,7 +397,6 @@ pub async fn build_full_context(
             }
         },
         build_project_instructions(project_dir),
-        build_skills_docs(selected_skills),
         build_repo_tree(project_dir),
         async {
             if attempts > 0 {
@@ -458,7 +420,6 @@ pub async fn build_full_context(
         task_context,
         parent_context,
         project_instructions,
-        skills_docs,
         repo_tree,
         git_diff,
         issue_comments,
@@ -506,19 +467,12 @@ mod tests {
         assert!(instructions.contains("readme"));
     }
 
-    #[tokio::test]
-    async fn test_build_skills_docs_empty() {
-        let docs = build_skills_docs(&[]).await;
-        assert_eq!(docs, "");
-    }
-
     #[test]
     fn test_task_context_default_values() {
         let ctx = TaskContext {
             task_context: String::new(),
             parent_context: String::new(),
             project_instructions: String::new(),
-            skills_docs: String::new(),
             repo_tree: String::new(),
             git_diff: String::new(),
             issue_comments: String::new(),

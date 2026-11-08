@@ -40,7 +40,7 @@ waiting
 
 - **new** — task created (via `task add`, `gh pull`, or `jobs tick`)
 - **waiting** — at least one dependency is still open. The router, the dispatcher, `orch task route`, `orch task run`, and `orch task retry` leave the task alone. `orch task unblock all` does not select it. When the last dependency is done, the next tick moves it back to `new`
-- **routed** — LLM router assigned agent, model, profile, skills
+- **routed** — LLM router assigned agent, model, and profile
 - **in_progress** — agent is running
 - **done** — PR merged (or agent completed with no code changes)
 - **in_review** — review agent is actively running on the PR

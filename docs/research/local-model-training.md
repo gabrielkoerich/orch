@@ -23,7 +23,7 @@ This document evaluates training and deploying a local open-source model to repl
 | Code review | Sonnet (round-robin) | 1-3 | 30-120s | $0.05-0.50 |
 | Control chat | Sonnet (default) | per message | 2-10s | ~$0.01 |
 
-**Primary candidate for local model: task routing.** It's a narrow classification task (select agent + complexity + skills from a fixed set), runs on every task, and a local model would eliminate the latency and cost entirely.
+**Primary candidate for local model: task routing.** It's a narrow classification task (select agent and complexity from a fixed set), runs on every task, and a local model would eliminate the latency and cost entirely.
 
 **Secondary candidate: control chat.** For simple status queries, a local model could handle the majority of requests without a cloud call.
 
@@ -39,7 +39,7 @@ Orch's SQLite database (`~/.orch/orch.db`) contains comprehensive telemetry from
 
 | Source | Records | Fields Available |
 |--------|---------|-----------------|
-| `tasks` table | 1,601 | title, body, labels, agent, model, complexity, route_reason, selected_skills, outcome |
+| `tasks` table | 1,601 | title, body, labels, agent, model, complexity, route_reason, outcome |
 | `task_runs` (with prompts) | 2,339 | full prompt sent, agent response, outcome, duration, tokens |
 | `task_activity` | thousands | status transitions, agent assignments, re-routes |
 | `task_metrics` | per task | aggregated outcomes, duration, cost by agent/model |
@@ -61,7 +61,7 @@ Orch's SQLite database (`~/.orch/orch.db`) contains comprehensive telemetry from
 - Every task has a routing reason explaining the decision
 - Full prompt and response pairs are stored in `task_runs`
 - Outcome data allows filtering for only successful routing decisions
-- Rich metadata: labels, complexity, selected skills, review cycles
+- Rich metadata: labels, complexity, review cycles
 
 **Weaknesses:**
 - Imbalanced distribution: 72% medium, 19% complex, 12% simple (fixable with oversampling)
@@ -94,7 +94,7 @@ Orch's SQLite database (`~/.orch/orch.db`) contains comprehensive telemetry from
 | Fine-tuning RAM (QLoRA) | ~4GB | ~8GB | ~14GB | ~16GB |
 | Fine-tuning friendliness | Excellent | Excellent | Excellent | Good |
 
-**For task routing, Qwen2.5-Coder-3B-Instruct is the sweet spot.** The routing task is classification (pick from a fixed set of agents, complexity levels, and skills), not open-ended code generation. A 3B model fine-tuned on orch's actual routing data will outperform a general-purpose 70B model prompted zero-shot, because:
+**For task routing, Qwen2.5-Coder-3B-Instruct is the sweet spot.** The routing task is classification (pick from a fixed set of agents and complexity levels), not open-ended code generation. A 3B model fine-tuned on orch's actual routing data will outperform a general-purpose 70B model prompted zero-shot, because:
 
 1. The output schema is fixed and narrow (JSON with ~5 fields)
 2. The input is short (task title + body + labels, typically <500 tokens)
@@ -128,9 +128,9 @@ Extract from orch.db and format as instruction-tuning JSONL:
 
 ```json
 {"messages": [
-  {"role": "system", "content": "You are a task router for orch, a software engineering orchestrator. Given a task description, select the best agent, complexity level, and skills. Available agents: claude, codex, opencode, kimi, minimax. Complexity levels: simple, medium, complex."},
+  {"role": "system", "content": "You are a task router for orch, a software engineering orchestrator. Given a task description, select the best agent and complexity level. Available agents: claude, codex, opencode, kimi, minimax. Complexity levels: simple, medium, complex."},
   {"role": "user", "content": "Route this task:\nRepo: gabrielkoerich/orch\nTitle: Fix race condition in websocket handler\nLabels: bug, backend\nBody: The Discord gateway reconnect sometimes drops messages when two events arrive simultaneously..."},
-  {"role": "assistant", "content": "{\"agent\": \"claude\", \"complexity\": \"complex\", \"reason\": \"Race condition debugging requires deep concurrency reasoning and careful state analysis\", \"profile\": {\"role\": \"backend specialist\", \"skills\": [\"git-worktree\", \"gh\"], \"tools\": [\"cargo\", \"rg\", \"git\"], \"constraints\": [\"Do not modify config files\"]}, \"selected_skills\": [\"gh-issue-worktree\"]}"}
+  {"role": "assistant", "content": "{\"agent\": \"claude\", \"complexity\": \"complex\", \"reason\": \"Race condition debugging requires deep concurrency reasoning and careful state analysis\", \"profile\": {\"role\": \"backend specialist\", \"tools\": [\"cargo\", \"rg\", \"git\"], \"constraints\": [\"Do not modify config files\"]}}"}
 ]}
 ```
 
@@ -147,7 +147,6 @@ SELECT
     t.complexity,
     t.route_reason,
     t.agent_profile,
-    t.selected_skills,
     t.status,
     t.review_cycles,
     t.attempts
@@ -355,7 +354,7 @@ import sqlite3, json
 conn = sqlite3.connect("~/.orch/orch.db")
 tasks = conn.execute("""
     SELECT title, body, labels, repo, agent, complexity,
-           route_reason, agent_profile, selected_skills
+           route_reason, agent_profile
     FROM tasks
     WHERE status = 'done' AND agent IS NOT NULL
 """).fetchall()
@@ -400,7 +399,6 @@ python train_router.py --base-model Qwen/Qwen2.5-Coder-3B-Instruct \
 metrics = {
     "agent_accuracy": 0.0,      # correct agent selection
     "complexity_accuracy": 0.0,  # correct complexity level
-    "skill_f1": 0.0,            # F1 for skill selection (multi-label)
     "json_validity": 0.0,       # % of outputs that are valid JSON
     "latency_p50": 0.0,         # median inference time
     "latency_p99": 0.0,         # tail latency
@@ -473,7 +471,7 @@ Once deployed, the local model improves over time:
 Each completed task becomes a new training example. Monthly retraining incorporates:
 - New tasks and routing decisions
 - Corrected labels from re-routes (task failed with agent X, succeeded with Y)
-- New agents or skills added to the system
+- New agents added to the system
 - Changes in agent capabilities (model upgrades)
 
 ---

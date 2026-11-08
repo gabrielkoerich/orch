@@ -5,7 +5,7 @@
 //!
 //! Submodules handle the heavy lifting:
 //! - [`tick`] — core tick phases (session polling, stuck recovery, routing, dispatch)
-//! - [`sync`] — periodic sync operations (cleanup, PR review, mentions, skills)
+//! - [`sync`] — periodic sync operations (cleanup, PR review, mentions)
 //! - [`review`] — PR review pipeline (review agent, auto-merge, change handling)
 //! - [`cleanup`] — worktree cleanup and merged-PR detection
 //!

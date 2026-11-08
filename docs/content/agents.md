@@ -112,7 +112,7 @@ Every agent receives a rich context built from multiple sources:
 |---------|--------|------|
 | System prompt | `prompts/agent_system.md` | Always |
 | Task details | SQLite store (`~/.orch/orch.db`) | Always |
-| Agent profile | Router-generated role/skills/tools/constraints | Always |
+| Agent profile | Router-generated role, tools, and constraints | Always |
 | Error history | SQLite store | On retries |
 | Last error | Task store `last_error` field | On retries |
 | GitHub issue comments | GitHub API | If issue linked |
@@ -120,7 +120,6 @@ Every agent receives a rich context built from multiple sources:
 | Tool call summaries | `.orch/tools-{id}.json` | On retries |
 | Repo tree | `git ls-files` | Always |
 | Project instructions | `CLAUDE.md` + `AGENTS.md` + `README.md`, a file read once when one links to the other | If files exist |
-| Skills docs | `skills/{id}/SKILL.md` | If skills selected |
 | Parent/sibling context | Parent task summary + accomplished | If child task |
 | Git diff | Uncommitted changes | On retries |
 

@@ -46,7 +46,7 @@ new → routed → in_progress → needs_review → in_review → approved → d
 ```
 
 - **new**: task created (via `orch task add` or a scheduled job)
-- **routed**: LLM router assigned agent, model, profile, skills
+- **routed**: LLM router assigned agent, model, and profile
 - **in_progress**: agent is running
 - **needs_review**: PR exists and is queued for review
 - **in_review**: review agent is actively running on the PR
@@ -72,7 +72,6 @@ A separate **sync tick** (~45s) handles less-frequent operations. With `relay.ur
 3. **Mention scanning** — detects `@orch` (and legacy `@orchestrator`) mentions in issue comments
 4. **PR review processing** — re-routes tasks when reviews request changes (not child task creation), resets `ci_merge_failures` counter on re-route
 5. **Owner commands** — scans for `/slash` commands in issue comments
-6. **Skills sync** — clones/pulls skill repositories
 
 The review agent does not wait for a tick. A subscriber starts it when a task enters `needs_review`, once CI has run on the PR head. Running checks hold the review, red CI routes the task back to its agent once per head SHA, and with no CI, or no started check after 15 minutes, the review starts at once. In a shipcheck repository with no started check, orch runs `shipcheck run` first and the review starts when it ends.
 

@@ -349,7 +349,6 @@ graph LR
   worktrees/             # agent worktrees (all projects)
     repo/branch/         # one per task
   state/                 # runtime state (logs, prompts)
-  skills/                # cloned skill repositories
 ```
 
 ## Settled Decisions (DO NOT TOUCH)

@@ -1832,8 +1832,6 @@ pub(crate) async fn tick_route_tasks(
                     Ok(store_id) => {
                         let profile_json =
                             serde_json::to_string(&result.profile).unwrap_or_default();
-                        let skills_json =
-                            serde_json::to_string(&result.selected_skills).unwrap_or_default();
                         if let Err(e) = store
                             .store_route(&crate::store::StoreRoute {
                                 id: store_id,
@@ -1843,7 +1841,6 @@ pub(crate) async fn tick_route_tasks(
                                 estimate: result.estimate,
                                 reason: &result.reason,
                                 profile: &profile_json,
-                                skills: &skills_json,
                             })
                             .await
                         {
@@ -1990,8 +1987,6 @@ pub(crate) async fn route_new_tasks_global(
                     "global sweep: route completed"
                 );
                 let profile_json = serde_json::to_string(&result.profile).unwrap_or_default();
-                let skills_json =
-                    serde_json::to_string(&result.selected_skills).unwrap_or_default();
                 if let Err(e) = store
                     .store_route(&StoreRoute {
                         id: task.id,
@@ -2001,7 +1996,6 @@ pub(crate) async fn route_new_tasks_global(
                         estimate: result.estimate,
                         reason: &result.reason,
                         profile: &profile_json,
-                        skills: &skills_json,
                     })
                     .await
                 {
@@ -5580,7 +5574,6 @@ mod tests {
                 estimate: 0,
                 reason: "test",
                 profile: "{}",
-                skills: "[]",
             })
             .await
             .unwrap();
@@ -5676,7 +5669,6 @@ mod tests {
                 estimate: 0,
                 reason: "test",
                 profile: "{}",
-                skills: "[]",
             })
             .await
             .unwrap();
@@ -6389,7 +6381,6 @@ mod tests {
                     estimate: 0,
                     reason: "test",
                     profile: "{}",
-                    skills: "[]",
                 })
                 .await
                 .unwrap();
@@ -6470,7 +6461,6 @@ mod tests {
                     estimate: 0,
                     reason: "test",
                     profile: "{}",
-                    skills: "[]",
                 })
                 .await
                 .unwrap();
@@ -6550,7 +6540,6 @@ mod tests {
                 estimate: 0,
                 reason: "test",
                 profile: "{}",
-                skills: "[]",
             })
             .await
             .unwrap();

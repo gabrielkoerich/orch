@@ -49,7 +49,6 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `router` | `timeout_seconds` | Router call timeout in seconds. Values over 45 are lowered to 45 | `45` |
 | `router` | `max_route_attempts` | LLM failures before falling back to round-robin | `3` |
 | `router` | `max_tasks_per_tick` | Max routing decisions per engine tick (concurrency cap) | `1` |
-| `router` | `default_skills` | Skills selected for every task | `[gh, git-worktree]` |
 | `router` | `fallback_executor` | Fallback executor when router fails | `codex` |
 | `router` | `allowed_tools` | Default tool allowlist used in routing prompts | `[yq, jq, bash, ...]` |
 | `router` | `weighted_round_robin` | Use degraded-weight-aware round robin | `false` |
@@ -123,23 +122,9 @@ These settings still need `orch service restart`. Editing one logs `config chang
 
 ## Skills
 
-Skills extend agent capabilities with specialized knowledge. Skill repositories are cloned into `~/.orch/skills/` by the engine on its sync tick — there is no dedicated `orch skills` subcommand.
+Install skills on the agent. Claude Code, Codex, and the other agents keep their own skill directories. Name the skill in the task body when the task should use it.
 
-```yaml
-# ~/.orch/skills.yml
-repositories:
-  - name: gabrielkoerich
-    url: https://github.com/gabrielkoerich/skills
-    description: Personal skill catalog
-    pin: f9a2062d2a184f9625746262a6b7656d3b630973  # Optional: pin to a specific commit
-  - name: anthropics
-    url: https://github.com/anthropics/skills
-    description: Anthropic official skills
-    pin: 1ed29a03dc852d30fa6ef2ca53a67dc2c2c2c563
-skills: []   # Reserved for inline skill definitions (rarely used)
-```
-
-Skills in `router.default_skills` (default `gh`, `git-worktree`) are always selected. In `llm` mode the router adds more per task.
+A `skills:` list or `router.default_skills` left in a config file has no effect.
 
 ## Secret values
 
@@ -174,7 +159,7 @@ The simplest setup is just `gh auth login`. No extra config needed.
 
 ### Git
 
-orch's own git calls (fetches, rebases, pushes, `ls-remote`, skill clones) all start from one helper, `git_ops::git()`. It reaches github.com over HTTPS with the same token, whether the remote is SSH or HTTPS, and sets `commit.gpgsign=false` and `tag.gpgsign=false`, so orch never asks for your SSH key or signing key. The settings are environment variables of that one process: no remote and no `.git/config` changes, and your own commits keep your signing.
+orch's own git calls (fetches, rebases, pushes, `ls-remote`) all start from one helper, `git_ops::git()`. It reaches github.com over HTTPS with the same token, whether the remote is SSH or HTTPS, and sets `commit.gpgsign=false` and `tag.gpgsign=false`, so orch never asks for your SSH key or signing key. The settings are environment variables of that one process: no remote and no `.git/config` changes, and your own commits keep your signing.
 
 Agents commit as `git.name` / `git.email` (default `<agent>[bot]`), without signing. Their shell pushes over HTTPS with gh's credentials (`pushInsteadOf`), and agents may not change remotes or `url.*` rules, since a worktree shares `.git/config` with your checkout.
 
