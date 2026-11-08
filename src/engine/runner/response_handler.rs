@@ -1079,20 +1079,26 @@ async fn post_screenshots(
             Ok(commit) => commit,
             Err(e) => {
                 tracing::warn!(task_id = ctx.task_id, err = %e, "failed to push screenshots");
+                let body = screenshots::build_unpublished_comment(note, &skipped);
+                comment_screenshots(ctx, pr, &body).await;
                 return note.map(String::from);
             }
         }
     };
     let body = screenshots::build_comment(ctx.repo, &commit, &images, note, &skipped);
+    comment_screenshots(ctx, pr, &body).await;
+    note.map(String::from)
+}
+
+async fn comment_screenshots(ctx: &StoreCtx<'_>, pr: u64, body: &str) {
     match GhHttp::new() {
         Ok(gh) => {
-            if let Err(e) = gh.add_comment(ctx.repo, &pr.to_string(), &body).await {
+            if let Err(e) = gh.add_comment(ctx.repo, &pr.to_string(), body).await {
                 tracing::warn!(task_id = ctx.task_id, pr, err = %e, "failed to comment screenshots");
             }
         }
         Err(e) => tracing::warn!(task_id = ctx.task_id, err = %e, "cannot comment screenshots"),
     }
-    note.map(String::from)
 }
 
 /// Comment on and close a PR whose change already landed elsewhere.
