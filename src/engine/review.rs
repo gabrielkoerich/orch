@@ -11,7 +11,6 @@ use super::router::Router;
 /// Maximum consecutive review agent failures before the task is blocked
 /// for human intervention. Exported so `tick` and `sync` use the same threshold.
 use crate::backends::{ExternalBackend, ExternalTask, Status};
-use crate::cmd::CommandErrorContext;
 use crate::config;
 use crate::engine::attribution_footer;
 use crate::engine::auto_merge::{auto_merge_pr, handle_review_changes};

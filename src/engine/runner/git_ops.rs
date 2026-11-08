@@ -14,7 +14,9 @@ use crate::github::token;
 use crate::plan;
 use crate::security;
 use regex::Regex;
+use std::ffi::OsStr;
 use std::fmt::Write as _;
+use std::io;
 use std::path::Path;
 use std::process::Output;
 use std::sync::LazyLock;
@@ -610,12 +612,63 @@ pub(crate) fn remote_change_tools() -> Vec<String> {
     .to_vec()
 }
 
+/// Credentialed git command whose stdout and stderr are sanitized when read
+pub(crate) struct GitCommand {
+    inner: Command,
+}
+
+impl GitCommand {
+    pub(crate) fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Self {
+        self.inner.arg(arg);
+        self
+    }
+
+    pub(crate) fn args<I, S>(&mut self, args: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.inner.args(args);
+        self
+    }
+
+    pub(crate) fn current_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut Self {
+        self.inner.current_dir(dir);
+        self
+    }
+
+    pub(crate) fn env<K, V>(&mut self, key: K, val: V) -> &mut Self
+    where
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        self.inner.env(key, val);
+        self
+    }
+
+    pub(crate) fn kill_on_drop(&mut self, kill: bool) -> &mut Self {
+        self.inner.kill_on_drop(kill);
+        self
+    }
+
+    pub(crate) async fn output(&mut self) -> io::Result<Output> {
+        self.inner.output().await.map(sanitize_git_output)
+    }
+
+    pub(crate) async fn output_with_context(&mut self) -> anyhow::Result<Output> {
+        self.inner
+            .output_with_context()
+            .await
+            .map(sanitize_git_output)
+    }
+}
+
 /// A `git` command for every call orch makes: GitHub over HTTPS with the gh token, never SSH,
 /// and no commit or tag signing, whatever the owner's git config says
-pub(crate) async fn git() -> Command {
+pub(crate) async fn git() -> GitCommand {
     let mut cmd = Command::new("git");
     cmd.envs(build_git_auth_env().await).kill_on_drop(true);
-    cmd
+    GitCommand { inner: cmd }
 }
 
 /// Build git config environment variables that inject GitHub token credentials.

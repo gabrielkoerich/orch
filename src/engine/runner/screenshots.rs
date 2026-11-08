@@ -9,10 +9,8 @@ use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, bail};
-use tokio::process::Command;
 
 use super::git_ops;
-use crate::cmd::CommandErrorContext;
 use crate::parser::Screenshot;
 
 /// Branch that holds the images, used as no PR base or head, and cleanup deletes task branches only
@@ -176,7 +174,7 @@ pub fn build_unpublished_comment(note: Option<&str>, skipped: &[String]) -> Stri
 }
 
 async fn git_out(dir: &Path, index: Option<&Path>, args: &[&str]) -> anyhow::Result<String> {
-    let mut cmd: Command = git_ops::git().await;
+    let mut cmd = git_ops::git().await;
     cmd.arg("-C").arg(dir).args(args);
     if let Some(index) = index {
         cmd.env("GIT_INDEX_FILE", index);
