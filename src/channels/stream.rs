@@ -645,4 +645,62 @@ mod tests {
             "fanout did not forward topic_id in outgoing message"
         );
     }
+
+    async fn collect_fanout_body(channel: &str, task_id: &str, content: &str) -> OutgoingMessage {
+        let transport = Arc::new(Transport::new());
+        let (tx, mut rx) = mpsc::channel::<OutgoingMessage>(16);
+        let test_ch = TestChannel {
+            name: channel.to_string(),
+            tx,
+        };
+        let mut registry = ChannelRegistry::new();
+        registry.register(Box::new(test_ch));
+        let registry = Arc::new(registry);
+        let repo = "owner/test-repo";
+        transport
+            .bind(repo, task_id, "orch-fanout-test", channel, "thread-1", None)
+            .await;
+        let transport_clone = Arc::clone(&transport);
+        let registry_clone = Arc::clone(&registry);
+        let task_id_str = task_id.to_string();
+        let repo_str = repo.to_string();
+        tokio::spawn(async move {
+            fanout_output(repo_str, task_id_str, transport_clone, registry_clone).await;
+        });
+        time::sleep(std_time::Duration::from_millis(50)).await;
+        transport
+            .push_output(
+                repo,
+                task_id,
+                OutputChunk {
+                    content: content.to_string(),
+                    is_final: true,
+                },
+            )
+            .await;
+        for _ in 0..10 {
+            if let Ok(Some(msg)) = time::timeout(std_time::Duration::from_millis(200), async {
+                rx.recv().await
+            })
+            .await
+            {
+                return msg;
+            }
+        }
+        panic!("fanout did not send a message for channel {channel}");
+    }
+
+    #[tokio::test]
+    async fn fanout_telegram_escapes_html_and_marks_preformatted() {
+        let msg = collect_fanout_body("telegram", "escape-html-task", "a < b & c > d").await;
+        assert_eq!(msg.body, "a &lt; b &amp; c &gt; d");
+        assert_eq!(msg.metadata["preformatted_html"], true);
+    }
+
+    #[tokio::test]
+    async fn fanout_discord_sends_raw_angle_brackets() {
+        let msg = collect_fanout_body("discord", "raw-html-task", "a < b & c > d").await;
+        assert_eq!(msg.body, "a < b & c > d");
+        assert_eq!(msg.metadata, serde_json::json!({}));
+    }
 }

@@ -706,4 +706,114 @@ mod tests {
         let msg = n.format_slack();
         assert!(msg.contains("<https://github.com/owner/repo/pull/9|View on GitHub>"));
     }
+
+    #[test]
+    fn format_telegram_exact_layout_with_issue_link() {
+        let n = TaskNotification {
+            task_id: "42".to_string(),
+            title: "Fix auth bug".to_string(),
+            status: "done".to_string(),
+            agent: "claude".to_string(),
+            duration_seconds: 120.0,
+            summary: "Fixed the OAuth flow".to_string(),
+            repo: Some("owner/my-project".to_string()),
+            notify_target: None,
+            pr_number: None,
+        };
+        assert_eq!(
+            n.format_telegram(),
+            "✅ <b>Fix auth bug</b>\n\
+             done · <code>claude</code> · 2m 0s · #42\n\
+             \n\
+             Fixed the OAuth flow\n\
+             \n\
+             <a href=\"https://github.com/owner/my-project/issues/42\">View on GitHub</a>"
+        );
+    }
+
+    #[test]
+    fn format_slack_exact_layout_with_pr_link() {
+        let n = TaskNotification {
+            task_id: "internal:7".to_string(),
+            title: "T".to_string(),
+            status: "done".to_string(),
+            agent: "claude".to_string(),
+            duration_seconds: 1.0,
+            summary: "S".to_string(),
+            repo: Some("owner/repo".to_string()),
+            notify_target: None,
+            pr_number: Some("9".to_string()),
+        };
+        assert_eq!(
+            n.format_slack(),
+            "✅ *T*\n\
+             done · `claude` · 1s · #internal:7\n\
+             \n\
+             S\n\
+             \n\
+             <https://github.com/owner/repo/pull/9|View on GitHub>"
+        );
+    }
+
+    #[test]
+    fn format_discord_exact_layout_with_pr_link() {
+        let n = TaskNotification {
+            task_id: "internal:7".to_string(),
+            title: "T".to_string(),
+            status: "done".to_string(),
+            agent: "claude".to_string(),
+            duration_seconds: 1.0,
+            summary: "S".to_string(),
+            repo: Some("owner/repo".to_string()),
+            notify_target: None,
+            pr_number: Some("9".to_string()),
+        };
+        assert_eq!(
+            n.format_discord(),
+            "✅ **T**\n\
+             done · `claude` · 1s · #internal:7\n\
+             \n\
+             S\n\
+             \n\
+             [View on GitHub](https://github.com/owner/repo/pull/9)"
+        );
+    }
+
+    #[test]
+    fn format_telegram_escapes_html_entities_in_every_field() {
+        let n = TaskNotification {
+            task_id: "1<2".to_string(),
+            title: "a < b & c > d".to_string(),
+            status: "done".to_string(),
+            agent: "my_agent".to_string(),
+            duration_seconds: 10.0,
+            summary: "x < y".to_string(),
+            repo: Some("owner/repo".to_string()),
+            notify_target: None,
+            pr_number: None,
+        };
+        let msg = n.format_telegram();
+        assert!(msg.contains("<b>a &lt; b &amp; c &gt; d</b>"));
+        assert!(msg.contains("<code>my_agent</code>"));
+        assert!(msg.contains("x &lt; y"));
+        assert!(msg.contains("#1&lt;2"));
+        assert!(
+            !msg.contains("github.com"),
+            "non-numeric id has no issue link: {msg}"
+        );
+    }
+
+    #[test]
+    fn github_link_prefers_pr_then_issue_then_none() {
+        assert_eq!(
+            github_link(Some("owner/repo"), "internal:1", Some("9")),
+            Some("https://github.com/owner/repo/pull/9".into())
+        );
+        assert_eq!(
+            github_link(Some("owner/repo"), "1234", None),
+            Some("https://github.com/owner/repo/issues/1234".into())
+        );
+        assert_eq!(github_link(Some("owner/repo"), "internal:99", None), None);
+        assert_eq!(github_link(None, "1234", Some("9")), None);
+    }
 }
