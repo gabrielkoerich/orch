@@ -150,8 +150,6 @@ pub struct RouterConfig {
     pub max_route_attempts: u32,
     /// Default tools allowed
     pub allowed_tools: Vec<String>,
-    /// Default skills to always include
-    pub default_skills: Vec<String>,
     /// Model map for complexity levels.
     /// Each entry is a pool of models; one is selected randomly (skipping cooled ones) per dispatch.
     /// A single-model pool `vec!["model"]` behaves identically to the old string format.
@@ -261,7 +259,6 @@ impl Default for RouterConfig {
                 "npm".to_string(),
                 "bun".to_string(),
             ],
-            default_skills: vec!["gh".to_string(), "git-worktree".to_string()],
             // model_map is intentionally empty — config.yml is the sole source of truth.
             // Hardcoded models cause "Model not found" failures when the model does not
             // exist for a particular agent (e.g. anthropic/ prefixed models for opencode).
@@ -519,22 +516,6 @@ impl RouterConfig {
                     pruned_count = pruned,
                     "model_pruned_unavailable: removed opencode models absent from provider catalog"
                 );
-            }
-        }
-
-        // Parse default_skills
-        if let Ok(skills_str) = config::get("router.default_skills")
-            && !skills_str.is_empty()
-            && skills_str != "[]"
-        {
-            if let Ok(skills_arr) = serde_json::from_str::<Vec<String>>(&skills_str) {
-                config.default_skills = skills_arr;
-            } else {
-                config.default_skills = skills_str
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
             }
         }
 

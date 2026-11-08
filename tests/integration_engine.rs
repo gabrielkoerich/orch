@@ -406,7 +406,6 @@ async fn store_route_result_persists() {
             estimate: 5,
             reason: "test routing",
             profile: r#"{"role":"backend specialist","skills":[],"tools":[],"constraints":[]}"#,
-            skills: r#"["gh","git-worktree"]"#,
         })
         .await
         .expect("store route");
@@ -620,7 +619,6 @@ async fn engine_tick_simulation() {
             estimate: 8,
             reason: "backend task requiring deep caching knowledge",
             profile: r#"{"role":"backend specialist","skills":["redis"],"tools":["bash"],"constraints":[]}"#,
-            skills: r#"["gh"]"#,
         })
         .await
         .expect("store route");

@@ -7,7 +7,6 @@
 //! - PR review processing and follow-up dispatch
 //! - Stale InReview detection
 //! - Owner /slash command scanning
-//! - Skill repository syncing
 
 use super::EngineConfig;
 use super::ci_bootstrap;
@@ -17,7 +16,6 @@ use super::review_poll::review_open_prs;
 use crate::backends::ExternalId;
 use crate::backends::ExternalTask;
 use crate::backends::{ExternalBackend, Mention, Status};
-use crate::cmd::CommandErrorContext;
 use crate::config;
 use crate::engine;
 use crate::engine::auto_merge::{is_pr_behind, required_checks_state};
@@ -34,12 +32,10 @@ use crate::engine::router::Router;
 use crate::engine::router::RouterConfig;
 use crate::engine::router::config as router_config;
 use crate::engine::runner::agents::patterns;
-use crate::engine::runner::git_ops;
 use crate::engine::tasks;
 use crate::engine::tasks::{TaskManager, status_to_task_status};
 use crate::github::http::GhHttp;
 use crate::github::types::extract_issue_number_from_url;
-use crate::home;
 use crate::store;
 use crate::store::Task;
 use crate::store::TaskRun;
@@ -50,11 +46,9 @@ use dashmap::{DashMap, DashSet};
 use futures::future;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use tokio::fs;
 use tokio::sync::OnceCell;
 use tokio::sync::RwLock;
 use tokio::time;
@@ -2094,8 +2088,8 @@ pub(crate) async fn sync_tick(
 }
 
 /**
- * Skill repos and agent health are the same whichever project asks, so they run once per
- * sync pass rather than once per project. Called after every project's `sync_tick`
+ * Agent health is the same whichever project asks, so it runs once per sync pass rather than
+ * once per project. Called after every project's `sync_tick`
  **/
 pub(crate) async fn sync_shared_tail(router: &Arc<RwLock<Router>>, store: Option<&Arc<TaskStore>>) {
     let Some(store) = store else {
@@ -2103,17 +2097,6 @@ pub(crate) async fn sync_shared_tail(router: &Arc<RwLock<Router>>, store: Option
     };
     if !store.is_leader() {
         return;
-    }
-    match skills_sync().await {
-        Ok(()) => {
-            // Clone the Arc handle before releasing the read guard so the read lock is not
-            // held across the async invalidation call
-            let llm = router.read().await.llm_router_handle();
-            llm.invalidate_skills_catalog().await;
-        }
-        Err(e) => {
-            tracing::warn!(err = %e, "skills sync failed");
-        }
     }
 
     // Pre-emptive health check: refresh degraded-agent flags from the rate_limits table.
@@ -2411,132 +2394,6 @@ async fn scan_comments(
     }
 
     Ok(())
-}
-
-/// Sync skill repositories from config.
-///
-/// Reads the `skills:` list from config and clones/pulls each repository
-/// to `~/.orch/skills/{repo}/`. This keeps skill documentation up-to-date
-/// for agents.
-async fn skills_sync() -> anyhow::Result<()> {
-    let skills = match config::get_skills() {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::debug!(err = %e, "no skills configured");
-            return Ok(());
-        }
-    };
-
-    if skills.is_empty() {
-        tracing::debug!("no skills configured, skipping sync");
-        return Ok(());
-    }
-
-    let skills_base = home::skills_dir()?;
-    let git_timeout = Duration::from_secs(60);
-
-    // Run all skill git operations concurrently — each is fully independent.
-    // Wall-clock time drops from N × timeout to max(timeout).
-    let futs: Vec<_> = skills
-        .into_iter()
-        .map(|skill| sync_one_skill(skill, skills_base.clone(), git_timeout))
-        .collect();
-    future::join_all(futs).await;
-
-    Ok(())
-}
-
-/// Sync a single skill repository: `git pull` if it exists, `git clone` otherwise.
-///
-/// All errors are logged via `tracing::warn!` so that one failing skill does not
-/// prevent the others from being updated.
-async fn sync_one_skill(skill: config::SkillConfig, skills_base: PathBuf, git_timeout: Duration) {
-    // Validate repo format to prevent path traversal
-    if skill.repo.contains("..") || skill.repo.matches('/').count() != 1 {
-        tracing::warn!(repo = %skill.repo, "invalid skill repo format, expected 'owner/repo'");
-        return;
-    }
-
-    let repo_dir = skills_base.join(&skill.repo);
-    let repo_url = format!("https://github.com/{}.git", skill.repo);
-
-    // Use async metadata check instead of `Path::exists()` to avoid
-    // performing blocking syscall on the reactor thread.
-    let repo_exists = fs::metadata(&repo_dir).await.is_ok_and(|m| m.is_dir());
-
-    if repo_exists {
-        // Pull latest changes with timeout
-        tracing::debug!(repo = %skill.repo, "pulling skill repo");
-        let pull_result = time::timeout(
-            git_timeout,
-            git_ops::git()
-                .await
-                .args(["pull", "--ff-only", "--prune"])
-                .current_dir(&repo_dir)
-                .output_with_context(),
-        )
-        .await;
-
-        match pull_result {
-            Ok(Ok(output)) if !output.status.success() => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::warn!(repo = %skill.repo, err = %stderr, "git pull failed");
-            }
-            Ok(Ok(_)) => {
-                tracing::debug!(repo = %skill.repo, "skill repo updated");
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(repo = %skill.repo, err = %e, "git pull error");
-            }
-            Err(_) => {
-                tracing::warn!(repo = %skill.repo, "git pull timed out after 60s");
-            }
-        }
-    } else {
-        // Clone the repository (shallow for efficiency)
-        tracing::debug!(repo = %skill.repo, "cloning skill repo");
-        let Some(parent) = repo_dir.parent() else {
-            tracing::warn!(repo = %skill.repo, "skill repo path has no parent directory");
-            return;
-        };
-        if let Err(e) = fs::create_dir_all(parent).await {
-            tracing::warn!(repo = %skill.repo, err = %e, "failed to create parent dir for skill");
-            return;
-        }
-        let Some(repo_dir_str) = repo_dir.to_str() else {
-            tracing::warn!(repo = %skill.repo, "skill repo path is not valid UTF-8");
-            return;
-        };
-
-        let clone_result = time::timeout(
-            git_timeout,
-            git_ops::git()
-                .await
-                .args(["clone", "--depth", "1", &repo_url, repo_dir_str])
-                .output_with_context(),
-        )
-        .await;
-
-        match clone_result {
-            Ok(Ok(output)) if !output.status.success() => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::warn!(repo = %skill.repo, err = %stderr, "git clone failed");
-                // Clean up partial clone to allow retry on next tick
-                let _ = fs::remove_dir_all(&repo_dir).await;
-            }
-            Ok(Ok(_)) => {
-                tracing::info!(repo = %skill.repo, "skill repo cloned");
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(repo = %skill.repo, err = %e, "git clone error");
-                let _ = fs::remove_dir_all(&repo_dir).await;
-            }
-            Err(_) => {
-                tracing::warn!(repo = %skill.repo, "git clone timed out after 60s");
-                let _ = fs::remove_dir_all(&repo_dir).await;
-            }
-        }
-    }
 }
 
 /// Per-agent degradation detail collected during the alerting check.
@@ -6061,7 +5918,6 @@ mod tests {
             estimate: 0,
             route_reason: String::new(),
             agent_profile: String::new(),
-            selected_skills: String::new(),
             route_attempts: 0,
             attempts: 0,
             branch: String::new(),

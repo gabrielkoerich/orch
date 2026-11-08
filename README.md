@@ -460,7 +460,7 @@ src/
 └── engine/              # Core orchestration
     ├── mod.rs           # Main event loop, project init, struct defs
     ├── tick.rs          # Core tick phases (sessions, routing, dispatch, unblock)
-    ├── sync.rs          # Periodic sync (cleanup, PR review, mentions, skills)
+    ├── sync.rs          # Periodic sync (cleanup, PR review, mentions)
     ├── review.rs        # PR review pipeline (review agent, decision, re-route)
     ├── review_poll.rs   # Open PR polling, merges approved PRs
     ├── auto_merge.rs    # CI checks and merge

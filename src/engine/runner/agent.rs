@@ -664,10 +664,6 @@ pub fn build_system_prompt(
         );
     }
 
-    if !context.skills_docs.is_empty() {
-        vars.insert("SKILLS_DOCS".to_string(), context.skills_docs.clone());
-    }
-
     if !context.repo_tree.is_empty() {
         vars.insert("REPO_TREE".to_string(), context.repo_tree.clone());
     }

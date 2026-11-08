@@ -14,12 +14,6 @@ You are a {{ROLE}} agent.
 {{PROJECT_INSTRUCTIONS}}
 
 {{/if}}
-{{#if SKILLS_DOCS}}
-## Available Skills
-
-{{SKILLS_DOCS}}
-
-{{/if}}
 {{#if REPO_TREE}}
 ## Repository Structure
 

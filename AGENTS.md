@@ -199,7 +199,6 @@ The runner passes routing results to the agent via `ORCH_AGENT` (selected agent)
     repo/branch/         #   created by the runner, one per task
   state/                 # runtime state (logs, prompts, per-task artifacts)
     control/{pid}/       #   control session temp files (per-process isolation)
-  skills/                # cloned skill repositories
 ```
 
 - **User-managed projects** (e.g. `~/Projects/foo`): user clones, runs `orch init`. Project dir stays where the user put it.

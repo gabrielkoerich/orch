@@ -557,59 +557,6 @@ pub fn get_current_repo() -> anyhow::Result<String> {
     anyhow::bail!("could not determine repo — ensure .orch.yml has gh.repo set")
 }
 
-/// Skill repository configuration.
-#[derive(Debug, Clone)]
-pub struct SkillConfig {
-    /// GitHub repository in "owner/repo" format.
-    pub repo: String,
-}
-
-/// Get skills configuration from the global config.
-///
-/// Reads the `skills:` list from `~/.orch/config.yml`:
-/// ```yaml
-/// skills:
-///   - repo: "owner/skill-repo"
-///   - repo: "owner/another-repo"
-/// ```
-///
-/// Returns an empty vector if no skills are configured.
-pub fn get_skills() -> anyhow::Result<Vec<SkillConfig>> {
-    let global_path = global_config_path()?;
-
-    if !global_path.exists() {
-        return Ok(vec![]);
-    }
-
-    let root = load_cached_root(&global_path)?;
-
-    Ok(extract_skills_list(&root))
-}
-
-/// Extract skills list from a YAML tree.
-fn extract_skills_list(root: &serde_norway::Value) -> Vec<SkillConfig> {
-    let Some(serde_norway::Value::Sequence(seq)) = root.get("skills") else {
-        return vec![];
-    };
-
-    let mut skills = Vec::new();
-    for item in seq {
-        if let serde_norway::Value::Mapping(map) = item {
-            let repo = map
-                .get("repo")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .unwrap_or_default();
-
-            if !repo.is_empty() {
-                skills.push(SkillConfig { repo });
-            }
-        }
-    }
-
-    skills
-}
-
 /// Resolve a projects list from a config file.
 fn resolve_projects_list(path: &PathBuf, key: &str) -> anyhow::Result<Vec<String>> {
     // First, ensure we're watching this file for changes
@@ -882,28 +829,6 @@ mod tests {
         assert!(list.is_empty(), "{list:?}");
     }
 
-    #[test]
-    fn extract_skills_list_from_sequence() {
-        let yaml = serde_norway::from_str::<serde_norway::Value>(
-            "skills:\n  - repo: owner/skills1\n  - repo: owner/skills2\n",
-        )
-        .unwrap();
-        let skills = extract_skills_list(&yaml);
-        assert_eq!(skills.len(), 2);
-        assert_eq!(skills[0].repo, "owner/skills1");
-        assert_eq!(skills[1].repo, "owner/skills2");
-    }
-
-    #[test]
-    fn extract_skills_list_single_repo() {
-        let yaml =
-            serde_norway::from_str::<serde_norway::Value>("skills:\n  - repo: owner/skills\n")
-                .unwrap();
-        let skills = extract_skills_list(&yaml);
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].repo, "owner/skills");
-    }
-
     /**
      * Read a key straight out of the cache. The reload tests must not call `resolve_key` or
      * `resolve_projects_list`: those register the file with the real notify watcher, whose thread
@@ -996,12 +921,5 @@ mod tests {
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
         unsafe { env::remove_var("ORCH_HOME") };
         assert_eq!(got, ("false".to_string(), "os".to_string()));
-    }
-
-    #[test]
-    fn extract_skills_list_empty_for_missing() {
-        let yaml = serde_norway::from_str::<serde_norway::Value>("foo: bar").unwrap();
-        let skills = extract_skills_list(&yaml);
-        assert!(skills.is_empty());
     }
 }

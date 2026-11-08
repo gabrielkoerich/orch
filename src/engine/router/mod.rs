@@ -123,10 +123,8 @@ pub struct RouteResult {
     pub estimate: u8,
     /// Why this agent was selected
     pub reason: String,
-    /// Specialized agent profile (skills, tools, constraints)
+    /// Specialized agent profile (role, tools, constraints)
     pub profile: AgentProfile,
-    /// Selected skill IDs from the catalog
-    pub selected_skills: Vec<String>,
     /// Optional warning about routing decision
     pub warning: Option<String>,
 }
@@ -136,8 +134,6 @@ pub struct RouteResult {
 pub struct AgentProfile {
     /// Role name, e.g., "backend specialist"
     pub role: String,
-    /// Focus skills for this task
-    pub skills: Vec<String>,
     /// Tools allowed for this task
     pub tools: Vec<String>,
     /// Constraints for this task
@@ -149,7 +145,6 @@ impl AgentProfile {
     pub fn default_from_config(config: &RouterConfig) -> Self {
         Self {
             role: "general".to_string(),
-            skills: vec![],
             tools: config.allowed_tools.clone(),
             constraints: vec![],
         }
@@ -178,8 +173,8 @@ impl RouteResult {
 
     /// Build a standard route result from the three task-specific values.
     ///
-    /// Fills `profile`, `selected_skills`, and `warning` with router-config
-    /// defaults so call sites only need to supply what varies per task.
+    /// Fills `profile` and `warning` with router-config defaults so call sites
+    /// only need to supply what varies per task.
     pub fn from_config(
         agent: String,
         complexity: String,
@@ -195,30 +190,8 @@ impl RouteResult {
             estimate: 0,
             reason,
             profile: AgentProfile::default_from_config(config),
-            selected_skills: config.default_skills.clone(),
             warning,
         }
-    }
-}
-
-/// An opaque, cheaply-cloneable handle to the LLM routing subsystem.
-///
-/// Obtain one via [`Router::llm_router_handle`].  Holding this handle does
-/// **not** require holding the router's `RwLock`, so async operations can
-/// safely be called without starving write-lock waiters.
-pub struct LlmRouterHandle(Arc<LlmRouter>);
-
-impl Debug for LlmRouterHandle {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LlmRouterHandle").finish_non_exhaustive()
-    }
-}
-
-impl LlmRouterHandle {
-    /// Invalidate the skills catalog cache so the next routing call reloads
-    /// from disk.  Safe to await without holding any `RwLock` on `Router`.
-    pub async fn invalidate_skills_catalog(&self) {
-        self.0.invalidate_skills_catalog().await;
     }
 }
 
@@ -340,17 +313,6 @@ impl Router {
             router_pool,
             pool_index: 0,
         }
-    }
-
-    /// Return a cloned handle to the LLM router subsystem.
-    ///
-    /// Callers that need to invoke async methods on the underlying `LlmRouter`
-    /// should clone this handle *before* releasing any `RwLock` read guard on
-    /// `Router`, then call the async method after the guard is dropped.  This
-    /// prevents holding the read lock across await points (which starves
-    /// write-lock waiters due to Tokio's write-preferring `RwLock`).
-    pub fn llm_router_handle(&self) -> LlmRouterHandle {
-        LlmRouterHandle(Arc::clone(&self.llm_router))
     }
 
     fn advance_pool_index_after_attempt(&mut self, idx: usize, pool_len: usize) {
@@ -1034,7 +996,6 @@ impl Router {
                                 result.agent, fallback_agent
                             ),
                             profile: result.profile.clone(),
-                            selected_skills: result.selected_skills.clone(),
                             warning: Some(format!(
                                 "LLM selected no-code agent {}; used fallback {}",
                                 result.agent, fallback_agent
@@ -1116,7 +1077,6 @@ impl Router {
                             estimate: result.estimate,
                             reason: reason.clone(),
                             profile: result.profile.clone(),
-                            selected_skills: result.selected_skills.clone(),
                             warning: Some(if fallback_agent == result.agent {
                                 "LLM-selected model was cooled; selected alternative model for same agent"
                                     .to_string()
@@ -1251,7 +1211,6 @@ impl Router {
         let details = serde_json::json!({
             "reason": result.reason,
             "complexity": result.complexity,
-            "skills": result.selected_skills,
             "role": result.profile.role,
             "warning": result.warning,
         });
@@ -1635,7 +1594,6 @@ pub async fn get_route_result(
         estimate: 0,
         reason,
         profile: AgentProfile::default(),
-        selected_skills: vec![],
         warning: None,
     })
 }
@@ -1852,11 +1810,9 @@ mod tests {
             reason: "test".to_string(),
             profile: AgentProfile {
                 role: "backend".to_string(),
-                skills: vec!["rust".to_string()],
                 tools: vec!["git".to_string()],
                 constraints: vec![],
             },
-            selected_skills: vec!["gh".to_string()],
             warning: None,
         };
 
@@ -1890,7 +1846,6 @@ mod tests {
         assert_eq!(config.fallback_executor, "codex");
         assert_eq!(config.max_route_attempts, 3);
         assert_ne!(config.allowed_tools, [] as [String; 0]);
-        assert_ne!(config.default_skills, [] as [String; 0]);
 
         // Verify configurable agents list includes all 7 agents
         assert_eq!(config.agents.len(), 7);
@@ -2355,7 +2310,6 @@ Hope that helps!"#;
         let task = create_test_task("1", "Fix API", vec!["backend".to_string()]);
         let profile = AgentProfile {
             role: "general".to_string(),
-            skills: vec!["api".to_string()],
             tools: vec![],
             constraints: vec![],
         };

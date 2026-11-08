@@ -242,11 +242,6 @@ pub async fn prepare_task(
     let pseudo_task = build_pseudo_task(task_id, store, repo).await;
     let task_title = pseudo_task.title.clone();
 
-    let selected_skills = route_result
-        .as_ref()
-        .map(|r| r.selected_skills.clone())
-        .unwrap_or_default();
-
     // Build full context: memory, issue comments, and parent context are all loaded here
     let ctx = context::build_full_context(
         &pseudo_task,
@@ -254,7 +249,6 @@ pub async fn prepare_task(
         &wt.work_dir,
         &wt.default_branch,
         attempts,
-        &selected_skills,
         store,
         repo,
     )

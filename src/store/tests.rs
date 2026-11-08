@@ -1567,7 +1567,6 @@ async fn store_route_updates_routing_fields() {
             estimate: 8,
             reason: "needs deep analysis",
             profile: r#"{"role":"backend"}"#,
-            skills: "git,rust",
         })
         .await
         .unwrap();
@@ -1578,7 +1577,6 @@ async fn store_route_updates_routing_fields() {
     assert_eq!(task.complexity, "complex");
     assert_eq!(task.estimate, 8);
     assert_eq!(task.route_reason, "needs deep analysis");
-    assert_eq!(task.selected_skills, "git,rust");
 }
 
 #[tokio::test]
@@ -3318,7 +3316,6 @@ async fn store_route_persists_all_routing_fields() {
             estimate: 13,
             reason: "needs deep refactoring",
             profile: r#"{"role":"backend"}"#,
-            skills: r#"["git","rust"]"#,
         })
         .await
         .unwrap();
@@ -3330,7 +3327,6 @@ async fn store_route_persists_all_routing_fields() {
     assert_eq!(task.estimate, 13);
     assert_eq!(task.route_reason, "needs deep refactoring");
     assert_eq!(task.agent_profile, r#"{"role":"backend"}"#);
-    assert_eq!(task.selected_skills, r#"["git","rust"]"#);
 }
 
 #[tokio::test]
@@ -3385,7 +3381,6 @@ async fn set_estimate_if_zero_does_not_overwrite() {
             estimate: 8,
             reason: "complex refactor",
             profile: "{}",
-            skills: "[]",
         })
         .await
         .unwrap();

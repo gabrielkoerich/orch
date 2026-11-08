@@ -22,7 +22,7 @@ use sqlx::sqlite::SqliteRow;
 /// mismatch.
 pub(crate) const TASK_COLS: &str = "id, external_id, repo, origin, title, body, status, \
     source, source_id, author, url, labels, agent, model, complexity, estimate, \
-    route_reason, agent_profile, selected_skills, route_attempts, attempts, \
+    route_reason, agent_profile, route_attempts, attempts, \
     branch, worktree, worktree_cleaned, summary, last_error, parent_id, \
     block_reason, pr_number, pr_review_context, last_review_ts, review_ts_map, \
     last_comment_review_ts, merge_conflict_retries, ci_merge_failures, \
@@ -35,7 +35,7 @@ pub(crate) const TASK_COLS: &str = "id, external_id, repo, origin, title, body, 
      owner_node, timeout_retries";
 
 /// Number of columns in TASK_COLS (used for diagnostic verification).
-pub(crate) const TASK_COLS_COUNT: usize = 62;
+pub(crate) const TASK_COLS_COUNT: usize = 61;
 
 /// Explicit column list for `SELECT` queries on the `task_runs` table.
 const TASK_RUN_COLS: &str = "id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, \
@@ -53,7 +53,6 @@ const ALLOWED_FIELDS: &[&str] = &[
     "complexity",
     "route_reason",
     "agent_profile",
-    "selected_skills",
     "route_attempts",
     "attempts",
     "branch",
@@ -231,7 +230,6 @@ pub struct Task {
     pub estimate: u8,
     pub route_reason: String,
     pub agent_profile: String,
-    pub selected_skills: String,
     pub route_attempts: i32,
 
     // Execution
@@ -591,7 +589,6 @@ pub struct StoreRoute<'a> {
     pub estimate: u8,
     pub reason: &'a str,
     pub profile: &'a str,
-    pub skills: &'a str,
 }
 
 /// Parameters for upserting an external task.
@@ -1372,7 +1369,6 @@ impl TaskStore {
             estimate: route.estimate,
             reason: route.reason.to_string(),
             profile: route.profile.to_string(),
-            skills: route.skills.to_string(),
         }))
         .await
         .map(|_| ())
@@ -2219,7 +2215,6 @@ impl TaskStore {
             },
             route_reason: row.try_get("route_reason").unwrap_or_default(),
             agent_profile: row.try_get("agent_profile").unwrap_or_default(),
-            selected_skills: row.try_get("selected_skills").unwrap_or_default(),
             route_attempts: row.try_get("route_attempts").unwrap_or(0),
             attempts: row.try_get("attempts").unwrap_or(0),
             branch: row.try_get("branch").unwrap_or_default(),
@@ -2632,7 +2627,6 @@ pub struct StoreRouteCmd {
     pub estimate: u8,
     pub reason: String,
     pub profile: String,
-    pub skills: String,
 }
 
 /// The columns a done task's tombstone keeps. Nodes that had the task keep the rest locally

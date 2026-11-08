@@ -152,7 +152,6 @@ impl OllamaRouter {
 
         let mut profile = AgentProfile {
             role: llm_response.profile.role,
-            skills: llm_response.profile.skills,
             tools: if llm_response.profile.tools.is_empty() {
                 config.allowed_tools.clone()
             } else {
@@ -166,13 +165,6 @@ impl OllamaRouter {
             }
         }
 
-        let mut selected_skills = llm_response.selected_skills;
-        for skill in &config.default_skills {
-            if !selected_skills.contains(skill) {
-                selected_skills.push(skill.clone());
-            }
-        }
-
         Ok(RouteResult {
             agent,
             model,
@@ -180,7 +172,6 @@ impl OllamaRouter {
             estimate: llm_response.estimate,
             reason: llm_response.reason,
             profile,
-            selected_skills,
             warning: tier_warning,
         })
     }
@@ -218,7 +209,6 @@ impl OllamaRouter {
             .replace("{{ROUTER_AGENT}}", "ollama")
             .replace("{{AVAILABLE_AGENTS}}", &available_agents_str)
             .replace("{{AGENT_WEIGHTS}}", &weights_str)
-            .replace("{{SKILLS_CATALOG}}", "[]") // Ollama doesn't support dynamic skills catalog
             .replace("{{TASK_ID}}", &task.id.0)
             .replace("{{TASK_TITLE}}", &task.title)
             .replace("{{TASK_LABELS}}", &labels)
@@ -336,16 +326,12 @@ mod tests {
     }
 
     #[test]
-    fn build_routing_prompt_skills_catalog_replaced_with_empty() {
+    fn build_routing_prompt_has_no_skills_catalog() {
         let task = make_task("Title", "Body", &[]);
         let config = RouterConfig::default();
         let prompt = OllamaRouter::build_routing_prompt(&task, &config);
-        // Ollama uses "[]" for skills catalog since it doesn't support dynamic skills
-        // The template placeholder {{SKILLS_CATALOG}} should be replaced with "[]"
-        assert!(
-            !prompt.contains("{{SKILLS_CATALOG}}"),
-            "SKILLS_CATALOG placeholder should be substituted"
-        );
+        assert!(!prompt.contains("{{SKILLS_CATALOG}}"));
+        assert!(!prompt.contains("selected_skills"));
     }
 
     #[test]

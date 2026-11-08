@@ -2,7 +2,7 @@
 //!
 //! Replaces `run_task.sh` with pure Rust. The runner:
 //! 1. Sets up a git worktree for isolation
-//! 2. Builds context (project instructions, skills, comments)
+//! 2. Builds context (project instructions, comments)
 //! 3. Renders prompts and spawns the agent in tmux
 //! 4. Waits for completion, collects and classifies the response
 //! 5. Handles errors (reroute on limits, fallback agents)

@@ -8,7 +8,7 @@ Orch uses an LLM-as-classifier to route each task to the best agent. This is a n
 
 ## How It Works
 
-1. The Rust router (`src/engine/router/`) sends the task title, body, labels, and the skills catalog to a lightweight LLM (default: `claude --model haiku --print`).
+1. The Rust router (`src/engine/router/`) sends the task title, body, and labels to a lightweight LLM (default: `claude --model haiku --print`).
 2. The router LLM returns JSON:
    ```json
    {
@@ -17,11 +17,9 @@ Orch uses an LLM-as-classifier to route each task to the best agent. This is a n
      "reason": "why this agent/model",
      "profile": {
        "role": "DeFi Protocol Engineer",
-       "skills": ["Solana", "Anchor"],
        "tools": ["Bash", "Edit", "Read"],
        "constraints": ["audit with sealevel attacks"]
-     },
-     "selected_skills": ["solana-best-practices"]
+     }
    }
    ```
 3. Sanity checks run -- e.g. warns if a backend task gets routed to claude, or a docs task to codex. If the router fails repeatedly (configurable via `max_route_attempts`, default 3), it falls back to round-robin.
@@ -43,9 +41,6 @@ router:
     - yq
     - jq
     - bash
-  default_skills:           # always included in routing
-    - gh
-    - git-worktree
 ```
 
 To exclude an agent from routing entirely, remove it from the `agents:` discovery list (the router only considers installed, listed agents) — there is no separate `disabled_agents` knob.

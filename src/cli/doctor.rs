@@ -1340,7 +1340,6 @@ mod tests {
             estimate: 0,
             route_reason: String::new(),
             agent_profile: String::new(),
-            selected_skills: String::new(),
             route_attempts: 0,
             attempts: 0,
             branch: String::new(),
