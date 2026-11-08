@@ -500,7 +500,7 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
                 tracing::info!(%repo, "fetched origin after worktree cleanup");
             }
             Ok(Ok(output)) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr = git_ops::sanitize_push_error(&String::from_utf8_lossy(&output.stderr));
                 tracing::debug!(%repo, err = %stderr, "git fetch skipped after cleanup");
             }
             Ok(Err(e)) => {
@@ -573,7 +573,7 @@ async fn cleanup_task_worktree_impl(
                 tracing::debug!(%repo, "fetched origin after task cleanup");
             }
             Ok(Ok(output)) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr = git_ops::sanitize_push_error(&String::from_utf8_lossy(&output.stderr));
                 tracing::debug!(%repo, err = %stderr, "git fetch skipped after task cleanup");
             }
             Ok(Err(e)) => {
@@ -914,6 +914,7 @@ async fn git_in(dir: &Path, args: &[&str]) -> Option<Output> {
         .output_with_context()
         .await
         .ok()
+        .map(git_ops::sanitize_git_output)
 }
 
 /**
@@ -1429,7 +1430,7 @@ pub(crate) async fn delete_branches(task_id: &str, br: &str, repo_root: &Path) {
             git_ops::clear_push_lease(repo_root, br).await;
         }
         Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = git_ops::sanitize_push_error(&String::from_utf8_lossy(&output.stderr));
             tracing::debug!(task_id, err = %stderr, "remote branch delete skipped");
         }
         Err(e) => {

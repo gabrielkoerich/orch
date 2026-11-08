@@ -1132,8 +1132,8 @@ async fn build_review_context(
                 tracing::warn!(
                     task_id = task.id.0,
                     exit_code = ?o.status.code(),
-                    stdout = %String::from_utf8_lossy(&o.stdout),
-                    stderr = %String::from_utf8_lossy(&o.stderr),
+                    stdout = %git_ops::sanitize_push_error(&String::from_utf8_lossy(&o.stdout)),
+                    stderr = %git_ops::sanitize_push_error(&String::from_utf8_lossy(&o.stderr)),
                     "review: git fetch failed (non-zero exit) — diff/log may use stale remote refs"
                 );
             }
@@ -2900,8 +2900,8 @@ async fn ensure_pr_exists(
                                 task_id = task.id.0,
                                 branch = %branch_name,
                                 exit_code = ?o.status.code(),
-                                stdout = %String::from_utf8_lossy(&o.stdout),
-                                stderr = %String::from_utf8_lossy(&o.stderr),
+                                stdout = %git_ops::sanitize_push_error(&String::from_utf8_lossy(&o.stdout)),
+                                stderr = %git_ops::sanitize_push_error(&String::from_utf8_lossy(&o.stderr)),
                                 "review gate fallback push failed"
                             );
                         }

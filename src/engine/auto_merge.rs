@@ -430,7 +430,7 @@ async fn attempt_worktree_rebase_and_force_push(
             .await
         }
         Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let stderr = git_ops::sanitize_push_error(String::from_utf8_lossy(&out.stderr).trim());
             if is_ssh_agent_fetch_failure(&stderr) {
                 return WorktreeRebaseOutcome::SshFetchFailed(stderr);
             }
@@ -3368,6 +3368,27 @@ mod tests {
 
         pr.mergeable_state = None;
         assert!(!is_pr_behind(&pr));
+    }
+
+    #[test]
+    fn fetch_failure_reason_strips_url_credentials() {
+        let raw = "fatal: unable to access 'https://x-access-token:test-secret-1234567890abcdef@github.com/o/r.git/'";
+        let stderr = git_ops::sanitize_push_error(raw);
+        let reason = format!("git fetch failed: {stderr}");
+        assert!(!reason.contains("test-secret-1234567890abcdef"));
+        assert!(reason.contains("://***@github.com"));
+    }
+
+    #[test]
+    fn ssh_agent_fetch_failure_matches_sanitized_stderr() {
+        let raw = concat!(
+            "sign_and_send_pubkey: signing failed: agent refused operation\n",
+            "fatal: unable to access 'https://x-access-token:test-secret-1234567890abcdef@github.com/o/r.git/'"
+        );
+        let sanitized = git_ops::sanitize_push_error(raw);
+        assert!(!sanitized.contains("test-secret-1234567890abcdef"));
+        assert!(is_ssh_agent_fetch_failure(&sanitized));
+        assert!(is_ssh_agent_fetch_failure(raw));
     }
 
     #[test]

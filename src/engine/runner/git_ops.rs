@@ -16,6 +16,7 @@ use crate::security;
 use regex::Regex;
 use std::fmt::Write as _;
 use std::path::Path;
+use std::process::Output;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -259,7 +260,7 @@ pub(crate) async fn stash_rebase_restore(
             Ok(RebaseOutcome::Succeeded)
         }
         Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+            let stderr = sanitize_push_error(&String::from_utf8_lossy(&o.stderr));
             tracing::warn!(dir = %dir.display(), target_ref, err = %stderr, "rebase failed");
             if opts.abort_on_failure {
                 let abort = Command::new("git")
@@ -443,7 +444,7 @@ pub async fn rebase_on_branch(dir: &Path, branch: &str) -> anyhow::Result<bool> 
     match fetch {
         Ok(o) if o.status.success() => {}
         Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
+            let stderr = sanitize_push_error(&String::from_utf8_lossy(&o.stderr));
             anyhow::bail!("failed to fetch origin/{branch}: {stderr}");
         }
         Err(e) => anyhow::bail!("failed to fetch origin/{branch}: {e}"),
@@ -1050,8 +1051,8 @@ pub(crate) async fn force_push_leased(
         return Ok(());
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    anyhow::bail!("{}", sanitize_push_error(&stderr))
+    let stderr = sanitize_push_error(String::from_utf8_lossy(&output.stderr).trim());
+    anyhow::bail!("{stderr}")
 }
 
 /// Push the branch to origin.
@@ -1128,14 +1129,14 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
         return Ok(true);
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stderr = sanitize_push_error(String::from_utf8_lossy(&output.stderr).trim());
 
     // Transient network blip (timeout, reset) rather than a ref rejection —
     // retry the identical push once before classifying the run as failed.
     if is_transient_network_error(&stderr) {
         tracing::warn!(
             branch = branch_to_push,
-            stderr = %sanitize_push_error(&stderr),
+            stderr = %stderr,
             "push failed with transient network error — retrying once"
         );
         let retry_output = time::timeout(
@@ -1163,15 +1164,14 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
             return Ok(true);
         }
 
-        let retry_stderr = String::from_utf8_lossy(&retry_output.stderr)
-            .trim()
-            .to_string();
+        let retry_stderr =
+            sanitize_push_error(String::from_utf8_lossy(&retry_output.stderr).trim());
         tracing::warn!(
             branch = branch_to_push,
-            stderr = %sanitize_push_error(&retry_stderr),
+            stderr = %retry_stderr,
             "push retry also failed"
         );
-        anyhow::bail!("push failed: {}", sanitize_push_error(&retry_stderr));
+        anyhow::bail!("push failed: {retry_stderr}");
     }
 
     // Handle workflow scope error: the token lacks the `workflow` OAuth scope
@@ -1214,9 +1214,8 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
                     return Ok(true);
                 }
 
-                let retry_stderr = String::from_utf8_lossy(&retry_output.stderr)
-                    .trim()
-                    .to_string();
+                let retry_stderr =
+                    sanitize_push_error(String::from_utf8_lossy(&retry_output.stderr).trim());
 
                 // If still failing with workflow scope, bail with clear message
                 if is_workflow_scope_error(&retry_stderr) {
@@ -1322,7 +1321,7 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
                 return Ok(true);
             }
 
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stderr = sanitize_push_error(String::from_utf8_lossy(&output.stderr).trim());
             anyhow::bail!("push failed after rebasing on the moved remote branch: {stderr}");
         }
 
@@ -1375,14 +1374,20 @@ pub fn is_transient_network_error(stderr: &str) -> bool {
         || (lower.contains("[remote rejected]") && lower.contains("(failure)"))
 }
 
-/// Strip credentials from push stderr before it is logged or returned:
-/// URL userinfo (`https://x-access-token:TOKEN@…`) plus any secrets caught
-/// by the leak patterns, so a failing push can never write a token to logs.
-fn sanitize_push_error(stderr: &str) -> String {
+/// Strip URL userinfo (`https://x-access-token:TOKEN@…`) and leak-pattern secrets
+/// from credentialed git stdout and stderr before it is logged or stored
+pub(crate) fn sanitize_push_error(stderr: &str) -> String {
     static URL_USERINFO: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"://[^/@\s]+@").expect("valid url userinfo regex"));
     let no_userinfo = URL_USERINFO.replace_all(stderr, "://***@");
     security::redact(&no_userinfo)
+}
+
+/// Sanitize both streams of a credentialed git `Output` so callers cannot log the raw bytes
+pub(crate) fn sanitize_git_output(mut output: Output) -> Output {
+    output.stdout = sanitize_push_error(&String::from_utf8_lossy(&output.stdout)).into_bytes();
+    output.stderr = sanitize_push_error(&String::from_utf8_lossy(&output.stderr)).into_bytes();
+    output
 }
 
 /// Drop sentences and list items about pushing or opening the PR
@@ -2077,6 +2082,8 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
     use std::process;
 
@@ -2241,6 +2248,35 @@ mod tests {
         assert!(!sanitized.contains("test-secret-1234567890abcdef"));
         assert!(sanitized.contains("://***@github.com"));
         assert!(sanitized.contains("i/o timeout"));
+    }
+
+    #[test]
+    fn sanitize_push_error_strips_fetch_url_credentials() {
+        let raw = "fatal: unable to access 'https://x-access-token:test-secret-1234567890abcdef@github.com/o/r.git/': The requested URL returned error: 403";
+        let sanitized = sanitize_push_error(raw);
+        assert!(!sanitized.contains("test-secret-1234567890abcdef"));
+        assert!(sanitized.contains("://***@github.com"));
+        assert!(sanitized.contains("403"));
+        assert_eq!(sanitized, sanitize_push_error(&sanitized));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sanitize_git_output_strips_url_credentials_from_both_streams() {
+        let output = process::Output {
+            status: process::ExitStatus::from_raw(0),
+            stdout: b"To https://x-access-token:test-secret-1234567890abcdef@github.com/o/r.git\n"
+                .to_vec(),
+            stderr: b"fatal: unable to access 'https://x-access-token:test-secret-1234567890abcdef@github.com/o/r.git/'\n"
+                .to_vec(),
+        };
+        let sanitized = sanitize_git_output(output);
+        let stdout = String::from_utf8_lossy(&sanitized.stdout);
+        let stderr = String::from_utf8_lossy(&sanitized.stderr);
+        assert!(!stdout.contains("test-secret-1234567890abcdef"));
+        assert!(!stderr.contains("test-secret-1234567890abcdef"));
+        assert!(stdout.contains("://***@github.com"));
+        assert!(stderr.contains("://***@github.com"));
     }
 
     #[test]

@@ -185,7 +185,7 @@ async fn git_out(dir: &Path, index: Option<&Path>, args: &[&str]) -> anyhow::Res
         .env("GIT_AUTHOR_EMAIL", "orch@localhost")
         .env("GIT_COMMITTER_NAME", "orch")
         .env("GIT_COMMITTER_EMAIL", "orch@localhost");
-    let out = cmd.output_with_context().await?;
+    let out = git_ops::sanitize_git_output(cmd.output_with_context().await?);
     if !out.status.success() {
         bail!(
             "git {} failed: {}",
@@ -346,6 +346,14 @@ mod tests {
             .unwrap();
         assert!(out.status.success(), "git {args:?}: {out:?}");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn git_error_strips_url_credentials() {
+        let raw = "error: failed to push some refs to 'https://x-access-token:test-secret-1234567890abcdef@github.com/o/r.git'";
+        let msg = format!("git push failed: {}", git_ops::sanitize_push_error(raw));
+        assert!(!msg.contains("test-secret-1234567890abcdef"));
+        assert!(msg.contains("://***@github.com"));
     }
 
     #[test]
