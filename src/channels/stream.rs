@@ -85,6 +85,24 @@ async fn send_to_thread(
     );
 }
 
+/// Escape Telegram HTML before splitting so chunk sizes match the API payload
+async fn send_buffered(
+    channels: &Arc<ChannelRegistry>,
+    channel_name: &str,
+    thread_id: &str,
+    topic_id: Option<&str>,
+    buffered: String,
+) {
+    let to_send = if channel_name == "telegram" {
+        html_escape(&buffered)
+    } else {
+        buffered
+    };
+    for part in split_for_platform(&to_send, channel_name) {
+        send_to_thread(channels, channel_name, thread_id, topic_id, part).await;
+    }
+}
+
 /// Fan out output chunks from a task to all bound channel threads.
 ///
 /// Subscribes to the task's output broadcast in `transport`, accumulates
@@ -142,18 +160,8 @@ pub async fn fanout_output(
                                 .is_none_or(|t| now.duration_since(*t) >= rate);
 
                             if can_send && let Some(buffered) = buffers.remove(thread_key) {
-                                // Escape HTML for Telegram before splitting so chunk
-                                // boundaries are computed on the actual API payload size.
-                                let to_send = if ch_name == "telegram" {
-                                    html_escape(&buffered)
-                                } else {
-                                    buffered
-                                };
-                                let parts = split_for_platform(&to_send, ch_name);
-                                for part in parts {
-                                    send_to_thread(&channels, ch_name, thread_id, topic_id, part)
-                                        .await;
-                                }
+                                send_buffered(&channels, ch_name, thread_id, topic_id, buffered)
+                                    .await;
                                 last_send.insert(ch_name.to_string(), now);
                             }
                         }
@@ -173,16 +181,7 @@ pub async fn fanout_output(
                             else {
                                 continue;
                             };
-                            // Escape HTML for Telegram before splitting (same as above).
-                            let to_send = if ch_name == "telegram" {
-                                html_escape(&buffered)
-                            } else {
-                                buffered
-                            };
-                            let parts = split_for_platform(&to_send, ch_name);
-                            for part in parts {
-                                send_to_thread(&channels, ch_name, thread_id, topic_id, part).await;
-                            }
+                            send_buffered(&channels, ch_name, thread_id, topic_id, buffered).await;
                         }
                     }
                     tracing::debug!(task_id, "fanout: final chunk received, stream complete");
@@ -253,17 +252,8 @@ pub async fn fanout_output(
                                 .get(ch_name)
                                 .is_none_or(|t| now.duration_since(*t) >= rate);
                             if can_send {
-                                // Escape HTML for Telegram before splitting (same as above).
-                                let to_send = if ch_name == "telegram" {
-                                    html_escape(&buffered)
-                                } else {
-                                    buffered
-                                };
-                                let parts = split_for_platform(&to_send, ch_name);
-                                for part in parts {
-                                    send_to_thread(&channels, ch_name, thread_id, topic_id, part)
-                                        .await;
-                                }
+                                send_buffered(&channels, ch_name, thread_id, topic_id, buffered)
+                                    .await;
                                 last_send.insert(ch_name.to_string(), now);
                             } else {
                                 // Put it back for next round
@@ -644,5 +634,63 @@ mod tests {
             got_topic,
             "fanout did not forward topic_id in outgoing message"
         );
+    }
+
+    async fn collect_fanout_body(channel: &str, task_id: &str, content: &str) -> OutgoingMessage {
+        let transport = Arc::new(Transport::new());
+        let (tx, mut rx) = mpsc::channel::<OutgoingMessage>(16);
+        let test_ch = TestChannel {
+            name: channel.to_string(),
+            tx,
+        };
+        let mut registry = ChannelRegistry::new();
+        registry.register(Box::new(test_ch));
+        let registry = Arc::new(registry);
+        let repo = "owner/test-repo";
+        transport
+            .bind(repo, task_id, "orch-fanout-test", channel, "thread-1", None)
+            .await;
+        let transport_clone = Arc::clone(&transport);
+        let registry_clone = Arc::clone(&registry);
+        let task_id_str = task_id.to_string();
+        let repo_str = repo.to_string();
+        tokio::spawn(async move {
+            fanout_output(repo_str, task_id_str, transport_clone, registry_clone).await;
+        });
+        time::sleep(std_time::Duration::from_millis(50)).await;
+        transport
+            .push_output(
+                repo,
+                task_id,
+                OutputChunk {
+                    content: content.to_string(),
+                    is_final: true,
+                },
+            )
+            .await;
+        for _ in 0..10 {
+            if let Ok(Some(msg)) = time::timeout(std_time::Duration::from_millis(200), async {
+                rx.recv().await
+            })
+            .await
+            {
+                return msg;
+            }
+        }
+        panic!("fanout did not send a message for channel {channel}");
+    }
+
+    #[tokio::test]
+    async fn fanout_telegram_escapes_html_and_marks_preformatted() {
+        let msg = collect_fanout_body("telegram", "escape-html-task", "a < b & c > d").await;
+        assert_eq!(msg.body, "a &lt; b &amp; c &gt; d");
+        assert_eq!(msg.metadata["preformatted_html"], true);
+    }
+
+    #[tokio::test]
+    async fn fanout_discord_sends_raw_angle_brackets() {
+        let msg = collect_fanout_body("discord", "raw-html-task", "a < b & c > d").await;
+        assert_eq!(msg.body, "a < b & c > d");
+        assert_eq!(msg.metadata, serde_json::json!({}));
     }
 }
