@@ -48,6 +48,12 @@ fn fmt_degraded(degraded: &[String]) -> String {
     }
 }
 
+/// A turn-cap error comes from the router command line (`--max-turns 1`)
+fn is_max_turns_error(err_msg: &str) -> bool {
+    let lower = err_msg.to_ascii_lowercase();
+    lower.contains("max turns reached") || lower.contains("reached the maximum number of turns")
+}
+
 /// Error returned when all agents/models are in cooldown and routing is temporarily unavailable.
 ///
 /// This is a transient error that should not count against `max_route_attempts` since
@@ -1341,20 +1347,29 @@ impl Router {
                         response::record_model_failure(agent, model_str).await;
                         return Err(e);
                     }
-                    tracing::warn!(
-                        agent,
-                        model = model_str,
-                        error = %e,
-                        "pool entry failed, recording cooldown and trying next"
-                    );
-                    if !cooldown::record_credit_exhaustion_from_message(
-                        agent,
-                        Some(model_str),
-                        &err_msg,
-                    )
-                    .await
-                    {
-                        response::record_model_failure(agent, model_str).await;
+                    if is_max_turns_error(&err_msg) {
+                        tracing::warn!(
+                            agent,
+                            model = model_str,
+                            error = %e,
+                            "pool entry hit max turns — trying next without cooldown"
+                        );
+                    } else {
+                        tracing::warn!(
+                            agent,
+                            model = model_str,
+                            error = %e,
+                            "pool entry failed, recording cooldown and trying next"
+                        );
+                        if !cooldown::record_credit_exhaustion_from_message(
+                            agent,
+                            Some(model_str),
+                            &err_msg,
+                        )
+                        .await
+                        {
+                            response::record_model_failure(agent, model_str).await;
+                        }
                     }
                     last_err = Some(e);
                     self.advance_pool_index_after_attempt(idx, n);
@@ -1442,7 +1457,9 @@ impl Router {
                         error = %e,
                         "fallback router LLM also failed"
                     );
-                    response::record_model_failure(&fb_agent, fb_model_str).await;
+                    if !is_max_turns_error(&err_msg) {
+                        response::record_model_failure(&fb_agent, fb_model_str).await;
+                    }
                     last_err = Some(e);
                 }
             }
@@ -1636,6 +1653,19 @@ mod tests {
     #[cfg(unix)]
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn max_turns_error_matches_grok_phrases() {
+        assert!(is_max_turns_error(
+            "router LLM returned error: Reached the maximum number of turns"
+        ));
+        assert!(is_max_turns_error("Error: max turns reached"));
+        assert!(is_max_turns_error(
+            "router LLM failed: router LLM returned error: Reached the maximum number of turns"
+        ));
+        assert!(!is_max_turns_error("router LLM timed out after 30s"));
+        assert!(!is_max_turns_error("rate limited"));
+    }
 
     #[tokio::test]
     #[serial_test::serial(orch_home)]
