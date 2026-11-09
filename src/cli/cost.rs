@@ -1,9 +1,6 @@
 use crate::cli;
 use crate::cli::task_ref;
-#[cfg(test)]
-use crate::store::CostByGroup;
-use crate::store::{self, TaskStore};
-#[cfg(test)]
+use crate::store::{self, CostByGroup, TaskStore};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -92,38 +89,10 @@ pub async fn show_by_agent() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!();
-    println!("Cost by Agent");
-    println!("{}", "=".repeat(60));
-    println!();
-    println!(
-        "{:<12} {:>10} {:>10} {:>10} {:>8}",
-        "AGENT", "INPUT", "OUTPUT", "COST", "TASKS"
+    print!(
+        "{}",
+        format_cost_groups("Cost by Agent", "AGENT", 12, &groups)
     );
-    println!("{}", "-".repeat(60));
-
-    let mut total_cost = 0.0;
-    for group in &groups {
-        total_cost += group.total_cost_usd;
-        println!(
-            "{:<12} {:>10} {:>10} {:>10} {:>8}",
-            group.name,
-            format_tokens(u64::try_from(group.input_tokens).unwrap_or(0)),
-            format_tokens(u64::try_from(group.output_tokens).unwrap_or(0)),
-            format_cost(group.total_cost_usd),
-            group.task_count,
-        );
-    }
-    println!("{}", "-".repeat(60));
-    println!(
-        "{:<12} {:>10} {:>10} {:>10}",
-        "",
-        "",
-        "",
-        format_cost(total_cost)
-    );
-    println!();
-
     Ok(())
 }
 
@@ -138,38 +107,10 @@ pub async fn show_by_model() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!();
-    println!("Cost by Model");
-    println!("{}", "=".repeat(60));
-    println!();
-    println!(
-        "{:<20} {:>10} {:>10} {:>10} {:>8}",
-        "MODEL", "INPUT", "OUTPUT", "COST", "TASKS"
+    print!(
+        "{}",
+        format_cost_groups("Cost by Model", "MODEL", 20, &groups)
     );
-    println!("{}", "-".repeat(60));
-
-    let mut total_cost = 0.0;
-    for group in &groups {
-        total_cost += group.total_cost_usd;
-        println!(
-            "{:<20} {:>10} {:>10} {:>10} {:>8}",
-            group.name,
-            format_tokens(u64::try_from(group.input_tokens).unwrap_or(0)),
-            format_tokens(u64::try_from(group.output_tokens).unwrap_or(0)),
-            format_cost(group.total_cost_usd),
-            group.task_count,
-        );
-    }
-    println!("{}", "-".repeat(60));
-    println!(
-        "{:<20} {:>10} {:>10} {:>10}",
-        "",
-        "",
-        "",
-        format_cost(total_cost)
-    );
-    println!();
-
     Ok(())
 }
 
@@ -198,7 +139,6 @@ fn format_tokens(n: u64) -> String {
     result.chars().rev().collect()
 }
 
-#[cfg(test)]
 fn format_cost_groups(
     title: &str,
     header: &str,

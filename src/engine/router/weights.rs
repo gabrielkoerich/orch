@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use super::selection::{simple_hash_fraction_for, simple_hash_index_for};
+use super::selection::{hash_task_id, simple_hash_fraction_for, simple_hash_index_for};
 
 /// Default weight for agents with full capacity.
 pub(super) const DEFAULT_WEIGHT: f64 = 1.0;
@@ -37,13 +37,8 @@ pub(super) fn default_missing_weight(configured_weights: &HashMap<String, f64>) 
 /// Generate jitter duration for recovery delay based on agent name.
 /// Uses a simple hash to create deterministic but varied jitter per agent.
 fn generate_recovery_jitter(agent: &str) -> Duration {
-    // Simple hash: sum of char values modulo a large prime
-    let hash: u64 = agent.bytes().fold(0u64, |acc, b| {
-        acc.wrapping_mul(31).wrapping_add(u64::from(b))
-    });
-    // Map hash to 0..RECOVERY_JITTER_MAX range
     let max_secs = RECOVERY_JITTER_MAX.as_secs();
-    let jitter_secs = hash % max_secs;
+    let jitter_secs = hash_task_id(agent) % max_secs;
     Duration::from_secs(jitter_secs)
 }
 
