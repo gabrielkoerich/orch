@@ -3615,17 +3615,31 @@ pub(crate) fn classify_ruleset_create_error(err: &str) -> RulesetCreateKind {
         || lower.contains("(502")
         || lower.contains("(503")
         || lower.contains("(504")
+        || lower.contains("(429")
     {
         return RulesetCreateKind::Retryable;
     }
-    if lower.contains("403")
-        || lower.contains("401")
+    // "(401" / "(403" is the status token, a 422 body can contain those digits
+    if lower.contains("(403")
+        || lower.contains("(401")
         || lower.contains("upgrade to github pro")
         || lower.contains("not accessible")
     {
         return RulesetCreateKind::Refused;
     }
+    // timeout and transport errors never include an HTTP status
+    if !has_http_status_token(&lower) {
+        return RulesetCreateKind::Retryable;
+    }
     RulesetCreateKind::Other
+}
+
+fn has_http_status_token(err: &str) -> bool {
+    err.match_indices('(').any(|(i, _)| {
+        err.as_bytes()
+            .get(i + 1..i + 4)
+            .is_some_and(|digits| digits.iter().all(u8::is_ascii_digit))
+    })
 }
 
 /// Classic protection prefers `checks` (includes `app_id`) and falls back to `contexts`
@@ -4133,6 +4147,36 @@ mod tests {
         assert_eq!(
             classify_ruleset_create_error("failed (500 Internal Server Error): boom"),
             RulesetCreateKind::Retryable
+        );
+        assert_eq!(
+            classify_ruleset_create_error(
+                "GitHub API POST /rulesets failed (429 Too Many Requests): {\"message\":\"API rate limit exceeded\"}"
+            ),
+            RulesetCreateKind::Retryable
+        );
+        assert_eq!(
+            classify_ruleset_create_error(
+                "HTTP request failed to send (transport error): connection reset by peer"
+            ),
+            RulesetCreateKind::Retryable
+        );
+        assert_eq!(
+            classify_ruleset_create_error(
+                "error sending request for url (https://api.github.com/repos/o/r/rulesets): operation timed out"
+            ),
+            RulesetCreateKind::Retryable
+        );
+        assert_eq!(
+            classify_ruleset_create_error(
+                "failed (422 Unprocessable Entity): {\"message\":\"Ruleset validation failed for rule 401\"}"
+            ),
+            RulesetCreateKind::Other
+        );
+        assert_eq!(
+            classify_ruleset_create_error(
+                "GitHub API POST /rulesets failed (401 Unauthorized): {\"message\":\"Bad credentials\"}"
+            ),
+            RulesetCreateKind::Refused
         );
     }
 
