@@ -319,7 +319,7 @@ async fn handle_ruleset_write_error(
     kind: RulesetCreateKind,
 ) -> anyhow::Result<()> {
     match kind {
-        RulesetCreateKind::NameTaken | RulesetCreateKind::Retryable => {
+        RulesetCreateKind::NameTaken | RulesetCreateKind::Retryable | RulesetCreateKind::Other => {
             tracing::info!(
                 task_id,
                 err = %err,
@@ -336,7 +336,7 @@ async fn handle_ruleset_write_error(
             comment_never_run_once(gh, store, repo, task_id, err).await;
             Ok(())
         }
-        RulesetCreateKind::Refused | RulesetCreateKind::Other => {
+        RulesetCreateKind::Refused => {
             comment_refused(gh, repo, task_id, err).await;
             store.kv_set(&kv_key(repo, task_id), KV_REFUSED).await?;
             Ok(())
@@ -835,6 +835,23 @@ mod tests {
             .expect(expected)
             .mount(server)
             .await;
+    }
+
+    #[test]
+    fn ruleset_write_keeps_429_transport_and_422_with_401_digits_pending() {
+        for err in [
+            "GitHub API POST /rulesets failed (429 Too Many Requests): {\"message\":\"API rate limit exceeded\"}",
+            "HTTP request failed to send (transport error): connection reset by peer",
+            "failed (422 Unprocessable Entity): {\"message\":\"Ruleset validation failed for rule 401\"}",
+        ] {
+            assert!(
+                !matches!(
+                    classify_ruleset_create_error(err),
+                    RulesetCreateKind::Refused
+                ),
+                "{err}"
+            );
+        }
     }
 
     #[test]
@@ -1444,6 +1461,49 @@ mod tests {
         assert_eq!(
             store.kv_get(&kv_key("o/r", "12")).await.unwrap().as_deref(),
             Some(KV_REFUSED)
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_pending_holds_when_ruleset_create_is_unrecognized_even_with_401_digits() {
+        let _token = EnvVarGuard::set("GH_TOKEN", "test_token");
+        let server = MockServer::start().await;
+        mock_unprotected_main(&server, "deadbeef").await;
+        mock_runs_and_empty_status(
+            &server,
+            "deadbeef",
+            serde_json::json!([{
+                "id": 1,
+                "name": "test",
+                "status": "completed",
+                "conclusion": "success",
+                "app": { "id": 15368 }
+            }]),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/rulesets"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({
+                "message": "Ruleset validation failed for rule 401"
+            })))
+            .mount(&server)
+            .await;
+        mock_issue_comment(&server, 0).await;
+
+        let (store, task_manager, id) = pending_store().await;
+        let gh = GhHttp::for_test(server.uri(), None);
+        apply_pending_with(&gh, &store, &task_manager, "o/r")
+            .await
+            .unwrap();
+        apply_pending_with(&gh, &store, &task_manager, "o/r")
+            .await
+            .unwrap();
+
+        let stored = store.get(id).await.unwrap();
+        assert_eq!(stored.status, TaskStatus::Approved);
+        assert_eq!(
+            store.kv_get(&kv_key("o/r", "12")).await.unwrap().as_deref(),
+            Some(KV_PENDING)
         );
     }
 
