@@ -526,25 +526,33 @@ pub fn parse_session_output(
         match parse_success_output(task_id, agent_name, agent_runner, &combined_output) {
             Ok(parsed) => return Ok(parsed),
             Err(err) => {
-                if session_output.exit_code == 124
-                    && let Some(summary) = salvage_wrapup(&combined_output)
-                {
-                    tracing::warn!(
-                        task_id,
-                        agent = agent_name,
-                        "timed out after commit during wrap-up, salvaging as done"
-                    );
-                    return Ok(agents::ParsedResponse {
-                        response: AgentResponse {
-                            status: "done".to_string(),
-                            summary,
-                            ..Default::default()
-                        },
-                        input_tokens: None,
-                        output_tokens: None,
-                        cost_usd: None,
-                        duration_ms: None,
-                    });
+                if session_output.exit_code == 124 {
+                    if let Some(summary) = salvage_wrapup(&combined_output) {
+                        tracing::warn!(
+                            task_id,
+                            agent = agent_name,
+                            "timed out after commit during wrap-up, salvaging as done"
+                        );
+                        return Ok(agents::ParsedResponse {
+                            response: AgentResponse {
+                                status: "done".to_string(),
+                                summary,
+                                ..Default::default()
+                            },
+                            input_tokens: None,
+                            output_tokens: None,
+                            cost_usd: None,
+                            duration_ms: None,
+                        });
+                    }
+                    // timeout(1) killed the process. A cancelled error envelope is the CLI
+                    // reacting to SIGTERM
+                    return Err(agent_runner.classify_error_with_elapsed(
+                        session_output.exit_code,
+                        &session_output.raw_stdout,
+                        &session_output.raw_stderr,
+                        session_output.elapsed_secs,
+                    ));
                 }
                 // If parse_success_output already returned a classified error
                 // (RateLimit, AgentFailed, Timeout, Auth, etc.), propagate it
@@ -3505,6 +3513,52 @@ mod tests {
         );
         assert!(salvage_wrapup(&pending).is_none());
         assert!(salvage_wrapup(&tool_pair("1", "run_terminal_cmd", "ls", false)).is_none());
+    }
+
+    /// Grok writes `is_error: true` and `errors: ["cancelled"]` when the timeout
+    /// wrapper kills it. Exit 124 is the time limit, so this is Timeout
+    #[test]
+    fn parse_session_output_exit124_cancelled_envelope_is_timeout() {
+        let ndjson = r#"{"type":"result","subtype":"error","is_error":true,"stop_reason":"cancelled","errors":["cancelled"],"duration_ms":2697000}"#;
+        let session = session::SessionOutput {
+            exit_code: 124,
+            raw_stdout: ndjson.to_string(),
+            raw_stderr: String::new(),
+            elapsed_secs: Some(2705),
+            sandbox_error: None,
+        };
+
+        let runner = agents::get_runner("grok");
+        let err = parse_session_output("4068", "grok", &*runner, &session)
+            .expect_err("cancelled at the time limit should be an error");
+        match err {
+            agents::AgentError::Timeout { elapsed } => {
+                assert_eq!(elapsed.as_secs(), 2705);
+            }
+            _ => panic!("exit 124 with cancelled envelope should be Timeout, got {err:?}"),
+        }
+    }
+
+    /// A provider error with a normal non-zero exit is AgentFailed
+    #[test]
+    fn parse_session_output_exit1_provider_error_stays_agent_failed() {
+        let ndjson =
+            r#"{"type":"result","subtype":"error","is_error":true,"errors":["provider error"]}"#;
+        let session = session::SessionOutput {
+            exit_code: 1,
+            raw_stdout: ndjson.to_string(),
+            raw_stderr: String::new(),
+            elapsed_secs: Some(12),
+            sandbox_error: None,
+        };
+
+        let runner = agents::get_runner("grok");
+        let err = parse_session_output("4068", "grok", &*runner, &session)
+            .expect_err("provider error should be an error");
+        assert!(
+            matches!(err, agents::AgentError::AgentFailed { .. }),
+            "exit 1 provider error should stay AgentFailed, got {err:?}"
+        );
     }
 
     // ── terminal_reason:completed + exit 1 detection (issue #3087) ─────────────
