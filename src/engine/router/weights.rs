@@ -276,3 +276,19 @@ impl AgentWeights {
         snap
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_jitter_is_the_byte_hash_modulo_the_cap() {
+        assert_eq!(generate_recovery_jitter(""), Duration::from_secs(0));
+        assert_eq!(generate_recovery_jitter("a"), Duration::from_secs(7));
+        assert_eq!(
+            generate_recovery_jitter("claude"),
+            generate_recovery_jitter("claude")
+        );
+        assert!(generate_recovery_jitter("claude") < RECOVERY_JITTER_MAX);
+    }
+}

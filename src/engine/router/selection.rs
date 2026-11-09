@@ -64,3 +64,50 @@ fn hash_task_id(task_id: &str) -> u64 {
         acc.wrapping_mul(31).wrapping_add(u64::from(b))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hash_task_id_is_a_polynomial_byte_hash() {
+        assert_eq!(hash_task_id(""), 0);
+        assert_eq!(hash_task_id("a"), 97);
+        assert_eq!(hash_task_id("ab"), 97 * 31 + 98);
+    }
+
+    #[test]
+    fn simple_hash_index_for_empty_len_is_zero() {
+        assert_eq!(simple_hash_index_for(0, "any"), 0);
+    }
+
+    #[test]
+    fn simple_hash_index_for_stays_in_range() {
+        for len in 1..=16 {
+            for _ in 0..20 {
+                let idx = simple_hash_index_for(len, "task-1");
+                assert!(idx < len, "idx={idx} len={len}");
+            }
+        }
+    }
+
+    #[test]
+    fn simple_hash_fraction_for_stays_in_unit_interval() {
+        for _ in 0..20 {
+            let fraction = simple_hash_fraction_for("task-1");
+            assert!(
+                (0.0..1.0).contains(&fraction),
+                "fraction={fraction} is outside [0, 1)"
+            );
+        }
+    }
+
+    #[test]
+    fn hash_counter_advances_on_each_call() {
+        let before = HASH_COUNTER.load(Ordering::Relaxed);
+        let _ = simple_hash_fraction_for("counter");
+        let _ = simple_hash_index_for(4, "counter");
+        let after = HASH_COUNTER.load(Ordering::Relaxed);
+        assert!(after >= before + 2, "before={before} after={after}");
+    }
+}
