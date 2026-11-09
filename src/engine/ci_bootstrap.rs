@@ -21,7 +21,7 @@ const KV_REFUSED: &str = "refused";
 #[derive(Debug, PartialEq)]
 pub(crate) enum ChecksReady {
     Ready(Vec<RequiredStatusCheck>),
-    /// A real check is still queued or in progress
+    /// A real check is still queued, in progress, or waiting on a person
     Pending,
     /// A real check finished as failure, error, cancelled, or timed out
     Failed(Vec<FailedCheck>),
@@ -121,25 +121,26 @@ pub(crate) fn checks_ready_for_ruleset(
         if review_gate::is_own_check(&run.name) {
             continue;
         }
-        match run.status.as_str() {
-            "completed" => match run.conclusion.as_deref() {
-                Some("success") => {
-                    let integration_id = run.app.as_ref().map(|app| app.id).filter(|&id| id > 0);
-                    if !ready.iter().any(|check| check.context == run.name) {
-                        ready.push(RequiredStatusCheck {
-                            context: run.name.clone(),
-                            integration_id,
-                        });
-                    }
+        if !run.is_finished() {
+            pending = true;
+            continue;
+        }
+        match run.conclusion.as_deref() {
+            Some("success") => {
+                let integration_id = run.app.as_ref().map(|app| app.id).filter(|&id| id > 0);
+                if !ready.iter().any(|check| check.context == run.name) {
+                    ready.push(RequiredStatusCheck {
+                        context: run.name.clone(),
+                        integration_id,
+                    });
                 }
-                Some("skipped" | "neutral") => {}
-                Some(conclusion) => failed.push(FailedCheck {
-                    name: run.name.clone(),
-                    conclusion: conclusion.to_string(),
-                }),
-                None => pending = true,
-            },
-            _ => pending = true,
+            }
+            Some("skipped" | "neutral") => {}
+            Some(conclusion) => failed.push(FailedCheck {
+                name: run.name.clone(),
+                conclusion: conclusion.to_string(),
+            }),
+            None => pending = true,
         }
     }
 
@@ -876,6 +877,23 @@ mod tests {
                 name: "test".to_string(),
                 conclusion: "failure".to_string(),
             }])
+        );
+        assert_eq!(
+            checks_ready_for_ruleset(
+                &[run("deploy", "completed", Some("action_required"), None)],
+                &[]
+            ),
+            ChecksReady::Pending
+        );
+        assert_eq!(
+            checks_ready_for_ruleset(
+                &[
+                    run("test", "completed", Some("success"), None),
+                    run("deploy", "completed", Some("action_required"), None),
+                ],
+                &[]
+            ),
+            ChecksReady::Pending
         );
         assert_eq!(
             checks_ready_for_ruleset(&[run("test", "completed", Some("cancelled"), None)], &[]),

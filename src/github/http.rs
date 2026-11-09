@@ -3150,23 +3150,21 @@ impl GhHttp {
         let mut pending = 0u64;
 
         for run in &runs {
-            let conclusion = run.get("conclusion").and_then(|v| v.as_str()).unwrap_or("");
+            let conclusion = run
+                .get("conclusion")
+                .and_then(|v| v.as_str())
+                .filter(|c| !c.is_empty());
             let status = run
                 .get("status")
                 .and_then(|v| v.as_str())
                 .unwrap_or("queued");
 
-            match status {
-                "completed" => {
-                    if conclusion.is_empty() {
-                        pending += 1;
-                    } else if matches!(conclusion, "success" | "neutral" | "skipped") {
-                        passing += 1;
-                    } else {
-                        failing += 1;
-                    }
-                }
-                _ => pending += 1,
+            if !types::check_run_is_finished(status, conclusion) {
+                pending += 1;
+            } else if types::check_conclusion_passed(conclusion) {
+                passing += 1;
+            } else {
+                failing += 1;
             }
         }
 

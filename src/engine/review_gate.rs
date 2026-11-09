@@ -139,12 +139,12 @@ fn ci_state(
     // (name, started, finished, passed)
     let mut checks: Vec<(String, bool, bool, bool)> = Vec::new();
     for run in runs.iter().filter(|r| !is_own_check(&r.name)) {
-        let finished = run.status == "completed" && run.conclusion.is_some();
-        let passed = matches!(
-            run.conclusion.as_deref(),
-            Some("success" | "neutral" | "skipped")
-        );
-        checks.push((run.name.clone(), run.status != "queued", finished, passed));
+        checks.push((
+            run.name.clone(),
+            run.status != "queued",
+            run.is_finished(),
+            run.is_passed(),
+        ));
     }
     for (context, state) in statuses.iter().filter(|(c, _)| !is_own_check(c)) {
         let finished = state != "pending";
@@ -307,6 +307,13 @@ mod tests {
             ci_state(&[], &red, &[]),
             CiState::Red(vec!["test".to_string()])
         );
+
+        let action_required = [
+            run("test", "completed", Some("success")),
+            run("docs", "completed", Some("skipped")),
+            run("deploy", "completed", Some("action_required")),
+        ];
+        assert_eq!(ci_state(&[], &action_required, &[]), CiState::Running);
     }
 
     #[test]

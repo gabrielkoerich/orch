@@ -967,11 +967,9 @@ pub(crate) fn required_checks_state(
             .find(|run| required_check_run_matches(required, run))
         {
             matched = true;
-            let status = run.status.as_str();
-            let conclusion = run.conclusion.as_deref();
-            if status != "completed" || conclusion.is_none() {
+            if !run.is_finished() {
                 pending += 1;
-            } else if matches!(conclusion, Some("success" | "neutral" | "skipped")) {
+            } else if run.is_passed() {
                 passing += 1;
             } else {
                 failing += 1;
@@ -1116,9 +1114,7 @@ fn may_merge_onto_base(behind_by: Option<u64>) -> bool {
 
 /// True when any check run or commit status has not finished
 fn any_check_pending(check_runs: &[GitHubCheckRun], statuses: &[(String, String)]) -> bool {
-    check_runs
-        .iter()
-        .any(|run| run.status != "completed" || run.conclusion.is_none())
+    check_runs.iter().any(|run| !run.is_finished())
         || statuses.iter().any(|(_, state)| {
             !matches!(
                 state.as_str(),
@@ -1138,12 +1134,7 @@ fn failing_optional_check_names(
         if required.iter().any(|r| required_check_run_matches(r, run)) {
             continue;
         }
-        let failed = run.status == "completed"
-            && matches!(
-                run.conclusion.as_deref(),
-                Some(conclusion) if !matches!(conclusion, "success" | "neutral" | "skipped")
-            );
-        if failed {
+        if run.is_finished() && !run.is_passed() {
             names.push(run.name.clone());
         }
     }
@@ -2757,6 +2748,19 @@ mod tests {
             failing_optional_check_names(&[], &check_runs, &[]),
             vec!["lint"]
         );
+        let action_required = vec![check_run(
+            "deploy",
+            "completed",
+            Some("action_required"),
+            None,
+        )];
+        assert!(!mergeable_state_ready(
+            "unstable",
+            &[],
+            &action_required,
+            &[]
+        ));
+        assert!(failing_optional_check_names(&[], &action_required, &[]).is_empty());
     }
 
     /// Auto-merge refuses a PR whose head does not contain the current base
@@ -2868,6 +2872,24 @@ mod tests {
         let check_runs = vec![check_run("ci/test", "completed", Some("failure"), Some(42))];
         let (state, ..) = required_checks_state(&required, &check_runs, &[]);
         assert_eq!(state, "failure");
+    }
+
+    #[test]
+    fn required_checks_state_action_required_is_pending() {
+        let required = vec![required_check("ci/test", Some(42))];
+        let check_runs = vec![check_run(
+            "ci/test",
+            "completed",
+            Some("action_required"),
+            Some(42),
+        )];
+        let (state, total, passing, failing, pending) =
+            required_checks_state(&required, &check_runs, &[]);
+        assert_eq!(state, "pending");
+        assert_eq!(total, 1);
+        assert_eq!(passing, 0);
+        assert_eq!(failing, 0);
+        assert_eq!(pending, 1);
     }
 
     #[test]

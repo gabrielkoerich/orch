@@ -69,6 +69,25 @@ pub struct GitHubCheckRun {
     pub app: Option<GitHubApp>,
 }
 
+impl GitHubCheckRun {
+    pub(crate) fn is_finished(&self) -> bool {
+        check_run_is_finished(&self.status, self.conclusion.as_deref())
+    }
+
+    pub(crate) fn is_passed(&self) -> bool {
+        check_conclusion_passed(self.conclusion.as_deref())
+    }
+}
+
+/// `action_required` is completed on GitHub but still needs a person
+pub(crate) fn check_run_is_finished(status: &str, conclusion: Option<&str>) -> bool {
+    status == "completed" && conclusion.is_some_and(|c| c != "action_required")
+}
+
+pub(crate) fn check_conclusion_passed(conclusion: Option<&str>) -> bool {
+    matches!(conclusion, Some("success" | "neutral" | "skipped"))
+}
+
 /// The GitHub App that created a check run (`check_run.app`)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubApp {
@@ -198,6 +217,21 @@ impl PullRequestReview {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_required_is_not_finished() {
+        assert!(!check_run_is_finished("completed", Some("action_required")));
+        assert!(check_run_is_finished("completed", Some("success")));
+        assert!(check_run_is_finished("completed", Some("failure")));
+        assert!(check_run_is_finished("completed", Some("skipped")));
+        assert!(!check_run_is_finished("completed", None));
+        assert!(!check_run_is_finished("in_progress", None));
+        assert!(!check_run_is_finished("waiting", None));
+        assert!(!check_conclusion_passed(Some("action_required")));
+        assert!(check_conclusion_passed(Some("success")));
+        assert!(check_conclusion_passed(Some("skipped")));
+        assert!(!check_conclusion_passed(Some("failure")));
+    }
 
     #[test]
     fn test_github_review_deserialization() {
