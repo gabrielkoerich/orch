@@ -1,6 +1,7 @@
 use crate::cli;
 use crate::cli::task_ref;
-use crate::store::{self, TaskStore};
+use crate::store::{self, CostByGroup, TaskStore};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 /// Show cost breakdown for a specific task.
@@ -88,38 +89,10 @@ pub async fn show_by_agent() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!();
-    println!("Cost by Agent");
-    println!("{}", "=".repeat(60));
-    println!();
-    println!(
-        "{:<12} {:>10} {:>10} {:>10} {:>8}",
-        "AGENT", "INPUT", "OUTPUT", "COST", "TASKS"
+    print!(
+        "{}",
+        format_cost_groups("Cost by Agent", "AGENT", 12, &groups)
     );
-    println!("{}", "-".repeat(60));
-
-    let mut total_cost = 0.0;
-    for group in &groups {
-        total_cost += group.total_cost_usd;
-        println!(
-            "{:<12} {:>10} {:>10} {:>10} {:>8}",
-            group.name,
-            format_tokens(u64::try_from(group.input_tokens).unwrap_or(0)),
-            format_tokens(u64::try_from(group.output_tokens).unwrap_or(0)),
-            format_cost(group.total_cost_usd),
-            group.task_count,
-        );
-    }
-    println!("{}", "-".repeat(60));
-    println!(
-        "{:<12} {:>10} {:>10} {:>10}",
-        "",
-        "",
-        "",
-        format_cost(total_cost)
-    );
-    println!();
-
     Ok(())
 }
 
@@ -134,38 +107,10 @@ pub async fn show_by_model() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!();
-    println!("Cost by Model");
-    println!("{}", "=".repeat(60));
-    println!();
-    println!(
-        "{:<20} {:>10} {:>10} {:>10} {:>8}",
-        "MODEL", "INPUT", "OUTPUT", "COST", "TASKS"
+    print!(
+        "{}",
+        format_cost_groups("Cost by Model", "MODEL", 20, &groups)
     );
-    println!("{}", "-".repeat(60));
-
-    let mut total_cost = 0.0;
-    for group in &groups {
-        total_cost += group.total_cost_usd;
-        println!(
-            "{:<20} {:>10} {:>10} {:>10} {:>8}",
-            group.name,
-            format_tokens(u64::try_from(group.input_tokens).unwrap_or(0)),
-            format_tokens(u64::try_from(group.output_tokens).unwrap_or(0)),
-            format_cost(group.total_cost_usd),
-            group.task_count,
-        );
-    }
-    println!("{}", "-".repeat(60));
-    println!(
-        "{:<20} {:>10} {:>10} {:>10}",
-        "",
-        "",
-        "",
-        format_cost(total_cost)
-    );
-    println!();
-
     Ok(())
 }
 
@@ -194,6 +139,49 @@ fn format_tokens(n: u64) -> String {
     result.chars().rev().collect()
 }
 
+fn format_cost_groups(
+    title: &str,
+    header: &str,
+    name_width: usize,
+    groups: &[CostByGroup],
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{title}");
+    let _ = writeln!(out, "{}", "=".repeat(60));
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "{header:<name_width$} {:>10} {:>10} {:>10} {:>8}",
+        "INPUT", "OUTPUT", "COST", "TASKS"
+    );
+    let _ = writeln!(out, "{}", "-".repeat(60));
+    let mut total_cost = 0.0;
+    for group in groups {
+        total_cost += group.total_cost_usd;
+        let _ = writeln!(
+            out,
+            "{:<name_width$} {:>10} {:>10} {:>10} {:>8}",
+            group.name,
+            format_tokens(u64::try_from(group.input_tokens).unwrap_or(0)),
+            format_tokens(u64::try_from(group.output_tokens).unwrap_or(0)),
+            format_cost(group.total_cost_usd),
+            group.task_count,
+        );
+    }
+    let _ = writeln!(out, "{}", "-".repeat(60));
+    let _ = writeln!(
+        out,
+        "{:<name_width$} {:>10} {:>10} {:>10}",
+        "",
+        "",
+        "",
+        format_cost(total_cost)
+    );
+    let _ = writeln!(out);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +204,41 @@ mod tests {
     #[test]
     fn format_tokens_millions() {
         assert_eq!(format_tokens(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn format_cost_positive_zero_and_negative() {
+        assert_eq!(format_cost(0.0), "not reported");
+        assert_eq!(format_cost(-0.01), "not reported");
+        assert_eq!(format_cost(0.5), "$0.5000");
+        assert_eq!(format_cost(1.23456), "$1.2346");
+    }
+
+    fn group(name: &str, input: i64, output: i64, cost: f64, tasks: i64) -> CostByGroup {
+        CostByGroup {
+            name: name.to_string(),
+            input_tokens: input,
+            output_tokens: output,
+            total_cost_usd: cost,
+            task_count: tasks,
+        }
+    }
+
+    #[test]
+    fn cost_by_agent_table_layout() {
+        let groups = [group("claude", 1_234, 56, 0.5, 2)];
+        assert_eq!(
+            format_cost_groups("Cost by Agent", "AGENT", 12, &groups),
+            "\nCost by Agent\n============================================================\n\nAGENT             INPUT     OUTPUT       COST    TASKS\n------------------------------------------------------------\nclaude            1,234         56    $0.5000        2\n------------------------------------------------------------\n                                      $0.5000\n\n"
+        );
+    }
+
+    #[test]
+    fn cost_by_model_table_layout_and_unreported_total() {
+        let groups = [group("sonnet", 0, 1_234_567, 0.0, 1)];
+        assert_eq!(
+            format_cost_groups("Cost by Model", "MODEL", 20, &groups),
+            "\nCost by Model\n============================================================\n\nMODEL                     INPUT     OUTPUT       COST    TASKS\n------------------------------------------------------------\nsonnet                        0  1,234,567 not reported        1\n------------------------------------------------------------\n                                           not reported\n\n"
+        );
     }
 }
