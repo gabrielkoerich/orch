@@ -108,8 +108,8 @@ impl AgentRunner for GrokRunner {
     }
 
     fn router_command(&self, prompt: &str, model: Option<&str>) -> anyhow::Result<Command> {
-        // Classification only needs a JSON answer. Strip the tools so the
-        // call cannot edit the repo or browse the network while routing.
+        // Classification only needs a JSON answer. One leftover tool call
+        // spends `--max-turns 1` and grok exits with max turns reached
         let mut cmd = Command::new("grok");
         cmd.arg("--no-plan")
             .arg("--no-subagents")
@@ -121,7 +121,7 @@ impl AgentRunner for GrokRunner {
             .arg("--permission-mode")
             .arg("dontAsk")
             .arg("--disallowed-tools")
-            .arg("read_file,grep,list_dir,search_replace,write,run_terminal_cmd,web_search,web_fetch,task");
+            .arg(ROUTER_DISALLOWED_TOOLS);
         if let Some(model) = model.filter(|m| !m.is_empty()) {
             cmd.arg("--model").arg(model);
         }
@@ -167,6 +167,14 @@ fn sandbox_profile(permissions: &PermissionRules) -> &'static str {
         "off"
     }
 }
+
+/// Tools the grok router must not expose. One tool call spends `--max-turns 1`
+const ROUTER_DISALLOWED_TOOLS: &str = concat!(
+    "read_file,grep,list_dir,search_replace,write,run_terminal_cmd,",
+    "web_search,web_fetch,task,todo_write,monitor,search_tool,use_tool,",
+    "workflow,enter_plan_mode,exit_plan_mode,ask_user_question,",
+    "send_feedback,image_gen,image_edit,image_to_video,reference_to_video"
+);
 
 /// Claude tool names that map to a Grok tool id for `--tools` / `--disallowed-tools`
 fn grok_tool_id(name: &str) -> Option<&'static str> {
@@ -454,5 +462,28 @@ mod tests {
             r#"{"type":"error","message":"permission required: Edit calc.py was not run"}"#;
         let err = runner().classify_error(1, stdout, "");
         assert!(matches!(err, AgentError::PermissionDenied { .. }), "{err}");
+    }
+
+    #[test]
+    fn router_command_disallows_leftover_tools() {
+        let cmd = runner()
+            .router_command("classify this task", None)
+            .expect("router command");
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let disallowed = args
+            .windows(2)
+            .find(|pair| pair[0] == "--disallowed-tools")
+            .map(|pair| pair[1].as_str())
+            .expect("disallowed-tools flag");
+        for tool in ["search_tool", "use_tool", "todo_write", "workflow"] {
+            assert!(
+                disallowed.split(',').any(|name| name == tool),
+                "{tool} missing from {disallowed}"
+            );
+        }
     }
 }
