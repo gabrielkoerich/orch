@@ -417,11 +417,12 @@ async fn check_commits_and_clear_stale_errors(
 /// (conflicts), the task is blocked for human intervention.
 ///
 /// Returns `PushResult::Success` on success, `PushResult::Failed` if push failed
-/// and recovery was not possible, or `PushResult::NoCommits` if the branch has no
-/// commits ahead of the default branch
+/// and recovery was not possible, `PushResult::Skipped` if the push was skipped,
+/// or `PushResult::NoCommits` if the branch has no commits ahead of the default branch
 enum PushResult {
     Success,
     Failed,
+    Skipped,         // push_branch returned Ok(false)
     NoCommits,       // agent made no code changes
     WorktreeMissing, // retry after rebuilding missing worktree
 }
@@ -506,7 +507,7 @@ async fn push_after_rebase(
     model_name: Option<&str>,
 ) -> PushResult {
     match git_ops::push_branch(work_dir, branch, default_branch).await {
-        Ok(_) => {
+        Ok(true) => {
             ctx.append_activity(
                 "push",
                 Some(agent_name),
@@ -525,6 +526,27 @@ async fn push_after_rebase(
             ])
             .await;
             PushResult::Success
+        }
+        Ok(false) => {
+            tracing::info!(
+                task_id = ctx.task_id,
+                branch,
+                default_branch,
+                "push skipped after rebase"
+            );
+            ctx.append_activity(
+                "push",
+                Some(agent_name),
+                model_name,
+                Some(&serde_json::json!({
+                    "status": "skipped",
+                    "branch": branch,
+                    "default_branch": default_branch,
+                    "reason": "pushed_after_rebase",
+                })),
+            )
+            .await;
+            PushResult::Skipped
         }
         Err(e) => {
             tracing::error!(
@@ -565,7 +587,7 @@ async fn push_branch_with_log(
     model_name: Option<&str>,
 ) -> PushResult {
     match git_ops::push_branch(work_dir, branch, default_branch).await {
-        Ok(_) => {
+        Ok(true) => {
             ctx.append_activity(
                 "push",
                 Some(agent_name),
@@ -585,6 +607,26 @@ async fn push_branch_with_log(
             ])
             .await;
             PushResult::Success
+        }
+        Ok(false) => {
+            tracing::info!(
+                task_id = ctx.task_id,
+                branch,
+                default_branch,
+                "push skipped"
+            );
+            ctx.append_activity(
+                "push",
+                Some(agent_name),
+                model_name,
+                Some(&serde_json::json!({
+                    "status": "skipped",
+                    "branch": branch,
+                    "default_branch": default_branch,
+                })),
+            )
+            .await;
+            PushResult::Skipped
         }
         Err(e) => {
             let err_str = e.to_string();
@@ -1014,6 +1056,8 @@ async fn run_git_ops(
             task_id = ctx.task_id,
             "skipping PR creation due to push failure"
         );
+    } else if matches!(push_result, PushResult::Skipped) {
+        tracing::info!(task_id = ctx.task_id, "push skipped, skipping PR creation");
     } else if matches!(push_result, PushResult::NoCommits) {
         tracing::info!(
             task_id = ctx.task_id,

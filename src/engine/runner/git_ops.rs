@@ -1005,7 +1005,8 @@ pub(crate) async fn clear_push_lease(dir: &Path, branch: &str) {
 }
 
 async fn note_pushed_head(dir: &Path, branch: &str) {
-    if let Some(sha) = git_stdout(dir, &["rev-parse", "--verify", "HEAD"]).await {
+    let spec = format!("refs/heads/{branch}");
+    if let Some(sha) = git_stdout(dir, &["rev-parse", "--verify", &spec]).await {
         write_push_lease(dir, branch, &sha).await;
     }
 }
@@ -1108,20 +1109,38 @@ pub(crate) async fn force_push_leased(
     anyhow::bail!("{stderr}")
 }
 
+/// True for a branch orch must never push: the repo default, plus `main` and `master`
+fn is_protected_push_branch(name: &str, default_branch: &str) -> bool {
+    !name.is_empty() && (name == default_branch || name == "main" || name == "master")
+}
+
+/// Pick the ref to push. A protected checkout falls back to the task branch when that name is safe
+fn resolve_push_branch<'a>(
+    current: &'a str,
+    branch: &'a str,
+    default_branch: &str,
+) -> anyhow::Result<&'a str> {
+    let chosen = if !current.is_empty() && !is_protected_push_branch(current, default_branch) {
+        current
+    } else if !branch.is_empty() && !is_protected_push_branch(branch, default_branch) {
+        branch
+    } else {
+        let name = if current.is_empty() { branch } else { current };
+        if name.is_empty() {
+            anyhow::bail!("cannot push: branch name is empty");
+        }
+        anyhow::bail!("push refused: '{name}' is a default branch");
+    };
+    Ok(chosen)
+}
+
 /// Push the branch to origin.
+///
+/// Returns `Ok(true)` when the branch is on the remote, `Ok(false)` when the push was skipped,
+/// and `Err` when the push was refused (default branch) or failed
 pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyhow::Result<bool> {
     let current = get_current_branch(dir).await;
-    let branch_to_push = if current.is_empty() { branch } else { &current };
-
-    // Guard against empty branch names (prevents git config corruption)
-    if branch_to_push.is_empty() {
-        anyhow::bail!("cannot push: branch name is empty");
-    }
-
-    // Skip push for main/master
-    if branch_to_push == "main" || branch_to_push == "master" {
-        return Ok(false);
-    }
+    let branch_to_push = resolve_push_branch(&current, branch, default_branch)?;
 
     // Check if there are commits to push and whether the remote branch exists
     let (remote_exists, has_unpushed) =
@@ -2091,11 +2110,10 @@ async fn check_push_needed(dir: &Path, branch: &str, default_branch: &str) -> (b
         .is_ok_and(|o| o.status.success());
 
     let compare_ref = if remote_exists {
-        format!("origin/{branch}..HEAD")
+        format!("origin/{branch}..{branch}")
     } else {
-        // Compare against default branch (passed in, NOT detected from
-        // current HEAD — in a worktree HEAD is the feature branch itself)
-        format!("origin/{default_branch}..HEAD")
+        // Compare the named branch, not HEAD: a protected checkout still pushes the task branch
+        format!("origin/{default_branch}..{branch}")
     };
 
     tracing::debug!(
@@ -3183,20 +3201,31 @@ mod tests {
 
     /// A bare origin with `main` and a pushed `feature`, and a clone `a` on `feature`
     fn publish_feature(root: &Path) -> (PathBuf, PathBuf) {
+        let (bare, a) = publish_default(root, "main");
+        git_ok(&a, &["checkout", "-b", "feature"]);
+        write_commit(&a, "feature.txt", "feature\n", "feature");
+        git_ok(&a, &["push", "-u", "origin", "feature"]);
+        (bare, a)
+    }
+
+    fn publish_default(root: &Path, default_branch: &str) -> (PathBuf, PathBuf) {
         let bare = root.join("bare.git");
         let a = root.join("a");
-        git_ok(root, &["init", "-b", "main", a.to_str().unwrap()]);
+        git_ok(root, &["init", "-b", default_branch, a.to_str().unwrap()]);
         init_identity(&a);
         write_commit(&a, "README.md", "base\n", "base");
         git_ok(
             root,
-            &["init", "--bare", "-b", "main", bare.to_str().unwrap()],
+            &[
+                "init",
+                "--bare",
+                "-b",
+                default_branch,
+                bare.to_str().unwrap(),
+            ],
         );
         git_ok(&a, &["remote", "add", "origin", bare.to_str().unwrap()]);
-        git_ok(&a, &["push", "-u", "origin", "main"]);
-        git_ok(&a, &["checkout", "-b", "feature"]);
-        write_commit(&a, "feature.txt", "feature\n", "feature");
-        git_ok(&a, &["push", "-u", "origin", "feature"]);
+        git_ok(&a, &["push", "-u", "origin", default_branch]);
         (bare, a)
     }
 
@@ -3602,5 +3631,80 @@ mod tests {
             )
             .await
         );
+    }
+
+    #[test]
+    fn resolve_push_branch_picks_the_task_branch_when_checkout_is_main() {
+        assert_eq!(
+            resolve_push_branch("main", "feature", "main").unwrap(),
+            "feature"
+        );
+        assert_eq!(
+            resolve_push_branch("main", "feature", "develop").unwrap(),
+            "feature"
+        );
+    }
+
+    #[test]
+    fn resolve_push_branch_refuses_a_develop_default_checkout() {
+        let err = resolve_push_branch("develop", "develop", "develop")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("push refused"), "{err}");
+        assert!(err.contains("develop"), "{err}");
+    }
+
+    #[test]
+    fn resolve_push_branch_picks_the_task_branch_when_checkout_is_default_develop() {
+        assert_eq!(
+            resolve_push_branch("develop", "feature", "develop").unwrap(),
+            "feature"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_branch_refuses_when_checkout_is_default_develop() {
+        let root = tempfile::tempdir().unwrap();
+        let (bare, a) = publish_default(root.path(), "develop");
+        write_commit(&a, "secret.txt", "must not land on develop\n", "local");
+        let before = git_sha(&bare, "refs/heads/develop");
+
+        let err = push_branch(&a, "develop", "develop")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("push refused"), "{err}");
+        assert_eq!(git_sha(&bare, "refs/heads/develop"), before);
+    }
+
+    #[tokio::test]
+    async fn push_branch_pushes_the_task_branch_when_checkout_is_main() {
+        let root = tempfile::tempdir().unwrap();
+        let (bare, a) = publish_feature(root.path());
+        write_commit(&a, "more.txt", "more\n", "more");
+        let feature_sha = git_sha(&a, "feature");
+        git_ok(&a, &["checkout", "main"]);
+
+        assert!(push_branch(&a, "feature", "main").await.unwrap());
+        assert_eq!(git_sha(&bare, "refs/heads/feature"), feature_sha);
+        assert_ne!(git_sha(&bare, "refs/heads/main"), feature_sha);
+        assert_eq!(
+            read_push_lease(&a, "feature").await.as_deref(),
+            Some(feature_sha.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn push_branch_pushes_the_task_branch_when_checkout_is_default_develop() {
+        let root = tempfile::tempdir().unwrap();
+        let (bare, a) = publish_default(root.path(), "develop");
+        git_ok(&a, &["checkout", "-b", "feature"]);
+        write_commit(&a, "feature.txt", "feature\n", "feature");
+        let feature_sha = git_sha(&a, "feature");
+        git_ok(&a, &["checkout", "develop"]);
+
+        assert!(push_branch(&a, "feature", "develop").await.unwrap());
+        assert_eq!(git_sha(&bare, "refs/heads/feature"), feature_sha);
+        assert_ne!(git_sha(&bare, "refs/heads/develop"), feature_sha);
     }
 }

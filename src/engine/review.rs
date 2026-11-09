@@ -2271,7 +2271,7 @@ async fn push_review_branch(
     };
 
     match push_result {
-        Ok(_) => {
+        Ok(true) => {
             store_log_activity(
                 &Some(Arc::clone(store)),
                 repo,
@@ -2304,6 +2304,26 @@ async fn push_review_branch(
                 tracing::warn!(task_id = task.id.0, err = %e, "failed to reset push_failures — counter may drift");
             }
             Ok(())
+        }
+        Ok(false) => {
+            store_log_activity(
+                &Some(Arc::clone(store)),
+                repo,
+                &task.id.0,
+                "push",
+                None,
+                None,
+                Some(&ctx.review_agent),
+                ctx.review_model.as_deref(),
+                Some(&serde_json::json!({
+                    "status": "skipped",
+                    "branch": branch_name.clone(),
+                    "default_branch": ctx.default_branch.clone(),
+                    "phase": "review",
+                })),
+            )
+            .await;
+            Err("push skipped".to_string())
         }
         Err(e) => {
             store_log_activity(

@@ -103,7 +103,7 @@ pub(crate) async fn retry_pending_push(
         "retrying the push from the engine"
     );
     match git_ops::push_branch(&worktree_path, &task.branch, &default_branch).await {
-        Ok(_) => {
+        Ok(true) => {
             log_push(store, repo, task_id, &task, "ok", None).await;
             store.kv_delete(&key).await.ok();
             store::store_set(
@@ -120,6 +120,12 @@ pub(crate) async fn retry_pending_push(
                 open_pr(store, repo, task_id, &task, &worktree_path, &default_branch).await;
             }
             PushRetry::Pushed
+        }
+        Ok(false) => {
+            let err = "push skipped".to_string();
+            log_push(store, repo, task_id, &task, "skipped", Some(&err)).await;
+            store.kv_delete(&key).await.ok();
+            PushRetry::NeedsAgent(err)
         }
         Err(e) => {
             let err = push_error_text(&e.to_string());
