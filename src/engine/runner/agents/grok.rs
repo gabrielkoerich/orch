@@ -6,7 +6,8 @@
 //! Messages API NDJSON shape, so parsing delegates to the Claude runner.
 //!
 //! ```bash
-//! grok --output-format streaming-messages-json \
+//! grok --no-plan --no-wait-for-background \
+//!   --output-format streaming-messages-json \
 //!   --permission-mode bypassPermissions \
 //!   --sandbox off \
 //!   --deny 'Bash(rm *)' \
@@ -19,12 +20,18 @@
 //! `--sandbox off`. Orch still isolates the agent in the worktree and denies
 //! `rm` and `git push`. Control sessions (`deny_read_only`) use `read-only`.
 
+use std::iter;
+use std::time::Duration;
+
 use tokio::process::Command;
 
 use super::claude::{self, ClaudeRunner};
 use super::{
     AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent, shell_single_quote,
 };
+
+/// Grok waits this long for background tools when no timeout flag is passed
+const GROK_BACKGROUND_WAIT_SECS: u64 = 600;
 
 /// Runner for the `grok` CLI
 #[derive(Debug)]
@@ -70,6 +77,8 @@ impl AgentRunner for GrokRunner {
         }
         args.push("grok".to_string());
         args.push("--no-plan".to_string());
+        // Leftover background tool calls wait 600s, then grok exits 1 and the task blocks
+        args.push("--no-wait-for-background".to_string());
         args.push("--output-format".to_string());
         args.push("streaming-messages-json".to_string());
         args.push("--permission-mode".to_string());
@@ -94,7 +103,12 @@ impl AgentRunner for GrokRunner {
 
     fn classify_error(&self, exit_code: i32, stdout: &str, stderr: &str) -> AgentError {
         let extracted = startup_errors(stdout);
-        for message in &extracted {
+        for message in extracted
+            .iter()
+            .map(String::as_str)
+            .chain(iter::once(stdout))
+            .chain(iter::once(stderr))
+        {
             if let Some(err) = classify_grok_message(message) {
                 return err;
             }
@@ -302,6 +316,11 @@ fn classify_grok_message(message: &str) -> Option<AgentError> {
             message: message.to_string(),
         });
     }
+    if lower.contains("the wait for background work ran out") {
+        return Some(AgentError::Timeout {
+            elapsed: Duration::from_secs(GROK_BACKGROUND_WAIT_SECS),
+        });
+    }
     None
 }
 
@@ -311,6 +330,8 @@ mod tests {
 
     use super::*;
     use crate::engine::runner::agents::SandboxLevel;
+    use crate::engine::runner::parse_session_output;
+    use crate::engine::runner::session::SessionOutput;
 
     fn runner() -> GrokRunner {
         GrokRunner
@@ -346,6 +367,7 @@ mod tests {
         assert!(cmd.contains("--permission-mode bypassPermissions"), "{cmd}");
         assert!(cmd.contains("--sandbox off"), "{cmd}");
         assert!(cmd.contains("--no-plan"), "{cmd}");
+        assert!(cmd.contains("--no-wait-for-background"), "{cmd}");
         assert!(cmd.contains("--deny 'Bash(rm *)'"), "{cmd}");
         assert!(cmd.contains("--deny 'Bash(git push*)'"), "{cmd}");
         assert!(cmd.contains("--prompt-file '/tmp/msg.txt'"), "{cmd}");
@@ -484,6 +506,33 @@ mod tests {
                 disallowed.split(',').any(|name| name == tool),
                 "{tool} missing from {disallowed}"
             );
+        }
+    }
+
+    #[test]
+    fn classify_error_background_wait_expiry_is_timeout() {
+        let stdout = r#"{"type":"error","message":"the wait for background work ran out after 600 s and exit stopped 1 background task. Pass --background-wait-timeout <secs> to wait longer, or --no-wait-for-background to exit as soon as the prompt's turn ends"}"#;
+        let err = runner().classify_error(1, stdout, "");
+        assert!(matches!(err, AgentError::Timeout { .. }), "{err}");
+    }
+
+    #[test]
+    fn parse_session_output_background_wait_envelope_is_timeout() {
+        let ndjson = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":12,"errors":["the wait for background work ran out after 600 s and exit stopped 1 background task. Pass --background-wait-timeout <secs> to wait longer, or --no-wait-for-background to exit as soon as the prompt's turn ends"],"costUSD":2.01,"usage":{"input_tokens":100,"output_tokens":50}}"#;
+        let session = SessionOutput {
+            exit_code: 1,
+            raw_stdout: ndjson.to_string(),
+            raw_stderr: String::new(),
+            elapsed_secs: Some(1313),
+            sandbox_error: None,
+        };
+        let err = parse_session_output("489522", "grok", &runner(), &session)
+            .expect_err("background-wait expiry should be an error");
+        match err {
+            AgentError::Timeout { elapsed } => {
+                assert_eq!(elapsed, Duration::from_secs(1313));
+            }
+            other => panic!("expected Timeout, got {other}"),
         }
     }
 }

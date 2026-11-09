@@ -69,6 +69,7 @@ use std::fmt::Formatter;
 use std::path::PathBuf;
 use std::slice;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::fs;
 use tokio::task;
 
@@ -319,6 +320,12 @@ fn parse_success_output(
             if let Some(e) = agents::patterns::detect_model_unavailable(&agent_result.result_text) {
                 return Err(e);
             }
+            // Grok puts "the wait for background work ran out" in errors[] and
+            // exits 1. That is a timeout, so handle_failover retries
+            let classified = agent_runner.classify_error(1, raw_stdout, "");
+            if matches!(classified, agents::AgentError::Timeout { .. }) {
+                return Err(classified);
+            }
             return Err(agents::AgentError::AgentFailed {
                 message: agent_result.result_text,
             });
@@ -562,6 +569,12 @@ pub fn parse_session_output(
                 // with terminal_reason=completed would be downgraded from RateLimit
                 // to InvalidResponse → Failed, losing the correct cooldown/reroute.
                 if !matches!(err, agents::AgentError::InvalidResponse { .. }) {
+                    let mut err = err;
+                    if let agents::AgentError::Timeout { elapsed } = &mut err
+                        && let Some(secs) = session_output.elapsed_secs
+                    {
+                        *elapsed = Duration::from_secs(secs);
+                    }
                     return Err(err);
                 }
                 if session_output.exit_code != 0 {
