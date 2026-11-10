@@ -3128,7 +3128,10 @@ impl GhHttp {
         Ok(all_numbers)
     }
 
-    /// Get combined CI check status for a git ref.
+    /// Get combined CI check status for a git ref
+    ///
+    /// Counts come from [`Self::get_check_runs`], which requests `filter=latest`
+    /// and follows pagination, so a failure or in-progress run past the first page still counts
     pub async fn get_combined_status(
         &self,
         repo: &str,
@@ -3136,32 +3139,16 @@ impl GhHttp {
         has_workflows: bool,
         mergeable_state: Option<&str>,
     ) -> anyhow::Result<(String, u64, u64, u64, u64)> {
-        let url = format!("{GITHUB_API}/repos/{repo}/commits/{git_ref}/check-runs");
-        let resp: serde_json::Value = self.get_json(&url).await?;
-
-        let runs = resp
-            .get("check_runs")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let runs = self.get_check_runs(repo, git_ref).await?;
 
         let mut passing = 0u64;
         let mut failing = 0u64;
         let mut pending = 0u64;
 
         for run in &runs {
-            let conclusion = run
-                .get("conclusion")
-                .and_then(|v| v.as_str())
-                .filter(|c| !c.is_empty());
-            let status = run
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("queued");
-
-            if !types::check_run_is_finished(status, conclusion) {
+            if !run.is_finished() {
                 pending += 1;
-            } else if types::check_conclusion_passed(conclusion) {
+            } else if run.is_passed() {
                 passing += 1;
             } else {
                 failing += 1;
@@ -4941,7 +4928,7 @@ mod tests {
         use std::sync::Arc;
         use std::time;
         use std::time::SystemTime;
-        use wiremock::matchers::{method, path};
+        use wiremock::matchers::{method, path, query_param};
         use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate, matchers};
 
         /// wiremock has no negated matcher, and the first poll must be matched on the
@@ -4993,6 +4980,68 @@ mod tests {
                 api_base: None,
             };
             (client, guard)
+        }
+
+        fn client_for(server: &MockServer) -> (GhHttp, EnvVarGuard) {
+            let guard = EnvVarGuard::set("GH_TOKEN", "test_token");
+            (GhHttp::for_test(server.uri(), None), guard)
+        }
+
+        fn check_run_json(
+            id: u64,
+            name: &str,
+            status: &str,
+            conclusion: Option<&str>,
+        ) -> serde_json::Value {
+            serde_json::json!({
+                "id": id,
+                "name": name,
+                "status": status,
+                "conclusion": conclusion,
+            })
+        }
+
+        fn passing_check_runs(count: u64) -> Vec<serde_json::Value> {
+            (1..=count)
+                .map(|i| check_run_json(i, &format!("check-{i}"), "completed", Some("success")))
+                .collect()
+        }
+
+        async fn mock_paginated_check_runs(
+            server: &MockServer,
+            sha: &str,
+            page1: Vec<serde_json::Value>,
+            page2: Vec<serde_json::Value>,
+        ) {
+            let total_count = page1.len() + page2.len();
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/o/r/commits/{sha}/check-runs")))
+                .and(query_param("filter", "latest"))
+                .and(query_param("per_page", "100"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({
+                            "total_count": total_count,
+                            "check_runs": page1,
+                        }))
+                        .insert_header(
+                            "Link",
+                            format!("<{}/check-runs/page2>; rel=\"next\"", server.uri()),
+                        ),
+                )
+                .expect(1)
+                .mount(server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path("/check-runs/page2"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "total_count": total_count,
+                    "check_runs": page2,
+                })))
+                .expect(1)
+                .mount(server)
+                .await;
         }
 
         #[tokio::test]
@@ -5377,6 +5426,56 @@ mod tests {
                 err.contains("422") || err.contains("failed"),
                 "error should indicate failure: {err}"
             );
+        }
+
+        #[tokio::test]
+        async fn get_combined_status_counts_a_failure_on_a_later_page() {
+            let server = MockServer::start().await;
+            let sha = "abc123";
+            mock_paginated_check_runs(
+                &server,
+                sha,
+                passing_check_runs(30),
+                vec![check_run_json(31, "check-31", "completed", Some("failure"))],
+            )
+            .await;
+
+            let (gh, _guard) = client_for(&server);
+            let (state, total, passing, failing, pending) = gh
+                .get_combined_status("o/r", sha, true, None)
+                .await
+                .unwrap();
+
+            assert_eq!(state, "failure");
+            assert_eq!(total, 31);
+            assert_eq!(passing, 30);
+            assert_eq!(failing, 1);
+            assert_eq!(pending, 0);
+        }
+
+        #[tokio::test]
+        async fn get_combined_status_counts_an_in_progress_run_on_a_later_page() {
+            let server = MockServer::start().await;
+            let sha = "abc123";
+            mock_paginated_check_runs(
+                &server,
+                sha,
+                passing_check_runs(30),
+                vec![check_run_json(31, "check-31", "in_progress", None)],
+            )
+            .await;
+
+            let (gh, _guard) = client_for(&server);
+            let (state, total, passing, failing, pending) = gh
+                .get_combined_status("o/r", sha, true, None)
+                .await
+                .unwrap();
+
+            assert_eq!(state, "pending");
+            assert_eq!(total, 31);
+            assert_eq!(passing, 30);
+            assert_eq!(failing, 0);
+            assert_eq!(pending, 1);
         }
     }
 
