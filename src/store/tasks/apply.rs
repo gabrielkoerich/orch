@@ -282,16 +282,31 @@ pub(crate) async fn reset_to_new(
     conn: &mut SqliteConnection,
     now: &str,
     id: i64,
+    keep_branch: bool,
 ) -> anyhow::Result<()> {
     let prev = previous(conn, id).await?;
-    sqlx::query(
-        "UPDATE tasks SET status = 'new', branch = '', worktree = '', worktree_cleaned = 0, block_reason = NULL, updated_at = ? WHERE id = ?",
-    )
-    .bind(now)
-    .bind(id)
-    .execute(&mut *conn)
-    .await?;
-    let details = serde_json::json!({ "op": "reset_to_new" });
+    if keep_branch {
+        sqlx::query(
+            "UPDATE tasks SET status = 'new', worktree = '', worktree_cleaned = 0, block_reason = NULL, updated_at = ? WHERE id = ?",
+        )
+        .bind(now)
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+    } else {
+        sqlx::query(
+            "UPDATE tasks SET status = 'new', branch = '', worktree = '', worktree_cleaned = 0, block_reason = NULL, updated_at = ? WHERE id = ?",
+        )
+        .bind(now)
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+    }
+    let details = if keep_branch {
+        serde_json::json!({ "op": "reset_to_new", "keep_branch": true })
+    } else {
+        serde_json::json!({ "op": "reset_to_new" })
+    };
     status_change(conn, id, &prev, TaskStatus::New, Some(&details)).await
 }
 

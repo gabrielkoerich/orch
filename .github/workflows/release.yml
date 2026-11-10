@@ -92,8 +92,8 @@ jobs:
   # Uses cargo-llvm-cov for line/branch coverage — cheaper than tarpaulin.
   test:
     runs-on: ubuntu-latest
-    # The whole job usually takes 2 to 4 minutes
-    timeout-minutes: 5
+    # llvm-cov compile plus apt-get install lcov can take more than 5 minutes
+    timeout-minutes: 10
     permissions:
       contents: read
       pull-requests: write

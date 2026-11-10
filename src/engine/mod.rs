@@ -54,11 +54,13 @@ use crate::channels::transport::Transport;
 use crate::channels::{Channel, ChannelRegistry, IncomingMessage, OutgoingMessage};
 use crate::cmd::CommandErrorContext;
 use crate::config;
-use crate::engine::cleanup::{remove_worktree_and_branch, remove_worktree_and_branch_for};
+use crate::engine::cleanup::{
+    local_branch_exists, remove_worktree_and_branch, remove_worktree_and_branch_for,
+};
 use crate::engine::router::{Router, RouterConfig};
 use crate::engine::runner::worktree::{
-    abort_worktree_rebase, list_project_worktrees, rebase_worktree_on_origin_main,
-    task_id_from_worktree_name, validate_worktree_gitdir,
+    abort_worktree_rebase, list_project_worktrees, task_id_from_worktree_name,
+    validate_worktree_gitdir,
 };
 use crate::engine::tasks::TaskManager;
 use crate::github::http::{GhHttp, rate_limit_metrics};
@@ -1116,52 +1118,61 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
                 | TaskStatus::InProgress
                 | TaskStatus::NeedsReview
                 | TaskStatus::InReview => {
+                    let keep_conflict = worktree::keep_conflicted_rebase(
+                        task.merge_conflict_retries,
+                        task.pr_number,
+                    );
+                    if keep_conflict && git_ops::rebase_in_progress(&worktree_dir).await {
+                        tracing::info!(
+                            repo = %engine.repo,
+                            task_id = %task_id,
+                            worktree = %worktree_dir.display(),
+                            "keeping the conflicted rebase auto_merge left for the agent"
+                        );
+                        valid_kept += 1;
+                        continue;
+                    }
                     tracing::info!(repo = %engine.repo, task_id = %task_id, worktree = %worktree_dir.display(), "rebasing startup worktree");
-                    match rebase_worktree_on_origin_main(&worktree_dir, &default_branch).await {
-                        Err(e) => {
-                            // If rebase failed we already made efforts to stash and
-                            // restore changes safely. Log the error and reset the
-                            // task as before. The worktree removal path is used
-                            // to avoid leaving corrupted worktrees around.
-                            tracing::warn!(repo = %engine.repo, task_id = %task_id, err = %e, "startup rebase failed, resetting task");
-                            abort_worktree_rebase(&worktree_dir).await;
-                            let keep_remote = task.pr_number.is_some();
-                            remove_worktree_and_branch(
-                                &task_id,
-                                &worktree_dir,
-                                Some(branch_name),
-                                &repo_root_path,
-                                keep_remote,
-                            )
-                            .await;
-                            match engine.store.resolve_task_id(&engine.repo, &task_id).await {
-                                Ok(Some(reset_id)) => {
-                                    if let Err(e) = engine.store.reset_to_new(reset_id).await {
-                                        tracing::warn!(task_id, err = %e, "failed to reset task to new after rebase failure");
-                                    }
-                                }
-                                Ok(None) => {
-                                    tracing::warn!(
-                                        task_id,
-                                        "task not found in store during reconciliation"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(task_id, err = %e, "failed to resolve task ID during reconciliation");
-                                }
-                            }
-                            if let Err(e) = engine
-                                .task_manager
-                                .update_task_status(&ExternalId(task_id.clone()), Status::New)
-                                .await
-                            {
-                                tracing::warn!(task_id, err = %e, "failed to update backend status during reconciliation");
-                            }
-                            cleaned += 1;
+                    let origin_branch = format!("origin/{default_branch}");
+                    let outcome = git_ops::stash_rebase_restore(
+                        &worktree_dir,
+                        &origin_branch,
+                        git_ops::StashRebaseOpts {
+                            abort_on_failure: false,
+                        },
+                    )
+                    .await;
+                    let conflict_left = git_ops::rebase_in_progress(&worktree_dir).await;
+                    let failed_err = match outcome {
+                        Ok(
+                            git_ops::RebaseOutcome::Succeeded | git_ops::RebaseOutcome::Skipped(_),
+                        ) => None,
+                        Ok(git_ops::RebaseOutcome::Failed(e)) if keep_conflict && conflict_left => {
+                            tracing::info!(
+                                repo = %engine.repo,
+                                task_id = %task_id,
+                                err = %e,
+                                "startup rebase hit a content conflict, leaving it for the agent"
+                            );
+                            None
                         }
-                        _ => {
-                            valid_kept += 1;
-                        }
+                        Ok(git_ops::RebaseOutcome::Failed(e)) => Some(e),
+                        Err(e) => Some(e.to_string()),
+                    };
+                    if let Some(e) = failed_err {
+                        reset_startup_task_after_failed_rebase(
+                            engine,
+                            &task_id,
+                            &worktree_dir,
+                            branch_name,
+                            &repo_root_path,
+                            task.pr_number.is_some(),
+                            &e,
+                        )
+                        .await;
+                        cleaned += 1;
+                    } else {
+                        valid_kept += 1;
                     }
                 }
                 // A blocked or waiting task resumes from this work, and without a PR the branch
@@ -1215,6 +1226,53 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
     }
 
     Ok(())
+}
+
+async fn reset_startup_task_after_failed_rebase(
+    engine: &ProjectEngine,
+    task_id: &str,
+    worktree_dir: &Path,
+    branch_name: &str,
+    repo_root: &Path,
+    keep_remote: bool,
+    err: &str,
+) {
+    tracing::warn!(repo = %engine.repo, task_id, err, "startup rebase failed, resetting task");
+    abort_worktree_rebase(worktree_dir).await;
+    remove_worktree_and_branch(
+        task_id,
+        worktree_dir,
+        Some(branch_name),
+        repo_root,
+        keep_remote,
+    )
+    .await;
+    let keep_branch = local_branch_exists(repo_root, branch_name).await;
+    match engine.store.resolve_task_id(&engine.repo, task_id).await {
+        Ok(Some(reset_id)) => {
+            let result = if keep_branch {
+                engine.store.reset_to_new_keep_branch(reset_id).await
+            } else {
+                engine.store.reset_to_new(reset_id).await
+            };
+            if let Err(e) = result {
+                tracing::warn!(task_id, err = %e, "failed to reset task to new after rebase failure");
+            }
+        }
+        Ok(None) => {
+            tracing::warn!(task_id, "task not found in store during reconciliation");
+        }
+        Err(e) => {
+            tracing::warn!(task_id, err = %e, "failed to resolve task ID during reconciliation");
+        }
+    }
+    if let Err(e) = engine
+        .task_manager
+        .update_task_status(&ExternalId(task_id.to_string()), Status::New)
+        .await
+    {
+        tracing::warn!(task_id, err = %e, "failed to update backend status during reconciliation");
+    }
 }
 
 /// Sync Fibonacci estimates stored in SQLite to the GitHub Projects board for
@@ -3148,18 +3206,24 @@ pub async fn serve() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::process;
+    use std::slice;
     use std::sync::Arc;
 
     use super::*;
+    use crate::backends::ExternalBackend;
     use crate::backends::test_helpers::NoopBackend;
     use crate::channels::capture::CaptureService;
     use crate::channels::transport::Transport;
+    use crate::engine::runner::git_ops;
+    use crate::store::UpsertExternal;
     use crate::tmux::SessionGuard;
     use crate::tmux::TmuxManager;
 
     async fn in_review_task(store: &TaskStore, number: &str) -> i64 {
         let id = store
-            .upsert_external(&crate::store::UpsertExternal {
+            .upsert_external(&UpsertExternal {
                 repo: "owner/repo",
                 ext_id: number,
                 title: "Under review",
@@ -3586,5 +3650,247 @@ mod tests {
         // Should return defaults (not panic) and emit a warn! log with the read error.
         assert!(cfg.telegram_topic_id.is_none());
         assert!(cfg.discord_channel_id.is_none());
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let mut cmd = process::Command::new("git");
+        cmd.current_dir(dir);
+        if args.first() == Some(&"commit") {
+            cmd.args(["-c", "commit.gpgsign=false"]);
+        }
+        let out = cmd
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?} failed to start: {e}"));
+        assert!(
+            out.status.success(),
+            "git {:?} failed:\nstdout: {}\nstderr: {}",
+            args,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn restore_orch_home(prev: Option<String>) {
+        match prev {
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            Some(v) => unsafe { env::set_var("ORCH_HOME", v) },
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            None => unsafe { env::remove_var("ORCH_HOME") },
+        }
+    }
+
+    struct StartupConflict {
+        _tmp: tempfile::TempDir,
+        _orch_home: tempfile::TempDir,
+        prev_orch_home: Option<String>,
+        project_dir: PathBuf,
+        worktree_dir: PathBuf,
+        branch: String,
+        store: Arc<TaskStore>,
+        store_id: i64,
+        engine: ProjectEngine,
+    }
+
+    impl Drop for StartupConflict {
+        fn drop(&mut self) {
+            restore_orch_home(self.prev_orch_home.take());
+        }
+    }
+
+    async fn startup_conflict_fixture(
+        retries: i32,
+        pr_number: Option<i32>,
+        start_rebase: bool,
+    ) -> StartupConflict {
+        let orch_home = tempfile::tempdir().unwrap();
+        let prev_orch_home = env::var("ORCH_HOME").ok();
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::set_var("ORCH_HOME", orch_home.path()) };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "--bare", "-b", "main"]);
+        let project_dir = tmp.path().join("repo");
+        git(
+            tmp.path(),
+            &[
+                "clone",
+                origin.to_str().unwrap(),
+                project_dir.to_str().unwrap(),
+            ],
+        );
+        git(&project_dir, &["config", "user.email", "t@t.com"]);
+        git(&project_dir, &["config", "user.name", "T"]);
+        fs::write(project_dir.join("f.txt"), "base\n").unwrap();
+        git(&project_dir, &["add", "."]);
+        git(&project_dir, &["commit", "-m", "base"]);
+        git(&project_dir, &["push", "origin", "HEAD:main"]);
+        git(&project_dir, &["remote", "set-head", "origin", "main"]);
+
+        let branch = "gh-issue-4087-conflict".to_string();
+        git(&project_dir, &["checkout", "-b", &branch]);
+        fs::write(project_dir.join("f.txt"), "agent\n").unwrap();
+        git(&project_dir, &["commit", "-am", "agent"]);
+        git(&project_dir, &["checkout", "main"]);
+        fs::write(project_dir.join("f.txt"), "main\n").unwrap();
+        git(&project_dir, &["commit", "-am", "main"]);
+        git(&project_dir, &["push", "origin", "HEAD:main"]);
+
+        let wt_base = orch_home.path().join("worktrees").join("repo");
+        fs::create_dir_all(&wt_base).unwrap();
+        let worktree_dir = wt_base.join(&branch);
+        git(
+            &project_dir,
+            &["worktree", "add", worktree_dir.to_str().unwrap(), &branch],
+        );
+        git(&worktree_dir, &["config", "user.email", "t@t.com"]);
+        git(&worktree_dir, &["config", "user.name", "T"]);
+        git(&worktree_dir, &["fetch", "origin"]);
+        if start_rebase {
+            let rebase = process::Command::new("git")
+                .args(["rebase", "origin/main"])
+                .current_dir(&worktree_dir)
+                .output()
+                .unwrap();
+            assert!(!rebase.status.success(), "precondition: rebase conflicts");
+        }
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let store_id = store
+            .upsert_external(&UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "4087",
+                title: "Conflict",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(store_id, TaskStatus::Routed)
+            .await
+            .unwrap();
+        let mut fields = vec![
+            ("branch", serde_json::json!(branch)),
+            (
+                "worktree",
+                serde_json::json!(worktree_dir.to_string_lossy().as_ref()),
+            ),
+            ("merge_conflict_retries", serde_json::json!(retries)),
+        ];
+        if let Some(pr) = pr_number {
+            fields.push(("pr_number", serde_json::json!(pr)));
+        }
+        store.set_fields(store_id, &fields).await.unwrap();
+
+        let backend: Arc<dyn ExternalBackend> = Arc::new(NoopBackend);
+        let engine = ProjectEngine {
+            repo: "owner/repo".to_string(),
+            project_dir: project_dir.clone(),
+            backend: Arc::clone(&backend),
+            task_manager: Arc::new(TaskManager::with_store(
+                backend,
+                Arc::clone(&store),
+                "owner/repo".to_string(),
+            )),
+            runner: Arc::new(
+                runner::TaskRunner::new("owner/repo".to_string()).with_store(Arc::clone(&store)),
+            ),
+            store: Arc::clone(&store),
+        };
+
+        StartupConflict {
+            _tmp: tmp,
+            _orch_home: orch_home,
+            prev_orch_home,
+            project_dir,
+            worktree_dir,
+            branch,
+            store,
+            store_id,
+            engine,
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(orch_home)]
+    async fn startup_keeps_a_content_conflict_when_the_task_retried_a_merge() {
+        let fx = startup_conflict_fixture(2, Some(4043), false).await;
+        reconcile_startup_worktrees(slice::from_ref(&fx.engine))
+            .await
+            .unwrap();
+
+        assert!(fx.worktree_dir.exists(), "worktree must stay");
+        assert!(
+            git_ops::rebase_in_progress(&fx.worktree_dir).await,
+            "the content conflict must stay for the agent"
+        );
+        let task = fx.store.get(fx.store_id).await.unwrap();
+        assert_eq!(task.status, TaskStatus::Routed);
+        assert_eq!(task.branch, fx.branch);
+        assert!(!task.worktree.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(orch_home)]
+    async fn startup_keeps_an_in_progress_rebase_when_the_task_has_a_pr() {
+        let fx = startup_conflict_fixture(0, Some(12), true).await;
+        reconcile_startup_worktrees(slice::from_ref(&fx.engine))
+            .await
+            .unwrap();
+
+        assert!(fx.worktree_dir.exists(), "worktree must stay");
+        assert!(
+            git_ops::rebase_in_progress(&fx.worktree_dir).await,
+            "an in-progress rebase for a PR task must stay"
+        );
+        let task = fx.store.get(fx.store_id).await.unwrap();
+        assert_eq!(task.status, TaskStatus::Routed);
+        assert_eq!(task.branch, fx.branch);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(orch_home)]
+    async fn startup_resets_a_conflict_without_retries_or_a_pr() {
+        let fx = startup_conflict_fixture(0, None, false).await;
+        reconcile_startup_worktrees(slice::from_ref(&fx.engine))
+            .await
+            .unwrap();
+
+        assert!(
+            !fx.worktree_dir.exists(),
+            "worktree is removed when there is nothing to keep"
+        );
+        let task = fx.store.get(fx.store_id).await.unwrap();
+        assert_eq!(task.status, TaskStatus::New);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(orch_home)]
+    async fn startup_reset_keeps_branch_when_rescue_cannot_push() {
+        let fx = startup_conflict_fixture(0, None, false).await;
+        git(
+            &fx.project_dir,
+            &["remote", "set-url", "origin", "/nonexistent/origin.git"],
+        );
+        reconcile_startup_worktrees(slice::from_ref(&fx.engine))
+            .await
+            .unwrap();
+
+        let task = fx.store.get(fx.store_id).await.unwrap();
+        assert_eq!(task.status, TaskStatus::New);
+        assert_eq!(
+            task.branch, fx.branch,
+            "the task still names the local branch cleanup kept"
+        );
+        assert!(
+            fx.worktree_dir.exists(),
+            "rescue failure keeps the worktree on disk"
+        );
     }
 }

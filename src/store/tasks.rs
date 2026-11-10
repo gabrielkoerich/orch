@@ -975,9 +975,24 @@ impl TaskStore {
         self.write(Command::TaskTouch { id }).await.map(|_| ())
     }
 
-    /// Reset a task back to `new`.
+    /// Reset a task back to `new`, clearing `branch` and `worktree`
     pub async fn reset_to_new(&self, id: i64) -> anyhow::Result<()> {
-        self.write(Command::TaskResetToNew { id }).await.map(|_| ())
+        self.write(Command::TaskResetToNew {
+            id,
+            keep_branch: false,
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Reset a task back to `new` and keep `branch` when cleanup left the local ref
+    pub async fn reset_to_new_keep_branch(&self, id: i64) -> anyhow::Result<()> {
+        self.write(Command::TaskResetToNew {
+            id,
+            keep_branch: true,
+        })
+        .await
+        .map(|_| ())
     }
 
     /// Update the block reason for a task.

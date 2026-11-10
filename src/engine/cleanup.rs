@@ -1033,6 +1033,18 @@ pub(crate) async fn rescue_unpushed_work(
     )
     .await;
     if pushed.is_some_and(|o| o.status.success()) {
+        // A bare clone has no fetchspec, so push does not create the tracking ref
+        // Point that ref at the tip we just sent so delete_local_branch can see it
+        let tracking = format!("refs/remotes/origin/{rescue}");
+        if let Some(tip) = git_in(repo_root, &["rev-parse", &local_ref])
+            .await
+            .filter(|o| o.status.success())
+        {
+            let sha = String::from_utf8_lossy(&tip.stdout).trim().to_string();
+            if !sha.is_empty() {
+                let _ = git_in(repo_root, &["update-ref", &tracking, &sha]).await;
+            }
+        }
         tracing::warn!(task_id, branch = %br, rescue = %rescue, commits = commits.len(), "pushed unpushed commits to rescue branch");
         Rescue::Pushed {
             branch: rescue,
@@ -1287,6 +1299,14 @@ async fn remove_worktree_and_branch_unchecked(
     }
 }
 
+/// Whether `refs/heads/{br}` still exists in `repo_root`
+pub(crate) async fn local_branch_exists(repo_root: &Path, br: &str) -> bool {
+    let local_ref = format!("refs/heads/{br}");
+    git_in(repo_root, &["rev-parse", "--verify", "--quiet", &local_ref])
+        .await
+        .is_some_and(|o| o.status.success())
+}
+
 /// Commits reachable from `rev` and from none of `others`. `None` when git cannot answer
 async fn commits_outside(repo_root: &Path, rev: &str, others: &[&str]) -> Option<u64> {
     let mut args = vec![
@@ -1294,6 +1314,8 @@ async fn commits_outside(repo_root: &Path, rev: &str, others: &[&str]) -> Option
         "--count".to_string(),
         rev.to_string(),
     ];
+    // One `--not` then every other ref, a `--not` per ref would toggle and count the wrong set
+    let mut exclude = Vec::new();
     for other in others {
         let exists = Command::new("git")
             .args([
@@ -1308,9 +1330,12 @@ async fn commits_outside(repo_root: &Path, rev: &str, others: &[&str]) -> Option
             .await
             .is_ok_and(|o| o.status.success());
         if exists {
-            args.push("--not".to_string());
-            args.push(other.to_string());
+            exclude.push(other.to_string());
         }
+    }
+    if !exclude.is_empty() {
+        args.push("--not".to_string());
+        args.extend(exclude);
     }
     let output = Command::new("git")
         .arg("-C")
@@ -2886,11 +2911,35 @@ mod tests {
             other => panic!("expected a rescue push, got {other:?}"),
         }
 
+        let tip = git_ok(&clone, &["rev-parse", "feat"]);
+        let tracking = git_ok(&clone, &["rev-parse", "refs/remotes/origin/rescue/feat"]);
+        assert_eq!(
+            tracking.trim(),
+            tip.trim(),
+            "rescue push must point the tracking ref at the tip it sent"
+        );
+
         let removed = remove_worktree_and_branch("1", &wt, Some("feat"), &clone, false).await;
 
         assert!(removed);
         assert!(remote_has(&clone, "rescue/feat"));
         assert!(!local_has(&clone, "feat"));
+    }
+
+    #[tokio::test]
+    async fn rescue_push_sets_tracking_ref_without_a_fetchspec() {
+        let (tmp, clone) = origin_and_clone_with_feat();
+        let wt = add_worktree(&clone, tmp.path(), "feat");
+        git_ok(&clone, &["config", "--unset-all", "remote.origin.fetch"]);
+
+        match rescue_unpushed_work("1", Some(&wt), "feat", &clone).await {
+            Rescue::Pushed { branch, .. } => assert_eq!(branch, "rescue/feat"),
+            other => panic!("expected a rescue push, got {other:?}"),
+        }
+
+        let tracking = git_ok(&clone, &["rev-parse", "refs/remotes/origin/rescue/feat"]);
+        let tip = git_ok(&clone, &["rev-parse", "feat"]);
+        assert_eq!(tracking.trim(), tip.trim());
     }
 
     #[tokio::test]

@@ -51,6 +51,60 @@ async fn create_and_get_task() {
 }
 
 #[tokio::test]
+async fn reset_to_new_clears_branch_and_worktree() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let id = store
+        .create_internal("owner/repo", "reset", "", "test", "reset-clear", None)
+        .await
+        .unwrap();
+    store.update_status(id, TaskStatus::Routed).await.unwrap();
+    store
+        .set_fields(
+            id,
+            &[
+                ("branch", serde_json::json!("gh-issue-1-x")),
+                ("worktree", serde_json::json!("/tmp/wt")),
+            ],
+        )
+        .await
+        .unwrap();
+
+    store.reset_to_new(id).await.unwrap();
+
+    let task = store.get(id).await.unwrap();
+    assert_eq!(task.status, TaskStatus::New);
+    assert!(task.branch.is_empty(), "branch is cleared");
+    assert!(task.worktree.is_empty(), "worktree is cleared");
+}
+
+#[tokio::test]
+async fn reset_to_new_keep_branch_leaves_the_branch_name() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let id = store
+        .create_internal("owner/repo", "reset", "", "test", "reset-keep", None)
+        .await
+        .unwrap();
+    store.update_status(id, TaskStatus::Routed).await.unwrap();
+    store
+        .set_fields(
+            id,
+            &[
+                ("branch", serde_json::json!("gh-issue-1-x")),
+                ("worktree", serde_json::json!("/tmp/wt")),
+            ],
+        )
+        .await
+        .unwrap();
+
+    store.reset_to_new_keep_branch(id).await.unwrap();
+
+    let task = store.get(id).await.unwrap();
+    assert_eq!(task.status, TaskStatus::New);
+    assert_eq!(task.branch, "gh-issue-1-x");
+    assert!(task.worktree.is_empty(), "worktree is cleared");
+}
+
+#[tokio::test]
 async fn upsert_external_task() {
     let store = TaskStore::open_memory().await.unwrap();
 
