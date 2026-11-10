@@ -97,6 +97,105 @@ async fn finish_merged_pr(
     Ok(())
 }
 
+/// Confirm a closed PR still belongs to `branch`, then mark the task done
+async fn finish_already_closed_pr(
+    gh: &GhHttp,
+    task: &ExternalTask,
+    branch: &str,
+    repo: &str,
+    task_manager: &Arc<TaskManager>,
+    store: &Arc<TaskStore>,
+) -> anyhow::Result<()> {
+    match gh.get_closed_pr_state(repo, branch).await {
+        Ok(Some((closed_pr_number, true, _))) => {
+            let pr = gh.get_pr(repo, closed_pr_number).await.inspect_err(|e| {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    branch,
+                    pr_number = closed_pr_number,
+                    err = %e,
+                    "failed to verify PR details"
+                );
+            })?;
+            if pr.head.ref_ != branch {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    branch,
+                    pr_number = closed_pr_number,
+                    "closed PR head ref does not match branch — may be wrong PR"
+                );
+                anyhow::bail!("no matching merged PR found for branch {branch}");
+            }
+            tracing::info!(
+                task_id = task.id.0,
+                branch,
+                pr_number = closed_pr_number,
+                "PR already merged — marking task done (idempotent)"
+            );
+            finish_merged_pr(task, task_manager, store, repo).await?;
+            Ok(())
+        }
+        Ok(Some((closed_pr_number, false, state))) => {
+            let pr = gh.get_pr(repo, closed_pr_number).await.inspect_err(|e| {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    branch,
+                    pr_number = closed_pr_number,
+                    err = %e,
+                    "failed to verify PR details"
+                );
+            })?;
+            if pr.head.ref_ != branch {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    branch,
+                    pr_number = closed_pr_number,
+                    "closed PR head ref does not match branch — may be wrong PR"
+                );
+                anyhow::bail!("no matching closed PR found for branch {branch}");
+            }
+            let approved = store::opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
+                .await
+                .is_some_and(|t| t.status == TaskStatus::Approved);
+            if approved {
+                review_poll::block_closed_approved_pr(task_manager, &task.id).await;
+                return Ok(());
+            }
+
+            tracing::info!(
+                task_id = task.id.0,
+                branch,
+                pr_number = closed_pr_number,
+                pr_state = %state,
+                "PR was closed without merge — marking task done"
+            );
+            task_manager
+                .update_task_status(&task.id, Status::Done)
+                .await?;
+            if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    err = %e,
+                    "post-close cleanup failed"
+                );
+            }
+            Ok(())
+        }
+        Ok(None) => {
+            anyhow::bail!("no open PR found for branch {branch}");
+        }
+        Err(e) => {
+            tracing::warn!(
+                task_id = task.id.0,
+                branch,
+                err = %e,
+                "failed to check closed PR state"
+            );
+            anyhow::bail!("no open PR found for branch {branch}");
+        }
+    }
+}
+
 /// Check if we should skip CI status checking for this task due to per-task cooldown.
 ///
 /// Uses the KV store to track the last time CI was checked for each task.
@@ -1216,122 +1315,7 @@ pub(crate) async fn auto_merge_pr(
         // Treat a closed/merged PR as idempotent success rather than a
         // retryable failure so the review-agent failure counter is not
         // incremented when the work is already done.
-        match gh.get_closed_pr_state(repo, branch).await {
-            Ok(Some((closed_pr_number, true, _))) => {
-                // Validate the PR's head ref matches our branch before treating as merged
-                match gh.get_pr(repo, closed_pr_number).await {
-                    Ok(pr) if pr.head.ref_ == branch => {
-                        tracing::info!(
-                            task_id = task.id.0,
-                            branch,
-                            pr_number = closed_pr_number,
-                            "PR already merged — marking task done (idempotent)"
-                        );
-                        finish_merged_pr(task, task_manager, store, repo).await?;
-                        return Ok(());
-                    }
-                    Ok(_) => {
-                        tracing::warn!(
-                            task_id = task.id.0,
-                            branch,
-                            pr_number = closed_pr_number,
-                            "closed PR head ref does not match branch — may be wrong PR"
-                        );
-                        anyhow::bail!("no matching merged PR found for branch {branch}");
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            task_id = task.id.0,
-                            branch,
-                            pr_number = closed_pr_number,
-                            err = %e,
-                            "failed to verify PR details, assuming merged"
-                        );
-                        // Fall through to marking done since get_closed_pr_state said it was merged
-                        finish_merged_pr(task, task_manager, store, repo).await?;
-                        return Ok(());
-                    }
-                }
-            }
-            Ok(Some((closed_pr_number, false, state))) => {
-                // Validate the PR's head ref matches our branch before treating as closed
-                match gh.get_pr(repo, closed_pr_number).await {
-                    Ok(pr) if pr.head.ref_ == branch => {
-                        let approved =
-                            store::opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
-                                .await
-                                .is_some_and(|t| t.status == TaskStatus::Approved);
-                        if approved {
-                            review_poll::block_closed_approved_pr(task_manager, &task.id).await;
-                            return Ok(());
-                        }
-
-                        tracing::info!(
-                            task_id = task.id.0,
-                            branch,
-                            pr_number = closed_pr_number,
-                            pr_state = %state,
-                            "PR was closed without merge — marking task done"
-                        );
-                        task_manager
-                            .update_task_status(&task.id, Status::Done)
-                            .await?;
-                        if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
-                            tracing::warn!(
-                                task_id = task.id.0,
-                                err = %e,
-                                "post-close cleanup failed"
-                            );
-                        }
-                        return Ok(());
-                    }
-                    Ok(_) => {
-                        tracing::warn!(
-                            task_id = task.id.0,
-                            branch,
-                            pr_number = closed_pr_number,
-                            "closed PR head ref does not match branch — may be wrong PR"
-                        );
-                        anyhow::bail!("no matching closed PR found for branch {branch}");
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            task_id = task.id.0,
-                            branch,
-                            pr_number = closed_pr_number,
-                            err = %e,
-                            "failed to verify PR details, assuming closed"
-                        );
-                        // Fall through to marking done since get_closed_pr_state said it was closed
-                        task_manager
-                            .update_task_status(&task.id, Status::Done)
-                            .await?;
-                        if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
-                            tracing::warn!(
-                                task_id = task.id.0,
-                                err = %e,
-                                "post-close cleanup failed"
-                            );
-                        }
-                        return Ok(());
-                    }
-                }
-            }
-            Ok(None) => {
-                // No closed PR found either — this is a genuine error
-                anyhow::bail!("no open PR found for branch {branch}");
-            }
-            Err(e) => {
-                // Error checking closed PR state — fail gracefully
-                tracing::warn!(
-                    task_id = task.id.0,
-                    branch,
-                    err = %e,
-                    "failed to check closed PR state"
-                );
-                anyhow::bail!("no open PR found for branch {branch}");
-            }
-        }
+        return finish_already_closed_pr(&gh, task, branch, repo, task_manager, store).await;
     };
 
     // 2. Verify the automated review comment says "approve"
@@ -2679,12 +2663,16 @@ mod tests {
     use crate::backends::{ExternalId, ExternalTask};
     use crate::engine::router;
     use crate::engine::tasks::TaskManager;
+    use crate::github::token;
     use crate::github::types::GitHubApp;
     use crate::github::types::GitHubBranchRef;
     use crate::github::types::{GitHubReview, GitHubUser};
     use crate::store::NewTask;
     use crate::store::TaskStatus;
     use crate::store::TaskStore;
+    use std::env;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn mergeable_state_ready_accepts_only_clean_states() {
@@ -3675,6 +3663,85 @@ mod tests {
         record_ci_check(&store, "a/x", "5").await.unwrap();
         assert!(is_ci_check_in_cooldown(&store, "a/x", "5").await.unwrap());
         assert!(!is_ci_check_in_cooldown(&store, "b/x", "5").await.unwrap());
+    }
+
+    /// A get_pr failure after get_closed_pr_state reported a match must not mark the task done
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the env lock stays held across the awaits so tests do not race on GH_TOKEN"
+    )]
+    #[tokio::test]
+    async fn finish_already_closed_pr_leaves_status_when_get_pr_fails() {
+        let _env_guard = token::ENV_LOCK.lock().unwrap();
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::set_var("GH_TOKEN", "test_token") };
+
+        let server = MockServer::start().await;
+        let repo = "owner/repo";
+        let branch = "task-branch";
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls"))
+            .and(query_param("state", "closed"))
+            .and(query_param("head", "owner:task-branch"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "number": 42,
+                    "state": "closed",
+                    "merged_at": "2026-01-01T00:00:00Z",
+                    "head": { "ref": "task-branch" }
+                }])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/42"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let task_id_num = store
+            .create(&NewTask {
+                repo: repo.to_string(),
+                origin: "internal".to_string(),
+                title: "task".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(task_id_num, TaskStatus::InReview)
+            .await
+            .unwrap();
+
+        let backend: Arc<dyn ExternalBackend> = Arc::new(NoopBackend);
+        let task_manager = Arc::new(TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
+            repo.to_string(),
+        ));
+        let task = ExternalTask {
+            id: ExternalId(format!("internal:{task_id_num}")),
+            title: "task".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: vec![],
+            author: String::new(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: String::new(),
+        };
+
+        let gh = GhHttp::for_test(server.uri(), None);
+        let result =
+            finish_already_closed_pr(&gh, &task, branch, repo, &task_manager, &store).await;
+        assert!(
+            result.is_err(),
+            "get_pr failure must not finish the task: {result:?}"
+        );
+        let stored = store.get(task_id_num).await.unwrap();
+        assert_eq!(stored.status, TaskStatus::InReview);
     }
 
     #[tokio::test]
