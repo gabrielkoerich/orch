@@ -245,13 +245,36 @@ fn is_ssh_agent_fetch_failure(stderr: &str) -> bool {
         || lower.contains("communication with agent failed")
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum WorktreeRebaseOutcome {
     RebasedAndPushed,
     RebaseConflict(String),
     PushFailed(String),
     SshFetchFailed(String),
+    /// Fetch timed out, GitHub was unreachable, or a ref lock blocked the fetch
+    Transient(String),
     Unavailable(String),
+}
+
+fn is_transient_fetch_failure(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("could not connect")
+        || lower.contains("failed to connect")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("cannot lock ref")
+        || git_ops::is_transient_network_error(stderr)
+        || git_ops::is_transient_github_error(stderr)
+}
+
+fn classify_fetch_failure(stderr: &str) -> WorktreeRebaseOutcome {
+    if is_ssh_agent_fetch_failure(stderr) {
+        WorktreeRebaseOutcome::SshFetchFailed(stderr.to_string())
+    } else if is_transient_fetch_failure(stderr) {
+        WorktreeRebaseOutcome::Transient(format!("git fetch failed: {stderr}"))
+    } else {
+        WorktreeRebaseOutcome::Unavailable(format!("git fetch failed: {stderr}"))
+    }
 }
 
 /// The task worktree, when it sits on the PR head and the PR base is the branch a rebase targets.
@@ -393,10 +416,21 @@ pub(crate) async fn prepare_branch_for_review(
             );
             return false;
         }
+        WorktreeRebaseOutcome::Transient(reason) => {
+            tracing::warn!(
+                task_id,
+                pr_number,
+                reason = %reason,
+                "transient fetch failure before review, waiting for the next tick"
+            );
+            return false;
+        }
         WorktreeRebaseOutcome::RebaseConflict(_) => {
             "Your PR conflicts with its base branch before review. Rebasing hit a content conflict and the worktree has the rebase in progress (see `git status`). Resolve the conflict markers keeping your changes, `git add` the files and run `git rebase --continue`. Do not redo the task from scratch."
         }
-        _ => {
+        WorktreeRebaseOutcome::SshFetchFailed(_)
+        | WorktreeRebaseOutcome::PushFailed(_)
+        | WorktreeRebaseOutcome::Unavailable(_) => {
             "Your PR conflicts with its base branch before review and orch could not rebase it. Rebase the branch onto the default branch (check `git status` first), resolve the conflicts and make sure the checks pass."
         }
     };
@@ -456,12 +490,16 @@ fn classify_merge_failure(error: &str) -> MergeFailureClass {
     if err_msg.contains("head branch was modified") || err_msg.contains("sha does not match") {
         return MergeFailureClass::Transient;
     }
-    let is_conflict = err_msg.contains("405")
+    // Draft merges return HTTP 405, keep the task until the PR is ready
+    if err_msg.contains("pull request is a draft") {
+        return MergeFailureClass::Transient;
+    }
+    let is_conflict = err_msg.contains("merge conflict")
         || err_msg.contains("not mergeable")
-        || err_msg.contains("merge conflict")
         || (err_msg.contains("409") && err_msg.contains("head branch is out of date"))
         || err_msg.contains("review and try the merge again");
-    let is_transient = err_msg.contains("502")
+    let is_transient = git_ops::is_transient_github_error(error)
+        || err_msg.contains("502")
         || err_msg.contains("503")
         || err_msg.contains("504")
         || err_msg.contains("server error")
@@ -530,17 +568,16 @@ async fn attempt_worktree_rebase_and_force_push(
         }
         Ok(out) => {
             let stderr = git_ops::sanitize_push_error(String::from_utf8_lossy(&out.stderr).trim());
-            if is_ssh_agent_fetch_failure(&stderr) {
-                return WorktreeRebaseOutcome::SshFetchFailed(stderr);
+            let outcome = classify_fetch_failure(&stderr);
+            if !matches!(outcome, WorktreeRebaseOutcome::SshFetchFailed(_)) {
+                tracing::warn!(task_id, stderr = %stderr, "git fetch failed before rebase");
             }
-
-            tracing::warn!(task_id, stderr = %stderr, "git fetch failed before rebase");
-            return WorktreeRebaseOutcome::Unavailable(format!("git fetch failed: {stderr}"));
+            return outcome;
         }
         Err(err) => {
             let err = err.to_string();
             tracing::warn!(task_id, error = %err, "git fetch errored before rebase");
-            return WorktreeRebaseOutcome::Unavailable(format!("git fetch failed: {err}"));
+            return classify_fetch_failure(&err);
         }
     };
 
@@ -954,6 +991,14 @@ async fn handle_pr_rebase_recovery(
             }
             return Ok(());
         }
+        WorktreeRebaseOutcome::Transient(reason) => {
+            tracing::warn!(
+                task_id = task.id.0,
+                reason = %reason,
+                "merge rebase fetch failed transiently, leaving the task in place"
+            );
+            return Ok(());
+        }
         WorktreeRebaseOutcome::Unavailable(reason) => {
             tracing::warn!(
                 task_id = task.id.0,
@@ -963,8 +1008,7 @@ async fn handle_pr_rebase_recovery(
         }
     }
 
-    // No worktree, worktree missing, or fetch/IO error — re-route to the task
-    // agent so it can resolve the conflict in a fresh worktree.
+    // No worktree or the rebase could not start, re-route so the agent can rebase
     tracing::info!(
         task_id = task.id.0,
         pr_number,
@@ -1689,6 +1733,14 @@ pub(crate) async fn auto_merge_pr(
                                         "auto_merge: failed to post behind-branch push failure comment on PR"
                                     );
                                 }
+                                return Ok(());
+                            }
+                            WorktreeRebaseOutcome::Transient(reason) => {
+                                tracing::warn!(
+                                    task_id = task.id.0,
+                                    reason = %reason,
+                                    "behind-branch fetch failed transiently, leaving the task in place"
+                                );
                                 return Ok(());
                             }
                             WorktreeRebaseOutcome::Unavailable(reason) => {
@@ -3402,6 +3454,10 @@ mod tests {
         assert!(!sanitized.contains("test-secret-1234567890abcdef"));
         assert!(is_ssh_agent_fetch_failure(&sanitized));
         assert!(is_ssh_agent_fetch_failure(raw));
+        assert!(matches!(
+            classify_fetch_failure(&sanitized),
+            WorktreeRebaseOutcome::SshFetchFailed(_)
+        ));
     }
 
     #[test]
@@ -3435,6 +3491,62 @@ mod tests {
     fn classify_merge_failure_keeps_branch_protection_errors_blocking() {
         let error = "GitHub PR merge failed (403 Forbidden): branch protection prevented merge";
         assert_eq!(classify_merge_failure(error), MergeFailureClass::Blocking);
+    }
+
+    #[test]
+    fn classify_merge_failure_treats_draft_as_transient() {
+        let error = r#"GitHub PR merge failed (405 Method Not Allowed): {"message":"Pull request is a draft"}"#;
+        assert_eq!(classify_merge_failure(error), MergeFailureClass::Transient);
+    }
+
+    #[test]
+    fn classify_merge_failure_keeps_not_mergeable_as_recoverable() {
+        let error = r#"GitHub PR merge failed (405 Method Not Allowed): {"message":"Pull Request is not mergeable"}"#;
+        assert_eq!(
+            classify_merge_failure(error),
+            MergeFailureClass::RecoverableConflict
+        );
+    }
+
+    #[test]
+    fn classify_merge_failure_treats_connection_failure_as_transient() {
+        let error = "error sending request for url (https://api.github.com/repos/o/r/pulls/1/merge): Failed to connect to github.com:443 after 75021 ms: Could not connect to server";
+        assert_eq!(classify_merge_failure(error), MergeFailureClass::Transient);
+    }
+
+    #[test]
+    fn classify_fetch_failure_treats_connection_timeout_and_ref_lock_as_transient() {
+        let connect = concat!(
+            "fatal: unable to access 'https://github.com/owner/repo.git/': ",
+            "Failed to connect to github.com:443 after 75021 ms: Could not connect to server"
+        );
+        assert!(matches!(
+            classify_fetch_failure(connect),
+            WorktreeRebaseOutcome::Transient(_)
+        ));
+        assert!(matches!(
+            classify_fetch_failure("git fetch timed out"),
+            WorktreeRebaseOutcome::Transient(_)
+        ));
+        assert!(matches!(
+            classify_fetch_failure("error: cannot lock ref 'refs/remotes/origin/main'"),
+            WorktreeRebaseOutcome::Transient(_)
+        ));
+    }
+
+    #[test]
+    fn draft_merge_and_connect_fetch_leave_an_approved_task_and_counter() {
+        let draft = r#"GitHub PR merge failed (405 Method Not Allowed): {"message":"Pull request is a draft"}"#;
+        assert_eq!(classify_merge_failure(draft), MergeFailureClass::Transient);
+
+        let fetch = classify_fetch_failure(concat!(
+            "fatal: unable to access 'https://github.com/owner/repo.git/': ",
+            "Failed to connect to github.com:443 after 75021 ms: Could not connect to server"
+        ));
+        assert!(
+            matches!(fetch, WorktreeRebaseOutcome::Transient(_)),
+            "a connect failure must not spend a merge-conflict retry: {fetch:?}"
+        );
     }
 
     /// When the GitHub API is unavailable (no real token in unit tests),
