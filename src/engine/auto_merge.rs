@@ -1105,7 +1105,10 @@ pub(crate) fn required_checks_state(
     (state, total, passing, failing, pending)
 }
 
-fn required_check_run_matches(required: &RequiredStatusCheck, run: &GitHubCheckRun) -> bool {
+pub(crate) fn required_check_run_matches(
+    required: &RequiredStatusCheck,
+    run: &GitHubCheckRun,
+) -> bool {
     if run.name != required.context {
         return false;
     }
