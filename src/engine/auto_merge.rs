@@ -843,7 +843,37 @@ async fn handle_pr_rebase_recovery(
         .await
         .map(|t| t.worktree)
         .filter(|wt| !wt.is_empty());
-    match attempt_worktree_rebase_and_force_push(&task.id.0, worktree_path).await {
+    let outcome = attempt_worktree_rebase_and_force_push(&task.id.0, worktree_path).await;
+    apply_rebase_recovery_outcome(
+        outcome,
+        task,
+        repo,
+        pr_number,
+        gh,
+        task_manager,
+        store,
+        review_agent,
+        review_model,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors handle_pr_rebase_recovery so tests can inject a rebase outcome"
+)]
+async fn apply_rebase_recovery_outcome(
+    outcome: WorktreeRebaseOutcome,
+    task: &ExternalTask,
+    repo: &str,
+    pr_number: u64,
+    gh: &GhHttp,
+    task_manager: &Arc<TaskManager>,
+    store: &Arc<TaskStore>,
+    review_agent: &str,
+    review_model: &str,
+) -> anyhow::Result<()> {
+    match outcome {
         WorktreeRebaseOutcome::RebasedAndPushed => {
             tracing::info!(
                 task_id = task.id.0,
@@ -3534,8 +3564,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn draft_merge_and_connect_fetch_leave_an_approved_task_and_counter() {
+    #[tokio::test]
+    async fn draft_merge_and_connect_fetch_leave_an_approved_task_and_counter() {
         let draft = r#"GitHub PR merge failed (405 Method Not Allowed): {"message":"Pull request is a draft"}"#;
         assert_eq!(classify_merge_failure(draft), MergeFailureClass::Transient);
 
@@ -3547,6 +3577,26 @@ mod tests {
             matches!(fetch, WorktreeRebaseOutcome::Transient(_)),
             "a connect failure must not spend a merge-conflict retry: {fetch:?}"
         );
+
+        let (store, task, task_manager, task_id_num) = approved_task_with_conflict_retries(2).await;
+        let gh = GhHttp::new().unwrap();
+        apply_rebase_recovery_outcome(
+            fetch,
+            &task,
+            "owner/repo",
+            4043,
+            &gh,
+            &task_manager,
+            &store,
+            "review-agent",
+            "review-model",
+        )
+        .await
+        .unwrap();
+
+        let stored = store.get(task_id_num).await.unwrap();
+        assert_eq!(stored.status, TaskStatus::Approved);
+        assert_eq!(stored.merge_conflict_retries, 2);
     }
 
     /// When the GitHub API is unavailable (no real token in unit tests),
@@ -3720,6 +3770,59 @@ mod tests {
             racer.num_seconds() >= 600,
             "a racing call must not reset an already-persisted ci_pending_since, got {racer:?}"
         );
+    }
+
+    async fn approved_task_with_conflict_retries(
+        retries: i32,
+    ) -> (Arc<TaskStore>, ExternalTask, Arc<TaskManager>, i64) {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let repo = "owner/repo";
+        let task_id_num = store
+            .create(&NewTask {
+                external_id: None,
+                repo: repo.to_string(),
+                origin: "internal".to_string(),
+                title: "Approved merge".to_string(),
+                body: "body".to_string(),
+                source: "github".to_string(),
+                source_id: "4086".to_string(),
+                author: String::new(),
+                url: String::new(),
+                labels: vec![],
+                parent_id: None,
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(task_id_num, TaskStatus::Approved)
+            .await
+            .unwrap();
+        for _ in 0..retries {
+            store
+                .increment(task_id_num, "merge_conflict_retries")
+                .await
+                .unwrap();
+        }
+
+        let task_id_str = format!("internal:{task_id_num}");
+        let backend: Arc<dyn ExternalBackend> = Arc::new(NoopBackend);
+        let task_manager = Arc::new(TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
+            repo.to_string(),
+        ));
+        let task = ExternalTask {
+            id: ExternalId(task_id_str),
+            title: "Approved merge".to_string(),
+            body: "body".to_string(),
+            state: "open".to_string(),
+            labels: vec![],
+            author: String::new(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: String::new(),
+        };
+        (store, task, task_manager, task_id_num)
     }
 
     const REPO: &str = "owner/repo";
