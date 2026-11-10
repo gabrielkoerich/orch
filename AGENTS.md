@@ -492,6 +492,10 @@ Do not add a `git push origin --delete`, a `git branch -D` or a forced `git work
 
 `blocked` means a person has to look, and `waiting` means a dependency is open. Both resume from their worktree and branch. Only `done` is terminal. Cleanup must never treat `Blocked` or `Waiting` as finished: startup reconciliation keeps their worktrees, and periodic cleanup collects only done tasks (#3793). `cleanup_skips_blocked_internal_tasks_and_cleans_done_ones` guards this.
 
+### Startup leaves a conflicted rebase for the agent
+
+Startup rebases `new`, `routed`, `in_progress`, `needs_review`, and `in_review` worktrees onto the default branch. A content conflict stays in the worktree when `merge_conflict_retries > 0` or the task has a PR, the same rule dispatch uses (#3982, #4087). Do not abort that rebase, delete the worktree, or call `reset_to_new`. Other rebase failures still abort, rescue, and reset. `reset_to_new` keeps `branch` when the local branch still has commits the rescue ref does not. After a rescue push, `refs/remotes/origin/rescue/<branch>` must point at the tip that was pushed so `delete_local_branch` can see it.
+
 ### Age stuck tasks from their status entry, not `updated_at`
 
 Many writes touch `updated_at` without changing the status. `review_open_prs` writes `pr_number` on every pass, so an `in_review` task with a PR never looked older than a minute, and a task with no reviewer sat for 10 hours (#3791). Stuck and stale checks must age a task from the `task_activity` row where it entered its current status. Do not move them back to `updated_at`. `stale_in_review_recovery_resets_orphaned_task_without_session` guards this.

@@ -89,6 +89,11 @@ pub fn task_id_from_worktree_name(name: &str) -> Option<String> {
     None
 }
 
+/// A content conflict is for the agent when auto_merge already retried or a PR exists
+pub fn keep_conflicted_rebase(merge_conflict_retries: i32, pr_number: Option<i32>) -> bool {
+    merge_conflict_retries > 0 || pr_number.is_some()
+}
+
 /// Abort any rebase in progress for a worktree.
 pub async fn abort_worktree_rebase(worktree_dir: &Path) {
     let _ = Command::new("git")
@@ -516,20 +521,12 @@ pub async fn setup_worktree(
         anyhow::bail!("empty branch name for task {task_id}");
     }
 
-    // Abort any in-progress rebase in an existing worktree.
-    //
-    // Agents can leave a worktree stuck mid-rebase (e.g. after running
-    // `git rebase -i` interactively).  The next dispatch attempt would
-    // inherit that broken state, causing all subsequent git operations to
-    // fail.  Aborting here is safe: if no rebase is in progress git exits
-    // with a non-zero code which we silently ignore.
-    // A task with a recorded merge conflict keeps its rebase, auto_merge left it on purpose and
-    // told the agent to continue it.
+    // Abort a leftover rebase unless auto_merge left a content conflict for the agent
     // Use tokio::fs for async-safe existence check
     if fs::metadata(&worktree_dir).await.is_ok() {
         let keep_rebase = task_record
             .as_ref()
-            .is_some_and(|t| t.merge_conflict_retries > 0)
+            .is_some_and(|t| keep_conflicted_rebase(t.merge_conflict_retries, t.pr_number))
             && git_ops::rebase_in_progress(&worktree_dir).await;
         if keep_rebase {
             tracing::info!(
@@ -911,6 +908,14 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn keep_conflicted_rebase_when_retries_or_pr() {
+        assert!(keep_conflicted_rebase(1, None));
+        assert!(keep_conflicted_rebase(0, Some(12)));
+        assert!(keep_conflicted_rebase(2, Some(12)));
+        assert!(!keep_conflicted_rebase(0, None));
+    }
+
     /// Helper: run a git command in `dir`, panicking on failure.
     fn git(dir: &Path, args: &[&str]) {
         let mut cmd = process::Command::new("git");
@@ -1199,6 +1204,81 @@ mod tests {
         assert!(
             git_ops::rebase_in_progress(&wt).await,
             "the rebase auto_merge left must survive dispatch"
+        );
+
+        match prev_orch_home {
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            Some(v) => unsafe { env::set_var("ORCH_HOME", v) },
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            None => unsafe { env::remove_var("ORCH_HOME") },
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(orch_home)]
+    async fn setup_worktree_keeps_the_conflicted_rebase_when_the_task_has_a_pr() {
+        let orch_home_dir = tempfile::tempdir().unwrap();
+        let prev_orch_home = env::var("ORCH_HOME").ok();
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::set_var("ORCH_HOME", orch_home_dir.path()) };
+
+        let remote = tempfile::tempdir().unwrap();
+        git(remote.path(), &["init", "--bare"]);
+        let project = tempfile::tempdir().unwrap();
+        git(
+            project.path(),
+            &["clone", remote.path().to_str().unwrap(), "."],
+        );
+        git(project.path(), &["config", "user.email", "t@t.com"]);
+        git(project.path(), &["config", "user.name", "T"]);
+        std_fs::write(project.path().join("f.txt"), "base\n").unwrap();
+        git(project.path(), &["add", "."]);
+        git(project.path(), &["commit", "-m", "base"]);
+        git(project.path(), &["push", "origin", "HEAD:main"]);
+        git(project.path(), &["remote", "set-head", "origin", "main"]);
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let id = store
+            .create_internal("test/repo", "conflict", "", "test", "1", None)
+            .await
+            .unwrap();
+        let task_id = format!("internal:{id}");
+        let opt = Some(Arc::clone(&store));
+
+        let setup = setup_worktree(&task_id, "conflict", project.path(), &opt, "test/repo")
+            .await
+            .unwrap();
+        let wt = setup.work_dir.clone();
+        git(&wt, &["config", "user.email", "t@t.com"]);
+        git(&wt, &["config", "user.name", "T"]);
+        std_fs::write(wt.join("f.txt"), "agent\n").unwrap();
+        git(&wt, &["commit", "-am", "agent change"]);
+        git(&wt, &["push", "origin", "HEAD"]);
+
+        std_fs::write(project.path().join("f.txt"), "main\n").unwrap();
+        git(project.path(), &["commit", "-am", "main change"]);
+        git(project.path(), &["push", "origin", "HEAD:main"]);
+        git(&wt, &["fetch", "origin"]);
+        let rebase = process::Command::new("git")
+            .args(["rebase", "origin/main"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert!(!rebase.status.success(), "precondition: rebase conflicts");
+        assert!(git_ops::rebase_in_progress(&wt).await);
+
+        store
+            .set_fields(id, &[("pr_number", serde_json::json!(7))])
+            .await
+            .unwrap();
+
+        setup_worktree(&task_id, "conflict", project.path(), &opt, "test/repo")
+            .await
+            .unwrap();
+        git_ops::rebase_on_default(&wt, "main").await;
+        assert!(
+            git_ops::rebase_in_progress(&wt).await,
+            "the rebase auto_merge left must survive dispatch when the task has a PR"
         );
 
         match prev_orch_home {

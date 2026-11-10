@@ -58,6 +58,8 @@ pub enum Command {
     },
     TaskResetToNew {
         id: i64,
+        #[serde(default)]
+        keep_branch: bool,
     },
     TaskSetFields {
         id: i64,
@@ -208,8 +210,8 @@ impl Command {
                 apply::touch(conn, now, id).await?;
                 Reply::Done
             }
-            Command::TaskResetToNew { id } => {
-                apply::reset_to_new(conn, now, id).await?;
+            Command::TaskResetToNew { id, keep_branch } => {
+                apply::reset_to_new(conn, now, id, keep_branch).await?;
                 Reply::Done
             }
             Command::TaskSetFields {
