@@ -1774,27 +1774,15 @@ impl GhHttp {
         self.get_all_pages(&url, &[("per_page", "100")]).await
     }
 
-    /// Check if a PR with the given branch was merged.
+    /// Whether a merged PR exists whose head ref is `branch`.
+    ///
+    /// The closed-PR list can include a PR for a different branch, so this
+    /// uses [`Self::get_closed_pr_state`], which skips a mismatched `head.ref`
     pub async fn is_pr_merged(&self, repo: &str, branch: &str) -> anyhow::Result<bool> {
-        let owner = repo
-            .split('/')
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {repo}"))?;
-        let head = format!("{owner}:{branch}");
-
-        let url = format!("{GITHUB_API}/repos/{repo}/pulls");
-        let prs: Vec<serde_json::Value> = self
-            .get_with_query(
-                &url,
-                &[("head", &head), ("state", "closed"), ("per_page", "1")],
-            )
-            .await?;
-
-        if prs.is_empty() {
-            return Ok(false);
-        }
-        let merged_at = prs[0].get("merged_at");
-        Ok(merged_at.is_some_and(|v| !v.is_null()))
+        Ok(self
+            .get_closed_pr_state(repo, branch)
+            .await?
+            .is_some_and(|(_, merged, _)| merged))
     }
 
     /// Get the state of a closed PR for the given branch.
@@ -1820,7 +1808,7 @@ impl GhHttp {
             .ok_or_else(|| anyhow::anyhow!("invalid repo format: {repo}"))?;
         let head = format!("{owner}:{branch}");
 
-        let url = format!("{GITHUB_API}/repos/{repo}/pulls");
+        let url = format!("{}/repos/{repo}/pulls", self.api_root());
         let prs: Vec<serde_json::Value> = self
             .get_with_query(
                 &url,
@@ -2111,7 +2099,7 @@ impl GhHttp {
     /// Get PR details by PR number.
     /// Returns the full PR object including the `mergeable` field.
     pub async fn get_pr(&self, repo: &str, pr_number: u64) -> anyhow::Result<GitHubPullRequest> {
-        let url = format!("{GITHUB_API}/repos/{repo}/pulls/{pr_number}");
+        let url = format!("{}/repos/{repo}/pulls/{pr_number}", self.api_root());
         self.get_json(&url).await
     }
 
@@ -4033,6 +4021,7 @@ fn parse_graphql_issue_comment(node: &serde_json::Value) -> Option<GitHubComment
 #[cfg(test)]
 mod tests {
     // Secret redaction on posted bodies (wiremock)
+    mod closed_pr;
     mod leak_redaction;
 
     use std::env;
