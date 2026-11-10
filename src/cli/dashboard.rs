@@ -2,6 +2,7 @@ use crate::backends::Status;
 use crate::cli;
 use crate::cli::init_task_manager;
 use crate::config;
+use crate::engine::tasks::status_to_task_status;
 use crate::store;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
@@ -52,17 +53,7 @@ pub async fn dashboard(global: bool, project: Option<String>) -> anyhow::Result<
             .filter(|t| t.labels.contains(&label.to_string()))
             .cloned()
             .collect();
-        let ts = match s {
-            Status::New => TaskStatus::New,
-            Status::Routed => TaskStatus::Routed,
-            Status::InProgress => TaskStatus::InProgress,
-            Status::Done => TaskStatus::Done,
-            Status::Blocked => TaskStatus::Blocked,
-            Status::InReview => TaskStatus::InReview,
-            Status::Approved => TaskStatus::Approved,
-            Status::NeedsReview => TaskStatus::NeedsReview,
-            Status::Waiting => TaskStatus::Waiting,
-        };
+        let ts = status_to_task_status(*s);
         let int_count = all_internal.iter().filter(|t| t.status == ts).count();
         total += ext_filtered.len() + int_count;
         counts.push((*s, ext_filtered.len(), int_count));
@@ -78,7 +69,7 @@ pub async fn dashboard(global: bool, project: Option<String>) -> anyhow::Result<
         if count > 0 {
             println!(
                 "  {:<12} {:>3}{}",
-                s.as_label().replace("status:", ""),
+                s.as_str(),
                 count,
                 if *int > 0 {
                     format!(" ({int} internal)")

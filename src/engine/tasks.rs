@@ -746,7 +746,7 @@ impl TaskManager {
                 task_id: id.0.clone(),
                 repo: repo.to_string(),
                 old_status: snapshot.old_status.clone().unwrap_or_default(),
-                new_status: status.as_label().trim_start_matches("status:").to_string(),
+                new_status: status.as_str().to_string(),
                 agent: snapshot.agent.clone(),
                 model: snapshot.model.clone(),
                 pr_number: snapshot.pr_number.clone(),
@@ -1151,6 +1151,11 @@ mod tests {
             status_to_task_status(Status::NeedsReview),
             TaskStatus::NeedsReview
         );
+        assert_eq!(
+            status_to_task_status(Status::Approved),
+            TaskStatus::Approved
+        );
+        assert_eq!(status_to_task_status(Status::Waiting), TaskStatus::Waiting);
     }
 
     #[test]
