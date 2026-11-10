@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% import "docs-macros.html" as docs_macros %}
+
+{% block header_title %}{{ docs_macros::header() }}{% endblock header_title %}
+
+{% block content %}
+<div class="docs-layout">
+    {{ docs_macros::sidebar(docs=section, current="") }}
+    <article class="docs-content content">
+        <h1>Docs</h1>
+        {{ section.content | safe }}
+        <div class="docs-cards">
+            {% for group in config.extra.docs_groups %}
+            <section class="docs-card">
+                <h2>{{ group }}</h2>
+                <ul>
+                    {% for p in section.pages %}{% if p.extra.group == group %}
+                    <li><a href="{{ p.permalink | safe }}">{{ p.title }}</a>{% if p.description %}<span>{{ p.description }}</span>{% endif %}</li>
+                    {% endif %}{% endfor %}
+                </ul>
+            </section>
+            {% endfor %}
+        </div>
+    </article>
+</div>
+{% endblock content %}

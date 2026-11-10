@@ -1,0 +1,16 @@
+{% macro header() %}
+<a class="brand" href="{{ get_url(path='/') }}"><span class="brand-mark">◆</span> orch</a>
+{% endmacro header %}
+
+{% macro sidebar(docs, current) %}
+<nav class="docs-sidebar" aria-label="Docs">
+    {% for group in config.extra.docs_groups %}
+    <p class="docs-group">{{ group }}</p>
+    <ul>
+        {% for p in docs.pages %}{% if p.extra.group == group %}
+        <li{% if p.path == current %} class="active"{% endif %}><a href="{{ p.permalink | safe }}">{% if p.extra.short_title %}{{ p.extra.short_title }}{% else %}{{ p.title }}{% endif %}</a></li>
+        {% endif %}{% endfor %}
+    </ul>
+    {% endfor %}
+</nav>
+{% endmacro sidebar %}

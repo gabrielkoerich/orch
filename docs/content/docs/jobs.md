@@ -1,7 +1,11 @@
 +++
 title = "Scheduled Jobs"
 description = "Cron-based scheduled tasks and bash jobs"
-weight = 9
+weight = 34
+aliases = ["/jobs/"]
+
+[extra]
+group = "Integrations"
 +++
 
 Define recurring work with cron expressions. Jobs create tasks on schedule (or run bash commands directly).

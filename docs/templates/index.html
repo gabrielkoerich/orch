@@ -1,27 +1,227 @@
-{% extends "base.html" %}
+<!DOCTYPE html>
+<html lang="{{ config.default_language }}">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>orch · Write the plan. orch builds it.</title>
+    <meta name="description" content="{{ config.description }}">
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="orch · Write the plan. orch builds it.">
+    <meta property="og:description" content="{{ config.description }}">
+    <meta property="og:url" content="{{ current_url | safe }}">
+    <link rel="canonical" href="{{ current_url | safe }}">
+    <link rel="stylesheet" href="{{ get_url(path='landing.css', cachebust=true) }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400..800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+</head>
+<body>
+{% set docs = get_section(path="docs/_index.md") %}
+{% set proof = load_data(path="static/proof.json", required=false) %}
 
-{% block content %}
-<div id="intro">
-    <em>{{config.description}}</em>
-</div>
+<header class="nav">
+    <div class="wrap nav-row">
+        <a class="brand" href="{{ get_url(path='/') }}"><span class="brand-mark">◆</span> orch</a>
+        <nav class="nav-links">
+            <a href="{{ get_url(path='@/docs/_index.md') }}">Docs</a>
+            <a href="{{ get_url(path='@/posts/_index.md') }}">Updates</a>
+            <a href="{{ config.extra.github }}">GitHub</a>
+            <a class="btn btn-small" href="#install">Install</a>
+        </nav>
+    </div>
+</header>
 
-<h2>Documentation</h2>
-<ul>
-    {% for page in section.pages %}
-    <li><a href="{{page.permalink | safe}}">{{page.title}}</a>{% if page.description %} — <span style="color: var(--text-secondary);">{{page.description}}</span>{% endif %}</li>
-    {% endfor %}
-</ul>
+<main>
+<section class="hero">
+    <div class="wrap">
+        <p class="eyebrow">Open source · runs on your machine · MIT</p>
+        <h1>Write the plan.<br>orch builds it.</h1>
+        <p class="lede">orch turns a markdown plan into GitHub issues and builds them into merged pull requests with Claude Code, Codex and OpenCode, on your machine and the subscriptions you already pay for.</p>
+        <div class="hero-actions">
+            <div class="copy-box" data-copy="brew install gabrielkoerich/tap/orch">
+                <span class="prompt">$</span> <code>brew install gabrielkoerich/tap/orch</code>
+                <button type="button" class="copy-btn" aria-label="Copy the install command">Copy</button>
+            </div>
+            <a class="btn" href="{{ get_url(path='@/docs/getting-started.md') }}">Get started</a>
+            <a class="btn btn-ghost" href="{{ config.extra.github }}">View on GitHub</a>
+        </div>
+        <p class="works-with">Works with <span>Claude Code</span><span>Codex</span><span>OpenCode</span><span>Kimi</span><span>MiniMax</span><span>Grok</span></p>
+    </div>
 
-{% set posts = get_section(path="posts/_index.md") %}
-{% if posts.pages | length > 0 %}
-<h2>Recent Updates</h2>
-<ul>
-    {% for page in posts.pages %}
-    <li>
-        <a href="{{page.permalink | safe}}">{{page.title}}</a>
-        {% if page.date %}<span style="color: var(--text-secondary); font-size: .85rem; font-family: var(--font-mono);"> — {{page.date | date(format="%Y-%m-%d")}}</span>{% endif %}
-    </li>
-    {% endfor %}
-</ul>
-{% endif %}
-{% endblock %}
+    <figure class="wrap hero-figure">
+        <div class="pane pane-plan">
+            <p class="pane-title">PLAN.md</p>
+<pre><code><span class="md-h">## M1. Search</span>
+
+<span class="md-h">### M1-01 Index the notes</span>
+- Goal: full-text search over every note.
+- Acceptance: a query returns in 50 ms.
+
+<span class="md-h">### M1-02 Search command</span>
+- Depends on: M1-01.
+
+<span class="md-h">### M1-03 Pick the ranking</span>
+- Owner: human.</code></pre>
+        </div>
+        <div class="pane pane-board">
+            <p class="pane-title">GitHub issues, built in order</p>
+            <div class="board">
+                <div class="col"><p class="col-title">waiting</p><div class="card"><b>#12</b> Search command<span class="tag">blocked by #11</span></div></div>
+                <div class="col"><p class="col-title">building</p><div class="card"><b>#11</b> Index the notes<span class="tag tag-agent">codex · worktree</span></div></div>
+                <div class="col"><p class="col-title">review</p><div class="card"><b>#9</b> Config loader<span class="tag tag-ok">CI green · approved</span></div></div>
+                <div class="col"><p class="col-title">merged</p><div class="card card-done"><b>#8</b> Project skeleton<span class="tag tag-ok">merged</span></div><div class="card card-you"><b>#13</b> Pick the ranking<span class="tag">yours</span></div></div>
+            </div>
+        </div>
+        <figcaption>fig. 1 · a plan becomes a board. An illustration, the live numbers are below.</figcaption>
+    </figure>
+</section>
+
+<section class="section">
+    <div class="wrap">
+        <h2>The loop you no longer run</h2>
+        <p class="section-lede">Agents write the code. The work is everything around them: splitting the plan, starting each session, pasting the CI failure back, answering the review, rebasing, merging, starting the next task. orch does all of it.</p>
+        <ol class="steps">
+            <li><span class="step-n">01</span><h3>Plan</h3><p>Write what you want in markdown. <code>orch plan</code> turns it into a roadmap and shows it to you first.</p></li>
+            <li><span class="step-n">02</span><h3>Issues</h3><p>One GitHub issue per task, with blocked-by links. A task starts when its blockers merge.</p></li>
+            <li><span class="step-n">03</span><h3>Agent</h3><p>Each task runs in its own worktree, on the agent with quota left.</p></li>
+            <li><span class="step-n">04</span><h3>Review</h3><p>A second agent reviews the PR. Requested changes go back to the author.</p></li>
+            <li><span class="step-n">05</span><h3>CI</h3><p>Your GitHub Actions or shipcheck test it. Red checks go back to the author too.</p></li>
+            <li><span class="step-n">06</span><h3>Merge</h3><p>It merges under your branch protection, and the tasks that waited on it start.</p></li>
+        </ol>
+        <p class="note">A task marked <code>Owner: human</code> waits for you. Everything else runs without you.</p>
+    </div>
+</section>
+
+<section class="section section-alt">
+    <div class="wrap">
+        <h2>Your machine, your subscriptions</h2>
+        <div class="grid grid-3">
+            <div class="feature"><h3>Runs where your code is</h3><p>A headless service on your Mac or Linux box. Agents run in tmux sessions inside git worktrees that share build output, so a new task starts warm.</p></div>
+            <div class="feature"><h3>Routes by quota</h3><p>When Claude hits its limit, the next task goes to Codex or OpenCode. Rate limits, expired credits and dead models cool down and fail over on their own.</p></div>
+            <div class="feature"><h3>Nothing to resell</h3><p>No API keys, no cloud, no telemetry. orch talks to GitHub and to the agent CLIs you already logged in to, and nothing else.</p></div>
+        </div>
+    </div>
+</section>
+
+<section class="section">
+    <div class="wrap">
+        <h2>What orch handles for you</h2>
+        <div class="grid grid-3 grid-tight">
+            <div class="feature"><h3>Review cycles</h3><p>Changes requested go back to the same agent, branch and worktree.</p></div>
+            <div class="feature"><h3>Red CI</h3><p>Failed checks reach the author with the failing tests.</p></div>
+            <div class="feature"><h3>Rebases</h3><p>A branch that falls behind is rebased, and a conflict goes back to its author.</p></div>
+            <div class="feature"><h3>CI first</h3><p>A plan for an empty repo starts with a task that sets up its tests and CI.</p></div>
+            <div class="feature"><h3>Your phone</h3><p>Follow and steer tasks from Telegram or Discord.</p></div>
+            <div class="feature"><h3>Secrets</h3><p>Agent output is scanned and redacted before anything reaches GitHub.</p></div>
+        </div>
+    </div>
+</section>
+
+<section class="section section-alt" id="proof">
+    <div class="wrap">
+        <h2>orch builds orch</h2>
+        {% if proof and proof.days %}
+            {% set_global orch_merged = 0 %}
+            {% set_global all_merged = 0 %}
+            {% set_global hours = [] %}
+            {% for day in proof.days %}
+                {% set_global orch_merged = orch_merged + day.merged_by_orch %}
+                {% set_global all_merged = all_merged + day.merged %}
+                {% for pr in day.prs %}
+                    {% set_global hours = hours | concat(with=pr.hours_to_merge) %}
+                {% endfor %}
+            {% endfor %}
+            {% set sorted_hours = hours | sort %}
+            {% set n_prs = sorted_hours | length %}
+            {% set half = n_prs / 2 %}
+            {% set mid = half | int %}
+            {% set median_h = sorted_hours | nth(n=mid) %}
+            {% set median_min = median_h * 60 %}
+            {% set share = orch_merged * 100 / all_merged %}
+            {% set first_day = proof.days | first %}
+            <div class="stats">
+                <div class="stat"><span class="stat-n">{{ orch_merged }}</span><span class="stat-l">pull requests merged by orch's agents</span></div>
+                <div class="stat"><span class="stat-n">{{ share | round }}%</span><span class="stat-l">of everything merged on orch</span></div>
+                <div class="stat"><span class="stat-n">{% if median_h < 1 %}{{ median_min | round }} min{% else %}{{ median_h | round(precision=1) }} h{% endif %}</span><span class="stat-l">median from issue to merge</span></div>
+            </div>
+            {% set recent = proof.days | reverse | slice(end=30) | reverse %}
+            {% set_global peak = 1 %}
+            {% for day in recent %}{% if day.merged > peak %}{% set_global peak = day.merged %}{% endif %}{% endfor %}
+            <ol class="bars" aria-label="Pull requests merged per day, last {{ recent | length }} days with merges">
+                {% for day in recent %}
+                <li title="{{ day.date }}: {{ day.merged_by_orch }} of {{ day.merged }} by orch">
+                    <span class="bar bar-all" style="height: {{ day.merged * 100 / peak }}%"></span>
+                    <span class="bar bar-orch" style="height: {{ day.merged_by_orch * 100 / peak }}%"></span>
+                </li>
+                {% endfor %}
+            </ol>
+            <p class="caption">Merged pull requests per day on <a href="https://github.com/{{ proof.repo }}/pulls?q=is%3Apr+is%3Amerged">{{ proof.repo }}</a> since {{ first_day.date }}, by orch's agents in green. Updated with every release from <a href="{{ get_url(path='proof.json') }}">proof.json</a>.</p>
+        {% else %}
+            <p class="section-lede">Every release publishes the pull requests orch merged on its own repository, by day and by agent, in <a href="{{ get_url(path='proof.json') }}">proof.json</a>.</p>
+        {% endif %}
+        <div class="case">
+            <p class="case-label">Built from a plan</p>
+            <p class="case-text"><strong>brain</strong>, a knowledge base for agents, went from one roadmap file to <strong>41 of 47 tasks merged in about 45 hours</strong>. The other 6 were marked for a person from the start.</p>
+        </div>
+    </div>
+</section>
+
+<section class="section" id="install">
+    <div class="wrap">
+        <h2>Install</h2>
+        <div class="tabs">
+            <input type="radio" name="install" id="tab-mac" checked>
+            <label for="tab-mac">macOS</label>
+            <input type="radio" name="install" id="tab-linux">
+            <label for="tab-linux">Linux</label>
+            <div class="tab tab-mac">
+<pre><code><span class="c"># log in to gh and one agent CLI first</span>
+brew install gabrielkoerich/tap/orch
+orch init
+orch plan PLAN.md</code></pre>
+            </div>
+            <div class="tab tab-linux">
+<pre><code><span class="c"># log in to gh and one agent CLI first</span>
+cargo binstall orch-cli
+orch service install
+orch init
+orch plan PLAN.md</code></pre>
+            </div>
+        </div>
+        <p class="note"><code>orch init</code> finds your agent CLIs and asks for one repository. The rest is in <a href="{{ get_url(path='@/docs/getting-started.md') }}">Getting started</a>.</p>
+    </div>
+</section>
+
+<section class="section section-alt">
+    <div class="wrap"><div class="faq">
+        <h2>Questions</h2>
+        <details><summary>What does it cost?</summary><p>Nothing. orch is MIT licensed and runs the agent CLIs on the plans you already pay for. It never asks for an API key.</p></details>
+        <details><summary>Is it safe to let it merge?</summary><p>orch merges only what your branch protection allows. Every PR gets a second agent's review and your CI, and a plan for a new repo sets up CI before anything else.</p></details>
+        <details><summary>Does my code leave my machine?</summary><p>It goes where it goes today: to GitHub and to the agents you use. orch adds no server of its own and collects no telemetry.</p></details>
+        <details><summary>Which agents work?</summary><p>Claude Code, Codex, OpenCode, Kimi, MiniMax and Grok. orch picks one per task by complexity and remaining quota, and a label can pin one.</p></details>
+        <details><summary>What does it not do?</summary><p>Work that needs taste, such as design and copy, stays with you. Mark it <code>Owner: human</code> in the plan and orch builds around it.</p></details>
+    </div></div>
+</section>
+</main>
+
+<footer class="footer">
+    <div class="wrap footer-row">
+        <span><span class="brand-mark">◆</span> orch · MIT · built by <a href="{{ config.extra.home_url }}">{{ config.extra.author }}</a></span>
+        <nav><a href="{{ get_url(path='@/docs/_index.md') }}">Docs</a><a href="{{ get_url(path='@/posts/_index.md') }}">Updates</a><a href="{{ config.extra.github }}">GitHub</a></nav>
+    </div>
+</footer>
+
+<script>
+for (const box of document.querySelectorAll(".copy-box")) {
+    const button = box.querySelector(".copy-btn");
+    button.addEventListener("click", async () => {
+        await navigator.clipboard.writeText(box.dataset.copy);
+        button.textContent = "Copied";
+        setTimeout(() => {
+            button.textContent = "Copy";
+        }, 1500);
+    });
+}
+</script>
+</body>
+</html>

@@ -3,7 +3,7 @@ theme = "zola-docs"
 compile_sass = true
 build_search_index = false
 title = "Orch"
-description = "A multi-agent task orchestration engine for AI coding agents"
+description = "Write the plan. orch builds it. orch turns a markdown plan into GitHub issues and builds them into merged pull requests with the coding agents on your machine."
 default_language = "en"
 minify_html = true
 
@@ -18,7 +18,15 @@ site_name = "Orch"
 home_url = "https://gabrielkoerich.com"
 github = "https://github.com/gabrielkoerich/orch"
 stylesheet = "main.css"
+# orch.works is a product site, so the theme's personal menu, tagline and profile icons stay off
+tagline = ""
+site_nav = []
+profile_github = ""
+x = ""
+linkedin = ""
+email = ""
 nav = [
-    { name = "Docs", url = "@/_index.md" },
+    { name = "Docs", url = "@/docs/_index.md" },
     { name = "Updates", url = "@/posts/_index.md" },
 ]
+docs_groups = ["Start", "Concepts", "Reference", "Integrations", "Operate"]

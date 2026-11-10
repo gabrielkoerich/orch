@@ -106,3 +106,92 @@ table {
     line-height: 1.5;
   }
 }
+
+// Product docs: orch wordmark, grouped sidebar, docs home cards and pager
+.brand {
+  color: var(--heading-color);
+  font-weight: 800;
+  font-size: 1.25rem;
+  letter-spacing: -.02em;
+  text-decoration: none;
+}
+
+.brand-mark {
+  color: var(--accent-color);
+}
+
+.docs-group {
+  margin: 1.25rem 0 .35rem;
+  font-family: var(--font-mono);
+  font-size: .7rem;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--text-secondary);
+
+  &:first-child {
+    margin-top: 0;
+  }
+}
+
+.docs-crumb {
+  margin: 0 0 .25rem;
+  font-family: var(--font-mono);
+  font-size: .75rem;
+  text-transform: uppercase;
+  color: var(--accent-color);
+}
+
+.docs-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 1rem;
+  margin-top: 2rem;
+}
+
+.docs-card {
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  padding: 1.1rem 1.25rem;
+  background: var(--bg-secondary);
+
+  h2 {
+    margin: 0 0 .5rem;
+    font-size: 1rem;
+  }
+
+  ul {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+
+  li {
+    margin: .5rem 0;
+  }
+
+  span {
+    display: block;
+    font-size: .85rem;
+    color: var(--text-secondary);
+  }
+}
+
+.docs-pager {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 3rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--border-color);
+}
+
+.docs-edit {
+  margin-top: 1rem;
+  font-size: .85rem;
+}
+
+// Product docs read in the sans face, the theme's serif suits the blog posts
+.docs-content.content {
+  font-family: var(--font-main);
+  font-size: 1rem;
+}

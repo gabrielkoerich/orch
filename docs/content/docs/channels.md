@@ -1,9 +1,11 @@
 +++
 title = "Channels — Telegram, Discord & Slack"
 description = "Set up and operate the Telegram, Discord, and Slack integrations"
-weight = 8
+weight = 32
 
+aliases = ["/channels/"]
 [extra]
+group = "Integrations"
 short_title = "Channels"
 +++
 

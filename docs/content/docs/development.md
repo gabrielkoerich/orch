@@ -1,7 +1,11 @@
 +++
 title = "Development"
 description = "Contributing, testing, and release pipeline"
-weight = 11
+weight = 41
+aliases = ["/development/"]
+
+[extra]
+group = "Operate"
 +++
 
 ## Setup

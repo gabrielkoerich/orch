@@ -1,7 +1,11 @@
 +++
 title = "Cluster"
 description = "Run orch on several machines over a tailnet, with leader failover"
-weight = 12
+weight = 40
+aliases = ["/cluster/"]
+
+[extra]
+group = "Operate"
 +++
 
 ## What it is

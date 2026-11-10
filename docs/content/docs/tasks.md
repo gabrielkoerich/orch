@@ -1,7 +1,11 @@
 +++
 title = "Task Model"
 description = "Task schema, lifecycle, and delegation"
-weight = 2
+weight = 3
+aliases = ["/tasks/"]
+
+[extra]
+group = "Start"
 +++
 
 ## Task Schema

@@ -1,7 +1,11 @@
 +++
 title = "CLI Reference"
 description = "Commands, namespaces, and background service"
-weight = 6
+weight = 20
+aliases = ["/cli/"]
+
+[extra]
+group = "Reference"
 +++
 
 ## Namespaces
@@ -21,7 +25,7 @@ orch chat     [message…] | history | stats
 
 Visible top-level commands: `init`, `log`, `nodes`, `progress`, `commit`, `config`, `stream`, `chat`, `task`, `job`, `plan`, `service`, `project`, `cooldown`, `stats`, `notify`.
 
-`orch serve` is hidden. It runs the engine in the foreground, and the launchd and systemd units run it. `orch progress --done "..." [--left "..."] [--state "..."]` records what a task step finished and commits it, and the service pushes. `orch nodes` lists the cluster's machines, see [Cluster](@/cluster.md).
+`orch serve` is hidden. It runs the engine in the foreground, and the launchd and systemd units run it. `orch progress --done "..." [--left "..."] [--state "..."]` records what a task step finished and commits it, and the service pushes. `orch nodes` lists the cluster's machines, see [Cluster](@/docs/cluster.md).
 
 ## Init
 
@@ -155,7 +159,7 @@ orch job run <id>                                          # run a job immediate
 orch job cron "0 9 * * *" [--since <ts>]                    # check if a cron expression matches now
 ```
 
-Jobs can also be defined declaratively as markdown files under `prompts/jobs/*.md` (frontmatter: `id`, `schedule`, `title`, `type`, `enabled`, `external`, `agent`, `command`, `dir`). See [Jobs](@/jobs.md).
+Jobs can also be defined declaratively as markdown files under `prompts/jobs/*.md` (frontmatter: `id`, `schedule`, `title`, `type`, `enabled`, `external`, `agent`, `command`, `dir`). See [Jobs](@/docs/jobs.md).
 
 ## Plan
 

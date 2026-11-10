@@ -1,12 +1,16 @@
 +++
 title = "Review Agent"
 description = "Automated PR reviews using a different agent when one is available"
-weight = 10
+weight = 12
+aliases = ["/review-agent/"]
+
+[extra]
+group = "Concepts"
 +++
 
-The review agent automatically reviews pull requests after an agent completes a task. It picks a different agent from the one that wrote the code (and from any agents that previously reviewed the same task), and posts its decision on the PR, see [Review mode](@/configuration.md#review-mode). If no other agent is available, the authoring agent reviews and the fallback is logged as a `review_agent_fallback` task activity and noted in the review comment.
+The review agent automatically reviews pull requests after an agent completes a task. It picks a different agent from the one that wrote the code (and from any agents that previously reviewed the same task), and posts its decision on the PR, see [Review mode](@/docs/configuration.md#review-mode). If no other agent is available, the authoring agent reviews and the fallback is logged as a `review_agent_fallback` task activity and noted in the review comment.
 
-How the decision shows on the PR depends on whether the [GitHub App](@/github-app.md) is set up:
+How the decision shows on the PR depends on whether the [GitHub App](@/docs/github-app.md) is set up:
 
 | | With the GitHub App (`review.mode: app`) | Without it (`comment`, the default) |
 |---|---|---|
@@ -49,7 +53,7 @@ Set it in `~/.orch/config.yml` for every project, or in one project's `.orch.yml
 
    In `comment` mode the decision is a comment with the `## Automated Review` header and a commit status on the PR head SHA, context `orch/review`: `pending` while the review runs, `success` for approve, `failure` for changes requested. `orch init` no longer installs `.github/workflows/orch-review.yml`. A repository that has it can delete the file and the `ORCH_REVIEWER` variable.
 
-   With `review.mode: app` and the GitHub App installed on the repository, the decision is a real App review with inline comments, and `orch/review` is a check run from the App. No comment is posted, unless GitHub refuses the App review. See [Review mode](@/configuration.md#review-mode).
+   With `review.mode: app` and the GitHub App installed on the repository, the decision is a real App review with inline comments, and `orch/review` is a check run from the App. No comment is posted, unless GitHub refuses the App review. See [Review mode](@/docs/configuration.md#review-mode).
 
    A new commit moves the head SHA, so an approval does not cover it. The one exception is a base update in `approved`: when the PR falls behind, orch rebases it in the task worktree (or GitHub merges the base in when that fails), and carries the approval to the new head only if the repository, branch, base, commits, authors and tree all match what was approved. A carried approval posts no second review: orch passes `orch/review` on the new head (the App check run, or the commit status in comment mode) and the first review stays on the PR.
 
@@ -105,7 +109,7 @@ CI has already run when the review starts. The reviewer reads the required check
 | **approve** | Changes correctly implement the task, no obvious bugs or security issues | `orch/review` passes, the task moves to `approved` and orch merges once CI passes |
 | **request_changes** | The changes have fixable issues, or the reviewer could not resolve a conflict | `orch/review` fails, the task goes back to `routed` |
 
-In `comment` mode the decision is a `## Automated Review` comment and an `orch/review` commit status. In `app` mode it is a real `APPROVE` or `REQUEST_CHANGES` review from the GitHub App with inline comments, and `orch/review` is a check run, with no comment. See [Review mode](@/configuration.md#review-mode).
+In `comment` mode the decision is a `## Automated Review` comment and an `orch/review` commit status. In `app` mode it is a real `APPROVE` or `REQUEST_CHANGES` review from the GitHub App with inline comments, and `orch/review` is a check run, with no comment. See [Review mode](@/docs/configuration.md#review-mode).
 
 ## Task Flow
 

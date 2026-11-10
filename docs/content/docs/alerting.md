@@ -1,7 +1,11 @@
 +++
 title = "Alerting"
 description = "Multi-agent degradation detection and alert thresholds"
-weight = 9
+weight = 33
+aliases = ["/alerting/"]
+
+[extra]
+group = "Integrations"
 +++
 
 Orch emits structured logs and KV-backed metrics that can be scraped by any log aggregation or monitoring pipeline to detect when the agent fleet is degraded.
