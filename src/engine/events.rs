@@ -3,20 +3,29 @@
 use std::borrow::Cow;
 use std::env;
 use std::fs as std_fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::net;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process;
 
+use anyhow::Context;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
+use tokio::fs;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::handshake::server::ErrorResponse;
 use tokio_tungstenite::tungstenite::handshake::server::Request;
+use tokio_tungstenite::tungstenite::handshake::server::Response;
+use tokio_tungstenite::tungstenite::http::StatusCode;
+use tokio_tungstenite::tungstenite::http::header;
 
 use crate::home;
-
-use tokio::fs;
-use tokio_tungstenite::tungstenite::Message;
 
 /// Parsed query-parameter filters for a websocket connection.
 #[derive(Clone, Debug, Default)]
@@ -65,6 +74,58 @@ impl EventFilter {
         }
         true
     }
+}
+
+fn query_value<'a>(request: &'a Request, key: &str) -> Option<Cow<'a, str>> {
+    let query = request.uri().query()?;
+    for pair in query.split('&') {
+        let Some((k, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if k == key {
+            return Some(urlencoding::decode(value).unwrap_or(Cow::Borrowed(value)));
+        }
+    }
+    None
+}
+
+fn handshake_token(request: &Request) -> Cow<'_, str> {
+    if let Some(token) = query_value(request, "token") {
+        return token;
+    }
+    request
+        .headers()
+        .get(header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|v| v.to_str().ok())
+        .map_or(Cow::Borrowed(""), |v| Cow::Borrowed(v.trim()))
+}
+
+fn authorize_handshake(request: &Request, token: &str, host: &str) -> Result<(), StatusCode> {
+    // Local clients send no Origin, a page in the browser always does
+    if request.headers().get(header::ORIGIN).is_some() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    // A rebound DNS name sends its own Host, so only the literal address passes
+    let host_ok = request
+        .headers()
+        .get(header::HOST)
+        .is_some_and(|h| h.as_bytes() == host.as_bytes());
+    if !host_ok {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let given = handshake_token(request);
+    let token_ok: bool = given.as_bytes().ct_eq(token.as_bytes()).into();
+    if token_ok {
+        Ok(())
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+fn handshake_error(status: StatusCode) -> ErrorResponse {
+    let mut resp = ErrorResponse::new(None);
+    *resp.status_mut() = status;
+    resp
 }
 
 /// A control message sent by the server to the websocket client for out-of-band
@@ -129,21 +190,22 @@ impl EventBus {
         self.tx.send(event).unwrap_or(0)
     }
 
-    /// Start the websocket server. Returns the bound port.
-    /// Spawns a background task — does not block.
-    pub async fn start_ws_server(&self) -> anyhow::Result<u16> {
+    /// Start the websocket server. Returns the bound port and handshake token.
+    /// Spawns a background task, does not block.
+    pub async fn start_ws_server(&self) -> anyhow::Result<(u16, String)> {
         // Select a deterministic port in the ephemeral range (49152-65535),
         // starting from a hostname-based offset to be stable across restarts.
         let (listener, port) = select_available_listener()?;
         listener.set_nonblocking(true)?;
         let listener = TcpListener::from_std(listener)?;
 
-        // Write port file without blocking the runtime thread.
-        let port_path = ws_port_path()?;
-        if let Some(parent) = port_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        fs::write(&port_path, port.to_string()).await?;
+        let token = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let host = format!("127.0.0.1:{port}");
+        write_private(&ws_port_path()?, &format!("{port} {token}"))?;
 
         // Write service version file so service status can detect CLI/service drift.
         // Format: "{pid}\t{version}" so readers can verify the owning process is alive.
@@ -157,18 +219,37 @@ impl EventBus {
         }
 
         let tx = self.tx.clone();
+        let serve_token = token.clone();
+        let serve_host = host;
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _addr)) => {
                         let mut rx = tx.subscribe();
+                        let token = serve_token.clone();
+                        let host = serve_host.clone();
                         tokio::spawn(async move {
                             let mut filter = EventFilter::default();
                             #[expect(
                                 clippy::result_large_err,
                                 reason = "the tungstenite callback type fixes the error type"
                             )]
-                            let callback = |req: &Request, resp| {
+                            let callback = |req: &Request,
+                                            mut resp: Response|
+                             -> Result<Response, ErrorResponse> {
+                                if let Err(status) = authorize_handshake(req, &token, &host) {
+                                    return Err(handshake_error(status));
+                                }
+                                if let Some(proto) =
+                                    req.headers().get(header::SEC_WEBSOCKET_PROTOCOL)
+                                {
+                                    let proto_ok: bool =
+                                        proto.as_bytes().ct_eq(token.as_bytes()).into();
+                                    if proto_ok {
+                                        resp.headers_mut()
+                                            .insert(header::SEC_WEBSOCKET_PROTOCOL, proto.clone());
+                                    }
+                                }
                                 filter = EventFilter::from_request(req);
                                 tracing::debug!(?filter, "ws client connected with filter");
                                 Ok(resp)
@@ -234,7 +315,7 @@ impl EventBus {
         });
 
         tracing::info!(port, "event bus websocket server started on 127.0.0.1");
-        Ok(port)
+        Ok((port, token))
     }
 }
 
@@ -289,11 +370,53 @@ fn ws_port_path() -> anyhow::Result<PathBuf> {
     }
 }
 
+/// Owner-only file, written to a temp name and renamed so a reader never sees half of it
+fn write_private(path: &Path, body: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std_fs::create_dir_all(parent)?;
+    }
+
+    let tmp = path.with_extension(format!("tmp.{}", process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.write_all(body.as_bytes())?;
+    std_fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn parse_ws_credentials(body: &str) -> anyhow::Result<(u16, String)> {
+    let mut parts = body.split_whitespace();
+    let port = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty ws.port"))?
+        .parse()
+        .context("invalid port number in ws.port")?;
+    let token = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("ws.port missing token"))?
+        .to_string();
+    Ok((port, token))
+}
+
+/// Port and token written at listen time, so the CLI can prove it can read `~/.orch`
+pub fn read_ws_credentials() -> anyhow::Result<(u16, String)> {
+    let body = std_fs::read_to_string(ws_port_path()?)
+        .context("event bus not running — is the service started? (ws.port not found)")?;
+    parse_ws_credentials(&body)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
     use tokio::time;
+    use tokio_tungstenite::tungstenite::Error;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     use super::*;
 
@@ -400,6 +523,23 @@ mod tests {
         }
     }
 
+    fn authed_url(port: u16, token: &str, extra: &str) -> String {
+        let mut url = format!("ws://127.0.0.1:{port}/events?token={token}");
+        if !extra.is_empty() {
+            url.push('&');
+            url.push_str(extra);
+        }
+        url
+    }
+
+    async fn handshake_status(req: impl IntoClientRequest + Unpin) -> u16 {
+        match tokio_tungstenite::connect_async(req).await {
+            Ok(_) => 101,
+            Err(Error::Http(resp)) => resp.status().as_u16(),
+            Err(e) => panic!("expected HTTP handshake status, got {e}"),
+        }
+    }
+
     #[test]
     fn event_filter_empty_matches_all() {
         let filter = EventFilter::default();
@@ -452,10 +592,10 @@ mod tests {
     #[tokio::test]
     async fn ws_server_broadcasts_events() {
         let bus = EventBus::new(256);
-        let port = bus.start_ws_server().await.unwrap();
+        let (port, token) = bus.start_ws_server().await.unwrap();
 
         // Connect a websocket client
-        let url = format!("ws://127.0.0.1:{port}");
+        let url = authed_url(port, &token, "");
         let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         let (_write, mut read) = ws.split();
 
@@ -490,10 +630,10 @@ mod tests {
     #[tokio::test]
     async fn ws_filter_by_task_id() {
         let bus = EventBus::new(256);
-        let port = bus.start_ws_server().await.unwrap();
+        let (port, token) = bus.start_ws_server().await.unwrap();
 
-        // Connect filtered client — only task "42"
-        let url = format!("ws://127.0.0.1:{port}/events?task_id=42");
+        // Connect filtered client, only task "42"
+        let url = authed_url(port, &token, "task_id=42");
         let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         let (_write, mut read) = ws.split();
 
@@ -527,12 +667,12 @@ mod tests {
     #[tokio::test]
     async fn ws_filter_by_repo() {
         let bus = EventBus::new(256);
-        let port = bus.start_ws_server().await.unwrap();
+        let (port, token) = bus.start_ws_server().await.unwrap();
 
-        // Connect filtered client — only repo containing "gabrielkoerich/orch"
-        let url = format!(
-            "ws://127.0.0.1:{port}/events?repo={}",
-            urlencoding::encode("gabrielkoerich/orch")
+        let url = authed_url(
+            port,
+            &token,
+            &format!("repo={}", urlencoding::encode("gabrielkoerich/orch")),
         );
         let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         let (_write, mut read) = ws.split();
@@ -568,10 +708,9 @@ mod tests {
     #[tokio::test]
     async fn ws_unfiltered_client_receives_all() {
         let bus = EventBus::new(256);
-        let port = bus.start_ws_server().await.unwrap();
+        let (port, token) = bus.start_ws_server().await.unwrap();
 
-        // Unfiltered client
-        let url = format!("ws://127.0.0.1:{port}/events");
+        let url = authed_url(port, &token, "");
         let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         let (_write, mut read) = ws.split();
 
@@ -607,13 +746,13 @@ mod tests {
         // Tiny capacity (1) so we can force lag by publishing faster than the
         // client consumes.
         let bus = EventBus::new(1);
-        let Ok(port) = bus.start_ws_server().await else {
-            // Port unavailable (race with parallel tests) — skip gracefully.
+        let Ok((port, token)) = bus.start_ws_server().await else {
+            // Port unavailable (race with parallel tests), skip gracefully
             return;
         };
 
-        // Connect client, but don't read yet — let the buffer overflow.
-        let url = format!("ws://127.0.0.1:{port}/events");
+        // Connect client, but don't read yet, let the buffer overflow
+        let url = authed_url(port, &token, "");
         let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         let (_write, mut read) = ws.split();
 
@@ -648,6 +787,118 @@ mod tests {
             "expected a lagged ControlMessage when bus capacity is exceeded"
         );
 
+        cleanup_port_file().await;
+    }
+
+    #[test]
+    fn parse_ws_credentials_reads_port_and_token() {
+        let (port, token) = parse_ws_credentials("51234 abcdef\n").unwrap();
+        assert_eq!(port, 51234);
+        assert_eq!(token, "abcdef");
+    }
+
+    #[test]
+    fn parse_ws_credentials_rejects_port_only() {
+        assert!(
+            parse_ws_credentials("51234\n").is_err(),
+            "a port file without a token is refused"
+        );
+    }
+
+    #[test]
+    fn write_private_creates_owner_only_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ws.port");
+        write_private(&path, "9 tok").unwrap();
+        let mode = std_fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "ws.port must be owner-only");
+    }
+
+    #[tokio::test]
+    async fn ws_port_file_is_owner_only() {
+        let bus = EventBus::new(16);
+        let (port, token) = bus.start_ws_server().await.unwrap();
+        let path = ws_port_path().unwrap();
+        let body = std_fs::read_to_string(&path).unwrap_or_default();
+        if body.contains(&token) {
+            let mode = std_fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "ws.port must be owner-only");
+            assert!(
+                body.starts_with(&format!("{port} ")),
+                "port is first in the file, got {body:?}"
+            );
+        }
+        cleanup_port_file().await;
+    }
+
+    #[tokio::test]
+    async fn ws_handshake_rejects_a_missing_token() {
+        let bus = EventBus::new(16);
+        let (port, _token) = bus.start_ws_server().await.unwrap();
+        let url = format!("ws://127.0.0.1:{port}/events");
+        assert_eq!(
+            handshake_status(&url).await,
+            401,
+            "a handshake with no token is unauthorized"
+        );
+        cleanup_port_file().await;
+    }
+
+    #[tokio::test]
+    async fn ws_handshake_rejects_a_wrong_token() {
+        let bus = EventBus::new(16);
+        let (port, _token) = bus.start_ws_server().await.unwrap();
+        let url = format!("ws://127.0.0.1:{port}/events?token=nope");
+        assert_eq!(
+            handshake_status(&url).await,
+            401,
+            "a handshake with a wrong token is unauthorized"
+        );
+        cleanup_port_file().await;
+    }
+
+    #[tokio::test]
+    async fn ws_handshake_rejects_another_host() {
+        let bus = EventBus::new(16);
+        let (port, token) = bus.start_ws_server().await.unwrap();
+        let url = format!("ws://localhost:{port}/events?token={token}");
+        assert_eq!(
+            handshake_status(&url).await,
+            401,
+            "a Host other than 127.0.0.1 is refused"
+        );
+        cleanup_port_file().await;
+    }
+
+    #[tokio::test]
+    async fn ws_handshake_rejects_any_origin() {
+        let bus = EventBus::new(16);
+        let (port, token) = bus.start_ws_server().await.unwrap();
+        let mut req = authed_url(port, &token, "").into_client_request().unwrap();
+        req.headers_mut()
+            .insert("origin", "http://evil.test".parse().unwrap());
+        assert_eq!(
+            handshake_status(req).await,
+            403,
+            "a handshake with an Origin header is forbidden"
+        );
+        cleanup_port_file().await;
+    }
+
+    #[tokio::test]
+    async fn ws_handshake_accepts_sec_websocket_protocol() {
+        let bus = EventBus::new(16);
+        let (port, token) = bus.start_ws_server().await.unwrap();
+        let mut req = format!("ws://127.0.0.1:{port}/events")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("sec-websocket-protocol", token.parse().unwrap());
+        assert_eq!(
+            handshake_status(req).await,
+            101,
+            "the token may be sent as Sec-WebSocket-Protocol"
+        );
         cleanup_port_file().await;
     }
 }

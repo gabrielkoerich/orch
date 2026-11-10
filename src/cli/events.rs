@@ -8,7 +8,6 @@ use anyhow::Context;
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::fs;
 use std::net::SocketAddr;
 use std::net::TcpStream;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -20,20 +19,9 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::cli;
 use crate::engine::events::ControlMessage;
 use crate::engine::events::TaskEvent;
-use crate::home;
+use crate::engine::events::read_ws_credentials;
 use crate::store::Task;
 use crate::store::TaskStore;
-
-/// Read the websocket port from `~/.orch/state/ws.port`.
-fn read_ws_port() -> anyhow::Result<u16> {
-    let state_dir = home::state_dir()?;
-    let port_str = fs::read_to_string(state_dir.join("ws.port"))
-        .context("event bus not running — is the service started? (ws.port not found)")?;
-    port_str
-        .trim()
-        .parse()
-        .context("invalid port number in ws.port")
-}
 
 /// Probe whether a TCP socket is reachable on the given port.
 ///
@@ -48,18 +36,13 @@ fn probe_ws_port(port: u16) -> bool {
 ///
 /// Output format: `HH:MM:SS task_id old_status → new_status agent PR: #N`
 pub async fn stream(repo: Option<&str>, task: Option<&str>) -> anyhow::Result<()> {
-    // Try to read and probe the websocket port.
-    match read_ws_port() {
-        Ok(port) if probe_ws_port(port) => {
-            // Port is alive — connect via websocket.
-            stream_from_ws(port, repo, task).await
-        }
-        Ok(port) => {
+    match read_ws_credentials() {
+        Ok((port, token)) if probe_ws_port(port) => stream_from_ws(port, &token, repo, task).await,
+        Ok((port, _)) => {
             eprintln!("Event bus port {port} is not reachable — falling back to store polling.");
             stream_from_store(repo, task).await
         }
         Err(_) => {
-            // No port file at all — service probably isn't running.
             eprintln!("Event bus not available — falling back to store polling.");
             stream_from_store(repo, task).await
         }
@@ -67,18 +50,23 @@ pub async fn stream(repo: Option<&str>, task: Option<&str>) -> anyhow::Result<()
 }
 
 /// Connect to the event bus websocket and stream events.
-async fn stream_from_ws(port: u16, repo: Option<&str>, task: Option<&str>) -> anyhow::Result<()> {
-    let mut url = format!("ws://127.0.0.1:{port}/events");
-    let mut params = Vec::new();
+async fn stream_from_ws(
+    port: u16,
+    token: &str,
+    repo: Option<&str>,
+    task: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut url = format!(
+        "ws://127.0.0.1:{port}/events?token={}",
+        urlencoding::encode(token)
+    );
     if let Some(r) = repo {
-        params.push(format!("repo={}", urlencoding::encode(r)));
+        url.push_str("&repo=");
+        url.push_str(&urlencoding::encode(r));
     }
     if let Some(t) = task {
-        params.push(format!("task_id={}", urlencoding::encode(t)));
-    }
-    if !params.is_empty() {
-        url.push('?');
-        url.push_str(&params.join("&"));
+        url.push_str("&task_id=");
+        url.push_str(&urlencoding::encode(t));
     }
 
     let (ws, _) = connect_async(&url)

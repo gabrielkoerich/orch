@@ -62,15 +62,16 @@ Event-driven subscribers act immediately. The tick loop still polls for the same
 - Starts at engine startup alongside the main loop.
 - Binds to `127.0.0.1` (localhost only, no external access).
 - Port selection: try ports in range `49152-65535` starting from a hash of the machine hostname (deterministic first attempt). On conflict, increment until a free port is found.
-- Write the bound port to `~/.orch/state/ws.port` (overwritten each startup).
-- On shutdown, remove `ws.port` file.
+- Write `{port} {token}` to `~/.orch/state/ws.port` with mode `0600` (overwritten each startup).
+- On shutdown, remove `ws.port`.
 
 ### Protocol
 
-- Connection: `ws://127.0.0.1:{port}/events`
-- Server subscribes to the broadcast channel and fans out JSON-serialized `TaskEvent` to all connected websocket clients.
-- Optional query parameter for filtering: `?task_id=123` or `?repo=owner/repo`.
-- No authentication (localhost-only, single-user tool).
+- Connection: `ws://127.0.0.1:{port}/events?token=<token>`
+- The token may also be sent as `Sec-WebSocket-Protocol`
+- Handshake requires that token (constant-time compare), `Host` exactly `127.0.0.1:<port>`, and no `Origin` header. A missing or wrong token, another Host, or any Origin is 401 or 403
+- Server subscribes to the broadcast channel and fans out JSON-serialized `TaskEvent` to all connected websocket clients
+- Optional query parameter for filtering: `task_id=123` or `repo=owner/repo`
 
 ### Backpressure
 
@@ -88,7 +89,7 @@ orch events --repo owner/repo  # filter by project
 orch events --task 123         # filter by task ID
 ```
 
-Reads port from `~/.orch/state/ws.port`. Connects to websocket. Prints events as formatted lines (colorized status transitions). Exits cleanly on Ctrl+C.
+Reads port and token from `~/.orch/state/ws.port`. Connects to the websocket with the token. Prints events as formatted lines (colorized status transitions). Exits cleanly on Ctrl+C.
 
 ### `orch task watch <id>`
 
