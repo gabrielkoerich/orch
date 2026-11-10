@@ -697,17 +697,7 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
     let int_counts: Vec<usize> = statuses
         .iter()
         .map(|s| {
-            let ts = match s {
-                Status::New => TaskStatus::New,
-                Status::Routed => TaskStatus::Routed,
-                Status::InProgress => TaskStatus::InProgress,
-                Status::Done => TaskStatus::Done,
-                Status::Blocked => TaskStatus::Blocked,
-                Status::InReview => TaskStatus::InReview,
-                Status::Approved => TaskStatus::Approved,
-                Status::NeedsReview => TaskStatus::NeedsReview,
-                Status::Waiting => TaskStatus::Waiting,
-            };
+            let ts = status_to_task_status(*s);
             all_internal.iter().filter(|t| t.status == ts).count()
         })
         .collect();
@@ -750,7 +740,7 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
     if json {
         let mut map = serde_json::Map::new();
         for (i, s) in statuses.iter().enumerate() {
-            let key = s.as_label().replace("status:", "");
+            let key = s.as_str().to_string();
             let mut entry = serde_json::Map::new();
             entry.insert(
                 "external".to_string(),
@@ -807,12 +797,7 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
             let ext = ext_counts[i];
             let int = int_counts[i];
             if ext > 0 || int > 0 {
-                println!(
-                    "{:<20} {:>8}  {:>8}",
-                    s.as_label().replace("status:", ""),
-                    ext,
-                    int
-                );
+                println!("{:<20} {:>8}  {:>8}", s.as_str(), ext, int);
             }
         }
         println!("{}", "-".repeat(42));
