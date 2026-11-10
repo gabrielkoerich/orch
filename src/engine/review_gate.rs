@@ -139,6 +139,13 @@ fn ci_state(
     // (name, started, finished, passed)
     let mut checks: Vec<(String, bool, bool, bool)> = Vec::new();
     for run in runs.iter().filter(|r| !is_own_check(&r.name)) {
+        if !required.is_empty()
+            && !required
+                .iter()
+                .any(|r| auto_merge::required_check_run_matches(r, run))
+        {
+            continue;
+        }
         checks.push((
             run.name.clone(),
             run.status != "queued",
@@ -147,15 +154,27 @@ fn ci_state(
         ));
     }
     for (context, state) in statuses.iter().filter(|(c, _)| !is_own_check(c)) {
+        if !required.is_empty()
+            && !required
+                .iter()
+                .any(|r| r.integration_id.is_none() && r.context == *context)
+        {
+            continue;
+        }
         let finished = state != "pending";
         let passed = matches!(state.as_str(), "success" | "neutral" | "skipped");
         checks.push((context.clone(), true, finished, passed));
     }
-    if !required.is_empty() {
-        checks.retain(|(name, ..)| required.iter().any(|r| &r.context == name));
-    }
 
-    if checks.iter().all(|(_, started, ..)| !started) {
+    // Same-named activity that did not match the app still counts as started
+    if checks.iter().all(|(_, started, ..)| !started)
+        && required.iter().all(|r| {
+            !runs
+                .iter()
+                .any(|run| run.name == r.context && run.status != "queued")
+                && !statuses.iter().any(|(c, _)| c == &r.context)
+        })
+    {
         return CiState::NotStarted;
     }
 
@@ -180,14 +199,24 @@ fn ci_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::types::GitHubApp;
 
     fn run(name: &str, status: &str, conclusion: Option<&str>) -> GitHubCheckRun {
+        check_run(name, status, conclusion, None)
+    }
+
+    fn check_run(
+        name: &str,
+        status: &str,
+        conclusion: Option<&str>,
+        app_id: Option<i64>,
+    ) -> GitHubCheckRun {
         GitHubCheckRun {
             id: 1,
             name: name.to_string(),
             status: status.to_string(),
             conclusion: conclusion.map(String::from),
-            app: None,
+            app: app_id.map(|id| GitHubApp { id }),
         }
     }
 
@@ -243,9 +272,13 @@ mod tests {
     }
 
     fn required(name: &str) -> RequiredStatusCheck {
+        required_check(name, None)
+    }
+
+    fn required_check(name: &str, integration_id: Option<i64>) -> RequiredStatusCheck {
         RequiredStatusCheck {
             context: name.to_string(),
-            integration_id: None,
+            integration_id,
         }
     }
 
@@ -359,5 +392,27 @@ mod tests {
     fn a_pending_commit_status_keeps_the_review_waiting() {
         let statuses = [("ci/build".to_string(), "pending".to_string())];
         assert_eq!(ci_state(&[], &[], &statuses), CiState::Running);
+    }
+
+    #[test]
+    fn an_app_bound_required_check_waits_for_that_app() {
+        let app_bound = [required_check("ci/test", Some(42))];
+        let wrong_app = [check_run("ci/test", "completed", Some("success"), Some(99))];
+        assert_eq!(ci_state(&app_bound, &wrong_app, &[]), CiState::Running);
+
+        let wrong_app_red = [check_run("ci/test", "completed", Some("failure"), Some(99))];
+        assert_eq!(ci_state(&app_bound, &wrong_app_red, &[]), CiState::Running);
+
+        let statuses = [("ci/test".to_string(), "success".to_string())];
+        assert_eq!(ci_state(&app_bound, &[], &statuses), CiState::Running);
+
+        let no_app = [check_run("ci/test", "completed", Some("success"), None)];
+        assert_eq!(ci_state(&app_bound, &no_app, &[]), CiState::Running);
+
+        let right_app = [check_run("ci/test", "completed", Some("success"), Some(42))];
+        assert_eq!(ci_state(&app_bound, &right_app, &[]), CiState::Green);
+
+        let name_only = [required("ci/test")];
+        assert_eq!(ci_state(&name_only, &wrong_app, &[]), CiState::Green);
     }
 }
