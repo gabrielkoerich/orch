@@ -17,7 +17,7 @@ An autonomous task orchestration engine that delegates work to AI coding agents 
 - **Internal tasks** — SQLite-backed tasks for cron jobs and maintenance (no GitHub issue clutter)
 - **Job scheduler** — Cron-like scheduled tasks with native Rust cron matching
 - **Automatic PR creation** — Branches pushed, PRs created, and comments posted automatically
-- **Automated PR review** — Another agent reviews each PR once CI has run. With the [GitHub App](docs/content/github-app.md), the bot posts real GitHub PR reviews with inline comments. Without it, the review is a PR comment
+- **Automated PR review** — Another agent reviews each PR once CI has run. With the [GitHub App](docs/content/docs/github-app.md), the bot posts real GitHub PR reviews with inline comments. Without it, the review is a PR comment
 - **Complexity-based routing** — Router assigns `simple|medium|complex` and config maps to models
 - **Agent memory** — Learnings persist across retries so agents don't repeat mistakes
 - **Per-task artifacts** — Organized per-repo, per-task, per-attempt directory structure
@@ -117,7 +117,7 @@ review:
   mode: app
 ```
 
-The full setup, the permissions, the bot commit identity and the relay for events are in [docs/content/github-app.md](docs/content/github-app.md).
+The full setup, the permissions, the bot commit identity and the relay for events are in [docs/content/docs/github-app.md](docs/content/docs/github-app.md).
 
 ## CLI Reference
 

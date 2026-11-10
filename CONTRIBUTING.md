@@ -44,7 +44,7 @@ cargo nextest run                          # tests
 DYLINT_RUSTFLAGS="-D warnings" cargo dylint --all -- --all-targets  # use_in_fn lint
 ```
 
-The import rules and the dylint setup are in [docs/content/development.md](docs/content/development.md#import-rules).
+The import rules and the dylint setup are in [docs/content/docs/development.md](docs/content/docs/development.md#import-rules).
 
 Or all at once:
 

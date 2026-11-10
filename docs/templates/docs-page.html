@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% import "docs-macros.html" as docs_macros %}
+
+{% block header_title %}{{ docs_macros::header() }}{% endblock header_title %}
+
+{% block content %}
+{% set docs = get_section(path="docs/_index.md") %}
+<div class="docs-layout">
+    {{ docs_macros::sidebar(docs=docs, current=page.path) }}
+    <article class="docs-content content">
+        <p class="docs-crumb">{{ page.extra.group | default(value="Docs") }}</p>
+        <h1>{{ page.title }}</h1>
+        {{ page.content | safe }}
+        <nav class="docs-pager">
+            {% if page.lower %}<a class="docs-prev" href="{{ page.lower.permalink | safe }}">← {{ page.lower.title }}</a>{% else %}<span></span>{% endif %}
+            {% if page.higher %}<a class="docs-next" href="{{ page.higher.permalink | safe }}">{{ page.higher.title }} →</a>{% endif %}
+        </nav>
+        <p class="docs-edit"><a href="{{ config.extra.github }}/edit/main/docs/content/{{ page.relative_path }}">Edit this page on GitHub</a></p>
+    </article>
+</div>
+{% endblock content %}

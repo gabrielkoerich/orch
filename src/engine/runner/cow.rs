@@ -1,4 +1,4 @@
-//! Copy-on-write task worktrees cloned from a per-project template by the git-cow crate, see docs/content/cow-worktrees.md
+//! Copy-on-write task worktrees cloned from a per-project template by the git-cow crate, see docs/content/docs/cow-worktrees.md
 
 use super::worktree::resolve_branch_start_point;
 use crate::home;

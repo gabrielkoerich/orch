@@ -1,7 +1,11 @@
 +++
 title = "GitHub Backend"
 description = "GitHub Issues as the native task backend"
-weight = 8
+weight = 30
+aliases = ["/github-sync/"]
+
+[extra]
+group = "Integrations"
 +++
 
 Tasks are stored in a unified SQLite database (`~/.orch/orch.db`) and synced to GitHub Issues. External tasks from GitHub are ingested into the store on each sync tick, so the store always has the latest data. Orch centralizes GitHub API calls via the server and uses a native HTTP client (`reqwest`) or the `gh` CLI internally.

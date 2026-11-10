@@ -1,12 +1,16 @@
 +++
 title = "GitHub App"
 description = "Real PR reviews from a bot account, and GitHub events through a relay instead of polling"
-weight = 10
+weight = 31
+aliases = ["/github-app/"]
+
+[extra]
+group = "Integrations"
 +++
 
 A GitHub App is optional. Without one, orch reviews with an `## Automated Review` comment and polls GitHub every 45 seconds. With one:
 
-- **Reviews** are real `APPROVE` or `REQUEST_CHANGES` reviews from the App's bot account, with each issue on a changed line as an inline comment, and an `orch/review` check run. See [Review Agent](@/review-agent.md).
+- **Reviews** are real `APPROVE` or `REQUEST_CHANGES` reviews from the App's bot account, with each issue on a changed line as an inline comment, and an `orch/review` check run. See [Review Agent](@/docs/review-agent.md).
 - **Events** reach orch as soon as GitHub sends them, through a relay, so orch syncs at once instead of on the next poll.
 
 The App only reviews. Every other call (pushes, pull requests, comments, labels, reads) uses your `gh` token, and you stay the author of the pull requests. GitHub refuses a review from a pull request's author, so the App must never open the pull requests it reviews.
@@ -59,7 +63,7 @@ review:
   mode: app                                # or in one project's .orch.yml
 ```
 
-`private_key_path` (a path to the `.pem` file) and `private_key_env` (a variable holding the PEM) work instead of `private_key`. See [Configuration](@/configuration.md#github-app).
+`private_key_path` (a path to the `.pem` file) and `private_key_env` (a variable holding the PEM) work instead of `private_key`. See [Configuration](@/docs/configuration.md#github-app).
 
 orch reads the key once after it starts, in the background, and keeps it in memory. A passbox read waits on Touch ID, so approve the prompt after a restart. Until the key loads, reviews fall back to the comment. The log confirms it:
 

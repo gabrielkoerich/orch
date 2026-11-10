@@ -1,6 +1,4 @@
 +++
-title = "Documentation"
-sort_by = "weight"
+title = "orch"
+template = "index.html"
 +++
-
-Orch documentation — a Rust-based multi-agent task orchestration engine for AI coding agents.

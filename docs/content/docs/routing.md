@@ -1,7 +1,11 @@
 +++
 title = "Routing"
 description = "How orch picks an agent for each task"
-weight = 4
+weight = 10
+aliases = ["/routing/"]
+
+[extra]
+group = "Concepts"
 +++
 
 Orch uses an LLM-as-classifier to route each task to the best agent. This is a non-agentic call (`--print`) — fast and cheap, no tool access needed.

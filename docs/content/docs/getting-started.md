@@ -2,6 +2,10 @@
 title = "Getting Started"
 description = "Install orch and run your first task"
 weight = 1
+aliases = ["/getting-started/"]
+
+[extra]
+group = "Start"
 +++
 
 ## Install

@@ -1,7 +1,11 @@
 +++
 title = "Configuration"
 description = "Config reference and per-project overrides"
-weight = 7
+weight = 21
+aliases = ["/configuration/"]
+
+[extra]
+group = "Reference"
 +++
 
 All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless overridden via the `ORCH_HOME` environment variable.
@@ -24,7 +28,7 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `engine` | `upgrade_check_interval` | How often to check for new orch versions and notify channels (seconds). Upgrading is operator-only — the service never runs `brew` itself | `3600` |
 | `engine` | `startup_failure_escalation_secs` | Seconds of continuous startup failure before escalating to ERROR log + push notification (0 disables) | `3600` |
 | `workflow` | `auto_close` | Auto-close GitHub issues when tasks are `done` | `true` |
-| `workflow` | `enable_review_agent` | Run a [review agent](@/review-agent.md) after task completion | `true` |
+| `workflow` | `enable_review_agent` | Run a [review agent](@/docs/review-agent.md) after task completion | `true` |
 | `workflow` | `max_attempts` | Max attempts before marking task as blocked | `5` |
 | `workflow` | `max_review_cycles` | Max PR review cycles before escalating to human | `2` |
 | `workflow` | `max_reroute_attempts` | Max times a task may be re-routed automatically. Falls back to `max_attempts` when unset | `3` |
@@ -180,7 +184,7 @@ gh:
 
 ### GitHub App
 
-Creating the App, its permissions, installing it and the relay for events are in [GitHub App](@/github-app.md). This section is the config reference.
+Creating the App, its permissions, installing it and the relay for events are in [GitHub App](@/docs/github-app.md). This section is the config reference.
 
 The App posts reviews only: the `APPROVE` or `REQUEST_CHANGES` review with its inline comments, and the `orch/review` check run. Every other call, pushes, pull requests, comments, labels and reads, uses the owner's `gh` token, as agents do. GitHub refuses a review from a pull request's author, so the App must never open the pull requests it reviews.
 
@@ -214,8 +218,8 @@ review:
 | `comment` | a `## Automated Review` comment | the `orch/review` commit status |
 | `app` | a real `APPROVE` or `REQUEST_CHANGES` review from the App, with each issue on a changed line as an inline comment | the `orch/review` check run from the App, `in_progress` while the review runs, then `success` or `failure` |
 
-In `app` mode the App review is the decision and no comment is posted. The `## Automated Review` comment goes out only when GitHub refuses the App review, and the gate reads it when the App has no review on the head. A review and the check run belong to the head sha the agent reviewed, so a new push makes the PR pending again, except a base update orch makes in `approved`, which carries the approval (see [Review Agent](@/review-agent.md)). Issues on lines outside the diff stay in the review body, since GitHub refuses an inline comment there. A project in `app` mode whose repository does not have the App installed, or a daemon whose App key is not read yet, reviews in `comment` mode.
+In `app` mode the App review is the decision and no comment is posted. The `## Automated Review` comment goes out only when GitHub refuses the App review, and the gate reads it when the App has no review on the head. A review and the check run belong to the head sha the agent reviewed, so a new push makes the PR pending again, except a base update orch makes in `approved`, which carries the approval (see [Review Agent](@/docs/review-agent.md)). Issues on lines outside the diff stay in the review body, since GitHub refuses an inline comment there. A project in `app` mode whose repository does not have the App installed, or a daemon whose App key is not read yet, reviews in `comment` mode.
 
 ## Cluster
 
-The `cluster` section runs orch on several machines. Without it orch runs on one machine. Keys, roles and setup are in [Cluster](@/cluster.md).
+The `cluster` section runs orch on several machines. Without it orch runs on one machine. Keys, roles and setup are in [Cluster](@/docs/cluster.md).

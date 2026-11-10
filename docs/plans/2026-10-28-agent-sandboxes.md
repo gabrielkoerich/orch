@@ -122,7 +122,7 @@ Recommendation: A first, then B for `os` mode.
 6. When the sandbox cannot start (`Backend::detect()` or `Vm::tart` or `Vm::lume` fails, or the crate refuses the policy), the task blocks with the error. It never falls back to running unsandboxed.
 7. A sandbox denial blocks the task with the denied path in `block_reason`. It is a gap in the policy, so it must not cool down the agent or the model. `detect_permission_denied` already matches `operation not permitted`. The path comes from the agent's stderr or the Seatbelt log (`log show --predicate 'sender == "Sandbox"'`).
 8. Startup reconciliation deletes orphaned `sandbox-jail-*` tart and lume clones.
-9. Docs: `docs/content/agents.md` and `configuration.md` get both modes, the policy and how to read a denial.
+9. Docs: `docs/content/docs/agents.md` and `configuration.md` get both modes, the policy and how to read a denial.
 
 ## Phases
 

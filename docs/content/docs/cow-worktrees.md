@@ -1,7 +1,11 @@
 +++
 title = "Copy-on-write worktrees"
 description = "How task worktrees share files with a per-project template"
-weight = 4
+weight = 13
+aliases = ["/cow-worktrees/"]
+
+[extra]
+group = "Concepts"
 +++
 
 ## What it is

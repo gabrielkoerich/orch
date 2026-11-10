@@ -1,7 +1,11 @@
 +++
 title = "Workflow"
 description = "How orch runs tasks end-to-end"
-weight = 3
+weight = 2
+aliases = ["/workflow/"]
+
+[extra]
+group = "Start"
 +++
 
 How orch runs tasks end-to-end.
@@ -65,7 +69,7 @@ The Rust engine ticks every `engine.tick_interval` seconds (default 10s). Each t
 5. **Unblock** — if all children of a blocked parent are `done`, resets parent to `new`
 6. **Jobs** — runs due scheduled jobs (cron, per-project)
 
-A separate **sync tick** (~45s) handles less-frequent operations. With `relay.url` set, each GitHub App event from the relay starts a sync at once (see [GitHub App](@/github-app.md#events)):
+A separate **sync tick** (~45s) handles less-frequent operations. With `relay.url` set, each GitHub App event from the relay starts a sync at once (see [GitHub App](@/docs/github-app.md#events)):
 
 1. **Cleanup** — removes worktrees for done tasks (runs in background), deletes orphaned remote branches, auto-prunes stale worktree metadata, pulls main once per cycle; remote branch is kept when a blocked task has an open PR
 2. **Merged PR detection** — marks tasks done when their PRs are merged, and merges `approved` PRs once CI passes
@@ -138,7 +142,7 @@ After agent completion, if a PR is open and `enable_review_agent` is true:
 4. Review agent evaluates and posts a comment with `## Automated Review — Approve/Changes Requested` header. The run is limited to `workflow.review_timeout_seconds` (default 900)
 5. orch sets the `orch/review` gate on the PR head and, on approve, moves the task to `approved`
 
-See the [Review Agent](@/review-agent.md) page for full details.
+See the [Review Agent](@/docs/review-agent.md) page for full details.
 
 ## Stuck Task Recovery
 

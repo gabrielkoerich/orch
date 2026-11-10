@@ -1,7 +1,11 @@
 +++
 title = "Agents"
 description = "Agentic mode, safety rules, and context enrichment"
-weight = 5
+weight = 11
+aliases = ["/agents/"]
+
+[extra]
+group = "Concepts"
 +++
 
 Once routed, agents run in full agentic mode with tool access:
