@@ -788,6 +788,36 @@ mod tests {
         assert_eq!(TaskStatus::from_str("approved"), Some(TaskStatus::Approved));
         assert_eq!(TaskStatus::Approved.as_str(), "approved");
         assert_eq!(Status::NeedsReview.as_label(), "status:needs_review");
+        assert_eq!(Status::Waiting.as_label(), "status:waiting");
+        assert_eq!(Status::Waiting.as_str(), "waiting");
+    }
+
+    #[test]
+    fn as_str_is_as_label_without_status_prefix() {
+        for status in [
+            Status::New,
+            Status::Routed,
+            Status::InProgress,
+            Status::Done,
+            Status::Blocked,
+            Status::InReview,
+            Status::Approved,
+            Status::NeedsReview,
+            Status::Waiting,
+        ] {
+            let label = status.as_label();
+            assert_eq!(
+                status.as_str(),
+                label.strip_prefix("status:").unwrap(),
+                "{status:?}"
+            );
+            assert_eq!(status.as_str(), label.replace("status:", ""), "{status:?}");
+            assert_eq!(
+                status.as_str(),
+                label.trim_start_matches("status:"),
+                "{status:?}"
+            );
+        }
     }
 
     #[test]

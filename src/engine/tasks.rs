@@ -1151,6 +1151,11 @@ mod tests {
             status_to_task_status(Status::NeedsReview),
             TaskStatus::NeedsReview
         );
+        assert_eq!(
+            status_to_task_status(Status::Approved),
+            TaskStatus::Approved
+        );
+        assert_eq!(status_to_task_status(Status::Waiting), TaskStatus::Waiting);
     }
 
     #[test]
