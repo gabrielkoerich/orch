@@ -575,7 +575,7 @@ pub async fn tick(
                                 | TaskStatus::Approved
                                 | TaskStatus::Waiting
                                 | TaskStatus::Blocked => true,
-                                _ => false, // Terminal state (Done, Cancelled)
+                                TaskStatus::Done | TaskStatus::Cancelled => false,
                             },
                             Err(e) => {
                                 tracing::warn!(
