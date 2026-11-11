@@ -29,6 +29,7 @@ use std::any;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::error::Error as _;
 use std::fmt;
 use std::fmt::Debug;
 use std::fmt::Formatter;
@@ -473,6 +474,24 @@ impl Debug for GhHttp {
     }
 }
 
+/// The error with its full source chain plus the timeout and connect flags, because the
+/// top-level reqwest message alone hides why the request failed
+fn transport_error_detail(e: &reqwest::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(s) = source {
+        let _ = write!(out, ": {s}");
+        source = s.source();
+    }
+    let _ = write!(
+        out,
+        " (is_timeout={}, is_connect={})",
+        e.is_timeout(),
+        e.is_connect()
+    );
+    out
+}
+
 impl GhHttp {
     /// Create a new client backed by the process-wide shared [`TokenResolver`].
     ///
@@ -486,6 +505,9 @@ impl GhHttp {
             .user_agent("orch/0.1 (reqwest)")
             .pool_max_idle_per_host(4)
             .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(60))
             .build()
             .map_err(|e| anyhow::anyhow!("failed to build HTTP client (TLS init): {e}"))?;
 
@@ -763,9 +785,10 @@ impl GhHttp {
                     // so unlike the 5xx arm above it must NOT trip the shared "github:5xx"
                     // circuit breaker: other subsystems (routing-phase skip, cooldown
                     // throttling) key off that breaker as a signal about GitHub's health.
-                    tracing::warn!(err = %e, attempt, "HTTP request failed to send (transport error, GitHub not reached), will retry if attempts remain");
+                    let detail = transport_error_detail(&e);
+                    tracing::warn!(err = %detail, attempt, "HTTP request failed to send (transport error, GitHub not reached), will retry if attempts remain");
                     last_err = Some(anyhow::anyhow!(
-                        "HTTP request failed to send (transport error): {e}"
+                        "HTTP request failed to send (transport error): {detail}"
                     ));
                     if attempt + 1 < attempts {
                         // Cap exponent at 63 (max valid shift for u64) to prevent overflow
@@ -4783,7 +4806,11 @@ mod tests {
         let make_req = || Ok(gh.client.get(&url));
         let result = gh.send_with_retries(make_req, false).await;
 
-        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("is_connect=true") && err.to_lowercase().contains("refused"),
+            "transport error should hold the source chain, got: {err}"
+        );
         assert!(
             !cooldown::is_agent_in_cooldown("github:5xx"),
             "transport error must not trip the github:5xx circuit breaker"
