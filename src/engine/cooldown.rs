@@ -467,6 +467,28 @@ async fn read_and_increment_failure_count_with_prefix(
     }
 }
 
+/// Backoff schedule for one kind of per-model failure.
+struct ModelBackoff {
+    prefix: &'static str,
+    base: i64,
+    max: i64,
+    allow_extended: bool,
+    reason: &'static str,
+}
+
+/// Bump the failure counter for `agent:model` and cool the model for the backoff it maps to.
+async fn record_model_backoff(agent_name: &str, model: &str, schedule: &ModelBackoff) {
+    let key = format!("{agent_name}:{model}");
+    let store_opt = cooldown_store().lock().await.clone();
+    let count =
+        read_and_increment_failure_count_with_prefix(store_opt.as_ref(), schedule.prefix, &key)
+            .await;
+    let cooldown_secs =
+        compute_backoff(count, schedule.base, schedule.max, schedule.allow_extended);
+    let cooldown_until = chrono::Utc::now().timestamp() + cooldown_secs;
+    set_cooldown_async(&key, cooldown_until, schedule.reason).await;
+}
+
 /// Reset failure counts for an agent and agent:model combo after a successful run.
 ///
 /// Call this from the runner's success path so that the next failure starts
@@ -699,13 +721,15 @@ pub async fn record_credit_exhaustion_from_message(
 ///
 /// Applies exponential backoff based on the model's failure count in KV.
 pub async fn record_model_failure(agent_name: &str, model: &str) {
-    let key = format!("{agent_name}:{model}");
-    let store_opt = cooldown_store().lock().await.clone();
-    let count = read_and_increment_failure_count(store_opt.as_ref(), &key).await;
     let base = config::get_agent_backoff_base(agent_name);
-    let cooldown_until =
-        chrono::Utc::now().timestamp() + compute_backoff(count, base, BACKOFF_MAX_SECS, true);
-    set_cooldown_async(&key, cooldown_until, "model_error").await;
+    let schedule = ModelBackoff {
+        prefix: FAILURE_COUNT_PREFIX,
+        base,
+        max: BACKOFF_MAX_SECS,
+        allow_extended: true,
+        reason: "model_error",
+    };
+    record_model_backoff(agent_name, model, &schedule).await;
 }
 
 /// Record a rate-limit event for an agent+model.
@@ -751,22 +775,14 @@ pub async fn record_rate_limit(agent_name: &str, model: Option<&str>, error_mess
 /// reset escalation back to the 4h base, letting structurally unreliable models
 /// (intermittent parse errors, truncated runs) stay in rotation indefinitely.
 pub async fn record_persistent_model_failure(agent_name: &str, model: &str) {
-    let key = format!("{agent_name}:{model}");
-    let store_opt = cooldown_store().lock().await.clone();
-    let count = read_and_increment_failure_count_with_prefix(
-        store_opt.as_ref(),
-        PERSISTENT_FAILURE_COUNT_PREFIX,
-        &key,
-    )
-    .await;
-    let cooldown_secs = compute_backoff(
-        count,
-        PERSISTENT_MODEL_BACKOFF_BASE_SECS,
-        PERSISTENT_MODEL_BACKOFF_MAX_SECS,
-        false,
-    );
-    let cooldown_until = chrono::Utc::now().timestamp() + cooldown_secs;
-    set_cooldown_async(&key, cooldown_until, "persistent_model_error").await;
+    let schedule = ModelBackoff {
+        prefix: PERSISTENT_FAILURE_COUNT_PREFIX,
+        base: PERSISTENT_MODEL_BACKOFF_BASE_SECS,
+        max: PERSISTENT_MODEL_BACKOFF_MAX_SECS,
+        allow_extended: false,
+        reason: "persistent_model_error",
+    };
+    record_model_backoff(agent_name, model, &schedule).await;
 }
 
 /// Record a `ModelUnavailable` failure for an agent+model.
@@ -795,17 +811,14 @@ fn is_model_permanently_gone(message: &str) -> bool {
 /// A stopped session or one odd answer causes these, so the backoff is 5 then 15 minutes. Billing
 /// exhaustion and "model not found" keep [`record_persistent_model_failure`]
 pub async fn record_transient_model_failure(agent_name: &str, model: &str) {
-    let key = format!("{agent_name}:{model}");
-    let store_opt = cooldown_store().lock().await.clone();
-    let count = read_and_increment_failure_count(store_opt.as_ref(), &key).await;
-    let cooldown_secs = compute_backoff(
-        count,
-        TRANSIENT_MODEL_BACKOFF_BASE_SECS,
-        TRANSIENT_MODEL_BACKOFF_MAX_SECS,
-        false,
-    );
-    let cooldown_until = chrono::Utc::now().timestamp() + cooldown_secs;
-    set_cooldown_async(&key, cooldown_until, "transient_model_error").await;
+    let schedule = ModelBackoff {
+        prefix: FAILURE_COUNT_PREFIX,
+        base: TRANSIENT_MODEL_BACKOFF_BASE_SECS,
+        max: TRANSIENT_MODEL_BACKOFF_MAX_SECS,
+        allow_extended: false,
+        reason: "transient_model_error",
+    };
+    record_model_backoff(agent_name, model, &schedule).await;
 }
 
 /// Set a model cooldown with a custom duration (in seconds) and reason.
