@@ -1918,6 +1918,91 @@ mod tests {
 
     #[serial(cooldown_state)]
     #[tokio::test]
+    async fn record_transient_model_failure_backs_off_5_then_15_minutes() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
+
+        let agent = "testagent_transient";
+        let model = "testmodel_transient";
+        let key = format!("{agent}:{model}");
+
+        record_transient_model_failure(agent, model).await;
+        let first = cooldown_until(&key)
+            .expect("first cooldown should exist")
+            .saturating_sub(chrono::Utc::now().timestamp());
+        assert!(
+            (TRANSIENT_MODEL_BACKOFF_BASE_SECS - 5..=TRANSIENT_MODEL_BACKOFF_BASE_SECS + 5)
+                .contains(&first),
+            "first transient cooldown should be ~5m, got {first}s"
+        );
+
+        record_transient_model_failure(agent, model).await;
+        let second = cooldown_until(&key)
+            .expect("second cooldown should exist")
+            .saturating_sub(chrono::Utc::now().timestamp());
+        assert!(
+            (TRANSIENT_MODEL_BACKOFF_MAX_SECS - 5..=TRANSIENT_MODEL_BACKOFF_MAX_SECS + 5)
+                .contains(&second),
+            "second transient cooldown should be capped at ~15m, got {second}s"
+        );
+
+        let (_, reason) = parse_cooldown_value(
+            &store
+                .kv_get(&format!("{KV_PREFIX}{key}"))
+                .await
+                .unwrap()
+                .expect("cooldown persisted"),
+        )
+        .expect("cooldown value");
+        assert_eq!(reason, "transient_model_error");
+
+        let count = store
+            .kv_get(&format!("{FAILURE_COUNT_PREFIX}{key}"))
+            .await
+            .unwrap();
+        assert_eq!(count.as_deref(), Some("2"));
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn record_model_failure_and_persistent_failure_use_separate_counters() {
+        super::reset_global_state().await;
+        let store = test_store().await;
+        *cooldown_store().lock().await = Some(Arc::clone(&store));
+
+        let agent = "testagent_counters";
+        let model = "testmodel_counters";
+        let key = format!("{agent}:{model}");
+
+        record_model_failure(agent, model).await;
+        record_persistent_model_failure(agent, model).await;
+        record_persistent_model_failure(agent, model).await;
+
+        let generic = store
+            .kv_get(&format!("{FAILURE_COUNT_PREFIX}{key}"))
+            .await
+            .unwrap();
+        let persistent = store
+            .kv_get(&format!("{PERSISTENT_FAILURE_COUNT_PREFIX}{key}"))
+            .await
+            .unwrap();
+        assert_eq!(generic.as_deref(), Some("1"));
+        assert_eq!(persistent.as_deref(), Some("2"));
+
+        let (_, reason) = parse_cooldown_value(
+            &store
+                .kv_get(&format!("{KV_PREFIX}{key}"))
+                .await
+                .unwrap()
+                .expect("cooldown persisted"),
+        )
+        .expect("cooldown value");
+        assert_eq!(reason, "persistent_model_error");
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
     async fn cooldown_reason_survives_restart_via_kv() {
         super::reset_global_state().await;
         let store = test_store().await;
