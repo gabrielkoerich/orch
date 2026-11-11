@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Output;
 use std::result;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -657,6 +658,24 @@ pub async fn tick(
     Ok(())
 }
 
+/// Runs `bash -c` under a timeout. `kill_on_drop` kills the child when the timeout drops the future
+async fn run_bash(
+    cmd: &str,
+    dir: &str,
+    timeout: Duration,
+) -> result::Result<anyhow::Result<Output>, time::error::Elapsed> {
+    time::timeout(
+        timeout,
+        Command::new("bash")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(dir)
+            .kill_on_drop(true)
+            .output_with_context(),
+    )
+    .await
+}
+
 /// Execute a single job immediately (ignoring schedule and active-task guard).
 ///
 /// Updates `state` with the result but does NOT persist to SQLite — caller is
@@ -747,15 +766,7 @@ pub async fn execute_job(
                     .unwrap_or(300);
                 let timeout = Duration::from_secs(timeout_secs);
 
-                let output = time::timeout(
-                    timeout,
-                    Command::new("bash")
-                        .arg("-c")
-                        .arg(cmd)
-                        .current_dir(dir)
-                        .output_with_context(),
-                )
-                .await;
+                let output = run_bash(cmd, dir, timeout).await;
 
                 match output {
                     Ok(Ok(o)) if o.status.success() => {
@@ -779,7 +790,7 @@ pub async fn execute_job(
                         tracing::error!(
                             job_id = job.id,
                             secs = timeout_secs,
-                            "bash job timed out after {}s — killing to unblock tick loop",
+                            "bash job timed out after {}s, child killed",
                             timeout_secs
                         );
                         state.last_task_status = Some("timeout".to_string());
@@ -840,12 +851,40 @@ pub async fn execute_job(
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command as StdCommand;
     use tempfile::tempdir;
 
     fn write_config(dir: &Path, content: &str) -> PathBuf {
         let path = dir.join(".orch.yml");
         fs::write(&path, content).unwrap();
         path
+    }
+
+    #[tokio::test]
+    async fn run_bash_timeout_kills_the_child() {
+        let tmp = tempdir().unwrap();
+        let pid_file = tmp.path().join("pid");
+        let cmd = format!("echo $$ > {}; exec sleep 60", pid_file.display());
+
+        let out = run_bash(&cmd, ".", Duration::from_secs(1)).await;
+        assert!(out.is_err(), "expected a timeout");
+
+        let pid = fs::read_to_string(&pid_file).unwrap().trim().to_string();
+        let mut gone = false;
+        for _ in 0..20 {
+            let alive = StdCommand::new("kill")
+                .args(["-0", &pid])
+                .output()
+                .unwrap()
+                .status
+                .success();
+            if !alive {
+                gone = true;
+                break;
+            }
+            time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(gone, "child {pid} still running after timeout");
     }
 
     #[test]
