@@ -14,6 +14,7 @@ use crate::engine;
 use crate::engine::ci_bootstrap;
 use crate::engine::cleanup::{cleanup_merged_pr_worktree, cleanup_task_worktree};
 use crate::engine::review;
+use crate::engine::review_gate;
 use crate::engine::review_poll;
 use crate::engine::router::config::RouterConfig;
 use crate::engine::runner::response::ReviewIssue;
@@ -1290,12 +1291,15 @@ fn may_merge_onto_base(behind_by: Option<u64>) -> bool {
 
 /// True when any check run or commit status has not finished
 fn any_check_pending(check_runs: &[GitHubCheckRun], statuses: &[(String, String)]) -> bool {
-    check_runs.iter().any(|run| !run.is_finished())
-        || statuses.iter().any(|(_, state)| {
-            !matches!(
-                state.as_str(),
-                "success" | "failure" | "error" | "neutral" | "skipped"
-            )
+    check_runs
+        .iter()
+        .any(|run| !review_gate::is_own_check(&run.name) && !run.is_finished())
+        || statuses.iter().any(|(name, state)| {
+            !review_gate::is_own_check(name)
+                && !matches!(
+                    state.as_str(),
+                    "success" | "failure" | "error" | "neutral" | "skipped"
+                )
         })
 }
 
@@ -2892,6 +2896,20 @@ mod tests {
             conclusion: conclusion.map(str::to_string),
             app: app_id.map(|id| GitHubApp { id }),
         }
+    }
+
+    #[test]
+    fn any_check_pending_ignores_the_reviews_own_checks() {
+        let runs = vec![
+            check_run("ci", "completed", Some("success"), None),
+            check_run("review-gate", "in_progress", None, None),
+            check_run("orch/review", "queued", None, None),
+        ];
+        let statuses = vec![("orch/review".to_string(), "pending".to_string())];
+        assert!(!any_check_pending(&runs, &statuses));
+
+        let runs = vec![check_run("ci", "in_progress", None, None)];
+        assert!(any_check_pending(&runs, &[]));
     }
 
     #[test]
